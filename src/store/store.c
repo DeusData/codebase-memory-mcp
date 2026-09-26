@@ -151,6 +151,15 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+
+    /* ADRs live in a per-project sidecar DB ("<db_path>.adr.db"), NOT in the
+     * graph DB, so a reindex that rebuilds/replaces the graph DB never touches
+     * them (removing the capture/re-apply race entirely). The read-write handle
+     * is lazily opened on the first ADR write/migration and cached for the
+     * store's lifetime; NULL for a :memory: store, where ADRs stay in the graph
+     * DB (never file-swapped, no race). Reads open a short-lived read-only
+     * handle so a query-only cache is never mutated. */
+    sqlite3 *adr_db;
 };
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -161,6 +170,13 @@ static void store_set_error(cbm_store_t *s, const char *msg) {
 
 static void store_set_error_sqlite(cbm_store_t *s, const char *prefix) {
     snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(s->db));
+}
+
+/* Like store_set_error_sqlite but reads the message from an explicit
+ * connection — used for the ADR sidecar DB, whose errors do not live on
+ * s->db. */
+static void store_set_error_sqlite_on(cbm_store_t *s, sqlite3 *db, const char *prefix) {
+    snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(db));
 }
 
 static int exec_sql(cbm_store_t *s, const char *sql) {
@@ -1300,6 +1316,11 @@ void cbm_store_close(cbm_store_t *s) {
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
     sqlite3_close_v2(s->db);
+    /* ADR sidecar: checkpoint + close its own connection (file stores only). */
+    if (s->adr_db) {
+        (void)sqlite3_wal_checkpoint_v2(s->adr_db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
+        sqlite3_close_v2(s->adr_db);
+    }
     safe_str_free(&s->db_path);
     free(s);
 }
@@ -9579,7 +9600,190 @@ void cbm_adr_sections_free(cbm_adr_sections_t *s) {
     memset(s, 0, sizeof(*s));
 }
 
+/* ── ADR sidecar store ──────────────────────────────────────────────
+ * ADRs are kept in a per-project sidecar SQLite DB ("<graph_db>.adr.db"), so a
+ * reindex that deletes/replaces the graph DB never disturbs them (no capture,
+ * re-read or re-apply, no lock). adr_conn() returns the connection ADR ops run
+ * on: the sidecar for a file-backed store (opened, schema-created and migrated
+ * once, then cached), or the graph DB for a :memory: store (never file-swapped,
+ * so there is no race to avoid there). */
+
+/* The sidecar's on-disk path ("<db_path>.adr.db"), routed through
+ * cbm_path_for_file_api so a long path gets the Windows \\?\ prefix (like
+ * store_open_internal). Returns false for a :memory: store or an over-long
+ * path. `raw` receives the plain path for existence checks/unlinks; `api`
+ * receives the file-API form used to open. */
+static bool adr_sidecar_path(const cbm_store_t *s, char *raw, size_t raw_sz, char *api,
+                             size_t api_sz) {
+    if (!s->db_path) {
+        return false;
+    }
+    int n = snprintf(raw, raw_sz, "%s.adr.db", s->db_path);
+    if (n <= 0 || (size_t)n >= (int)raw_sz) {
+        return false;
+    }
+    return cbm_path_for_file_api(raw, api, api_sz);
+}
+
+/* Match the graph store's locking so cross-process ADR access waits rather than
+ * failing: WAL + a 10 s busy timeout (SQLite's own lock wait, not a hand-rolled
+ * poll). Best-effort: a read-only sidecar rejects journal_mode, which is fine. */
+static void adr_configure(sqlite3 *db) {
+    (void)sqlite3_exec(db, "PRAGMA busy_timeout = 10000;", NULL, NULL, NULL);
+    (void)sqlite3_exec(db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
+}
+
+static int adr_ensure_schema(sqlite3 *db) {
+    /* project_summaries has the same shape as the graph DB's, so migration is a
+     * plain row copy and the cbm_adr_t mapping is unchanged. adr_meta carries a
+     * one-time "migrated" marker so the legacy copy runs exactly once and can
+     * never resurrect a row deleted after migration. */
+    int rc = sqlite3_exec(db,
+                          "CREATE TABLE IF NOT EXISTS project_summaries ("
+                          "  project TEXT PRIMARY KEY,"
+                          "  summary TEXT NOT NULL,"
+                          "  source_hash TEXT NOT NULL,"
+                          "  created_at TEXT NOT NULL,"
+                          "  updated_at TEXT NOT NULL"
+                          ");"
+                          "CREATE TABLE IF NOT EXISTS adr_meta ("
+                          "  key TEXT PRIMARY KEY,"
+                          "  value TEXT NOT NULL"
+                          ");",
+                          NULL, NULL, NULL);
+    return (rc == SQLITE_OK) ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+/* True once the one-time legacy migration has been recorded in the sidecar. */
+static bool adr_migrated(sqlite3 *adb) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(adb, "SELECT 1 FROM adr_meta WHERE key='migrated' LIMIT 1;",
+                           CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool done = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return done;
+}
+
+/* Copy any legacy ADR rows from the graph DB's project_summaries into the
+ * sidecar (INSERT OR IGNORE, so a local row is never clobbered), then set the
+ * one-time marker. Returns CBM_STORE_ERR on any failure so callers can fail
+ * closed and preserve the old generation. No-op once the marker is set. */
+static int adr_copy_legacy_once(cbm_store_t *s, sqlite3 *adb) {
+    if (adr_migrated(adb)) {
+        return CBM_STORE_OK;
+    }
+    sqlite3_stmt *probe = NULL;
+    if (sqlite3_prepare_v2(
+            s->db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_summaries' LIMIT 1;",
+            CBM_NOT_FOUND, &probe, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bool has_legacy = sqlite3_step(probe) == SQLITE_ROW;
+    sqlite3_finalize(probe);
+
+    if (has_legacy) {
+        sqlite3_stmt *sel = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                               "SELECT project, summary, source_hash, created_at, updated_at "
+                               "FROM project_summaries;",
+                               CBM_NOT_FOUND, &sel, NULL) != SQLITE_OK) {
+            return CBM_STORE_ERR;
+        }
+        sqlite3_stmt *ins = NULL;
+        if (sqlite3_prepare_v2(adb,
+                               "INSERT OR IGNORE INTO project_summaries "
+                               "(project, summary, source_hash, created_at, updated_at) "
+                               "VALUES (?1, ?2, ?3, ?4, ?5);",
+                               CBM_NOT_FOUND, &ins, NULL) != SQLITE_OK) {
+            sqlite3_finalize(sel);
+            return CBM_STORE_ERR;
+        }
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+            for (int c = 0; c < ST_COL_5; c++) {
+                bind_text(ins, c + 1, (const char *)sqlite3_column_text(sel, c));
+            }
+            int irc = sqlite3_step(ins);
+            sqlite3_reset(ins);
+            sqlite3_clear_bindings(ins);
+            if (irc != SQLITE_DONE) {
+                sqlite3_finalize(sel);
+                sqlite3_finalize(ins);
+                return CBM_STORE_ERR;
+            }
+        }
+        sqlite3_finalize(sel);
+        sqlite3_finalize(ins);
+        if (rc != SQLITE_DONE) {
+            return CBM_STORE_ERR;
+        }
+    }
+
+    int mrc =
+        sqlite3_exec(adb, "INSERT OR IGNORE INTO adr_meta (key, value) VALUES ('migrated','1');",
+                     NULL, NULL, NULL);
+    return (mrc == SQLITE_OK) ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+/* Open (create) the read-write sidecar, configure locking, ensure the schema,
+ * run the one-time legacy migration, and cache the handle. NULL + error set on
+ * failure (fail closed). :memory: stores return the graph DB (no race there). */
+static sqlite3 *adr_conn_write(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return NULL;
+    }
+    if (!s->db_path) {
+        return s->db; /* :memory: store — ADRs stay in the graph DB */
+    }
+    if (s->adr_db) {
+        return s->adr_db;
+    }
+    char raw[4096];
+    char api[4096];
+    if (!adr_sidecar_path(s, raw, sizeof(raw), api, sizeof(api))) {
+        store_set_error(s, "adr sidecar path too long");
+        return NULL;
+    }
+    sqlite3 *adb = NULL;
+    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    if (sqlite3_open_v2(api, &adb, flags, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr sidecar open");
+        sqlite3_close_v2(adb);
+        return NULL;
+    }
+    adr_configure(adb);
+    if (adr_ensure_schema(adb) != CBM_STORE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr sidecar schema");
+        sqlite3_close_v2(adb);
+        return NULL;
+    }
+    if (adr_copy_legacy_once(s, adb) != CBM_STORE_OK) {
+        store_set_error(s, "adr sidecar legacy migration failed");
+        sqlite3_close_v2(adb);
+        return NULL;
+    }
+    s->adr_db = adb;
+    return s->adr_db;
+}
+
+int cbm_store_adr_migrate_once(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    if (!s->db_path) {
+        return CBM_STORE_OK; /* :memory: — ADRs already in the graph DB, nothing to move */
+    }
+    return adr_conn_write(s) ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
 int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content) {
+    sqlite3 *adb = adr_conn_write(s);
+    if (!adb) {
+        return CBM_STORE_ERR;
+    }
     char now[CBM_SZ_32];
     iso_now(now, sizeof(now));
 
@@ -9589,8 +9793,8 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
         "ON CONFLICT(project) DO UPDATE SET summary=excluded.summary, "
         "updated_at=excluded.updated_at";
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_store");
+    if (sqlite3_prepare_v2(adb, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_store");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
@@ -9602,22 +9806,17 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
     return (rc == SQLITE_DONE) ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
-int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
-    if (!s || !s->db || !project || !out) {
-        return CBM_STORE_ERR;
-    }
-    memset(out, 0, sizeof(*out));
-
-    /* ADR storage was added after the original graph schema. A readable
-     * legacy generation without project_summaries has no ADR to preserve; it
-     * is not a read failure and must remain replaceable by a full reindex. */
+/* Read one ADR row from an already-open connection into `out`. Returns
+ * CBM_STORE_OK / CBM_STORE_NOT_FOUND / CBM_STORE_ERR. Never writes. */
+static int adr_read_row(cbm_store_t *s, sqlite3 *adb, const char *project, cbm_adr_t *out) {
+    /* A readable legacy generation without project_summaries has no ADR; that is
+     * NOT_FOUND, not a read failure. */
     sqlite3_stmt *table_stmt = NULL;
     int rc = sqlite3_prepare_v2(
-        s->db,
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_summaries' LIMIT 1;",
+        adb, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_summaries' LIMIT 1;",
         CBM_NOT_FOUND, &table_stmt, NULL);
     if (rc != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get table probe");
+        store_set_error_sqlite_on(s, adb, "adr_get table probe");
         return CBM_STORE_ERR;
     }
     rc = sqlite3_step(table_stmt);
@@ -9626,26 +9825,26 @@ int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
         return CBM_STORE_NOT_FOUND;
     }
     if (rc != SQLITE_ROW || sqlite3_finalize(table_stmt) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get table probe step");
+        store_set_error_sqlite_on(s, adb, "adr_get table probe step");
         return CBM_STORE_ERR;
     }
 
     const char *sql = "SELECT project, summary, created_at, updated_at FROM project_summaries "
                       "WHERE project=?1";
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get");
+    if (sqlite3_prepare_v2(adb, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_get");
         return CBM_STORE_ERR;
     }
     if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get bind");
+        store_set_error_sqlite_on(s, adb, "adr_get bind");
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
         if (rc != SQLITE_DONE) {
-            store_set_error_sqlite(s, "adr_get step");
+            store_set_error_sqlite_on(s, adb, "adr_get step");
         }
         sqlite3_finalize(stmt);
         if (rc == SQLITE_DONE) {
@@ -9661,13 +9860,11 @@ int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
     rc = sqlite3_finalize(stmt);
     if (rc != SQLITE_OK) {
         cbm_store_adr_free(out);
-        store_set_error_sqlite(s, "adr_get finalize");
+        store_set_error_sqlite_on(s, adb, "adr_get finalize");
         return CBM_STORE_ERR;
     }
-
-    /* Every selected column is NOT NULL in the schema. A NULL here therefore
-     * means either allocation failure or corrupt data; never return a partial
-     * ADR that a full rebuild could silently drop during publication. */
+    /* Every selected column is NOT NULL in the schema. A NULL here means an
+     * allocation failure or corruption; never return a partial ADR. */
     if (!out->project || !out->content || !out->created_at || !out->updated_at) {
         cbm_store_adr_free(out);
         store_set_error(s, "adr_get: failed to copy complete ADR");
@@ -9676,16 +9873,53 @@ int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
     return CBM_STORE_OK;
 }
 
+int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
+    if (!s || !s->db || !project || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /* :memory: store, or a sidecar already open read-write: read it directly. */
+    if (!s->db_path) {
+        return adr_read_row(s, s->db, project, out);
+    }
+    if (s->adr_db) {
+        return adr_read_row(s, s->adr_db, project, out);
+    }
+
+    /* A read must never create the sidecar (a query-only cache may be
+     * read-only): open it READONLY if the file exists, otherwise read the
+     * legacy row from the graph DB without migrating. */
+    char raw[4096];
+    char api[4096];
+    if (adr_sidecar_path(s, raw, sizeof(raw), api, sizeof(api)) && cbm_file_exists(raw)) {
+        sqlite3 *ro = NULL;
+        if (sqlite3_open_v2(api, &ro, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+            store_set_error_sqlite_on(s, ro, "adr sidecar open (ro)");
+            sqlite3_close_v2(ro);
+            return CBM_STORE_ERR;
+        }
+        int rc = adr_read_row(s, ro, project, out);
+        sqlite3_close_v2(ro);
+        return rc;
+    }
+    return adr_read_row(s, s->db, project, out);
+}
+
 int cbm_store_adr_delete(cbm_store_t *s, const char *project) {
+    sqlite3 *adb = adr_conn_write(s);
+    if (!adb) {
+        return CBM_STORE_ERR;
+    }
     const char *sql = "DELETE FROM project_summaries WHERE project=?1";
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_delete");
+    if (sqlite3_prepare_v2(adb, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_delete");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
     int rc = sqlite3_step(stmt);
-    int changes = sqlite3_changes(s->db);
+    int changes = sqlite3_changes(adb);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
         return CBM_STORE_ERR;
@@ -9703,13 +9937,20 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
         return CBM_STORE_ERR;
     }
 
-    /* The read-modify-write below must be ONE transaction. Three writers
-     * replace this row wholesale — the indexing pipeline, the UI POST
-     * /api/adr handler, and manage_adr mode='update' — so an unguarded
-     * get/merge/store silently loses whichever of them commits between the
-     * read and the UPSERT. BEGIN IMMEDIATE takes the write lock up front, so a
-     * competing writer waits rather than being overwritten. */
-    if (cbm_store_begin(s) != CBM_STORE_OK) {
+    /* The read-modify-write below must be ONE transaction, and it runs on the
+     * ADR connection (the sidecar for a file store, the graph DB for :memory:)
+     * — the same connection cbm_store_adr_get/store use, so the write lock
+     * actually covers them. Two writers replace this row wholesale — the UI
+     * POST /api/adr handler and manage_adr mode='update' — so an unguarded
+     * get/merge/store silently loses whichever commits between the read and the
+     * UPSERT. BEGIN IMMEDIATE takes the write lock up front, so a competing
+     * writer waits rather than being overwritten. */
+    sqlite3 *adb = adr_conn_write(s);
+    if (!adb) {
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_exec(adb, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_update begin");
         return CBM_STORE_ERR;
     }
 
@@ -9717,7 +9958,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     cbm_adr_t existing;
     int rc = cbm_store_adr_get(s, project, &existing);
     if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, "no existing ADR to update");
         return rc;
     }
@@ -9732,7 +9973,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     if (cbm_adr_check_structure(existing.content, structure_err, (int)sizeof(structure_err)) !=
         CBM_STORE_OK) {
         cbm_store_adr_free(&existing);
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, structure_err);
         return CBM_STORE_ERR;
     }
@@ -9746,7 +9987,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     }
 
     if (!merged) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, "failed to splice ADR section");
         return CBM_STORE_ERR;
     }
@@ -9757,7 +9998,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
         snprintf(msg, sizeof(msg), "merged ADR exceeds %d chars (%d chars)", CBM_ADR_MAX_LENGTH,
                  (int)strlen(merged));
         free(merged);
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, msg);
         return CBM_STORE_ERR;
     }
@@ -9766,19 +10007,20 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     rc = cbm_store_adr_store(s, project, merged);
     free(merged);
     if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return rc;
     }
 
     /* Read back INSIDE the transaction so `out` is exactly what commits. */
     rc = cbm_store_adr_get(s, project, out);
     if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return rc;
     }
-    if (cbm_store_commit(s) != CBM_STORE_OK) {
+    if (sqlite3_exec(adb, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_update commit");
         cbm_store_adr_free(out);
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;

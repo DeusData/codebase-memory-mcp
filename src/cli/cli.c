@@ -7193,6 +7193,13 @@ static const char *get_cache_dir(const char *home_dir) {
     return cbm_resolve_cache_dir();
 }
 
+/* A per-project ADR sidecar ("<db>.adr.db") sits in the cache beside its index
+ * but is not itself an index — exclude it from listing/counting. */
+static bool cli_is_adr_sidecar(const char *name, size_t len) {
+    const size_t ext = sizeof(".adr.db") - 1;
+    return len >= ext && strcmp(name + len - ext, ".adr.db") == 0;
+}
+
 int cbm_list_indexes(const char *home_dir) {
     const char *cache_dir = get_cache_dir(home_dir);
     if (!cache_dir) {
@@ -7208,7 +7215,8 @@ int cbm_list_indexes(const char *home_dir) {
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
         size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0 &&
+            !cli_is_adr_sidecar(ent->name, len)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
         }
@@ -10437,7 +10445,8 @@ static int count_db_indexes(const char *home) {
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
         size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0 &&
+            !cli_is_adr_sidecar(ent->name, len)) {
             count++;
         }
     }

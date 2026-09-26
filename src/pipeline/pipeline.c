@@ -75,7 +75,6 @@ static atomic_int g_pipeline_busy = 0;
 static atomic_bool g_persist_test_fail_after_stage_dump = false;
 static atomic_bool g_persist_test_cancel_after_predump = false;
 static atomic_bool g_persist_test_cancel_after_destination_prepare = false;
-static atomic_bool g_persist_test_fail_adr_capture = false;
 static cbm_pipeline_test_hook_fn g_persist_test_before_final_manifest = NULL;
 static void *g_persist_test_before_final_manifest_userdata = NULL;
 static cbm_pipeline_test_hook_fn g_persist_test_after_stage_created = NULL;
@@ -91,10 +90,6 @@ void cbm_pipeline_incremental_test_cancel_after_predump_once(void) {
 
 void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void) {
     atomic_store(&g_persist_test_cancel_after_destination_prepare, true);
-}
-
-void cbm_pipeline_incremental_test_fail_adr_capture_once(void) {
-    atomic_store(&g_persist_test_fail_adr_capture, true);
 }
 
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
@@ -152,7 +147,6 @@ void cbm_pipeline_persist_test_reset_faults(void) {
     atomic_store(&g_persist_test_fail_after_stage_dump, false);
     atomic_store(&g_persist_test_cancel_after_predump, false);
     atomic_store(&g_persist_test_cancel_after_destination_prepare, false);
-    atomic_store(&g_persist_test_fail_adr_capture, false);
     g_persist_test_before_final_manifest = NULL;
     g_persist_test_before_final_manifest_userdata = NULL;
     g_persist_test_after_stage_created = NULL;
@@ -238,10 +232,6 @@ struct cbm_pipeline {
      * "invalid_existing_db" (#1864). */
     bool final_existed;
     bool existing_generation;
-
-    /* ADR (project_summaries) captured before a full-reindex DB delete, so it
-     * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
-    char *saved_adr;
 
     /* Per-file LSP surfaces serialized at the collect_all_defs seam (the only
      * moment the result cache is alive), persisted by dump_and_persist_hashes
@@ -444,9 +434,6 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
     free(p->branch_qn);
-    free(p->saved_adr); /* freed here too: error paths can exit before the
-                         * restore in dump_and_persist_hashes runs. Issue #516. */
-    p->saved_adr = NULL;
     cbm_store_free_lsp_surfaces(p->surface_rows, p->surface_row_count);
     p->surface_rows = NULL;
     p->surface_row_count = 0;
@@ -1716,38 +1703,35 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
-static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    if (atomic_exchange(&g_persist_test_fail_adr_capture, false)) {
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+static size_t stage_root_length(const char *path);
+
+/* Move a legacy ADR row (pre-sidecar, still in the graph DB's project_summaries)
+ * into the "<db>.adr.db" sidecar BEFORE a reindex unlinks the old generation —
+ * otherwise the row is lost on an upgrade whose first action is a full/format
+ * reindex. Read-only on the graph DB (migration writes only the sidecar, on its
+ * own connection). One-time via the sidecar's marker; a no-op when there is no
+ * legacy row. Returns true on success (safe to delete), false to preserve. */
+static bool adr_migrate_before_delete(const char *db_path) {
+    /* `db_path` in routing is a staging copy; the live generation (and the
+     * sidecar the reader looks for) is keyed to the FINAL path — the staging
+     * suffix stripped. Migrate against that, so the ADR lands in
+     * "<final>.adr.db", not a discarded stage's sidecar. */
+    size_t root_len = stage_root_length(db_path);
+    char final_path[4096];
+    if (root_len >= sizeof(final_path)) {
+        return false;
     }
-#endif
-    cbm_store_t *adr_store = cbm_store_open_path_query(db_path);
-    if (!adr_store) {
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    memcpy(final_path, db_path, root_len);
+    final_path[root_len] = '\0';
+    /* The live final DB must exist to carry a legacy ADR forward; if it does
+     * not (a first index), there is nothing to migrate — succeed. */
+    cbm_store_t *mig = cbm_store_open_path_query(final_path);
+    if (!mig) {
+        return true;
     }
-    cbm_adr_t existing = {0};
-    int adr_rc = cbm_store_adr_get(adr_store, p->project_name, &existing);
-    if (adr_rc == CBM_STORE_NOT_FOUND) {
-        cbm_store_close(adr_store);
-        free(p->saved_adr);
-        p->saved_adr = NULL;
-        return 0;
-    }
-    if (adr_rc != CBM_STORE_OK || !existing.content) {
-        cbm_store_adr_free(&existing);
-        cbm_store_close(adr_store);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
-    }
-    char *saved = strdup(existing.content);
-    cbm_store_adr_free(&existing);
-    cbm_store_close(adr_store);
-    if (!saved) {
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
-    }
-    free(p->saved_adr);
-    p->saved_adr = saved;
-    return 0;
+    int rc = cbm_store_adr_migrate_once(mig);
+    cbm_store_close(mig);
+    return rc == CBM_STORE_OK;
 }
 
 /* Route an existing generation. Full rebuilds never delete the live DB here:
@@ -1796,11 +1780,19 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_log_info("pipeline.route", "path", "format_change_reindex", "stored_format",
                      itoa_buf(fmt));
         p->format_migration = true;
-        int adr_rc = capture_existing_adr(p, db_path);
+        /* Carry a legacy ADR into the sidecar before deleting the old graph DB;
+         * preserve and abort if that fails, so the decision record is never lost
+         * to a rebuild. The sidecar itself is untouched by cbm_remove_db_sidecars
+         * (it strips only -wal/-shm/-journal). */
+        if (!adr_migrate_before_delete(db_path)) {
+            cbm_log_warn("pipeline.route", "reason", "adr_migrate_failed");
+            free(db_path);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
         (void)cbm_unlink(db_path);
         (void)cbm_remove_db_sidecars(db_path);
         free(db_path);
-        return adr_rc != 0 ? adr_rc : CBM_PIPELINE_FORCE_FULL_REINDEX;
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
     }
 
     cbm_log_info("pipeline.route", "path", "incremental_manifest");
@@ -1813,9 +1805,13 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
      * no-op and successful-incremental routes -- the pipeline reports success
      * while every later reader finds no store. */
     if (rc == CBM_PIPELINE_FORCE_FULL_REINDEX) {
-        int adr_rc = capture_existing_adr(p, db_path);
-        if (adr_rc != 0) {
-            rc = adr_rc;
+        /* Carry a legacy ADR into the sidecar before deleting the old graph DB;
+         * preserve and abort if that fails. The sidecar survives the delete
+         * (cbm_remove_db_sidecars strips only -wal/-shm/-journal). */
+        if (!adr_migrate_before_delete(db_path)) {
+            cbm_log_warn("pipeline.route", "reason", "adr_migrate_failed");
+            free(db_path);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
         (void)cbm_unlink(db_path);
         (void)cbm_remove_db_sidecars(db_path);
@@ -2273,10 +2269,8 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
              cbm_store_upsert_lsp_surface_batch(store, generation->surface_rows,
                                                 generation->surface_row_count) == CBM_STORE_OK;
     }
-    if (ok && generation->adr_content) {
-        ok = cbm_store_adr_store(store, generation->project, generation->adr_content) ==
-             CBM_STORE_OK;
-    }
+    /* ADRs are NOT written here: they live in the "<db>.adr.db" sidecar, which
+     * this rebuild never touches, so there is nothing to re-apply. */
 
     if (ok) {
         ok = cbm_store_set_format_version(store, CBM_INDEX_FORMAT_VERSION) == CBM_STORE_OK;
@@ -2518,7 +2512,6 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         .cancelled = p->cancelled,
         .manifest = manifest,
         .manifest_count = manifest_count,
-        .adr_content = p->saved_adr,
         .coverage = cov,
         .coverage_count = cov_count,
         .coverage_meta =
@@ -2561,8 +2554,6 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         cbm_log_warn("index.ignored_capped", "stored", itoa_buf(p->ignored_count), "total",
                      itoa_buf(p->ignored_total));
     }
-    free(p->saved_adr);
-    p->saved_adr = NULL;
 
     free(db_path);
     return 0;

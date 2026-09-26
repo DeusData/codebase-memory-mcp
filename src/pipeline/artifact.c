@@ -888,13 +888,49 @@ static void artifact_snapshot_tmp_close(artifact_snapshot_tmp_t *tmp) {
     tmp->dir[0] = '\0';
 }
 
+/* Write the ADR into the snapshot's project_summaries so the exported artifact
+ * carries the team's decision record (ADRs now live in the "<db>.adr.db"
+ * sidecar, which the VACUUM INTO snapshot does not include). Best-effort: a
+ * failure just means this artifact omits the ADR, exactly as before the sidecar
+ * existed. */
+static void snapshot_inject_adr(const char *snapshot_path, const cbm_adr_t *adr) {
+    if (!adr || !adr->project || !adr->content) {
+        return;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(snapshot_path, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return;
+    }
+    sqlite3_exec(db,
+                 "CREATE TABLE IF NOT EXISTS project_summaries ("
+                 "  project TEXT PRIMARY KEY, summary TEXT NOT NULL, source_hash TEXT NOT NULL,"
+                 "  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
+                 NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "INSERT OR REPLACE INTO project_summaries "
+                           "(project, summary, source_hash, created_at, updated_at) "
+                           "VALUES (?1, ?2, '', ?3, ?4);",
+                           -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, adr->project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, adr->content, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, adr->created_at ? adr->created_at : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, adr->updated_at ? adr->updated_at : "", -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+}
+
 /* Prepare a stripped DB copy for best-quality export.
- * VACUUM INTO → (optionally) drop indexes → VACUUM. Returns malloc'd buffer
- * or NULL. VACUUM INTO runs on BOTH quality levels: it is the consistent
- * snapshot — the store runs in WAL mode, so raw main-file bytes miss
- * committed transactions still in the -wal and can be mid-checkpoint torn
- * (#895). Only the index-stripping is BEST-only. */
-static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes) {
+ * VACUUM INTO → (optionally) drop indexes → VACUUM → (optionally) inject the
+ * ADR. Returns malloc'd buffer or NULL. VACUUM INTO runs on BOTH quality
+ * levels: it is the consistent snapshot — the store runs in WAL mode, so raw
+ * main-file bytes miss committed transactions still in the -wal and can be
+ * mid-checkpoint torn (#895). Only the index-stripping is BEST-only. */
+static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes,
+                                 const cbm_adr_t *adr) {
     artifact_snapshot_tmp_t tmp;
     if (!artifact_snapshot_tmp_open(&tmp)) {
         artifact_export_fail("prepare_snapshot_dir", cbm_tmpdir(), "private_tmpdir_failed", errno);
@@ -938,6 +974,11 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
             sqlite3_close(tmp_db);
         }
     }
+
+    /* Carry the ADR (from the sidecar) into the snapshot so the exported
+     * artifact ships the team's decision record. After the strip/VACUUM, so the
+     * row is not dropped. */
+    snapshot_inject_adr(tmp_path, adr);
 
     /* Reopened by path rather than held on a descriptor across VACUUM INTO,
      * because sqlite owns the create. The private directory is what makes that
@@ -984,15 +1025,28 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     char *db_data = NULL;
     int compression_level = ART_ZSTD_FAST;
 
+    /* Fetch the ADR from the sidecar (read-only; does not create it) so the
+     * snapshot can carry it — the team-shared artifact used to include the ADR
+     * via project_summaries, and the sidecar must not silently break that. */
+    cbm_adr_t adr = {0};
+    bool have_adr = false;
+    cbm_store_t *adr_src = cbm_store_open_path_query(db_path);
+    if (adr_src) {
+        have_adr = cbm_store_adr_get(adr_src, project_name, &adr) == CBM_STORE_OK;
+        cbm_store_close(adr_src);
+    }
+    const cbm_adr_t *adr_arg = have_adr ? &adr : NULL;
+
     if (quality == CBM_ARTIFACT_BEST) {
         compression_level = ART_ZSTD_BEST;
-        db_data = prepare_snapshot_db(db_path, &db_size, true);
+        db_data = prepare_snapshot_db(db_path, &db_size, true, adr_arg);
     } else {
         /* FAST keeps zstd-3 and its indexes, but still snapshots via
          * VACUUM INTO: the raw main-file bytes of a live WAL store are a
          * torn copy (#895). */
-        db_data = prepare_snapshot_db(db_path, &db_size, false);
+        db_data = prepare_snapshot_db(db_path, &db_size, false, adr_arg);
     }
+    cbm_store_adr_free(&adr);
 
     if (!db_data || db_size == 0) {
         free(db_data);
@@ -1201,6 +1255,16 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
     snprintf(shm, sizeof(shm), "%s-shm", tmp_path);
     cbm_unlink(wal);
     cbm_unlink(shm);
+
+    /* Restore the imported ADR (carried in the graph DB's project_summaries)
+     * into the per-project sidecar, so a teammate's first index starts with the
+     * team's decisions. migrate-once uses INSERT OR IGNORE, so it never clobbers
+     * an ADR already present locally. Best-effort. */
+    cbm_store_t *restore = cbm_store_open_path_existing(cache_db_path);
+    if (restore) {
+        (void)cbm_store_adr_migrate_once(restore);
+        cbm_store_close(restore);
+    }
 
     cbm_log_info("artifact.import", "db", cache_db_path, "size_mb",
                  itoa_buf((int)((size_t)dlen / ART_BYTES_PER_MB)));
