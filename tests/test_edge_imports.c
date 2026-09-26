@@ -706,6 +706,85 @@ TEST(ei_cpp_header_include_targets_header_file) {
     PASS();
 }
 
+/* Scala packages do not have to mirror the repository path. Concrete imports
+ * must resolve to the symbol declared in the source package, while package
+ * wildcards may only resolve inside that exact package. External wildcards
+ * must fail closed instead of selecting an unrelated same-name node. */
+TEST(ei_scala_package_imports_ignore_physical_layout) {
+    static const EILangFile f[] = {
+        {"modules/model/src/odd/layout/Target.scala",
+         "package com.example.model\nobject Target { def build(): Int = 1 }\n"},
+        {"modules/model/src/another/layout/Aux.scala",
+         "package com.example.model\nobject Aux { def value: Int = 2 }\n"},
+        {"modules/decoy/src/App.scala", "package unrelated\nobject App\n"},
+        {"modules/client/src/Consumer.scala",
+         "package com.example.client\n"
+         "import com.example.model.Target\n"
+         "import com.example.model._\n"
+         "import outside.library._\n"
+         "object Consumer { def run(): Int = Target.build() }\n"}};
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 4);
+    ASSERT_NOT_NULL(store);
+    int64_t source_id =
+        ei_node_id_for_file_label(store, lp.project, "modules/client/src/Consumer.scala", "File");
+    ASSERT_GT(source_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, source_id, "IMPORTS", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 2);
+
+    bool saw_target_symbol = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        ASSERT_NOT_NULL(target->file_path);
+        ASSERT_TRUE(strstr(target->file_path, "modules/model/src/") == target->file_path);
+        if (target->name && strcmp(target->name, "Target") == 0 &&
+            strstr(target->file_path, "Target.scala") != NULL) {
+            saw_target_symbol = true;
+        }
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ASSERT_TRUE(saw_target_symbol);
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
+/* Scala package clauses feed only the Scala resolver. A Java import whose
+ * package is external must not bind to a Scala file that merely declares a
+ * shared prefix of that package. */
+TEST(ei_java_import_ignores_scala_package_prefix) {
+    static const EILangFile f[] = {
+        {"core/src/main/scala/com/acme/package.scala",
+         "package com.acme\npackage object core { val marker: Int = 1 }\n"},
+        {"client/src/main/java/com/acme/client/Consumer.java",
+         "package com.acme.client;\n"
+         "import com.acme.util.Future;\n"
+         "public class Consumer { Future pending; }\n"}};
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    int64_t source_id = ei_node_id_for_file_label(
+        store, lp.project, "client/src/main/java/com/acme/client/Consumer.java", "File");
+    ASSERT_GT(source_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, source_id, "IMPORTS", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 0);
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * RED REPRODUCTION — Rust
  *
@@ -1172,6 +1251,10 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
+
+    /* ── GREEN GUARDS — Scala package-aware resolution ── */
+    RUN_TEST(ei_scala_package_imports_ignore_physical_layout);
+    RUN_TEST(ei_java_import_ignores_scala_package_prefix);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */
     RUN_TEST(ei_rust_mod_plus_use);
