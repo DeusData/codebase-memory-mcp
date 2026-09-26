@@ -8069,29 +8069,10 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     return NULL;
 }
 
-/* Path rules also cover legacy nodes with missing or false is_test metadata. */
+/* Same rule as TESTS edges and importance, plus the node's is_test property. */
 static bool trace_node_is_test(const cbm_node_t *node) {
-    const char *base = node->file_path;
-    if (base) {
-        for (const char *end = base; *end; end++) {
-            if (*end != '/' && *end != '\\') {
-                continue;
-            }
-            size_t length = (size_t)(end - base);
-            if ((length == SLEN("test") && strncmp(base, "test", length) == 0) ||
-                (length == SLEN("tests") && strncmp(base, "tests", length) == 0) ||
-                (length == SLEN("spec") && strncmp(base, "spec", length) == 0) ||
-                (length == SLEN("__tests__") && strncmp(base, "__tests__", length) == 0)) {
-                return true;
-            }
-            base = end + SKIP_ONE;
-        }
-        if (strncmp(base, "test_", SLEN("test_")) == 0 || strstr(base, "_test.") ||
-            strstr(base, ".test.") || strstr(base, ".spec.")) {
-            return true;
-        }
-    }
-    return node->properties_json && cbm_mcp_get_bool_arg(node->properties_json, "is_test");
+    return cbm_is_test_path(node->file_path) ||
+           (node->properties_json && cbm_mcp_get_bool_arg(node->properties_json, "is_test"));
 }
 
 /* Filtering belongs before page-window calculation: hidden test rows must not

@@ -395,4 +395,12 @@ typedef struct {
  * Returns count written to out (capped at max_out). */
 int cbm_parse_hunks(const char *output, cbm_changed_hunk_t *out, int max_out);
 
+/* ── Test-path classifier (pass_tests.c) ──────────────────────────
+ * Public (unlike the rest of pipeline_internal.h) because trace_path
+ * (src/mcp/mcp.c) hides and marks test nodes with the same rule that TESTS
+ * edges and importance use. */
+
+/* Check if a file path looks like a test file (language-agnostic). */
+bool cbm_is_test_path(const char *path);
+
 #endif /* CBM_PIPELINE_H */

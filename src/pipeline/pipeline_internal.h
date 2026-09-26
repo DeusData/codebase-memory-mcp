@@ -285,9 +285,6 @@ bool cbm_import_symbol_fallback_allowed(CBMLanguage lang);
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
 
-/* Check if a file path looks like a test file (language-agnostic). */
-bool cbm_is_test_path(const char *path);
-
 /* Check if a function name looks like a test function (language-agnostic). */
 bool cbm_is_test_func_name(const char *name);
 
