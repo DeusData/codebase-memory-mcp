@@ -384,6 +384,13 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
 echo "=== Step 5f: worker request-scope regression ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_session_scope.sh"
 
+# Step 5g: CBM_IN_PROCESS (#2072) is a read-only, daemon-free stdio session.
+# Next to a live private daemon it must write no shared state: no rendezvous,
+# cohort or lifetime lock, and no byte of the daemon's index. Reuses the prod
+# binary built in Step 5.
+echo "=== Step 5g: CBM_IN_PROCESS writes no shared state (#2072) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_in_process_mcp.sh"
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).
