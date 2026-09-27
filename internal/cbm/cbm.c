@@ -2115,8 +2115,8 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
  * is parsed with its markup blanked (#2000); the rewrite keeps the length and
  * every line break, so offsets and line numbers still refer to the file on
  * disk. Every other language parses the file as it is. */
-static const char *cbm_parse_source(CBMArena *a, CBMLanguage language, const char *source,
-                                    int source_len) {
+static const char *extract_parse_bytes(CBMArena *a, CBMLanguage language, const char *source,
+                                       int source_len) {
     if (language == CBM_LANG_PHP) {
         return cbm_php_mask_inline_html(a, source, source_len);
     }
@@ -2203,7 +2203,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return result;
     }
 
-    source = cbm_parse_source(a, language, source, source_len);
+    source = extract_parse_bytes(a, language, source, source_len);
 
     // Skip pathologically nested Perl before tree-sitter's recursive GLR stack
     // merge overflows a small stack during the parse (see

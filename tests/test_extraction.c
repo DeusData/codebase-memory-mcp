@@ -886,6 +886,56 @@ TEST(php_inline_html_close_tag_in_literals_issue2000) {
     PASS();
 }
 
+/* Markup is blanked, never parsed: code-shaped text outside the PHP tags must
+ * not produce definitions or calls, wherever it sits. */
+TEST(php_inline_html_markup_never_reaches_graph_issue2000) {
+    CBMFileResult *r = extract("<p>function before() { return leakBefore(); }</p>\n"
+                               "<?php\n"
+                               "function real() { return 1; }\n"
+                               "?>\n"
+                               "<p>function fake() { return leak(); }</p>\n"
+                               "<script>function jsFake() { leakScript(); }</script>\n"
+                               "<?xml version=\"1.0\"?><x>function xmlFake() { leakXml(); }</x>\n"
+                               "<?php\n"
+                               "function after() { return real(); }\n"
+                               "?>\n"
+                               "<p>class Tail { function tailFake() { leakTail(); } }</p>\n",
+                               CBM_LANG_PHP, "t", "markup.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "real"));
+    ASSERT(has_def(r, "Function", "after"));
+    ASSERT(has_call(r, "real"));
+    ASSERT_FALSE(has_def_any(r, "before"));
+    ASSERT_FALSE(has_def_any(r, "fake"));
+    ASSERT_FALSE(has_def_any(r, "jsFake"));
+    ASSERT_FALSE(has_def_any(r, "xmlFake"));
+    ASSERT_FALSE(has_def_any(r, "Tail"));
+    ASSERT_FALSE(has_def_any(r, "tailFake"));
+    ASSERT_FALSE(has_call(r, "leak"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The mask hands back the caller's buffer, uncopied, when nothing needs
+ * rewriting, and a same-length rewrite otherwise. */
+TEST(php_inline_html_mask_copies_only_on_write_issue2000) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *plain = "<?php\nfunction a() { return 1; }\n";
+    const char *quoted = "<?php\n$s = '?>';\n/* ?> */\n$h = <<<EOT\n?>\nEOT;\n";
+    const char *mixed = "<?php\nfunction a() {}\n?>\n<b>x</b>\n";
+    ASSERT(cbm_php_mask_inline_html(&arena, plain, (int)strlen(plain)) == plain);
+    ASSERT(cbm_php_mask_inline_html(&arena, quoted, (int)strlen(quoted)) == quoted);
+    const char *masked = cbm_php_mask_inline_html(&arena, mixed, (int)strlen(mixed));
+    ASSERT(masked != mixed);
+    ASSERT_EQ((int)strlen(masked), (int)strlen(mixed));
+    ASSERT_STR_EQ(masked, "<?php\nfunction a() {}\n; \n        \n");
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* A trailing `?>` (common at the end of older class files) is not a partial
  * parse, and CRLF line endings keep their line numbers. */
 TEST(php_inline_html_trailing_close_tag_crlf_issue2000) {
@@ -8910,6 +8960,8 @@ SUITE(extraction) {
     RUN_TEST(php_inline_html_tail_reaches_graph_issue2000);
     RUN_TEST(php_inline_html_template_shapes_issue2000);
     RUN_TEST(php_inline_html_close_tag_in_literals_issue2000);
+    RUN_TEST(php_inline_html_markup_never_reaches_graph_issue2000);
+    RUN_TEST(php_inline_html_mask_copies_only_on_write_issue2000);
     RUN_TEST(php_inline_html_trailing_close_tag_crlf_issue2000);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);

@@ -1401,15 +1401,7 @@ TEST(pipeline_php_inline_html_calls_resolve_issue2000) {
                           "function renderCard($item) { return formatPrice($item['cents']); }\n"},
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/%s", g_tmpdir, files[i].name);
-        FILE *f = fopen(path, "w");
-        if (!f) {
-            teardown_test_repo();
-            FAIL("failed to write php fixture");
-        }
-        fputs(files[i].body, f);
-        fclose(f);
+        write_temp_file(g_tmpdir, files[i].name, files[i].body);
     }
 
     char db[512];
