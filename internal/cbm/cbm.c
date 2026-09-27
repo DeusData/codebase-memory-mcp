@@ -2111,6 +2111,18 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
     return r;
 }
 
+/* The bytes the grammar parses. PHP that leaves PHP mode (`?> markup <?php`)
+ * is parsed with its markup blanked (#2000); the rewrite keeps the length and
+ * every line break, so offsets and line numbers still refer to the file on
+ * disk. Every other language parses the file as it is. */
+static const char *cbm_parse_source(CBMArena *a, CBMLanguage language, const char *source,
+                                    int source_len) {
+    if (language == CBM_LANG_PHP) {
+        return cbm_php_mask_inline_html(a, source, source_len);
+    }
+    return source;
+}
+
 /* Initial block for the per-file traversal scratch arena, chosen by measuring
  * arena_grow on a 14k-file TypeScript tree: it fires on one file in 12,000 at
  * both this size and at 1 MB, and on most files at 256 KB, where the two
@@ -2190,6 +2202,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         cbm_index_mark_done(rel_path);
         return result;
     }
+
+    source = cbm_parse_source(a, language, source, source_len);
 
     // Skip pathologically nested Perl before tree-sitter's recursive GLR stack
     // merge overflows a small stack during the parse (see

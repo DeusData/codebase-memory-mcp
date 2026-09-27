@@ -897,6 +897,10 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // per ref()/source() call. No-op unless the file parses as SQL and actually
 // contains a dbt builtin call. Defined in extract_dbt.c.
 void cbm_extract_dbt(CBMExtractCtx *ctx);
+// PHP source with its inline-HTML regions blanked so the php_only grammar can
+// parse past `?>` (#2000). Same length and line breaks as the input; returns
+// `source` itself when nothing needs rewriting. Defined in php_inline_html.c.
+const char *cbm_php_mask_inline_html(CBMArena *arena, const char *source, int source_len);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
