@@ -12,6 +12,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
+#include "lsp/ts_lsp.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -400,31 +401,22 @@ TEST(cpp_large_templated_header_no_crash_issue424) {
  * java_resolve_calls_in_node frames (bind_lambda_args), bitcoin → SIGSEGV
  * under deep c_resolve_calls_in_node frames (cbm_type_substitute via
  * c_adl_resolve), microsoft/TypeScript → SIGBUS under an unbounded
- * lookup_member_type cycle. The walks now carry depth guards. On POSIX,
- * these reproductions fork a child so a regression cannot kill the test
- * runner; Windows runs them in-process and lacks the timeout watchdog. The
- * TS cyclic-type shape is only reachable with a real cross-file registry,
- * so that one is verified at the real-repo tier; the synthetic cyclic
- * fixture here guards the in-file path.
+ * lookup_member_type cycle. The walks now carry depth guards. Non-TS crash
+ * fixtures fork on POSIX and run in-process on Windows. TypeScript cycle work
+ * runs in-process on both platforms to assert test-only lookup counters.
+ * The synthetic single-file fixtures here guard the local inheritance path;
+ * real-repo scale extraction is checked separately.
  * ═══════════════════════════════════════════════════════════════════ */
 
 #if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
-
-static void so_extract_alarm_exit(int sig) {
-    (void)sig;
-    _exit(124);
-}
 #endif
 
-/* Run cbm_extract_file in a forked child; true if the child died by signal,
- * timed out, or exited non-zero. On Windows run in-process (a genuine crash
- * there aborts the runner — hard, visible failure). */
-static bool so_extract_crashes_with_timeout(const char *content, CBMLanguage lang,
-                                            const char *relpath, unsigned timeout_seconds) {
+/* Run cbm_extract_file in a forked child; true if the child died by signal or
+ * exited non-zero. On Windows run in-process (a genuine crash aborts the runner). */
+static bool so_extract_crashes(const char *content, CBMLanguage lang, const char *relpath) {
 #if defined(_WIN32)
-    (void)timeout_seconds;
     CBMFileResult *r =
         cbm_extract_file(content, (int)strlen(content), lang, "so", relpath, 0, NULL, NULL);
     if (r) {
@@ -438,13 +430,8 @@ static bool so_extract_crashes_with_timeout(const char *content, CBMLanguage lan
         return true;
     }
     if (pid == 0) {
-        if (timeout_seconds > 0) {
-            signal(SIGALRM, so_extract_alarm_exit);
-            alarm(timeout_seconds);
-        }
         CBMFileResult *r =
             cbm_extract_file(content, (int)strlen(content), lang, "so", relpath, 0, NULL, NULL);
-        alarm(0);
         if (r) {
             cbm_free_result(r);
         }
@@ -464,10 +451,6 @@ static bool so_extract_crashes_with_timeout(const char *content, CBMLanguage lan
     }
     return WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
 #endif
-}
-
-static bool so_extract_crashes(const char *content, CBMLanguage lang, const char *relpath) {
-    return so_extract_crashes_with_timeout(content, lang, relpath, 0);
 }
 
 #if !defined(_WIN32)
@@ -698,36 +681,36 @@ TEST(lsp_ts_cyclic_types_no_crash) {
                       "interface D extends C { d: number; }\n"
                       "declare const a: A;\n"
                       "declare const c: C;\n"
-#ifdef _WIN32
-                      /* Preserve baseline property-cycle coverage where the
-                       * POSIX child watchdog is unavailable. */
-                      "function useIt(p: C) { return p.missing_member; }\n"
-#else
-                      /* A missing method forces inherited-method lookup through
-                       * the cyclic interface graph instead of returning early. */
+                      /* Both lookup paths must traverse the inheritance cycle. */
                       "function useIt(p: C) { p.missing(); return p.missing_member; }\n"
-#endif
                       "const y = c.also_missing;\n";
-#ifdef _WIN32
-    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_TYPESCRIPT, "cycle.ts"));
-#else
-    ASSERT_FALSE(so_extract_crashes_with_timeout(src, CBM_LANG_TYPESCRIPT, "cycle.ts", 30));
-#endif
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "cycle.ts");
+    ASSERT_NOT_NULL(r);
+    /* C and D each have one parent: <= 64 admitted visits per type, plus
+     * one attempted (possibly rejected) parent visit per admitted visit. */
+    ASSERT_GT(cbm_ts_lsp_test_max_member_lookup_steps(), 0);
+    ASSERT_GT(cbm_ts_lsp_test_max_method_lookup_steps(), 0);
+    ASSERT_LTE(cbm_ts_lsp_test_max_member_lookup_steps(), 2 * 64 * 2);
+    ASSERT_LTE(cbm_ts_lsp_test_max_method_lookup_steps(), 2 * 64 * 2);
+    cbm_free_result(r);
     PASS();
 }
 
 TEST(lsp_ts_branching_cycle_has_bounded_work) {
-#ifdef _WIN32
-    SKIP_PLATFORM("POSIX child watchdog required for bounded-work timing");
-#else
     const char *src = "interface A extends B, C {}\n"
                       "interface B extends A, C {}\n"
                       "interface C extends A, B {}\n"
                       "function useIt(value: A) { value.missing(); return value.missing_member; }\n";
-    ASSERT_FALSE(
-        so_extract_crashes_with_timeout(src, CBM_LANG_TYPESCRIPT, "branching-cycle.ts", 30));
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "branching-cycle.ts");
+    ASSERT_NOT_NULL(r);
+    /* A, B, C each have two parents: <= 64 admitted visits per type, plus
+     * two attempted (possibly rejected) parent visits per admitted visit. */
+    ASSERT_GT(cbm_ts_lsp_test_max_member_lookup_steps(), 0);
+    ASSERT_GT(cbm_ts_lsp_test_max_method_lookup_steps(), 0);
+    ASSERT_LTE(cbm_ts_lsp_test_max_member_lookup_steps(), 3 * 64 * 3);
+    ASSERT_LTE(cbm_ts_lsp_test_max_method_lookup_steps(), 3 * 64 * 3);
+    cbm_free_result(r);
     PASS();
-#endif
 }
 
 TEST(lsp_ts_shallower_revisit_preserves_inherited_method) {

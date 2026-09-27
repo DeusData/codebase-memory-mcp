@@ -72,6 +72,10 @@ typedef struct {
 // for the calling thread, valid after a cbm_run_ts_lsp on the same thread.
 long cbm_ts_lsp_test_budget_remaining(void);
 bool cbm_ts_lsp_test_budget_warned(void);
+// Maximum recursive calls in one member/method lookup during the last TS LSP run,
+// including attempts rejected by the depth or visited-type guard.
+int cbm_ts_lsp_test_max_member_lookup_steps(void);
+int cbm_ts_lsp_test_max_method_lookup_steps(void);
 #endif
 
 // --- Initialization ---

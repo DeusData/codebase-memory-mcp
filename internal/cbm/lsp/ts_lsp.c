@@ -58,6 +58,10 @@ void cbm_ts_full_registry_builds_reset(void) {
  * constructs it does not model. -1 = unlimited (no entry point armed it). */
 static _Thread_local long g_ts_type_budget = -1;
 static _Thread_local bool g_ts_type_budget_warned;
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int g_ts_max_member_lookup_steps;
+static _Thread_local int g_ts_max_method_lookup_steps;
+#endif
 
 static void ts_type_budget_reset(size_t source_len) {
     const char *e = getenv("CBM_TS_TYPE_BUDGET");
@@ -169,6 +173,12 @@ long cbm_ts_lsp_test_budget_remaining(void) {
 bool cbm_ts_lsp_test_budget_warned(void) {
     return g_ts_type_budget_warned;
 }
+int cbm_ts_lsp_test_max_member_lookup_steps(void) {
+    return g_ts_max_member_lookup_steps;
+}
+int cbm_ts_lsp_test_max_method_lookup_steps(void) {
+    return g_ts_max_method_lookup_steps;
+}
 #endif
 
 #define TS_LSP_MAX_EVAL_DEPTH 64
@@ -189,10 +199,10 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name);
 static const CBMType *lookup_member_type(TSLSPContext *ctx, const CBMType *recv, const char *name);
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name);
-typedef struct TSMethodLookupState TSMethodLookupState;
+typedef struct TSLookupState TSLookupState;
 static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMType *recv,
                                                  const char *method_name, int depth,
-                                                 TSMethodLookupState *state);
+                                                 TSLookupState *state);
 static char *node_text(TSLSPContext *ctx, TSNode node);
 
 // Collect a node's children into an arena array via a single O(n) cursor pass.
@@ -1564,36 +1574,76 @@ static const char *builtin_wrapper_class(const char *builtin_name) {
 
 // Look up a property `name` on a receiver type. Returns the property type or UNKNOWN.
 #define TS_LSP_MAX_MEMBER_DEPTH 64
-
-enum {
-    TS_LSP_MAX_MEMBER_LOOKUP_WORK = 4096,
-    TS_LSP_MAX_MEMBER_VISITED_TYPES = 1024,
-};
+#define TS_LSP_INLINE_VISITED_TYPES 16
 
 typedef struct {
-    int remaining;
+    const char *qn;
+    int depth;
+} TSVisitedType;
+
+struct TSLookupState {
+    TSVisitedType inline_visited[TS_LSP_INLINE_VISITED_TYPES];
+    TSVisitedType *visited;
     int visited_count;
-    const char *visited_qns[TS_LSP_MAX_MEMBER_VISITED_TYPES];
-    int visited_depths[TS_LSP_MAX_MEMBER_VISITED_TYPES];
-} TSMemberLookupState;
+    int visited_capacity;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int steps;
+#endif
+};
 
-static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *recv,
-                                            const char *name, int depth,
-                                            TSMemberLookupState *state);
-
-/* Bound both structural depth and total traversal work. Named-type de-duplication
- * prevents branching inheritance cycles from revisiting the same graph
- * exponentially; exhaustion degrades to UNKNOWN, as unsupported members do. */
-static const CBMType *lookup_member_type(TSLSPContext *ctx, const CBMType *recv, const char *name) {
-    TSMemberLookupState state = {.remaining = TS_LSP_MAX_MEMBER_LOOKUP_WORK};
-    return lookup_member_type_at(ctx, recv, name, 0, &state);
+/* A named type needs another visit only when reached along a shallower path.
+ * Grow the visited table rather than silently dropping entries at a fixed cap:
+ * the depth bound then limits each named type to at most 64 admitted visits. */
+static bool ts_lookup_visit_named(CBMArena *arena, TSLookupState *state, const char *qn,
+                                  int depth) {
+    for (int i = 0; i < state->visited_count; i++) {
+        if (strcmp(state->visited[i].qn, qn) == 0) {
+            if (state->visited[i].depth <= depth)
+                return false;
+            state->visited[i].depth = depth;
+            return true;
+        }
+    }
+    if (!state->visited) {
+        state->visited = state->inline_visited;
+        state->visited_capacity = TS_LSP_INLINE_VISITED_TYPES;
+    } else if (state->visited_count == state->visited_capacity) {
+        int capacity = state->visited_capacity * 2;
+        TSVisitedType *larger = (TSVisitedType *)cbm_arena_alloc(
+            arena, (size_t)capacity * sizeof(*larger));
+        if (!larger) {
+            fprintf(stderr, "[tslsp] lookup visited allocation failed\n");
+            return false;
+        }
+        memcpy(larger, state->visited, (size_t)state->visited_count * sizeof(*larger));
+        state->visited = larger;
+        state->visited_capacity = capacity;
+    }
+    state->visited[state->visited_count++] = (TSVisitedType){.qn = qn, .depth = depth};
+    return true;
 }
 
 static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *recv,
-                                            const char *name, int depth,
-                                            TSMemberLookupState *state) {
-    if (!ctx || !recv || !name || !state || depth >= TS_LSP_MAX_MEMBER_DEPTH ||
-        state->remaining-- <= 0)
+                                            const char *name, int depth, TSLookupState *state);
+
+/* Depth and shallower-only named-type visits bound work on cyclic inheritance. */
+static const CBMType *lookup_member_type(TSLSPContext *ctx, const CBMType *recv, const char *name) {
+    TSLookupState state = {0};
+    const CBMType *result = lookup_member_type_at(ctx, recv, name, 0, &state);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state.steps > g_ts_max_member_lookup_steps)
+        g_ts_max_member_lookup_steps = state.steps;
+#endif
+    return result;
+}
+
+static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *recv,
+                                            const char *name, int depth, TSLookupState *state) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state)
+        state->steps++;
+#endif
+    if (!ctx || !recv || !name || !state || depth >= TS_LSP_MAX_MEMBER_DEPTH)
         return cbm_type_unknown();
     const CBMType *base = simplify_type(ctx, recv);
     if (!base)
@@ -1662,7 +1712,7 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
         // first hit instead of building a union of results.)
         if (base->data.union_type.members) {
             for (int i = 0; i < base->data.union_type.count; i++) {
-                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH || state->remaining <= 0)
+                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
                     break;
                 const CBMType *m = lookup_member_type_at(
                     ctx, base->data.union_type.members[i], name, depth + 1, state);
@@ -1676,7 +1726,7 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
     if (base->kind == CBM_TYPE_INTERSECTION) {
         if (base->data.union_type.members) {
             for (int i = 0; i < base->data.union_type.count; i++) {
-                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH || state->remaining <= 0)
+                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
                     break;
                 const CBMType *m = lookup_member_type_at(
                     ctx, base->data.union_type.members[i], name, depth + 1, state);
@@ -1693,20 +1743,8 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
     const char *recv_qn = base->data.named.qualified_name;
     if (!recv_qn)
         return cbm_type_unknown();
-    bool seen = false;
-    for (int i = 0; i < state->visited_count; i++) {
-        if (strcmp(state->visited_qns[i], recv_qn) == 0) {
-            if (state->visited_depths[i] <= depth)
-                return cbm_type_unknown();
-            state->visited_depths[i] = depth;
-            seen = true;
-            break;
-        }
-    }
-    if (!seen && state->visited_count < TS_LSP_MAX_MEMBER_VISITED_TYPES) {
-        state->visited_qns[state->visited_count] = recv_qn;
-        state->visited_depths[state->visited_count++] = depth;
-    }
+    if (!ts_lookup_visit_named(ctx->arena, state, recv_qn, depth))
+        return cbm_type_unknown();
     const CBMRegisteredType *rt = cbm_registry_resolve_alias(ctx->registry, recv_qn);
     if (!rt) {
         rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
@@ -1736,7 +1774,7 @@ static const CBMType *lookup_member_type_at(TSLSPContext *ctx, const CBMType *re
     // Walk extends/implements.
     if (rt->embedded_types) {
         for (int i = 0; rt->embedded_types[i]; i++) {
-            if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH || state->remaining <= 0)
+            if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
                 break;
             const CBMType *parent = cbm_type_named(ctx->arena, rt->embedded_types[i]);
             const CBMType *m = lookup_member_type_at(ctx, parent, name, depth + 1, state);
@@ -1822,34 +1860,27 @@ static const CBMType *eval_indexed_access(TSLSPContext *ctx, const CBMType *obj,
     return cbm_type_unknown();
 }
 
-enum {
-    TS_LSP_MAX_METHOD_LOOKUP_WORK = 4096,
-    TS_LSP_MAX_METHOD_VISITED_TYPES = 1024,
-};
-
-struct TSMethodLookupState {
-    int remaining;
-    int visited_count;
-    const char *visited_qns[TS_LSP_MAX_METHOD_VISITED_TYPES];
-    int visited_depths[TS_LSP_MAX_METHOD_VISITED_TYPES];
-};
-
 // Look up a method on a receiver type — returns the registered func.
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name) {
-    TSMethodLookupState state = {.remaining = TS_LSP_MAX_METHOD_LOOKUP_WORK};
-    return lookup_method_at(ctx, recv, method_name, 0, &state);
+    TSLookupState state = {0};
+    const CBMRegisteredFunc *result = lookup_method_at(ctx, recv, method_name, 0, &state);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state.steps > g_ts_max_method_lookup_steps)
+        g_ts_max_method_lookup_steps = state.steps;
+#endif
+    return result;
 }
 
-/* Bound both path depth and total traversal work. Interface `extends` cycles
- * otherwise overflow the resolve-worker stack, while branching cycles can
- * revisit shared parents exponentially. */
+/* Depth and shallower-only named-type visits bound cyclic inheritance work. */
 static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMType *recv,
                                                  const char *method_name, int depth,
-                                                 TSMethodLookupState *state) {
-    if (!ctx || !recv || !method_name || !state)
-        return NULL;
-    if (depth >= TS_LSP_MAX_MEMBER_DEPTH || state->remaining-- <= 0)
+                                                 TSLookupState *state) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (state)
+        state->steps++;
+#endif
+    if (!ctx || !recv || !method_name || !state || depth >= TS_LSP_MAX_MEMBER_DEPTH)
         return NULL;
     const CBMType *base = simplify_type(ctx, recv);
     if (!base)
@@ -1892,7 +1923,7 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
     if (base->kind == CBM_TYPE_UNION || base->kind == CBM_TYPE_INTERSECTION) {
         if (base->data.union_type.members) {
             for (int i = 0; i < base->data.union_type.count; i++) {
-                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH || state->remaining <= 0)
+                if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
                     break;
                 const CBMRegisteredFunc *f = lookup_method_at(
                     ctx, base->data.union_type.members[i], method_name, depth + 1, state);
@@ -1909,20 +1940,8 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
     if (!recv_qn)
         return NULL;
 
-    bool seen = false;
-    for (int i = 0; i < state->visited_count; i++) {
-        if (strcmp(state->visited_qns[i], recv_qn) == 0) {
-            if (state->visited_depths[i] <= depth)
-                return NULL;
-            state->visited_depths[i] = depth;
-            seen = true;
-            break;
-        }
-    }
-    if (!seen && state->visited_count < TS_LSP_MAX_METHOD_VISITED_TYPES) {
-        state->visited_qns[state->visited_count] = recv_qn;
-        state->visited_depths[state->visited_count++] = depth;
-    }
+    if (!ts_lookup_visit_named(ctx->arena, state, recv_qn, depth))
+        return NULL;
 
     const CBMRegisteredFunc *f =
         cbm_registry_lookup_method_aliased(ctx->registry, recv_qn, method_name);
@@ -1933,7 +1952,7 @@ static const CBMRegisteredFunc *lookup_method_at(TSLSPContext *ctx, const CBMTyp
     const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
     if (rt && rt->embedded_types) {
         for (int i = 0; rt->embedded_types[i]; i++) {
-            if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH || state->remaining <= 0)
+            if (depth + 1 >= TS_LSP_MAX_MEMBER_DEPTH)
                 break;
             const CBMType *parent = cbm_type_named(ctx->arena, rt->embedded_types[i]);
             const CBMRegisteredFunc *pf =
@@ -3874,6 +3893,10 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
                  bool jsx_mode, bool dts_mode, CBMResolvedCallArray *out) {
     if (!ctx)
         return;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_ts_max_member_lookup_steps = 0;
+    g_ts_max_method_lookup_steps = 0;
+#endif
     memset(ctx, 0, sizeof(TSLSPContext));
     ctx->arena = arena;
     ctx->source = source;
