@@ -959,6 +959,16 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
 // const", and a member lookup for "operator bool" (the implicit call in
 // `if (obj)`) misses.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang) {
+    if (lang == CBM_LANG_SWIFT) {
+        const char *kind = ts_node_type(name_node);
+        if (strcmp(kind, "init_declaration") == 0) {
+            return cbm_arena_strdup(a, "init");
+        }
+        if (strcmp(kind, "deinit_declaration") == 0) {
+            return cbm_arena_strdup(a, "deinit");
+        }
+    }
+
     char *text = cbm_node_text(a, name_node, source);
     if (text && strcmp(ts_node_type(name_node), "operator_cast") == 0) {
         char *paren = strchr(text, '(');
