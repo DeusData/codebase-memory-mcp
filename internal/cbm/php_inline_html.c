@@ -263,6 +263,47 @@ static int php_scan_code(const char *s, int len, int i) {
     return len;
 }
 
+/* The rewritten buffer. It is allocated and filled from the source on the
+ * first write, so a file whose only `?>` bytes sit in strings or comments
+ * costs no copy. */
+typedef struct {
+    CBMArena *arena;
+    const char *source;
+    int len;
+    char *out;
+    bool failed;
+} PHPMask;
+
+static char *php_mask_writable(PHPMask *m) {
+    if (!m->out && !m->failed) {
+        m->out = (char *)cbm_arena_alloc(m->arena, (size_t)m->len + SKIP_ONE);
+        if (m->out) {
+            memcpy(m->out, m->source, (size_t)m->len);
+            m->out[m->len] = '\0';
+        } else {
+            m->failed = true;
+        }
+    }
+    return m->out;
+}
+
+/* Blank [from, to) of the rewritten buffer, keeping line breaks. */
+static void php_mask_blank(PHPMask *m, int from, int to) {
+    char *out = php_mask_writable(m);
+    if (out) {
+        php_blank(out, from, to);
+    }
+}
+
+/* Turn the `?>` at i into `; `. */
+static void php_mask_close_tag(PHPMask *m, int i) {
+    char *out = php_mask_writable(m);
+    if (out) {
+        out[i] = ';';
+        out[i + SKIP_ONE] = ' ';
+    }
+}
+
 const char *cbm_php_mask_inline_html(CBMArena *arena, const char *source, int source_len) {
     if (!arena || !source || source_len <= 0) {
         return source;
@@ -273,17 +314,10 @@ const char *cbm_php_mask_inline_html(CBMArena *arena, const char *source, int so
         return source;
     }
 
-    char *out = (char *)cbm_arena_alloc(arena, (size_t)source_len + SKIP_ONE);
-    if (!out) {
-        return source;
-    }
-    memcpy(out, source, (size_t)source_len);
-    out[source_len] = '\0';
-
-    bool changed = false;
+    PHPMask m = {.arena = arena, .source = source, .len = source_len};
     bool seen_open = false;
     int i = 0;
-    while (i < source_len) {
+    while (i < source_len && !m.failed) {
         /* Inline-HTML mode: blank up to the next open tag. */
         int html_start = i;
         int tag = 0;
@@ -291,15 +325,13 @@ const char *cbm_php_mask_inline_html(CBMArena *arena, const char *source, int so
             i++;
         }
         if (i > html_start) {
-            php_blank(out, html_start, i);
-            changed = true;
+            php_mask_blank(&m, html_start, i);
         }
         if (i >= source_len) {
             break;
         }
         if (seen_open) {
-            php_blank(out, i, i + tag);
-            changed = true;
+            php_mask_blank(&m, i, i + tag);
         }
         seen_open = true;
 
@@ -308,10 +340,9 @@ const char *cbm_php_mask_inline_html(CBMArena *arena, const char *source, int so
         if (close < 0 || close >= source_len) {
             break;
         }
-        out[close] = ';';
-        out[close + SKIP_ONE] = ' ';
-        changed = true;
+        php_mask_close_tag(&m, close);
         i = close + PAIR_LEN;
     }
-    return changed ? out : source;
+    /* On allocation failure parse the file as it is: the old behaviour. */
+    return (m.out && !m.failed) ? m.out : source;
 }
