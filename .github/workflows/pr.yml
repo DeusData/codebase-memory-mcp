@@ -64,9 +64,29 @@ jobs:
         run: |
           # The full .diff endpoint rejects large-but-valid PRs at 20k lines.
           # The paginated files endpoint remains filename-only for this gate.
-          FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename')
+          if FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename'); then
+            echo "file list: pulls/files API"
+          else
+            # The files endpoint renders the diff server-side too, and answers
+            # 422 "this diff is taking too long to generate" for a PR that
+            # regenerates a vendored parser (#2246: a 42 MB sql/parser.c) --
+            # so does the compare endpoint. The PR merge ref's first parent is
+            # the base, so a name-only diff across it is the same file list.
+            # depth 2 + blob:none fetches commits and trees only (well under
+            # 1 MB, under a second); nothing from the PR is checked out or run.
+            echo "::notice::pulls/files API failed; file list taken from refs/pull/$PR/merge"
+            CHANGES_GIT="$RUNNER_TEMP/changes.git"
+            git init -q --bare "$CHANGES_GIT"
+            git --git-dir="$CHANGES_GIT" fetch -q --depth=2 --filter=blob:none \
+              "https://github.com/$REPO" "refs/pull/$PR/merge"
+            FILES=$(git --git-dir="$CHANGES_GIT" diff --name-only --no-renames FETCH_HEAD^1 FETCH_HEAD)
+          fi
           printf '%s\n' "$FILES"
-          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
+          # A here-string, not a pipe: under this shell's pipefail, grep -q
+          # exits on its first match, printf dies of SIGPIPE once the list
+          # outgrows the pipe buffer, and the MATCH is then reported as a
+          # failure -- product=false, smoke skipped, on the largest PRs.
+          if grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)' <<<"$FILES"; then
             echo "product=true" >> "$GITHUB_OUTPUT"
           else
             echo "product=false" >> "$GITHUB_OUTPUT"
@@ -153,6 +173,17 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+
+  # ── Waste sanitizer, REPORT-ONLY: memory + CPU waste on this repository and
+  #    the per-function scaling lane (Linux). Deliberately NOT in ci-ok's needs:
+  #    it uploads evidence and prints the ratchet, it never blocks a merge. Only
+  #    product-code PRs pay for it. ──
+  memwaste:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.product == 'true' }}
+    uses: ./.github/workflows/_memwaste.yml
+    with:
+      mode: pr
 
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage

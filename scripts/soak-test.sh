@@ -66,9 +66,17 @@ CBM_SOAK_MODE="${CBM_SOAK_MODE:-default}"
 RESULTS_DIR="${RESULTS_DIR:-soak-results}"
 mkdir -p "$RESULTS_DIR"
 
-# Isolate daemon coordination from interactive CBM sessions and give this run
-# a deterministic host-side daemon log. Wine needs a Windows-form cache path
-# in the child environment while this Bash harness retains the host path.
+# Every product process below must reach a daemon rendezvous this run owns.
+# Only CBM_RUNTIME_DIR moves that rendezvous — a private CBM_CACHE_DIR alone
+# still shares the operator's account daemon (#1691, #1696).
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
+
+# Give this run a deterministic host-side daemon log. Wine needs a Windows-form
+# cache path in the child environment while this Bash harness retains the host
+# path.
 #
 # On native Windows the cache CANNOT live under msys /tmp: the server's
 # cache-private executable-identity check walks the cache path's ancestors
@@ -146,7 +154,7 @@ if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
         exit 1
     fi
 else
-    SOAK_CACHE_DIR_HOST=$(mktemp -d "${TMPDIR:-/tmp}/cbm-soak-cache.XXXXXX")
+    SOAK_CACHE_DIR_HOST="$CBM_TEST_CACHE_DIR_HOST"
 fi
 SOAK_CACHE_DIR_VALUE="$SOAK_CACHE_DIR_HOST"
 if [[ "$BINARY" == *.exe ]] && command -v winepath >/dev/null 2>&1; then
@@ -206,7 +214,12 @@ soak_cleanup() {
     if [ -f "$DAEMON_LOG" ]; then
         cp "$DAEMON_LOG" "$RESULTS_DIR/cbm-daemon.log" 2>/dev/null || true
     fi
-    rm -rf -- "$SOAK_PROJECT" "$SOAK_CACHE_DIR_HOST"
+    rm -rf -- "$SOAK_PROJECT"
+    # The helper stops this run's private daemon before removing its root and
+    # leaves the root behind for diagnosis when the daemon will not stop. The
+    # native-Windows cache sits under SOAK_WIN_ROOT, which goes only after the
+    # daemon check because the binary it probes with is the copy inside it.
+    cbm_test_runtime_cleanup "$BINARY"
     [ -z "${SOAK_WIN_ROOT:-}" ] || rm -rf -- "$SOAK_WIN_ROOT"
 }
 
@@ -807,7 +820,7 @@ if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak
     SERVER_PID=""
     exec 3>&- 4<&-
     if ! wait_for_daemon_stop "$DAEMON_STOP_COUNT"; then
-        echo "FAIL: last-session crash did not stop the shared daemon"
+        echo "FAIL: last-session crash did not stop the private daemon"
         exit 1
     fi
 
@@ -848,7 +861,7 @@ kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
 if ! wait_for_daemon_stop "$FINAL_DAEMON_STOP_COUNT"; then
-    echo "FAIL: final frontend shutdown did not stop the shared daemon"
+    echo "FAIL: final frontend shutdown did not stop the private daemon"
     PASS=false
 fi
 

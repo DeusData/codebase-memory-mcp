@@ -3,6 +3,7 @@
  */
 #include "foundation/mem_core.h"
 #include "foundation/mem.h"
+#include "foundation/mem_events.h"
 
 /* Ownership check for blocks handed back to the core (defined with cbm_free). */
 static void check_owned(const void *block, const char *op);
@@ -152,6 +153,7 @@ static void class_flush_one(cbm_mem_class_t cls) {
 }
 
 void cbm_mem_class_flush_thread(void) {
+    cbm_memev_flush_thread(); /* same seam: work-item end, thread end, every reader */
     for (int i = 0; i < CBM_MEM_CLASS_COUNT; i++) {
         class_flush_one((cbm_mem_class_t)i);
     }
@@ -205,8 +207,61 @@ size_t cbm_mem_usable_size(const void *block) {
 }
 #endif
 
+/* -- Waste-sanitizer hooks (mem_events.h) ---------------------------------
+ * Compiled to nothing outside the `memwaste` flavour. The core names the
+ * caller's site and the class; who REPORTS the event depends on whether an
+ * observer sees the backing allocator:
+ *   - backing is mimalloc called directly (CBM_BIND_TS_ALLOCATOR): no observer
+ *     ever sees it, the core reports everything itself;
+ *   - backing is plain malloc and an observer is installed: the observer
+ *     reports, the hint hands it the site and the class;
+ *   - backing is plain malloc, no observer: the core reports.
+ * Frees are reported BEFORE the block goes back (see mem_events.h). */
+#if defined(CBM_MEMWASTE) && CBM_MEMWASTE
+static bool core_reports_frees(void) {
+#if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
+    return true;
+#else
+    return !cbm_memev_observer_installed();
+#endif
+}
+#define MEMEV_HINT(cls)                                              \
+    do {                                                             \
+        if (cbm_memev_enabled() && !cbm_memev_hint_pending()) {      \
+            cbm_memev_hint(__builtin_return_address(0), (int)(cls)); \
+        }                                                            \
+    } while (0)
+#define MEMEV_ALLOCATED(block, bytes, flags)                                                  \
+    do {                                                                                      \
+        if (cbm_memev_hint_pending()) {                                                       \
+            cbm_memev_alloc_ex((block), (bytes), (block) ? charge_size((block), (bytes)) : 0, \
+                               NULL, (flags));                                                \
+        }                                                                                     \
+    } while (0)
+#define MEMEV_REALLOCATED(old_block, grown, bytes)                                \
+    do {                                                                          \
+        if (cbm_memev_hint_pending()) {                                           \
+            cbm_memev_realloc((old_block), (grown), (bytes),                      \
+                              (grown) ? charge_size((grown), (bytes)) : 0, NULL); \
+        }                                                                         \
+    } while (0)
+#define MEMEV_FREEING(block)                               \
+    do {                                                   \
+        if (cbm_memev_enabled() && core_reports_frees()) { \
+            cbm_memev_free(block);                         \
+        }                                                  \
+    } while (0)
+#else
+#define MEMEV_HINT(cls) ((void)0)
+#define MEMEV_ALLOCATED(block, bytes, flags) ((void)0)
+#define MEMEV_REALLOCATED(old_block, grown, bytes) ((void)0)
+#define MEMEV_FREEING(block) ((void)0)
+#endif
+
 void *cbm_alloc(cbm_mem_class_t cls, size_t bytes) {
+    MEMEV_HINT(cls);
     void *block = CBM_BACKING_MALLOC(bytes ? bytes : CBM_ALLOC_ONE);
+    MEMEV_ALLOCATED(block, bytes, 0);
     if (!block) {
         return NULL;
     }
@@ -215,7 +270,9 @@ void *cbm_alloc(cbm_mem_class_t cls, size_t bytes) {
 }
 
 void *cbm_calloc(cbm_mem_class_t cls, size_t bytes) {
+    MEMEV_HINT(cls);
     void *block = CBM_BACKING_CALLOC(bytes ? bytes : CBM_ALLOC_ONE);
+    MEMEV_ALLOCATED(block, bytes, CBM_MEMEV_ZEROED);
     if (!block) {
         return NULL;
     }
@@ -231,7 +288,11 @@ void *cbm_realloc(cbm_mem_class_t cls, void *block, size_t bytes) {
     /* Measure BEFORE: after realloc the old block is gone and its size is
      * unknowable, so the decrement has to be computed first. */
     size_t old = charge_size(block, 0);
+    MEMEV_HINT(cls);
+    CBM_MEMEV_BACKING(1);
     void *next = CBM_BACKING_REALLOC(block, bytes ? bytes : CBM_ALLOC_ONE);
+    CBM_MEMEV_BACKING(-1);
+    MEMEV_REALLOCATED(block, next, bytes);
     if (!next) {
         return NULL; /* original intact and still charged - correct */
     }
@@ -245,6 +306,7 @@ char *cbm_mem_strdup(cbm_mem_class_t cls, const char *s) {
         return NULL;
     }
     size_t len = strlen(s) + CBM_ALLOC_ONE;
+    MEMEV_HINT(cls); /* the site is OUR caller, not cbm_alloc's */
     char *copy = (char *)cbm_alloc(cls, len);
     if (!copy) {
         return NULL;
@@ -279,6 +341,7 @@ void cbm_free(cbm_mem_class_t cls, void *block) {
     }
     check_owned(block, "free");
     class_sub(cls, charge_size(block, 0), CBM_ALLOC_ONE);
+    MEMEV_FREEING(block);
     CBM_BACKING_FREE(block);
 }
 

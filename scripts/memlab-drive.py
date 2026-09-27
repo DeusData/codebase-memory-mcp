@@ -32,6 +32,16 @@ def rpc(proc, payload, timeout_note):
             return message
 
 
+def tool_failed(reply):
+    """A JSON-RPC error, or a tool result the server marked isError: MCP reports
+    a failed tool call as a normal result, so checking only "error" counts every
+    failure as served (a lab measuring nothing looked healthy)."""
+    if "error" in reply:
+        return True
+    result = reply.get("result")
+    return isinstance(result, dict) and bool(result.get("isError"))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary")
@@ -63,14 +73,16 @@ def main():
                    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                               "clientInfo": {"name": "memlab", "version": "1"}}},
             "initialize")
+        project = None
         if not args.skip_index:
             indexed = rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                  "params": {"name": "index_repository",
-                                            "arguments": {"path": args.corpus}}},
+                                            "arguments": {"repo_path": args.corpus}}},
                           "index_repository")
-            if "error" in indexed:
-                print(f"index failed: {indexed['error']}", file=sys.stderr)
+            if tool_failed(indexed):
+                print(f"index failed: {indexed.get('error') or indexed.get('result')}", file=sys.stderr)
                 return 3
+            project = (indexed.get("result", {}).get("structuredContent") or {}).get("project")
 
         halfway = 2 + args.requests // 2
         for i in range(2, args.requests + 2):
@@ -84,11 +96,15 @@ def main():
                          "list_projects": {},
                          "get_graph_schema": {},
                          "search_code": {"pattern": "Widget"}}.get(args.tool, {})
+            if project and args.tool != "list_projects":
+                arguments = dict(arguments, project=project)
             reply = rpc(proc, {"jsonrpc": "2.0", "id": i, "method": "tools/call",
                                "params": {"name": args.tool, "arguments": arguments}},
                         f"request {i}")
             served += 1
-            if "error" in reply:
+            if tool_failed(reply):
+                if failures == 0:
+                    print(f"first failure (request {i}): {json.dumps(reply)[:600]}", file=sys.stderr, flush=True)
                 failures += 1
     finally:
         try:

@@ -890,8 +890,16 @@ static bool activation_posix_acl_empty(int descriptor) {
 }
 
 static char *activation_posix_walk_path(const char *directory) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
+    /* macOS and immutable Linux layouts can expose writable trees through
+     * root-owned aliases (for example /tmp and /home on Atomic systems).
+     * Resolve only these trusted system aliases; arbitrary user symlinks must
+     * still fail the O_NOFOLLOW walk below. */
+#ifdef __linux__
+    static const char *const aliases[] = {"/tmp", "/var", "/home"};
+#else
     static const char *const aliases[] = {"/tmp", "/var"};
+#endif
     for (size_t index = 0; index < sizeof(aliases) / sizeof(aliases[0]); index++) {
         const char *alias = aliases[index];
         size_t alias_length = strlen(alias);
@@ -901,8 +909,13 @@ static char *activation_posix_walk_path(const char *directory) {
         }
         struct stat alias_status;
         char resolved[4096];
-        if (lstat(alias, &alias_status) != 0 || !S_ISLNK(alias_status.st_mode) ||
-            alias_status.st_uid != 0 || !realpath(alias, resolved)) {
+        if (lstat(alias, &alias_status) != 0) {
+            continue;
+        }
+        if (!S_ISLNK(alias_status.st_mode)) {
+            continue;
+        }
+        if (alias_status.st_uid != 0 || !realpath(alias, resolved)) {
             return NULL;
         }
         struct stat resolved_status;

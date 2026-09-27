@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>codebase-memory-mcp</id>
-    <version>0.10.8</version>
+    <version>0.11.0</version>
     <title>codebase-memory-mcp</title>
     <authors>DeusData</authors>
     <projectUrl>https://github.com/DeusData/codebase-memory-mcp</projectUrl>
@@ -28,7 +28,7 @@ After installation, run:
 
 to configure your coding agents automatically.
     </description>
-    <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.10.8</releaseNotes>
+    <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.11.0</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />
