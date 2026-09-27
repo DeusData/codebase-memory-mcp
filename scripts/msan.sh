@@ -79,6 +79,27 @@ ulimit -s 262144 2>/dev/null || true
 export CBM_THREAD_STACK_MB="${CBM_THREAD_STACK_MB:-256}"
 export LD_LIBRARY_PATH="$MSAN_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+expected_build_config=$'sanitized=1 test_seams=1\n'
+build_config_marker="__cbm_build_config_end__"
+captured_build_config=""
+actual_build_config=""
+build_config_probe_ok=0
+if captured_build_config="$(./build/msan/test-runner --build-config && printf '%s' "$build_config_marker")"; then
+    build_config_probe_ok=1
+    actual_build_config="${captured_build_config%"$build_config_marker"}"
+else
+    actual_build_config="$captured_build_config"
+fi
+if [ "$build_config_probe_ok" -ne 1 ] ||
+    [ "$actual_build_config" != "$expected_build_config" ]; then
+    reported_build_config="${actual_build_config//$'\n'/\\n}"
+    printf '%s\n' 'ERROR: build config mismatch for build/msan/test-runner' >&2
+    printf '%s\n' '  expected: sanitized=1 test_seams=1' >&2
+    printf '  reported: %s\n' "${reported_build_config:-<empty>}" >&2
+    printf '%s\n' 'Refusing to run suites; check sanitizer flags and CBM_SANITIZED_BUILD wiring.' >&2
+    exit 1
+fi
+
 echo "=== MSan lane: $(clang --version | head -1) ==="
 
 # KNOWN RED — THREE DISTINCT CAUSES, whitelisted per cause (O10)

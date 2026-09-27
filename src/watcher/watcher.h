@@ -110,6 +110,14 @@ int cbm_watcher_watch_count(cbm_watcher_t *w);
  * without first giving the counter atomic accessors. */
 int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: number of unwatched/replaced project states parked on the
+ * deferred-free list, read under projects_lock. The drain in poll_once is
+ * otherwise unobservable — cbm_watcher_free frees the same list, so a poll
+ * that stopped draining would neither crash nor leak. Test builds only. */
+int cbm_watcher_test_pending_free_count(cbm_watcher_t *w);
+#endif
+
 /* Return the adaptive poll interval (ms) for a given file count. */
 int cbm_watcher_poll_interval_ms(int file_count);
 

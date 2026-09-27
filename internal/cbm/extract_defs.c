@@ -3,15 +3,16 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
-#include "foundation/platform.h" // safe_realloc (frees old on failure)
-#include "foundation/log.h"      // cbm_log_warn
+#include "foundation/log.h"      // cbm_log_error
+#include "foundation/mem_core.h" // cbm_realloc/cbm_free -- walk_defs stack
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include <limits.h>          // INT_MAX
+#include <stdint.h>          // uint32_t, SIZE_MAX
 #include <stdio.h>           // snprintf (ObjectScript storage/trigger sidecars)
-#include <stdlib.h>          // getenv, atoi
+#include <stdlib.h>          // malloc/free (child-collection scratch)
 #include <string.h>
 #include <ctype.h>
 
@@ -1417,7 +1418,8 @@ static bool is_route_string_kind(const char *kind) {
            strcmp(kind, "interpreted_string_literal") == 0;
 }
 
-static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source) {
+static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source,
+                                               bool allow_relative) {
     if (!is_route_string_kind(ts_node_type(node))) {
         return NULL;
     }
@@ -1429,21 +1431,30 @@ static const char *route_path_from_string_node(CBMArena *a, TSNode node, const c
     if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
         path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
     }
-    return (path && path[0] == '/') ? path : NULL;
+    if (!path || path[0] == '/' || !allow_relative) {
+        return (path && path[0] == '/') ? path : NULL;
+    }
+    /* JAX-RS @Path values are relative URI templates; a leading slash is
+     * optional and ignored by the framework. Route nodes use absolute-looking
+     * paths consistently, so normalize a non-empty relative value here. An
+     * empty @Path("") means "the class path itself": leave it unset so the
+     * caller falls back exactly as it does for a method without @Path. */
+    return path[0] ? cbm_arena_sprintf(a, "/%s", path) : NULL;
 }
 
 static const char *find_route_path_literal(CBMArena *a, TSNode node, const char *source,
-                                           int max_depth) {
+                                           int max_depth, bool allow_relative) {
     if (ts_node_is_null(node) || max_depth < 0) {
         return NULL;
     }
-    const char *path = route_path_from_string_node(a, node, source);
+    const char *path = route_path_from_string_node(a, node, source, allow_relative);
     if (path || max_depth == 0) {
         return path;
     }
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc && i < DECORATOR_SCAN_LIMIT; i++) {
-        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1);
+        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1,
+                                       allow_relative);
         if (path) {
             return path;
         }
@@ -1451,8 +1462,10 @@ static const char *find_route_path_literal(CBMArena *a, TSNode node, const char 
     return NULL;
 }
 
-// Extract route path from decorator arguments (first string that starts with /).
-static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source) {
+// Extract route path from decorator arguments. Generic mappings keep only
+// slash-prefixed strings; JAX-RS @Path additionally accepts relative templates.
+static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source,
+                                                bool allow_relative) {
     /* Every argument is checked. Java and Kotlin put no order on annotation
      * attributes, so `path` can sit anywhere in the list. Stopping early left
      * a real route unread and formed no Route node. Each argument's own
@@ -1465,7 +1478,8 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
          *   @GetMapping(path = {"/orders"})
          * Walk a bounded subtree and keep the first string literal that is
          * path-shaped, while ignoring non-route literals such as media types. */
-        const char *path = find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH);
+        const char *path =
+            find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH, allow_relative);
         if (path) {
             return path;
         }
@@ -1611,7 +1625,7 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
 
     TSNode args = find_decorator_args(dchild);
     if (!ts_node_is_null(args)) {
-        const char *path = extract_route_path_from_args(a, args, source);
+        const char *path = extract_route_path_from_args(a, args, source, false);
         if (path) {
             *out_path = path;
             *out_method = method;
@@ -1691,7 +1705,7 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     TSNode args = annotation_args_node(annotation);
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
-        path = extract_route_path_from_args(a, args, source);
+        path = extract_route_path_from_args(a, args, source, false);
     }
     *out_path = path ? path : "/";
     *out_method = method;
@@ -1741,7 +1755,7 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
             if (!*out_jax_path && strcmp(name, "Path") == 0) {
                 TSNode args = annotation_args_node(child);
                 if (!ts_node_is_null(args)) {
-                    *out_jax_path = extract_route_path_from_args(a, args, source);
+                    *out_jax_path = extract_route_path_from_args(a, args, source, true);
                 }
                 continue;
             }
@@ -1751,7 +1765,7 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
                     *out_method = method;
                     TSNode args = annotation_args_node(child);
                     if (!ts_node_is_null(args)) {
-                        *out_map_path = extract_route_path_from_args(a, args, source);
+                        *out_map_path = extract_route_path_from_args(a, args, source, false);
                     }
                 }
             }
@@ -3478,6 +3492,159 @@ static TSNode find_function_params(TSNode func_node, CBMLanguage lang) {
     return params;
 }
 
+/* ── C-family declared return type ──────────────────────────────────
+ * The C-family grammars split a declared return type three ways: the `type`
+ * field (`char`), sibling type_qualifier nodes (`const`), and the
+ * pointer/reference declarators wrapping the function declarator (`*`). Taking
+ * only the `type` field published `const char *get_name(void)` as "char".
+ *
+ * Canonical spelling: leading cv-qualifiers in source order, the base type text
+ * verbatim, then one space and the declarator markers outermost-first with no
+ * space between them — `const char *`, `char **`, `Text &`, `Text *&`. A
+ * qualifier on a pointer level follows its `*` and is separated from the next
+ * marker by a space: `char *const *`. A qualifier written after the base type
+ * (`char const *`) is normalized to the leading position. */
+
+/* Output sink: measures when buf is NULL, writes otherwise. Rendering twice
+ * sizes the arena allocation exactly without a second copy of the logic. */
+typedef struct {
+    char *buf;
+    size_t len;
+} c_rt_out_t;
+
+static void c_rt_put(c_rt_out_t *out, const char *text, size_t n) {
+    if (out->buf) {
+        memcpy(out->buf + out->len, text, n);
+    }
+    out->len += n;
+}
+
+static void c_rt_put_str(c_rt_out_t *out, const char *text) {
+    c_rt_put(out, text, strlen(text));
+}
+
+static void c_rt_put_node(c_rt_out_t *out, TSNode node, const char *source) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    if (end > start) {
+        c_rt_put(out, source + start, (size_t)(end - start));
+    }
+}
+
+/* type_qualifier also covers keywords that are not part of the type
+ * (`constexpr`, `_Noreturn`, `mutable`, `__extension__`, …). Keep only the ones
+ * that are, so `constexpr int f()` still returns "int". */
+static bool is_c_return_cv_qualifier(TSNode node, const char *source) {
+    static const char *const kept[] = {"const",        "volatile", "restrict", "__restrict",
+                                       "__restrict__", "_Atomic",  NULL};
+    if (strcmp(ts_node_type(node), "type_qualifier") != 0) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = end > start ? (size_t)(end - start) : 0;
+    for (const char *const *k = kept; *k; k++) {
+        if (strlen(*k) == len && memcmp(source + start, *k, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_c_declarator_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
+           lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC;
+}
+
+/* Render the canonical return type into `out`; returns how many qualifiers and
+ * markers were added around the base type (0 = the base text alone is already
+ * the whole type). The declarator walk is one strict child chain, so it is
+ * O(depth) with no recursion and needs no depth cap. It stops at the first node
+ * that is neither a pointer nor a reference declarator: for a function returning
+ * a function pointer (`int (*f(void))(int)`) that is the outer
+ * function_declarator, which leaves the base type as it was. */
+static size_t c_rt_render(c_rt_out_t *out, TSNode func_node, TSNode type_node, TSNode declarator,
+                          const char *source) {
+    size_t added = 0;
+    uint32_t decl_start = ts_node_start_byte(declarator);
+    uint32_t nc = ts_node_named_child_count(func_node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode ch = ts_node_named_child(func_node, i);
+        if (ts_node_start_byte(ch) >= decl_start) {
+            break;
+        }
+        if (is_c_return_cv_qualifier(ch, source)) {
+            c_rt_put_node(out, ch, source);
+            c_rt_put_str(out, " ");
+            added++;
+        }
+    }
+    c_rt_put_node(out, type_node, source);
+
+    bool need_space = true;
+    TSNode decl = declarator;
+    while (!ts_node_is_null(decl)) {
+        const char *dk = ts_node_type(decl);
+        bool is_ref = strcmp(dk, "reference_declarator") == 0;
+        if (!is_ref && strcmp(dk, "pointer_declarator") != 0) {
+            break;
+        }
+        if (need_space) {
+            c_rt_put_str(out, " ");
+            need_space = false;
+        }
+        /* A reference_declarator opens with its `&` / `&&` token. */
+        TSNode marker = ts_node_child(decl, 0);
+        if (is_ref && !ts_node_is_null(marker) && !ts_node_is_named(marker)) {
+            c_rt_put_node(out, marker, source);
+        } else {
+            c_rt_put_str(out, is_ref ? "&" : "*");
+        }
+        added++;
+        uint32_t dn = ts_node_named_child_count(decl);
+        for (uint32_t i = 0; i < dn; i++) {
+            TSNode q = ts_node_named_child(decl, i);
+            if (is_c_return_cv_qualifier(q, source)) {
+                c_rt_put_node(out, q, source);
+                need_space = true;
+                added++;
+            }
+        }
+        /* tree-sitter-cpp/-cuda give a reference_declarator's inner declarator no
+         * `declarator` field (see find_c_params); it is the one named child. */
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && is_ref && dn > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        decl = inner;
+    }
+    return added;
+}
+
+/* Declared return type of a C-family function/method node whose `type` field is
+ * `type_node`. Any other language, and any type with nothing around its base
+ * type, gets the base type text exactly as before. */
+static char *c_declared_return_type(CBMExtractCtx *ctx, TSNode func_node, TSNode type_node) {
+    CBMArena *a = ctx->arena;
+    TSNode declarator = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    if (!is_c_declarator_lang(ctx->language) || ts_node_is_null(declarator)) {
+        return cbm_node_text(a, type_node, ctx->source);
+    }
+    c_rt_out_t out = {NULL, 0};
+    if (c_rt_render(&out, func_node, type_node, declarator, ctx->source) == 0) {
+        return cbm_node_text(a, type_node, ctx->source);
+    }
+    out.buf = (char *)cbm_arena_alloc(a, out.len + NULL_TERM);
+    if (!out.buf) {
+        return cbm_node_text(a, type_node, ctx->source);
+    }
+    out.len = 0;
+    (void)c_rt_render(&out, func_node, type_node, declarator, ctx->source);
+    out.buf[out.len] = '\0';
+    return out.buf;
+}
+
 // C++: resolve trailing return type (auto f() -> Type) on a declarator node.
 // Updates def->return_type and def->return_types if trailing type found.
 static void resolve_cpp_trailing_return(CBMArena *a, TSNode func_node, const char *source,
@@ -3713,7 +3880,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     for (const char **f = rt_fields; *f; f++) {
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
-            def.return_type = cbm_node_text(a, rt, ctx->source);
+            def.return_type = c_declared_return_type(ctx, func_node, rt);
             def.return_types = extract_return_types(a, rt, ctx->source, ctx->language);
             break;
         }
@@ -4969,7 +5136,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         for (const char **f = rt_fields; *f; f++) {
             TSNode rt = ts_node_child_by_field_name(child, *f, (uint32_t)strlen(*f));
             if (!ts_node_is_null(rt)) {
-                def.return_type = cbm_node_text(a, rt, ctx->source);
+                def.return_type = c_declared_return_type(ctx, child, rt);
                 break;
             }
         }
@@ -4999,7 +5166,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
-    if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
+    if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN ||
+                           ctx->language == CBM_LANG_SCALA)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
     }
@@ -7122,74 +7290,75 @@ typedef struct {
  * single ~160 KB C-stack frame. That overflowed small thread stacks (the
  * pre-2026-03 Windows 1 MB main thread) on the definitions pass, and its
  * `top < 4096` push guards SILENTLY DROPPED every top-level definition past
- * 4096. Use a growable heap stack instead: a tiny initial footprint that doubles
- * on demand, bounded by a generous, env-configurable ceiling that WARNs (once)
- * rather than dropping — so a file with thousands of top-level defs is fully
- * extracted, and a pathological one degrades to a warned, bounded skip instead
- * of an OOM or a stack overflow. */
+ * 4096. It became a growable stack bounded by an 8M-frame ceiling
+ * (env CBM_WALK_DEFS_MAX) that still stopped pushing once reached — and since
+ * children are pushed last-to-first, a file wider than the ceiling lost its
+ * FIRST definitions. No work cap may decide graph content, so there is no
+ * ceiling: the stack doubles on demand, and only an allocation failure stops
+ * the walk. That failure is loud — logged at error level and reported as a
+ * per-file extract error (result->has_error) — never a silent partial file. */
 typedef struct {
     walk_defs_frame_t *data;
     int top;
     int cap;
-    const char *path; // for the WARN when the ceiling is hit (may be NULL)
-    bool warned;
+    const char *path; // for the error log on allocation failure (may be NULL)
+    bool failed;      // growth failed: pending frames dropped, walk drains
     /* The per-file traversal scratch (ctx->scratch) when there is one: frames
      * then come from memory the thread reuses file after file, where a malloc
      * of 256 frames per file was 28 k allocations and 255 MB never written on
      * the Go corpus (waste sanitizer, 2026-09-17). Growth copies into a
      * doubled buffer and abandons the old one to the arena, like TSNodeStack.
-     * NULL: the heap, freed by the walk. */
+     * NULL: the memory core (class EXTRACT), released by the walk. */
     CBMArena *arena;
 } wd_stack_t;
 
-// Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
-// Realistic files never approach this; it only bounds a pathological/adversarial
-// file so extraction degrades to a warned skip rather than unbounded memory.
-static int wd_stack_max(void) {
-    const char *e = getenv("CBM_WALK_DEFS_MAX");
-    if (e) {
-        int v = atoi(e);
-        if (v > 0) {
-            return v;
-        }
-    }
-    return 8 * 1024 * 1024; // 8M frames (~320 MB) default
-}
+enum { WD_STACK_INITIAL = 256 };
 
-static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
-    if (s->top >= s->cap) {
-        int ncap = s->cap ? s->cap * 2 : 256;
-        if (ncap > wd_stack_max()) {
-            if (!s->warned) {
-                char lim[24];
-                snprintf(lim, sizeof(lim), "%d", wd_stack_max());
-                cbm_log_warn("extract.walk_defs_capped", "limit", lim, "path",
-                             s->path ? s->path : "");
-                s->warned = true;
-            }
-            return; // bounded: stop growing (warned, not silent)
-        }
-        walk_defs_frame_t *nd = NULL;
+/* Double `s` (or give it its first WD_STACK_INITIAL frames). Returns false,
+ * after logging, when the doubled size is not representable or cannot be
+ * allocated; the old buffer is left intact so the walk can still release it. */
+static bool wd_grow(wd_stack_t *s) {
+    walk_defs_frame_t *nd = NULL;
+    int ncap = WD_STACK_INITIAL;
+    bool fits = true;
+    if (s->cap > 0) {
+        fits = s->cap <= INT_MAX / 2;
+        ncap = fits ? s->cap * 2 : s->cap;
+    }
+    fits = fits && (size_t)ncap <= SIZE_MAX / sizeof(walk_defs_frame_t);
+    if (fits) {
+        size_t bytes = (size_t)ncap * sizeof(walk_defs_frame_t);
         if (s->arena) {
-            nd = (walk_defs_frame_t *)cbm_arena_alloc(s->arena,
-                                                      (size_t)ncap * sizeof(walk_defs_frame_t));
+            nd = (walk_defs_frame_t *)cbm_arena_alloc(s->arena, bytes);
             if (nd && s->top > 0) {
                 memcpy(nd, s->data, (size_t)s->top * sizeof(walk_defs_frame_t));
             }
         } else {
-            nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+            nd = (walk_defs_frame_t *)cbm_realloc(CBM_MEM_CLASS_EXTRACT, s->data, bytes);
         }
-        if (!nd) {
-            /* OOM — safe_realloc already freed the old buffer. Bail cleanly: drop
-             * pending frames so the walk_defs loop drains and exits without a NULL
-             * deref; extraction keeps whatever was already emitted. */
-            s->data = NULL;
-            s->cap = 0;
-            s->top = 0;
-            return;
-        }
-        s->data = nd;
-        s->cap = ncap;
+    }
+    if (!nd) {
+        char pending[24];
+        snprintf(pending, sizeof(pending), "%d", s->top);
+        cbm_log_error("extract.walk_stack_alloc_failed", "walker", "walk_defs", "pending", pending,
+                      "path", s->path ? s->path : "");
+        return false;
+    }
+    s->data = nd;
+    s->cap = ncap;
+    return true;
+}
+
+static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    if (s->failed) {
+        return;
+    }
+    if (s->top >= s->cap && !wd_grow(s)) {
+        /* Drop every pending frame so the walk_defs loop drains and exits;
+         * walk_defs then marks the file's result as an extract error. */
+        s->failed = true;
+        s->top = 0;
+        return;
     }
     s->data[s->top++] = (walk_defs_frame_t){node, enclosing_qn};
 }
@@ -7997,7 +8166,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
     if (!s.arena) {
-        free(s.data);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, s.data);
+    }
+    if (s.failed) {
+        ctx->result->has_error = true;
+        ctx->result->error_msg = "definitions walk: stack allocation failed";
     }
 }
 

@@ -1653,3 +1653,15 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
     cbm_log_info("watcher.stop");
     return 0;
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+int cbm_watcher_test_pending_free_count(cbm_watcher_t *w) {
+    if (!w) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    int count = w->pending_free_count;
+    cbm_mutex_unlock(&w->projects_lock);
+    return count;
+}
+#endif
