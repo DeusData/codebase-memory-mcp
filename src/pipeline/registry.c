@@ -698,14 +698,16 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
            lang == CBM_LANG_ARKTS || lang == CBM_LANG_VUE || lang == CBM_LANG_SVELTE ||
-           lang == CBM_LANG_ASTRO;
+           lang == CBM_LANG_ASTRO || lang == CBM_LANG_HTML;
 }
 
 /* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
  * in the extension table, so a .c file referencing a symbol declared in its
- * own header would otherwise read as a language boundary. */
+ * own header would otherwise read as a language boundary. CUDA and Objective-C
+ * use the same front end for header calls (#1702 census addendum). */
 static bool c_cpp_family(CBMLanguage lang) {
-    return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_OBJC;
 }
 
 static bool jvm_family(CBMLanguage lang) {
@@ -724,6 +726,19 @@ static const char *path_basename(const char *path) {
     }
 #endif
     return slash ? slash + 1 : path;
+}
+
+/* Target language from basename alone is wrong for extensions whose real
+ * language is decided by file content during discovery (.m → MATLAB in the
+ * table but often Objective-C, etc.). Never suppress on filename guess alone. */
+static bool target_lang_from_filename_ambiguous(const char *target_file_path) {
+    const char *base = path_basename(target_file_path);
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot == base) {
+        return false;
+    }
+    return strcmp(dot, ".m") == 0 || strcmp(dot, ".cls") == 0 || strcmp(dot, ".inc") == 0 ||
+           strcmp(dot, ".cfc") == 0 || strcmp(dot, ".frm") == 0;
 }
 
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
@@ -747,6 +762,9 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
         return false;
     }
     if (caller_lang == target_lang) {
+        return false;
+    }
+    if (target_lang_from_filename_ambiguous(target_file_path)) {
         return false;
     }
     if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
@@ -781,6 +799,9 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
         return false;
     }
     if (caller_lang == target_lang) {
+        return false;
+    }
+    if (target_lang_from_filename_ambiguous(target_file_path)) {
         return false;
     }
     if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {

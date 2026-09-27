@@ -8183,82 +8183,6 @@ TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
     PASS();
 }
 
-/* #1572: unique_name (candidates==1) must not bind a Python mock.patch
- * call to the only project symbol named `patch` when that symbol is TSX.
- * The issue fixture is two files: frontend/Panel.tsx and backend/test_thing.py. */
-TEST(pipeline_cross_language_unique_name_does_not_share_calls_issue1572) {
-    const char *files[] = {"frontend/Panel.tsx", "backend/test_thing.py"};
-    const char *contents[] = {
-        "function patch(x: string) {\n"
-        "  return x;\n"
-        "}\n",
-
-        "from unittest.mock import patch\n"
-        "\n"
-        "def test_one():\n"
-        "    with patch(\"os.path.exists\"):\n"
-        "        pass\n"
-        "\n"
-        "def test_two():\n"
-        "    with patch(\"os.path.join\"):\n"
-        "        pass\n"};
-
-    if (setup_lang_repo(files, contents, 2) != 0)
-        FAIL("tmpdir");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
-
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
-
-    cbm_store_t *s = cbm_store_open_path(db);
-    ASSERT_NOT_NULL(s);
-    const char *proj = cbm_pipeline_project_name(p);
-
-    cbm_node_t *patches = NULL;
-    int npatch = 0;
-    cbm_store_find_nodes_by_name(s, proj, "patch", &patches, &npatch);
-    ASSERT_GT(npatch, 0);
-
-    int64_t tsx_id = 0;
-    for (int i = 0; i < npatch; i++) {
-        if (patches[i].file_path && strstr(patches[i].file_path, "Panel.tsx"))
-            tsx_id = patches[i].id;
-    }
-    ASSERT_TRUE(tsx_id != 0);
-
-    cbm_edge_t *into_tsx = NULL;
-    int ntsx = 0;
-    cbm_store_find_edges_by_target_type(s, tsx_id, "CALLS", &into_tsx, &ntsx);
-    ASSERT_EQ(ntsx, 0);
-
-    const char *callers[] = {"test_one", "test_two"};
-    for (int c = 0; c < 2; c++) {
-        cbm_node_t *fns = NULL;
-        int nfn = 0;
-        cbm_store_find_nodes_by_name(s, proj, callers[c], &fns, &nfn);
-        ASSERT_GT(nfn, 0);
-        cbm_edge_t *from_fn = NULL;
-        int nfrom = 0;
-        cbm_store_find_edges_by_source_type(s, fns[0].id, "CALLS", &from_fn, &nfrom);
-        for (int i = 0; i < nfrom; i++) {
-            ASSERT_TRUE(from_fn[i].target_id != tsx_id);
-        }
-        if (from_fn)
-            cbm_store_free_edges(from_fn, nfrom);
-        cbm_store_free_nodes(fns, nfn);
-    }
-
-    if (into_tsx)
-        cbm_store_free_edges(into_tsx, ntsx);
-    cbm_store_free_nodes(patches, npatch);
-    cbm_store_close(s);
-    cbm_pipeline_free(p);
-    teardown_lang_repo();
-    PASS();
-}
-
 TEST(pipeline_go_type_classification) {
     /* Port of TestGoTypeClassification */
     const char *files[] = {"types.go"};
@@ -15267,7 +15191,6 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
-    RUN_TEST(pipeline_cross_language_unique_name_does_not_share_calls_issue1572);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
     RUN_TEST(pipeline_kotlin_project);

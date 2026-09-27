@@ -1015,6 +1015,16 @@ TEST(cross_language_unique_name_drops_py_vs_tsx) {
                                                  "unique_name"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_VUE, "services/Queue.ts",
                                                           "unique_name"));
+    /* #1702 addendum: CUDA / ObjC / HTML inline script stay in-family. */
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_CUDA, "kernels/vec.h", "unique_name"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_OBJC, "include/Foo.h", "unique_name"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_HTML, "static/app.js", "unique_name"));
+    /* .m targets are MATLAB by extension table but often ObjC — do not suppress. */
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_OBJC, "models/Foo.m", "unique_name"));
     PASS();
 }
 
