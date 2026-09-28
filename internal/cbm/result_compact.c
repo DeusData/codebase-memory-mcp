@@ -20,6 +20,7 @@
 
 #include "cbm.h"
 #include "foundation/arena.h"
+#include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/constants.h"
 #include "foundation/mem_core.h"
 #include "result_spill.h" /* cbm_result_relocate */
@@ -47,6 +48,14 @@ typedef struct {
     bool failed;
     cr_slot_t *slots;
     size_t cap; /* power of two */
+    /* MEASURE records which slot each string reference landed in; COPY, which
+     * presents the very same references in the same order, replays them
+     * instead of measuring, hashing and comparing every string a second time
+     * (20 M repeated strlen + 31 M memcmp on the Go corpus, waste sanitizer
+     * 2026-09-17). */
+    uint32_t *seq;
+    size_t seq_len;
+    size_t seq_pos;
     /* RELOCATE: pointers in [old_base, old_base + old_len) move by delta. */
     const char *old_base;
     size_t old_len;
@@ -131,8 +140,16 @@ static void cr_str(cr_ctx_t *c, const char **field) {
         c->refs++;
         return;
     }
-    cr_slot_t *slot = cr_slot(c, s);
+    cr_slot_t *slot;
+    if (c->phase == CR_COPY && c->seq && c->seq_pos < c->seq_len) {
+        slot = &c->slots[c->seq[c->seq_pos++]];
+    } else {
+        slot = cr_slot(c, s);
+    }
     if (c->phase == CR_MEASURE) {
+        if (c->seq && c->seq_len < c->refs) {
+            c->seq[c->seq_len++] = (uint32_t)(slot - c->slots);
+        }
         if (!slot->dst) {
             slot->dst = (char *)s; /* mark as booked; reset before COPY */
             c->bytes += cr_aligned(slot->len + SKIP_ONE);
@@ -390,6 +407,64 @@ static size_t cr_pow2_at_least(size_t n) {
     return cap;
 }
 
+/* The intern table and the replay sequence, kept per pipeline worker: a fresh
+ * zeroed table per file was 21,875 allocations and 2.0 GB of pure churn on the
+ * Go corpus (waste sanitizer, 2026-09-17). Kept only on threads whose
+ * cbm_work_arena_release is guaranteed to run (cbm_work_arena_keeping), and
+ * only up to CR_KEEP_BYTES; anything else allocates per call as before. */
+enum { CR_KEEP_BYTES = 8 * 1024 * 1024 };
+static CBM_TLS void *tl_cr_buf;
+static CBM_TLS size_t tl_cr_bytes;
+
+void cbm_result_compact_release_thread(void) {
+    cbm_free(CBM_MEM_CLASS_EXTRACT, tl_cr_buf);
+    tl_cr_buf = NULL;
+    tl_cr_bytes = 0;
+}
+
+/* One zeroed block holding the slot table followed by the sequence. Returns
+ * whether the block is the kept one (then the caller must not free it). */
+static bool cr_scratch_get(cr_ctx_t *c) {
+    size_t slot_bytes = c->cap * sizeof(cr_slot_t);
+    size_t bytes = slot_bytes + (c->refs * sizeof(uint32_t));
+    bool keep = bytes <= (size_t)CR_KEEP_BYTES && cbm_work_arena_keeping();
+    void *buf = NULL;
+    if (keep && tl_cr_buf && tl_cr_bytes >= bytes) {
+        buf = tl_cr_buf;
+    } else if (keep) {
+        size_t grown = CR_MIN_TABLE; /* powers of two: a growing file mix reallocates rarely */
+        while (grown < bytes) {
+            grown *= PAIR_LEN;
+        }
+        if (grown > (size_t)CR_KEEP_BYTES) {
+            grown = bytes;
+        }
+        cbm_result_compact_release_thread();
+        tl_cr_buf = cbm_alloc(CBM_MEM_CLASS_EXTRACT, grown);
+        tl_cr_bytes = tl_cr_buf ? grown : 0;
+        buf = tl_cr_buf;
+    } else {
+        buf = cbm_alloc(CBM_MEM_CLASS_EXTRACT, bytes);
+    }
+    if (!buf) {
+        return false;
+    }
+    memset(
+        buf, 0,
+        slot_bytes); /* MEASURE needs an empty table; the sequence is written before it is read */
+    c->slots = (cr_slot_t *)buf;
+    c->seq = c->refs ? (uint32_t *)((char *)buf + slot_bytes) : NULL;
+    return true;
+}
+
+static void cr_scratch_put(cr_ctx_t *c) {
+    if ((void *)c->slots != tl_cr_buf) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, c->slots);
+    }
+    c->slots = NULL;
+    c->seq = NULL;
+}
+
 void cbm_result_compact(CBMFileResult *result) {
     if (!result || result->arena.nblocks == 0) {
         return;
@@ -405,8 +480,7 @@ void cbm_result_compact(CBMFileResult *result) {
     cr_walk(&c, &tmp);
 
     c.cap = cr_pow2_at_least(c.refs * CR_TABLE_LOAD + CR_MIN_TABLE);
-    c.slots = (cr_slot_t *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, c.cap * sizeof(cr_slot_t));
-    if (!c.slots) {
+    if (!cr_scratch_get(&c)) {
         return;
     }
 
@@ -419,14 +493,14 @@ void cbm_result_compact(CBMFileResult *result) {
     CBMArena fresh;
     cbm_arena_init_exact(&fresh, c.bytes);
     if (fresh.nblocks == 0) {
-        cbm_free(CBM_MEM_CLASS_EXTRACT, c.slots);
+        cr_scratch_put(&c);
         return;
     }
 
     c.phase = CR_COPY;
     c.dst = &fresh;
     cr_walk(&c, &tmp);
-    cbm_free(CBM_MEM_CLASS_EXTRACT, c.slots);
+    cr_scratch_put(&c);
     if (c.failed) {
         cbm_arena_destroy(&fresh);
         return;

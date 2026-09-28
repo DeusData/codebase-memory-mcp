@@ -114,6 +114,18 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
 int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
                        const cbm_lsh_entry_t **out_buf, int out_cap);
 
+/* A dedup set one thread reuses across many queries. Starting a query costs a
+ * generation increment, not a fresh 131 KB zeroed table: the similarity pass
+ * allocated one per query, 5.3 GB of churn over 42 k queries on the Go corpus
+ * (waste sanitizer, 2026-09-17). Not shareable between threads. */
+typedef struct cbm_lsh_seen cbm_lsh_seen_t;
+cbm_lsh_seen_t *cbm_lsh_seen_new(void);
+void cbm_lsh_seen_free(cbm_lsh_seen_t *seen);
+
+/* cbm_lsh_query_into with a caller-owned dedup set: same candidates, same order. */
+int cbm_lsh_query_into_seen(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                            const cbm_lsh_entry_t **out_buf, int out_cap, cbm_lsh_seen_t *seen);
+
 /* Free the LSH index and all internal storage. */
 void cbm_lsh_free(cbm_lsh_index_t *idx);
 

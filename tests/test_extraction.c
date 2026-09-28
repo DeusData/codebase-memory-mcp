@@ -8,6 +8,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "foundation/constants.h"     /* CBM_SZ_* */
+#include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
 #include <time.h>
@@ -976,6 +977,65 @@ TEST(c_struct) {
     PASS();
 }
 
+/* return_type of the first definition named `name`; NULL when there is no such
+ * definition or it carries no return type. */
+static const char *def_return_type(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, name) == 0) {
+            return r->defs.items[i].return_type;
+        }
+    }
+    return NULL;
+}
+
+/* PR #1245: the C grammar splits a declared return type across the `type` node,
+ * sibling type_qualifier nodes and the pointer_declarator chain wrapping the
+ * function declarator. Taking only the `type` node published `const char *` as
+ * "char". Canonical spelling: qualifiers, base type, one space, then the
+ * declarator markers unspaced (`const char *`, `char **`). */
+TEST(c_function_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r = extract("static const char *text_end(const char *text) { return text; }\n"
+                               "char **table(void) { return 0; }\n"
+                               "char const *east_const(void) { return 0; }\n"
+                               "const struct Point *find_point(void) { return 0; }\n"
+                               "volatile unsigned long *reg(void) { return 0; }\n"
+                               "char *const *frozen(void) { return 0; }\n",
+                               CBM_LANG_C, "t", "returns.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "text_end"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "table"), "char **");
+    ASSERT_STR_EQ(def_return_type(r, "east_const"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "find_point"), "const struct Point *");
+    ASSERT_STR_EQ(def_return_type(r, "reg"), "volatile unsigned long *");
+    ASSERT_STR_EQ(def_return_type(r, "frozen"), "char *const *");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Guard for the fix above: a return type with no qualifier and no declarator
+ * marker is already correct and must come out byte-identical. */
+TEST(c_function_return_type_plain_unchanged) {
+    CBMFileResult *r = extract("int scalar(void) { return 0; }\n"
+                               "void nothing(void) {}\n"
+                               "unsigned long wide(void) { return 0; }\n"
+                               "struct Point make_point(void) { struct Point p; return p; }\n"
+                               "static inline size_t count(void) { return 0; }\n"
+                               "_Noreturn void die(void) { for (;;) {} }\n",
+                               CBM_LANG_C, "t", "plain.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "scalar"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "nothing"), "void");
+    ASSERT_STR_EQ(def_return_type(r, "wide"), "unsigned long");
+    ASSERT_STR_EQ(def_return_type(r, "make_point"), "struct Point");
+    ASSERT_STR_EQ(def_return_type(r, "count"), "size_t");
+    /* _Noreturn parses as a type_qualifier but is not part of the type. */
+    ASSERT_STR_EQ(def_return_type(r, "die"), "void");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C++ --- */
 TEST(cpp_class) {
     CBMFileResult *r = extract(
@@ -985,6 +1045,42 @@ TEST(cpp_class) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Widget"));
     ASSERT(has_def(r, "Method", "draw"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* PR #1245, C++ side: in-class methods go through a separate extraction path
+ * from free functions, and C++ adds reference markers (`&`, `&&`) whose
+ * reference_declarator carries no `declarator` field. */
+TEST(cpp_method_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r = extract("class Text {\n"
+                               "public:\n"
+                               "    const char *end() { return nullptr; }\n"
+                               "    char **table() { return nullptr; }\n"
+                               "    Text &self() { return *this; }\n"
+                               "    const Text &cself() const { return *this; }\n"
+                               "    Text *&slot() { return next_; }\n"
+                               "    Text *next_;\n"
+                               "    int width() const { return 0; }\n"
+                               "    constexpr int square(int x) const { return x * x; }\n"
+                               "};\n"
+                               "const Text &shared() { static Text t; return t; }\n"
+                               "Text &&moved(Text &t) { return static_cast<Text &&>(t); }\n"
+                               "const char *Text::c_str() const { return nullptr; }\n",
+                               CBM_LANG_CPP, "t", "text.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "end"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "table"), "char **");
+    ASSERT_STR_EQ(def_return_type(r, "self"), "Text &");
+    ASSERT_STR_EQ(def_return_type(r, "cself"), "const Text &");
+    ASSERT_STR_EQ(def_return_type(r, "slot"), "Text *&");
+    ASSERT_STR_EQ(def_return_type(r, "width"), "int");
+    /* constexpr parses as a type_qualifier but is not part of the type. */
+    ASSERT_STR_EQ(def_return_type(r, "square"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "shared"), "const Text &");
+    ASSERT_STR_EQ(def_return_type(r, "moved"), "Text &&");
+    ASSERT_STR_EQ(def_return_type(r, "c_str"), "const char *");
     cbm_free_result(r);
     PASS();
 }
@@ -2940,6 +3036,106 @@ TEST(commonlisp_defmacro) {
     PASS();
 }
 
+/* 2026-09-16 probe: config extractors handed multi-line node text over as a
+ * name (8,301 elasticsearch YAML Fields, 91 kernel Makefile/.conf nodes with a
+ * line break inside), and JS/TS baselines named functions `{}` and variables
+ * `1`. The definition push is the one place every extractor goes through. */
+TEST(defs_push_cuts_multiline_names_and_rejects_js_literal_names) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMDefArray defs = {0};
+
+    CBMDefinition make = {0};
+    make.name = "endif\n\n$(obj)/pm_data-offsets.h";
+    make.qualified_name = "proj.arch.arm.mach-at91.Makefile.endif\n\n$(obj)/pm_data-offsets.h";
+    make.label = "Function";
+    make.file_path = "arch/arm/mach-at91/Makefile";
+    cbm_defs_push(&defs, &a, make);
+    ASSERT_EQ(defs.count, 1);
+    ASSERT_STR_EQ(defs.items[0].name, "endif");
+    ASSERT_STR_EQ(defs.items[0].qualified_name, "proj.arch.arm.mach-at91.Makefile.endif");
+
+    CBMDefinition yaml = {0};
+    yaml.name = "Test get datafeed stats given missing datafeed_id   \r\n  - do:";
+    yaml.qualified_name =
+        "proj.spec.Test get datafeed stats given missing datafeed_id   \r\n  - do:";
+    yaml.label = "Field";
+    yaml.file_path = "rest-api-spec/test/ml/get_datafeed_stats.yml";
+    cbm_defs_push(&defs, &a, yaml);
+    ASSERT_EQ(defs.count, 2);
+    ASSERT_STR_EQ(defs.items[1].name, "Test get datafeed stats given missing datafeed_id");
+
+    /* JS/TS: a literal token is not a name. */
+    CBMDefinition brace = {0};
+    brace.name = "{}";
+    brace.qualified_name = "proj.tests.baselines.x.{}";
+    brace.label = "Function";
+    brace.file_path = "tests/baselines/reference/x.js";
+    cbm_defs_push(&defs, &a, brace);
+    CBMDefinition one = {0};
+    one.name = "1";
+    one.qualified_name = "proj.tests.cases.y.1";
+    one.label = "Variable";
+    one.file_path = "tests/cases/y.ts";
+    cbm_defs_push(&defs, &a, one);
+    ASSERT_EQ(defs.count, 2);
+
+    /* Real JS names, including private members and `$`-prefixed ones, stay. */
+    CBMDefinition priv = {0};
+    priv.name = "#secret";
+    priv.qualified_name = "proj.src.a.Klass.#secret";
+    priv.label = "Method";
+    priv.file_path = "src/a.ts";
+    cbm_defs_push(&defs, &a, priv);
+    CBMDefinition dollar = {0};
+    dollar.name = "$scope";
+    dollar.qualified_name = "proj.src.b.$scope";
+    dollar.label = "Variable";
+    dollar.file_path = "src/b.js";
+    cbm_defs_push(&defs, &a, dollar);
+    ASSERT_EQ(defs.count, 4);
+
+    /* Member keys JS spells without an identifier start are names too:
+     * computed, string-literal and escaped (1,782 real definitions in the
+     * TypeScript corpus wore these spellings). */
+    const char *member_keys[] = {"[Symbol.iterator]", "\"my-key\"", "'x'", "\\u0410"};
+    for (int i = 0; i < 4; i++) {
+        CBMDefinition member = {0};
+        member.name = member_keys[i];
+        member.qualified_name = member_keys[i];
+        member.label = "Method";
+        member.file_path = "src/c.ts";
+        cbm_defs_push(&defs, &a, member);
+    }
+    ASSERT_EQ(defs.count, 8);
+
+    /* Tokens that are not names in any spelling: patterns, numeric literals,
+     * parenthesised types, rest elements. */
+    const char *tokens[] = {"{ b11 } = { b11: \"string\" }", "0x0",  "3.2e1",
+                            "(x: number) => string",         "...a", "?"};
+    for (int i = 0; i < 6; i++) {
+        CBMDefinition token = {0};
+        token.name = tokens[i];
+        token.qualified_name = tokens[i];
+        token.label = "Variable";
+        token.file_path = "tests/cases/z.js";
+        cbm_defs_push(&defs, &a, token);
+    }
+    ASSERT_EQ(defs.count, 8);
+
+    /* Other languages may legitimately name operators: untouched. */
+    CBMDefinition op = {0};
+    op.name = "<$>";
+    op.qualified_name = "proj.Data.Functor.<$>";
+    op.label = "Function";
+    op.file_path = "src/Data/Functor.hs";
+    cbm_defs_push(&defs, &a, op);
+    ASSERT_EQ(defs.count, 9);
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(makefile_rule_as_function) {
     CBMFileResult *r = extract("all:\n\t@echo hello\n", CBM_LANG_MAKEFILE, "test", "Makefile");
     ASSERT_NOT_NULL(r);
@@ -3069,6 +3265,93 @@ TEST(python_iris_classMethodValue) {
     PASS();
 }
 
+/* #1260: count calls with an exact callee whose enclosing function qn ends
+ * with ".<func>". has_call() is a substring match, which cannot tell
+ * "Pkg.A.Run" emitted from want_a apart from the same callee in want_b. */
+static int count_calls_in_func(CBMFileResult *r, const char *callee, const char *func) {
+    int n = 0;
+    size_t flen = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || strcmp(c->callee_name, callee) != 0 || !c->enclosing_func_qn) {
+            continue;
+        }
+        size_t qlen = strlen(c->enclosing_func_qn);
+        if (qlen > flen && c->enclosing_func_qn[qlen - flen - 1] == '.' &&
+            strcmp(c->enclosing_func_qn + qlen - flen, func) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* #1260: calls in `func` whose callee is "Run" or ends in ".Run", whatever
+ * the qualifier. One iris.cls("X").Run() site must emit exactly one. */
+static int count_run_calls_in_func(CBMFileResult *r, const char *func) {
+    int n = 0;
+    size_t flen = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || !c->enclosing_func_qn) {
+            continue;
+        }
+        size_t cl = strlen(c->callee_name);
+        bool is_run = strcmp(c->callee_name, "Run") == 0 ||
+                      (cl > 4 && strcmp(c->callee_name + cl - 4, ".Run") == 0);
+        size_t qlen = strlen(c->enclosing_func_qn);
+        if (is_run && qlen > flen && c->enclosing_func_qn[qlen - flen - 1] == '.' &&
+            strcmp(c->enclosing_func_qn + qlen - flen, func) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(python_iris_cls_receiver_is_class_aware) {
+    CBMFileResult *r = extract("import iris\n"
+                               "def want_a():\n"
+                               "    return iris.cls(\"Pkg.A\").Run(\"x\")\n"
+                               "def want_b():\n"
+                               "    return iris.cls('Pkg.B').Run('x')\n"
+                               "def dynamic(name):\n"
+                               "    return iris.cls(name).Run('x')\n"
+                               "def fstring(n):\n"
+                               "    return iris.cls(f'Pkg.{n}').Run('x')\n"
+                               "def unrelated_receiver():\n"
+                               "    return some_random_thing.Run('x')\n",
+                               CBM_LANG_PYTHON, "t", "caller.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_a"), 1);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.B.Run", "want_b"), 1);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_b"), 0);
+    /* The class-qualified callee replaces the bare one: no second call per site. */
+    ASSERT_EQ(count_run_calls_in_func(r, "want_a"), 1);
+    ASSERT_EQ(count_run_calls_in_func(r, "want_b"), 1);
+    ASSERT_EQ(count_run_calls_in_func(r, "dynamic"), 1);
+    /* A non-literal class argument names nothing: no class-qualified callee. */
+    ASSERT_EQ(count_calls_in_func(r, "name.Run", "dynamic"), 0);
+    /* An f-string is a Python "string" node but not a class name. */
+    ASSERT_EQ(count_calls_in_func(r, "f'Pkg.{n}'.Run", "fstring"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.{n}.Run", "fstring"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "unrelated_receiver"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.B.Run", "unrelated_receiver"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(python_iris_invokeClassMethod) {
+    CBMFileResult *r =
+        extract("def call(db):\n"
+                "    return db.invokeClassMethod('MyApp.Service', 'SomeClassMethod', 1)\n",
+                CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_in_func(r, "MyApp.Service.SomeClassMethod", "call"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(go_calls) {
     CBMFileResult *r =
         extract("package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"hello\") }\n",
@@ -3110,6 +3393,25 @@ TEST(go_imports) {
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
     ASSERT(has_import(r, "fmt"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* cgo's `import "C"` is a pseudo-package, not a real import: keeping it lets the
+ * import resolver name-match "C" onto an arbitrary project symbol called C. The
+ * real imports of the same file must survive. */
+TEST(go_cgo_pseudo_import_dropped) {
+    CBMFileResult *r = extract("package m\n\n/*\nstatic int helper(void) { return 1; }\n*/\n"
+                               "import \"C\"\n\nimport \"fmt\"\n\n"
+                               "func Run() { fmt.Println(C.helper()) }\n",
+                               CBM_LANG_GO, "t", "cgo.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "fmt"));
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT_NOT_NULL(r->imports.items[i].module_path);
+        ASSERT_TRUE(strcmp(r->imports.items[i].module_path, "C") != 0);
+    }
     cbm_free_result(r);
     PASS();
 }
@@ -4175,6 +4477,106 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* JAX-RS @Path values are URI templates relative to the enclosing resource;
+ * the leading slash is optional and ignored by the framework. Relative class
+ * and method templates must compose to the same rooted routes as the
+ * slash-prefixed spelling above. */
+TEST(extract_java_jaxrs_relative_path_templates) {
+    CBMFileResult *r = extract("import jakarta.ws.rs.GET;\n"
+                               "import jakarta.ws.rs.Path;\n"
+                               "@Path(\"api/v1/widgets\")\n"
+                               "public class WidgetResource {\n"
+                               "  @GET\n"
+                               "  public String list() { return \"\"; }\n"
+                               "  @GET\n"
+                               "  @Path(\"count\")\n"
+                               "  public String count() { return \"\"; }\n"
+                               "  @GET\n"
+                               "  @Path(\"{id}/tags\")\n"
+                               "  public String tags() { return \"\"; }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "WidgetResource.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *list = find_def_by_name(r, "list");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(list->route_path);
+    ASSERT_STR_EQ(list->route_path, "/api/v1/widgets");
+    ASSERT_STR_EQ(list->route_method, "GET");
+    const CBMDefinition *count = find_def_by_name(r, "count");
+    ASSERT_NOT_NULL(count);
+    ASSERT_NOT_NULL(count->route_path);
+    ASSERT_STR_EQ(count->route_path, "/api/v1/widgets/count");
+    ASSERT_STR_EQ(count->route_method, "GET");
+    const CBMDefinition *tags = find_def_by_name(r, "tags");
+    ASSERT_NOT_NULL(tags);
+    ASSERT_NOT_NULL(tags->route_path);
+    ASSERT_STR_EQ(tags->route_path, "/api/v1/widgets/{id}/tags");
+    ASSERT_STR_EQ(tags->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* @Path("") is legal JAX-RS and means "the class path itself". Accepting
+ * relative templates must not turn it into an empty route path: the method
+ * has to behave exactly like one without @Path (fallback to "/", then
+ * class-level composition). The class without a class-level @Path is the
+ * binding case: an empty method path would otherwise drop the route. */
+TEST(extract_java_jaxrs_empty_path_means_class_path) {
+    CBMFileResult *r = extract("import jakarta.ws.rs.GET;\n"
+                               "import jakarta.ws.rs.Path;\n"
+                               "@Path(\"api/v1/widgets\")\n"
+                               "class WidgetResource {\n"
+                               "  @GET\n"
+                               "  @Path(\"\")\n"
+                               "  public String root() { return \"\"; }\n"
+                               "}\n"
+                               "class RootResource {\n"
+                               "  @GET\n"
+                               "  @Path(\"\")\n"
+                               "  public String index() { return \"\"; }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "Resources.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *root = find_def_by_name(r, "root");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(root->route_path);
+    ASSERT_STR_EQ(root->route_path, "/api/v1/widgets");
+    ASSERT_STR_EQ(root->route_method, "GET");
+    const CBMDefinition *index = find_def_by_name(r, "index");
+    ASSERT_NOT_NULL(index);
+    ASSERT_NOT_NULL(index->route_path);
+    ASSERT_STR_EQ(index->route_path, "/");
+    ASSERT_STR_EQ(index->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Negative control: relative templates are accepted for JAX-RS @Path only.
+ * A slash-less string on a non-JAX-RS mapping annotation must keep the
+ * previous behaviour (the literal is not read as a route path), so the
+ * relaxation cannot broaden route extraction for other frameworks. */
+TEST(extract_java_spring_relative_string_not_route_path) {
+    CBMFileResult *r = extract("import org.springframework.web.bind.annotation.GetMapping;\n"
+                               "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                               "@RequestMapping(\"api\")\n"
+                               "public class OrderController {\n"
+                               "  @GetMapping(\"orders\")\n"
+                               "  public String listOrders() { return \"\"; }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "OrderController.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *list = find_def_by_name(r, "listOrders");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(list->route_path);
+    ASSERT_STR_EQ(list->route_path, "/");
+    ASSERT_STR_EQ(list->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Return the file's Module definition (extraction pushes it first), or NULL. */
 static const CBMDefinition *find_module_def(CBMFileResult *r) {
     for (int i = 0; i < r->defs.count; i++) {
@@ -4358,10 +4760,68 @@ TEST(swift_labeled_call_string_arg_issue1892) {
     PASS();
 }
 
+/* Swift has no URL literal, so real code builds one and force-unwraps it. The
+ * string then sits two levels below the argument list. */
+TEST(swift_nested_url_constructor_issue1892) {
+    CBMFileResult *r = extract("func fetch() { URLSession.shared.dataTask(with: URL(string: "
+                               "\"https://example.com/api/v1/widgets\")!) }\n",
+                               CBM_LANG_SWIFT, "t", "Fetch.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "URLSession.shared.dataTask");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "https://example.com/api/v1/widgets");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Without the trailing "!" the constructor is not wrapped in a
+ * postfix_expression, so this covers the other shape. */
+TEST(swift_nested_url_no_bang_issue1892) {
+    CBMFileResult *r =
+        extract("func fetch() { client.send(to: URLRequest(url: \"/api/v1/widgets/1\")) }\n",
+                CBM_LANG_SWIFT, "t", "Send.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "client.send");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/widgets/1");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A constructor that is not one of the three URL types keeps its own meaning:
+ * the outer call must not borrow the inner call's string. */
+TEST(swift_non_url_constructor_untouched_issue1892) {
+    CBMFileResult *r = extract("func f() { log.write(to: Formatter(pattern: \"%s-%d\")) }\n",
+                               CBM_LANG_SWIFT, "t", "Log.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "log.write");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NULL(c->first_string_arg);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1009: URL-builder helper pattern — a function returning a URL-shaped
  * literal, consumed as client(buildPath(id)). The builder's URL is recorded in
  * the per-file constant map and resolved at the call site, for both return
  * statements and arrow expression bodies. */
+TEST(extract_ts_await_generic_call_issue2210) {
+    CBMFileResult *r = extract("function parseJsonBody<T>() { return {} as T; }\n"
+                               "async function plain() { return await parseJsonBody(); }\n"
+                               "async function generic() { return await parseJsonBody<string>(); }\n",
+                               CBM_LANG_TYPESCRIPT, "t", "await.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_named(r, "parseJsonBody"), 2);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_ts_url_builder_issue1009) {
     CBMFileResult *r = extract("function thingDetail(id: string): string {\n"
                                "  return `/api/v1/things/${id}/detail`;\n"
@@ -5107,6 +5567,38 @@ TEST(complexity_access_depth_and_params) {
     PASS();
 }
 
+/* The definitions walk kept its pending frames under a ceiling (8M frames,
+ * env CBM_WALK_DEFS_MAX) and stopped pushing once it was reached. Children are
+ * pushed last-to-first, so a file wider than the ceiling lost its FIRST
+ * top-level definitions. The ceiling and its env knob are gone; the knob is set
+ * here to a value this file exceeds to prove it no longer decides content. */
+enum { WIDE_DEFS = 1000, WIDE_DEFS_OLD_CAP = 256 };
+
+TEST(walk_defs_wide_file_extracts_every_definition) {
+    size_t cap = (size_t)WIDE_DEFS * 32 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_DEFS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "int wd%d(void) { return %d; }\n", i, i);
+    }
+    char lim[16];
+    snprintf(lim, sizeof(lim), "%d", WIDE_DEFS_OLD_CAP);
+    cbm_setenv("CBM_WALK_DEFS_MAX", lim, 1);
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_defs.c");
+    cbm_unsetenv("CBM_WALK_DEFS_MAX");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_DEFS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "wd%d", i);
+        ASSERT_NOT_NULL(find_def(r, name));
+    }
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Perl call-graph noise (#459 follow-up)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5771,6 +6263,370 @@ TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
     PASS();
 }
 
+/* #1989: build-system export macros (UE "<MOD>_API", CMake generate_export_header
+ * "<lib>_EXPORT") are empty on the real compile line but opaque to tree-sitter,
+ * so `class MOD_API Foo` misparses. The preprocessed second pass predefines the
+ * conventional export-macro-shaped identifiers found in the file as empty, and
+ * the recovery loop adopts the corrected type defs (superseding the raw
+ * misparse artifacts). */
+TEST(extract_cpp_export_macro_class_recovery_issue1989) {
+    CBMFileResult *r = extract("#pragma once\n"
+                               "UCLASS()\n"
+                               "class DUMMY_API UFoo : public UObject\n"
+                               "{\n"
+                               "    GENERATED_BODY()\n"
+                               "public:\n"
+                               "    int32 X = 0;\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "UFoo");
+    ASSERT_NOT_NULL(cls); /* was missing entirely before the fix */
+    ASSERT_EQ(cls->start_line, 3u);
+    ASSERT_NULL(find_def(r, "DUMMY_API")); /* macro-as-name artifact superseded */
+    /* The raw misparse also mints a phantom Function def NAMED AFTER THE BASE
+     * CLASS spanning the whole class ("UObject" from the declarator of the
+     * broken function_definition shape) — it must be suppressed, not just the
+     * macro-named artifact. */
+    ASSERT_NULL(find_def(r, "UObject"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_struct_recovery_issue1989) {
+    /* The struct case is the SILENT failure: the raw tree parses "successfully"
+     * with the macro token as the name and raises no error flag at all. */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "USTRUCT()\n"
+                               "struct DUMMY_API FBar\n"
+                               "{\n"
+                               "    int32 Y;\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue_struct.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *st = find_def(r, "FBar");
+    ASSERT_NOT_NULL(st);
+    ASSERT(st->label && strcmp(st->label, "Class") == 0); /* struct_specifier -> Class */
+    ASSERT_NULL(find_def(r, "DUMMY_API"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_enum_recovery_issue1989) {
+    /* `enum class MOD_API EKind` is lost to an ERROR region entirely. */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "UENUM()\n"
+                               "enum class DUMMY_API EKind : uint8\n"
+                               "{\n"
+                               "    A,\n"
+                               "    B\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue_enum.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "EKind"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_free_function_recovery_issue1989) {
+    /* A free function DEFINED with the export macro is lost to an ERROR region
+     * on the raw tree (prototypes never mint defs — same as clean code). */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "DUMMY_API int Add(int a, int b)\n"
+                               "{\n"
+                               "    return a + b;\n"
+                               "}\n",
+                               CBM_LANG_CPP, "p", "ue_fn.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "Add"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_inline_method_recovery_issue1989) {
+    /* The misparsed class parsed as a function body on the raw tree, so the
+     * raw walk never extracted its inline methods — the rescued class def must
+     * carry them in via the nested-span adoption. */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "class DUMMY_API FCalc\n"
+                               "{\n"
+                               "public:\n"
+                               "    int Add(int a, int b) { return a + b; }\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue_inline.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "FCalc");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0); /* not the raw "Function" mislabel */
+    const CBMDefinition *m = find_def(r, "Add");
+    ASSERT_NOT_NULL(m);
+    ASSERT(m->label && strcmp(m->label, "Method") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Negative control the maintainer asked for: ordinary ALL_CAPS identifiers
+ * (constants, enum values) must NOT be swept in as export-macro candidates and
+ * stripped from the graph. Only the narrow _API/_EXPORT/... suffix shape is. */
+TEST(extract_cpp_export_macro_negative_control_ordinary_caps_issue1989) {
+    CBMFileResult *r = extract("#pragma once\n"
+                               "#define MAX_CONNECTIONS 16\n"
+                               "const int TIMEOUT_MS = 250;\n"
+                               "enum class State { IDLE, RUNNING };\n"
+                               "struct Config { int MAX_RETRIES; };\n",
+                               CBM_LANG_CPP, "p", "caps.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "Config"));
+    ASSERT_TRUE(has_def(r, "Variable", "TIMEOUT_MS"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* C files get the same rescue (SQLITE_API-style prefixes are C, not C++). */
+TEST(extract_c_export_macro_recovery_issue1989) {
+    CBMFileResult *r = extract("typedef struct sqlite3 sqlite3;\n"
+                               "SQLITE_API int sqlite3_open(const char *path)\n"
+                               "{\n"
+                               "    return 0;\n"
+                               "}\n",
+                               CBM_LANG_C, "p", "db.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "sqlite3_open"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review (P1): an over-long candidate-shaped identifier (>= 96 chars)
+ * arriving AFTER a stored candidate must be rejected BEFORE the dedup
+ * compares — the pre-fix dedup ran strncmp(out[k], src, len) with
+ * len >= CBM_EXPORT_MACRO_NAME_MAX against 96-byte rows (out-of-bounds read;
+ * sanitizer lanes crash). Locally unsanitized, so this pins the behavior
+ * (normal candidate still recovers, no crash); CI's sanitized lanes guard
+ * the memory error itself. */
+TEST(extract_cpp_export_macro_overlong_candidate_safe_issue1989) {
+    char src[4096];
+    int off = snprintf(src, sizeof(src), "class MOD_API First { int v; };\nclass ");
+    ASSERT_GTE(off, 0);
+    memset(src + off, 'A', 100);
+    off += 100;
+    ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off, "_API Long { int w; };\n"), 0);
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "overlong.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *first = find_def(r, "First");
+    ASSERT_NOT_NULL(first);
+    ASSERT(first->label && strcmp(first->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review (P2): candidate-shaped tokens inside comments and string
+ * literals must NOT consume the bounded budget — 32 of them ahead of the real
+ * class would otherwise exhaust the cap and leave the real macro undefined. */
+TEST(extract_cpp_export_macro_comment_string_budget_issue1989) {
+    char src[8192];
+    int off = 0;
+    for (int n = 0; n < 31; n++) {
+        ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off, "// see DOC%02d_API notes\n", n),
+                   0);
+        off += (int)strlen(src + off);
+    }
+    ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off,
+                        "static const char *kRef = \"STRING_DOC_API\";\n"
+                        "class REALMOD_API Real { int v; };\n"),
+               0);
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "budget.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Real");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review: the bounded-budget contract — 33 distinct candidates collect
+ * only the first CBM_EXPORT_MACRO_MAX (32, in source order); the 33rd stays
+ * unpredefined and its class keeps the raw misparse (value label, not Class). */
+TEST(extract_cpp_export_macro_candidate_cap_issue1989) {
+    char src[8192];
+    int off = 0;
+    for (int n = 0; n < 33; n++) {
+        ASSERT_GTE(
+            snprintf(src + off, sizeof(src) - (size_t)off, "class CAP%02d_API K%02d {};\n", n, n),
+            0);
+        off += (int)strlen(src + off);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "cap.h");
+    ASSERT_NOT_NULL(r);
+    int recovered = 0;
+    for (int n = 0; n < 33; n++) {
+        char name[8];
+        snprintf(name, sizeof(name), "K%02d", n);
+        const CBMDefinition *d = find_def(r, name);
+        if (d && d->label && strcmp(d->label, "Class") == 0) {
+            recovered++;
+        }
+    }
+    ASSERT_EQ(recovered, 32);
+    /* The cap contract's other half: the 33rd candidate (K32) must STILL be
+     * present with its raw misparse — dropping the def entirely would be a
+     * regression, not a graceful cap. */
+    const CBMDefinition *cap_tail = find_def(r, "K32");
+    ASSERT_NOT_NULL(cap_tail);
+    ASSERT_TRUE(!cap_tail->label || strcmp(cap_tail->label, "Class") != 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review round 2: line-spliced // comments. A backslash before the
+ * newline continues the comment (splicing happens before comment
+ * recognition), so "FAKE_API" below is comment text and must NOT consume
+ * budget. 32 spliced fake comments would otherwise exhaust the cap and leave
+ * the real class unrecovered. */
+TEST(extract_cpp_export_macro_spliced_comment_budget_issue1989) {
+    char src[8192];
+    int off = 0;
+    for (int n = 0; n < 31; n++) {
+        ASSERT_GTE(
+            snprintf(src + off, sizeof(src) - (size_t)off, "// fake \\\nFAKE%02d_API notes\n", n),
+            0);
+        off += (int)strlen(src + off);
+    }
+    ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off,
+                        "// last \\\r\nSPLICEFAKE_API notes\n"
+                        "class REALMOD_API Real { int v; };\n"),
+               0);
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "spliced.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Real");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review round 2: C++ raw string literals. Tokens inside R"(...)"
+ * must not be collected, and code after the literal must still be scanned —
+ * an unmodeled raw string previously let "BAR_API" leak in AND masked the
+ * real candidate after the literal's closing quote. An unrecognizable raw
+ * form (unterminated/malformed delimiter) stops collection entirely so scan
+ * state cannot be poisoned. */
+TEST(extract_cpp_export_macro_raw_string_issue1989) {
+    CBMFileResult *r = extract("const char *s = R\"(foo \" BAR_API)\";\n"
+                               "class REALMOD_API Real { int v; };\n",
+                               CBM_LANG_CPP, "p", "raw.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Real");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_raw_string_delimited_issue1989) {
+    CBMFileResult *r = extract("auto log = R\"log(FOO_API \"quote\")log\";\n"
+                               "class DELIMMOD_API Delim { int v; };\n",
+                               CBM_LANG_CPP, "p", "raw_delim.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Delim");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review: every conventional suffix variant must be collected and
+ * recovered, not just _API. */
+TEST(extract_cpp_export_macro_suffix_variants_issue1989) {
+    CBMFileResult *r = extract("class LIB_EXPORT A1 { int v; };\n"
+                               "class LIB_IMPORT B2 { int v; };\n"
+                               "class LIB_DLLEXPORT C3 { int v; };\n"
+                               "class LIB_DEPRECATED D4 { int v; };\n",
+                               CBM_LANG_CPP, "p", "suffix.h");
+    ASSERT_NOT_NULL(r);
+    const char *names[] = {"A1", "B2", "C3", "D4"};
+    for (int n = 0; n < 4; n++) {
+        const CBMDefinition *d = find_def(r, names[n]);
+        ASSERT_NOT_NULL(d);
+        ASSERT(d->label && strcmp(d->label, "Class") == 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review: caller-provided defines win — the collector must not push a
+ * define for a name the caller already provided (a duplicate could flip the
+ * expansion and silently change what parses). With an explicit empty define
+ * the class still recovers; with a caller define that corrupts the header,
+ * the injected empty define must NOT clobber it back into parsing. */
+TEST(extract_cpp_export_macro_explicit_define_priority_issue1989) {
+    const char *src = "class MYMOD_API Foo { int v; };\n";
+
+    const char *empty_defines[] = {"MYMOD_API=", NULL};
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "p", "prio_empty.h", 0,
+                                        empty_defines, NULL);
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Foo");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+
+    const char *body_defines[] = {"MYMOD_API=Junk", NULL};
+    CBMFileResult *r2 = cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "p", "prio_body.h", 0,
+                                         body_defines, NULL);
+    ASSERT_NOT_NULL(r2);
+    const CBMDefinition *foo2 = find_def(r2, "Foo");
+    ASSERT_TRUE(foo2 == NULL || (foo2->label && strcmp(foo2->label, "Class") != 0));
+    cbm_free_result(r2);
+    PASS();
+}
+
+/* #1989 review round 2: the collector CONTRACT itself, called directly (the
+ * reviewer's method): the raw string's inner token is not a candidate and the
+ * code after the literal IS. */
+TEST(extract_cpp_export_macro_collector_raw_string_contract_issue1989) {
+    const char *src = "const char *s = R\"(foo \" BAR_API)\";\n"
+                      "class REALMOD_API Real { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 1);
+    ASSERT(strcmp(out[0], "REALMOD_API") == 0);
+    PASS();
+}
+
+/* Delimiter form R"log(...)log" works the same way. */
+TEST(extract_cpp_export_macro_collector_raw_string_delim_contract_issue1989) {
+    const char *src = "auto log = R\"log(FOO_API \"q\")log\";\n"
+                      "class DELIMMOD_API Delim { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 1);
+    ASSERT(strcmp(out[0], "DELIMMOD_API") == 0);
+    PASS();
+}
+
+/* A double quote is a legal raw-string delimiter character. Keep scanning
+ * after R"""(...)""" so a later export macro is still collected. */
+TEST(extract_cpp_export_macro_collector_raw_string_quote_delim_issue1989) {
+    const char *src = "const char *s = R\"\"\"(FOO_API)\"\"\";\n"
+                      "class QUOTEMOD_API Quoted { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 1);
+    ASSERT(strcmp(out[0], "QUOTEMOD_API") == 0);
+    PASS();
+}
+
+/* Unterminated raw literal: the scan stops rather than mis-tokenizing the
+ * rest of the file (uncertain state -> fail toward raw behavior). */
+TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989) {
+    const char *src = "const char *s = R\"(never closed BAR_API\n"
+                      "class REALMOD_API Real { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
 /* #668: walk_defs used a fixed `walk_defs_frame_t stack[4096]` — a ~160 KB
  * C-stack frame that overflowed small thread stacks (the reporter's crash was in
  * the "definitions pass" on a large SQL file), and whose `top < 4096` push guards
@@ -6219,6 +7075,96 @@ TEST(extract_wide_flat_reference_fields_are_linear) {
         snprintf(message, sizeof(message),
                  "wide-reference field lookup grew from %llu to %llu for %dx input "
                  "(maximum %dx + 256) -- quadratic sibling scan",
+                 (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
+                 WORK_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+
+/* The same guard for C#, whose callable-value site walk was the last one still
+ * climbing with ts_node_parent instead of the walk cursor. tree-sitter answers
+ * ts_node_parent by descending from the ROOT, so every step costs O(depth) and
+ * a deep file pays it per identifier. The .NET JIT tests are exactly that —
+ * single expressions megabytes deep — and they cost 18-48 us per node, which is
+ * why they were the only files a CPU-time budget ever cut off, and why the C#
+ * graph differed between two runs on one machine (2026-09-19). The budget is
+ * gone; this keeps the reason it was needed from coming back. */
+static uint64_t extract_csharp_argument_value_work(int statement_count, int *out_usages,
+                                                   uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "class C {\n"
+                                 "  static void Sink(object o) {}\n"
+                                 "  static void Target() {}\n"
+                                 "  static void Wide() {\n";
+    /* Parenthesised on purpose: a bare `Sink(Target)` needs no climb at all, so
+     * it cannot tell the cursor walk from the root-descending one and the test
+     * would pass either way. The wrapper makes the site walk take a step. */
+    static const char statement[] = "    Sink((Target));\n";
+    static const char suffix[] = "  }\n}\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement) + sizeof(suffix);
+    char *source = malloc(capacity);
+    if (!source) {
+        return UINT64_MAX;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    memcpy(source + offset, suffix, sizeof(suffix));
+    offset += sizeof(suffix) - 1U;
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)offset, CBM_LANG_CSHARP, "proj", "Wide.cs", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return UINT64_MAX;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "Target") == 0) {
+            usages++;
+        }
+    }
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return work;
+}
+
+TEST(extract_csharp_argument_values_use_the_walk_cursor) {
+    enum { SMALL = 128, BIG = 1024, INPUT_GROWTH = 8, WORK_RATIO_MAX = 12 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_slow_parent_fallbacks = 0;
+    uint64_t big_slow_parent_fallbacks = 0;
+    uint64_t small_work =
+        extract_csharp_argument_value_work(SMALL, &small_usages, &small_slow_parent_fallbacks);
+    uint64_t big_work =
+        extract_csharp_argument_value_work(BIG, &big_usages, &big_slow_parent_fallbacks);
+    ASSERT_TRUE(small_work != UINT64_MAX);
+    ASSERT_TRUE(big_work != UINT64_MAX);
+    /* Anti-vacuous: the occurrences really were classified, so a zero fallback
+     * count means "took the cursor", not "never looked". */
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    /* The assertion this test exists for: not one occurrence fell back to the
+     * root-descending parent lookup. */
+    ASSERT_EQ(small_slow_parent_fallbacks, 0);
+    ASSERT_EQ(big_slow_parent_fallbacks, 0);
+    fprintf(stderr, "  [csharp-argument-values] work(%d)=%llu work(%d)=%llu input_growth=%dx\n",
+            SMALL, (unsigned long long)small_work, BIG, (unsigned long long)big_work, INPUT_GROWTH);
+    uint64_t maximum = small_work * WORK_RATIO_MAX + 256U;
+    if (big_work > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "csharp argument-value lookup grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- the site walk is not linear",
                  (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
                  WORK_RATIO_MAX);
         FAIL(message);
@@ -6708,6 +7654,38 @@ static int find_call_args(const CBMFileResult *r, const char *callee, const char
         }
     }
     return -1;
+}
+
+/* tree-sitter lists a comment inside an argument list as a named child; it is
+ * not an argument. A Java constructor call whose argument list opened with a
+ * slash-star comment handed the comment text to the Route pass as a URL
+ * (three Route nodes named by comments on elasticsearch, 2026-09-16). */
+TEST(call_args_skip_comments_between_arguments) {
+    CBMFileResult *r = extract("class A {\n"
+                               "  void f() {\n"
+                               "    app.get(/* the orders listing */ \"/orders\", handler);\n"
+                               "    new TestCase(\n"
+                               "        /*\n"
+                               "         * a multi-line note\n"
+                               "         */\n"
+                               "        \"x\", // trailing\n"
+                               "        1);\n"
+                               "  }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "A.java");
+    ASSERT_NOT_NULL(r);
+    const char *arg0 = NULL;
+    const char *arg1 = NULL;
+    int argc = find_call_args(r, "get", &arg0, &arg1);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(arg0, "\"/orders\"");
+    ASSERT_STR_EQ(arg1, "handler");
+    argc = find_call_args(r, "TestCase", &arg0, &arg1);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(arg0, "\"x\"");
+    ASSERT_STR_EQ(arg1, "1");
+    cbm_free_result(r);
+    PASS();
 }
 
 TEST(objectscript_data_flows_class_method_args) {
@@ -7323,11 +8301,15 @@ TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
     ASSERT(shared);
 
     /* The arena stays usable for the cross-file pass: growth restarts at the
-     * default block, never at twice the compact block. */
+     * small append block, never at twice the compact block. (It restarted at
+     * the 64 KB default until 2026-09-17: the cross-file pass appends a few
+     * resolved calls, so that block was ~60 KB of untouched memory per
+     * appended-to result — 0.5 GB of the worker's peak on the Go corpus.
+     * See CBM_ARENA_APPEND_BLOCK.) */
     char *later = cbm_arena_strdup(&r->arena, "appended after compaction");
     ASSERT_NOT_NULL(later);
     ASSERT_EQ(r->arena.nblocks, 2);
-    ASSERT_EQ(r->arena.block_sizes[1], CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    ASSERT_EQ(r->arena.block_sizes[1], CBM_ARENA_APPEND_BLOCK);
 
     cbm_free_result(r);
     cbm_free_result(ref);
@@ -7466,13 +8448,15 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     PASS();
 }
 
-/* ── LSP budget share: an oversized parse disqualifies the file from the walks ── */
+/* ── A skipped file gets no LSP walk, per-file or cross-file ── */
 
-/* CBM_TEST_LSP_SKIP_ON names the file (no real timing): the result carries
- * lsp_skipped, the per-file LSP walk did not run (no LSP-resolved calls),
- * and the shared cross-file dispatcher returns without touching it. The
- * unified extractor definitions are still there. */
-TEST(extract_lsp_skipped_when_parse_used_its_budget_share) {
+/* CBM_TEST_LSP_SKIP_ON names the file: the result carries lsp_skipped, the
+ * per-file LSP walk did not run (no LSP-resolved calls), and the shared
+ * cross-file dispatcher returns without touching it. The unified extractor
+ * definitions are still there. Nothing in production sets lsp_skipped from a
+ * clock any more — this pins what the flag DOES, which is what the cross-file
+ * dispatcher and the per-file walks both have to honour. */
+TEST(extract_lsp_skipped_file_gets_no_walk) {
     cbm_setenv("CBM_TEST_LSP_SKIP_ON", "budget_share.py", 1);
     CBMFileResult *skipped = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "budget_share.py");
     cbm_unsetenv("CBM_TEST_LSP_SKIP_ON");
@@ -7497,10 +8481,12 @@ TEST(extract_lsp_skipped_when_parse_used_its_budget_share) {
     PASS();
 }
 
-/* CBM_TEST_WALK_BUDGET_NODES stops the unified walk after that many nodes
- * (no real timing): the result is walk_truncated, therefore lsp_skipped, and
- * the definitions the walk had not reached are the only loss. */
-TEST(extract_walk_truncated_at_its_cpu_budget) {
+/* CBM_TEST_WALK_BUDGET_NODES stops the unified walk after that many nodes: the
+ * result is walk_truncated, therefore lsp_skipped, and the definitions the walk
+ * had not reached are the only loss. There is no budget by default (see
+ * CBM_WALK_MAX_NODES_DEFAULT), so this drives the same node counter an operator
+ * would set with CBM_WALK_MAX_NODES rather than a mechanism of its own. */
+TEST(extract_walk_truncated_when_a_node_budget_is_set) {
     cbm_setenv("CBM_TEST_WALK_BUDGET_NODES", "8", 1);
     CBMFileResult *cut = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walk_budget.py");
     cbm_unsetenv("CBM_TEST_WALK_BUDGET_NODES");
@@ -7521,8 +8507,8 @@ SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
-    RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
-    RUN_TEST(extract_walk_truncated_at_its_cpu_budget);
+    RUN_TEST(extract_lsp_skipped_file_gets_no_walk);
+    RUN_TEST(extract_walk_truncated_when_a_node_budget_is_set);
     /* Initialize extraction library */
     cbm_init();
 
@@ -7530,6 +8516,7 @@ SUITE(extraction) {
     RUN_TEST(extract_wide_flat_file_is_linear);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
+    RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
@@ -7571,6 +8558,7 @@ SUITE(extraction) {
     RUN_TEST(objectscript_macro_constant_no_extra_call);
     RUN_TEST(objectscript_udl_method_return_type);
     RUN_TEST(objectscript_udl_scalar_return_type_not_resolved);
+    RUN_TEST(call_args_skip_comments_between_arguments);
     RUN_TEST(objectscript_data_flows_class_method_args);
     RUN_TEST(objectscript_data_flows_instance_method_args);
     RUN_TEST(iris_export_xml_simple_class);
@@ -7630,8 +8618,11 @@ SUITE(extraction) {
     RUN_TEST(go_interface);
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
+    RUN_TEST(c_function_return_type_preserves_pointer_and_qualifier);
+    RUN_TEST(c_function_return_type_plain_unchanged);
     RUN_TEST(c_struct);
     RUN_TEST(cpp_class);
+    RUN_TEST(cpp_method_return_type_preserves_pointer_and_qualifier);
 
     /* Scripting */
     RUN_TEST(python_function);
@@ -7704,6 +8695,9 @@ SUITE(extraction) {
     RUN_TEST(swift_chained_call);
     RUN_TEST(swift_force_unwrap_scanner_shift);
     RUN_TEST(swift_call_string_arg_issue1892);
+    RUN_TEST(swift_nested_url_constructor_issue1892);
+    RUN_TEST(swift_nested_url_no_bang_issue1892);
+    RUN_TEST(swift_non_url_constructor_untouched_issue1892);
     RUN_TEST(swift_labeled_call_string_arg_issue1892);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
@@ -7781,6 +8775,7 @@ SUITE(extraction) {
     RUN_TEST(commonlisp_defun);
     RUN_TEST(commonlisp_multiple_functions);
     RUN_TEST(commonlisp_defmacro);
+    RUN_TEST(defs_push_cuts_multiline_names_and_rejects_js_literal_names);
     RUN_TEST(makefile_rule_as_function);
     RUN_TEST(makefile_multiple_targets);
     RUN_TEST(makefile_variable_extraction);
@@ -7792,10 +8787,13 @@ SUITE(extraction) {
     /* Cross-cutting */
     RUN_TEST(python_calls);
     RUN_TEST(python_iris_classMethodValue);
+    RUN_TEST(python_iris_cls_receiver_is_class_aware);
+    RUN_TEST(python_iris_invokeClassMethod);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
+    RUN_TEST(go_cgo_pseudo_import_dropped);
     RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);
@@ -7856,6 +8854,9 @@ SUITE(extraction) {
     RUN_TEST(arkts_lazy_import);
     RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_java_jaxrs_relative_path_templates);
+    RUN_TEST(extract_java_jaxrs_empty_path_means_class_path);
+    RUN_TEST(extract_java_spring_relative_string_not_route_path);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
@@ -7864,6 +8865,7 @@ SUITE(extraction) {
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);
+    RUN_TEST(extract_ts_await_generic_call_issue2210);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
     RUN_TEST(extract_ts_route_handler_after_inline_middleware);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
@@ -7890,11 +8892,31 @@ SUITE(extraction) {
     RUN_TEST(complexity_go_method_receiver_self_recursion);
     RUN_TEST(complexity_delegation_receivers_not_recursive_issue876);
     RUN_TEST(complexity_access_depth_and_params);
+    RUN_TEST(walk_defs_wide_file_extracts_every_definition);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
+    RUN_TEST(extract_cpp_export_macro_class_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_struct_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_enum_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_free_function_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_inline_method_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_negative_control_ordinary_caps_issue1989);
+    RUN_TEST(extract_c_export_macro_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_overlong_candidate_safe_issue1989);
+    RUN_TEST(extract_cpp_export_macro_comment_string_budget_issue1989);
+    RUN_TEST(extract_cpp_export_macro_candidate_cap_issue1989);
+    RUN_TEST(extract_cpp_export_macro_spliced_comment_budget_issue1989);
+    RUN_TEST(extract_cpp_export_macro_raw_string_issue1989);
+    RUN_TEST(extract_cpp_export_macro_raw_string_delimited_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_contract_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_delim_contract_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_quote_delim_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989);
+    RUN_TEST(extract_cpp_export_macro_suffix_variants_issue1989);
+    RUN_TEST(extract_cpp_export_macro_explicit_define_priority_issue1989);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
     RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);

@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "foundation/index_policy.h"
+
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
 /* ── Version ──────────────────────────────────────────────────── */
@@ -24,6 +26,18 @@ void cbm_cli_set_version(const char *ver);
 const char *cbm_cli_get_version(void);
 
 /* ── CLI tool arguments (flags / --args-file / --help) ────────── */
+
+/* Top-level `cli --help` text printed by run_cli() in src/main.c.
+ * Documents tool-level --format without adding a session-wide flag (#2102). */
+#define CBM_CLI_USAGE                                                                         \
+    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
+    "[json_args]\n"                                                                           \
+    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
+    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
+    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
+    "  --json      Print the raw MCP result envelope\n"                                       \
+    "  Tools that accept format support --format tree|json (default: tree).\n"                \
+    "  --format json prints payload JSON; outer --json prints the full MCP envelope.\n"
 
 /* Convert `--flag value` / `--flag=value` / bare-boolean `--flag` arguments for
  * a tool into a JSON arguments object string, using the tool's input_schema to
@@ -419,6 +433,11 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
+
+/* Load and validate the operator-controlled discovery policy. Invalid stored
+ * values fail closed instead of silently disabling a guard. */
+bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
+                                  char *error, size_t error_size);
 
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"

@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Tests](https://img.shields.io/badge/tests-8050_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)
@@ -16,7 +16,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a native executable with a small verified runtime-asset set for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 162 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No language runtime, hosted service, or API key. Plug and play across 45 supported automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 162 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 17 MCP tools. No language runtime, hosted service, or API key. Plug and play across 45 supported automatic/conditional client surfaces.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -37,7 +37,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **45 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749`, served from the binary itself.
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **17 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
 
@@ -425,7 +425,7 @@ scripts/build.sh                    # without the UI (development only)
 
 Every platform ships **one self-contained executable**: the graph UI and the agent integration templates are linked into the binary, so an extracted archive is immediately complete.
 
-Run the test suite (6,768 tests across 120 suites):
+Run the test suite (8,060 tests across 141 suites):
 
 ```bash
 scripts/test.sh                     # full: clean sanitizer build + all suites + guards
@@ -461,7 +461,7 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 15 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 17 tools.
 
 </details>
 
@@ -673,6 +673,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
+| `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
 
 ### Querying
 
@@ -683,7 +684,9 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
+| `compare_graphs` | Compare two indexed snapshots: node/edge additions and removals between a base and a target. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
+| `get_file_outline` | Declaration outline of one repository-relative file in source order, with optional label filter and paging. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records (`get` reads, `update` replaces the whole document, `set_sections` rewrites only the named sections and leaves every other byte untouched, `sections` lists headings). Query modes do not wait behind a same-project reindex; writes remain serialized. |
@@ -701,7 +704,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
 
 ### Qualified Names
 
@@ -733,8 +736,14 @@ codebase-memory-mcp config set auto_index true           # auto-index on session
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
+codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
+codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+The two `index_max_*` settings default to `off`. Exceeding one fails the complete
+index attempt rather than publishing a partial graph; an existing serving index
+is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables
 
@@ -843,7 +852,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
   daemon/             Per-account session coordination, IPC, lifecycle, shared jobs/watchers
-  mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (17 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (45 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)

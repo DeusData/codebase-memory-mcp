@@ -22,6 +22,8 @@ they stage the release fixture, start the fixture server, and sandbox
 HOME/TEMP/agent-config destinations. Called bare, the download/checksum/
 install-script phases (12-13) SKIP for lack of a fixture server, and the run
 mutates the REAL profile — the venue-parity contract forbids that in any venue.
+The daemon runtime and cache are private to the run either way: every product
+process is started under a CBM_RUNTIME_DIR/CBM_CACHE_DIR this harness owns.
 
 Arguments:
   <binary-path>         product binary to smoke
@@ -40,6 +42,20 @@ if [ -n "$SMOKE_MODE" ] && [ "$SMOKE_MODE" != "--agent-config-only" ]; then
   exit 2
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+
+# Every product process below — the phases, the install/update E2E and the
+# daemon retirements — must reach a daemon rendezvous this run owns. Only
+# CBM_RUNTIME_DIR moves that rendezvous; the wrappers' HOME/TMPDIR/CBM_CACHE_DIR
+# sandbox does not, so without this the retirements land on the operator's live
+# account daemon (#1691, #1696).
+# shellcheck source=test-runtime.sh
+source "$REPO_ROOT/scripts/test-runtime.sh"
+cbm_test_runtime_init
+# Armed here rather than only with the fixture trap below: the fixture mktemp
+# and its cygpath conversion sit between the two, and under `set -e` a failure
+# there would otherwise leave the private root behind. The fixture trap
+# replaces this one and keeps the same cleanup as its first step.
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 smoke_mktemp_file() {
   if [ -n "${SMOKE_TEMP_ROOT:-}" ]; then
@@ -100,8 +116,8 @@ copy_smoke_binary() {
   cp "$BINARY" "$destination"
 }
 
-# Retire the shared account daemon (if one is running) and wait until it
-# reports not-running. Install/uninstall flows leave an ephemeral daemon
+# Retire this run's private account daemon (if one is running) and wait until
+# it reports not-running. Install/uninstall flows leave an ephemeral daemon
 # draining asynchronously whose mapped generation backing and open logs
 # block rm on Windows (POSIX rm doesn't care) — so every cleanup of a
 # fixture HOME that received an install, and the final cache removal, must
@@ -149,7 +165,11 @@ CODEX_LIFECYCLE_HOME=""
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}" "${CODEX_LIFECYCLE_HOME:-}"' EXIT
+# Runtime cleanup first, so no earlier cleanup step stands between the exit
+# and the private daemon's retirement; on Windows that retirement is also what
+# unblocks the fixture rm (mapped binary, open logs). smoke_rmtree never fails,
+# so the fixture removal still runs after it.
+trap 'cbm_test_runtime_cleanup "$BINARY"; smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}" "${CODEX_LIFECYCLE_HOME:-}"' EXIT
 
 CLI_STDERR=$(smoke_mktemp_file)
 # 10 of the cli call sites assign directly (VAR=$(cli ...)). Under
@@ -172,6 +192,29 @@ cli() {
     } >&2
   fi
   return "$rc"
+}
+
+# A worker failure says "inspect log: <path>" — and in CI that path dies with the
+# job's sandbox, so the one artifact naming the cause is the one nobody can open.
+# A worker killed by a signal writes no summary of its own either, which is
+# exactly the case that most needs the log (PR #2233: "index worker ended with
+# killed (exit=-1, signal=9)" on ubuntu-latest, unreproducible on every local
+# venue). Print it while it still exists.
+smoke_dump_worker_log() {
+  local log
+  log=$(sed -n 's/.*inspect log: \([^ ]*\).*/\1/p' "$CLI_STDERR" 2>/dev/null | tail -1)
+  if [ -z "$log" ] || [ ! -f "$log" ]; then
+    # The path is only printed for some failures; fall back to the newest log
+    # the run produced.
+    log=$(ls -t "${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"/logs/.worker-log-* 2>/dev/null | head -1)
+  fi
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    echo "--- worker log: $log ---"
+    tail -80 "$log"
+    echo "--- end worker log ---"
+  else
+    echo "--- no worker log found (cache ${CBM_CACHE_DIR:-unset}) ---"
+  fi
 }
 
 echo "=== Phase 1: version ==="
@@ -334,6 +377,7 @@ GENEOF
 if ! RESULT=$(cli index_repository --repo-path "$TMPDIR"); then
   echo "FAIL: index_repository (flag form) exited non-zero"
   cat "$CLI_STDERR"
+  smoke_dump_worker_log
   exit 1
 fi
 echo "$RESULT"

@@ -207,8 +207,13 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
     sim_query_ctx_t *sc = ctx_ptr;
     sim_edge_buf_t *my_buf = &sc->worker_bufs[worker_id];
 
-    /* Thread-local candidate buffer (stack-allocated) */
+    /* Thread-local candidate buffer (stack-allocated) and one dedup set for
+     * all of this worker's queries. */
     const cbm_lsh_entry_t *cands[SIM_CAND_CAP];
+    cbm_lsh_seen_t *seen = cbm_lsh_seen_new();
+    if (!seen) {
+        return; /* the other workers claim the entries this one leaves */
+    }
 
     while (true) {
         int i = atomic_fetch_add_explicit(&sc->next_idx, SKIP_ONE, memory_order_relaxed);
@@ -222,7 +227,7 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
         }
 
         const fp_entry_t *src = &sc->entries[i];
-        int cand_count = cbm_lsh_query_into(sc->lsh, &src->fp, cands, SIM_CAND_CAP);
+        int cand_count = cbm_lsh_query_into_seen(sc->lsh, &src->fp, cands, SIM_CAND_CAP, seen);
 
         int emitted = 0;
         for (int c = 0; c < cand_count; c++) {
@@ -260,6 +265,7 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             atomic_fetch_add_explicit(&sc->edge_counts[i], emitted, memory_order_relaxed);
         }
     }
+    cbm_lsh_seen_free(seen);
 }
 
 /* Merge worker edge buffers into gbuf. Returns total edge count. Frees worker buffers. */

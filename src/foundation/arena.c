@@ -12,6 +12,7 @@
 #include "arena.h"
 #include "foundation/constants.h"
 #include "foundation/mem_core.h"
+#include "foundation/mem_events.h"
 
 enum { ARENA_ALIGN = 7, ARENA_GROW_OK = 1 };
 #include <stdlib.h>
@@ -23,12 +24,46 @@ enum { ARENA_ALIGN = 7, ARENA_GROW_OK = 1 };
 #endif
 #include <stdio.h>
 
+#if defined(CBM_MEMWASTE) && CBM_MEMWASTE
+/* Capacity against use for the life of an arena, reported when it resets or
+ * dies: bytes left at the end of every block it moved past, the unused rest of
+ * the block it stopped in, and blocks it owned but never reached. */
+static void arena_waste_report(const CBMArena *a) {
+    if (!a || a->nblocks == 0 || !cbm_memev_enabled()) {
+        return;
+    }
+    uint64_t capacity = 0;
+    uint64_t unreached = 0;
+    for (int i = 0; i < a->nblocks; i++) {
+        capacity += a->block_sizes[i];
+        if (i > a->cur) {
+            unreached += a->block_sizes[i];
+        }
+    }
+    uint64_t current_rest = a->block_size > a->used ? a->block_size - a->used : 0;
+    uint64_t wasted = a->waste_tail + current_rest + unreached;
+    uint64_t used = capacity > wasted ? capacity - wasted : 0;
+    cbm_memev_container(CBM_WORK_CT_ARENA, a->waste_site, capacity, used, (uint64_t)a->waste_grows);
+}
+#define ARENA_SITE() __builtin_return_address(0)
+#else
+#define arena_waste_report(a) ((void)0)
+#define ARENA_SITE() NULL
+#endif
+
+static void arena_init_at(CBMArena *a, size_t block_size, void *site);
+
 void cbm_arena_init(CBMArena *a) {
-    cbm_arena_init_sized(a, CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    arena_init_at(a, CBM_ARENA_DEFAULT_BLOCK_SIZE, ARENA_SITE());
 }
 
 void cbm_arena_init_sized(CBMArena *a, size_t block_size) {
+    arena_init_at(a, block_size, ARENA_SITE());
+}
+
+static void arena_init_at(CBMArena *a, size_t block_size, void *site) {
     memset(a, 0, sizeof(*a));
+    a->waste_site = site;
     if (block_size < CBM_SZ_64) {
         block_size = CBM_SZ_64; /* minimum sanity */
     }
@@ -41,10 +76,19 @@ void cbm_arena_init_sized(CBMArena *a, size_t block_size) {
     }
 }
 
+void cbm_arena_init_lazy(CBMArena *a, size_t block_size) {
+    memset(a, 0, sizeof(*a));
+    a->waste_site = ARENA_SITE();
+    if (block_size < CBM_SZ_64) {
+        block_size = CBM_SZ_64; /* minimum sanity */
+    }
+    a->grow_size = block_size; /* the opening block; arena_grow doubles from there */
+}
+
 void cbm_arena_init_exact(CBMArena *a, size_t bytes) {
     size_t block = (bytes + ARENA_ALIGN) & ~(size_t)ARENA_ALIGN;
-    cbm_arena_init_sized(a, block);
-    a->grow_size = CBM_ARENA_DEFAULT_BLOCK_SIZE;
+    arena_init_at(a, block, ARENA_SITE());
+    a->grow_size = CBM_ARENA_APPEND_BLOCK;
     /* An exact block is a compacted result's image and may be written to
      * disk whole (result_spill): the alignment gaps between objects and the
      * padding inside structs are never written by the copy, and MemorySanitizer
@@ -59,6 +103,7 @@ void cbm_arena_init_exact(CBMArena *a, size_t bytes) {
 static int arena_grow(CBMArena *a, size_t min_size) {
     /* A rewound arena still owns blocks past the cursor: use the next one if
      * it fits, otherwise drop it and everything after it and grow fresh. */
+    a->waste_tail += a->block_size > a->used ? a->block_size - a->used : 0;
     if (a->cur + SKIP_ONE < a->nblocks && a->blocks[a->cur + SKIP_ONE]) {
         if (a->block_sizes[a->cur + SKIP_ONE] >= min_size) {
             a->cur++;
@@ -87,6 +132,7 @@ static int arena_grow(CBMArena *a, size_t min_size) {
     }
     a->blocks[a->nblocks] = block;
     a->block_sizes[a->nblocks] = new_size;
+    a->waste_grows++;
     a->cur = a->nblocks;
     a->nblocks++;
     a->block_size = new_size;
@@ -101,7 +147,12 @@ void *cbm_arena_alloc(CBMArena *a, size_t n) {
     /* 8-byte alignment */
     n = (n + ARENA_ALIGN) & ~(size_t)ARENA_ALIGN;
     if (a->nblocks == 0) {
-        return NULL;
+        /* A lazy arena opens here. A zeroed or destroyed one has no grow size
+         * and stays closed. */
+        if (a->grow_size == 0 || !arena_grow(a, n)) {
+            return NULL;
+        }
+        a->waste_grows = 0; /* the opening block is the arena's first, not a growth */
     }
     if (a->used + n > a->block_size) {
         if (!arena_grow(a, n)) {
@@ -217,6 +268,9 @@ void cbm_arena_rewind(CBMArena *a) {
     if (!a || a->nblocks == 0) {
         return;
     }
+    arena_waste_report(a);
+    a->waste_tail = 0;
+    a->waste_grows = 0;
     a->cur = 0;
     a->block_size = a->block_sizes[0];
     a->used = 0;
@@ -232,6 +286,9 @@ size_t cbm_arena_capacity(const CBMArena *a) {
 }
 
 void cbm_arena_reset(CBMArena *a) {
+    arena_waste_report(a);
+    a->waste_tail = 0;
+    a->waste_grows = 0;
     /* Keep first block, free the rest */
     for (int i = SKIP_ONE; i < a->nblocks; i++) {
         cbm_free(CBM_MEM_CLASS_ARENA, a->blocks[i]);
@@ -253,6 +310,7 @@ void cbm_arena_reset(CBMArena *a) {
 }
 
 void cbm_arena_destroy(CBMArena *a) {
+    arena_waste_report(a);
     for (int i = 0; i < a->nblocks; i++) {
         cbm_free(CBM_MEM_CLASS_ARENA, a->blocks[i]);
     }
