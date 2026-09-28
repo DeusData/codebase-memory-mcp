@@ -2323,18 +2323,14 @@ static void cs_resolve_object_creation(CSLSPContext *ctx, TSNode call) {
     /* `new Foo(...)` adds an implicit constructor CALLS edge: to Foo's ctor
      * Method node when one is indexed, otherwise to the Foo class node. */
     TSNode tnode = ts_node_child_by_field_name(call, "type", 4);
-    if (ts_node_is_null(tnode)) {
-        fprintf(stderr, "DBG ctor: no type field\n");
+    if (ts_node_is_null(tnode))
         return;
-    }
     const CBMType *t = cs_parse_type_node(ctx, tnode);
     const char *tqn = NULL;
     if (t && t->kind == CBM_TYPE_NAMED)
         tqn = t->data.named.qualified_name;
     else if (t && t->kind == CBM_TYPE_TEMPLATE)
         tqn = t->data.template_type.template_name;
-    fprintf(stderr, "DBG ctor: tqn=%s kind=%d enclosing=%s\n", tqn ? tqn : "(null)",
-            t ? (int)t->kind : -1, ctx->enclosing_func_qn ? ctx->enclosing_func_qn : "(null)");
     if (!tqn)
         return;
     /* A C# constructor is extracted as a Method whose short name is the class's

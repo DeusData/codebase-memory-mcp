@@ -2745,6 +2745,20 @@ TEST(parallel_csharp_nested_type_and_global_namespace_binding) {
         "        return u.Check();\n"
         "    }\n"
         "}\n";
+    /* The lookup-order probe: the SAME simple name resolves through an
+     * imported namespace AND exists in the global namespace. C# binds the
+     * imported namespace first, so ImportUser.Run2 must hit the Other variant
+     * and never the global one — proving the global namespace is appended
+     * last in cs_visible_namespaces, not merged as an equal. */
+    static const char import_user_src[] =
+        "using Acme.Other.Web.Services;\n"
+        "namespace Acme.App;\n"
+        "public class ImportUser {\n"
+        "    public string Run2() {\n"
+        "        var u = new UpdateService();\n"
+        "        return u.Check();\n"
+    "    }\n"
+        "}\n";
     const char *project = "cbm_cs_nested";
     static const char *rels[] = {
         "src/Decoy/Layouts.cs",
@@ -2755,11 +2769,12 @@ TEST(parallel_csharp_nested_type_and_global_namespace_binding) {
         "src/App/NestedUser.cs",
         "src/App/ChainedUser.cs",
         "src/App/Boot.cs",
+        "src/App/ImportUser.cs",
     };
     const char *srcs[] = {decoy_src,       other_update_src, partner_src,
                           backoffice_src,  global_update_src, nested_user_src,
-                          chained_user_src, boot_src};
-    enum { N_FILES = 8, N_CHECKS = 8 };
+                          chained_user_src, boot_src, import_user_src};
+    enum { N_FILES = 9, N_CHECKS = 10 };
 
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_nested_XXXXXX");
@@ -2827,6 +2842,8 @@ TEST(parallel_csharp_nested_type_and_global_namespace_binding) {
         ok[g][5] = !has_edge_from_callable_to_qn(gb, "ChainedUser.Run", decoy_handle, "CALLS");
         ok[g][6] = has_edge_from_callable_to_qn(gb, "Boot.Boot1", global_check, "CALLS");
         ok[g][7] = !has_edge_from_callable_to_qn(gb, "Boot.Boot1", other_check, "CALLS");
+        ok[g][8] = has_edge_from_callable_to_qn(gb, "ImportUser.Run2", other_check, "CALLS");
+        ok[g][9] = !has_edge_from_callable_to_qn(gb, "ImportUser.Run2", global_check, "CALLS");
         for (int k = 0; k < N_CHECKS; k++) {
             all = all && ok[g][k];
         }
@@ -2834,9 +2851,9 @@ TEST(parallel_csharp_nested_type_and_global_namespace_binding) {
     if (!all) {
         for (int g = 0; g < 2; g++) {
             printf("  C# nested/global diagnostic %s: nested_code=%d/%d nested_ctor=%d/%d "
-                   "chained=%d/%d global_ns=%d/%d\n",
+                   "chained=%d/%d global_ns=%d/%d imported=%d/%d\n",
                    g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
-                   ok[g][4], ok[g][5], ok[g][6], ok[g][7]);
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9]);
         }
     }
     cbm_gbuf_free(graphs[0]);
