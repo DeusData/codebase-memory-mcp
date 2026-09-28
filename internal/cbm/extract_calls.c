@@ -1485,6 +1485,21 @@ static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
     return NULL;
 }
 
+/* Callee container of a routine_tag_call / extrinsic_function. Older routine
+ * grammars always wrapped the target in line_ref. Newer ones emit a bare
+ * label as method_name (`Do accept`) and a bare routine as routine_ref
+ * (`$$^Other`). All three have the same source text. */
+static TSNode objectscript_routine_callee_container(TSNode node) {
+    static const char *const kinds[] = {"line_ref", "method_name", "routine_ref", NULL};
+    for (int i = 0; kinds[i]; i++) {
+        TSNode child = cbm_find_child_by_kind(node, kinds[i]);
+        if (!ts_node_is_null(child)) {
+            return child;
+        }
+    }
+    return (TSNode){0};
+}
+
 static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
@@ -1690,13 +1705,13 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
             }
             return NULL;
         }
-        // $$label^routine extrinsic / routine tag call -> the line_ref text.
-        // The routine grammar keeps the leading `$$` as an unnamed token, so
-        // both call forms have the same exact named callee container.
+        // $$label^routine extrinsic / routine tag call -> the callee container
+        // text. The routine grammar keeps the leading `$$` as an unnamed token,
+        // so both call forms have the same exact named callee container.
         if (strcmp(nk, "extrinsic_function") == 0 || strcmp(nk, "routine_tag_call") == 0) {
-            TSNode line_ref = cbm_find_child_by_kind(node, "line_ref");
-            if (!ts_node_is_null(line_ref)) {
-                return cbm_node_text(a, line_ref, source);
+            TSNode callee = objectscript_routine_callee_container(node);
+            if (!ts_node_is_null(callee)) {
+                return cbm_node_text(a, callee, source);
             }
             return NULL;
         }
@@ -3453,7 +3468,7 @@ static TSNode objectscript_callee_expr(TSNode node) {
         return ts_node_is_null(oref) ? (TSNode){0} : cbm_find_child_by_kind(oref, "method_name");
     }
     if (strcmp(kind, "extrinsic_function") == 0 || strcmp(kind, "routine_tag_call") == 0) {
-        return cbm_find_child_by_kind(node, "line_ref");
+        return objectscript_routine_callee_container(node);
     }
     return (TSNode){0};
 }

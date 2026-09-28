@@ -7621,6 +7621,32 @@ TEST(objectscript_routine_tags) {
     PASS();
 }
 
+/* Each routine call form keeps the callee text it had before the grammar hid
+ * line_ref under routine_tag_call and extrinsic_function. */
+TEST(objectscript_routine_call_forms_callee_text) {
+    CBMFileResult *r = extract("run(x)\n"
+                               "    Do accept(x)\n"
+                               "    Do accept\n"
+                               "    Do accept^Other(x)\n"
+                               "    Do ^Other\n"
+                               "    Do accept+2^Other\n"
+                               "    Set a = $$accept(x)\n"
+                               "    Set b = $$accept^Other(x)\n"
+                               "    Set c = $$^Other(1)\n"
+                               "    Quit\n"
+                               "accept(value)\n"
+                               "    Quit value\n",
+                               CBM_LANG_OBJECTSCRIPT_ROUTINE, "t", "Forms.mac");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_named(r, "accept"), 3);
+    ASSERT_EQ(count_calls_named(r, "accept^Other"), 2);
+    ASSERT_EQ(count_calls_named(r, "^Other"), 2);
+    ASSERT_EQ(count_calls_named(r, "accept+2^Other"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(objectscript_udl_query_member) {
     CBMFileResult *r =
         extract("Class MyApp.Repo Extends %Persistent\n"
@@ -8827,6 +8853,7 @@ SUITE(extraction) {
     RUN_TEST(objectscript_udl_multiple_bases);
     RUN_TEST(objectscript_udl_properties);
     RUN_TEST(objectscript_routine_tags);
+    RUN_TEST(objectscript_routine_call_forms_callee_text);
     RUN_TEST(objectscript_udl_query_member);
     RUN_TEST(objectscript_udl_index_member);
     RUN_TEST(objectscript_udl_xdata_member);
