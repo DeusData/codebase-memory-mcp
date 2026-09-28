@@ -7462,7 +7462,9 @@ TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
         .rel_path = "service.js",
         .kind = "unresolved_calls",
         .detail = "[{\"caller\":\"unresolved-trace.service.run\",\"leaf\":\"buscar\","
-                  "\"start_byte\":42,\"end_byte\":59,\"reason\":\"method_not_in_registry\"}]"};
+                  "\"start_byte\":42,\"end_byte\":59,\"line\":3,"
+                  "\"candidate\":\"unresolved-trace.client.buscar\","
+                  "\"reason\":\"method_not_in_registry\"}]"};
     cbm_coverage_meta_t meta = {.generation = "fixture",
                                 .index_mode = "full",
                                 .recorded_at = "2026-09-24T00:00:00Z",
@@ -7489,6 +7491,20 @@ TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
     ASSERT_NOT_NULL(strstr(txt, "\"callers_total_relation\":\"unknown\""));
     free(txt);
     free(out);
+    /* The same leaf in an unrelated module was never a resolver candidate. */
+    cbm_node_t unrelated = callee;
+    unrelated.qualified_name = "unresolved-trace.other.buscar";
+    unrelated.file_path = "other.js";
+    ASSERT_GT(cbm_store_upsert_node(st, &unrelated), 0);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"unresolved-trace.other.buscar\","
+             "\"direction\":\"inbound\",\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callers_total_relation\":\"eq\""));
+    free(txt);
+    free(out);
     out = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"check_index_coverage\",\"arguments\":{\"project\":"
@@ -7509,6 +7525,62 @@ TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
     free(txt);
     free(out);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_unresolved_nested_functions_are_indexed) {
+    char tmp[256] = "/tmp/cbm-mcp-unresolved-XXXXXX";
+    char cache[256] = "/tmp/cbm-mcp-unresolved-cache-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/service.js", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export function factory({ client }) {\n"
+          "  function inner(id) {\n"
+          "    return client.buscar(id);\n"
+          "  }\n  return { inner };\n}\n",
+          f);
+    fclose(f);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", tmp);
+    char *out = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"status\":\"indexed\""));
+    ASSERT(response_contains_json_fragment(out, "\"skipped_count\":0"));
+    free(out);
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"inner\","
+             "\"direction\":\"outbound\",\"format\":\"json\"}",
+             project);
+    out = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"callees_total_relation\":\"unknown\""));
+    free(out);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"factory\","
+             "\"direction\":\"outbound\",\"format\":\"json\"}",
+             project);
+    out = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"callees_total_relation\":\"eq\""));
+    free(out);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    remove(path);
+    cbm_rmdir(tmp);
+    cbm_rmdir(cache);
     PASS();
 }
 
@@ -20741,6 +20813,7 @@ SUITE(mcp) {
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
     RUN_TEST(tool_trace_path_marks_unresolved_call_totals_unknown);
+    RUN_TEST(tool_index_unresolved_nested_functions_are_indexed);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
     RUN_TEST(tool_trace_path_unreadable_confidence_reports_not_recorded);
     RUN_TEST(tool_trace_path_edge_details_use_canonical_predecessor);

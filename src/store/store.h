@@ -650,9 +650,9 @@ typedef struct {
     const char *detail;
 } cbm_coverage_row_t;
 
-/* Older generations have no unresolved-call records, so their exact trace
- * totals cannot be trusted after this signal becomes part of coverage. */
-enum { CBM_UNRESOLVED_CALL_COVERAGE_VERSION = 4 };
+/* Older generations lack precise caller attribution and resolver candidates,
+ * so their exact trace totals cannot be trusted until the project is reindexed. */
+enum { CBM_UNRESOLVED_CALL_COVERAGE_VERSION = 5 };
 
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or

@@ -42,6 +42,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
 #include "result_spill.h"
+#include "cbm.h"
 #include "foundation/secure_random.h"
 #include "yyjson/yyjson.h"
 
@@ -265,7 +266,9 @@ struct cbm_pipeline {
     /* Per-file unresolved invocation diagnostics, published as coverage rows. */
     cbm_coverage_row_t *unresolved_rows;
     int unresolved_count;
-    bool unresolved_capture_failed;
+    int unresolved_capacity;
+    atomic_bool unresolved_capture_failed;
+    cbm_mutex_t unresolved_mutex; /* one append per file, after parallel resolution */
 
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
@@ -360,6 +363,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->committed_nodes = -1;
     p->committed_edges = -1;
     atomic_init(&p->cancelled_storage, 0);
+    atomic_init(&p->unresolved_capture_failed, false);
+    cbm_mutex_init(&p->unresolved_mutex);
     p->cancelled = &p->cancelled_storage;
 
     return p;
@@ -454,63 +459,236 @@ static void unresolved_json_free(void *ctx, void *ptr) {
     cbm_free(CBM_MEM_CLASS_DUMP, ptr);
 }
 
-void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
-                                          const CBMFileResult *result) {
-    if (!p || !rel_path || !result || result->resolved_calls.count == 0 ||
-        p->unresolved_capture_failed) {
-        return;
+enum { UNRESOLVED_KEY_OVERHEAD = 128, UNRESOLVED_INITIAL_ROWS = 64, UNRESOLVED_ROW_GROWTH = 2 };
+
+static char *unresolved_site_key(const char *caller, const char *leaf, uint32_t start, uint32_t end,
+                                 CBMSourceOrigin origin) {
+    size_t cn = strlen(caller);
+    size_t ln = strlen(leaf);
+    size_t cap = cn + ln + UNRESOLVED_KEY_OVERHEAD;
+    char *key = cbm_alloc(CBM_MEM_CLASS_DUMP, cap);
+    if (key) {
+        (void)snprintf(key, cap, "%zu:%s|%zu:%s|%u:%u:%u", cn, caller, ln, leaf, start, end,
+                       (unsigned)origin);
     }
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    if (!doc) {
-        p->unresolved_capture_failed = true;
-        return;
+    return key;
+}
+
+typedef struct {
+    const CBMCall *call;
+} unresolved_carrier_t;
+
+typedef struct {
+    yyjson_mut_doc *doc;
+    yyjson_mut_val *sites;
+    CBMHashTable *carriers;
+    CBMHashTable *seen;
+} unresolved_capture_t;
+
+static void unresolved_carrier_free(const char *key, void *value, void *ctx) {
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_DUMP, (void *)key);
+    cbm_free(CBM_MEM_CLASS_DUMP, value);
+}
+
+static void unresolved_key_free(const char *key, void *value, void *ctx) {
+    (void)value;
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_DUMP, (void *)key);
+}
+
+static void unresolved_capture_free(unresolved_capture_t *capture) {
+    if (capture->carriers) {
+        cbm_ht_foreach(capture->carriers, unresolved_carrier_free, NULL);
+        cbm_ht_free(capture->carriers);
     }
-    yyjson_mut_val *sites = yyjson_mut_arr(doc);
-    yyjson_mut_doc_set_root(doc, sites);
-    int count = 0;
+    if (capture->seen) {
+        cbm_ht_foreach(capture->seen, unresolved_key_free, NULL);
+        cbm_ht_free(capture->seen);
+    }
+    if (capture->doc) {
+        yyjson_mut_doc_free(capture->doc);
+    }
+}
+
+static bool unresolved_call_is_missing(const CBMResolvedCall *rc) {
+    return rc->kind == CBM_RESOLVED_INVOCATION && rc->strategy &&
+           strcmp(rc->strategy, "lsp_unresolved") == 0 && rc->caller_qn && rc->callee_qn;
+}
+
+static bool unresolved_has_missing_calls(const CBMFileResult *result) {
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        if (unresolved_call_is_missing(&result->resolved_calls.items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool unresolved_add_carrier(CBMHashTable *carriers, const CBMCall *call) {
+    if (!call->callee_name || call->site_end_byte <= call->site_start_byte) {
+        return true;
+    }
+    char *key =
+        unresolved_site_key("", cbm_lsp_bare_segment(call->callee_name), call->site_start_byte,
+                            call->site_end_byte, call->source_origin);
+    if (!key) {
+        return false;
+    }
+    if (cbm_ht_has(carriers, key)) {
+        /* Ambiguous extractor occurrences must never erase a diagnostic. */
+        unresolved_carrier_t *carrier = cbm_ht_get(carriers, key);
+        carrier->call = NULL;
+        cbm_free(CBM_MEM_CLASS_DUMP, key);
+        return true;
+    }
+    unresolved_carrier_t *carrier = cbm_alloc(CBM_MEM_CLASS_DUMP, sizeof(*carrier));
+    if (!carrier) {
+        cbm_free(CBM_MEM_CLASS_DUMP, key);
+        return false;
+    }
+    carrier->call = call;
+    cbm_ht_set(carriers, key, carrier);
+    if (!cbm_ht_has(carriers, key)) {
+        cbm_free(CBM_MEM_CLASS_DUMP, key);
+        cbm_free(CBM_MEM_CLASS_DUMP, carrier);
+        return false;
+    }
+    return true;
+}
+
+static bool unresolved_build_carriers(CBMHashTable *carriers, const CBMFileResult *result) {
+    /* Caller names in the TS LSP walk can denote an outer factory. The
+     * extractor's exact occurrence is the authoritative enclosing function.
+     * Index by span AND leaf: two receiver calls on one line remain distinct. */
+    for (int i = 0; i < result->calls.count; i++) {
+        if (!unresolved_add_carrier(carriers, &result->calls.items[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool unresolved_append_site(unresolved_capture_t *capture, const CBMResolvedCall *rc,
+                                   const CBMCall *call, const char *caller, const char *leaf) {
+    yyjson_mut_doc *doc = capture->doc;
+    yyjson_mut_val *site = yyjson_mut_obj(doc);
+    bool ok =
+        site && yyjson_mut_obj_add_strcpy(doc, site, "caller", caller) &&
+        yyjson_mut_obj_add_strcpy(doc, site, "leaf", leaf) &&
+        yyjson_mut_obj_add_uint(doc, site, "start_byte", rc->site_start_byte) &&
+        yyjson_mut_obj_add_uint(doc, site, "end_byte", rc->site_end_byte) &&
+        yyjson_mut_obj_add_uint(doc, site, "source_origin", rc->source_origin) &&
+        yyjson_mut_obj_add_strcpy(doc, site, "reason", rc->reason ? rc->reason : "unresolved");
+    if (ok && call && call->start_line > 0) {
+        ok = yyjson_mut_obj_add_int(doc, site, "line", call->start_line);
+    }
+    if (ok && call && call->coverage_candidate_qn) {
+        ok = yyjson_mut_obj_add_strcpy(doc, site, "candidate", call->coverage_candidate_qn);
+    }
+    return ok && yyjson_mut_arr_add_val(capture->sites, site);
+}
+
+static bool unresolved_collect_site(unresolved_capture_t *capture, const CBMResolvedCall *rc) {
+    const char *leaf = cbm_lsp_bare_segment(rc->callee_qn);
+    char *lookup =
+        unresolved_site_key("", leaf, rc->site_start_byte, rc->site_end_byte, rc->source_origin);
+    if (!lookup) {
+        return false;
+    }
+    const unresolved_carrier_t *carrier = cbm_ht_get(capture->carriers, lookup);
+    const CBMCall *call = carrier ? carrier->call : NULL;
+    cbm_free(CBM_MEM_CLASS_DUMP, lookup);
+    /* This exact occurrence emitted a real CALLS edge, possibly via the
+     * registry after LSP failure. Never suppress a different occurrence. */
+    if (call && call->coverage_calls_emitted) {
+        return true;
+    }
+    const char *caller = call && call->enclosing_func_qn ? call->enclosing_func_qn : rc->caller_qn;
+    char *key = unresolved_site_key(caller, leaf, rc->site_start_byte, rc->site_end_byte,
+                                    rc->source_origin);
+    if (!key) {
+        return false;
+    }
+    if (cbm_ht_has(capture->seen, key)) {
+        cbm_free(CBM_MEM_CLASS_DUMP, key);
+        return true;
+    }
+    cbm_ht_set(capture->seen, key, key);
+    if (!cbm_ht_has(capture->seen, key)) {
+        cbm_free(CBM_MEM_CLASS_DUMP, key);
+        return false;
+    }
+    return unresolved_append_site(capture, rc, call, caller, leaf);
+}
+
+static bool unresolved_collect_sites(unresolved_capture_t *capture, const CBMFileResult *result) {
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *rc = &result->resolved_calls.items[i];
-        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->strategy ||
-            strcmp(rc->strategy, "lsp_unresolved") != 0 || !rc->caller_qn || !rc->callee_qn) {
-            continue;
+        if (unresolved_call_is_missing(rc) && !unresolved_collect_site(capture, rc)) {
+            return false;
         }
-        const char *leaf = strrchr(rc->callee_qn, '.');
-        leaf = leaf ? leaf + 1 : rc->callee_qn;
-        yyjson_mut_val *site = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_strcpy(doc, site, "caller", rc->caller_qn);
-        yyjson_mut_obj_add_strcpy(doc, site, "leaf", leaf);
-        yyjson_mut_obj_add_uint(doc, site, "start_byte", rc->site_start_byte);
-        yyjson_mut_obj_add_uint(doc, site, "end_byte", rc->site_end_byte);
-        yyjson_mut_obj_add_strcpy(doc, site, "reason", rc->reason ? rc->reason : "unresolved");
-        yyjson_mut_arr_add_val(sites, site);
-        count++;
     }
-    if (count > 0) {
-        yyjson_alc allocator = {.malloc = unresolved_json_alloc,
-                                .realloc = unresolved_json_realloc,
-                                .free = unresolved_json_free};
-        char *detail = yyjson_mut_write_opts(doc, 0, &allocator, NULL, NULL);
+    return true;
+}
+
+/* Caller holds unresolved_mutex. Ownership transfers only on success. */
+static bool unresolved_append_row(cbm_pipeline_t *p, const char *path, const char *detail) {
+    if (!detail || !path || p->unresolved_capture_failed) {
+        return false;
+    }
+    if (p->unresolved_count == p->unresolved_capacity) {
+        int capacity = p->unresolved_capacity ? p->unresolved_capacity * UNRESOLVED_ROW_GROWTH
+                                              : UNRESOLVED_INITIAL_ROWS;
+        cbm_coverage_row_t *rows =
+            cbm_realloc(CBM_MEM_CLASS_DUMP, p->unresolved_rows, (size_t)capacity * sizeof(*rows));
+        if (!rows) {
+            return false;
+        }
+        p->unresolved_rows = rows;
+        p->unresolved_capacity = capacity;
+    }
+    p->unresolved_rows[p->unresolved_count++] =
+        (cbm_coverage_row_t){.rel_path = path, .kind = "unresolved_calls", .detail = detail};
+    return true;
+}
+
+void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
+                                          const CBMFileResult *result) {
+    if (!p || !rel_path || !result || p->unresolved_capture_failed) {
+        return;
+    }
+    if (!unresolved_has_missing_calls(result)) {
+        return;
+    }
+    yyjson_alc allocator = {.malloc = unresolved_json_alloc,
+                            .realloc = unresolved_json_realloc,
+                            .free = unresolved_json_free};
+    unresolved_capture_t capture = {.doc = yyjson_mut_doc_new(&allocator),
+                                    .carriers = cbm_ht_create(0),
+                                    .seen = cbm_ht_create(0)};
+    capture.sites = capture.doc ? yyjson_mut_arr(capture.doc) : NULL;
+    bool ok = capture.doc && capture.carriers && capture.seen && capture.sites;
+    if (capture.doc) {
+        yyjson_mut_doc_set_root(capture.doc, capture.sites);
+    }
+    ok = ok && unresolved_build_carriers(capture.carriers, result) &&
+         unresolved_collect_sites(&capture, result);
+    if (ok && yyjson_mut_arr_size(capture.sites) > 0) {
+        char *detail = yyjson_mut_write_opts(capture.doc, 0, &allocator, NULL, NULL);
         char *path = cbm_mem_strdup(CBM_MEM_CLASS_DUMP, rel_path);
-        if (!detail || !path) {
-            p->unresolved_capture_failed = true;
+        cbm_mutex_lock(&p->unresolved_mutex);
+        ok = unresolved_append_row(p, path, detail);
+        cbm_mutex_unlock(&p->unresolved_mutex);
+        if (!ok) {
             cbm_free(CBM_MEM_CLASS_DUMP, detail);
             cbm_free(CBM_MEM_CLASS_DUMP, path);
-        } else {
-            cbm_coverage_row_t *rows =
-                cbm_realloc(CBM_MEM_CLASS_DUMP, p->unresolved_rows,
-                            (size_t)(p->unresolved_count + 1) * sizeof(*rows));
-            if (!rows) {
-                p->unresolved_capture_failed = true;
-                cbm_free(CBM_MEM_CLASS_DUMP, detail);
-                cbm_free(CBM_MEM_CLASS_DUMP, path);
-            } else {
-                p->unresolved_rows = rows;
-                p->unresolved_rows[p->unresolved_count++] = (cbm_coverage_row_t){
-                    .rel_path = path, .kind = "unresolved_calls", .detail = detail};
-            }
         }
     }
-    yyjson_mut_doc_free(doc);
+    if (!ok) {
+        p->unresolved_capture_failed = true;
+    }
+    unresolved_capture_free(&capture);
 }
 
 void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p) {
@@ -563,6 +741,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
         cbm_free(CBM_MEM_CLASS_DUMP, (char *)p->unresolved_rows[i].detail);
     }
     cbm_free(CBM_MEM_CLASS_DUMP, p->unresolved_rows);
+    cbm_mutex_destroy(&p->unresolved_mutex);
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -1799,18 +1978,6 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                               def_count, def_modules, module_def_index, &cross_registries);
-    if (rc == 0) {
-        for (int i = 0; i < file_count; i++) {
-            bool loaded = false;
-            CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
-            if (result) {
-                cbm_pipeline_record_unresolved_calls(p, files[i].rel_path, result);
-            } else if (ctx->spill && cbm_result_spill_has(ctx->spill, i)) {
-                cbm_pipeline_mark_unresolved_capture_failed(p);
-            }
-            cbm_pipeline_result_release(result, loaded);
-        }
-    }
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     pipeline_phase_mark("parallel_resolve");

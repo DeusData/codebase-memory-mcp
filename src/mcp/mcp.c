@@ -9046,6 +9046,147 @@ static int clamp_mcp_depth(int depth, const char *tool) {
     return depth;
 }
 
+typedef struct {
+    const cbm_node_t *roots;
+    int root_count;
+    const cbm_traverse_result_t *outbound;
+    const cbm_traverse_result_t *inbound;
+    bool include_tests;
+    bool do_outbound;
+    bool do_inbound;
+} trace_coverage_scope_t;
+
+typedef struct {
+    CBMHashTable *callers;
+    CBMHashTable *targets;
+    bool unresolved_out;
+    bool unresolved_in;
+} trace_coverage_match_t;
+
+static bool trace_coverage_add_node(CBMHashTable *table, const cbm_node_t *node) {
+    if (!table || !node->qualified_name) {
+        return true;
+    }
+    cbm_ht_set(table, node->qualified_name, (void *)node);
+    return cbm_ht_has(table, node->qualified_name);
+}
+
+static bool trace_coverage_add_visited(CBMHashTable *table, const cbm_traverse_result_t *tr,
+                                       bool include_tests) {
+    if (!table) {
+        return true;
+    }
+    for (int i = 0; i < tr->visited_count; i++) {
+        const cbm_node_t *node = &tr->visited[i].node;
+        if ((include_tests || !is_test_file(node->file_path)) &&
+            !trace_coverage_add_node(table, node)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool trace_coverage_build_sets(trace_coverage_match_t *match,
+                                      const trace_coverage_scope_t *scope) {
+    for (int i = 0; i < scope->root_count; i++) {
+        if (!trace_coverage_add_node(match->callers, &scope->roots[i]) ||
+            !trace_coverage_add_node(match->targets, &scope->roots[i])) {
+            return false;
+        }
+    }
+    return trace_coverage_add_visited(match->callers, scope->outbound, scope->include_tests) &&
+           trace_coverage_add_visited(match->targets, scope->inbound, scope->include_tests);
+}
+
+static void trace_coverage_match_site(trace_coverage_match_t *match, const char *rel_path,
+                                      yyjson_val *site) {
+    const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
+    const char *candidate = yyjson_get_str(yyjson_obj_get(site, "candidate"));
+    const cbm_node_t *caller_node =
+        match->callers && caller ? cbm_ht_get(match->callers, caller) : NULL;
+    int line = yyjson_get_int(yyjson_obj_get(site, "line"));
+    /* The producer joins the exact byte span to the extractor's innermost
+     * caller. Check its file and source range too; never match a containing
+     * factory merely because its range overlaps. */
+    if (caller_node && caller_node->file_path && strcmp(caller_node->file_path, rel_path) == 0 &&
+        (line <= 0 || (line >= caller_node->start_line && line <= caller_node->end_line))) {
+        match->unresolved_out = true;
+    }
+    /* A short-name collision is not evidence that the resolver considered
+     * this traced target. */
+    if (match->targets && candidate && cbm_ht_has(match->targets, candidate)) {
+        match->unresolved_in = true;
+    }
+}
+
+static void trace_coverage_match_row(trace_coverage_match_t *match, const cbm_coverage_row_t *row,
+                                     const trace_coverage_scope_t *scope) {
+    yyjson_doc *detail = yyjson_read(row->detail, strlen(row->detail), 0);
+    yyjson_val *sites = detail ? yyjson_doc_get_root(detail) : NULL;
+    if (!yyjson_is_arr(sites)) {
+        match->unresolved_out = scope->do_outbound;
+        match->unresolved_in = scope->do_inbound;
+    } else {
+        size_t idx;
+        size_t max;
+        yyjson_val *site;
+        yyjson_arr_foreach(sites, idx, max, site) {
+            trace_coverage_match_site(match, row->rel_path, site);
+        }
+    }
+    if (detail) {
+        yyjson_doc_free(detail);
+    }
+}
+
+static bool trace_coverage_scan_rows(cbm_store_t *store, const char *project,
+                                     trace_coverage_match_t *match,
+                                     const trace_coverage_scope_t *scope) {
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    if (cbm_store_coverage_get_unresolved_calls(store, project, &rows, &row_count) !=
+        CBM_STORE_OK) {
+        return false;
+    }
+    for (int i = 0; i < row_count; i++) {
+        if ((!scope->do_outbound || match->unresolved_out) &&
+            (!scope->do_inbound || match->unresolved_in)) {
+            break;
+        }
+        trace_coverage_match_row(match, &rows[i], scope);
+    }
+    cbm_store_free_coverage(rows, row_count);
+    return true;
+}
+
+static bool trace_coverage_meta_available(cbm_store_t *store, const char *project) {
+    cbm_coverage_meta_t meta = {0};
+    int rc = cbm_store_coverage_meta_get(store, project, &meta);
+    bool available = rc == CBM_STORE_OK &&
+                     meta.coverage_version >= CBM_UNRESOLVED_CALL_COVERAGE_VERSION &&
+                     meta.recording_status && strcmp(meta.recording_status, "unavailable") != 0;
+    cbm_store_coverage_meta_clear(&meta);
+    return available;
+}
+
+static void trace_call_coverage(cbm_store_t *store, const char *project,
+                                const trace_coverage_scope_t *scope, bool includes_calls,
+                                bool *unresolved_out, bool *unresolved_in) {
+    if (!includes_calls) {
+        return;
+    }
+    trace_coverage_match_t match = {.callers = scope->do_outbound ? cbm_ht_create(0) : NULL,
+                                    .targets = scope->do_inbound ? cbm_ht_create(0) : NULL};
+    bool ok = trace_coverage_meta_available(store, project) &&
+              (!scope->do_outbound || match.callers) && (!scope->do_inbound || match.targets) &&
+              trace_coverage_build_sets(&match, scope) &&
+              trace_coverage_scan_rows(store, project, &match, scope);
+    *unresolved_out = ok ? match.unresolved_out : scope->do_outbound;
+    *unresolved_in = ok ? match.unresolved_in : scope->do_inbound;
+    cbm_ht_free(match.callers);
+    cbm_ht_free(match.targets);
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = get_project_arg(args);
@@ -9381,90 +9522,15 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
     bool unresolved_out = false;
     bool unresolved_in = false;
-    if (trace_includes_calls) {
-        cbm_coverage_meta_t coverage_meta = {0};
-        int meta_rc = cbm_store_coverage_meta_get(store, project, &coverage_meta);
-        if (meta_rc == CBM_STORE_OK) {
-            if (coverage_meta.coverage_version < CBM_UNRESOLVED_CALL_COVERAGE_VERSION ||
-                !coverage_meta.recording_status ||
-                strcmp(coverage_meta.recording_status, "unavailable") == 0) {
-                unresolved_out = do_outbound;
-                unresolved_in = do_inbound;
-            }
-        } else {
-            unresolved_out = do_outbound;
-            unresolved_in = do_inbound;
-        }
-        cbm_store_coverage_meta_clear(&coverage_meta);
-        if ((do_outbound && !unresolved_out) || (do_inbound && !unresolved_in)) {
-            CBMHashTable *callers = do_outbound ? cbm_ht_create(0) : NULL;
-            CBMHashTable *leaves = do_inbound ? cbm_ht_create(0) : NULL;
-            if ((do_outbound && !callers) || (do_inbound && !leaves)) {
-                unresolved_out = do_outbound;
-                unresolved_in = do_inbound;
-            } else {
-                bool key_set_failed = false;
-                for (int i = 0; i < node_count; i++) {
-                    if (callers && nodes[i].qualified_name) {
-                        cbm_ht_set(callers, nodes[i].qualified_name, (void *)1);
-                        key_set_failed |= !cbm_ht_has(callers, nodes[i].qualified_name);
-                    }
-                    if (leaves && nodes[i].name) {
-                        cbm_ht_set(leaves, nodes[i].name, (void *)1);
-                        key_set_failed |= !cbm_ht_has(leaves, nodes[i].name);
-                    }
-                }
-                for (int i = 0; callers && i < tr_out.visited_count; i++) {
-                    const cbm_node_t *node = &tr_out.visited[i].node;
-                    if ((include_tests || !is_test_file(node->file_path)) && node->qualified_name) {
-                        cbm_ht_set(callers, node->qualified_name, (void *)1);
-                        key_set_failed |= !cbm_ht_has(callers, node->qualified_name);
-                    }
-                }
-                for (int i = 0; leaves && i < tr_in.visited_count; i++) {
-                    const cbm_node_t *node = &tr_in.visited[i].node;
-                    if ((include_tests || !is_test_file(node->file_path)) && node->name) {
-                        cbm_ht_set(leaves, node->name, (void *)1);
-                        key_set_failed |= !cbm_ht_has(leaves, node->name);
-                    }
-                }
-                cbm_coverage_row_t *rows = NULL;
-                int row_count = 0;
-                if (key_set_failed || cbm_store_coverage_get_unresolved_calls(
-                                          store, project, &rows, &row_count) != CBM_STORE_OK) {
-                    unresolved_out = do_outbound;
-                    unresolved_in = do_inbound;
-                } else {
-                    for (int i = 0; i < row_count && ((!unresolved_out && do_outbound) ||
-                                                      (!unresolved_in && do_inbound));
-                         i++) {
-                        yyjson_doc *detail = yyjson_read(rows[i].detail, strlen(rows[i].detail), 0);
-                        yyjson_val *sites = detail ? yyjson_doc_get_root(detail) : NULL;
-                        if (!yyjson_is_arr(sites)) {
-                            unresolved_out = do_outbound;
-                            unresolved_in = do_inbound;
-                        } else {
-                            size_t idx, max;
-                            yyjson_val *site;
-                            yyjson_arr_foreach(sites, idx, max, site) {
-                                const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
-                                const char *leaf = yyjson_get_str(yyjson_obj_get(site, "leaf"));
-                                if (callers && caller && cbm_ht_has(callers, caller))
-                                    unresolved_out = true;
-                                if (leaves && leaf && cbm_ht_has(leaves, leaf))
-                                    unresolved_in = true;
-                            }
-                        }
-                        if (detail)
-                            yyjson_doc_free(detail);
-                    }
-                }
-                cbm_store_free_coverage(rows, row_count);
-            }
-            cbm_ht_free(callers);
-            cbm_ht_free(leaves);
-        }
-    }
+    trace_coverage_scope_t coverage_scope = {.roots = nodes,
+                                             .root_count = node_count,
+                                             .outbound = &tr_out,
+                                             .inbound = &tr_in,
+                                             .include_tests = include_tests,
+                                             .do_outbound = do_outbound,
+                                             .do_inbound = do_inbound};
+    trace_call_coverage(store, project, &coverage_scope, trace_includes_calls, &unresolved_out,
+                        &unresolved_in);
     const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
     const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
 
@@ -10215,11 +10281,12 @@ static bool is_parse_unusable(const cbm_file_error_t *e) {
     return e->phase && strcmp(e->phase, "parse_unusable") == 0;
 }
 
-/* Either coverage phase. Both mean the file WAS indexed, so both must stay out
+/* All coverage phases mean the file WAS indexed, so they must stay out
  * of skipped[] — a reader who sees a file there believes it is absent from the
  * graph entirely. */
-static bool is_parse_coverage(const cbm_file_error_t *e) {
-    return is_parse_partial(e) || is_parse_unusable(e);
+static bool is_indexed_coverage(const cbm_file_error_t *e) {
+    return is_parse_partial(e) || is_parse_unusable(e) ||
+           (e->phase && strcmp(e->phase, "unresolved_calls") == 0);
 }
 
 /* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
@@ -10229,17 +10296,20 @@ static bool is_parse_coverage(const cbm_file_error_t *e) {
  * and, if a per-run logfile was written, "logfile": "<path>".
  * The run status stays "indexed" — a skipped file is the expected handled
  * outcome, not a failure. errs[] is borrowed (copied into doc) and may contain
- * parse_partial and parse_unusable entries, which are filtered out here (both
- * reported separately by add_parse_partial_summary). */
+ * parse_partial, parse_unusable, and unresolved_calls entries. These describe
+ * indexed files and are counted separately from skips. */
 static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_file_error_t *errs, int count, const char *logfile) {
     int skips = 0;
+    int unresolved = 0;
     for (int i = 0; i < count; i++) {
-        if (!is_parse_coverage(&errs[i])) {
+        unresolved += errs[i].phase && strcmp(errs[i].phase, "unresolved_calls") == 0;
+        if (!is_indexed_coverage(&errs[i])) {
             skips++;
         }
     }
     yyjson_mut_obj_add_int(doc, root, "skipped_count", skips);
+    yyjson_mut_obj_add_int(doc, root, "unresolved_calls_count", unresolved);
     if (logfile && logfile[0]) {
         yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
     }
@@ -10250,7 +10320,7 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_val *files = yyjson_mut_arr(doc);
     int shown = 0;
     for (int i = 0; i < count && shown < INDEX_SKIPPED_FILE_CAP; i++) {
-        if (is_parse_coverage(&errs[i])) {
+        if (is_indexed_coverage(&errs[i])) {
             continue;
         }
         yyjson_mut_val *fe = yyjson_mut_obj(doc);

@@ -1352,19 +1352,6 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
                                   all_defs, all_def_count, closure ? closure->def_modules : NULL,
                                   module_def_index, registries_arg);
-        if (rc == 0) {
-            for (int i = 0; i < ci; i++) {
-                bool loaded = false;
-                CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
-                if (result) {
-                    cbm_pipeline_record_unresolved_calls(ctx->pipeline, changed_files[i].rel_path,
-                                                         result);
-                } else if (ctx->spill && cbm_result_spill_has(ctx->spill, i)) {
-                    cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
-                }
-                cbm_pipeline_result_release(result, loaded);
-            }
-        }
         if (module_def_index) {
             cbm_pxc_free_module_def_index(module_def_index);
         }

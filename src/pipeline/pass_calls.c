@@ -205,7 +205,7 @@ static void free_import_map(const char **keys, const char **vals, int count) {
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge. */
-static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+static void handle_route_registration(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
                                       const char **imp_keys, const char **imp_vals, int imp_count) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
@@ -225,7 +225,9 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_fa);
-    cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
+    if (cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props) > 0) {
+        call->coverage_calls_emitted = true;
+    }
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
                                                      module_qn, imp_keys, imp_vals, imp_count);
@@ -284,7 +286,7 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
  * this, so data_flow mode had no argument expressions to surface for small
  * (< 50 file) repos that take the sequential path (#514). Mirrors the parallel
  * path's append_args_json shape so both pipelines agree. */
-static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
+static void calls_append_args(char *props, size_t cap, CBMCall *call) {
     if (!call || call->arg_count <= 0) {
         return;
     }
@@ -331,7 +333,7 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
 }
 
 static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
-                            char *props, size_t cap, const CBMCall *call) {
+                            char *props, size_t cap, CBMCall *call) {
     if (call && call->start_line > 0 && strcmp(type, "CALLS") == 0) {
         size_t len = strlen(props);
         if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}' && len + CBM_SZ_32 < cap) {
@@ -342,10 +344,13 @@ static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const ch
     if (call && strcmp(type, "CALLS") == 0) {
         calls_append_args(props, cap, call);
     }
-    cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
+    if (cbm_gbuf_insert_edge(gbuf, src, tgt, type, props) > 0 && call &&
+        strcmp(type, "CALLS") == 0) {
+        call->coverage_calls_emitted = true;
+    }
 }
 
-static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
                                  const cbm_resolution_t *res, cbm_svc_kind_t svc,
                                  bool suppress_plain_calls) {
@@ -414,7 +419,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
  * match, #592/#606), the route/HTTP/ASYNC/CONFIG service classifications below
  * still run — only the plain CALLS fall-through is skipped, so a fabricated
  * project edge is dropped while every service edge stays main-identical. */
-static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
                                  const cbm_resolution_t *res, const char *module_qn,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
@@ -504,7 +509,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.qualified_name = target_node->qualified_name;
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
-            res.candidate_count = 1;
+            res.candidate_count = CBM_ALLOC_ONE;
+            call->coverage_candidate_qn = target_node->qualified_name;
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
                                  imp_vals, imp_count, false);
             return SKIP_ONE;
@@ -682,6 +688,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
+    call->coverage_candidate_qn = target_node->qualified_name;
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count, drop_plain_call);
     return SKIP_ONE;
