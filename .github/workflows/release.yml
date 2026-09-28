@@ -145,6 +145,15 @@ jobs:
       version: ${{ inputs.version }}
       use_release_artifacts: true
 
+  # ── Waste sanitizer, REPORT-ONLY ────────────────────────────────
+  # The same full run as the dry run, on the release commit. Not in
+  # release-draft's needs: the report is evidence for the release notes, never
+  # a publication gate.
+  memwaste:
+    uses: ./.github/workflows/_memwaste.yml
+    with:
+      mode: full
+
   # ── 6. Create DRAFT release ────────────────────────────────────
   # Requires smoke to have actually SUCCEEDED, not merely "not failed". The bare
   # !cancelled() && !failure() form is fail-OPEN: a skipped smoke is neither

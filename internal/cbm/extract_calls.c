@@ -79,8 +79,9 @@ static const char *strip_quotes(CBMArena *a, const char *text) {
 
 // Callee suffixes for IRIS Python interop string-dispatch. Kept at file scope
 // (not inside the function) to satisfy cppcheck variableScope.
-static const char *s_py_dispatch_suffixes[] = {".classMethodValue", ".classMethodVoid",
-                                               ".classMethodBoolean", ".classMethodObject", NULL};
+static const char *s_py_dispatch_suffixes[] = {".classMethodValue",   ".classMethodVoid",
+                                               ".classMethodBoolean", ".classMethodObject",
+                                               ".invokeClassMethod",  NULL};
 
 // Per-language callee-suffix dispatch table — returns a NULL-terminated list of
 // method-name suffixes whose calls should be resolved by extracting class+method
@@ -258,9 +259,18 @@ static char *extract_constructor_callee(CBMArena *a, TSNode node, const char *so
 }
 
 // Try common field-based callee resolution (function, name, method fields).
+static TSNode unwrap_await_callee(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "await_expression") != 0 ||
+        ts_node_named_child_count(node) == 0) {
+        return node;
+    }
+    return ts_node_named_child(node, 0);
+}
+
 static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *source) {
     // Try "function" field
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    func_node = unwrap_await_callee(func_node);
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
         if (strcmp(fk, "selector_expression") == 0) {
@@ -2030,6 +2040,49 @@ static const char *extract_nth_string_arg(CBMExtractCtx *ctx, TSNode args, uint3
     return NULL;
 }
 
+// IRIS embedded Python names the target class in the receiver:
+// iris.cls("Pkg.Class").Method(...) calls ClassMethod Pkg.Class.Method.
+// Returns "Pkg.Class.Method", or NULL unless the receiver is iris.cls() with
+// a string-literal first argument. A non-literal class names nothing, so it
+// gets no class-qualified callee rather than a guessed one.
+static const char *python_iris_cls_callee(CBMExtractCtx *ctx, TSNode call_node) {
+    TSNode fn = ts_node_child_by_field_name(call_node, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "attribute") != 0) {
+        return NULL;
+    }
+    TSNode recv = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+    TSNode meth = ts_node_child_by_field_name(fn, TS_FIELD("attribute"));
+    if (ts_node_is_null(recv) || ts_node_is_null(meth) || strcmp(ts_node_type(recv), "call") != 0) {
+        return NULL;
+    }
+    TSNode recv_fn = ts_node_child_by_field_name(recv, TS_FIELD("function"));
+    TSNode recv_args = ts_node_child_by_field_name(recv, TS_FIELD("arguments"));
+    if (ts_node_is_null(recv_fn) || ts_node_is_null(recv_args) ||
+        ts_node_named_child_count(recv_args) == 0) {
+        return NULL;
+    }
+    const char *recv_text = cbm_node_text(ctx->arena, recv_fn, ctx->source);
+    if (!recv_text || strcmp(recv_text, "iris.cls") != 0) {
+        return NULL;
+    }
+    TSNode cls_arg = ts_node_named_child(recv_args, 0);
+    if (!is_string_like(ts_node_type(cls_arg))) {
+        return NULL;
+    }
+    // Plain quoted literals only: an f-string or other prefixed string is a
+    // "string" node too, but its text is not a class name.
+    char *cls_text = cbm_node_text(ctx->arena, cls_arg, ctx->source);
+    if (!cls_text || (cls_text[0] != '"' && cls_text[0] != '\'')) {
+        return NULL;
+    }
+    const char *cls = strip_and_validate_string_arg(ctx->arena, cls_text);
+    const char *mth = cbm_node_text(ctx->arena, meth, ctx->source);
+    if (!cls || !cls[0] || !mth || !mth[0]) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s.%s", cls, mth);
+}
+
 // --- Unified handler: called once per node by the cursor walk ---
 
 // Process a keyword argument (keyword_argument or pair node).
@@ -2059,6 +2112,14 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
     for (uint32_t ai = 0; ai < argc && call->arg_count < CBM_MAX_CALL_ARGS; ai++) {
         TSNode arg_node = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg_node);
+        /* tree-sitter lists a comment inside the argument list as a named
+         * child (Java block_comment/line_comment, C-family comment). It is
+         * not an argument: taken as one, a leading block comment became
+         * args[0] and the Route pass read its text as a URL. */
+        if (strcmp(ak, "comment") == 0 || strcmp(ak, "line_comment") == 0 ||
+            strcmp(ak, "block_comment") == 0) {
+            continue;
+        }
         if (!call->args) {
             call->args = cbm_arena_calloc(ctx->arena, CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
             if (!call->args) {
@@ -2263,6 +2324,61 @@ static const char *extract_binary_concat_suffix(CBMExtractCtx *ctx, TSNode node)
 }
 
 // Try to extract URL/topic from a positional argument (string or constant).
+/* Swift names its call arguments, so each one is a value_argument that may lead
+ * with a value_argument_label — the `from:` in `data(from: url)`. Return the
+ * value itself, and leave any other node exactly as it came in. */
+static TSNode swift_argument_value(TSNode arg) {
+    if (strcmp(ts_node_type(arg), "value_argument") != 0 || ts_node_named_child_count(arg) == 0) {
+        return arg;
+    }
+    TSNode val = ts_node_named_child(arg, 0);
+    if (strcmp(ts_node_type(val), "value_argument_label") == 0 &&
+        ts_node_named_child_count(arg) > 1) {
+        val = ts_node_named_child(arg, 1);
+    }
+    return val;
+}
+
+/* Swift has no URL literal, so almost no real code passes a bare string to a
+ * request. It writes `URL(string: "https://…")!` instead, and the literal then
+ * sits two levels down: past the trailing `!`, which the grammar models as a
+ * postfix_expression, and inside the constructor's own argument list.
+ *
+ * Unwrap both so that literal is as reachable as a bare one. Only the three
+ * Foundation types that take a URL string are unwrapped — any other call keeps
+ * its own meaning, and a non-literal argument such as `URL(string: base + path)`
+ * falls through to the ordinary handling unchanged. */
+static TSNode swift_unwrap_url_constructor(CBMExtractCtx *ctx, TSNode arg) {
+    /* Step past a trailing "!" or "?". */
+    if (strcmp(ts_node_type(arg), "postfix_expression") == 0) {
+        TSNode target = ts_node_child_by_field_name(arg, TS_FIELD("target"));
+        if (!ts_node_is_null(target)) {
+            arg = target;
+        }
+    }
+    if (strcmp(ts_node_type(arg), "call_expression") != 0) {
+        return arg;
+    }
+    TSNode callee = ts_node_named_child(arg, 0);
+    if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "simple_identifier") != 0) {
+        return arg;
+    }
+    const char *name = cbm_node_text(ctx->arena, callee, ctx->source);
+    if (!name || (strcmp(name, "URL") != 0 && strcmp(name, "URLComponents") != 0 &&
+                  strcmp(name, "URLRequest") != 0)) {
+        return arg;
+    }
+    TSNode suffix = cbm_find_child_by_kind(arg, "call_suffix");
+    if (ts_node_is_null(suffix)) {
+        return arg;
+    }
+    TSNode inner = cbm_find_child_by_kind(suffix, "value_arguments");
+    if (ts_node_is_null(inner) || ts_node_named_child_count(inner) == 0) {
+        return arg;
+    }
+    return swift_argument_value(ts_node_named_child(inner, 0));
+}
+
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
     /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
      * client URL joins the server route's canonical placeholder (issue #1006). */
@@ -2306,15 +2422,12 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
         }
         /* Swift wraps each argument in a value_argument that may lead with its
          * label, so `data(from: url)` would otherwise yield the label `from`
-         * rather than the value. Step past a leading value_argument_label. */
-        if (strcmp(ts_node_type(arg), "value_argument") == 0 &&
-            ts_node_named_child_count(arg) > 0) {
-            TSNode val = ts_node_named_child(arg, 0);
-            if (strcmp(ts_node_type(val), "value_argument_label") == 0 &&
-                ts_node_named_child_count(arg) > 1) {
-                val = ts_node_named_child(arg, 1);
-            }
-            arg = val;
+         * rather than the value. */
+        arg = swift_argument_value(arg);
+        /* A Swift URL is usually built rather than written bare, and the
+         * literal then sits inside that constructor. */
+        if (ctx->language == CBM_LANG_SWIFT) {
+            arg = swift_unwrap_url_constructor(ctx, arg);
         }
         const char *ak = ts_node_type(arg);
 
@@ -2956,6 +3069,28 @@ static char *resolve_objectscript_instance_call(CBMArena *a, TSNode node, const 
  * statically-known type here, so the call must not bind by short name alone.
  * Note `self.client.send()` is NOT exempt: the receiver is `self.client`, an
  * attribute of unknown type, not `self` itself. */
+/* True when a Python attribute-call receiver is an attribute chain ROOTED at
+ * self/cls but is not self/cls itself: `self.compiler.apply_converters()` has
+ * receiver `self.compiler`, an object the class owns. The weak-member guard's
+ * unique-name exemption keys on this shape (see cbm_weak_member_unique_name_
+ * exempt): a bare parameter (`accelerator.backward()`) carries no ownership
+ * evidence and stays suppressed. Direct `self.m()` is already exempt via
+ * python_receiver_is_exempt and is deliberately NOT flagged here. */
+static bool python_receiver_rooted_at_self(CBMExtractCtx *ctx, TSNode receiver) {
+    if (ts_node_is_null(receiver) || strcmp(ts_node_type(receiver), "attribute") != 0) {
+        return false;
+    }
+    TSNode root = receiver;
+    while (!ts_node_is_null(root) && strcmp(ts_node_type(root), "attribute") == 0) {
+        root = ts_node_child_by_field_name(root, TS_FIELD("object"));
+    }
+    if (ts_node_is_null(root) || strcmp(ts_node_type(root), "identifier") != 0) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, root, ctx->source);
+    return name && (strcmp(name, "self") == 0 || strcmp(name, "cls") == 0);
+}
+
 static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
     if (ts_node_is_null(receiver)) {
         return false;
@@ -3521,6 +3656,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     }
 
     selection.expr = language_specific_callee_expr(ctx->language, node);
+    selection.expr = unwrap_await_callee(selection.expr);
     if (is_dynamic_callee_expr(ctx, selection.expr)) {
         selection.expr = (TSNode){0};
         return selection;
@@ -3685,6 +3821,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
                     TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
                     call.is_method = !python_receiver_is_exempt(ctx, obj);
+                    call.receiver_is_self_attribute = python_receiver_rooted_at_self(ctx, obj);
                 } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
                     call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, state, fn);
                 }
@@ -3812,6 +3949,16 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 }
             }
 
+            // #1260: iris.cls("Pkg.X").M() names its class, so the qualified
+            // callee replaces the bare one. Keeping both would let the bare
+            // name weak-match an unrelated same-named method.
+            if (ctx->language == CBM_LANG_PYTHON) {
+                const char *iris_callee = python_iris_cls_callee(ctx, node);
+                if (iris_callee) {
+                    call.callee_name = iris_callee;
+                    call.is_method = false;
+                }
+            }
             cbm_calls_push(&ctx->result->calls, ctx->arena, call);
             invocation = describe_emitted_primary_call(node, &callee);
 

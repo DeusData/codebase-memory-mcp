@@ -1,0 +1,1 @@
+MATCH (f:Function)-[:CALLS]->(g:Function) WHERE f.name = 'main' AND g.file_path CONTAINS 'src' RETURN g.name, g.file_path ORDER BY g.name

@@ -328,6 +328,33 @@ TEST(sem_corpus_idf) {
     PASS();
 }
 
+/* The vector build resolves each token once and reads idf and vector by index
+ * (pass_semantic_edges.c): the index accessors must give the same answers as
+ * the name-keyed ones, before and after finalize, and agree on unknown tokens. */
+TEST(sem_corpus_index_accessors_match_name_lookups) {
+    cbm_sem_corpus_t *c = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(c);
+    const char *doc1[] = {"alpha", "beta", "gamma"};
+    const char *doc2[] = {"alpha", "delta", "beta"};
+    const char *doc3[] = {"epsilon", "alpha"};
+    cbm_sem_corpus_add_doc(c, doc1, 3);
+    cbm_sem_corpus_add_doc(c, doc2, 3);
+    cbm_sem_corpus_add_doc(c, doc3, 2);
+    static const char *const probe[] = {"alpha", "beta", "gamma", "delta", "epsilon", "absent"};
+    for (int round = 0; round < 2; round++) {
+        for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+            int idx = cbm_sem_corpus_token_index(c, probe[i]);
+            ASSERT_FLOAT_EQ(cbm_sem_corpus_idf_at(c, idx), cbm_sem_corpus_idf(c, probe[i]), 0.0);
+            ASSERT_TRUE(cbm_sem_corpus_ri_vec_at(c, idx) == cbm_sem_corpus_ri_vec(c, probe[i]));
+        }
+        ASSERT_EQ(cbm_sem_corpus_token_index(c, "absent"), -1);
+        ASSERT_NULL(cbm_sem_corpus_ri_vec_at(c, -1));
+        cbm_sem_corpus_finalize(c); /* second round: the finalized corpus */
+    }
+    cbm_sem_corpus_free(c);
+    PASS();
+}
+
 TEST(sem_corpus_add_null_doc) {
     cbm_sem_corpus_t *c = cbm_sem_corpus_new();
     ASSERT_NOT_NULL(c);
@@ -503,6 +530,7 @@ SUITE(semantic) {
     RUN_TEST(sem_corpus_new_free);
     RUN_TEST(sem_corpus_add_one_doc);
     RUN_TEST(sem_corpus_idf);
+    RUN_TEST(sem_corpus_index_accessors_match_name_lookups);
     RUN_TEST(sem_corpus_add_null_doc);
     RUN_TEST(sem_corpus_free_null);
     RUN_TEST(sem_get_config_defaults);

@@ -1491,6 +1491,33 @@ const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const
     return &corpus->entries[idx].enriched_vec;
 }
 
+int cbm_sem_corpus_token_index(const cbm_sem_corpus_t *corpus, const char *token) {
+    if (!corpus || !token) {
+        return CBM_NOT_FOUND;
+    }
+    int idx = parse_token_index(cbm_ht_get(corpus->token_map, token));
+    return (idx < 0 || idx >= corpus->entry_count) ? CBM_NOT_FOUND : idx;
+}
+
+/* Same arithmetic as cbm_sem_corpus_idf, by index. */
+float cbm_sem_corpus_idf_at(const cbm_sem_corpus_t *corpus, int index) {
+    if (!corpus || corpus->doc_count == 0 || index < 0 || index >= corpus->entry_count) {
+        return 0.0F;
+    }
+    int df = corpus->entries[index].doc_freq;
+    if (df <= 0) {
+        return 0.0F;
+    }
+    return logf((float)corpus->doc_count / (float)df);
+}
+
+const cbm_sem_vec_t *cbm_sem_corpus_ri_vec_at(const cbm_sem_corpus_t *corpus, int index) {
+    if (!corpus || index < 0 || index >= corpus->entry_count) {
+        return NULL;
+    }
+    return &corpus->entries[index].enriched_vec;
+}
+
 int cbm_sem_corpus_doc_count(const cbm_sem_corpus_t *corpus) {
     return corpus ? corpus->doc_count : 0;
 }

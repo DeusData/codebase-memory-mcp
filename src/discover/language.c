@@ -321,6 +321,28 @@ static const ext_entry_t EXT_TABLE[] = {
     {".xsd", CBM_LANG_XML},
     {".xsl", CBM_LANG_XML},
     {".svg", CBM_LANG_XML},
+    /* MSBuild project system. Plain XML documents, and the files that carry a
+     * .NET repository's package references, target frameworks, build hooks and
+     * project layout — none of which were reachable while these were unmapped. */
+    {".csproj", CBM_LANG_XML},
+    {".vbproj", CBM_LANG_XML},
+    {".fsproj", CBM_LANG_XML},
+    {".props", CBM_LANG_XML},
+    {".targets", CBM_LANG_XML},
+    {".nuspec", CBM_LANG_XML},
+    {".slnx", CBM_LANG_XML},
+    {".runsettings", CBM_LANG_XML},
+    /* .NET resource files: the localized strings a UI reads back by key. */
+    {".resx", CBM_LANG_XML},
+    /* XAML views: WPF, WinUI, MAUI (.xaml) and Avalonia (.axaml). */
+    {".xaml", CBM_LANG_XML},
+    {".axaml", CBM_LANG_XML},
+    /* Application manifests: Apple property lists and privacy manifests, Win32
+     * side-by-side manifests and MSIX packages. */
+    {".plist", CBM_LANG_XML},
+    {".xcprivacy", CBM_LANG_XML},
+    {".manifest", CBM_LANG_XML},
+    {".appxmanifest", CBM_LANG_XML},
 
     /* YAML */
     {".yaml", CBM_LANG_YAML},

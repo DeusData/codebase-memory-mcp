@@ -1599,6 +1599,49 @@ static bool is_c_family_source(const char *source_rel) {
     return false;
 }
 
+/* Directory depth of a repo-relative path: how many directories sit above it. */
+static int include_path_depth(const char *path) {
+    int depth = 0;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Total order among nodes whose file path ends with the include path. The
+ * by-name hits arrive in node-registration order, which under parallel
+ * extraction is the workers' merge order and differs run to run; taking the
+ * first hit made `#include <linux/device.h>` target include/linux/device.h in
+ * one index of the kernel and tools/virtio/linux/device.h in the next (5,821
+ * IMPORTS edges moved, and every CALLS edge resolved through those files'
+ * import maps moved with them). The include names a file, so a File node
+ * outranks a symbol declared in it; among files the least nested path wins
+ * (include/ over tools/virtio/), then the smaller path, then the smaller QN
+ * — a function of the candidate set alone (O9). */
+static bool include_target_outranks(const cbm_gbuf_node_t *cand, const cbm_gbuf_node_t *best) {
+    if (!best) {
+        return true;
+    }
+    bool cand_file = strcmp(cand->label, "File") == 0;
+    bool best_file = strcmp(best->label, "File") == 0;
+    if (cand_file != best_file) {
+        return cand_file;
+    }
+    int cd = include_path_depth(cand->file_path);
+    int bd = include_path_depth(best->file_path);
+    if (cd != bd) {
+        return cd < bd;
+    }
+    int by_path = strcmp(cand->file_path, best->file_path);
+    if (by_path != 0) {
+        return by_path < 0;
+    }
+    return cand->qualified_name && best->qualified_name &&
+           strcmp(cand->qualified_name, best->qualified_name) < 0;
+}
+
 static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *ctx,
                                                       const char *file_path,
                                                       const char *source_file_qn) {
@@ -1651,18 +1694,12 @@ static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *
                 strcmp(cand->qualified_name, source_file_qn) == 0) {
                 continue;
             }
-            if (strcmp(cand->label, "File") == 0) {
-                return cand;
-            }
-            if (!best) {
+            if (include_target_outranks(cand, best)) {
                 best = cand;
             }
         }
-        if (best) {
-            return best;
-        }
     }
-    return NULL;
+    return best;
 }
 
 static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *ctx,
@@ -2100,13 +2137,19 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
 /* ── Namespace map ───────────────────────────────────────────────── */
 
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count) {
+/* The namespace names themselves, so a caller that has parked some results on
+ * disk can still contribute their namespaces (see
+ * cbm_result_spill_namespace). A file missing from this map does not fail to
+ * resolve -- it resolves DIFFERENTLY, through the looser fallback, which is why
+ * an incomplete map changed edge counts in both directions rather than only
+ * losing edges. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count) {
     CBMHashTable *map = NULL;
     for (int i = 0; i < count; i++) {
-        const CBMFileResult *r = results[i];
-        if (!r || !r->namespace_name || !r->namespace_name[0] || !rels[i]) {
+        const char *namespace_name = namespaces[i];
+        if (!namespace_name || !namespace_name[0] || !rels[i]) {
             continue;
         }
         if (!map) {
@@ -2122,7 +2165,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(r->namespace_name);
+        char *key = strdup(namespace_name);
         if (!key) {
             free(file_qn);
             continue;
@@ -2159,6 +2202,25 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
             free(file_qn); /* content copied into combined */
         }
     }
+    return map;
+}
+
+/* Convenience for callers whose results are all in memory (the sequential
+ * definitions pass). A caller that can SPILL must use the _names variant and
+ * fill the parked slots from cbm_result_spill_namespace, or its map silently
+ * loses those files. */
+CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
+                                               CBMFileResult *const *results,
+                                               const char *const *rels, int count) {
+    const char **names = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        names[i] = results[i] ? results[i]->namespace_name : NULL;
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build_names(project_name, names, rels, count);
+    cbm_free(CBM_MEM_CLASS_OTHER, names);
     return map;
 }
 

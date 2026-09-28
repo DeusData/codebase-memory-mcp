@@ -184,6 +184,14 @@ float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token);
 /* Get the enriched Random Indexing vector for a token (after co-occurrence). */
 const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const char *token);
 
+/* The same two answers by token index, for a caller that asks both about many
+ * tokens: resolve each token once (cbm_sem_corpus_token_index, -1 when unknown)
+ * and read idf and vector by index. The name-keyed pair costs one hash lookup and
+ * one strtol per question -- three per token in the vector build. */
+int cbm_sem_corpus_token_index(const cbm_sem_corpus_t *corpus, const char *token);
+float cbm_sem_corpus_idf_at(const cbm_sem_corpus_t *corpus, int index);
+const cbm_sem_vec_t *cbm_sem_corpus_ri_vec_at(const cbm_sem_corpus_t *corpus, int index);
+
 /* Get the total document count. */
 int cbm_sem_corpus_doc_count(const cbm_sem_corpus_t *corpus);
 

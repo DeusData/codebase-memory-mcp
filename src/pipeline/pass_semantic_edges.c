@@ -22,6 +22,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h" /* cbm_fopen for the pair dump */
 #define XXH_INLINE_ALL
 #include "xxhash/xxhash.h"
 
@@ -194,23 +195,33 @@ static int inject_callee_tokens(const char *name, char **tokens, int count, int 
 }
 
 /* Walk the outbound CALLS edges of n and inject tokens for each target. */
+static const char **collect_sorted_call_neighbors(const cbm_gbuf_t *gbuf, int64_t node_id,
+                                                  bool outbound, int *out_n);
+
 static int inject_calls_pattern_tokens(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf,
                                        char **tokens, int count, int max_tokens) {
     if (!gbuf) {
         return count;
     }
-    const cbm_gbuf_edge_t **edges = NULL;
-    int ec = 0;
-    if (cbm_gbuf_find_edges_by_source_type(gbuf, n->id, "CALLS", &edges, &ec) != 0) {
+    /* SORTED, like every other consumer of CALLS neighbours in this file. The
+     * raw edge array is in graph-buffer insertion order — parallel worker merge
+     * order — and this loop both ORDERS the injected tokens and truncates at
+     * max_tokens. Co-occurrence enrichment reads a window around each token
+     * POSITION, so a different order yields different token vectors while
+     * leaving document frequencies untouched: measured on the go corpus
+     * 2026-09-19, two runs of one binary with identical idf but different token
+     * sequences and different enriched vectors, which flickered near-threshold
+     * SEMANTICALLY_RELATED edges. collect_sorted_call_neighbors() was written
+     * for exactly this class and this call site was missed. */
+    int nn = 0;
+    const char **names = collect_sorted_call_neighbors(gbuf, n->id, /*outbound=*/true, &nn);
+    if (!names) {
         return count;
     }
-    for (int e = 0; e < ec && count < max_tokens; e++) {
-        const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(gbuf, edges[e]->target_id);
-        if (!t || !t->name) {
-            continue;
-        }
-        count = inject_callee_tokens(t->name, tokens, count, max_tokens);
+    for (int e = 0; e < nn && count < max_tokens; e++) {
+        count = inject_callee_tokens(names[e], tokens, count, max_tokens);
     }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)names);
     return count;
 }
 
@@ -704,12 +715,22 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
         int tc = vc->token_counts[f];
         char **tokens = &vc->all_tokens[vc->offsets[f]];
 
+        /* Each token is resolved to its corpus index ONCE: both loops below ask
+         * about every token, and asking by name cost a hash lookup plus a
+         * strtol per question -- three per token (35 M repeated lookups of an
+         * unchanged table on the Go corpus, waste sanitizer 2026-09-17). */
+        int *token_index = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)tc * sizeof(int));
+        for (int t = 0; token_index && t < tc; t++) {
+            token_index[t] = cbm_sem_corpus_token_index(vc->corpus, tokens[t]);
+        }
+
         /* TF-IDF weights */
         int *indices = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)tc * sizeof(int));
         float *weights = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)tc * sizeof(float));
         int tfidf_len = 0;
         for (int t = 0; t < tc; t++) {
-            float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
+            float idf = token_index ? cbm_sem_corpus_idf_at(vc->corpus, token_index[t])
+                                    : cbm_sem_corpus_idf(vc->corpus, tokens[t]);
             if (idf > 0.0F) {
                 indices[tfidf_len] = t;
                 weights[tfidf_len] = idf;
@@ -726,12 +747,16 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
         cbm_sem_vec_t ri_dense;
         memset(&ri_dense, 0, sizeof(cbm_sem_vec_t));
         for (int t = 0; t < tc; t++) {
-            const cbm_sem_vec_t *ri = cbm_sem_corpus_ri_vec(vc->corpus, tokens[t]);
+            const cbm_sem_vec_t *ri = token_index
+                                          ? cbm_sem_corpus_ri_vec_at(vc->corpus, token_index[t])
+                                          : cbm_sem_corpus_ri_vec(vc->corpus, tokens[t]);
             if (ri) {
-                float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
+                float idf = token_index ? cbm_sem_corpus_idf_at(vc->corpus, token_index[t])
+                                        : cbm_sem_corpus_idf(vc->corpus, tokens[t]);
                 cbm_sem_vec_add_scaled(&ri_dense, ri, idf);
             }
         }
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, token_index);
         cbm_sem_normalize(&ri_dense);
         cbm_rsq_encode(ri_dense.v, &vc->funcs[f].ri_code);
 
@@ -829,18 +854,30 @@ enum {
     SCORE_SEEN_EMPTY = -1,
 };
 
-/* Check whether `j` has already been recorded in the open-addressed `seen`
- * set for this function; insert it if not.  Returns true when the insertion
- * was fresh (caller should add to candidates). */
-static bool score_seen_insert(int *seen, int j) {
+/* The open-addressed `seen` set of one worker, reused for every function it
+ * scores: a slot belongs to the current function only when its stamp says so,
+ * so starting a function costs nothing where re-filling 8,192 slots cost a
+ * 32 KB write per function (90 k on the Go corpus, waste sanitizer
+ * 2026-09-17). Same size and probe order: the same candidates, in order. */
+typedef struct {
+    int ids[SCORE_SEEN_CAP];
+    int stamp[SCORE_SEEN_CAP];
+    int current; /* function index + 1: unique per function, never 0 */
+} score_seen_t;
+
+/* Check whether `j` has already been recorded in the `seen` set for this
+ * function; insert it if not.  Returns true when the insertion was fresh
+ * (caller should add to candidates). */
+static bool score_seen_insert(score_seen_t *seen, int j) {
     uint32_t slot = (uint32_t)j & SCORE_SEEN_MASK;
     for (int p = 0; p < SCORE_SEEN_CAP; p++) {
         uint32_t idx = (slot + (uint32_t)p) & SCORE_SEEN_MASK;
-        if (seen[idx] == SCORE_SEEN_EMPTY) {
-            seen[idx] = j;
+        if (seen->stamp[idx] != seen->current) {
+            seen->stamp[idx] = seen->current;
+            seen->ids[idx] = j;
             return true;
         }
-        if (seen[idx] == j) {
+        if (seen->ids[idx] == j) {
             return false;
         }
     }
@@ -850,7 +887,7 @@ static bool score_seen_insert(int *seen, int j) {
 /* Collect the unique candidate function indices for node `i` by iterating
  * every LSH band and merging bucket members via `seen[]`.  Returns the
  * populated candidate count. */
-static int score_collect_candidates(score_ctx_t *sc, int i, int *seen, int *candidates,
+static int score_collect_candidates(score_ctx_t *sc, int i, score_seen_t *seen, int *candidates,
                                     int cand_cap) {
     int cand_count = 0;
     for (int b = 0; b < SEM_LSH_BANDS && cand_count < cand_cap; b++) {
@@ -902,22 +939,24 @@ static void score_try_emit(score_ctx_t *sc, int i, int j, int c, deferred_edge_b
 static void score_worker(int worker_id, void *ctx_ptr) {
     score_ctx_t *sc = ctx_ptr;
     deferred_edge_buf_t *my_buf = &sc->worker_bufs[worker_id];
+    score_seen_t *seen = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(score_seen_t));
+    if (!seen) {
+        return; /* the other workers claim the functions this one leaves */
+    }
 
     while (true) {
         int i = atomic_fetch_add_explicit(&sc->next_idx, SKIP_ONE, memory_order_relaxed);
         if (i >= sc->func_count) {
             break;
         }
-        int seen[SCORE_SEEN_CAP];
-        for (int s = 0; s < SCORE_SEEN_CAP; s++) {
-            seen[s] = SCORE_SEEN_EMPTY;
-        }
+        seen->current = i + SKIP_ONE;
         int candidates[SEM_MAX_CANDIDATES];
         int cand_count = score_collect_candidates(sc, i, seen, candidates, SEM_MAX_CANDIDATES);
         for (int c = 0; c < cand_count; c++) {
             score_try_emit(sc, i, candidates[c], c, my_buf);
         }
     }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, seen);
 }
 
 /* ── Parallel Phase 1b: decode minhash/profile + build per-func vectors ── */
@@ -1124,9 +1163,27 @@ static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_buf
     }
     qsort(pairs, (size_t)n, sizeof(deferred_edge_t), cmp_deferred_edge_canonical);
 
+    /* CBM_SEM_PAIR_DUMP=<path>: every candidate that passed the threshold, with
+     * its score, in canonical order. Written HERE because this loop is
+     * single-threaded and already sorted, so the dump needs no lock and two
+     * runs compare line by line. The (i, j) indices are stable across runs —
+     * funcs[] is sorted by qualified name — where node ids are not. Exists to
+     * chase the near-threshold SEMANTICALLY_RELATED flicker: find the pair that
+     * flips, then compare its score between runs. */
+    FILE *pair_dump = NULL;
+    {
+        char dump_path[CBM_SZ_1K];
+        if (cbm_safe_getenv("CBM_SEM_PAIR_DUMP", dump_path, sizeof(dump_path), NULL)) {
+            pair_dump = cbm_fopen(dump_path, "w");
+        }
+    }
+
     int total_edges = 0;
     for (int e = 0; e < n; e++) {
         deferred_edge_t *de = &pairs[e];
+        if (pair_dump) {
+            fprintf(pair_dump, "%d %d %.9g\n", de->i, de->j, (double)de->score);
+        }
         if (edge_counts[de->i] >= max_edges || edge_counts[de->j] >= max_edges) {
             continue;
         }
@@ -1137,6 +1194,9 @@ static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_buf
         edge_counts[de->i]++;
         edge_counts[de->j]++;
         total_edges++;
+    }
+    if (pair_dump) {
+        (void)fclose(pair_dump);
     }
     cbm_free(CBM_MEM_CLASS_SEMANTIC, pairs);
     return total_edges;
@@ -1342,6 +1402,139 @@ static void phase5_lsh_build(cbm_sem_func_t *funcs, int func_count, int worker_c
     *out_buckets = band_buckets;
 }
 
+/* Checksum every input the scorer reads, so two runs can be compared at the
+ * seam right before scoring. cbm_sem_combined_score() reads exactly these
+ * fields, so identical checksums with differing scores would be impossible.
+ * Placed AFTER tf-idf is filled (phase 4), not after phase 1b where the
+ * sparse vectors are still empty. Diagnostic, off unless the env var is set. */
+static void sem_state_dump(const cbm_sem_func_t *funcs, int func_count) {
+    /* CBM_SEM_STATE_DUMP=1: one checksum over every per-function vector, so two
+     * runs can be compared at THIS seam. Scores are pure math over these
+     * vectors, so if the checksums match and the scores do not, the difference
+     * is downstream; if they differ, it is here or above. Diagnostic only. */
+    char state_path[CBM_SZ_1K];
+    if (cbm_safe_getenv("CBM_SEM_STATE_DUMP", state_path, sizeof(state_path), NULL)) {
+        uint64_t h = 1469598103934665603ULL;
+        uint64_t h_codes = 1469598103934665603ULL;
+        uint64_t h_tfidf = 1469598103934665603ULL;
+        for (int i = 0; i < func_count; i++) {
+            const unsigned char *bytes[] = {
+                (const unsigned char *)&funcs[i].ri_code,
+                (const unsigned char *)&funcs[i].api_code,
+                (const unsigned char *)&funcs[i].type_code,
+                (const unsigned char *)&funcs[i].deco_code,
+            };
+            for (size_t b = 0; b < sizeof(bytes) / sizeof(bytes[0]); b++) {
+                for (size_t k = 0; k < sizeof(cbm_rsq_code_t); k++) {
+                    h ^= bytes[b][k];
+                    h *= 1099511628211ULL;
+                    h_codes ^= bytes[b][k];
+                    h_codes *= 1099511628211ULL;
+                }
+            }
+            /* The other scoring inputs: sparse TF-IDF, the AST profile and the
+             * minhash fingerprint. Scoring reads exactly these plus the codes
+             * above, so a matching checksum means the scores must match too. */
+            const unsigned char *sp = (const unsigned char *)funcs[i].struct_profile;
+            for (size_t k = 0; k < sizeof(funcs[i].struct_profile); k++) {
+                h ^= sp[k];
+                h *= 1099511628211ULL;
+            }
+            const unsigned char *mh = (const unsigned char *)funcs[i].minhash;
+            for (size_t k = 0; k < (funcs[i].has_minhash ? sizeof(funcs[i].minhash) : 0); k++) {
+                h ^= mh[k];
+                h *= 1099511628211ULL;
+            }
+            for (int w = 0; w < funcs[i].tfidf_len; w++) {
+                h ^= (uint64_t)funcs[i].tfidf_indices[w];
+                h *= 1099511628211ULL;
+                uint32_t bits;
+                memcpy(&bits, &funcs[i].tfidf_weights[w], sizeof(bits));
+                h ^= bits;
+                h *= 1099511628211ULL;
+                h_tfidf ^= (uint64_t)funcs[i].tfidf_indices[w];
+                h_tfidf *= 1099511628211ULL;
+                h_tfidf ^= bits;
+                h_tfidf *= 1099511628211ULL;
+            }
+        }
+        /* To a FILE, not the log: the semantic pass runs in the index WORKER,
+         * whose log is removed when the run succeeds. */
+        FILE *sf = cbm_fopen(state_path, "w");
+        if (sf) {
+            fprintf(sf, "all=%016llx codes=%016llx tfidf=%016llx n=%d\n", (unsigned long long)h,
+                    (unsigned long long)h_codes, (unsigned long long)h_tfidf, func_count);
+            (void)fclose(sf);
+        }
+    }
+}
+
+/* Running hash of the token SEQUENCE handed to the corpus: the set AND the
+ * order, because co-occurrence enrichment reads a window around each position,
+ * so the same tokens in a different order produce different vectors while
+ * leaving document frequencies (and therefore idf) untouched. Diagnostic for
+ * the SEMANTICALLY_RELATED flicker; off unless CBM_SEM_STATE_DUMP is set. */
+static uint64_t g_sem_token_hash = 1469598103934665603ULL;
+
+static void sem_tokens_hash(char **tokens, const size_t *offsets, const int *counts, int n) {
+    char flag[CBM_SZ_1K];
+    if (!cbm_safe_getenv("CBM_SEM_STATE_DUMP", flag, sizeof(flag), NULL)) {
+        return;
+    }
+    for (int d = 0; d < n; d++) {
+        for (int k = 0; k < counts[d]; k++) {
+            const char *tok = tokens[offsets[d] + (size_t)k];
+            for (const unsigned char *c = (const unsigned char *)tok; c && *c; c++) {
+                g_sem_token_hash ^= *c;
+                g_sem_token_hash *= 1099511628211ULL;
+            }
+            g_sem_token_hash ^= 0xff; /* token boundary */
+            g_sem_token_hash *= 1099511628211ULL;
+        }
+        g_sem_token_hash ^= 0xfe; /* document boundary */
+        g_sem_token_hash *= 1099511628211ULL;
+    }
+}
+
+/* Checksum the corpus AFTER enrichment: the per-function vectors and tf-idf are
+ * both derived from it, so if this differs between two runs, everything
+ * downstream differs and the cause is in the corpus build rather than in
+ * scoring. Diagnostic, off unless CBM_SEM_STATE_DUMP is set. */
+static void sem_corpus_dump(const cbm_sem_corpus_t *corpus, const char *suffix) {
+    char state_path[CBM_SZ_1K];
+    if (!cbm_safe_getenv("CBM_SEM_STATE_DUMP", state_path, sizeof(state_path), NULL)) {
+        return;
+    }
+    char path[CBM_SZ_1K];
+    if (snprintf(path, sizeof(path), "%s.%s", state_path, suffix) >= (int)sizeof(path)) {
+        return;
+    }
+    int n = cbm_sem_corpus_token_count(corpus);
+    uint64_t h_vec = 1469598103934665603ULL;
+    uint64_t h_idf = 1469598103934665603ULL;
+    for (int i = 0; i < n; i++) {
+        const cbm_sem_vec_t *v = cbm_sem_corpus_ri_vec_at(corpus, i);
+        if (v) {
+            const unsigned char *b = (const unsigned char *)v;
+            for (size_t k = 0; k < sizeof(*v); k++) {
+                h_vec ^= b[k];
+                h_vec *= 1099511628211ULL;
+            }
+        }
+        uint32_t bits;
+        float idf = cbm_sem_corpus_idf_at(corpus, i);
+        memcpy(&bits, &idf, sizeof(bits));
+        h_idf ^= bits;
+        h_idf *= 1099511628211ULL;
+    }
+    FILE *sf = cbm_fopen(path, "w");
+    if (sf) {
+        fprintf(sf, "vec=%016llx idf=%016llx toks=%016llx tokens=%d\n", (unsigned long long)h_vec,
+                (unsigned long long)h_idf, (unsigned long long)g_sem_token_hash, n);
+        (void)fclose(sf);
+    }
+}
+
 /* Phase 6a: score candidate pairs in parallel and collect deferred edges. */
 static void phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures, int *edge_counts,
                                      sem_bucket_t **band_buckets, cbm_sem_config_t cfg,
@@ -1387,11 +1580,13 @@ static cbm_sem_corpus_t *run_corpus_phase(cbm_gbuf_t *gbuf, char **all_tokens,
                                           int func_count) {
     CBM_PROF_START(t_phase3a);
     cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    sem_tokens_hash(all_tokens, offsets, token_counts, func_count);
     cbm_sem_corpus_add_docs_batch(corpus, all_tokens, offsets, token_counts, func_count);
     CBM_PROF_END_N("semantic_edges", "3a_corpus_batch", t_phase3a, func_count);
 
     CBM_PROF_START(t_phase3b);
     cbm_sem_corpus_finalize(corpus);
+    sem_corpus_dump(corpus, "corpus");
     CBM_PROF_END_N("semantic_edges", "3b_corpus_finalize_seq", t_phase3b,
                    cbm_sem_corpus_token_count(corpus));
 
@@ -1421,6 +1616,7 @@ static int run_scoring_phase(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs, uint64_t *
     }
 
     CBM_PROF_START(t_phase6a);
+    sem_state_dump(funcs, func_count);
     phase6a_score_candidates(funcs, signatures, edge_counts, band_buckets, cfg, worker_bufs,
                              func_count, worker_count);
     CBM_PROF_END_N("semantic_edges", "6a_score_parallel", t_phase6a, func_count);
@@ -1571,6 +1767,7 @@ static cbm_sem_corpus_t *run_token_phases_batched(cbm_gbuf_t *gbuf, cbm_sem_func
         sem_batch_tokenize(node_ptrs, gbuf, first, count, worker_count, token_pools, token_counts,
                            &tokens, &offsets);
         if (tokens && offsets) {
+            sem_tokens_hash(tokens, offsets, token_counts + first, count);
             cbm_sem_corpus_add_docs_batch(corpus, tokens, offsets, token_counts + first, count);
         }
         sem_batch_free_tokens(tokens, offsets);
@@ -1581,6 +1778,7 @@ static cbm_sem_corpus_t *run_token_phases_batched(cbm_gbuf_t *gbuf, cbm_sem_func
 
     CBM_PROF_START(t_phase3b);
     cbm_sem_corpus_finalize(corpus);
+    sem_corpus_dump(corpus, "corpus");
     CBM_PROF_END_N("semantic_edges", "3b_corpus_finalize_seq", t_phase3b,
                    cbm_sem_corpus_token_count(corpus));
     CBM_PROF_START(t_phase3c);

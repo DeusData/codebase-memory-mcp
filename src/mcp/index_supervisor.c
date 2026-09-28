@@ -13,6 +13,7 @@
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 
 #include <limits.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -705,6 +706,11 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     worker_result_init(&handle->result);
     if (!worker_unique_file(handle->response_path, sizeof(handle->response_path), "response") ||
         !worker_unique_file(handle->log_path, sizeof(handle->log_path), "log")) {
+        int saved_errno = errno;
+        char error_text[CBM_SZ_32];
+        (void)snprintf(error_text, sizeof(error_text), "%d", saved_errno);
+        cbm_log_error("index.supervisor.artifact_create_failed", "artifact",
+                      handle->response_path[0] ? "log" : "response", "errno", error_text);
         (void)cbm_unlink(handle->response_path);
         (void)cbm_unlink(handle->log_path);
         free(handle);
