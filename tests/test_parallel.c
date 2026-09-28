@@ -616,6 +616,65 @@ TEST(parallel_spill_mode_builds_the_same_graph) {
     PASS();
 }
 
+/* ── Sequential cache: held like the parallel one ─────────────────── */
+
+/* The parallel extract caches each result without its parse tree and
+ * compacted (pass_parallel.c). The sequential definitions pass cached the raw
+ * result, tree and working arena included, and that cache lives through every
+ * later pass: about 5x the memory per file, for every file of the repo. */
+TEST(sequential_definitions_cache_drops_trees_and_compacts) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("par-test", g_par_tmpdir);
+    cbm_registry_t *reg = cbm_registry_new();
+    CBMFileResult **cache = (CBMFileResult **)calloc((size_t)file_count, sizeof(CBMFileResult *));
+    ASSERT_NOT_NULL(cache);
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "par-test",
+        .repo_path = g_par_tmpdir,
+        .gbuf = gbuf,
+        .registry = reg,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+
+    cbm_init();
+    cbm_work_arena_release(); /* start from a thread that keeps nothing */
+    ASSERT_EQ(cbm_pipeline_pass_definitions(&ctx, files, file_count), 0);
+    ASSERT_FALSE(cbm_work_arena_keeping()); /* ...and end the pass that way */
+
+    int cached = 0;
+    for (int i = 0; i < file_count; i++) {
+        const CBMFileResult *r = cache[i];
+        if (!r) {
+            continue;
+        }
+        cached++;
+        ASSERT_NULL(r->cached_tree);
+        /* One exact block: capacity == bytes used, no dead headroom. */
+        ASSERT_EQ(r->arena.nblocks, 1);
+        ASSERT_EQ(cbm_arena_capacity(&r->arena), cbm_arena_total(&r->arena));
+    }
+    ASSERT_EQ(cached, file_count);
+
+    for (int i = 0; i < file_count; i++) {
+        cbm_free_result(cache[i]);
+    }
+    free(cache);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gbuf);
+    cbm_discover_free(files, file_count);
+    PASS();
+}
+
 /* ── Empty file list ──────────────────────────────────────────────── */
 
 TEST(parallel_empty_files) {
@@ -4437,6 +4496,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_semantic_fixture_expected_counts);
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_spill_mode_builds_the_same_graph);
+    RUN_TEST(sequential_definitions_cache_drops_trees_and_compacts);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
 
