@@ -10808,7 +10808,10 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         cbm_mcp_supervised_result_disposition_t recovery_disposition =
             cbm_mcp_supervised_result_disposition(rc2, &wr2);
         if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
-            last_outcome = wr2.outcome;
+            /* Keep the original worker failure if recovery setup fails. */
+            cbm_log_error("index.supervisor.recovery_start_failed", "original_outcome",
+                          cbm_proc_outcome_str(last_outcome), "recovery_outcome",
+                          cbm_proc_outcome_str(wr2.outcome));
             cbm_index_worker_result_free(&wr2);
             break; /* spawn failed mid-recovery — give up */
         }

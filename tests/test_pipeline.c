@@ -10,6 +10,7 @@
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
+#include "pipeline/lsp_surface.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
@@ -311,6 +312,36 @@ TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap) {
     /* One rpc per service: every service must be represented. The old cap
      * produced at most 64 however the workers interleaved. */
     ASSERT_EQ(grpc_routes, SERVICES);
+    PASS();
+}
+
+/* Pipeline-level: the doclinks pass runs as part of a real index and its
+ * REFERENCES_FILE edges land in the store, not just in a unit test that
+ * calls cbm_pipeline_pass_doclinks() directly. Registration-list gap: every
+ * doclinks unit test calls the pass function by hand, so deleting its
+ * {predump_doclinks, "doclinks", false} entry in pipeline.c would leave
+ * every one of them green. */
+TEST(pipeline_doclinks_edge_lands_in_store) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doclinks_pipeline_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    write_temp_file(tmp, "README.md", "See [main](src/main.go) for the entry point.\n");
+    write_temp_file(tmp, "src/main.go", "package main\n\nfunc main() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/doclinks.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_GT(cbm_store_count_edges_by_type(s, project, "REFERENCES_FILE"), 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -8951,9 +8982,10 @@ static int branch_head_match_count(cbm_store_t *store, const char *project, cons
     return matches;
 }
 
-/* Git context is graph input even when every repository file is unchanged.
- * Construct the second pipeline before moving HEAD so the test also proves
- * that run start refreshes the snapshot captured by cbm_pipeline_new(). */
+/* Regression for #1213: index A, re-index B after a tracked source change,
+ * then re-index C after an empty commit. Each successful run publishes its
+ * run-start HEAD. Construct the final pipeline before moving HEAD to also
+ * cover refreshing the snapshot captured by cbm_pipeline_new(). */
 TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
     if (!git_available()) {
         FAIL("git unavailable");
@@ -8996,6 +9028,42 @@ TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
     snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
     cbm_pipeline_free(baseline);
 
+    cbm_store_t *initial_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(initial_store);
+    int initial_matches = branch_head_match_count(initial_store, project, initial_head);
+    cbm_store_close(initial_store);
+    ASSERT_EQ(initial_matches, 1);
+
+    /* B: a committed source change must advance the existing project's HEAD. */
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "stable.py"), "def StableGitContext():\n    return 2\n"),
+              0);
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" "
+             "-c user.email=\"cbm@example.invalid\" commit -am \"source change\" >%s 2>&1",
+             repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    cbm_git_context_t source_ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(repo, &source_ctx), 0);
+    ASSERT_NOT_NULL(source_ctx.head_sha);
+    char source_head[128];
+    snprintf(source_head, sizeof(source_head), "%s", source_ctx.head_sha);
+    cbm_git_context_free(&source_ctx);
+    ASSERT_TRUE(strcmp(initial_head, source_head) != 0);
+
+    cbm_pipeline_t *after_source_change = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(after_source_change);
+    int source_rc = cbm_pipeline_run(after_source_change);
+    cbm_pipeline_free(after_source_change);
+    ASSERT_EQ(source_rc, 0);
+    cbm_store_t *source_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(source_store);
+    int source_matches = branch_head_match_count(source_store, project, source_head);
+    int initial_stale_matches = branch_head_match_count(source_store, project, initial_head);
+    cbm_store_close(source_store);
+    ASSERT_EQ(source_matches, 1);
+    ASSERT_EQ(initial_stale_matches, 0);
+
+    /* C: no file hashes change, but the empty commit must still advance HEAD. */
     cbm_pipeline_t *after_head_move = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
     ASSERT_NOT_NULL(after_head_move);
     snprintf(cmd, sizeof(cmd),
@@ -9010,7 +9078,7 @@ TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
     char changed_head[128];
     snprintf(changed_head, sizeof(changed_head), "%s", changed_ctx.head_sha);
     cbm_git_context_free(&changed_ctx);
-    ASSERT_TRUE(strcmp(initial_head, changed_head) != 0);
+    ASSERT_TRUE(strcmp(source_head, changed_head) != 0);
 
     cbm_pipeline_incremental_test_reset_faults();
     int changed_rc = cbm_pipeline_run(after_head_move);
@@ -9019,7 +9087,7 @@ TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     int changed_branch_matches = store ? branch_head_match_count(store, project, changed_head) : -1;
-    int stale_branch_matches = store ? branch_head_match_count(store, project, initial_head) : -1;
+    int stale_branch_matches = store ? branch_head_match_count(store, project, source_head) : -1;
     cbm_file_hash_t git_input = {0};
     int git_input_rc =
         store ? cbm_store_get_file_hash(
@@ -14185,6 +14253,48 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
     PASS();
 }
 
+/* Object arrays are non-flat in yyjson. Exercise ordered decoding and arena
+ * ownership across a large surface, including nested string arrays. */
+TEST(pipeline_lsp_surface_large_object_array_decode) {
+    const int count = 8192;
+    const size_t capacity = (size_t)count * 192 + 64;
+    char *json = malloc(capacity);
+    ASSERT_NOT_NULL(json);
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":1,\"lsp\":[");
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(json + used, capacity - used,
+                         "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
+                         "\"spt\":[\"str\",\"int\"],\"dec\":[\"first\",\"second\"]}",
+                         i ? "," : "", i, i);
+        ASSERT_TRUE(n > 0 && (size_t)n < capacity - used);
+        used += (size_t)n;
+    }
+    snprintf(json + used, capacity - used, "]}");
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs = NULL;
+    int decoded = cbm_lsp_surface_defs_from_json(&arena, json, &defs);
+    free(json);
+    ASSERT_EQ(decoded, count);
+    ASSERT_NOT_NULL(defs);
+    for (int i = 0; i < count; i++) {
+        char expected[64];
+        snprintf(expected, sizeof(expected), "pkg.f%d", i);
+        ASSERT_STR_EQ(defs[i].qualified_name, expected);
+        snprintf(expected, sizeof(expected), "f%d", i);
+        ASSERT_STR_EQ(defs[i].short_name, expected);
+        ASSERT_STR_EQ(defs[i].label, "Function");
+        ASSERT_EQ(defs[i].signature_param_count, 2);
+        ASSERT_STR_EQ(defs[i].signature_param_types[0], "str");
+        ASSERT_STR_EQ(defs[i].signature_param_types[1], "int");
+        ASSERT_STR_EQ(defs[i].decorators[0], "first");
+        ASSERT_STR_EQ(defs[i].decorators[1], "second");
+        ASSERT_NULL(defs[i].decorators[2]);
+    }
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* The closure-repair route lives and dies by two properties of the persisted
  * per-file LSP surface: a BODY edit must leave the surface_sha unchanged (the
  * early cutoff -- no dependent recomputation owed), while a SIGNATURE edit
@@ -14644,6 +14754,119 @@ TEST(pipeline_ensemble_routing_method_scoping) {
     PASS();
 }
 
+/* #1260: CALLS edges from the function named `func` whose target qn ends
+ * with ".<target_suffix>" (segment-anchored). A NULL suffix counts every
+ * CALLS edge to a node named "Run". */
+static int iris_cls_calls(cbm_store_t *s, const char *project, const char *func,
+                          const char *target_suffix) {
+    cbm_node_t *fn = NULL;
+    int fn_count = 0;
+    cbm_store_find_nodes_by_name(s, project, func, &fn, &fn_count);
+    int n = 0;
+    for (int fi = 0; fi < fn_count; fi++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, fn[fi].id, "CALLS", &edges, &ec);
+        for (int ei = 0; ei < ec; ei++) {
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[ei].target_id, &tgt) != 0) {
+                continue;
+            }
+            if (!target_suffix) {
+                if (tgt.name && strcmp(tgt.name, "Run") == 0) {
+                    n++;
+                }
+            } else if (tgt.qualified_name) {
+                size_t ql = strlen(tgt.qualified_name);
+                size_t sl = strlen(target_suffix);
+                if (ql > sl && tgt.qualified_name[ql - sl - 1] == '.' &&
+                    strcmp(tgt.qualified_name + ql - sl, target_suffix) == 0) {
+                    n++;
+                }
+            }
+            cbm_node_free_fields(&tgt);
+        }
+        cbm_store_free_edges(edges, ec);
+    }
+    cbm_store_free_nodes(fn, fn_count);
+    return n;
+}
+
+TEST(pipeline_python_iris_cls_class_aware_calls) {
+    /* The #1260 repro: two ObjectScript classes share a method name. Python
+     * callers must reach the class named in iris.cls("<literal>"), and a call
+     * that names no indexed class must not borrow an edge from one that does. */
+    char *tmp = th_mktempdir("cbm_iris_cls");
+    ASSERT_NOT_NULL(tmp);
+    const char *run_body = "{\n"
+                           "ClassMethod Run(x As %String) As %String\n"
+                           "{\n"
+                           "    Quit x\n"
+                           "}\n"
+                           "}\n";
+    char cls[256];
+    snprintf(cls, sizeof(cls), "Class Pkg.A Extends %%RegisteredObject\n%s", run_body);
+    write_temp_file(tmp, "A.cls", cls);
+    snprintf(cls, sizeof(cls), "Class Pkg.B Extends %%RegisteredObject\n%s", run_body);
+    write_temp_file(tmp, "B.cls", cls);
+    /* A third, unrelated Run: a bare "Run" callee could weak-match it. */
+    write_temp_file(tmp, "util.py",
+                    "def Run(x):\n"
+                    "    return x\n");
+    write_temp_file(tmp, "caller.py",
+                    "import iris\n"
+                    "\n"
+                    "class Helper:\n"
+                    "    def Run(self, x):\n"
+                    "        return x\n"
+                    "\n"
+                    "def want_a():\n"
+                    "    return iris.cls(\"Pkg.A\").Run(\"x\")\n"
+                    "\n"
+                    "def want_b():\n"
+                    "    return iris.cls(\"Pkg.B\").Run(\"x\")\n"
+                    "\n"
+                    "def want_nonexistent():\n"
+                    "    return iris.cls(\"Pkg.DoesNotExist\").Run(\"x\")\n"
+                    "\n"
+                    "def unrelated_receiver():\n"
+                    "    return some_random_thing.Run(\"x\")\n"
+                    "\n"
+                    "def via_classmethodvalue(db):\n"
+                    "    return db.classMethodValue(\"Pkg.B\", \"Run\", \"x\")\n"
+                    "\n"
+                    "def via_invoke(db):\n"
+                    "    return db.invokeClassMethod(\"Pkg.A\", \"Run\", \"x\")\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/iris_cls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "Pkg.A.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", NULL), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "Pkg.B.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", NULL), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "util.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "util.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "Helper.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "Helper.Run"), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_nonexistent", NULL), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "unrelated_receiver", NULL), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_classmethodvalue", "Pkg.B.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_invoke", "Pkg.A.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_invoke", NULL), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* #518/#519 item-7 regression: the DELTA merge is the warm path most users
  * hit. It used to write nodes_fts with a hand-rolled four-column INSERT of
  * its own; with a fifth `body` column that literal leaves prose NULL for every
@@ -15054,6 +15277,7 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_lsp_surface_large_object_array_decode);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -15079,6 +15303,7 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap);
+    RUN_TEST(pipeline_doclinks_edge_lands_in_store);
     RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
@@ -15397,6 +15622,7 @@ SUITE(pipeline) {
     /* Ensemble routing pass */
     RUN_TEST(pipeline_ensemble_routing_edges);
     RUN_TEST(pipeline_ensemble_routing_method_scoping);
+    RUN_TEST(pipeline_python_iris_cls_class_aware_calls);
     RUN_TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items);
     RUN_TEST(pipeline_ensemble_routing_settings_targets);
     RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);

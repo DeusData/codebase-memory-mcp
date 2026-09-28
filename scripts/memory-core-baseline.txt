@@ -6,7 +6,7 @@
 internal/cbm/ac.c	20
 internal/cbm/arena.c	3
 internal/cbm/cbm.c	13
-internal/cbm/extract_defs.c	5
+internal/cbm/extract_defs.c	4
 internal/cbm/helpers.c	3
 internal/cbm/lsp/c_lsp.c	4
 internal/cbm/lsp/perl_lsp.c	21
