@@ -803,6 +803,11 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     if (dot && strcmp(dot, ".res") == 0) {
         lang = cbm_disambiguate_res(abs_path);
     }
+    /* Special: .d is shared by D and make-style dep-info (cargo, gcc -MD).
+     * Probe only while .d maps to D, so a user override to another language wins. */
+    if (dot && strcmp(dot, ".d") == 0 && lang == CBM_LANG_DLANG) {
+        lang = cbm_disambiguate_d(abs_path);
+    }
     /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
      * detected by content; otherwise .xml stays XML. */
     if (lang == CBM_LANG_XML) {
