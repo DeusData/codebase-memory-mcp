@@ -58,6 +58,18 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 
+// Macro-wrapped definition name (#946): `void FNAME(first)(void)` and
+// `void Cls::__API_HOOK(Spawn)()` parse as a function_declarator whose own
+// declarator is ANOTHER function_declarator — the macro call. Valid C/C++ never
+// nests them directly (a function cannot return a function; a function-pointer
+// return has a parenthesized_declarator in between), so the shape is always a
+// function-like macro spelling the name. When `decl` is such an outer
+// function_declarator and the macro takes exactly one bare name, returns that
+// name node ("first", "Spawn"); otherwise a null node, and callers keep their
+// ordinary declarator walk. Shared by the declarator resolver and the C LSP so
+// the def name and the LSP caller QN agree.
+TSNode cbm_c_macro_wrapped_name_node(TSNode decl);
+
 // Convert a resolved function/method name node to its name string, normalizing a
 // C++ conversion-operator's `operator_cast` node (which spans the full
 // "operator bool() const") down to "operator bool". Shared by the defs and

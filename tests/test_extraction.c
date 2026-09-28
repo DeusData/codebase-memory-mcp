@@ -6595,6 +6595,193 @@ TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989) {
     PASS();
 }
 
+/* The call to `callee` on source line `line`, or NULL. */
+static const CBMCall *call_at_line(CBMFileResult *r, const char *callee, int line) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->start_line == line && c->callee_name && strcmp(c->callee_name, callee) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* #946: ReGameDLL_CS defines its hookable methods as
+ * `void CBasePlayer::__API_HOOK(ReloadWeapons)(...)`, a function-like macro in
+ * the declarator (`#define __API_HOOK(fname) fname`, from a header). The grammar
+ * nests that macro call as a function_declarator directly inside the definition's
+ * own function_declarator, and the declarator walk named the definition after the
+ * macro: every hook of a class collapsed into one Method `__API_HOOK`, calls in
+ * each body were sourced to whichever hook was minted last, and no caller of
+ * ReloadWeapons could reach it. The macro lives in a header here, as it does in
+ * ReGameDLL, so the preprocessed second pass cannot expand it either. */
+TEST(extract_cpp_macro_wrapped_declarator_names_def_issue946) {
+    CBMFileResult *r = extract("#include \"precompiled.h\"\n"                            /* 1 */
+                               "void helper();\n"                                        /* 2 */
+                               "class CBasePlayer {\n"                                   /* 3 */
+                               "public:\n"                                               /* 4 */
+                               "    void ReloadWeapons(int slot);\n"                     /* 5 */
+                               "    void Spawn();\n"                                     /* 6 */
+                               "};\n"                                                    /* 7 */
+                               "void CBasePlayer::__API_HOOK(ReloadWeapons)(int slot)\n" /* 8 */
+                               "{\n"                                                     /* 9 */
+                               "    helper();\n"                                         /* 10 */
+                               "}\n"                                                     /* 11 */
+                               "void EXT_FUNC CBasePlayer::__API_HOOK(Spawn)()\n"        /* 12 */
+                               "{\n"                                                     /* 13 */
+                               "    ReloadWeapons(0);\n"                                 /* 14 */
+                               "}\n"                                                     /* 15 */
+                               "void EXT_FUNC __API_HOOK(PM_Move)(int server)\n"         /* 16 */
+                               "{\n"                                                     /* 17 */
+                               "    helper();\n"                                         /* 18 */
+                               "}\n",                                                    /* 19 */
+                               CBM_LANG_CPP, "p", "player.cpp");
+    ASSERT_NOT_NULL(r);
+    /* One definition per hook, named after the macro argument. */
+    ASSERT_EQ(count_defs_named(r, "Method", "__API_HOOK"), 0);
+    ASSERT_EQ(count_defs_named(r, "Function", "__API_HOOK"), 0);
+    ASSERT_TRUE(has_def_qn(r, "p.player.CBasePlayer.ReloadWeapons"));
+    ASSERT_TRUE(has_def_qn(r, "p.player.CBasePlayer.Spawn"));
+    ASSERT_TRUE(has_def_qn(r, "p.player.PM_Move"));
+    const CBMDefinition *reload = find_def(r, "ReloadWeapons");
+    ASSERT_NOT_NULL(reload);
+    ASSERT_STR_EQ(reload->label, "Method");
+    ASSERT_EQ((int)reload->start_line, 8);
+    ASSERT_EQ((int)reload->end_line, 11);
+    /* The real parameter list, not the macro's argument list. */
+    ASSERT_EQ(reload->param_count, 1);
+    /* Each in-body call is sourced to the hook whose body contains it. */
+    const CBMCall *c10 = call_at_line(r, "helper", 10);
+    ASSERT_NOT_NULL(c10);
+    ASSERT_STR_EQ(c10->enclosing_func_qn, "p.player.CBasePlayer.ReloadWeapons");
+    const CBMCall *c14 = call_at_line(r, "ReloadWeapons", 14);
+    ASSERT_NOT_NULL(c14);
+    ASSERT_STR_EQ(c14->enclosing_func_qn, "p.player.CBasePlayer.Spawn");
+    const CBMCall *c18 = call_at_line(r, "helper", 18);
+    ASSERT_NOT_NULL(c18);
+    ASSERT_STR_EQ(c18->enclosing_func_qn, "p.player.PM_Move");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #946 precision controls: only a DEFINITION whose declarator nests a one-name
+ * macro call is renamed. Macro call statements (file scope or in a body), calls
+ * through a returned function pointer, a real function returning a function
+ * pointer, a prototype, and a multi-argument wrapper whose name is ambiguous must
+ * not mint a definition named after a macro argument. */
+TEST(extract_c_macro_wrapped_declarator_controls_issue946) {
+    CBMFileResult *r = extract("int (*get_handler(int k))(int);\n" /* 1 */
+                               "int (*pick(int k))(int)\n"         /* 2 */
+                               "{\n"                               /* 3 */
+                               "    return 0;\n"                   /* 4 */
+                               "}\n"                               /* 5 */
+                               "REGISTER(on_boot);\n"              /* 6 */
+                               "void WRAP(proto_only)(void);\n"    /* 7 */
+                               "void PAIR(alpha, beta)(void)\n"    /* 8 */
+                               "{\n"                               /* 9 */
+                               "}\n"                               /* 10 */
+                               "void run(int v)\n"                 /* 11 */
+                               "{\n"                               /* 12 */
+                               "    get_handler(v)(v);\n"          /* 13 */
+                               "    TRACE(v_trace);\n"             /* 14 */
+                               "}\n",                              /* 15 */
+                               CBM_LANG_C, "p", "controls.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "Function", "pick"));
+    ASSERT_TRUE(has_def(r, "Function", "run"));
+    ASSERT_FALSE(has_def_any(r, "on_boot"));
+    ASSERT_FALSE(has_def_any(r, "proto_only"));
+    ASSERT_FALSE(has_def_any(r, "alpha"));
+    ASSERT_FALSE(has_def_any(r, "beta"));
+    ASSERT_FALSE(has_def_any(r, "v"));
+    ASSERT_FALSE(has_def_any(r, "v_trace"));
+    const CBMCall *handler = call_at_line(r, "get_handler", 13);
+    ASSERT_NOT_NULL(handler);
+    ASSERT_STR_EQ(handler->enclosing_func_qn, "p.controls.run");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1957: the same root cause in C. `static void FNAME(first_caller)(void)` and
+ * `static void FNAME(later_function)(void)` collapsed into one Function FNAME
+ * (the later one won), and sink() inside first_caller, on line 9, was sourced
+ * to it: a call site outside its caller's range, from the textual extractor and
+ * the C LSP alike. The second file is the kernel template-header shape
+ * (arch/x86/kvm/mmu/paging_tmpl.h): FNAME token-pastes and is defined only
+ * inside #if branches, so no preprocessing can expand it. */
+TEST(extract_c_fname_macro_definitions_stay_distinct_issue1957) {
+    CBMFileResult *r = extract("#define FNAME(x) x\n"                      /* 1 */
+                               "\n"                                        /* 2 */
+                               "static void sink(void)\n"                  /* 3 */
+                               "{\n"                                       /* 4 */
+                               "}\n"                                       /* 5 */
+                               "\n"                                        /* 6 */
+                               "static void FNAME(first_caller)(void)\n"   /* 7 */
+                               "{\n"                                       /* 8 */
+                               "    sink();\n"                             /* 9 */
+                               "}\n"                                       /* 10 */
+                               "\n"                                        /* 11 */
+                               "static void FNAME(later_function)(void)\n" /* 12 */
+                               "{\n"                                       /* 13 */
+                               "}\n"                                       /* 14 */
+                               "\n"                                        /* 15 */
+                               "int main(void)\n"                          /* 16 */
+                               "{\n"                                       /* 17 */
+                               "    first_caller();\n"                     /* 18 */
+                               "    return 0;\n"                           /* 19 */
+                               "}\n",                                      /* 20 */
+                               CBM_LANG_C, "p", "repro.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Function", "FNAME"), 0);
+    const CBMDefinition *first = find_def(r, "first_caller");
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ((int)first->start_line, 7);
+    ASSERT_EQ((int)first->end_line, 10);
+    const CBMDefinition *later = find_def(r, "later_function");
+    ASSERT_NOT_NULL(later);
+    ASSERT_EQ((int)later->start_line, 12);
+    const CBMCall *sink = call_at_line(r, "sink", 9);
+    ASSERT_NOT_NULL(sink);
+    ASSERT_STR_EQ(sink->enclosing_func_qn, "p.repro.first_caller");
+    int lsp_sink = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->callee_qn && strcmp(rc->callee_qn, "p.repro.sink") == 0) {
+            ASSERT_STR_EQ(rc->caller_qn, "p.repro.first_caller");
+            lsp_sink++;
+        }
+    }
+    ASSERT_GTE(lsp_sink, 1);
+    cbm_free_result(r);
+
+    CBMFileResult *t = extract("#if PTTYPE == 64\n"                                /* 1 */
+                               "\t#define FNAME(name) paging##64_##name\n"         /* 2 */
+                               "#else\n"                                           /* 3 */
+                               "\t#error Invalid PTTYPE value\n"                   /* 4 */
+                               "#endif\n"                                          /* 5 */
+                               "static int FNAME(is_present)(unsigned long pte)\n" /* 6 */
+                               "{\n"                                               /* 7 */
+                               "\treturn test_bit(pte);\n"                         /* 8 */
+                               "}\n"                                               /* 9 */
+                               "static int FNAME(walk)(unsigned long pte)\n"       /* 10 */
+                               "{\n"                                               /* 11 */
+                               "\treturn check_pte(pte);\n"                        /* 12 */
+                               "}\n",                                              /* 13 */
+                               CBM_LANG_C, "p", "paging_tmpl.h");
+    ASSERT_NOT_NULL(t);
+    ASSERT_EQ(count_defs_named(t, "Function", "FNAME"), 0);
+    ASSERT_TRUE(has_def_qn(t, "p.paging_tmpl.is_present"));
+    ASSERT_TRUE(has_def_qn(t, "p.paging_tmpl.walk"));
+    const CBMCall *bit = call_at_line(t, "test_bit", 8);
+    ASSERT_NOT_NULL(bit);
+    ASSERT_STR_EQ(bit->enclosing_func_qn, "p.paging_tmpl.is_present");
+    const CBMCall *chk = call_at_line(t, "check_pte", 12);
+    ASSERT_NOT_NULL(chk);
+    ASSERT_STR_EQ(chk->enclosing_func_qn, "p.paging_tmpl.walk");
+    cbm_free_result(t);
+    PASS();
+}
+
 /* #668: walk_defs used a fixed `walk_defs_frame_t stack[4096]` — a ~160 KB
  * C-stack frame that overflowed small thread stacks (the reporter's crash was in
  * the "definitions pass" on a large SQL file), and whose `top < 4096` push guards
@@ -8884,6 +9071,9 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989);
     RUN_TEST(extract_cpp_export_macro_suffix_variants_issue1989);
     RUN_TEST(extract_cpp_export_macro_explicit_define_priority_issue1989);
+    RUN_TEST(extract_cpp_macro_wrapped_declarator_names_def_issue946);
+    RUN_TEST(extract_c_macro_wrapped_declarator_controls_issue946);
+    RUN_TEST(extract_c_fname_macro_definitions_stay_distinct_issue1957);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
     RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);
