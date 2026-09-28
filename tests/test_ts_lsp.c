@@ -511,6 +511,32 @@ TEST(tslsp_class_super_call) {
     PASS();
 }
 
+/* Issue #514: constructor parameter properties (NestJS DI) are class fields. */
+TEST(tslsp_class_ctor_param_property) {
+    CBMFileResult *r = extract_ts("class CatService { findAll(): string[] { return []; } }\n"
+                                  "class CatController {\n"
+                                  "    constructor(private readonly catService: CatService) {}\n"
+                                  "    findAll() { return this.catService.findAll(); }\n"
+                                  "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "CatController.findAll", "CatService.findAll"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A constructor parameter without a modifier is not a field. */
+TEST(tslsp_class_ctor_plain_param_not_field) {
+    CBMFileResult *r = extract_ts("class CatService { findAll(): string[] { return []; } }\n"
+                                  "class CatController {\n"
+                                  "    constructor(catService: CatService) {}\n"
+                                  "    list() { return this.catService.findAll(); }\n"
+                                  "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_LT(find_resolved(r, "CatController.list", "CatService.findAll"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Category 10: interface dispatch ──────────────────────────────────────── */
 
 TEST(tslsp_iface_method) {
@@ -2681,6 +2707,50 @@ TEST(tslsp_crossfile_no_def_match) {
     PASS();
 }
 
+/* Issue #514: NestJS controller injecting a service from another file via a
+ * constructor parameter property. */
+TEST(tslsp_crossfile_ctor_param_property) {
+    const char *source = "import { CatService } from './cat.service';\n"
+                         "export class CatController {\n"
+                         "    constructor(private readonly catService: CatService) {}\n"
+                         "    findAll() { return this.catService.findAll(); }\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.CatController",
+         .short_name = "CatController",
+         .label = "Class",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.main.CatController.findAll",
+         .short_name = "findAll",
+         .label = "Method",
+         .def_module_qn = "test.main",
+         .receiver_type = "test.main.CatController"},
+        {.qualified_name = "test.cat.service.CatService",
+         .short_name = "CatService",
+         .label = "Class",
+         .def_module_qn = "test.cat.service"},
+        {.qualified_name = "test.cat.service.CatService.findAll",
+         .short_name = "findAll",
+         .label = "Method",
+         .def_module_qn = "test.cat.service",
+         .receiver_type = "test.cat.service.CatService"},
+    };
+    const char *imp_names[] = {"CatService"};
+    const char *imp_qns[] = {"test.cat.service"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_ts_lsp_cross(&arena, source, (int)strlen(source), "test.main", false, false, false,
+                         defs, 4, imp_names, imp_qns, 1, NULL, &out);
+
+    ASSERT_GTE(find_resolved_arr(&out, "CatController.findAll", "CatService.findAll"), 0);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── More stdlib (Date, RegExp, Error, Math) ──────────────────────────────── */
 
 TEST(tslsp_stdlib_date_toISOString) {
@@ -4773,6 +4843,8 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_class_this_dispatch);
     RUN_TEST(tslsp_class_inheritance_method);
     RUN_TEST(tslsp_class_super_call);
+    RUN_TEST(tslsp_class_ctor_param_property);
+    RUN_TEST(tslsp_class_ctor_plain_param_not_field);
 
     /* Category 10: interface */
     RUN_TEST(tslsp_iface_method);
@@ -4994,6 +5066,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_crossfile_function_call);
     RUN_TEST(tslsp_crossfile_chain_through_return);
     RUN_TEST(tslsp_crossfile_no_def_match);
+    RUN_TEST(tslsp_crossfile_ctor_param_property);
 
     /* More stdlib */
     RUN_TEST(tslsp_stdlib_date_toISOString);

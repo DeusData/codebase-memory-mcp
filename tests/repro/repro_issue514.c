@@ -197,7 +197,68 @@ TEST(repro_issue514_data_flow_surfaces_arg_expr) {
     PASS();
 }
 
+/*
+ * Sub-claim (B), minimal form from the issue thread: a NestJS controller
+ * calling a service injected through a constructor parameter property
+ * (`constructor(private readonly catService: CatService)`) must produce an
+ * inbound caller for CatService.findAll.
+ */
+static const RFile k_nest_files[] = {
+    {"src/cats/cat.service.ts", "export class CatService {\n"
+                                "  findAll(): string[] {\n"
+                                "    return [\"a\"];\n"
+                                "  }\n"
+                                "}\n"},
+    {"src/cats/cat.controller.ts", "import { CatService } from \"./cat.service\";\n"
+                                   "\n"
+                                   "export class CatController {\n"
+                                   "  constructor(private readonly catService: CatService) {}\n"
+                                   "\n"
+                                   "  list() {\n"
+                                   "    return this.catService.findAll();\n"
+                                   "  }\n"
+                                   "}\n"},
+};
+
+TEST(repro_issue514_ctor_param_property_callers) {
+    RProj lp;
+    cbm_store_t *store =
+        rh_index_files(&lp, k_nest_files, (int)(sizeof(k_nest_files) / sizeof(k_nest_files[0])));
+    ASSERT_NOT_NULL(store);
+
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"findAll\","
+             "\"project\":\"%s\","
+             "\"direction\":\"inbound\","
+             "\"depth\":1}",
+             lp.project);
+
+    /* rh_index_files restores CBM_CACHE_DIR after indexing; point the query at
+     * the fixture's cache so trace_path finds the project. */
+    const char *prior_cache_dir = getenv("CBM_CACHE_DIR");
+    char *saved_cache_dir = prior_cache_dir ? strdup(prior_cache_dir) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", lp.cachedir, 1);
+    char *resp = cbm_mcp_handle_tool(lp.srv, "trace_path", args);
+    if (saved_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_dir, 1);
+        free(saved_cache_dir);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    ASSERT_NOT_NULL(resp);
+    fprintf(stderr, "  [514] trace_path inbound response: %.400s\n", resp);
+
+    ASSERT_NULL(strstr(resp, "function not found"));
+    ASSERT_NOT_NULL(strstr(resp, "CatController.list"));
+
+    free(resp);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────────────────── */
 SUITE(repro_issue514) {
     RUN_TEST(repro_issue514_data_flow_surfaces_arg_expr);
+    RUN_TEST(repro_issue514_ctor_param_property_callers);
 }
