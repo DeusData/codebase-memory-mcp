@@ -919,16 +919,28 @@ TEST(php_inline_html_markup_never_reaches_graph_issue2000) {
 }
 
 /* The mask hands back the caller's buffer, uncopied, when nothing needs
- * rewriting, and a same-length rewrite otherwise. */
+ * rewriting, and a same-length rewrite otherwise. The pointer alone cannot
+ * tell copy-on-write from an eager copy, so the arena's allocation total is
+ * sampled around each call: no bytes for `plain` and `quoted`, a copy for
+ * `mixed`. */
 TEST(php_inline_html_mask_copies_only_on_write_issue2000) {
     CBMArena arena;
     cbm_arena_init(&arena);
     const char *plain = "<?php\nfunction a() { return 1; }\n";
     const char *quoted = "<?php\n$s = '?>';\n/* ?> */\n$h = <<<EOT\n?>\nEOT;\n";
     const char *mixed = "<?php\nfunction a() {}\n?>\n<b>x</b>\n";
+
+    size_t before = cbm_arena_total(&arena);
     ASSERT(cbm_php_mask_inline_html(&arena, plain, (int)strlen(plain)) == plain);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
     ASSERT(cbm_php_mask_inline_html(&arena, quoted, (int)strlen(quoted)) == quoted);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
     const char *masked = cbm_php_mask_inline_html(&arena, mixed, (int)strlen(mixed));
+    ASSERT(cbm_arena_total(&arena) > before);
     ASSERT(masked != mixed);
     ASSERT_EQ((int)strlen(masked), (int)strlen(mixed));
     ASSERT_STR_EQ(masked, "<?php\nfunction a() {}\n; \n        \n");
