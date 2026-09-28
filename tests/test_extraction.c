@@ -7258,6 +7258,49 @@ TEST(extract_rescript_let_bindings_use_the_walk_cursor) {
     ASSERT_EQ(big_fallbacks, 0);
     PASS();
 }
+
+/* Every Python usage asks whether it is a global/nonlocal name and whether it
+ * sits in a parameter default. Both climbed with ts_node_parent, which
+ * descends from the ROOT: O(d^2) for a usage d deep, so one deep expression
+ * went cubic (2.2 s / 17 s / >90 s at 500/1000/2000 terms). Count every such
+ * root-descending step at N and 2N terms. */
+TEST(extract_python_deep_default_parent_climbs_are_linear) {
+    enum { SMALL = 200 };
+    uint64_t slow_parents[2];
+    for (int round = 0; round < 2; round++) {
+        /* def f(x=x + x + ... + x): return x -- a binary_operator chain. */
+        int terms = SMALL << round;
+        size_t capacity = 32U + (size_t)terms * 4U;
+        char *source = malloc(capacity);
+        ASSERT_NOT_NULL(source);
+        int length = snprintf(source, capacity, "def f(x=x");
+        for (int i = 1; i < terms; i++) {
+            length += snprintf(source + length, capacity - (size_t)length, " + x");
+        }
+        length += snprintf(source + length, capacity - (size_t)length, "):\n    return x\n");
+        cbm_usage_field_lookup_test_reset();
+        CBMFileResult *result =
+            cbm_extract_file(source, length, CBM_LANG_PYTHON, "proj", "deep.py", 0, NULL, NULL);
+        free(source);
+        ASSERT_NOT_NULL(result);
+        slow_parents[round] = cbm_usage_slow_parent_fallback_test_count();
+        /* Anti-vacuous: every default x climbed its chain to the parameter and
+         * reads the enclosing namespace; only `return x` is shadowed by it. */
+        int defaults = 0;
+        for (int i = 0; i < result->usages.count; i++) {
+            const CBMUsage *usage = &result->usages.items[i];
+            defaults += usage->ref_name && strcmp(usage->ref_name, "x") == 0 &&
+                        !usage->semantic_reference_local_shadow;
+        }
+        cbm_free_result(result);
+        ASSERT_EQ(defaults, terms);
+    }
+    fprintf(stderr, "  [python-deep-default] slow_parents(%d)=%llu slow_parents(%d)=%llu\n", SMALL,
+            (unsigned long long)slow_parents[0], 2 * SMALL, (unsigned long long)slow_parents[1]);
+    /* Twice the terms may cost about twice the steps; the cubic climb took 4x. */
+    ASSERT_LTE(slow_parents[1], slow_parents[0] * 3U + 64U);
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -8605,6 +8648,7 @@ SUITE(extraction) {
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
     RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
     RUN_TEST(extract_rescript_let_bindings_use_the_walk_cursor);
+    RUN_TEST(extract_python_deep_default_parent_climbs_are_linear);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
