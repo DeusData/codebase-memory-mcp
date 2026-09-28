@@ -205,6 +205,20 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 
+/* Resolve a route handler reference (the registry's answer for route passes).
+ * A class-qualified "Ns\\Class::method" reference — the extractor's form for
+ * Laravel `[Class::class, 'method']` and invokable `Class::class` handlers
+ * (#1146), with the class already qualified through the file's `use` imports
+ * and namespace — is placed on a method QN only by what places the class file:
+ * a composer.json PSR-4 root in psr4_roots (the package map), else the one
+ * candidate whose directories end with the class's namespace. Never by short
+ * name alone, so a vendor controller that is not in the repo gets no handler.
+ * A reference without "::" resolves exactly as cbm_registry_resolve does. */
+cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const char *handler_ref,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count,
+                                              const CBMHashTable *psr4_roots);
+
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
  * Caller must free() the returned string. */

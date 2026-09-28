@@ -2146,7 +2146,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
     if (handler_ref && handler_ref[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve(registry, handler_ref, module_qn, ik, iv, ic);
+        cbm_resolution_t hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik,
+                                                             iv, ic, cbm_pipeline_get_pkgmap());
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
