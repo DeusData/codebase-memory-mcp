@@ -637,6 +637,91 @@ TEST(pylsp_fused_self_attr_chain_via_overlay) {
     PASS();
 }
 
+/* Characterization of the shared Tier-2 build order. Defs register one at a
+ * time in defs[] order, so a Method seen before its Class auto-registers a
+ * placeholder receiver type that stays ahead of the Class entry, and a Method
+ * whose receiver is already known adds no type. Any change to how the build
+ * probes for known receivers must keep this exact sequence. */
+TEST(pylsp_cross_registry_interleaved_order) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *base = cbm_py_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(base);
+    int tb = base->type_count, fb = base->func_count;
+
+    CBMLSPDef defs[] = {
+        {.qualified_name = "t.m.A.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "t.m.A",
+         .def_module_qn = "t.m",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "t.m.A",
+         .short_name = "A",
+         .label = "Class",
+         .def_module_qn = "t.m",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "t.m.B",
+         .short_name = "B",
+         .label = "Class",
+         .def_module_qn = "t.m",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "t.m.B.f",
+         .short_name = "f",
+         .label = "Method",
+         .receiver_type = "t.m.B",
+         .def_module_qn = "t.m",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "t.m.C.g",
+         .short_name = "g",
+         .label = "Method",
+         .receiver_type = "t.m.C",
+         .def_module_qn = "t.m",
+         .lang = CBM_LANG_PYTHON},
+        /* Receiver auto-registered by C.g just above: no second placeholder. */
+        {.qualified_name = "t.m.C.h",
+         .short_name = "h",
+         .label = "Method",
+         .receiver_type = "t.m.C",
+         .def_module_qn = "t.m",
+         .lang = CBM_LANG_PYTHON},
+        /* Non-Python defs are skipped by the builder. */
+        {.qualified_name = "t.m.D",
+         .short_name = "D",
+         .label = "Class",
+         .def_module_qn = "t.m",
+         .lang = CBM_LANG_GO},
+    };
+    CBMTypeRegistry *reg =
+        cbm_py_build_cross_registry(&arena, defs, (int)(sizeof(defs) / sizeof(defs[0])));
+    ASSERT_NOT_NULL(reg);
+
+    /* Types: placeholder A (from A.m), Class A, Class B, placeholder C. */
+    ASSERT_EQ(reg->type_count, tb + 4);
+    ASSERT_TRUE(reg->types[tb].qualified_name == defs[0].receiver_type);
+    ASSERT_STR_EQ(reg->types[tb].short_name, "A");
+    ASSERT_TRUE(reg->types[tb + 1].qualified_name == defs[1].qualified_name);
+    ASSERT_TRUE(reg->types[tb + 2].qualified_name == defs[2].qualified_name);
+    ASSERT_TRUE(reg->types[tb + 3].qualified_name == defs[4].receiver_type);
+    ASSERT_STR_EQ(reg->types[tb + 3].short_name, "C");
+
+    /* Funcs keep defs[] order. */
+    ASSERT_EQ(reg->func_count, fb + 4);
+    ASSERT_STR_EQ(reg->funcs[fb].qualified_name, "t.m.A.m");
+    ASSERT_STR_EQ(reg->funcs[fb + 1].qualified_name, "t.m.B.f");
+    ASSERT_STR_EQ(reg->funcs[fb + 2].qualified_name, "t.m.C.g");
+    ASSERT_STR_EQ(reg->funcs[fb + 2].receiver_type, "t.m.C");
+    ASSERT_STR_EQ(reg->funcs[fb + 3].qualified_name, "t.m.C.h");
+
+    const CBMRegisteredType *a = cbm_registry_lookup_type(reg, "t.m.A");
+    ASSERT_NOT_NULL(a);
+    ASSERT_STR_EQ(a->qualified_name, "t.m.A");
+    ASSERT_NULL(cbm_registry_lookup_type(reg, "t.m.D"));
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* Issue #228: a class/static method invoked directly on a CROSS-FILE imported
  * class name — ActionRecordX.build_from_text(...) — produced no CALLS edge, so
  * the method showed in/out degree 0 and was flagged as dead code. Distinct from
@@ -2194,6 +2279,7 @@ SUITE(py_lsp) {
     /* Phase 9 — cross-file + batch */
     RUN_TEST(pylsp_crossfile_method_dispatch);
     RUN_TEST(pylsp_fused_self_attr_chain_via_overlay);
+    RUN_TEST(pylsp_cross_registry_interleaved_order);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);
     RUN_TEST(pylsp_batch_two_files);

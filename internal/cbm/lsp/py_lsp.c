@@ -13,6 +13,7 @@
 #include "py_lsp.h"
 #include "../cbm.h"
 #include "../helpers.h"
+#include "../../../src/foundation/hash_table.h"
 #include "tree_sitter/api.h"
 #include <ctype.h>
 #include <stdint.h>
@@ -4973,10 +4974,36 @@ static const char **py_split_pipe(CBMArena *arena, const char *text) {
     return out;
 }
 
+/* Qualified names of reg->types[0..noted), for a caller that registers into a
+ * registry it does not finalize until the end (cbm_py_build_cross_registry):
+ * that registry's own lookup scans every type. qns == NULL probes the
+ * registry instead. */
+typedef struct {
+    CBMHashTable *qns;
+    int noted;
+} PyKnownTypes;
+
+/* Note the types added since the last call. Run after every add_type, so an
+ * add that failed silently cannot desync set and registry. If the set cannot
+ * grow it is dropped and probes fall back to the registry. */
+static void py_note_known_types(PyKnownTypes *known, const CBMTypeRegistry *reg) {
+    for (; known && known->qns && known->noted < reg->type_count; known->noted++) {
+        const char *qn = reg->types[known->noted].qualified_name;
+        if (!qn || cbm_ht_has(known->qns, qn))
+            continue;
+        cbm_ht_set(known->qns, qn, (void *)(uintptr_t)(known->noted + 1));
+        if (!cbm_ht_has(known->qns, qn)) {
+            cbm_ht_free(known->qns);
+            known->qns = NULL;
+        }
+    }
+}
+
 /* Build a registry from CBMLSPDef[] supplied by the caller — covers both
- * the source file's own defs and cross-file referenced defs. */
+ * the source file's own defs and cross-file referenced defs. known is NULL
+ * except for the shared Tier-2 build. */
 static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
-                                 CBMLSPDef *defs, int def_count) {
+                                 CBMLSPDef *defs, int def_count, PyKnownTypes *known) {
     /* Pass 1: types only — the method pass probes the registry per Method def
      * (receiver auto-registration), which is a LINEAR scan pre-finalize:
      * O(methods x types) per file (same quadratic as php_register_lsp_defs;
@@ -4999,6 +5026,7 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
                 rt.method_names = py_split_pipe(arena, d->method_names_str);
             }
             cbm_registry_add_type(reg, rt);
+            py_note_known_types(known, reg);
         }
     }
     /* idx_arena == NULL skips the mid-build finalize: the tier-2 builder
@@ -5046,13 +5074,17 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
 
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
                 rf.receiver_type = d->receiver_type; /* borrowed */
-                if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+                bool recv_known = known && known->qns
+                                      ? cbm_ht_has(known->qns, rf.receiver_type)
+                                      : cbm_registry_lookup_type(reg, rf.receiver_type) != NULL;
+                if (!recv_known) {
                     CBMRegisteredType auto_t;
                     memset(&auto_t, 0, sizeof(auto_t));
                     auto_t.qualified_name = rf.receiver_type;
                     const char *dot = strrchr(d->receiver_type, '.');
                     auto_t.short_name = dot ? dot + 1 : rf.receiver_type; /* borrowed substring */
                     cbm_registry_add_type(reg, auto_t);
+                    py_note_known_types(known, reg);
                 }
             }
             cbm_registry_add_func(reg, rf);
@@ -5092,7 +5124,7 @@ void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
     /* Index allocations go to a per-call scratch arena (see php_lsp_cross). */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
-    py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count);
+    py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count, NULL);
     py_mark_ambiguous_callable_bindings(&reg);
 
     /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
@@ -5126,14 +5158,24 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     cbm_registry_init(reg, arena);
     cbm_python_stdlib_register(reg, arena);
 
+    /* The registry is not finalized until the end, so probing it for each
+     * Method's receiver scanned every type: O(methods x types), single-threaded
+     * (~54 s of lsp_cross_prepare on a large Python tree). Probe a set of
+     * the registered type QNs instead; registration order is unchanged. Sized
+     * for the stdlib seed, not def_count (the mixed all-language count). NULL
+     * on allocation failure: the registry probe runs as before. */
+    PyKnownTypes known = {cbm_ht_create((uint32_t)reg->type_count), 0};
+    py_note_known_types(&known, reg);
+
     /* Filter to Python defs only — defs[] is mixed-language all_defs. */
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
         if (d->lang != CBM_LANG_PYTHON)
             continue;
         /* Reuse the existing register fn on a single-def slice (n=1 inline). */
-        py_register_lsp_defs(arena, NULL, reg, d, 1);
+        py_register_lsp_defs(arena, NULL, reg, d, 1, &known);
     }
+    cbm_ht_free(known.qns);
 
     py_mark_ambiguous_callable_bindings(reg);
     cbm_registry_finalize(reg);
