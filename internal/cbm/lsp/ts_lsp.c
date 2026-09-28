@@ -5487,6 +5487,55 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
                 continue;
             }
 
+            // Constructor parameter properties: `constructor(private readonly svc: Svc)`.
+            // A parameter with an accessibility/readonly/override modifier is a class field.
+            if (!is_interface && strcmp(mk, "method_definition") == 0) {
+                TSNode mname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
+                TSNode params =
+                    ts_node_child_by_field_name(m, "parameters", TS_LSP_FIELD_LEN("parameters"));
+                if (ts_node_is_null(mname) || ts_node_is_null(params))
+                    continue;
+                char *mnm = node_text(ctx, mname);
+                if (!mnm || strcmp(mnm, "constructor") != 0)
+                    continue;
+                uint32_t pnc = ts_node_named_child_count(params);
+                for (uint32_t pi = 0; pi < pnc && field_count < 63; pi++) {
+                    TSNode p = ts_node_named_child(params, pi);
+                    const char *pk = ts_node_type(p);
+                    if (strcmp(pk, "required_parameter") != 0 &&
+                        strcmp(pk, "optional_parameter") != 0)
+                        continue;
+                    bool is_prop = false;
+                    uint32_t pcc = ts_node_child_count(p);
+                    for (uint32_t ci = 0; ci < pcc && !is_prop; ci++) {
+                        const char *ck = ts_node_type(ts_node_child(p, ci));
+                        is_prop = strcmp(ck, "accessibility_modifier") == 0 ||
+                                  strcmp(ck, "override_modifier") == 0 ||
+                                  strcmp(ck, "readonly") == 0;
+                    }
+                    if (!is_prop)
+                        continue;
+                    TSNode pp =
+                        ts_node_child_by_field_name(p, "pattern", TS_LSP_FIELD_LEN("pattern"));
+                    if (ts_node_is_null(pp) || strcmp(ts_node_type(pp), "identifier") != 0)
+                        continue;
+                    char *pnm = node_text(ctx, pp);
+                    if (!pnm)
+                        continue;
+                    const CBMType *pt = cbm_type_unknown();
+                    TSNode ptype = ts_node_child_by_field_name(p, "type", TS_LSP_FIELD_LEN("type"));
+                    if (!ts_node_is_null(ptype)) {
+                        TSNode tch = ts_node_named_child(ptype, 0);
+                        if (!ts_node_is_null(tch))
+                            pt = ts_parse_type_node(ctx, tch);
+                    }
+                    field_names[field_count] = pnm;
+                    field_types[field_count] = pt;
+                    field_count++;
+                }
+                continue;
+            }
+
             // Interface method signature: `methodName(params): ReturnType;`
             // Or class method declaration in `.d.ts` ambient mode.
             if (is_interface && (strcmp(mk, "method_signature") == 0)) {
