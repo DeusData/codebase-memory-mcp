@@ -1695,8 +1695,11 @@ static const char *objectscript_udl_func_types[] = {"method", "classmethod", "qu
 static const char *objectscript_udl_class_types[] = {"class_definition", NULL};
 static const char *objectscript_udl_field_types[] = {
     "property", "parameter", "index", "trigger", "xdata", "storage", "foreignkey", NULL};
-static const char *objectscript_udl_call_types[] = {"class_method_call", "method_call",
-                                                    "relative_dot_method", "macro", NULL};
+/* Instance calls (`Do obj.M()`) have no call node of their own: the grammar
+ * hides method_call, leaving do_parameter/job_argument with an oref_method
+ * child. cbm_is_call_site() matches those via cbm_objectscript_is_instance_call. */
+static const char *objectscript_udl_call_types[] = {"class_method_call", "relative_dot_method",
+                                                    "macro", NULL};
 static const char *objectscript_udl_module_types[] = {"source_file", NULL};
 /* Branching nodes for cyclomatic complexity (verified against grammar node-types) */
 static const char *objectscript_udl_branch_types[] = {
