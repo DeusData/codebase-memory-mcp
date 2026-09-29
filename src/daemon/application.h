@@ -31,7 +31,7 @@ typedef void *cbm_daemon_application_update_worker_t;
 typedef struct {
     void *context;
     int (*start)(void *context, const char *args_json, size_t memory_budget_bytes,
-                 const char *marker_file, const char *quarantine_file,
+                 const char *marker_file, const char *quarantine_file, uint64_t duration_origin_ms,
                  cbm_daemon_application_worker_t *worker_out);
     cbm_index_worker_poll_t (*poll)(void *context, cbm_daemon_application_worker_t worker,
                                     const cbm_index_worker_result_t **result_out);
