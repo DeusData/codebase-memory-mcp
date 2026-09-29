@@ -1496,12 +1496,11 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                                                                       sizeof(project_root))
                                : NULL;
     /* ignore_worktrees refuses a linked worktree, including one nested inside an
-     * indexed checkout. The ancestor walk would otherwise report that parent
-     * graph as this cwd's project. An index whose own root is the linked
-     * worktree (or inside it) still counts. */
+     * indexed checkout or inside another linked worktree. Keep a match only when
+     * its root belongs to this cwd's own linked worktree, not a parent graph. */
     bool ignore_linked = srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) &&
                          cbm_git_is_linked_worktree(cwd);
-    if (ignore_linked && project && !cbm_git_is_linked_worktree(project_root)) {
+    if (ignore_linked && project && !cbm_git_same_linked_worktree(cwd, project_root)) {
         free(project);
         project = NULL;
     }

@@ -309,6 +309,19 @@ TEST(is_linked_worktree_true_for_linked_worktree) {
     snprintf(main_nested, sizeof(main_nested), "%s/src", main_tmp);
     bool main_nested_ok = th_mkdir_p(main_nested) == 0;
     bool main_nested_detected = main_nested_ok && cbm_git_is_linked_worktree(main_nested);
+    /* A worktree nested inside another must not share the parent's anchor. */
+    char inner[1024];
+    snprintf(inner, sizeof(inner), "%s/inner-wt", wt_tmp);
+    char inner_cmd[1200];
+    snprintf(inner_cmd, sizeof(inner_cmd), "worktree add -b inner-branch \"%s\"", inner);
+    bool inner_added = git_run(main_tmp, inner_cmd) == 0;
+    char inner_sub[1200];
+    snprintf(inner_sub, sizeof(inner_sub), "%s/sub", inner);
+    bool inner_sub_ok = inner_added && th_mkdir_p(inner_sub) == 0;
+    bool same_outer = cbm_git_same_linked_worktree(nested, wt_tmp);
+    bool same_inner = inner_sub_ok && cbm_git_same_linked_worktree(inner_sub, inner);
+    bool not_parent = inner_sub_ok && !cbm_git_same_linked_worktree(inner_sub, wt_tmp);
+    bool not_main = !cbm_git_same_linked_worktree(nested, main_tmp);
 
     git_run(main_tmp, "worktree prune");
     th_rmtree(main_tmp);
@@ -320,6 +333,11 @@ TEST(is_linked_worktree_true_for_linked_worktree) {
     ASSERT(!main_detected);
     ASSERT(main_nested_ok);
     ASSERT(!main_nested_detected);
+    ASSERT(inner_added);
+    ASSERT(same_outer);
+    ASSERT(same_inner);
+    ASSERT(not_parent);
+    ASSERT(not_main);
     PASS();
 #endif /* _WIN32 */
 }

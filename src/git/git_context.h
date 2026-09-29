@@ -32,6 +32,12 @@ typedef struct {
  * cbm_git_context_resolve() shells out to git and is not usable on that path. */
 bool cbm_git_is_linked_worktree(const char *path);
 
+/* True when both paths sit in the same linked worktree. Identity is the
+ * gitdir pointer of each path's linked-worktree anchor, so a worktree nested
+ * inside another does not count as that parent. False when either path is not
+ * inside a linked worktree. */
+bool cbm_git_same_linked_worktree(const char *a, const char *b);
+
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);

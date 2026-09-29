@@ -211,7 +211,8 @@ static bool parent_directory(char *path) {
     return true;
 }
 
-bool cbm_git_is_linked_worktree(const char *path) {
+/* On a linked-worktree hit, optionally copy that anchor directory into root_out. */
+static bool walk_linked_worktree_root(const char *path, char *root_out, size_t root_out_size) {
     if (!path || !path[0]) {
         return false;
     }
@@ -230,7 +231,16 @@ bool cbm_git_is_linked_worktree(const char *path) {
     for (int depth = 0; depth < 64; depth++) {
         int kind = linked_worktree_anchor(current);
         if (kind >= 0) {
-            return kind == 1;
+            if (kind != 1) {
+                return false;
+            }
+            if (root_out && root_out_size > 0U) {
+                int written = snprintf(root_out, root_out_size, "%s", current);
+                if (written < 0 || (size_t)written >= root_out_size) {
+                    return false;
+                }
+            }
+            return true;
         }
         char previous[GIT_OUTPUT_MAX];
         snprintf(previous, sizeof(previous), "%s", current);
@@ -239,6 +249,29 @@ bool cbm_git_is_linked_worktree(const char *path) {
         }
     }
     return false;
+}
+
+bool cbm_git_is_linked_worktree(const char *path) {
+    return walk_linked_worktree_root(path, NULL, 0U);
+}
+
+bool cbm_git_same_linked_worktree(const char *a, const char *b) {
+    char root_a[GIT_OUTPUT_MAX];
+    char root_b[GIT_OUTPUT_MAX];
+    if (!walk_linked_worktree_root(a, root_a, sizeof(root_a)) ||
+        !walk_linked_worktree_root(b, root_b, sizeof(root_b))) {
+        return false;
+    }
+    /* The gitdir file is unique per linked worktree. Comparing those pointers
+     * keeps a nested worktree from matching its parent even when both are
+     * linked checkouts. */
+    char git_a[GIT_OUTPUT_MAX];
+    char git_b[GIT_OUTPUT_MAX];
+    if (!read_gitlink_target(root_a, git_a, sizeof(git_a)) ||
+        !read_gitlink_target(root_b, git_b, sizeof(git_b))) {
+        return false;
+    }
+    return strcmp(git_a, git_b) == 0;
 }
 
 static char *join_root_relative(const char *root, const char *rel) {

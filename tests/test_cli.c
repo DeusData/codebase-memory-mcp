@@ -10679,6 +10679,25 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
                       !strstr(exact_out, "ignore_worktrees is enabled");
     free(exact_out);
 
+    /* An unindexed worktree nested inside that indexed worktree must not
+     * inherit the outer worktree's graph. */
+    char child[600];
+    snprintf(child, sizeof(child), "%s/child-wt", insider);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree add -q \"%s\" -b agl7child", maindir,
+             child);
+    bool child_made = inside_stored && system(cmd) == 0;
+    char child_sub[700];
+    snprintf(child_sub, sizeof(child_sub), "%s/sub", child);
+    bool child_sub_made = child_made && test_mkdirp(child_sub) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             child_sub);
+    char *child_out = child_sub_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool child_ignored = child_out && inside_name &&
+                         strstr(child_out, "ignore_worktrees is enabled") &&
+                         strstr(child_out, "do not run index_repository") &&
+                         !strstr(child_out, "is indexed") && !strstr(child_out, inside_name);
+    free(child_out);
+
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
              maindir);
     char *main_out = cbm_hook_augment_lifecycle_json(input);
@@ -10701,6 +10720,8 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
         FAIL("a nested linked worktree must not inherit the indexed parent graph");
     if (!exact_kept)
         FAIL("an exact index of the nested worktree must still be reported");
+    if (!child_ignored)
+        FAIL("a worktree nested inside an indexed worktree must not inherit that graph");
     if (!main_ok)
         FAIL("the indexed main checkout must still resolve in the same matrix");
     PASS();
