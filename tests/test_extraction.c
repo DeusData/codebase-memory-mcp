@@ -4680,7 +4680,10 @@ TEST(extract_java_no_double_class_qn) {
 
     const CBMDefinition *run = find_def_by_name(r, "run");
     ASSERT_NOT_NULL(run);
-    ASSERT_STR_EQ(run->qualified_name, "t.Outer.Inner.run");
+    /* A Java member QN carries its parameter type list — that list is part of
+     * the identity, so overloads are distinct nodes instead of collapsing onto
+     * one (class, name) key. */
+    ASSERT_STR_EQ(run->qualified_name, "t.Outer.Inner.run(int)");
 
     /* The in-body call to helper() must be attributed to the SAME QN as the
      * method def — this is the equality the LSP cross-resolution join relies on

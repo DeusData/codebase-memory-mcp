@@ -1100,6 +1100,21 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     }
 
     if (state->enclosing_class_qn) {
+        /* Java member QNs carry their parameter type list (see
+         * cbm_java_method_qn_from_params), and this QN is what every call and
+         * usage in the body is sourced from. Re-spelling "Class.method" here
+         * would name a node that does not exist, so the edge would be dropped
+         * at write — the same failure the def-side gate below guards against.
+         * Constructors resolve their name node to the class name and follow the
+         * same rule, so no node-kind gate is needed. */
+        if (ctx->language == CBM_LANG_JAVA) {
+            TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+            const char *member_qn = cbm_java_method_qn_from_params(
+                ctx->arena, state->enclosing_class_qn, qn_name, params, ctx->source);
+            if (member_qn) {
+                return member_qn;
+            }
+        }
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
@@ -2544,6 +2559,21 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     push_lexical_boundary(node, state, depth);
     py_bind_scope_parameters(ctx, node, state);
     push_call_scope(state, depth, invocation);
+
+    /* Java anonymous class (`new T() { ... }`): a scope with no declaration.
+     * The extractor mints its members with the `$AC_<Type>` QN this helper
+     * produces, so pushing the SAME scope here is what makes a call inside the
+     * body source to its own member. Without it the enclosing function QN is
+     * the outer method's, which names no node for that body — the call then
+     * falls back to the File node and "who called it" is lost. */
+    if (ctx->language == CBM_LANG_JAVA) {
+        cbm_java_anon_scope_t anon = cbm_java_anonymous_class_scope(
+            ctx->arena, node, ctx->source, state->enclosing_class_qn, state->enclosing_func_qn,
+            ctx->module_qn);
+        if (anon.qn) {
+            (void)push_scope(state, SCOPE_CLASS, depth, anon.qn);
+        }
+    }
     if (is_actual_import_boundary(ctx, node, spec) && !is_export_of_declaration(node)) {
         push_scope(state, SCOPE_IMPORT, depth, NULL);
     }

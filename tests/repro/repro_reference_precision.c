@@ -24,7 +24,25 @@ static int rp_qn_ends_with(const char *qn, const char *suffix) {
         return 0;
     size_t qn_len = strlen(qn);
     size_t suffix_len = strlen(suffix);
-    return qn_len >= suffix_len && strcmp(qn + qn_len - suffix_len, suffix) == 0;
+    if (qn_len >= suffix_len && strcmp(qn + qn_len - suffix_len, suffix) == 0) {
+        return 1;
+    }
+    /* A Java member QN carries its parameter type list, because that list is
+     * part of the identity (overloads are separate nodes, and the list feeds
+     * the TrackerV2 hash). The fixtures here name a target as "Class.member",
+     * so that spelling also matches when the ONLY text after the suffix is the
+     * parameter list. Non-Java QNs do not end a segment with '(' , so their
+     * behaviour is unchanged. */
+    if (qn_len > suffix_len + 1U && qn[qn_len - 1] == ')') {
+        const char *open = strchr(qn, '(');
+        if (open) {
+            size_t stem = (size_t)(open - qn);
+            if (stem >= suffix_len && strncmp(qn + stem - suffix_len, suffix, suffix_len) == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 static int rp_extracts_clean(const char *source, CBMLanguage language, const char *filename) {

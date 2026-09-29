@@ -80,6 +80,62 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
     return seg;
 }
 
+/* Java member QNs carry their parameter list in the last segment
+ * ("pkg.Class.method(int,String)") so overloads are distinct identities. Every
+ * join in this header compares a QN against a name spelled at a call site —
+ * which never carries that list — so both sides are reduced to the same
+ * signature-free span.
+ *
+ * The list is recognised only when the name ends with ')' and the first '(' is
+ * immediately preceded by an identifier character. That keeps non-signature
+ * text that happens to end in a call ("... = new EnumMap<>(K.class)") intact,
+ * because there the '(' follows '>' (or a space). */
+static inline void cbm_pipeline_qn_sans_signature(const char *qn, size_t *out_len) {
+    size_t n = qn ? strlen(qn) : 0;
+    if (n > SKIP_ONE && qn[n - SKIP_ONE] == ')') {
+        const char *open = strchr(qn, '(');
+        if (open && open > qn) {
+            unsigned char prev = (unsigned char)open[-SKIP_ONE];
+            if (isalnum(prev) || prev == '_' || prev == '$') {
+                n = (size_t)(open - qn);
+            }
+        }
+    }
+    *out_len = n;
+}
+
+/* Equality on the signature-free spans. Works on whole QNs (dotted) and on the
+ * bare last segment alike. */
+static inline bool cbm_pipeline_qn_same_ignoring_signature(const char *a, const char *b) {
+    if (!a || !b) {
+        return false;
+    }
+    size_t al = 0;
+    size_t bl = 0;
+    cbm_pipeline_qn_sans_signature(a, &al);
+    cbm_pipeline_qn_sans_signature(b, &bl);
+    return al > 0 && al == bl && strncmp(a, b, al) == 0;
+}
+
+/* Bare last segment of `name`, with any trailing parameter list removed,
+ * written into `buf` (returning it) or NULL when it would not fit. This is the
+ * key every LSP leaf index in the pipeline is built and probed under, so a QN
+ * carrying a signature and a call-site spelling hash to the same entry. */
+static inline const char *cbm_lsp_member_leaf(const char *name, char *buf, size_t cap) {
+    if (!name) {
+        return NULL;
+    }
+    const char *seg = cbm_lsp_bare_segment(name);
+    size_t len = 0;
+    cbm_pipeline_qn_sans_signature(seg, &len);
+    if (len == 0 || len >= cap) {
+        return NULL;
+    }
+    memcpy(buf, seg, len);
+    buf[len] = '\0';
+    return buf;
+}
+
 /* Tail helper: return the start of the final two dot-separated segments
  * ("Class.method") or NULL when the QN is too short. */
 static inline const char *cbm_pipeline_qn_class_method_tail(const char *qn) {
@@ -210,7 +266,7 @@ static inline bool cbm_pipeline_node_is_callable_target(const cbm_gbuf_node_t *n
 
 static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const char *tail) {
     const char *qt = cbm_pipeline_qn_class_method_tail(qn);
-    return qt && tail && strcmp(qt, tail) == 0;
+    return qt && cbm_pipeline_qn_same_ignoring_signature(qt, tail);
 }
 
 static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
@@ -248,7 +304,8 @@ static inline bool cbm_pipeline_invocation_targets_equal(const char *left_qn, co
     }
     const char *left_tail = cbm_pipeline_qn_class_method_tail(left_qn);
     const char *right_tail = cbm_pipeline_qn_class_method_tail(right_qn);
-    if (!left_tail || !right_tail || strcmp(left_tail, right_tail) != 0) {
+    if (!left_tail || !right_tail ||
+        !cbm_pipeline_qn_same_ignoring_signature(left_tail, right_tail)) {
         return false;
     }
     /* Two package-shaped rows that both reach a node only through the tail
@@ -337,7 +394,7 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
     }
     const char *resolved_leaf = cbm_lsp_bare_segment(resolved->callee_qn);
     const char *call_leaf = cbm_lsp_bare_segment(call->callee_name);
-    if (resolved_leaf && call_leaf && strcmp(resolved_leaf, call_leaf) == 0) {
+    if (cbm_pipeline_qn_same_ignoring_signature(resolved_leaf, call_leaf)) {
         return true;
     }
 
@@ -721,7 +778,10 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_reference_view_in_gra
                                                rc->site_end_byte, rc->source_origin)) {
             continue;
         }
-        bool name_matches = strcmp(cbm_lsp_bare_segment(rc->callee_qn), ref_leaf) == 0;
+        /* Signature-free: a Java member reference QN carries its parameter
+         * list, the usage's own spelling never does. */
+        bool name_matches =
+            cbm_pipeline_qn_same_ignoring_signature(cbm_lsp_bare_segment(rc->callee_qn), ref_leaf);
         bool semantic_reason_matches = cbm_pipeline_reference_reason_matches(rc, ref_leaf);
         if (!name_matches && !semantic_reason_matches) {
             continue;
@@ -763,7 +823,8 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_reference_view_in_gra
                                                rc->site_end_byte, rc->source_origin)) {
             continue;
         }
-        bool name_matches = strcmp(cbm_lsp_bare_segment(rc->callee_qn), ref_leaf) == 0;
+        bool name_matches =
+            cbm_pipeline_qn_same_ignoring_signature(cbm_lsp_bare_segment(rc->callee_qn), ref_leaf);
         bool semantic_reason_matches = cbm_pipeline_reference_reason_matches(rc, ref_leaf);
         if (!name_matches && !semantic_reason_matches) {
             continue;
@@ -909,6 +970,19 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
     if (!callee_tail) {
         return NULL;
     }
+    /* Node `name` never carries the parameter list, so a signature-bearing
+     * callee leaf ("method(int)") must be truncated before the name index is
+     * consulted. The backing store is this frame's buffer: the lookup copies
+     * nothing and the name dies with the call. */
+    char short_buf[CBM_SZ_256];
+    size_t short_len = 0;
+    cbm_pipeline_qn_sans_signature(short_name, &short_len);
+    if (short_len == 0 || short_len >= sizeof(short_buf)) {
+        return NULL;
+    }
+    memcpy(short_buf, short_name, short_len);
+    short_buf[short_len] = '\0';
+    short_name = short_buf;
     const cbm_gbuf_node_t **hits = NULL;
     int hit_count = 0;
     if (cbm_gbuf_find_by_name(gbuf, short_name, &hits, &hit_count) != 0 || hit_count == 0) {

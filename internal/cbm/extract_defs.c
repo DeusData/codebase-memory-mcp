@@ -5,6 +5,7 @@
 #include "foundation/constants.h"
 #include "foundation/platform.h" // safe_realloc (frees old on failure)
 #include "foundation/log.h"      // cbm_log_warn
+#include "foundation/sha256.h"   // Java declaration content hash (duplicate_fingerprint)
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
@@ -202,6 +203,8 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
                                   const CBMLangSpec *spec);
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec);
+static TSNode resolve_method_name(TSNode child, CBMLanguage lang);
+static TSNode find_class_member_body(TSNode class_node, CBMLanguage lang);
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
@@ -2825,6 +2828,98 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
     return find_base_from_children(a, node, source, base_types);
 }
 
+/* ── Java anonymous classes ─────────────────────────────────────────────
+ *
+ * `new Iterator<>() { public boolean hasNext() { ... } }` declares a real
+ * method on a class that has no name. TrackerV2 registers such members and
+ * scopes them as `$AC_<Type>` (see cbm_java_anonymous_class_scope in
+ * helpers.h); a graph that omits them loses the declarations AND the
+ * attribution of every call made inside their bodies, because the call's
+ * enclosing scope resolves to no node and falls back to the File node.
+ *
+ * The scan starts at the enclosing class body and stops at nested DECLARED
+ * types: each of those reaches extract_class_def on its own and would
+ * otherwise be scanned twice, the second time under the wrong scope. */
+enum {
+    /* Depth bound for nested anonymous classes. Each level is a real nested
+     * scope, so this is generous; it exists to keep a pathological file from
+     * recursing without end. */
+    JAVA_ANON_MAX_DEPTH = 24,
+};
+
+static void extract_java_anonymous_scopes(CBMExtractCtx *ctx, TSNode node, const char *class_qn,
+                                         const char *func_qn, const CBMLangSpec *spec,
+                                         uint32_t depth) {
+    if (ts_node_is_null(node) || depth > JAVA_ANON_MAX_DEPTH) {
+        return;
+    }
+    if (cbm_kind_in_set(node, spec->class_node_types)) {
+        return; /* a nested declared type, handled by its own extract_class_def */
+    }
+
+    if (strcmp(ts_node_type(node), "object_creation_expression") == 0) {
+        TSNode body = cbm_find_child_by_kind(node, "class_body");
+        cbm_java_anon_scope_t sc = cbm_java_anonymous_class_scope(
+            ctx->arena, node, ctx->source, class_qn, func_qn, ctx->module_qn);
+        if (sc.qn && !ts_node_is_null(body)) {
+            CBMDefinition ac;
+            memset(&ac, 0, sizeof(ac));
+            ac.name = sc.name;
+            ac.qualified_name = sc.qn;
+            ac.label = "Class";
+            ac.file_path = ctx->rel_path;
+            ac.parent_class = class_qn;
+            ac.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+            ac.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+            ac.lines = (int)(ac.end_line - ac.start_line + TS_LINE_OFFSET);
+            ac.is_exported = cbm_is_exported(ac.name, ctx->language);
+            /* Scope yes, identity no: see the field's comment in cbm.h. */
+            ac.type_is_anonymous = true;
+            cbm_defs_push(&ctx->result->defs, ctx->arena, ac);
+
+            extract_class_methods(ctx, node, sc.qn, spec);
+            extract_class_fields(ctx, node, sc.qn, spec);
+            extract_class_variables(ctx, node, sc.qn, spec);
+
+            uint32_t n = ts_node_child_count(body);
+            for (uint32_t i = 0; i < n; i++) {
+                extract_java_anonymous_scopes(ctx, ts_node_child(body, i), sc.qn, NULL, spec,
+                                              depth + SKIP_ONE);
+            }
+        }
+        /* Everything outside the body — above all the argument list, where
+         * `new Foo(new Bar() { ... })` hides a second anonymous class — stays
+         * in the CURRENT scope. */
+        uint32_t n = ts_node_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode child = ts_node_child(node, i);
+            if (!ts_node_is_null(body) && ts_node_eq(child, body)) {
+                continue;
+            }
+            extract_java_anonymous_scopes(ctx, child, class_qn, func_qn, spec, depth + SKIP_ONE);
+        }
+        return;
+    }
+
+    if (cbm_kind_in_set(node, spec->function_node_types)) {
+        TSNode name_node = resolve_method_name(node, ctx->language);
+        if (!ts_node_is_null(name_node)) {
+            char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source, ctx->language);
+            if (name && name[0]) {
+                /* TrackerV2's chain carries the method's SIMPLE name, so this
+                 * prefix deliberately has no parameter list. */
+                func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
+            }
+        }
+    }
+
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        extract_java_anonymous_scopes(ctx, ts_node_child(node, i), class_qn, func_qn, spec,
+                                      depth + SKIP_ONE);
+    }
+}
+
 // Classify class label from AST node kind
 static const char *class_label_for_kind(const char *kind) {
     if (strcmp(kind, "interface_declaration") == 0 || strcmp(kind, "interface_type") == 0 ||
@@ -2841,6 +2936,29 @@ static const char *class_label_for_kind(const char *kind) {
         return "Type";
     }
     return "Class";
+}
+
+// Java declaration content hash — the digest half of TrackerV2's
+// duplicate_fingerprint.
+//
+// TrackerV2 disambiguates declarations that share a duplicate key with
+// `sha256(<the declaration's exact source text>)` plus the declaration's index
+// inside that key's group. The graph stores neither the text nor its digest, so
+// the digest has to be taken here, while the AST and the source are still in
+// hand. The byte range matches `_node_text(node, source)` on the TrackerV2
+// side, so the digest is byte-identical for the same declaration.
+static const char *java_decl_content_hash(CBMExtractCtx *ctx, TSNode node) {
+    if (!ctx || !ctx->source || ts_node_is_null(node)) {
+        return NULL;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    if (end <= start) {
+        return NULL;
+    }
+    char hex[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(ctx->source + start, (size_t)(end - start), hex);
+    return cbm_arena_strdup(ctx->arena, hex);
 }
 
 // --- Parameter type extraction ---
@@ -3363,6 +3481,31 @@ static char *resolve_signature_param_type_text(CBMArena *a, TSNode param, const 
             char *type_text = cbm_node_text(a, type_node, source);
             if (type_text && type_text[0]) {
                 return type_text;
+            }
+        }
+    }
+
+    /* Java varargs. tree-sitter-java's `spread_parameter` exposes NO fields at
+     * all: the element type is a plain positional child (`type_identifier` or
+     * `array_type`) and the name is wrapped in a `variable_declarator`. Without
+     * this branch the type resolves to the "?" unknown placeholder, so every
+     * varargs method loses its parameter list — and with it its identity, since
+     * the signature is part of the TrackerV2 HashUID.
+     *
+     * The "..." suffix is reconstructed rather than read, because it is a
+     * separate anonymous token between the type child and the declarator; this
+     * matches the TrackerV2 spelling for the `<Type>...` form. */
+    if (lang == CBM_LANG_JAVA && strcmp(ts_node_type(param), "spread_parameter") == 0) {
+        uint32_t nc = ts_node_named_child_count(param);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_named_child(param, i);
+            if (ts_node_is_null(child) ||
+                strcmp(ts_node_type(child), "variable_declarator") == 0) {
+                continue;
+            }
+            char *type_text = cbm_node_text(a, child, source);
+            if (type_text && type_text[0]) {
+                return cbm_arena_sprintf(a, "%s...", type_text);
             }
         }
     }
@@ -4635,6 +4778,14 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
+    /* Java: TrackerV2's type registry covers class/interface/enum only, so a
+     * `record` or an `@interface` is neither an identity-bearing type nor a
+     * scope for the members it contains. Recorded here for pass_hashuid.c. */
+    if (ctx->language == CBM_LANG_JAVA) {
+        def.type_is_record = strcmp(kind, "record_declaration") == 0;
+        def.type_is_annotation = strcmp(kind, "annotation_type_declaration") == 0;
+        def.decl_content_hash = java_decl_content_hash(ctx, node);
+    }
 
     cbm_defs_push(&ctx->result->defs, a, def);
 
@@ -4650,6 +4801,20 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
     // Extract class-level variables (field declarations)
     extract_class_variables(ctx, node, class_qn, spec);
+
+    /* Java: `new T() { ... }` bodies declare real methods. They belong to no
+     * named class, so no other extractor reaches them — see
+     * extract_java_anonymous_scopes above. */
+    if (ctx->language == CBM_LANG_JAVA) {
+        TSNode member_body = find_class_member_body(node, ctx->language);
+        if (!ts_node_is_null(member_body)) {
+            uint32_t anon_count = ts_node_child_count(member_body);
+            for (uint32_t i = 0; i < anon_count; i++) {
+                extract_java_anonymous_scopes(ctx, ts_node_child(member_body, i), class_qn, NULL,
+                                              spec, 0);
+            }
+        }
+    }
 
     // C# 12 primary-constructor parameters: declared on the class line
     // (`class Foo(IBar bar, IBaz baz) : Base { ... }`) and bound to implicit
@@ -4923,6 +5088,62 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
 }
 
 // Push a single method definition
+/* TrackerV2-compatible qualified name for a Java method or constructor: the
+ * parameter type list is part of the identity, so overloads become separate
+ * nodes instead of collapsing into one node keyed by (class, name).
+ *
+ * Types come from `signature_param_types`, which carries the raw source text of
+ * each parameter type — generics and `...` intact — rather than the cleaned
+ * `param_types` that strips them. Falls back to the historical
+ * `<class>.<name>` form if the buffer cannot be sized, so a failure can never
+ * produce a half-written name. */
+static const char *java_method_qn_with_signature(CBMArena *a, const char *class_qn,
+                                                 const char *name, const char **types,
+                                                 int type_count) {
+    size_t cap = strlen(class_qn) + strlen(name) + CBM_SZ_4;
+    for (int i = 0; i < type_count; i++) {
+        cap += strlen(types[i] ? types[i] : "?") + SKIP_ONE;
+    }
+    char *buf = (char *)cbm_arena_alloc(a, cap);
+    if (!buf) {
+        return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+    }
+    size_t pos = (size_t)snprintf(buf, cap, "%s.%s(", class_qn, name);
+    for (int i = 0; i < type_count; i++) {
+        const char *t = (types[i] && types[i][0]) ? types[i] : "?";
+        int n = snprintf(buf + pos, cap - pos, "%s%s", i ? "," : "", t);
+        if (n < 0 || (size_t)n >= cap - pos) {
+            return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+        }
+        pos += (size_t)n;
+    }
+    if (pos + CBM_SZ_2 > cap) {
+        return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+    }
+    buf[pos] = ')';
+    buf[pos + SKIP_ONE] = '\0';
+    return buf;
+}
+
+/* Public entry point for the same spelling, taking the tree-sitter node rather
+ * than an already-extracted type list. The Java LSP builds the QN of the
+ * method it is walking (and of synthesized dispatch targets) with this, so the
+ * caller_qn it records is byte-identical to the node the extractor minted and
+ * the pipeline's lsp_resolve join (which compares QNs exactly) still matches.
+ * Single source of truth: any change to the QN shape lands here only. */
+const char *cbm_java_method_qn_from_params(CBMArena *a, const char *class_qn, const char *name,
+                                           TSNode params, const char *source) {
+    if (!a || !class_qn || !name) {
+        return NULL;
+    }
+    const char **types = NULL;
+    int type_count = 0;
+    if (!ts_node_is_null(params)) {
+        types = extract_signature_param_types(a, params, source, CBM_LANG_JAVA, true, &type_count);
+    }
+    return java_method_qn_with_signature(a, class_qn, name, types, type_count);
+}
+
 static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
                             const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
     CBMArena *a = ctx->arena;
@@ -4932,7 +5153,20 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         return;
     }
 
-    const char *method_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+    /* Parameter types are needed before the qn is built (Java includes them in
+     * the identity), so they are extracted first and reused below. */
+    TSNode params = find_function_params(child, ctx->language);
+    const char **sig_types = NULL;
+    int sig_count = 0;
+    if (!ts_node_is_null(params)) {
+        sig_types = extract_signature_param_types(a, params, ctx->source, ctx->language, true,
+                                                  &sig_count);
+    }
+
+    const char *method_qn =
+        (ctx->language == CBM_LANG_JAVA)
+            ? java_method_qn_with_signature(a, class_qn, name, sig_types, sig_count)
+            : cbm_arena_sprintf(a, "%s.%s", class_qn, name);
 
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
@@ -4949,13 +5183,20 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         strcmp(ts_node_type(child), "function_signature_item") == 0) {
         def.is_abstract = true;
     }
+    /* Java: TrackerV2 only gives an identity to methods that DECLARE a body.
+     * Abstract methods, `native` methods and interface declarations carry no
+     * HashUID, so the verdict is recorded here (where the AST is still in
+     * hand) for pass_hashuid.c to read later. */
+    if (ctx->language == CBM_LANG_JAVA) {
+        def.has_body = !ts_node_is_null(ts_node_child_by_field_name(child, "body", 4));
+        def.decl_content_hash = java_decl_content_hash(ctx, child);
+    }
 
-    TSNode params = find_function_params(child, ctx->language);
     if (!ts_node_is_null(params)) {
         def.signature = cbm_node_text(a, params, ctx->source);
         def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
-        def.signature_param_types = extract_signature_param_types(
-            a, params, ctx->source, ctx->language, true, &def.signature_param_count);
+        def.signature_param_types = sig_types;
+        def.signature_param_count = sig_count;
     }
 
     // Return type (same fields as extract_func_def)

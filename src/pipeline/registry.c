@@ -32,6 +32,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/platform.h"
 
 #include <math.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,6 +121,63 @@ static const char *simple_name(const char *qn) {
 }
 
 /* Extract everything before the last dot. Returns heap-allocated string. */
+
+/* Java member QNs carry their parameter list in the last segment
+ * ("pkg.Class.method(int,String)") so overloads are distinct identities — see
+ * cbm_java_method_qn_from_params in cbm.h. Every caller-side spelling here is
+ * written at a call site and never carries that list, so the name index and
+ * every tail/segment comparison must ignore it.
+ *
+ * Returns the length of `qn` up to a trailing parameter list, or the full
+ * length when there is none. The list is only recognised when the name ends
+ * with ')' and the first '(' is immediately preceded by an identifier
+ * character, which leaves unrelated text that merely ends in a call alone
+ * ("... = new EnumMap<>(K.class)" has '>' before its '('). */
+static size_t qn_signature_cut(const char *qn) {
+    size_t n = strlen(qn);
+    if (n <= SKIP_ONE || qn[n - SKIP_ONE] != ')') {
+        return n;
+    }
+    const char *open = strchr(qn, '(');
+    if (!open || open == qn) {
+        return n;
+    }
+    unsigned char prev = (unsigned char)open[-SKIP_ONE];
+    if (!(isalnum(prev) || prev == '_' || prev == '$')) {
+        return n;
+    }
+    return (size_t)(open - qn);
+}
+
+/* True when `qn` consists of exactly `prefix` + "." + `member`, where `member`
+ * may carry a parameter list. Used by the member lookups that must place a
+ * callee inside one specific class/namespace. */
+static bool qn_is_direct_member(const char *qn, const char *prefix, const char *member) {
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(qn, prefix, prefix_len) != 0 || qn[prefix_len] != '.') {
+        return false;
+    }
+    const char *rest = qn + prefix_len + SKIP_ONE;
+    size_t member_len = strlen(member);
+    return qn_signature_cut(rest) == member_len && strncmp(rest, member, member_len) == 0;
+}
+
+/* The name-index key for a callee spelling: its bare last segment, without any
+ * trailing parameter list. Writes into `buf` (returning it) and returns NULL
+ * when the leaf would not fit, so callers never index a truncated name. */
+static const char *lookup_leaf(const char *callee_name, char *buf, size_t cap) {
+    if (!callee_name) {
+        return NULL;
+    }
+    const char *leaf = simple_name(callee_name);
+    size_t leaf_len = qn_signature_cut(leaf);
+    if (leaf_len == 0 || leaf_len >= cap) {
+        return NULL;
+    }
+    memcpy(buf, leaf, leaf_len);
+    buf[leaf_len] = '\0';
+    return buf;
+}
 
 /* Count common dot-separated prefix segments. One pass over the shared prefix:
  * the same answer as measuring each segment of both strings with strchr and
@@ -769,10 +827,26 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
     const char *simple = simple_name(qualified_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, simple);
+    /* The indexed key is the call-site spelling: the parameter list a Java
+     * member QN carries is dropped so `Class.method` finds
+     * `Class.method(int)`. Non-signature names keep their exact spelling. */
+    size_t simple_len = qn_signature_cut(simple);
+    char *lookup_key = (char *)malloc(simple_len + SKIP_ONE);
+    if (!lookup_key) {
+        return;
+    }
+    memcpy(lookup_key, simple, simple_len);
+    lookup_key[simple_len] = '\0';
+    qn_array_t *arr = cbm_ht_get(r->by_name, lookup_key);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
-        cbm_ht_set(r->by_name, strdup(simple), arr);
+        if (!arr) {
+            free(lookup_key);
+            return;
+        }
+        cbm_ht_set(r->by_name, lookup_key, arr); /* the table keeps this key */
+    } else {
+        free(lookup_key); /* an existing array owns the key it was stored under */
     }
     int before = arr->count;
     cbm_da_push(arr, (char *)owned_qn);
@@ -908,9 +982,12 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
             size_t ds_len = strlen(dot_suffix);
             for (int i = 0; i < arr->count; i++) {
                 const char *qn = arr->items[i];
-                size_t klen = strlen(qn);
+                /* Compare on the signature-free spelling: a Java member QN
+                 * ("….helper(int)") must still tail-match the import's plain
+                 * "….helper". */
+                size_t klen = qn_signature_cut(qn);
                 if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
-                    strcmp(qn + klen - ds_len, dot_suffix) == 0) {
+                    strncmp(qn + klen - ds_len, dot_suffix, ds_len) == 0) {
                     return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
                 }
@@ -921,6 +998,31 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
 }
 
 /* Strategy 2: Same-module match */
+
+/* The first registry member that is a direct child of `prefix` and named
+ * `member` (a parameter list is allowed). NULL when the name index has no such
+ * entry. The returned pointer is the registry's own QN copy. */
+static const char *same_module_member(const cbm_registry_t *r, const char *prefix,
+                                      const char *member) {
+    if (!r || !prefix || !prefix[0] || !member) {
+        return NULL;
+    }
+    const char *leaf = simple_name(member);
+    if (!leaf || !leaf[0]) {
+        return NULL;
+    }
+    qn_array_t *arr = cbm_ht_get(r->by_name, leaf);
+    if (!arr || arr->count <= 0) {
+        return NULL;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (qn_is_direct_member(arr->items[i], prefix, leaf)) {
+            return arr->items[i];
+        }
+    }
+    return NULL;
+}
+
 static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
                                             const char *suffix, const char *module_qn) {
     char candidate[CBM_SZ_512];
@@ -935,6 +1037,19 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
         if (stored_key) {
             return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
         }
+    }
+
+    /* Signature-bearing members never match the plain spellings above, so a
+     * same-module method resolves through the name index instead: keep the
+     * candidates that are direct members of `module_qn`. Overloads of one
+     * member all qualify — the first is taken so the edge survives, exactly as
+     * it did when they shared a single node. */
+    stored_key = same_module_member(r, module_qn, callee_name);
+    if (!stored_key && suffix && suffix[0]) {
+        stored_key = same_module_member(r, module_qn, suffix);
+    }
+    if (stored_key) {
+        return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     }
     return empty_result();
 }
@@ -1012,9 +1127,12 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
         return NULL;
     }
     const char *match = NULL;
+    size_t match_len = 0;
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i];
-        size_t qlen = strlen(qn);
+        /* The callee spelling never carries a parameter list, so the
+         * signature-free QN is what its tail must equal. */
+        size_t qlen = qn_signature_cut(qn);
         if (qlen < w) {
             continue;
         }
@@ -1027,9 +1145,16 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
             continue;
         }
         if (match) {
-            return NULL; /* ambiguous — more than one qualified tail matches */
+            /* Overloads of one member share their signature-free QN, so their
+             * tails agree: that is one identity, not an ambiguity. Only
+             * genuinely different declarations make the tail useless. */
+            if (qlen != match_len || strncmp(qn, match, match_len) != 0) {
+                return NULL; /* ambiguous — more than one qualified tail matches */
+            }
+            continue;
         }
         match = qn;
+        match_len = qlen;
     }
     return match;
 }
@@ -1119,7 +1244,11 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
                                             int import_count) {
-    const char *lookup = simple_name(callee_name);
+    char lookup_buf[CBM_SZ_256];
+    const char *lookup = lookup_leaf(callee_name, lookup_buf, sizeof(lookup_buf));
+    if (!lookup) {
+        return empty_result();
+    }
     qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
         return empty_result();
@@ -1301,8 +1430,12 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
         return no_match;
     }
 
-    /* Extract simple name (last segment after dots) */
-    const char *lookup = simple_name(callee_name);
+    /* Extract simple name (last segment after dots, without any parameter list) */
+    char lookup_buf[CBM_SZ_256];
+    const char *lookup = lookup_leaf(callee_name, lookup_buf, sizeof(lookup_buf));
+    if (!lookup) {
+        return no_match;
+    }
     qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
         return no_match;
@@ -1373,8 +1506,11 @@ struct few_ctx {
 static void few_scan(const char *key, void *value, void *ud) {
     (void)value;
     struct few_ctx *ctx = ud;
-    size_t klen = strlen(key);
-    if (klen >= ctx->target_len && strcmp(key + klen - ctx->target_len, ctx->target) == 0) {
+    /* Tail-match on the signature-free spelling so a Java member still ends
+     * with ".suffix" when its parameter list follows. */
+    size_t klen = qn_signature_cut(key);
+    if (klen >= ctx->target_len &&
+        strncmp(key + klen - ctx->target_len, ctx->target, ctx->target_len) == 0) {
         if (ctx->count >= ctx->cap) {
             ctx->cap = ctx->cap ? ctx->cap * PAIR_LEN : REG_INIT_CAP;
             ctx->results = safe_realloc(ctx->results, (size_t)ctx->cap * sizeof(char *));

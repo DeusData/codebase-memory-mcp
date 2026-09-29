@@ -477,7 +477,22 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+/* Append ,"key":true|false — the twin of pass_definitions.c's helper. */
+static void append_json_bool(char *buf, size_t bufsize, size_t *pos, const char *key,
+                             bool value) {
+    if (!key || *pos >= bufsize - PP_JSON_MARGIN) {
+        return;
+    }
+    int n = snprintf(buf + *pos, bufsize - *pos, ",\"%s\":%s", key, value ? "true" : "false");
+    if (n <= 0 || *pos + (size_t)n >= bufsize - PP_ESC_SPACE) {
+        return;
+    }
+    *pos += (size_t)n;
+    buf[*pos] = '\0';
+}
+
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            CBMLanguage lang) {
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
      * keep a lean properties blob (lossless — those fields are always zero for
@@ -512,6 +527,45 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    /* Java identity metadata (TrackerV2 HashUID) — the twin of the block in
+     * pass_definitions.c, including WHY it sits first: the appenders below skip
+     * a field that would not fit, so a verdict written at the tail of a full
+     * buffer disappears on exactly the nodes it protects. */
+    if (lang == CBM_LANG_JAVA) {
+        if (def->label &&
+            (strcmp(def->label, "Method") == 0 || strcmp(def->label, "Function") == 0)) {
+            append_json_bool(buf, bufsize, &pos, "hasBody", def->has_body);
+            if (!def->return_type && def->parent_class && def->name) {
+                const char *dot = strrchr(def->parent_class, '.');
+                const char *simple = dot ? dot + SKIP_ONE : def->parent_class;
+                if (strcmp(simple, def->name) == 0) {
+                    append_json_string(buf, bufsize, &pos, "javaMemberKind", "constructor");
+                }
+            }
+        } else if (def->label && strcmp(def->label, "Class") == 0) {
+            if (def->type_is_record) {
+                append_json_string(buf, bufsize, &pos, "javaTypeKind", "record");
+            } else if (def->type_is_annotation) {
+                append_json_string(buf, bufsize, &pos, "javaTypeKind", "annotation");
+            } else if (def->type_is_anonymous) {
+                /* Scope without identity — see the twin in pass_definitions.c. */
+                append_json_string(buf, bufsize, &pos, "javaTypeKind", "anonymous");
+            }
+        }
+        /* Declaration text digest for TrackerV2's duplicate_fingerprint — see
+         * the twin in pass_definitions.c for why it must come from extraction
+         * and why it is emitted up here rather than at the tail. */
+        bool identity_type = def->label && (strcmp(def->label, "Class") == 0 ||
+                                            strcmp(def->label, "Interface") == 0 ||
+                                            strcmp(def->label, "Enum") == 0);
+        bool identity_member = def->label &&
+                               (strcmp(def->label, "Method") == 0 ||
+                                strcmp(def->label, "Function") == 0);
+        if (def->decl_content_hash && (identity_type || identity_member) &&
+            !def->type_is_anonymous && !def->type_is_record && !def->type_is_annotation) {
+            append_json_string(buf, bufsize, &pos, "declHash", def->decl_content_hash);
+        }
+    }
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
@@ -699,7 +753,7 @@ enum { PP_OVERSIZED_WARN_MAX = 32 };
 static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
                                  CBMDefinition *def) {
     char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    build_def_props(props, sizeof(props), def, fi->language);
     int64_t func_id =
         cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name,
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
@@ -2692,7 +2746,9 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
         return NULL;
     }
     const char *leaf = cbm_pipeline_call_callee_leaf(call->callee_name);
-    if (!leaf || !leaf[0]) {
+    char leaf_buf[CBM_SZ_256];
+    leaf = cbm_lsp_member_leaf(leaf, leaf_buf, sizeof(leaf_buf));
+    if (!leaf) {
         return NULL;
     }
     char *key = lsp_idx_key(call->enclosing_func_qn, leaf, exact_site, call->site_start_byte,
@@ -2763,9 +2819,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     continue;
                 }
                 CBMHashTable *index = exact_site ? lsp_exact_idx : lsp_legacy_idx;
+                char leaf_buf[CBM_SZ_256];
+                const char *leaf =
+                    cbm_lsp_member_leaf(rc_e->callee_qn, leaf_buf, sizeof(leaf_buf));
                 bool inserted =
-                    lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->callee_qn),
-                                        exact_site, rc->main_gbuf, rc->project_name, allow_tail);
+                    leaf && lsp_idx_insert_leaf(index, rc_e, leaf, exact_site, rc->main_gbuf,
+                                                rc->project_name, allow_tail);
                 if (!inserted) {
                     if (exact_site) {
                         lsp_exact_idx_complete = false;
@@ -2774,9 +2833,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     }
                 }
                 if (rc_e->reason && cbm_pipeline_invocation_reason_join_strategy(rc_e->strategy)) {
-                    inserted = lsp_idx_insert_leaf(index, rc_e, cbm_lsp_bare_segment(rc_e->reason),
-                                                   exact_site, rc->main_gbuf, rc->project_name,
-                                                   allow_tail);
+                    const char *reason_leaf =
+                        cbm_lsp_member_leaf(rc_e->reason, leaf_buf, sizeof(leaf_buf));
+                    inserted = reason_leaf && lsp_idx_insert_leaf(
+                                                  index, rc_e, reason_leaf, exact_site,
+                                                  rc->main_gbuf, rc->project_name, allow_tail);
                     if (!inserted) {
                         if (exact_site) {
                             lsp_exact_idx_complete = false;

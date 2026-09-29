@@ -851,6 +851,23 @@ static const char *class_method_tail(const char *qn) {
     return qn;
 }
 
+/* Length of `s` up to a trailing Java parameter list, or the whole string.
+ * Java member QNs carry their parameter types ("Class.method(String)") while
+ * these tests name a target as "Class.method", so every tail comparison in this
+ * file is made on the signature-free spelling — the same normalisation the
+ * product's own tail joins use. Normalising BOTH sides keeps a caller that
+ * spells out the parameter list working too. */
+static size_t tail_sans_params_len(const char *s) {
+    const char *open = s ? strchr(s, '(') : NULL;
+    return open ? (size_t)(open - s) : (s ? strlen(s) : 0);
+}
+
+static bool tail_matches(const char *node_tail, const char *want) {
+    size_t have = tail_sans_params_len(node_tail);
+    size_t expect = tail_sans_params_len(want);
+    return have > 0 && have == expect && strncmp(node_tail, want, have) == 0;
+}
+
 static const cbm_gbuf_node_t *find_unique_callable_node_by_tail(const cbm_gbuf_t *gbuf,
                                                                 const char *tail) {
     const char *method = tail ? strrchr(tail, '.') : NULL;
@@ -873,7 +890,7 @@ static const cbm_gbuf_node_t *find_unique_callable_node_by_tail(const cbm_gbuf_t
             continue;
         }
         const char *node_tail = class_method_tail(node->qualified_name);
-        if (!node_tail || strcmp(node_tail, tail) != 0) {
+        if (!node_tail || !tail_matches(node_tail, tail)) {
             continue;
         }
         if (match) {

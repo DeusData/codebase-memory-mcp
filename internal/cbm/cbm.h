@@ -238,6 +238,26 @@ typedef struct {
      * that declared this method.  Kept at the tail so zero-initialised
      * callers in every other language remain ABI/source compatible. */
     const char *impl_trait;
+    /* Java only: identity metadata the TrackerV2 HashUID needs and the graph
+     * cannot recover later (see src/pipeline/pass_hashuid.c). Zero/false for
+     * every other language. `has_body` is false for abstract, native and
+     * interface declarations — TrackerV2 gives those no identity at all.
+     * A `record` or `@interface` is not an identity-bearing type for
+     * TrackerV2 and does not scope its members either. */
+    bool has_body;
+    bool type_is_record;
+    bool type_is_annotation;
+    /* A Java anonymous class (`new T() { ... }`). It is a real scope — its
+     * members get identities, and calls in their bodies attribute to them —
+     * but not an identity-bearing type: TrackerV2's registry has no type_id
+     * for it, so pass_hashuid leaves the node itself unstamped. */
+    bool type_is_anonymous;
+    /* Java only: lowercase hex SHA-256 of this declaration's exact source text
+     * (the AST node's byte range). TrackerV2's duplicate_fingerprint is
+     * `<sha256(full_text)><index within the duplicate group>`, so the digest
+     * has to come from extraction — the graph no longer has the text. NULL for
+     * every other language and for declarations that get no identity. */
+    const char *decl_content_hash;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -879,6 +899,18 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
+
+// Java member QN — the TrackerV2-shaped identity of a Java method/constructor:
+//   "<class_qn>.<name>()"          zero parameters
+//   "<class_qn>.<name>(t1,t2)"     one entry per parameter, raw source spelling
+// The parameter list is part of the identity so overloads are distinct nodes
+// instead of collapsing onto one (class, name) key. `params` is the
+// declaration's tree-sitter `parameters` node (may be null when the grammar
+// exposes none); `source` is the buffer that node was parsed from. Defined in
+// extract_defs.c and shared with java_lsp.c so both sides build the same bytes.
+const char *cbm_java_method_qn_from_params(CBMArena *a, const char *class_qn, const char *name,
+                                           TSNode params, const char *source);
+
 /* Internal companion for embedded-language trees that contribute definitions
  * to an existing host-file Module rather than minting a second Module. */
 void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);

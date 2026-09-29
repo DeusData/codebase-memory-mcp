@@ -76,12 +76,36 @@ static int qn_has_terminal_name(const char *qn, const char *name) {
         return 0;
     size_t qn_len = strlen(qn);
     size_t name_len = strlen(name);
-    if (name_len > qn_len || strcmp(qn + qn_len - name_len, name) != 0)
+    if (name_len > qn_len)
         return 0;
-    if (name_len == qn_len)
-        return 1;
-    char separator = qn[qn_len - name_len - 1];
-    return separator == '.' || separator == ':' || separator == '/' || separator == '#';
+
+    /* Plain terminal segment: every non-Java QN, and Java type QNs. */
+    if (strcmp(qn + qn_len - name_len, name) == 0) {
+        if (name_len == qn_len)
+            return 1;
+        char separator = qn[qn_len - name_len - 1];
+        if (separator == '.' || separator == ':' || separator == '/' || separator == '#')
+            return 1;
+    }
+    /* A Java member QN carries its parameter type list, because that list is
+     * part of the identity (overloads are separate nodes, and the list feeds
+     * the TrackerV2 hash). The fixtures name a caller as "argument", so accept
+     * that spelling when the ONLY text after the name is the parameter list.
+     * Non-Java QNs do not end a segment with '(' , so nothing else changes. */
+    if (qn[qn_len - 1] == ')' && name_len + 2U <= qn_len) {
+        const char *open = strchr(qn, '(');
+        if (open) {
+            size_t stem = (size_t)(open - qn);
+            if (stem >= name_len && strncmp(qn + stem - name_len, name, name_len) == 0) {
+                if (stem == name_len)
+                    return 1;
+                char pre = qn[stem - name_len - 1];
+                if (pre == '.' || pre == ':' || pre == '/' || pre == '#')
+                    return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 static const char *short_call_name(const char *name) {

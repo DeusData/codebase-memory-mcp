@@ -1494,14 +1494,20 @@ static void process_field_decl(JavaLSPContext *ctx, TSNode node) {
 
 static void process_method_decl(JavaLSPContext *ctx, TSNode node, const char *class_qn,
                                 const char *super_qn) {
-    /* Compute method QN. */
+    /* Compute method QN. The parameter type list is part of the identity (see
+     * cbm_java_method_qn_from_params), so it has to be read from the AST
+     * before the QN exists — the same order push_method_def uses. */
     TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
     if (ts_node_is_null(name_node))
         return;
     char *mname = java_node_text(ctx, name_node);
     if (!mname)
         return;
-    char *method_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, mname);
+    TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
+    const char *method_qn =
+        cbm_java_method_qn_from_params(ctx->arena, class_qn, mname, params, ctx->source);
+    if (!method_qn)
+        return;
 
     /* Save context. */
     const char *saved_method = ctx->enclosing_method_qn;
@@ -1515,7 +1521,6 @@ static void process_method_decl(JavaLSPContext *ctx, TSNode node, const char *cl
     ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
 
     /* Bind formal parameters into scope. */
-    TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
     if (!ts_node_is_null(params)) {
         uint32_t n = ts_node_named_child_count(params);
         for (uint32_t i = 0; i < n; i++) {
@@ -1562,13 +1567,18 @@ static void process_constructor_decl(JavaLSPContext *ctx, TSNode node, const cha
     TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
     char *cname = ts_node_is_null(name_node) ? NULL : java_node_text(ctx, name_node);
     /* Constructor QN convention: Class.<init> or Class.ClassShortName. The
-     * extractor uses the short class name; mirror that. */
-    char *ctor_qn;
+     * extractor uses the short class name; mirror that — including the
+     * parameter type list, which is what distinguishes overloaded
+     * constructors. */
+    TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
+    const char *ctor_qn;
     if (cname) {
-        ctor_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, cname);
+        ctor_qn = cbm_java_method_qn_from_params(ctx->arena, class_qn, cname, params, ctx->source);
     } else {
         ctor_qn = cbm_arena_sprintf(ctx->arena, "%s.<init>", class_qn);
     }
+    if (!ctor_qn)
+        return;
 
     const char *saved_method = ctx->enclosing_method_qn;
     const char *saved_class = ctx->enclosing_class_qn;
@@ -1580,7 +1590,6 @@ static void process_constructor_decl(JavaLSPContext *ctx, TSNode node, const cha
     ctx->enclosing_super_qn = super_qn;
     ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
 
-    TSNode params = ts_node_child_by_field_name(node, "parameters", 10);
     if (!ts_node_is_null(params)) {
         uint32_t n = ts_node_named_child_count(params);
         for (uint32_t i = 0; i < n; i++) {
@@ -1718,6 +1727,82 @@ static void java_process_class_decl(JavaLSPContext *ctx, TSNode node) {
         ctx->current_scope = saved_scope;
     }
 
+    pop_enclosing_class(ctx);
+    ctx->enclosing_class_qn = saved_class;
+    ctx->enclosing_super_qn = saved_super;
+    ctx->enclosing_class_short = saved_short;
+}
+
+/* An anonymous class body — the same member walk as java_process_class_decl,
+ * for a class that has no declaration node.
+ *
+ * The scope QN MUST be the one cbm_java_anonymous_class_scope() produces: the
+ * definition extractor mints the members under exactly that name, and the
+ * pipeline joins an LSP row to a call site by comparing caller QNs exactly. A
+ * hand-rolled spelling here would leave every resolution inside the body
+ * unmatched and silently downgraded to the name-based resolver. */
+static void java_process_anonymous_body(JavaLSPContext *ctx, TSNode occ, TSNode body) {
+    cbm_java_anon_scope_t sc = cbm_java_anonymous_class_scope(
+        ctx->arena, occ, ctx->source, ctx->enclosing_class_qn, ctx->enclosing_method_qn,
+        ctx->module_qn);
+    if (!sc.qn || ts_node_is_null(body)) {
+        return;
+    }
+
+    /* The anonymous type extends whatever it is constructed from
+     * (`new Runnable() { ... }` implements Runnable). Keeping that super link
+     * is what lets a bare call inside the body still find the interface's own
+     * members through the usual inheritance walk. */
+    const char *super_qn = NULL;
+    TSNode type_node = ts_node_child_by_field_name(occ, "type", 4);
+    if (!ts_node_is_null(type_node)) {
+        const CBMType *t = java_parse_type_node(ctx, type_node);
+        if (t && t->kind == CBM_TYPE_NAMED) {
+            super_qn = t->data.named.qualified_name;
+        } else if (t && t->kind == CBM_TYPE_TEMPLATE) {
+            super_qn = t->data.template_type.template_name;
+        }
+    }
+    if (!super_qn) {
+        super_qn = "java.lang.Object";
+    }
+
+    const char *saved_class = ctx->enclosing_class_qn;
+    const char *saved_super = ctx->enclosing_super_qn;
+    const char *saved_short = ctx->enclosing_class_short;
+
+    push_enclosing_class(ctx, sc.qn);
+    ctx->enclosing_class_qn = sc.qn;
+    ctx->enclosing_super_qn = super_qn;
+    ctx->enclosing_class_short = sc.name;
+
+    CBMScope *saved_scope = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
+
+    /* First pass: fields, so methods see them (same order as a declared class). */
+    uint32_t n = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(c), "field_declaration") == 0) {
+            process_field_decl(ctx, c);
+        }
+    }
+    /* Second pass: methods and nested types. */
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(body, i);
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "method_declaration") == 0) {
+            process_method_decl(ctx, c, sc.qn, super_qn);
+        } else if (strcmp(k, "class_declaration") == 0 || strcmp(k, "interface_declaration") == 0 ||
+                   strcmp(k, "enum_declaration") == 0 || strcmp(k, "record_declaration") == 0 ||
+                   strcmp(k, "annotation_type_declaration") == 0) {
+            java_process_class_decl(ctx, c);
+        } else if (strcmp(k, "static_initializer") == 0 && ts_node_named_child_count(c) > 0) {
+            process_block(ctx, ts_node_named_child(c, 0));
+        }
+    }
+
+    ctx->current_scope = saved_scope;
     pop_enclosing_class(ctx);
     ctx->enclosing_class_qn = saved_class;
     ctx->enclosing_super_qn = saved_super;
@@ -1973,8 +2058,14 @@ static bool java_emit_interface_resolution(JavaLSPContext *ctx, const char *ifac
         return true;
     }
     if (impl_count >= 2) {
-        java_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", iface_qn, mname),
-                           "lsp_interface_dispatch", 0.80f);
+        /* Dispatch target is the interface's own (abstract/default) declaration.
+         * Look its registered QN up instead of re-spelling `iface.member`: the
+         * member QN carries the parameter list, so a hand-built spelling would
+         * name a node that does not exist and the edge would be dropped. */
+        const CBMRegisteredFunc *df = cbm_registry_lookup_method(ctx->registry, iface_qn, mname);
+        const char *target =
+            df ? df->qualified_name : cbm_arena_sprintf(ctx->arena, "%s.%s", iface_qn, mname);
+        java_emit_resolved(ctx, target, "lsp_interface_dispatch", 0.80f);
         return true;
     }
     return false; /* impl_count == 0: caller falls back to type_dispatch. */
@@ -2972,6 +3063,27 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
             }
         }
         java_stamp_resolved_site(ctx, first_resolution, node);
+
+        /* `new T() { ... }`: process the body as its own scope. The generic
+         * recursion below would otherwise walk it under the OUTER method, so
+         * both the members and the calls they contain would be attributed to a
+         * scope the graph never minted. The body is excluded from that
+         * recursion here; everything else (type, arguments) still walks in the
+         * current scope, because an argument list can hold further anonymous
+         * classes or calls. */
+        TSNode anon_body = cbm_find_child_by_kind(node, "class_body");
+        if (!ts_node_is_null(anon_body)) {
+            java_process_anonymous_body(ctx, node, anon_body);
+            uint32_t cn = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < cn; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                if (ts_node_eq(c, anon_body)) {
+                    continue;
+                }
+                java_resolve_calls_in_node(ctx, c);
+            }
+            return;
+        }
     }
 
     /* catch_clause: push a fresh scope so the bound exception variable is
@@ -3428,11 +3540,16 @@ static void patch_one_method(JavaLSPContext *ctx, CBMTypeRegistry *reg, TSNode m
     char *mname = java_node_text(ctx, name_node);
     if (!mname)
         return;
-    char *method_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, mname);
 
     /* Re-extract param types from the AST. */
     TSNode params = ts_node_child_by_field_name(method_node, "parameters", 10);
     if (ts_node_is_null(params))
+        return;
+    /* Same QN the extractor minted for this declaration — including the
+     * parameter list, so overloads land on their own registry slot. */
+    const char *method_qn =
+        cbm_java_method_qn_from_params(ctx->arena, class_qn, mname, params, ctx->source);
+    if (!method_qn)
         return;
     uint32_t pn = ts_node_named_child_count(params);
     const CBMType **ptypes = NULL;
