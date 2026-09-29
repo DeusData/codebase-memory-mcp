@@ -1490,9 +1490,22 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
         owned_config = cbm_mcp_server_attach_runtime_config(srv);
     }
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
-    char *project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
-    bool worktree_ignored = !project && srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) &&
-                            cbm_git_is_linked_worktree(cwd);
+    char project_root[4096];
+    project_root[0] = '\0';
+    char *project = srv && cwd ? ha_resolve_indexed_project_with_root(srv, cwd, project_root,
+                                                                      sizeof(project_root))
+                               : NULL;
+    /* ignore_worktrees refuses a linked worktree, including one nested inside an
+     * indexed checkout. The ancestor walk would otherwise report that parent
+     * graph as this cwd's project. An index whose own root is the linked
+     * worktree (or inside it) still counts. */
+    bool ignore_linked = srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) &&
+                         cbm_git_is_linked_worktree(cwd);
+    if (ignore_linked && project && !cbm_git_is_linked_worktree(project_root)) {
+        free(project);
+        project = NULL;
+    }
+    bool worktree_ignored = ignore_linked && !project;
     if (owned_config) {
         cbm_mcp_server_set_config(srv, NULL);
         cbm_config_close(owned_config);

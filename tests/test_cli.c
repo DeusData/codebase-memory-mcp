@@ -10644,6 +10644,41 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
                    !strstr(ignored_out, "is indexed");
     free(ignored_out);
 
+    /* A linked worktree nested inside the indexed checkout must not inherit
+     * that parent graph once ignore_worktrees is on. */
+    char insider[512];
+    snprintf(insider, sizeof(insider), "%s/inside-wt", maindir);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree add -q \"%s\" -b agl7inside", maindir,
+             insider);
+    bool inside_made = configured && system(cmd) == 0;
+    char inside_sub[600];
+    snprintf(inside_sub, sizeof(inside_sub), "%s/nested", insider);
+    bool inside_sub_made = inside_made && test_mkdirp(inside_sub) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             inside_sub);
+    char *inside_out = inside_sub_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool inside_ignored = inside_out && strstr(inside_out, "ignore_worktrees is enabled") &&
+                          strstr(inside_out, "do not run index_repository") &&
+                          !strstr(inside_out, "is indexed") && !strstr(inside_out, main_name);
+    free(inside_out);
+
+    /* Indexing that nested worktree itself must still win over the parent. */
+    char *inside_name = inside_made ? cbm_project_name_from_path(insider) : NULL;
+    bool inside_stored = false;
+    if (inside_name) {
+        char db_inside[900];
+        snprintf(db_inside, sizeof(db_inside), "%s/%s.db", cache, inside_name);
+        cbm_store_t *si = cbm_store_open_path(db_inside);
+        inside_stored = si && cbm_store_upsert_project(si, inside_name, insider) == CBM_STORE_OK;
+        if (si)
+            cbm_store_close(si);
+    }
+    char *exact_out = inside_stored ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool exact_kept = exact_out && inside_name && strstr(exact_out, inside_name) &&
+                      strstr(exact_out, "is indexed") &&
+                      !strstr(exact_out, "ignore_worktrees is enabled");
+    free(exact_out);
+
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
              maindir);
     char *main_out = cbm_hook_augment_lifecycle_json(input);
@@ -10652,6 +10687,7 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
 
     restore_test_env("CBM_CACHE_DIR", saved_cache);
     free(main_name);
+    free(inside_name);
     snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
              maindir, wtdir);
     (void)system(cmd);
@@ -10661,6 +10697,10 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
         FAIL("unindexed worktree must get a deliberate no-match notice, never a silent 0 bytes");
     if (!honored)
         FAIL("ignore_worktrees in the runtime config must change the unindexed-worktree note");
+    if (!inside_ignored)
+        FAIL("a nested linked worktree must not inherit the indexed parent graph");
+    if (!exact_kept)
+        FAIL("an exact index of the nested worktree must still be reported");
     if (!main_ok)
         FAIL("the indexed main checkout must still resolve in the same matrix");
     PASS();
