@@ -1038,6 +1038,7 @@ static const char *solidity_field_types[] = {"state_variable_declaration", "stru
 static const char *solidity_call_types[] = {"call_expression", "call", "new_expression", NULL};
 static const char *solidity_import_types[] = {"import_directive", "import", "using_directive",
                                               NULL};
+static const char *solidity_decorator_types[] = {"modifier_invocation", NULL};
 static const char *solidity_branch_types[] = {"if_statement",    "for_statement",
                                               "while_statement", "do_while_statement",
                                               "try_statement",   NULL};
@@ -2115,7 +2116,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                            solidity_field_types, solidity_module_types, solidity_call_types,
                            solidity_import_types, empty_types, solidity_branch_types,
                            solidity_var_types, solidity_assign_types, solidity_throw_types, NULL,
-                           empty_types, NULL, NULL, tree_sitter_solidity, NULL},
+                           solidity_decorator_types, NULL, NULL, tree_sitter_solidity, NULL},
 
     // CBM_LANG_TYPST
     [CBM_LANG_TYPST] = {CBM_LANG_TYPST, typst_func_types, empty_types, empty_types,
