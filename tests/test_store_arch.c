@@ -1189,6 +1189,68 @@ TEST(adr_validate_keys_empty) {
     PASS();
 }
 
+/* ── cbm_store_fetch_call_edges / cbm_store_free_call_edges tests ─ */
+
+TEST(fetch_call_edges_basic) {
+    cbm_store_t *s = setup_arch_test_store();
+    ASSERT_NOT_NULL(s);
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "test", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    /* setup_arch_test_store() wires 5 CALLS edges among Function nodes. */
+    ASSERT_EQ(count, 5);
+    ASSERT_FALSE(truncated);
+    ASSERT_NOT_NULL(src);
+    ASSERT_NOT_NULL(tgt);
+
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(fetch_call_edges_truncated) {
+    cbm_store_t *s = setup_arch_test_store();
+    ASSERT_NOT_NULL(s);
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = false;
+    /* Only 5 CALLS edges exist; capping at 2 must set truncated. */
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "test", 2, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(truncated);
+
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(fetch_call_edges_empty_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "empty", "/tmp/empty");
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "empty", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    ASSERT_FALSE(truncated);
+
+    /* cbm_store_free_call_edges(NULL, NULL) must not crash. */
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Louvain tests ──────────────────────────────────────────────── */
 
 TEST(louvain_basic) {
@@ -1214,7 +1276,7 @@ TEST(louvain_basic) {
     /* Triangle and pair different */
     ASSERT_TRUE(comm[1] != comm[4]);
 
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1223,7 +1285,7 @@ TEST(louvain_empty) {
     int count = 0;
     ASSERT_EQ(cbm_louvain(NULL, 0, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 0);
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1234,7 +1296,7 @@ TEST(louvain_single_node) {
     ASSERT_EQ(cbm_louvain(nodes, 1, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 1);
     ASSERT_EQ(result[0].node_id, 42);
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1297,7 +1359,7 @@ TEST(louvain_converges) {
     }
     ASSERT_TRUE(same_count >= 8);
 
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1431,7 +1493,7 @@ TEST(leiden_multilevel_collapses_noise) {
         }
         ASSERT_TRUE(same >= SZ - 1);
     }
-    free(result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1463,8 +1525,8 @@ TEST(leiden_resolution_controls_granularity) {
     ASSERT_TRUE(n_hi > n_lo);
     ASSERT_TRUE(leiden_all_communities_connected(lo, N, edges, ne));
     ASSERT_TRUE(leiden_all_communities_connected(hi, N, edges, ne));
-    free(lo);
-    free(hi);
+    cbm_leiden_free(lo);
+    cbm_leiden_free(hi);
     PASS();
 }
 
@@ -1726,6 +1788,11 @@ SUITE(store_arch) {
     RUN_TEST(adr_splice_ignores_heading_inside_fence);
     RUN_TEST(adr_splice_refuses_unterminated_fence);
     RUN_TEST(adr_validate_keys_empty);
+
+    /* Call-edge fetch / free */
+    RUN_TEST(fetch_call_edges_basic);
+    RUN_TEST(fetch_call_edges_truncated);
+    RUN_TEST(fetch_call_edges_empty_project);
 
     /* Louvain */
     RUN_TEST(louvain_basic);
