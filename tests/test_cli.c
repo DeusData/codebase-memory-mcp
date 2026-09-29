@@ -13577,6 +13577,61 @@ TEST(cli_upsert_codex_mcp_replace) {
     PASS();
 }
 
+/* #2228: Codex Desktop had appended its own tables above our trailing closing
+ * marker. Install then rewrote the whole marked span and deleted them, plus the
+ * user's startup_timeout_sec inside our table. Only our keys may change;
+ * everything else between the markers keeps its bytes, and uninstall takes
+ * exactly our table back out. */
+TEST(cli_upsert_codex_mcp_keeps_foreign_tables_in_markers_issue2228) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-2228-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/config.toml", tmpdir);
+    const char *head = "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n";
+    const char *foreign = "\n[mcp_servers.node_repl]\nargs = []\ncommand = \"/opt/node_repl\"\n"
+                          "startup_timeout_sec = 120\n\n[desktop]\nfollowUpQueueMode = \"steer\"\n"
+                          "\n[marketplaces.openai-codex]\nsource_type = \"git\"\n";
+    char original[2048];
+    char expected[2048];
+    char removed[2048];
+    snprintf(original, sizeof(original),
+             "%s# >>> codebase-memory-mcp MCP >>>\n[mcp_servers.codebase-memory-mcp]\n"
+             "command = \"/tmp/old/codebase-memory-mcp\"\nargs = []\nstartup_timeout_sec = 90\n"
+             "%s# <<< codebase-memory-mcp MCP <<<\n",
+             head, foreign);
+    snprintf(expected, sizeof(expected),
+             "%s# >>> codebase-memory-mcp MCP >>>\n[mcp_servers.codebase-memory-mcp]\n"
+             "command = \"/opt/new/codebase-memory-mcp\"\nargs = []\nstartup_timeout_sec = 90\n"
+             "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+             "%s# <<< codebase-memory-mcp MCP <<<\n",
+             head, foreign);
+    snprintf(removed, sizeof(removed), "%s%s", head, foreign);
+    write_test_file(configpath, original);
+
+    int rc = cbm_upsert_codex_mcp("/opt/new/codebase-memory-mcp", configpath);
+    char *data = read_test_file_alloc(configpath);
+    bool install_ok = rc == 0 && data && strcmp(data, expected) == 0;
+    if (!install_ok && data)
+        printf("  config.toml after install:\n%s\n", data);
+    free(data);
+
+    int remove_rc = cbm_remove_codex_mcp(configpath);
+    data = read_test_file_alloc(configpath);
+    bool uninstall_ok = remove_rc == 0 && data && strcmp(data, removed) == 0;
+    if (!uninstall_ok && data)
+        printf("  config.toml after uninstall:\n%s\n", data);
+    free(data);
+
+    test_rmdir_r(tmpdir);
+    if (!install_ok)
+        FAIL("install must keep the tables Codex placed inside the markers and the user's keys");
+    if (!uninstall_ok)
+        FAIL("uninstall must remove only our table and the two marker lines");
+    PASS();
+}
+
 TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-multiline-XXXXXX");
@@ -16661,6 +16716,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_codex_mcp_escapes_windows_path);
     RUN_TEST(cli_upsert_codex_mcp_existing);
     RUN_TEST(cli_upsert_codex_mcp_replace);
+    RUN_TEST(cli_upsert_codex_mcp_keeps_foreign_tables_in_markers_issue2228);
     RUN_TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string);
 
     /* Zed MCP format fix (1 test — group B) */

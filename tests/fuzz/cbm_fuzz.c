@@ -125,6 +125,19 @@ static void fuzz_cypher(const uint8_t *data, size_t size) {
     free(query);
 }
 
+static int fuzz_write_input(const char *path, const uint8_t *data, size_t size) {
+    FILE *f = cbm_fopen(path, "wb");
+    if (!f) {
+        return -1;
+    }
+    size_t body = size - FUZZ_NUL;
+    if (body > 0 && fwrite(data + FUZZ_NUL, FUZZ_NUL, body, f) != body) {
+        (void)fclose(f);
+        return -1;
+    }
+    return fclose(f) == 0 ? 0 : -1;
+}
+
 static void fuzz_config(const uint8_t *data, size_t size) {
     if (size < FUZZ_NUL) {
         return;
@@ -132,16 +145,7 @@ static void fuzz_config(const uint8_t *data, size_t size) {
     char path[FUZZ_PATH_MAX + FUZZ_FILE_NAME_ROOM];
     const char *ext = data[0] == 't' ? "toml" : data[0] == 'y' ? "yaml" : "json";
     (void)snprintf(path, sizeof(path), "%s/config.%s", g_dir, ext);
-    FILE *f = cbm_fopen(path, "wb");
-    if (!f) {
-        return;
-    }
-    size_t body = size - FUZZ_NUL;
-    if (body > 0 && fwrite(data + FUZZ_NUL, FUZZ_NUL, body, f) != body) {
-        (void)fclose(f);
-        return;
-    }
-    if (fclose(f) != 0) {
+    if (fuzz_write_input(path, data, size) != 0) {
         return;
     }
     switch (data[0]) {
@@ -149,7 +153,19 @@ static void fuzz_config(const uint8_t *data, size_t size) {
         (void)cbm_toml_upsert_managed_block(path, "# BEGIN codebase-memory",
                                             "# END codebase-memory", "owned = true\n");
         (void)cbm_toml_remove_managed_block(path, "# BEGIN codebase-memory",
-                                            "# END codebase-memory");
+                                            "# END codebase-memory", NULL);
+        /* #2228: rerun on the original bytes with a table-headed block, which
+         * merges into the owned table and leaves the rest of the span alone. */
+        if (fuzz_write_input(path, data, size) == 0) {
+            (void)cbm_toml_upsert_managed_block(path, "# BEGIN codebase-memory",
+                                                "# END codebase-memory",
+                                                "[mcp_servers.codebase-memory-mcp]\n"
+                                                "command = \"codebase-memory-mcp\"\n"
+                                                "args = []\n");
+            (void)cbm_toml_remove_managed_block(path, "# BEGIN codebase-memory",
+                                                "# END codebase-memory",
+                                                "[mcp_servers.codebase-memory-mcp]");
+        }
         break;
     case 'y':
         (void)cbm_yaml_upsert_mapping_entry(path, "mcp_servers", "codebase-memory",

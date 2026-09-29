@@ -1,0 +1,13 @@
+t[mcp_servers.other]
+command = "other"
+# BEGIN codebase-memory
+[mcp_servers.codebase-memory-mcp]
+command = "/old/codebase-memory-mcp"
+startup_timeout_sec = 90
+
+[mcp_servers.codebase-memory-mcp.tools.search_graph]
+approval_mode = "approve"
+
+[desktop]
+mode = "steer"
+# END codebase-memory

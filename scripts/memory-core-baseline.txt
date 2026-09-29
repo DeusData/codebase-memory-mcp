@@ -22,7 +22,7 @@ src/cli/client_adapter.c	3
 src/cli/config_edit_path.c	2
 src/cli/config_json_like.c	142
 src/cli/config_text_edit.c	72
-src/cli/config_toml_edit.c	85
+src/cli/config_toml_edit.c	84
 src/cli/config_yaml_edit.c	117
 src/cli/hook_augment.c	31
 src/cypher/cypher.c	132
