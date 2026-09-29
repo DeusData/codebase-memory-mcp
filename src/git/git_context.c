@@ -86,6 +86,14 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
     return *out ? 0 : CBM_NOT_FOUND;
 }
 
+/* Regular file, not a directory and not a symlink. Uses the Unicode-safe
+ * path probe: stat() follows links and rejects non-ASCII paths on Windows,
+ * which upstream removed from this file in the Unicode repository-path fix. */
+static bool path_is_regular_file(const char *path) {
+    cbm_path_info_t info;
+    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_regular;
+}
+
 static bool path_is_absolute(const char *path) {
     if (!path || !path[0]) {
         return false;
@@ -109,8 +117,7 @@ static bool read_gitlink_target(const char *path, char *out, size_t out_size) {
     if (n < 0 || n >= (int)sizeof(dot_git)) {
         return false;
     }
-    struct stat st;
-    if (stat(dot_git, &st) != 0 || !S_ISREG(st.st_mode)) {
+    if (!path_is_regular_file(dot_git)) {
         return false;
     }
 
@@ -156,8 +163,7 @@ bool cbm_git_is_linked_worktree(const char *path) {
     if (n < 0 || n >= (int)sizeof(commondir)) {
         return false;
     }
-    struct stat st;
-    return stat(commondir, &st) == 0 && S_ISREG(st.st_mode);
+    return path_is_regular_file(commondir);
 }
 
 static char *join_root_relative(const char *root, const char *rel) {
