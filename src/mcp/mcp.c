@@ -9057,6 +9057,8 @@ typedef struct {
 } trace_coverage_scope_t;
 
 typedef struct {
+    cbm_store_t *store;
+    const char *project;
     CBMHashTable *callers;
     CBMHashTable *targets;
     bool unresolved_out;
@@ -9098,9 +9100,31 @@ static bool trace_coverage_build_sets(trace_coverage_match_t *match,
            trace_coverage_add_visited(match->targets, scope->inbound, scope->include_tests);
 }
 
+static bool trace_coverage_may_target_project(const trace_coverage_match_t *match,
+                                              const char *name) {
+    if (!name || !name[0]) {
+        return true;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_name(match->store, match->project, name, &nodes, &count);
+    /* An unsuccessful lookup cannot prove that the callee is outside the
+     * project. Free the allocated result even when it contains zero rows. */
+    bool possible = rc != CBM_STORE_OK;
+    for (int i = 0; i < count && !possible; i++) {
+        const char *label = nodes[i].label;
+        possible = label && strcmp(label, "File") != 0 && strcmp(label, "Folder") != 0 &&
+                   strcmp(label, "Project") != 0 && strcmp(label, "Module") != 0 &&
+                   strcmp(label, "Package") != 0 && strcmp(label, "Section") != 0;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return possible;
+}
+
 static void trace_coverage_match_site(trace_coverage_match_t *match, const char *rel_path,
                                       yyjson_val *site) {
     const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
+    const char *leaf = yyjson_get_str(yyjson_obj_get(site, "leaf"));
     const char *candidate = yyjson_get_str(yyjson_obj_get(site, "candidate"));
     const cbm_node_t *caller_node =
         match->callers && caller ? cbm_ht_get(match->callers, caller) : NULL;
@@ -9109,7 +9133,8 @@ static void trace_coverage_match_site(trace_coverage_match_t *match, const char 
      * caller. Check its file and source range too; never match a containing
      * factory merely because its range overlaps. */
     if (caller_node && caller_node->file_path && strcmp(caller_node->file_path, rel_path) == 0 &&
-        (line <= 0 || (line >= caller_node->start_line && line <= caller_node->end_line))) {
+        (line <= 0 || (line >= caller_node->start_line && line <= caller_node->end_line)) &&
+        trace_coverage_may_target_project(match, leaf)) {
         match->unresolved_out = true;
     }
     /* A short-name collision is not evidence that the resolver considered
@@ -9175,7 +9200,9 @@ static void trace_call_coverage(cbm_store_t *store, const char *project,
     if (!includes_calls) {
         return;
     }
-    trace_coverage_match_t match = {.callers = scope->do_outbound ? cbm_ht_create(0) : NULL,
+    trace_coverage_match_t match = {.store = store,
+                                    .project = project,
+                                    .callers = scope->do_outbound ? cbm_ht_create(0) : NULL,
                                     .targets = scope->do_inbound ? cbm_ht_create(0) : NULL};
     bool ok = trace_coverage_meta_available(store, project) &&
               (!scope->do_outbound || match.callers) && (!scope->do_inbound || match.targets) &&

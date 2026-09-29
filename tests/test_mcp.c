@@ -7528,6 +7528,90 @@ TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
     PASS();
 }
 
+TEST(tool_trace_path_outbound_requires_project_symbol) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "project-symbol-trace";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/project-symbol-trace"), CBM_STORE_OK);
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run",
+                         .qualified_name = "project-symbol-trace.service.run",
+                         .file_path = "service.js",
+                         .start_line = 1,
+                         .end_line = 4};
+    cbm_node_t local = {.project = proj,
+                        .label = "Function",
+                        .name = "buscar",
+                        .qualified_name = "project-symbol-trace.client.buscar",
+                        .file_path = "client.js"};
+    cbm_node_t constructor = {.project = proj,
+                              .label = "Class",
+                              .name = "Cliente",
+                              .qualified_name = "project-symbol-trace.client.Cliente",
+                              .file_path = "client.js"};
+    cbm_node_t foreign = {.project = "other-project",
+                          .label = "Function",
+                          .name = "foreignOnly",
+                          .qualified_name = "other-project.client.foreignOnly",
+                          .file_path = "client.js"};
+    ASSERT_GT(cbm_store_upsert_node(st, &caller), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &local), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &constructor), 0);
+    ASSERT_EQ(cbm_store_upsert_project(st, foreign.project, "/tmp/other-project"), CBM_STORE_OK);
+    ASSERT_GT(cbm_store_upsert_node(st, &foreign), 0);
+    const char *containers[] = {"File", "Folder", "Project", "Module", "Package", "Section"};
+    for (size_t i = 0; i < sizeof(containers) / sizeof(containers[0]); i++) {
+        char name[64], qn[128];
+        snprintf(name, sizeof(name), "external%s", containers[i]);
+        snprintf(qn, sizeof(qn), "%s.%s", proj, name);
+        cbm_node_t container = {
+            .project = proj, .label = containers[i], .name = name, .qualified_name = qn};
+        ASSERT_GT(cbm_store_upsert_node(st, &container), 0);
+    }
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, proj, "service.js", "fixture", 0, 0), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recorded_at = "2026-09-29T00:00:00Z",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .hash_records_complete = true};
+    const struct {
+        const char *leaf;
+        const char *relation;
+    } cases[] = {{"printf", "eq"},         {"foreignOnly", "eq"},     {"Buscar", "eq"},
+                 {"externalFile", "eq"},   {"externalFolder", "eq"},  {"externalProject", "eq"},
+                 {"externalModule", "eq"}, {"externalPackage", "eq"}, {"externalSection", "eq"},
+                 {"buscar", "unknown"},    {"Cliente", "unknown"}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char detail[512];
+        snprintf(detail, sizeof(detail),
+                 "[{\"caller\":\"project-symbol-trace.service.run\",\"leaf\":\"%s\","
+                 "\"start_byte\":42,\"end_byte\":59,\"line\":3,"
+                 "\"reason\":\"method_not_in_registry\"}]",
+                 cases[i].leaf);
+        cbm_coverage_row_t row = {
+            .rel_path = "service.js", .kind = "unresolved_calls", .detail = detail};
+        ASSERT_EQ(cbm_store_coverage_replace_ex(st, proj, &row, 1, &meta), CBM_STORE_OK);
+        char *out = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+                 "\"project-symbol-trace\",\"function_name\":\"run\","
+                 "\"direction\":\"outbound\",\"format\":\"json\"}}}");
+        char *txt = extract_text_content(out);
+        char expected[80];
+        snprintf(expected, sizeof(expected), "\"callees_total_relation\":\"%s\"",
+                 cases[i].relation);
+        ASSERT_NOT_NULL(strstr(txt, expected));
+        ASSERT_NOT_NULL(strstr(txt, "\"callees_total\":0"));
+        free(txt);
+        free(out);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_index_unresolved_nested_functions_are_indexed) {
     char tmp[256] = "/tmp/cbm-mcp-unresolved-XXXXXX";
     char cache[256] = "/tmp/cbm-mcp-unresolved-cache-XXXXXX";
@@ -7540,7 +7624,8 @@ TEST(tool_index_unresolved_nested_functions_are_indexed) {
     snprintf(path, sizeof(path), "%s/service.js", tmp);
     FILE *f = fopen(path, "w");
     ASSERT_NOT_NULL(f);
-    fputs("export function factory({ client }) {\n"
+    fputs("export class Client { buscar(id) { return id; } }\n"
+          "export function factory({ client }) {\n"
           "  function inner(id) {\n"
           "    return client.buscar(id);\n"
           "  }\n  return { inner };\n}\n",
@@ -20813,6 +20898,7 @@ SUITE(mcp) {
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
     RUN_TEST(tool_trace_path_marks_unresolved_call_totals_unknown);
+    RUN_TEST(tool_trace_path_outbound_requires_project_symbol);
     RUN_TEST(tool_index_unresolved_nested_functions_are_indexed);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
     RUN_TEST(tool_trace_path_unreadable_confidence_reports_not_recorded);
