@@ -204,10 +204,14 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
-/* Handle a route registration call: create Route node + HANDLES edge. */
+/* Handle a route registration call: create Route node + HANDLES edge.
+ * is_csharp is the caller's file-language gate for the #2121 C# receiver-chain
+ * check (threaded through to the handler-name resolve below); MUST match the
+ * pass_parallel.c twin (emit_route_registration). */
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
-                                      const char **imp_keys, const char **imp_vals, int imp_count) {
+                                      const char **imp_keys, const char **imp_vals, int imp_count,
+                                      bool is_csharp) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
@@ -227,8 +231,9 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
-                                                     module_qn, imp_keys, imp_vals, imp_count);
+        cbm_resolution_t hres =
+            cbm_registry_resolve_lang(ctx->registry, call->second_arg_name, module_qn, imp_keys,
+                                      imp_vals, imp_count, is_csharp);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
@@ -418,10 +423,11 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
                                  const cbm_resolution_t *res, const char *module_qn,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
-                                 bool suppress_plain_calls) {
+                                 bool suppress_plain_calls, bool is_csharp) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count,
+                                  is_csharp);
         return;
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
@@ -484,6 +490,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
+    /* #2121: C#'s lower-case type keywords (int, string, ...) are reserved
+     * words naming a type only in C#; every other language treats them as
+     * ordinary identifiers. Computed once here and threaded through every
+     * registry_resolve_lang / handle_route_registration call below; MUST
+     * match resolve_file_calls's computation in pass_parallel.c exactly. */
+    bool is_csharp = lang == CBM_LANG_CSHARP;
+
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
@@ -506,7 +519,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                                 imp_vals, imp_count, false);
+                                 imp_vals, imp_count, false, is_csharp);
             return SKIP_ONE;
         }
     }
@@ -544,8 +557,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
-    cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
-                                                imp_keys, imp_vals, imp_count);
+    cbm_resolution_t res = cbm_registry_resolve_lang(ctx->registry, call->callee_name, module_qn,
+                                                     imp_keys, imp_vals, imp_count, is_csharp);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,
@@ -569,7 +582,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
             call->first_string_arg[0] == '/') {
             handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
-                                      imp_count);
+                                      imp_count, is_csharp);
             return SKIP_ONE;
         }
         cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
@@ -683,7 +696,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count, drop_plain_call);
+                         imp_count, drop_plain_call, is_csharp);
     return SKIP_ONE;
 }
 
@@ -920,6 +933,11 @@ static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, c
         }
         memcpy(func_ref, scan + match[SKIP_ONE].rm_so, (size_t)ref_len);
         func_ref[ref_len] = '\0';
+        /* Plain cbm_registry_resolve (is_csharp=false) is correct here, not a
+         * gap: cbm_pipeline_pass_fastapi_depends only calls this for files
+         * where files[i].language == CBM_LANG_PYTHON (see its own guard), so
+         * func_ref can never come from a C# file and the #2121 keyword gate
+         * never applies. */
         cbm_resolution_t res = cbm_registry_resolve(ctx->registry, func_ref, module_qn, ik, iv, ic);
         if (res.qualified_name && res.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);

@@ -224,7 +224,12 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
  * pass_semantic.c::resolve_as_class — same registry, same type-like veto —
  * then additionally rejects weak short-name strategies (see above).
  * Returns NULL when the base is not a confidently-known project type;
- * stdlib and third-party bases land here and keep their raw spelling. */
+ * stdlib and third-party bases land here and keep their raw spelling.
+ * Plain cbm_registry_resolve (is_csharp=false) is correct here, not a gap:
+ * the only caller (pxc_join_base_qns, via pxc_build_lsp_def) is gated on
+ * pxc_lang_resolves_base_qns(lang), whose default case explicitly excludes
+ * C# ("Go / JVM / C# / C++ / Rust registrars qualify their own embedded
+ * types already"), so `raw` can never come from a C# file's base_classes. */
 static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *raw,
                                        const char *module_qn, const char **imp_keys,
                                        const char **imp_vals, int imp_count) {

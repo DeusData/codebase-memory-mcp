@@ -200,8 +200,8 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                 (lang == CBM_LANG_SQL)
                     ? cbm_registry_resolve_lineage(ctx->registry, usage->ref_name, module_qn,
                                                    imp_keys, imp_vals, imp_count)
-                    : cbm_registry_resolve(ctx->registry, usage->ref_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                    : cbm_registry_resolve_lang(ctx->registry, usage->ref_name, module_qn, imp_keys,
+                                                imp_vals, imp_count, lang == CBM_LANG_CSHARP);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -248,7 +248,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 /* Resolve THROWS/RAISES edges for one file's extracted throws. */
 static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count) {
+                               const char **imp_vals, int imp_count, CBMLanguage lang) {
     int resolved = 0;
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
@@ -262,8 +262,9 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
 
         const char *edge_type = is_checked_exception(thr->exception_name) ? "THROWS" : "RAISES";
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, thr->exception_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res =
+            cbm_registry_resolve_lang(ctx->registry, thr->exception_name, module_qn, imp_keys,
+                                      imp_vals, imp_count, lang == CBM_LANG_CSHARP);
 
         const cbm_gbuf_node_t *tgt = NULL;
         if (res.qualified_name && res.qualified_name[0]) {
@@ -295,8 +296,9 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        cbm_resolution_t res = cbm_registry_resolve(ctx->registry, rw->var_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res =
+            cbm_registry_resolve_lang(ctx->registry, rw->var_name, module_qn, imp_keys, imp_vals,
+                                      imp_count, lang == CBM_LANG_CSHARP);
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             continue;
         }
@@ -379,8 +381,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
 
         usage_resolved += resolve_usage_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
                                               imp_count, files[i].language);
-        throw_resolved +=
-            resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        throw_resolved += resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals,
+                                              imp_count, files[i].language);
         rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count,
                                         files[i].language);
 

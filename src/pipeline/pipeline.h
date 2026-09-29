@@ -238,10 +238,31 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
  * Never returns a data relation (Table/View): relations are lineage-only
  * registry members and common table names (users, orders, config) collide with
  * code identifiers in every language, so the default resolve vetoes them
- * centrally instead of relying on per-consumer label checks. */
+ * centrally instead of relying on per-consumer label checks.
+ * Language-blind: equivalent to cbm_registry_resolve_lang(..., false). Use
+ * this only where the caller cannot fabricate a C# receiver chain (tests,
+ * Rust-only impl_traits, Python-only Depends scanning, base-class resolvers
+ * pxc_lang_resolves_base_qns already excludes C# from); every resolver that
+ * walks a real file's receiver chains should call cbm_registry_resolve_lang
+ * with that file's own language instead. */
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
+
+/* Same as cbm_registry_resolve, plus the #2121 C# receiver-chain gate:
+ * `int.TryParse`-style lower-case type-keyword roots are only treated as a
+ * type when is_csharp is true (see receiver_chain_admits in registry.c).
+ * `is_csharp` MUST be computed from the FILE being resolved (its own
+ * `lang == CBM_LANG_CSHARP`), never guessed or hardcoded true: the sequential
+ * resolvers (pass_calls.c, pass_usages.c, pass_semantic.c) and the parallel
+ * resolver (pass_parallel.c) MUST compute it identically at their mirrored
+ * call sites or CALLS/INHERITS/DECORATES/USAGE/etc. edges diverge between the
+ * two build modes, exactly like the existing cbm_suppress_cross_language_suffix_match
+ * / cbm_weak_member_unique_name_exempt lockstep pairs. */
+cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
+                                           const char *module_qn, const char **import_map_keys,
+                                           const char **import_map_vals, int import_map_count,
+                                           bool is_csharp);
 
 /* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
  * consumer allowed to bind Table/View targets. Uncached (the per-file resolve

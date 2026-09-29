@@ -1197,6 +1197,23 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* C#'s built-in type aliases (int, string, bool, ...) are lower-case
+ * KEYWORDS naming a type, not an ordinary lower-case value root. Closed list;
+ * the caller (receiver_chain_admits) gates this on the file's language, since
+ * the same spellings are ordinary identifiers in Python/JS/Go/etc. */
+static bool receiver_root_is_type_keyword(const char *root, size_t len) {
+    static const char *const keywords[] = {
+        "bool",   "byte",  "char",  "decimal", "double", "dynamic", "float",  "int",  "long",
+        "object", "sbyte", "short", "string",  "uint",   "ulong",   "ushort", "void",
+    };
+    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (strlen(keywords[i]) == len && strncmp(root, keywords[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
  * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
  * throw away, and throwing it away binds Foundation's URLSession.shared.data to
@@ -1205,14 +1222,27 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
  * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
  * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
  *
- * Only an upper-case first segment is guarded. A lower-case root names a value
- * (vm.load, http.Get, os.path.join) whose declared type the chain does not
- * show, so the chain proves nothing there and the call passes through
- * unchanged. A callee with no separator passes through as well.
+ * Only an upper-case first segment is guarded, plus, for C# only, the closed
+ * set of lower-case type keywords above (#2121: `int.TryParse`, `string.Join`).
+ * Any other lower-case root names a value (vm.load, http.Get, os.path.join)
+ * whose declared type the chain does not show, so the chain proves nothing
+ * there and the call passes through unchanged. A callee with no separator
+ * passes through as well.
  *
- * Language agnostic by design: the registry holds no language, and every
- * language that writes receiver chains gains the same protection. */
-static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+ * `is_csharp` is the caller's per-language gate, kept out of
+ * receiver_root_is_type_keyword for the same reason as cbm_weak_member_unique_name_exempt
+ * and friends above: the words are reserved type keywords ONLY in C#. In
+ * Python/JS/Go, `object`, `string`, `char` etc. are ordinary identifiers, so a
+ * lower-case variable named `object` calling a method must keep resolving as
+ * a value root there. Every call site threading this MUST use the file's own
+ * language (`lang == CBM_LANG_CSHARP`); the sequential (pass_calls.c,
+ * pass_usages.c, pass_semantic.c) and parallel (pass_parallel.c) resolvers
+ * MUST agree on the same computation or CALLS/INHERITS/etc. edges diverge
+ * between the two build modes. Everything else in this function (the
+ * upper-case-root ancestry walk, the foreign-root refusal) stays
+ * language-agnostic by design, exactly as before #2121. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn,
+                                  bool is_csharp) {
     /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
      * the same way qualified_suffix_match does. */
     char dotted[CBM_SZ_512];
@@ -1232,7 +1262,15 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
         return true; /* bare name — no receiver chain to judge */
     }
     if (dotted[0] < 'A' || dotted[0] > 'Z') {
-        return true; /* lower-case root names a value, not a type */
+        const char *first_dot = strchr(dotted, '.');
+        size_t root_len = (size_t)((first_dot ? first_dot : last_dot) - dotted);
+        if (!is_csharp || !receiver_root_is_type_keyword(dotted, root_len)) {
+            return true; /* lower-case root names a value, not a type (or the
+                          * keyword list simply does not apply outside C#) */
+        }
+        /* A reserved type keyword IS a type in receiver position
+         * (int.TryParse), so it falls through to the same chain-consistency
+         * check an upper-case root gets. C# only, per the gate above. */
     }
     /* A name written in capitals with underscores is a constant holding a
      * value, not a type: ISO_4217_URL.lower is a string's own method. JSON and
@@ -1291,7 +1329,7 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
-                                            int import_count) {
+                                            int import_count, bool is_csharp) {
     const char *lookup = simple_name(callee_name);
     qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
@@ -1313,7 +1351,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 3: unique name */
     if (arr->count == SKIP_ONE) {
-        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+        if (!receiver_chain_admits(callee_name, arr->items[0], is_csharp)) {
             return empty_result();
         }
         double conf = CONF_UNIQUE_NAME;
@@ -1331,7 +1369,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     const char *best = best_by_import_distance((const char **)arr->items, qn_test_flags(arr),
                                                arr->count, module_qn);
     if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
+        if (!receiver_chain_admits(callee_name, best, is_csharp)) {
             return empty_result();
         }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
@@ -1341,10 +1379,15 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —
- * cbm_registry_resolve owns the per-file cache). */
+ * cbm_registry_resolve owns the per-file cache).
+ *
+ * `is_csharp` reaches only receiver_chain_admits via resolve_name_lookup;
+ * see the comment there for the lockstep requirement across pass_calls.c /
+ * pass_usages.c / pass_semantic.c / pass_parallel.c. */
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
-                                               const char **import_map_vals, int import_map_count) {
+                                               const char **import_map_vals, int import_map_count,
+                                               bool is_csharp) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -1381,21 +1424,27 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
+                                  is_csharp);
     }
     return res;
 }
 
-cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
+cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
+                                           const char *module_qn, const char **import_map_keys,
+                                           const char **import_map_vals, int import_map_count,
+                                           bool is_csharp) {
     if (!r || !callee_name) {
         return empty_result();
     }
 
     /* Per-file cache: same callee_name in N call sites → 1 chain walk
      * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
+     * cache key only needs callee_name, and so is is_csharp: every
+     * caller within one file's cbm_registry_resolve_cache_begin/_end
+     * bracket derives it from that same file's language, so a cache hit
+     * can never answer a callee_name resolved under a different
+     * is_csharp than the one asking (#2121 follow-up). */
     if (_resolve_cache) {
         resolve_cache_entry_t *cached =
             (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
@@ -1405,7 +1454,7 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     }
 
     cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
-                                                  import_map_vals, import_map_count);
+                                                  import_map_vals, import_map_count, is_csharp);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -1436,6 +1485,19 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     return res;
 }
 
+/* Language-blind entry point, kept for the many callers (tests included) that
+ * never touch a receiver chain a C# keyword could apply to. Always resolves
+ * as if the caller were not C#: is_csharp=false leaves this variant
+ * byte-identical to cbm_registry_resolve before #2121's C# gate existed.
+ * Every production call site that resolves a real C# file's receiver chains
+ * calls cbm_registry_resolve_lang directly with its own file's language. */
+cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    return cbm_registry_resolve_lang(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                     import_map_count, false);
+}
+
 cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count) {
@@ -1446,9 +1508,14 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * Deliberately uncached: the per-file cache is keyed by bare callee_name
      * and stores the relation-vetoed answer of the default variant — sharing
      * it would poison one variant with the other's semantics. SQL files hold
-     * few distinct relation refs, so the chain walk stays cheap. */
+     * few distinct relation refs, so the chain walk stays cheap.
+     *
+     * is_csharp is hardcoded false: the only two callers (pass_usages.c,
+     * pass_parallel.c) route here exclusively for CBM_LANG_SQL files, which
+     * can never be CBM_LANG_CSHARP, so the C# receiver-chain gate never
+     * applies to this path. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count);
+                                  import_map_count, false);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

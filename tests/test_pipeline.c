@@ -11202,6 +11202,76 @@ TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
     PASS();
 }
 
+/* Issue #2121: unlike vm.load's lower-case value root above, C#'s built-in
+ * type keywords (int, string, bool, ...) DO name a type and must get the
+ * same chain-consistency check an upper-case root gets. is_csharp=true here
+ * because this is exactly the C# file the maintainer's review (PR #2170)
+ * asked the gate to apply to: every production caller reaches this branch
+ * only when the file being resolved is CBM_LANG_CSHARP. */
+TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method");
+
+    cbm_resolution_t r =
+        cbm_registry_resolve_lang(reg, "int.TryParse", "tmp.Demo", NULL, NULL, 0, true);
+    ASSERT_NULL(r.qualified_name);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* The true positive the new keyword check must not eat: the project really
+ * does define a type literally named "int" (or similar) and the chain shows
+ * it, so the match must still go through. is_csharp=true so this actually
+ * exercises the keyword branch's ancestry walk, not the is_csharp=false
+ * early return (which would pass through for the wrong reason). */
+TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.int.TryParse", "Method");
+
+    cbm_resolution_t r =
+        cbm_registry_resolve_lang(reg, "int.TryParse", "tmp.Demo", NULL, NULL, 0, true);
+    ASSERT_STR_EQ(r.qualified_name, "tmp.int.TryParse");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* Review ask #1/#2 (PR #2170, DeusData): the type-keyword branch above is a
+ * C#-only rule (closed list, gated on is_csharp) and must not trade away
+ * recall in a language where the same spellings are ordinary identifiers.
+ * `object` and `string` are ordinary lower-case variable names in Python/Go;
+ * a variable named `object` calling a method (`object.TryParse` shaped
+ * exactly like the refusal test above) must still resolve as a value root
+ * when is_csharp is false: the negative control pinning the other side of
+ * the gate. */
+TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method");
+
+    /* Same callee/candidate shape as
+     * registry_receiver_chain_refuses_lowercase_type_keyword_issue2121 above,
+     * but resolved as a Python/Go file (is_csharp=false): "object" must be
+     * treated as an ordinary value root, not a reserved type keyword. */
+    cbm_resolution_t r =
+        cbm_registry_resolve_lang(reg, "object.TryParse", "tmp.Demo", NULL, NULL, 0, false);
+    ASSERT_STR_EQ(r.qualified_name, "tmp.Decoys.TsidNode.TryParse");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    /* The language-blind cbm_registry_resolve wrapper IS cbm_registry_resolve_lang
+     * with is_csharp=false, not a separate code path: confirm the every-day
+     * entry point behaves identically for a second keyword spelling. */
+    cbm_registry_t *reg2 = cbm_registry_new();
+    cbm_registry_add(reg2, "Join", "tmp.Decoys.Joiner.Join", "Method");
+    cbm_resolution_t r2 = cbm_registry_resolve(reg2, "string.Join", "tmp.Demo", NULL, NULL, 0);
+    ASSERT_STR_EQ(r2.qualified_name, "tmp.Decoys.Joiner.Join");
+    ASSERT_STR_EQ(r2.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    cbm_registry_free(reg2);
+    PASS();
+}
+
 /* An unqualified callee has no chain at all and must pass through unchanged. */
 TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
@@ -16065,6 +16135,9 @@ SUITE(pipeline) {
     RUN_TEST(registry_receiver_chain_admits_factory_chain_into_nested_type);
     RUN_TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule);
     RUN_TEST(registry_receiver_chain_ignores_lowercase_root_issue1893);
+    RUN_TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121);
+    RUN_TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121);
+    RUN_TEST(registry_receiver_chain_keyword_list_gated_to_csharp_issue2121);
     RUN_TEST(registry_receiver_chain_ignores_bare_name_issue1893);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
