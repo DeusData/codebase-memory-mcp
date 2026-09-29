@@ -148,22 +148,97 @@ static bool read_gitlink_target(const char *path, char *out, size_t out_size) {
     return got;
 }
 
-bool cbm_git_is_linked_worktree(const char *path) {
-    if (!path || !path[0]) {
-        return false;
+/* 1 = linked-worktree gitlink, 0 = a different git anchor (stop walking),
+ * -1 = no .git at this directory (keep walking). */
+static int linked_worktree_anchor(const char *path) {
+    char dot_git[GIT_OUTPUT_MAX];
+    int n = snprintf(dot_git, sizeof(dot_git), "%s/.git", path);
+    if (n < 0 || n >= (int)sizeof(dot_git)) {
+        return 0;
+    }
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(dot_git, &info) != CBM_PATH_INFO_OK) {
+        return -1;
+    }
+    /* A directory .git is a main checkout. Anything else that is not a
+     * regular gitlink file (a symlink, for example) is also an anchor:
+     * do not follow it, and do not blame a parent worktree for this tree. */
+    if (!info.is_regular) {
+        return 0;
     }
     char git_dir[GIT_OUTPUT_MAX];
     if (!read_gitlink_target(path, git_dir, sizeof(git_dir))) {
-        return false;
+        return 0;
     }
     /* Only linked worktrees carry <gitdir>/commondir; a submodule gitlink
      * points at <super>/.git/modules/<name>, which does not. */
     char commondir[GIT_OUTPUT_MAX];
-    int n = snprintf(commondir, sizeof(commondir), "%s/commondir", git_dir);
+    n = snprintf(commondir, sizeof(commondir), "%s/commondir", git_dir);
     if (n < 0 || n >= (int)sizeof(commondir)) {
+        return 0;
+    }
+    return path_is_regular_file(commondir) ? 1 : 0;
+}
+
+static bool parent_directory(char *path) {
+    size_t n = strlen(path);
+    while (n > 1 && (path[n - 1] == '/' || path[n - 1] == '\\')) {
+        path[--n] = '\0';
+    }
+#ifdef _WIN32
+    if ((n == 2 && path[1] == ':') ||
+        (n == 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\'))) {
         return false;
     }
-    return path_is_regular_file(commondir);
+#endif
+    if (n <= 1) {
+        return false;
+    }
+    char *slash = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (path[i] == '/' || path[i] == '\\') {
+            slash = path + i;
+        }
+    }
+    if (!slash) {
+        return false;
+    }
+    if (slash == path) {
+        path[1] = '\0';
+        return true;
+    }
+    *slash = '\0';
+    return true;
+}
+
+bool cbm_git_is_linked_worktree(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    char current[GIT_OUTPUT_MAX];
+    int n = snprintf(current, sizeof(current), "%s", path);
+    if (n < 0 || n >= (int)sizeof(current)) {
+        return false;
+    }
+    size_t len = strlen(current);
+    while (len > 1 && (current[len - 1] == '/' || current[len - 1] == '\\')) {
+        current[--len] = '\0';
+    }
+    /* A session cwd or index_repository path is often a subdirectory. Walk
+     * ancestors until a git anchor so ignore_worktrees applies to the whole
+     * linked checkout, not only its root. */
+    for (int depth = 0; depth < 64; depth++) {
+        int kind = linked_worktree_anchor(current);
+        if (kind >= 0) {
+            return kind == 1;
+        }
+        char previous[GIT_OUTPUT_MAX];
+        snprintf(previous, sizeof(previous), "%s", current);
+        if (!parent_directory(current) || strcmp(previous, current) == 0) {
+            return false;
+        }
+    }
+    return false;
 }
 
 static char *join_root_relative(const char *root, const char *rel) {

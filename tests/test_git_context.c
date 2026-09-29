@@ -296,16 +296,30 @@ TEST(is_linked_worktree_true_for_linked_worktree) {
     }
 
     bool worktree_detected = cbm_git_is_linked_worktree(wt_tmp);
+    /* A subdirectory has no .git of its own. The predicate must still see the
+     * linked worktree above it, or ignore_worktrees misses nested sessions. */
+    char nested[1024];
+    snprintf(nested, sizeof(nested), "%s/nested/deeper", wt_tmp);
+    bool nested_ok = th_mkdir_p(nested) == 0;
+    bool nested_detected = nested_ok && cbm_git_is_linked_worktree(nested);
     /* The MAIN checkout of the very same repo must NOT be flagged — otherwise
      * enabling ignore_worktrees would stop indexing ordinary repositories. */
     bool main_detected = cbm_git_is_linked_worktree(main_tmp);
+    char main_nested[1024];
+    snprintf(main_nested, sizeof(main_nested), "%s/src", main_tmp);
+    bool main_nested_ok = th_mkdir_p(main_nested) == 0;
+    bool main_nested_detected = main_nested_ok && cbm_git_is_linked_worktree(main_nested);
 
     git_run(main_tmp, "worktree prune");
     th_rmtree(main_tmp);
     th_rmtree(wt_tmp);
 
     ASSERT(worktree_detected);
+    ASSERT(nested_ok);
+    ASSERT(nested_detected);
     ASSERT(!main_detected);
+    ASSERT(main_nested_ok);
+    ASSERT(!main_nested_detected);
     PASS();
 #endif /* _WIN32 */
 }
@@ -351,6 +365,10 @@ TEST(is_linked_worktree_false_for_submodule_and_nongit) {
     char subm[1024];
     snprintf(subm, sizeof(subm), "%s/subm", super_tmp);
     bool submodule_detected = sub_rc == 0 && cbm_git_is_linked_worktree(subm);
+    char sub_nested[1024];
+    snprintf(sub_nested, sizeof(sub_nested), "%s/nested", subm);
+    bool sub_nested_made = sub_rc == 0 && th_mkdir_p(sub_nested) == 0;
+    bool sub_nested_detected = sub_nested_made && cbm_git_is_linked_worktree(sub_nested);
 
     th_rmtree(super_tmp);
     th_rmtree(child_tmp);
@@ -359,8 +377,11 @@ TEST(is_linked_worktree_false_for_submodule_and_nongit) {
     if (sub_rc != 0) {
         SKIP_PLATFORM("git submodule add unavailable in this environment");
     }
-    /* A submodule gitlink has no commondir → must not be treated as a worktree. */
+    /* A submodule gitlink has no commondir → must not be treated as a worktree,
+     * including a subdirectory, which must not walk into the superproject. */
     ASSERT(!submodule_detected);
+    ASSERT(sub_nested_made);
+    ASSERT(!sub_nested_detected);
     PASS();
 #endif /* _WIN32 */
 }

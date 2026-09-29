@@ -19,13 +19,14 @@ typedef struct {
     char *base_sha;
 } cbm_git_context_t;
 
-/* True when path is the root of a LINKED git worktree (`git worktree add`).
+/* True when path is a LINKED git worktree (`git worktree add`) or a
+ * subdirectory of one.
  *
- * Plumbing-only, no subprocess: <path>/.git must be a regular file holding a
- * "gitdir: <path>" pointer AND that gitdir must contain a `commondir` file.
- * The commondir check is what separates a linked worktree from a submodule —
- * a submodule's .git is also a gitlink file, but its gitdir
- * (<super>/.git/modules/<name>) has no commondir entry.
+ * Plumbing-only, no subprocess. Walk ancestors until a git anchor. A linked
+ * worktree's <root>/.git is a regular file holding a "gitdir: <path>" pointer
+ * AND that gitdir contains a `commondir` file. The walk stops at any other
+ * anchor: a main checkout (`.git` is a directory) or a submodule (gitlink
+ * file whose gitdir, <super>/.git/modules/<name>, has no commondir).
  *
  * Callers run this on every session start, so it stays fork-free; the richer
  * cbm_git_context_resolve() shells out to git and is not usable on that path. */
