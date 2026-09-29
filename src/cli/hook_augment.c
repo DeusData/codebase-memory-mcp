@@ -1504,11 +1504,11 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
      * its root belongs to this cwd's own linked worktree, not a parent graph. */
     bool ignore_linked =
         srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) && cbm_git_is_linked_worktree(cwd);
-    if (ignore_linked && project && !cbm_git_same_linked_worktree(cwd, project_root)) {
-        free(project);
-        project = NULL;
-    }
-    bool worktree_ignored = ignore_linked && !project;
+    /* Drop a parent graph without a second free(): this file's raw free count
+     * is ratcheted, and the single free(project) below still releases it. */
+    bool drop_ancestor =
+        ignore_linked && project && !cbm_git_same_linked_worktree(cwd, project_root);
+    bool worktree_ignored = ignore_linked && (!project || drop_ancestor);
     if (owned_config) {
         cbm_mcp_server_set_config(srv, NULL);
         cbm_config_close(owned_config);
@@ -1531,7 +1531,7 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
         scope = "Compaction";
     }
     const char *tier = ha_active_tier(root, event);
-    if (project) {
+    if (project && !drop_ancestor) {
         char safe_project[HA_METADATA_CAP];
         ha_sanitize_metadata(project, safe_project, sizeof(safe_project));
         snprintf(context, sizeof(context),
