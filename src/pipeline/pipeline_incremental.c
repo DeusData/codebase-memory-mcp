@@ -1484,6 +1484,20 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
         cbm_log_info("pass.timing", "pass", "incr_importance", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
     }
+    /* HashUID follows the same rule, for the same reason: a member's
+     * logical_module is read from ITS ENCLOSING CONTAINER NODES, so the pass
+     * may only run where the buffer really is the whole project (re-extraction
+     * covers each changed file entirely, including its own nested classes).
+     * The closure-delta route holds proxies whose containers may be absent —
+     * stamping a truncated chain there would persist a WRONG identity, so that
+     * route needs an SQL-side recompute instead (follow-up, mirroring what it
+     * already does for importance). */
+    if (score_importance) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_pipeline_pass_hashuid(ctx);
+        cbm_log_info("pass.timing", "pass", "incr_hashuid", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    }
     if (cbm_pipeline_check_cancel(ctx)) {
         return CBM_NOT_FOUND;
     }

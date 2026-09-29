@@ -1778,3 +1778,80 @@ const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *sourc
     }
     return cbm_arena_strndup(a, buf, pos);
 }
+
+/* `qn` with a trailing Java parameter list removed ("a.B.c(int)" -> "a.B.c").
+ * A member QN built by this code base carries at most one parameter list, and
+ * it is always the last thing in the string, so the first '(' is its opener. */
+static const char *java_qn_sans_params(CBMArena *a, const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    const char *open = strchr(qn, '(');
+    if (!open) {
+        return qn;
+    }
+    return cbm_arena_strndup(a, qn, (size_t)(open - qn));
+}
+
+cbm_java_anon_scope_t cbm_java_anonymous_class_scope(CBMArena *a, TSNode node, const char *source,
+                                                     const char *enclosing_class_qn,
+                                                     const char *enclosing_func_qn,
+                                                     const char *module_qn) {
+    cbm_java_anon_scope_t none = {NULL, NULL};
+    if (ts_node_is_null(node) ||
+        strcmp(ts_node_type(node), "object_creation_expression") != 0) {
+        return none;
+    }
+    /* A body IS what makes it anonymous: `new Foo()` on its own declares
+     * nothing and scopes nothing. */
+    if (ts_node_is_null(cbm_find_child_by_kind(node, "class_body"))) {
+        return none;
+    }
+    TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+    if (ts_node_is_null(type_node)) {
+        return none;
+    }
+    /* TrackerV2 reads the FIRST child of the type node, which unwraps
+     * `Iterator<>` to `Iterator` (and leaves a plain `Runnable` alone). A
+     * scoped spelling keeps its own first child, so `java.util.Iterator<>`
+     * yields `$AC_java.util.Iterator` there too — the same spelling on both
+     * sides matters more than the spelling being pretty. */
+    if (ts_node_child_count(type_node) > 0) {
+        type_node = ts_node_child(type_node, 0);
+    }
+    char *type_text = cbm_node_text(a, type_node, source);
+    if (!type_text || !type_text[0]) {
+        return none;
+    }
+
+    /* Inside a method, TrackerV2's chain adds that method's SIMPLE name — its
+     * container set includes method and constructor declarations. The enclosing
+     * function QN already starts with the enclosing type, so dropping its
+     * parameter list produces exactly `<type>.<method>`. */
+    const char *base = enclosing_class_qn;
+    if (enclosing_func_qn && enclosing_func_qn[0] &&
+        (!enclosing_class_qn || strcmp(enclosing_func_qn, enclosing_class_qn) != 0)) {
+        base = java_qn_sans_params(a, enclosing_func_qn);
+    }
+    if (!base || !base[0]) {
+        base = module_qn;
+    }
+
+    cbm_java_anon_scope_t out;
+    out.name = cbm_arena_sprintf(a, "$AC_%s", type_text);
+    /* Disambiguate the SCOPE QN by the creation's byte offset. Two anonymous
+     * classes of the same type inside one enclosing scope otherwise spell the
+     * very same scope QN, and since the graph keys nodes by QN, four
+     * `new RepoScanTask() {...}` in one method collapsed into a single node —
+     * losing three real declarations. The offset is a pure function of the
+     * occurrence, so every producer (definition extractor, unified call walk,
+     * Java LSP) derives the identical suffix without sharing any state.
+     *
+     * Only the QN carries it: `name` stays `$AC_<Type>`, and TrackerV2's
+     * logical_module is built from scope NAMES, so the identity of every
+     * member is unaffected. */
+    const char *occurrence = cbm_arena_sprintf(a, "@%u", (unsigned)ts_node_start_byte(node));
+    out.qn = (base && base[0]) ? cbm_arena_sprintf(a, "%s.%s%s", base, out.name, occurrence)
+                               : cbm_arena_sprintf(a, "%s%s", out.name, occurrence);
+    return out;
+}

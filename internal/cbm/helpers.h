@@ -41,6 +41,35 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang);
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path, const char *module_qn);
 
+// Java anonymous class scope (`new T() { ... }`).
+//
+// An anonymous class has no name, but it is a real scope: its members are real
+// declarations and TrackerV2 gives them identities. TrackerV2 names the scope
+// `$AC_<Type>` and places it under the enclosing type AND the enclosing method
+// (its container set counts method/constructor declarations), so a member of
+// `new Iterator<>(){...}` inside `JGitClient.iterateFileContents` is scoped as
+// `JGitClient.iterateFileContents.$AC_Iterator`.
+//
+// This is the single source of truth for that spelling. Three producers must
+// agree byte-for-byte or the edges they emit name nodes that do not exist: the
+// definition extractor (mints the nodes), the unified walk (attributes calls in
+// the body), and the Java LSP (reports the caller of a resolved call). Drift
+// between such producers is the exact failure that once cost half of all CALLS
+// edges.
+typedef struct {
+    const char *qn;   // full QN of the anonymous class scope; NULL if `node` is not one
+    const char *name; // "$AC_<Type>" — the scope's simple name
+} cbm_java_anon_scope_t;
+
+// Returns {NULL, NULL} unless `node` is a Java `object_creation_expression`
+// carrying a class body. `enclosing_class_qn`/`enclosing_func_qn` are the
+// caller's current scopes (the latter may be NULL, or carry a parameter list);
+// `module_qn` is the fallback when there is no enclosing type at all.
+cbm_java_anon_scope_t cbm_java_anonymous_class_scope(CBMArena *a, TSNode node, const char *source,
+                                                     const char *enclosing_class_qn,
+                                                     const char *enclosing_func_qn,
+                                                     const char *module_qn);
+
 // Cached version: uses ctx->ef_cache to avoid repeated parent-chain walks.
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 

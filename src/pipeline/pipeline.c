@@ -1039,6 +1039,9 @@ static void predump_ensemble(cbm_pipeline_ctx_t *ctx) {
 static void predump_importance(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_importance(ctx);
 }
+static void predump_hashuid(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_hashuid(ctx);
+}
 
 /* Phase boundary for memory attribution. Two instruments, both already in
  * foundation/, both previously wired ONLY into MCP request handling and never
@@ -1273,6 +1276,12 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
          * (pass_tests, which run_post_extraction runs before this loop), so
          * every edge type its score depends on already exists here. */
         {predump_importance, "importance", false},
+        /* HashUID reads only node properties written at extraction time plus
+         * the container nodes themselves, so it needs nothing this loop builds
+         * — but it must run after every file has been extracted, which is true
+         * for the whole loop. Kept last so no earlier pass can rewrite the
+         * properties it stamps. */
+        {predump_hashuid, "hashuid", false},
     };
     /* Derived from the table, never hand-written. A hand-written count that
      * lags a newly appended entry silently skips the LAST pass while every

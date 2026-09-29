@@ -327,6 +327,7 @@ FOUNDATION_SRCS = \
     src/foundation/limits.c \
     src/foundation/subprocess.c \
     src/foundation/sha256.c \
+    src/foundation/md5.c \
     src/foundation/secure_random.c \
     src/foundation/macos_acl.c \
     src/foundation/private_file_lock.c \
@@ -458,6 +459,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_semantic_edges.c \
     src/pipeline/pass_complexity.c \
     src/pipeline/pass_importance.c \
+    src/pipeline/pass_hashuid.c \
     src/pipeline/pass_cross_repo.c \
     src/pipeline/artifact.c \
     src/pipeline/pass_ensemble_routing.c \

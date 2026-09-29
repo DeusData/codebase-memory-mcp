@@ -689,6 +689,15 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
  * post-pass sequence. */
 void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx);
 
+/* Java HashUID (TrackerV2 identity) — stamps `hashuid`, `hashInput`,
+ * `canonicalSignature`, `logicalModule`, `duplicateFingerprint`, `typeId` and
+ * `languageTypeId` onto Class/Interface/Enum/Method nodes. Body-less
+ * declarations (interface/abstract/native) are stamped too — a deliberate
+ * superset of TrackerV2, and identifiable by `hasBody:false`. Defined in
+ * pass_hashuid.c; runs as the last predump pass, once every container node
+ * exists. */
+void cbm_pipeline_pass_hashuid(cbm_pipeline_ctx_t *ctx);
+
 /* Gathered inputs for one symbol. Each scoring route fills this its own way
  * (gbuf lookups, or SQL aggregates) and then calls the ONE rule below. */
 typedef struct {

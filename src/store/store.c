@@ -505,7 +505,23 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_target_type ON edges(project, target_id, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_source_type ON edges(project, source_id, type);"
-        "CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen);";
+        "CREATE INDEX IF NOT EXISTS idx_edges_url_path ON edges(project, url_path_gen);"
+        /* Java HashUID (pass_hashuid.c): the TrackerV2 identity is a BUSINESS
+         * key, so two nodes of one project must never share one. NULL entries
+         * are exempt (SQLite ignores NULLs in a unique index), which is what
+         * lets the digest cover only Class/Interface/Enum/Method while every
+         * other label — File, Folder, Field, Route, … — has none.
+         *
+         * The json_valid() guard is not optional: json_extract aborts the whole
+         * CREATE INDEX on a row whose properties are malformed, and legacy
+         * databases contain such rows. The CASE form keeps the malformed rows
+         * out of the expression entirely (same shape as FTS_BODY_EXPR above);
+         * a bare "json_extract(...) IS NOT NULL" in a WHERE clause is NOT
+         * equivalent, and that is why the idx_nodes_entry_point expression
+         * index noted directly above was reverted. */
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_hashuid"
+        " ON nodes(project, CASE WHEN json_valid(properties)"
+        " THEN json_extract(properties,'$.hashuid') END);";
     /* NOTE: a partial expression index on json_extract(properties,'$.is_entry_point')
      * was tried for arch_entry_points and REVERTED: json_extract in an index WHERE
      * aborts CREATE INDEX (and thus store open) on any row whose properties JSON is

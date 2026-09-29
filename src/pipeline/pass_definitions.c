@@ -247,8 +247,26 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
-/* Build properties JSON for a definition node. */
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+/* Append ,"key":true|false. Emitted only when it fits whole, like the other
+ * appenders, so an oversized definition can never leave broken JSON behind. */
+static void append_json_bool(char *buf, size_t bufsize, size_t *pos, const char *key,
+                             bool value) {
+    if (!key || *pos >= bufsize - PD_JSON_MARGIN) {
+        return;
+    }
+    int n = snprintf(buf + *pos, bufsize - *pos, ",\"%s\":%s", key, value ? "true" : "false");
+    if (n <= 0 || *pos + (size_t)n >= bufsize - PD_ESC_SPACE) {
+        return;
+    }
+    *pos += (size_t)n;
+    buf[*pos] = '\0';
+}
+
+/* Build properties JSON for a definition node. `lang` is only consulted for
+ * the Java HashUID identity block — every other language writes the same
+ * bytes it did before. */
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            CBMLanguage lang) {
     /* The complexity/loop/recursion metrics are only meaningful for executable
      * units (Function/Method). Emitting them on the millions of Macro/Field/
      * Variable/Class/Enum nodes — where they are always zero — bloats every
@@ -284,6 +302,59 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    /* Java identity metadata (TrackerV2 HashUID) goes FIRST, immediately after
+     * the fixed-size base. Both facts are unrecoverable from the graph alone:
+     * a method WITHOUT a body gets no HashUID at all, and a `record` /
+     * `@interface` type is neither an identity-bearing type nor a scope for its
+     * members, yet the graph stores it as a plain Class node.
+     *
+     * Position matters, not just presence: the appenders below are atomic and
+     * SILENTLY SKIP a field that would not fit, and a Java method with a long
+     * annotation-carrying signature plus a docstring can fill this 2 KiB buffer
+     * before the tail. Written last, the verdict would vanish on exactly the
+     * nodes it is meant to protect (measured: one MyBatis mapper method lost
+     * it). ~40 bytes up front always fits.
+     *
+     * pass_hashuid.c is the only reader. */
+    if (lang == CBM_LANG_JAVA) {
+        if (def->label &&
+            (strcmp(def->label, "Method") == 0 || strcmp(def->label, "Function") == 0)) {
+            append_json_bool(buf, bufsize, &pos, "hasBody", def->has_body);
+            /* Constructor verdict, from the extractor's own fields — never from
+             * the emitted properties, which may be truncated. */
+            if (!def->return_type && def->parent_class && def->name) {
+                const char *dot = strrchr(def->parent_class, '.');
+                const char *simple = dot ? dot + SKIP_ONE : def->parent_class;
+                if (strcmp(simple, def->name) == 0) {
+                    append_json_string(buf, bufsize, &pos, "javaMemberKind", "constructor");
+                }
+            }
+        } else if (def->label && strcmp(def->label, "Class") == 0) {
+            if (def->type_is_record) {
+                append_json_string(buf, bufsize, &pos, "javaTypeKind", "record");
+            } else if (def->type_is_annotation) {
+                append_json_string(buf, bufsize, &pos, "javaTypeKind", "annotation");
+            } else if (def->type_is_anonymous) {
+                /* A scope with no identity: TrackerV2 registers no type_id for
+                 * `new T() { ... }`, but its members are registered and scoped
+                 * under `$AC_<Type>`. */
+                append_json_string(buf, bufsize, &pos, "javaTypeKind", "anonymous");
+            }
+        }
+        /* TrackerV2's duplicate_fingerprint needs the declaration's own text
+         * digest, which only extraction can see. Emitted for the identity-
+         * bearing kinds only; an anonymous scope or a record carries none. */
+        bool identity_type = def->label && (strcmp(def->label, "Class") == 0 ||
+                                            strcmp(def->label, "Interface") == 0 ||
+                                            strcmp(def->label, "Enum") == 0);
+        bool identity_member = def->label &&
+                               (strcmp(def->label, "Method") == 0 ||
+                                strcmp(def->label, "Function") == 0);
+        if (def->decl_content_hash && (identity_type || identity_member) &&
+            !def->type_is_anonymous && !def->type_is_record && !def->type_is_annotation) {
+            append_json_string(buf, bufsize, &pos, "declHash", def->decl_content_hash);
+        }
+    }
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
@@ -320,12 +391,13 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
 }
 
 /* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
-static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
+static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
+                        CBMLanguage lang) {
     if (!def->qualified_name || !def->name) {
         return;
     }
     char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    build_def_props(props, sizeof(props), def, lang);
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
@@ -859,7 +931,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Create nodes for each definition */
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel);
+            process_def(ctx, &result->defs.items[d], rel, lang);
             total_defs++;
         }
 
