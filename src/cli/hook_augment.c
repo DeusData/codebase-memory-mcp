@@ -1002,10 +1002,6 @@ static char *ha_resolve_indexed_project_with_root(cbm_mcp_server_t *srv, const c
     return ha_registry_project_for_path(srv, cwd, root_out, root_out_size);
 }
 
-static char *ha_resolve_indexed_project(cbm_mcp_server_t *srv, const char *cwd) {
-    return ha_resolve_indexed_project_with_root(srv, cwd, NULL, 0U);
-}
-
 static const char *ha_hook_event_name(yyjson_val *root) {
     const char *event = ha_obj_str(root, "hook_event_name");
     return event ? event : ha_obj_str(root, "hookEventName");

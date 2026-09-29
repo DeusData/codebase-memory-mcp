@@ -228,7 +228,9 @@ static bool walk_linked_worktree_root(const char *path, char *root_out, size_t r
     /* A session cwd or index_repository path is often a subdirectory. Walk
      * ancestors until a git anchor so ignore_worktrees applies to the whole
      * linked checkout, not only its root. */
-    for (int depth = 0; depth < 64; depth++) {
+    /* Bound is the path itself: each step drops one component and stops at
+     * the filesystem root. A fixed depth would miss a deep session cwd. */
+    for (;;) {
         int kind = linked_worktree_anchor(current);
         if (kind >= 0) {
             if (kind != 1) {
@@ -248,7 +250,6 @@ static bool walk_linked_worktree_root(const char *path, char *root_out, size_t r
             return false;
         }
     }
-    return false;
 }
 
 bool cbm_git_is_linked_worktree(const char *path) {
@@ -271,7 +272,14 @@ bool cbm_git_same_linked_worktree(const char *a, const char *b) {
         !read_gitlink_target(root_b, git_b, sizeof(git_b))) {
         return false;
     }
-    return strcmp(git_a, git_b) == 0;
+    /* A relative gitdir is joined onto the walked path. Canonicalize both so
+     * a symlink spelling of the cwd still matches the real project root.
+     * Fall back to the raw string when the gitdir does not exist. */
+    char norm_a[GIT_OUTPUT_MAX];
+    char norm_b[GIT_OUTPUT_MAX];
+    const char *left = cbm_canonical_path(git_a, norm_a, sizeof(norm_a)) ? norm_a : git_a;
+    const char *right = cbm_canonical_path(git_b, norm_b, sizeof(norm_b)) ? norm_b : git_b;
+    return strcmp(left, right) == 0;
 }
 
 static char *join_root_relative(const char *root, const char *rel) {
