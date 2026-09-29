@@ -1475,14 +1475,28 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
 
     char cwd_buffer[4096];
     cbm_mcp_server_t *owned_server = NULL;
+    cbm_config_t *owned_config = NULL;
     if (!srv) {
         owned_server = cbm_mcp_server_new(NULL);
         srv = owned_server;
+    }
+    /* cbm_mcp_server_new(NULL) does not attach the runtime store. The production
+     * hook uses that constructor, so ignore_worktrees would stay at its default
+     * (off) and the "not indexed" note would still tell the agent to run
+     * index_repository in a linked worktree the setting refuses. Load the store
+     * only when the caller has not already set one, then drop it before return
+     * so a caller-owned server is not left pointing at a closed config. */
+    if (srv) {
+        owned_config = cbm_mcp_server_attach_runtime_config(srv);
     }
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
     char *project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
     bool worktree_ignored = !project && srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) &&
                             cbm_git_is_linked_worktree(cwd);
+    if (owned_config) {
+        cbm_mcp_server_set_config(srv, NULL);
+        cbm_config_close(owned_config);
+    }
     cbm_mcp_server_free(owned_server);
 
     char context[2048];

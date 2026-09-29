@@ -1751,6 +1751,18 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
+struct cbm_config *cbm_mcp_server_attach_runtime_config(cbm_mcp_server_t *srv) {
+    if (!srv || srv->config) {
+        return NULL;
+    }
+    cbm_config_t *cfg = cbm_config_open(cbm_resolve_cache_dir());
+    if (!cfg) {
+        return NULL;
+    }
+    srv->config = cfg;
+    return cfg;
+}
+
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
                                                    cbm_mcp_auto_index_count_test_hook_fn hook,

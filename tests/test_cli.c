@@ -10629,8 +10629,20 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
     char *wt_out = cbm_hook_augment_lifecycle_json(input);
     bool deliberate = wt_out && wt_out[0] && strstr(wt_out, "no indexed graph project matched") &&
-                      !strstr(wt_out, "is indexed");
+                      strstr(wt_out, "Run index_repository") &&
+                      !strstr(wt_out, "ignore_worktrees is enabled") && !strstr(wt_out, "is indexed");
     free(wt_out);
+
+    /* The hook must read the runtime store. With the key off the note still
+     * says to index; with it on, the same unindexed worktree must not. */
+    cbm_config_t *cfg = cbm_config_open(cache);
+    bool configured = cfg && cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(cfg);
+    char *ignored_out = configured ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool honored = ignored_out && strstr(ignored_out, "ignore_worktrees is enabled") &&
+                   strstr(ignored_out, "do not run index_repository") &&
+                   !strstr(ignored_out, "is indexed");
+    free(ignored_out);
 
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
              maindir);
@@ -10647,6 +10659,8 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
 
     if (!deliberate)
         FAIL("unindexed worktree must get a deliberate no-match notice, never a silent 0 bytes");
+    if (!honored)
+        FAIL("ignore_worktrees in the runtime config must change the unindexed-worktree note");
     if (!main_ok)
         FAIL("the indexed main checkout must still resolve in the same matrix");
     PASS();
