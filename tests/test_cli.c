@@ -10644,6 +10644,22 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
                    !strstr(ignored_out, "is indexed");
     free(ignored_out);
 
+    /* A symlink to a directory inside that worktree has no lexical .git.
+     * The hook must still follow the real path and honor ignore_worktrees. */
+    char alias_target[600];
+    snprintf(alias_target, sizeof(alias_target), "%s/nested", wtdir);
+    bool alias_target_ok = test_mkdirp(alias_target) == 0;
+    char alias[512];
+    snprintf(alias, sizeof(alias), "%s/wt-alias", tmpdir);
+    bool alias_made = alias_target_ok && symlink(alias_target, alias) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             alias);
+    char *alias_out = alias_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool alias_ignored = alias_out && strstr(alias_out, "ignore_worktrees is enabled") &&
+                         strstr(alias_out, "do not run index_repository") &&
+                         !strstr(alias_out, "Run index_repository");
+    free(alias_out);
+
     /* A linked worktree nested inside the indexed checkout must not inherit
      * that parent graph once ignore_worktrees is on. */
     char insider[512];
@@ -10716,6 +10732,8 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
         FAIL("unindexed worktree must get a deliberate no-match notice, never a silent 0 bytes");
     if (!honored)
         FAIL("ignore_worktrees in the runtime config must change the unindexed-worktree note");
+    if (!alias_ignored)
+        FAIL("a symlink into an ignored worktree must not recommend index_repository");
     if (!inside_ignored)
         FAIL("a nested linked worktree must not inherit the indexed parent graph");
     if (!exact_kept)

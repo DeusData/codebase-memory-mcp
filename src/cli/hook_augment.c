@@ -1486,6 +1486,14 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
         owned_config = cbm_mcp_server_attach_runtime_config(srv);
     }
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
+    /* A symlink alias has no .git of its own, and walking its lexical parents
+     * leaves the linked worktree. index_repository canonicalizes before the
+     * same gate, so the hook must too or it tells the agent to index a path
+     * the setting will refuse. */
+    char canonical_cwd[4096];
+    if (cwd && ha_canonical_path(cwd, canonical_cwd, sizeof(canonical_cwd))) {
+        cwd = canonical_cwd;
+    }
     char project_root[4096];
     project_root[0] = '\0';
     char *project = srv && cwd ? ha_resolve_indexed_project_with_root(srv, cwd, project_root,
