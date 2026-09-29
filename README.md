@@ -491,7 +491,7 @@ overwrite user-modified agents.
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
 | Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, and post-`Read` coverage |
-| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, skill, three read-only agents; `SessionStart` + `SubagentStart` |
+| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, `~/.agents/skills/codebase-memory/SKILL.md`, three read-only agents; `SessionStart` + `SubagentStart` |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
 | OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection |
@@ -540,6 +540,11 @@ For Codex, install keeps only a tiny managed activation pointer in global
 `$CODEX_HOME/AGENTS.md`; all detailed behavior lives in the installed `codebase-memory` skill.
 Fresh installs create the pointer, upgrades replace the legacy full managed block while preserving
 all user-owned bytes, and uninstall removes only the managed pointer.
+Skill placement follows the cross-client user skill root and does not follow
+`CODEX_HOME`. On upgrade, the installer migrates an installer-owned legacy
+`$CODEX_HOME/skills/codebase-memory/SKILL.md` only after verifying the canonical
+copy. Modified or foreign files are preserved; `--force` explicitly authorizes
+replacement before migration.
 
 ### Sessions, compaction, and subagents
 
