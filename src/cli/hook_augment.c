@@ -21,7 +21,9 @@
 #include "foundation/constants.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "git/git_context.h"
 #include "mcp/mcp.h"
+#include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
 
@@ -1000,10 +1002,6 @@ static char *ha_resolve_indexed_project_with_root(cbm_mcp_server_t *srv, const c
     return ha_registry_project_for_path(srv, cwd, root_out, root_out_size);
 }
 
-static char *ha_resolve_indexed_project(cbm_mcp_server_t *srv, const char *cwd) {
-    return ha_resolve_indexed_project_with_root(srv, cwd, NULL, 0U);
-}
-
 static const char *ha_hook_event_name(yyjson_val *root) {
     const char *event = ha_obj_str(root, "hook_event_name");
     return event ? event : ha_obj_str(root, "hookEventName");
@@ -1440,7 +1438,14 @@ static const char *ha_active_tier(yyjson_val *root, const char *event) {
     return "Tier 2 verification";
 }
 
-static const char *ha_no_project_index_guidance(const char *event) {
+static const char *ha_no_project_index_guidance(const char *event, bool worktree_ignored) {
+    /* ignore_worktrees is on and this cwd is a linked worktree: indexing it is
+     * deliberately disabled, so telling the agent to run index_repository would
+     * only produce a refusal. Point at the setting instead. */
+    if (worktree_ignored) {
+        return "This is a linked git worktree and ignore_worktrees is enabled, so it is not "
+               "indexed on purpose; do not run index_repository here.";
+    }
     return event && strcmp(event, "SubagentStart") == 0
                ? "Ask the parent agent to run index_repository before structural exploration; "
                  "do not attempt graph mutation."
@@ -1466,12 +1471,48 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
 
     char cwd_buffer[4096];
     cbm_mcp_server_t *owned_server = NULL;
+    cbm_config_t *owned_config = NULL;
     if (!srv) {
         owned_server = cbm_mcp_server_new(NULL);
         srv = owned_server;
     }
+    /* cbm_mcp_server_new(NULL) does not attach the runtime store. The production
+     * hook uses that constructor, so ignore_worktrees would stay at its default
+     * (off) and the "not indexed" note would still tell the agent to run
+     * index_repository in a linked worktree the setting refuses. Load the store
+     * only when the caller has not already set one, then drop it before return
+     * so a caller-owned server is not left pointing at a closed config. */
+    if (srv) {
+        owned_config = cbm_mcp_server_attach_runtime_config(srv);
+    }
     const char *cwd = ha_normalized_cwd_with_server(root, srv, cwd_buffer, sizeof(cwd_buffer));
-    char *project = srv && cwd ? ha_resolve_indexed_project(srv, cwd) : NULL;
+    /* A symlink alias has no .git of its own, and walking its lexical parents
+     * leaves the linked worktree. index_repository canonicalizes before the
+     * same gate, so the hook must too or it tells the agent to index a path
+     * the setting will refuse. */
+    char canonical_cwd[4096];
+    if (cwd && ha_canonical_path(cwd, canonical_cwd, sizeof(canonical_cwd))) {
+        cwd = canonical_cwd;
+    }
+    char project_root[4096];
+    project_root[0] = '\0';
+    char *project = srv && cwd ? ha_resolve_indexed_project_with_root(srv, cwd, project_root,
+                                                                      sizeof(project_root))
+                               : NULL;
+    /* ignore_worktrees refuses a linked worktree, including one nested inside an
+     * indexed checkout or inside another linked worktree. Keep a match only when
+     * its root belongs to this cwd's own linked worktree, not a parent graph. */
+    bool ignore_linked =
+        srv && cwd && cbm_mcp_ignore_worktrees_enabled(srv) && cbm_git_is_linked_worktree(cwd);
+    /* Drop a parent graph without a second free(): this file's raw free count
+     * is ratcheted, and the single free(project) below still releases it. */
+    bool drop_ancestor =
+        ignore_linked && project && !cbm_git_same_linked_worktree(cwd, project_root);
+    bool worktree_ignored = ignore_linked && (!project || drop_ancestor);
+    if (owned_config) {
+        cbm_mcp_server_set_config(srv, NULL);
+        cbm_config_close(owned_config);
+    }
     cbm_mcp_server_free(owned_server);
 
     char context[2048];
@@ -1490,7 +1531,7 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
         scope = "Compaction";
     }
     const char *tier = ha_active_tier(root, event);
-    if (project) {
+    if (project && !drop_ancestor) {
         char safe_project[HA_METADATA_CAP];
         ha_sanitize_metadata(project, safe_project, sizeof(safe_project));
         snprintf(context, sizeof(context),
@@ -1505,7 +1546,7 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                  "and file reads for literals, configs, non-code files, and verification.",
                  scope, safe_project, tier);
     } else {
-        const char *index_guidance = ha_no_project_index_guidance(event);
+        const char *index_guidance = ha_no_project_index_guidance(event, worktree_ignored);
         snprintf(context, sizeof(context),
                  "[codebase-memory] %s context: no indexed graph project matched this working "
                  "directory. %s Once indexed, "
@@ -1624,8 +1665,9 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
     return ha_path_contains_mode(root, candidate, case_insensitive);
 }
 
-const char *cbm_hook_no_project_index_guidance_for_testing(const char *event) {
-    return ha_no_project_index_guidance(event);
+const char *cbm_hook_no_project_index_guidance_for_testing(const char *event,
+                                                           bool worktree_ignored) {
+    return ha_no_project_index_guidance(event, worktree_ignored);
 }
 
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz) {

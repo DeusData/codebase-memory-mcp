@@ -158,6 +158,12 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 
+/* Open the runtime config and attach it when srv has none. The returned store
+ * is owned by the caller, who must clear it with cbm_mcp_server_set_config
+ * before closing. Returns NULL when a config is already set or the store
+ * cannot be opened. */
+struct cbm_config *cbm_mcp_server_attach_runtime_config(cbm_mcp_server_t *srv);
+
 /* Set an explicit session context for an embedded/daemon-backed server.
  * session_root is copied and its project name is derived using the same naming
  * rule as indexing. allowed_root is copied when non-NULL; an explicit NULL

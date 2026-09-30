@@ -10629,8 +10629,90 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
     char *wt_out = cbm_hook_augment_lifecycle_json(input);
     bool deliberate = wt_out && wt_out[0] && strstr(wt_out, "no indexed graph project matched") &&
-                      !strstr(wt_out, "is indexed");
+                      strstr(wt_out, "Run index_repository") &&
+                      !strstr(wt_out, "ignore_worktrees is enabled") && !strstr(wt_out, "is indexed");
     free(wt_out);
+
+    /* The hook must read the runtime store. With the key off the note still
+     * says to index; with it on, the same unindexed worktree must not. */
+    cbm_config_t *cfg = cbm_config_open(cache);
+    bool configured = cfg && cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(cfg);
+    char *ignored_out = configured ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool honored = ignored_out && strstr(ignored_out, "ignore_worktrees is enabled") &&
+                   strstr(ignored_out, "do not run index_repository") &&
+                   !strstr(ignored_out, "is indexed");
+    free(ignored_out);
+
+    /* A symlink to a directory inside that worktree has no lexical .git.
+     * The hook must still follow the real path and honor ignore_worktrees. */
+    char alias_target[600];
+    snprintf(alias_target, sizeof(alias_target), "%s/nested", wtdir);
+    bool alias_target_ok = test_mkdirp(alias_target) == 0;
+    char alias[512];
+    snprintf(alias, sizeof(alias), "%s/wt-alias", tmpdir);
+    bool alias_made = alias_target_ok && symlink(alias_target, alias) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             alias);
+    char *alias_out = alias_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool alias_ignored = alias_out && strstr(alias_out, "ignore_worktrees is enabled") &&
+                         strstr(alias_out, "do not run index_repository") &&
+                         !strstr(alias_out, "Run index_repository");
+    free(alias_out);
+
+    /* A linked worktree nested inside the indexed checkout must not inherit
+     * that parent graph once ignore_worktrees is on. */
+    char insider[512];
+    snprintf(insider, sizeof(insider), "%s/inside-wt", maindir);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree add -q \"%s\" -b agl7inside", maindir,
+             insider);
+    bool inside_made = configured && system(cmd) == 0;
+    char inside_sub[600];
+    snprintf(inside_sub, sizeof(inside_sub), "%s/nested", insider);
+    bool inside_sub_made = inside_made && test_mkdirp(inside_sub) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             inside_sub);
+    char *inside_out = inside_sub_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool inside_ignored = inside_out && strstr(inside_out, "ignore_worktrees is enabled") &&
+                          strstr(inside_out, "do not run index_repository") &&
+                          !strstr(inside_out, "is indexed") && !strstr(inside_out, main_name);
+    free(inside_out);
+
+    /* Indexing that nested worktree itself must still win over the parent. */
+    char *inside_name = inside_made ? cbm_project_name_from_path(insider) : NULL;
+    bool inside_stored = false;
+    if (inside_name) {
+        char db_inside[900];
+        snprintf(db_inside, sizeof(db_inside), "%s/%s.db", cache, inside_name);
+        cbm_store_t *si = cbm_store_open_path(db_inside);
+        inside_stored = si && cbm_store_upsert_project(si, inside_name, insider) == CBM_STORE_OK;
+        if (si)
+            cbm_store_close(si);
+    }
+    char *exact_out = inside_stored ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool exact_kept = exact_out && inside_name && strstr(exact_out, inside_name) &&
+                      strstr(exact_out, "is indexed") &&
+                      !strstr(exact_out, "ignore_worktrees is enabled");
+    free(exact_out);
+
+    /* An unindexed worktree nested inside that indexed worktree must not
+     * inherit the outer worktree's graph. */
+    char child[600];
+    snprintf(child, sizeof(child), "%s/child-wt", insider);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree add -q \"%s\" -b agl7child", maindir,
+             child);
+    bool child_made = inside_stored && system(cmd) == 0;
+    char child_sub[700];
+    snprintf(child_sub, sizeof(child_sub), "%s/sub", child);
+    bool child_sub_made = child_made && test_mkdirp(child_sub) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             child_sub);
+    char *child_out = child_sub_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool child_ignored = child_out && inside_name &&
+                         strstr(child_out, "ignore_worktrees is enabled") &&
+                         strstr(child_out, "do not run index_repository") &&
+                         !strstr(child_out, "is indexed") && !strstr(child_out, inside_name);
+    free(child_out);
 
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
              maindir);
@@ -10640,6 +10722,7 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
 
     restore_test_env("CBM_CACHE_DIR", saved_cache);
     free(main_name);
+    free(inside_name);
     snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
              maindir, wtdir);
     (void)system(cmd);
@@ -10647,6 +10730,16 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
 
     if (!deliberate)
         FAIL("unindexed worktree must get a deliberate no-match notice, never a silent 0 bytes");
+    if (!honored)
+        FAIL("ignore_worktrees in the runtime config must change the unindexed-worktree note");
+    if (!alias_ignored)
+        FAIL("a symlink into an ignored worktree must not recommend index_repository");
+    if (!inside_ignored)
+        FAIL("a nested linked worktree must not inherit the indexed parent graph");
+    if (!exact_kept)
+        FAIL("an exact index of the nested worktree must still be reported");
+    if (!child_ignored)
+        FAIL("a worktree nested inside an indexed worktree must not inherit that graph");
     if (!main_ok)
         FAIL("the indexed main checkout must still resolve in the same matrix");
     PASS();
@@ -12536,14 +12629,18 @@ TEST(cli_hook_augment_subagent_tier_router_contract) {
 }
 
 TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only) {
-    const char *session = cbm_hook_no_project_index_guidance_for_testing("SessionStart");
-    const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart");
+    const char *session = cbm_hook_no_project_index_guidance_for_testing("SessionStart", false);
+    const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart", false);
+    const char *worktree = cbm_hook_no_project_index_guidance_for_testing("SessionStart", true);
     ASSERT_NOT_NULL(session);
     ASSERT_NOT_NULL(subagent);
+    ASSERT_NOT_NULL(worktree);
     ASSERT(strstr(session, "Run index_repository") != NULL);
     ASSERT(strstr(subagent, "Ask the parent agent to run index_repository") != NULL);
     ASSERT(strstr(subagent, "do not attempt graph mutation") != NULL);
     ASSERT(strstr(subagent, "Run index_repository") == NULL);
+    ASSERT(strstr(worktree, "ignore_worktrees is enabled") != NULL);
+    ASSERT(strstr(worktree, "do not run index_repository") != NULL);
     PASS();
 }
 
@@ -15941,6 +16038,19 @@ TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558) {
     PASS();
 }
 
+TEST(cli_ignore_worktrees_config_key_is_discoverable) {
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        if (key && strcmp(key, CBM_CONFIG_IGNORE_WORKTREES) == 0) {
+            listed = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(listed);
+    PASS();
+}
+
 TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
     const cbm_skill_t *sk = cbm_get_skills();
     ASSERT_NOT_NULL(sk);
@@ -16374,6 +16484,7 @@ SUITE(cli) {
     RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
     RUN_TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558);
+    RUN_TEST(cli_ignore_worktrees_config_key_is_discoverable);
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
