@@ -21,6 +21,7 @@
 #include "lsp/kotlin_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
+#include "sql_values.h" // #1735: literal INSERT rows kept out of the SQL parse
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
@@ -1773,6 +1774,19 @@ static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMD
     *regs = out;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Source bytes this thread has read to locate lines for the #1071 macro check
+ * (walks and line-table builds). Lets a test pin the check's cost as a count
+ * instead of a clock (#1735). Compiled only into seam-enabled test artifacts. */
+static CBM_TLS uint64_t tl_macro_line_scan_bytes = 0;
+uint64_t cbm_test_macro_line_scan_bytes(void) {
+    return tl_macro_line_scan_bytes;
+}
+#define CBM_MACRO_LINE_SCAN(n) (tl_macro_line_scan_bytes += (uint64_t)(n))
+#else
+#define CBM_MACRO_LINE_SCAN(n) ((void)0)
+#endif
+
 /* #1071: a function-like macro invocation whose argument is a type token
  * (e.g. ALLOC(int, n)) makes tree-sitter's C/C++ grammar emit an ERROR node — it
  * parses `int` in expression position — which would be recorded as a parse_partial
@@ -1862,6 +1876,7 @@ static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t 
         }
     }
     if (line != start_line) {
+        CBM_MACRO_LINE_SCAN(span_start);
         return false;
     }
     int span_end = span_start;
@@ -1870,6 +1885,7 @@ static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t 
             line++;
         }
     }
+    CBM_MACRO_LINE_SCAN(span_end);
     return cbm_byte_span_is_macro_invocation(src, src_len, span_start, span_end, defs);
 }
 
@@ -1896,21 +1912,59 @@ static bool cbm_region_inside_callable(uint32_t rs, uint32_t re, const CBMDefArr
     return false;
 }
 
+/* cbm_span_is_macro_invocation over a cbm_line_offsets table: offs[k] is where
+ * 1-based line k+1 starts and offs[nlines] is the end of the source, so a span
+ * costs two reads instead of a walk from byte 0. Same answer as the walk; falls
+ * back to it when there is no table. */
+static bool cbm_lines_are_macro_invocation(const char *src, int src_len, const uint32_t *offs,
+                                           uint32_t nlines, uint32_t start_line, uint32_t end_line,
+                                           const CBMDefArray *defs) {
+    if (!offs) {
+        return cbm_span_is_macro_invocation(src, src_len, start_line, end_line, defs);
+    }
+    if (!src || src_len <= 0 || !defs || start_line == 0 || end_line < start_line ||
+        start_line > nlines) {
+        return false;
+    }
+    uint32_t last = end_line < nlines ? end_line : nlines;
+    return cbm_byte_span_is_macro_invocation(src, src_len, (int)offs[start_line - 1],
+                                             (int)offs[last], defs);
+}
+
+/* #1071 subtraction. Both questions are pure, so asking the cheap one first
+ * changes no answer: "is the region inside a function?" reads only the
+ * definition list, while "is it a macro call?" has to find the region's lines
+ * in the source. A region no function encloses — every region of a file with
+ * no functions, such as a SQL data dump — never touches the source, and the
+ * ones that do share one line table built on first use. The old order walked
+ * the source from byte 0 for every region: regions x file bytes (#1735). */
 static void cbm_subtract_macro_invocation_regions(cbm_error_regions_t *regs,
                                                   const CBMDefArray *defs, const char *src,
                                                   int src_len) {
+    uint32_t *offs = NULL;
+    uint32_t nlines = 0;
+    bool offs_built = false;
     int kept = 0;
     for (int i = 0; i < regs->count; i++) {
-        bool benign =
-            cbm_span_is_macro_invocation(src, src_len, regs->starts[i], regs->ends[i], defs) &&
-            cbm_region_inside_callable(regs->starts[i], regs->ends[i], defs);
+        uint32_t rs = regs->starts[i];
+        uint32_t re = regs->ends[i];
+        bool benign = false;
+        if (cbm_region_inside_callable(rs, re, defs)) {
+            if (!offs_built) {
+                offs = cbm_line_offsets(src, src_len, &nlines);
+                offs_built = true;
+                CBM_MACRO_LINE_SCAN(src_len);
+            }
+            benign = cbm_lines_are_macro_invocation(src, src_len, offs, nlines, rs, re, defs);
+        }
         if (!benign) {
-            regs->starts[kept] = regs->starts[i];
-            regs->ends[kept] = regs->ends[i];
+            regs->starts[kept] = rs;
+            regs->ends[kept] = re;
             kept++;
         }
     }
     regs->count = kept;
+    cbm_free(CBM_MEM_CLASS_EXTRACT, offs);
 }
 
 /* Push [start, end] after trimming no-code lines off both ends. A run made
@@ -2072,6 +2126,21 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
 enum { CBM_EXTRACT_SCRATCH_BLOCK = CBM_SZ_512 * CBM_SZ_1K };
 enum { CBM_EXTRACT_SCRATCH_KEEP_BYTES = 4 * CBM_SZ_1K * CBM_SZ_1K };
 
+/* The #1735 value-row exclusion is always on. Test builds can turn it off for
+ * one file (CBM_TEST_SQL_FULL_PARSE_ON=<rel_path substring>) so a test can
+ * compare the excluded parse against the full one on the same source. */
+static bool cbm_sql_values_exclusion_on(const char *rel_path) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    const char *full_on = getenv("CBM_TEST_SQL_FULL_PARSE_ON");
+    if (full_on && full_on[0] && rel_path && strstr(rel_path, full_on)) {
+        return false;
+    }
+#else
+    (void)rel_path;
+#endif
+    return true;
+}
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -2180,7 +2249,19 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
 #endif
     }
 
+    /* #1735: a SQL data dump's literal-only INSERT rows carry no graph content
+     * but dominate its parse. Keep them out through included ranges; offsets
+     * and positions of everything kept are unchanged. The parser is
+     * thread-local and reused, so the ranges are cleared right after. */
+    CBMSqlKeptRanges sql_kept = {NULL, 0};
+    bool sql_ranged = language == CBM_LANG_SQL && cbm_sql_values_exclusion_on(rel_path) &&
+                      cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
+                      ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
+    if (sql_ranged) {
+        (void)ts_parser_set_included_ranges(parser, NULL, 0);
+    }
+    cbm_sql_kept_ranges_free(&sql_kept);
     uint64_t t1 = now_ns();
 #ifdef CBM_ENABLE_TEST_SEAMS
     t1 += tl_parse_wall_seam_offset_ns; /* the stall seam inflates every wall reading */

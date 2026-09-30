@@ -1309,6 +1309,27 @@ CBMLanguage cbm_disambiguate_frm(const char *path) {
     return has_vb6_markers(buf) ? CBM_LANG_COUNT : CBM_LANG_FORM;
 }
 
+/* Disambiguate .res files (#2176): ReScript source shares the extension with
+ * two binary formats -- Godot resources (RSRC/RSCC magic, the default save
+ * format for imported meshes) and Windows compiled resource files. Binary
+ * content has no ReScript meaning, and a NUL byte never occurs in ReScript
+ * text while both binary formats carry NULs in their first bytes. */
+CBMLanguage cbm_disambiguate_res(const char *path) {
+    if (!path) {
+        return CBM_LANG_RESCRIPT;
+    }
+
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return CBM_LANG_RESCRIPT;
+    }
+
+    char buf[CBM_SZ_4K];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    (void)fclose(f);
+    return memchr(buf, '\0', n) ? CBM_LANG_COUNT : CBM_LANG_RESCRIPT;
+}
+
 /* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
  * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
  * with a line of the form "Class <UppercasePackage>..."; VB6 class modules

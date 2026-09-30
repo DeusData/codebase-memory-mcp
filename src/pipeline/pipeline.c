@@ -193,6 +193,13 @@ struct cbm_pipeline {
     cbm_index_resource_policy_t resource_policy;
     cbm_index_resource_violation_t resource_violation;
 
+    /* Snapshot of the artifact export failure of THIS run (set only by
+     * export_after_publish failure, zeroed at run start, cleared on success).
+     * The MCP layer reads it to attribute a failed run to artifact export
+     * without consulting cbm_artifact_export_last_error() directly — that
+     * global can still hold a PREVIOUS run's error. */
+    char export_error[CBM_SZ_1K];
+
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
     cbm_registry_t *registry;
@@ -387,6 +394,10 @@ void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
     if (violation) {
         *violation = p ? p->resource_violation : (cbm_index_resource_violation_t){0};
     }
+}
+
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
+    return p ? p->export_error : "";
 }
 
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
@@ -1054,6 +1065,9 @@ static void predump_sem(cbm_pipeline_ctx_t *ctx) {
 static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_configlink(ctx);
 }
+static void predump_doclinks(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_doclinks(ctx);
+}
 static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_complexity(ctx);
 }
@@ -1180,7 +1194,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             }
             str_def_fp += def->fingerprint ? (size_t)def->fingerprint_k * sizeof(uint32_t) : 0;
             str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
-                            census_len(def->impl_trait);
+                            census_len(def->impl_trait) + census_len(def->http_base_url);
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];
@@ -1288,6 +1302,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     } passes[] = {
         {predump_deco, "decorator_tags", false},
         {predump_cfg, "configlink", false},
+        {predump_doclinks, "doclinks", false},
         {predump_route, "route_match", false},
         {predump_ensemble, "ensemble_routing", false},
         {predump_sim, "similarity", true},
@@ -3158,6 +3173,12 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
         if (rc != 0) {
             const char *err = cbm_artifact_export_last_error();
             cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+            /* #1665: snapshot the error of THIS run so the MCP layer can
+             * attribute the failure truthfully, instead of re-reading the
+             * process-global export error (which may describe a previous run)
+             * and instead of the generic "Pipeline failed" hint that blames
+             * repo_path for a write-permission failure. */
+            (void)snprintf(p->export_error, sizeof(p->export_error), "%s", err ? err : "unknown");
         }
         return rc;
     }
@@ -3393,6 +3414,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->export_error[0] = '\0';
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);

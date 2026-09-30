@@ -201,7 +201,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
 
 ### Search
-- **Semantic search** (`semantic_query`): vector search across the entire graph, powered by bundled Nomic `nomic-embed-code` embeddings (40K tokens, 768d int8) compiled into the binary — no API key, no Ollama, no Docker. 11-signal combined scoring (TF-IDF, RRI, API/Type/Decorator signatures, AST profiles, data flow, Halstead-lite, MinHash, module proximity, graph diffusion).
+- **Semantic search** (the `semantic_query` parameter of `search_graph`, not a separate tool): vector search across the entire graph, powered by bundled Nomic `nomic-embed-code` embeddings (40K tokens, 768d int8) compiled into the binary — no API key, no Ollama, no Docker. 11-signal combined scoring (TF-IDF, RRI, API/Type/Decorator signatures, AST profiles, data flow, Halstead-lite, MinHash, module proximity, graph diffusion).
 - **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware)
 - **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping
 - **Code search** (`search_code`): graph-augmented grep over indexed files only
@@ -245,12 +245,12 @@ The install script placed beside the binary is **reported, not deleted** — uni
 
 Commit a single compressed file to your repo and your teammates skip the reindex.
 
-`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. When you index, the artifact is written or refreshed; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact is decompressed and incremental indexing fills in their local diff.
+`.codebase-memory/graph.db.zst` is a zstd-compressed snapshot of the knowledge graph that lives next to your source. The artifact is opt-in: `index_repository` writes it only with `persistence: true` (the default is `false`), and once it exists later indexes refresh it; when a teammate clones the repo and runs `codebase-memory-mcp` for the first time, the artifact is decompressed and incremental indexing fills in their local diff.
 
 - **Format**: SQLite database, indexes stripped, `VACUUM INTO` compacted, then zstd 1.5.7 compressed (8–13:1 ratio typical)
 - **Two tiers**:
-  - **Best** (`zstd -9` + index strip + `VACUUM INTO`) — written on explicit `index_repository`
-  - **Fast** (`zstd -3`) — written by the watcher for low-latency incremental updates
+  - **Best** (`zstd -9` + index strip + `VACUUM INTO`) — written by `index_repository` with `persistence: true`
+  - **Fast** (`zstd -3`) — refreshes an existing artifact on every other index (including the watcher's low-latency incremental updates)
 - **Bootstrap**: when no local DB exists but the artifact is present, `index_repository` imports the artifact first, then runs incremental indexing — avoiding the full reindex cost
 - **No merge pain**: a `.codebase-memory/.gitattributes` line with `merge=ours` is auto-created on first export, so concurrent edits don't produce conflicts on the binary artifact
 - **Commit it deliberately**: the artifact is rewritten on every index, including the watcher's Fast tier, and git stores each rewrite as a full new blob. Committing every refresh is what turns a 20 MB file into gigabytes of history — one team reached ~6 GB across ~350 commits of this single path. Pick a cadence (a release, a milestone, a nightly job) rather than committing every save.
@@ -671,11 +671,38 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
+| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
+
+**Long indexes and client call deadlines.** A synchronous `index_repository` on a large
+repository can take longer than an MCP client allows one tool call (some IDE clients give up
+after a fixed deadline). When a client cancels or disconnects, the daemon cancels an index that
+nobody else is waiting for, so retrying the same blocking call never finishes. Use the async
+mode instead:
+
+1. `index_repository(repo_path="/abs/path", async: true)` starts the index in the daemon (or
+   joins the one already running for that project) and returns immediately with
+   `state` (`queued`/`running`). The job keeps running even if the client cancels, times out or
+   disconnects; only stopping the daemon ends it.
+2. `index_repository(repo_path="/abs/path", status: true)` reports `state`
+   (`queued`, `running`, `cancelling`, `succeeded`, `failed`, `cancelled`), `started_at`,
+   `finished_at` and an `error` summary. Poll it until the state is `succeeded`, `failed` or
+   `cancelled`. Pass the same `repo_path` (and `name`, if the index call used one).
+
+`async` and `status` are exclusive; `async` does not apply to `cross-repo-intelligence`. Both
+need the daemon-backed server (the default `codebase-memory-mcp` entry point). A temporary
+daemon (started on demand rather than by `codebase-memory-mcp daemon start`) stops, and
+cancels its jobs, when its last client disconnects. A connected MCP session keeps it alive, so
+async from your editor works. A one-shot `codebase-memory-mcp cli index_repository --async`
+that is the daemon's only client is refused with a clear error, because the job would die the
+moment the command exits: run `codebase-memory-mcp daemon start` first, keep an MCP session
+open, or call without `--async`. `status` works everywhere. When a synchronous call was cut
+short, the next
+`index_repository` or `status` call for that project carries a `notice` suggesting the async
+mode. `index_status` keeps describing the published graph and its freshness.
 
 ### Querying
 
@@ -706,7 +733,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
 
 ### Qualified Names
 
@@ -802,6 +829,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 |---------|-----|
 | `/mcp` doesn't show the server | Check `.mcp.json` path is absolute. Restart agent. Test: `echo '{}' \| /path/to/binary` should output JSON. |
 | `index_repository` fails | Pass absolute path: `index_repository(repo_path="/absolute/path")` |
+| `index_repository` times out in the client | Start it with `async: true`, then poll with `status: true` (see [Indexing](#indexing)). |
 | `trace_path` returns 0 results | Use `search_graph(name_pattern=".*PartialName.*")` first to find the exact name. |
 | Queries return wrong project results | Add `project="name"` parameter. Use `list_projects` to see names. |
 | Binary not found after install | Add to PATH: `export PATH="$HOME/.local/bin:$PATH"` |

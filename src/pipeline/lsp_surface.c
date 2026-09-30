@@ -125,6 +125,31 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
     }
     yyjson_mut_obj_add_val(doc, root, "reg", reg);
 
+    /* #1916: an axios instance binding's baseURL is consumed by the files
+     * that import it (their HTTP_CALLS compose base + path), so a changed
+     * base must change the surface or those importers keep stale edges.
+     * Written only when the file has such a binding: every other file's
+     * surface bytes — and so its sha — stay exactly what they were. The
+     * decoder ignores this key; it feeds the early-cutoff hash only. */
+    yyjson_mut_val *http = NULL;
+    for (int i = 0; result && i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (!d->http_client || !d->qualified_name) {
+            continue;
+        }
+        if (!http) {
+            http = yyjson_mut_arr(doc);
+        }
+        yyjson_mut_val *o = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, o, "q", d->qualified_name);
+        yyjson_mut_obj_add_str(doc, o, "c", d->http_client);
+        add_str_or_null(doc, o, "b", d->http_base_url);
+        yyjson_mut_arr_add_val(http, o);
+    }
+    if (http) {
+        yyjson_mut_obj_add_val(doc, root, "http", http);
+    }
+
     char *json = yyjson_mut_write(doc, 0, out_len);
     yyjson_mut_doc_free(doc);
     return json;
@@ -250,9 +275,15 @@ static const char **arena_str_array(CBMArena *arena, yyjson_val *arr, bool null_
     if (!items) {
         return NULL;
     }
-    for (int i = 0; i < count; i++) {
-        const char *s = yyjson_get_str(yyjson_arr_get(arr, (size_t)i));
-        items[i] = s ? cbm_arena_strdup(arena, s) : "?";
+    /* Iterate instead of yyjson_arr_get(i): that call is a linear scan for
+     * non-flat arrays (arrays of objects are not flat), which turns this loop
+     * into O(n^2) in the element count. */
+    yyjson_arr_iter iter = yyjson_arr_iter_with(arr);
+    int i = 0;
+    yyjson_val *item;
+    while ((item = yyjson_arr_iter_next(&iter))) {
+        const char *s = yyjson_get_str(item);
+        items[i++] = s ? cbm_arena_strdup(arena, s) : "?";
     }
     if (null_terminated) {
         items[count] = NULL;
@@ -288,9 +319,15 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         return -1;
     }
     memset(defs, 0, (size_t)count * sizeof(CBMLSPDef));
-    for (int i = 0; i < count; i++) {
-        yyjson_val *o = yyjson_arr_get(lsp, (size_t)i);
-        CBMLSPDef *d = &defs[i];
+    /* Iterate instead of yyjson_arr_get(i). `lsp` is an array of objects, which
+     * is not flat, so indexing rescans the preceding elements and the whole
+     * decode becomes O(n^2). One generated data file with ~300k defs made this
+     * step take minutes. */
+    yyjson_arr_iter iter = yyjson_arr_iter_with(lsp);
+    int i = 0;
+    yyjson_val *o;
+    while ((o = yyjson_arr_iter_next(&iter))) {
+        CBMLSPDef *d = &defs[i++];
         d->qualified_name = arena_str_or_null(arena, yyjson_obj_get(o, "qn"));
         d->short_name = arena_str_or_null(arena, yyjson_obj_get(o, "sn"));
         d->label = arena_str_or_null(arena, yyjson_obj_get(o, "lb"));

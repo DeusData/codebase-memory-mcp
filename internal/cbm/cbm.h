@@ -238,6 +238,14 @@ typedef struct {
      * that declared this method.  Kept at the tail so zero-initialised
      * callers in every other language remain ABI/source compatible. */
     const char *impl_trait;
+    /* JS/TS only (#1916): a module-level binding initialised by
+     * `axios.create(...)` records the client library here ("axios"), and the
+     * literal `baseURL` string (or NULL when absent / not a string literal).
+     * The Module def carries the pair when its default export is such a
+     * client. The call resolver composes `<binding>.get('/p')` into an
+     * HTTP_CALLS edge to base + path. Tail fields: zero-init stays valid. */
+    const char *http_client;
+    const char *http_base_url;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -299,6 +307,7 @@ typedef struct {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
 } CBMImport;
 
 typedef enum {
@@ -729,9 +738,6 @@ const char *cbm_index_quarantine_phase(const char *rel_path);
 void cbm_index_mark_start(const char *rel_path);
 void cbm_index_mark_done(const char *rel_path);
 
-// Extract all data from one file. Caller must call cbm_free_result().
-// source must remain valid for the duration of the call.
-// timeout_micros: per-file parse timeout in microseconds (0 = no timeout).
 /* Compact a finished result: copy everything reachable from it -- every
  * record array at exact count, every string once (interned by content within
  * the file), the retained source -- into one exact-size arena, and destroy the
@@ -767,6 +773,11 @@ void cbm_work_arena_keep_begin(void);
 /* Free the compaction scratch this thread kept (cbm_work_arena_release calls it). */
 void cbm_result_compact_release_thread(void);
 
+// Extract all data from one file. Caller must call cbm_free_result().
+// source must remain valid for the duration of the call.
+// timeout_micros: per-file tree-sitter parse budget in microseconds of the
+// calling thread's CPU time, with a wall-clock backstop of
+// CBM_PARSE_WALL_CEILING_FACTOR x the budget (0 = no budget).
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, // NULL-terminated, or NULL
@@ -799,6 +810,12 @@ void cbm_free_tree(CBMFileResult *result);
 
 // Free a standalone TSTree pointer (for Go layer cleanup).
 void cbm_free_tree_ptr(TSTree *tree);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+// Test-only: source bytes this thread has read to locate lines for the #1071
+// macro-invocation check, cumulative (#1735).
+uint64_t cbm_test_macro_line_scan_bytes(void);
+#endif
 
 // Reset the thread-local parser's internal state, releasing slab-allocated
 // subtrees. Must be called BEFORE cbm_slab_reset_thread() so the slab rebuild

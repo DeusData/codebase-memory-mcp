@@ -2774,9 +2774,14 @@ static int toml_codex_executable_is_safe(const char *encoded, size_t len, size_t
     *end = *start && len >= 2U && encoded[len - 1U] == '\'' ? len - 1U : len;
     if (*start && *end == len)
         return 0;
+    /* #2044: inside the single-quoted form a space is literal in sh and
+     * PowerShell alike, and cbm_shell_quote_word/cbm_powershell_quote_word
+     * emit it for a profile such as C:\Users\First Last. Only an unquoted
+     * word must be free of spaces, since the shell would split it. */
+    unsigned char lowest = *start ? 0x20U : 0x21U;
     for (size_t pos = *start; pos < *end;) {
         unsigned char ch = (unsigned char)encoded[pos++];
-        if (ch < 0x21U || ch == 0x7fU || (!*start && strchr("\"'`$;&|<>(){}[]*?!", ch))) {
+        if (ch < lowest || ch == 0x7fU || (!*start && strchr("\"'`$;&|<>(){}[]*?!", ch))) {
             return 0;
         }
         if (*start && ch == '\'') {

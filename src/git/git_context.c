@@ -2,6 +2,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -9,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 enum {
     GIT_CMD_MAX = 1024,
@@ -65,7 +65,7 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
@@ -314,8 +314,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return CBM_NOT_FOUND;
     }
 
-    struct stat st;
-    out->root_exists = (stat(path, &st) == 0);
+    out->root_exists = cbm_is_dir(path);
     if (!out->root_exists) {
         return 0;
     }

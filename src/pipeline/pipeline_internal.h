@@ -23,7 +23,10 @@
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
-/* Maximum byte budget for tree-sitter extraction per file */
+/* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time
+ * (5 s). Passed as cbm_extract_file*()'s timeout_micros; a generous wall-clock
+ * ceiling (CBM_PARSE_WALL_CEILING_FACTOR x, ~60 s) backstops a stuck parse.
+ * It is a time budget, not a byte budget. */
 #define CBM_EXTRACT_BUDGET 5000000
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
@@ -210,6 +213,21 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
  * Caller must free() the returned string. */
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path);
+
+/* #1916: HTTP client-instance calls. When `call` is `<recv>.<verb>(url)` with
+ * an HTTP verb suffix and a path/URL first argument, and `recv` is bound —
+ * in the calling module itself, or via an ES import (named or default) — to a
+ * binding the extractor marked as an `axios.create(...)` instance
+ * (`http_client` node property), write the request URL to `out` (the
+ * instance's literal `http_base_url` joined with a '/'-leading path, the path
+ * unchanged when the base is unknown or the URL is absolute) and return true.
+ * Both call resolvers (pass_calls.c, pass_parallel.c) call this before any
+ * route-registration or registry fallback, so a wrapper client's `api.get`
+ * is never mistaken for an Express `app.get` route registration. */
+bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                       const CBMFileResult *result, const char **imp_keys,
+                                       const char **imp_vals, int imp_count, const CBMCall *call,
+                                       char *out, size_t out_sz);
 
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
@@ -664,6 +682,9 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
+
+/* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
+int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
 
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);

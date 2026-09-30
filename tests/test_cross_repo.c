@@ -147,6 +147,84 @@ static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
     return ok;
 }
 
+/* Give the source project its own handler for the local Route the seeded
+ * HTTP_CALLS edge points at (caller-local HANDLES), as when a monorepo's
+ * client code calls the API the same repo serves. (#1459) */
+static bool cross_repo_seed_local_handler(const cross_repo_fixture_t *fixture,
+                                          const char *source_project, const char *suffix) {
+    char source_path[512];
+    if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path))) {
+        return false;
+    }
+    cbm_store_t *source = cbm_store_open_path(source_path);
+    if (!source) {
+        return false;
+    }
+    char local_route_qn[256];
+    char handler_qn[256];
+    snprintf(local_route_qn, sizeof(local_route_qn), "%s.local-route.%s", source_project, suffix);
+    snprintf(handler_qn, sizeof(handler_qn), "%s.local-handle.%s", source_project, suffix);
+    cbm_node_t route = {0};
+    bool ok =
+        cbm_store_find_node_by_qn(source, source_project, local_route_qn, &route) == CBM_STORE_OK;
+    int64_t route_id = ok ? route.id : 0;
+    if (ok) {
+        cbm_node_free_fields(&route);
+    }
+    cbm_node_t handler = {.project = source_project,
+                          .label = "Function",
+                          .name = "handle_local",
+                          .qualified_name = handler_qn,
+                          .file_path = "server.c"};
+    int64_t handler_id = ok ? cbm_store_upsert_node(source, &handler) : 0;
+    cbm_edge_t handles = {.project = source_project,
+                          .source_id = handler_id,
+                          .target_id = route_id,
+                          .type = "HANDLES"};
+    ok = ok && route_id > 0 && handler_id > 0 && cbm_store_insert_edge(source, &handles) > 0;
+    cbm_store_close(source);
+    return ok;
+}
+
+/* Give the source project a canonical "__route__GET__<path>" Route with its
+ * own handler, distinct from the node the seeded HTTP_CALLS points at — the
+ * shape extraction produces for a method-less fetch() against a local
+ * app.get() route. (#1459) */
+static bool cross_repo_seed_local_get_route(const cross_repo_fixture_t *fixture,
+                                            const char *source_project, const char *route_path) {
+    char source_path[512];
+    if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path))) {
+        return false;
+    }
+    cbm_store_t *source = cbm_store_open_path(source_path);
+    if (!source) {
+        return false;
+    }
+    char route_qn[256];
+    char handler_qn[256];
+    snprintf(route_qn, sizeof(route_qn), "__route__GET__%s", route_path);
+    snprintf(handler_qn, sizeof(handler_qn), "%s.local-get-handler", source_project);
+    cbm_node_t route = {.project = source_project,
+                        .label = "Route",
+                        .name = route_path,
+                        .qualified_name = route_qn,
+                        .file_path = "server.c"};
+    cbm_node_t handler = {.project = source_project,
+                          .label = "Function",
+                          .name = "handle_local_get",
+                          .qualified_name = handler_qn,
+                          .file_path = "server.c"};
+    int64_t route_id = cbm_store_upsert_node(source, &route);
+    int64_t handler_id = cbm_store_upsert_node(source, &handler);
+    cbm_edge_t handles = {.project = source_project,
+                          .source_id = handler_id,
+                          .target_id = route_id,
+                          .type = "HANDLES"};
+    bool ok = route_id > 0 && handler_id > 0 && cbm_store_insert_edge(source, &handles) > 0;
+    cbm_store_close(source);
+    return ok;
+}
+
 static bool cross_repo_exec(const cross_repo_fixture_t *fixture, const char *project,
                             const char *sql) {
     char path[512];
@@ -233,6 +311,93 @@ TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens) {
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.projects_scanned, 4);
     ASSERT_EQ(result.http_edges, 4);
+    PASS();
+}
+
+/* A project store written before the #768 edges.local_name_gen column: it
+ * still answers read-only queries (list_projects shows it), but the
+ * read-write open every cross-repo target needs refuses it until a reindex. */
+static bool cross_repo_create_pre768_project(const cross_repo_fixture_t *fixture,
+                                             const char *project) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return false;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+             "CREATE TABLE projects(name TEXT PRIMARY KEY, indexed_at TEXT NOT NULL,"
+             " root_path TEXT NOT NULL);"
+             "CREATE TABLE nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " label TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT NOT NULL,"
+             " file_path TEXT DEFAULT '', start_line INTEGER DEFAULT 0,"
+             " end_line INTEGER DEFAULT 0, properties TEXT DEFAULT '{}',"
+             " UNIQUE(project, qualified_name));"
+             "CREATE TABLE edges(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, type TEXT NOT NULL,"
+             " properties TEXT DEFAULT '{}', UNIQUE(source_id, target_id, type));"
+             "INSERT INTO projects VALUES('%s', '2026-06-01T00:00:00Z', '/pre768');",
+             project);
+    bool ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+/* #2133: ["*"] enumerated every store a read-only open accepts, then aborted
+ * the whole run on the first one the matcher's read-write open refused — a
+ * single pre-#768 index anywhere in the cache made the wildcard fail with
+ * "missing, invalid, or not indexed" while naming the same live targets
+ * worked. A store the matcher cannot use is not a wildcard target. */
+TEST(cross_repo_wildcard_skips_pre768_store_issue2133) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair(&fixture, "wild-src", "wild-api", "/orders", "w") &&
+                 cross_repo_create_pre768_project(&fixture, "aa-pre768-store");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed pre-#768 wildcard fixture");
+    }
+
+    const char *targets[] = {"*"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("wild-src", targets, 1);
+    int edges = cross_repo_count_edges(&fixture, "wild-src", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 1);
+    ASSERT_EQ(result.http_edges, 1);
+    ASSERT_EQ(edges, 1);
+    PASS();
+}
+
+/* Naming an unusable store stays an error, but it must be refused during
+ * validation, before the source's previous CROSS_* generation is deleted. */
+TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair(&fixture, "named-src", "named-api", "/orders", "n") &&
+                 cross_repo_create_pre768_project(&fixture, "aa-pre768-store");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed pre-#768 named fixture");
+    }
+
+    const char *live[] = {"named-api"};
+    cbm_cross_repo_result_t initial = cbm_cross_repo_match("named-src", live, 1);
+    int before = cross_repo_count_edges(&fixture, "named-src", "CROSS_HTTP_CALLS");
+    const char *with_pre768[] = {"named-api", "aa-pre768-store"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("named-src", with_pre768, 2);
+    int after = cross_repo_count_edges(&fixture, "named-src", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(initial.failed);
+    ASSERT_EQ(before, 1);
+    ASSERT_TRUE(result.failed);
+    ASSERT_EQ(after, before);
     PASS();
 }
 
@@ -469,6 +634,58 @@ TEST(cross_repo_pre_cancel_preserves_existing_cross_edges) {
     PASS();
 }
 
+/* #1133: a run whose targets resolve to nothing but the source project must
+ * fail explicitly. It used to report "success" with projects_scanned:0 --
+ * indistinguishable from "these services share no routes" -- and, worse, it
+ * had already wiped the source's existing CROSS_* edges before noticing there
+ * was nothing to match against. */
+TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "self-source", "self-target", "/self-only", "self");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed self-only fixture");
+    }
+
+    const char *target = "self-target";
+    cbm_cross_repo_result_t initial = cbm_cross_repo_match("self-source", &target, 1);
+    int before = cross_repo_count_edges(&fixture, "self-source", "CROSS_HTTP_CALLS");
+    const char *self = "self-source";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("self-source", &self, 1);
+    int after = cross_repo_count_edges(&fixture, "self-source", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(initial.failed);
+    ASSERT_TRUE(before > 0);
+    ASSERT_TRUE(result.failed);
+    ASSERT_TRUE(result.no_targets);
+    ASSERT_EQ(result.projects_scanned, 0);
+    ASSERT_EQ(after, before);
+    PASS();
+}
+
+/* #1133: ["*"] in a store that holds only the source project resolves to zero
+ * targets -- same contract as an explicit self-only list. */
+TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133) {
+    cross_repo_fixture_t fixture;
+    if (!cross_repo_fixture_begin(&fixture) ||
+        !cross_repo_create_project(&fixture, "lonely-source")) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to create isolated source project");
+    }
+
+    const char *targets[] = {"*"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("lonely-source", targets, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_TRUE(result.failed);
+    ASSERT_TRUE(result.no_targets);
+    ASSERT_EQ(result.projects_scanned, 0);
+    PASS();
+}
+
 /* Add the internal "<name>::missed" miss-graph row that indexing writes into
  * the SAME db whenever a file parses partially. */
 static bool cross_repo_add_missed_shadow(const cross_repo_fixture_t *fixture, const char *project) {
@@ -519,13 +736,111 @@ TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609) {
     PASS();
 }
 
+/* #1459 floor: a caller whose own project handles the route it calls is
+ * calling itself — another project exposing the same path is not evidence of
+ * a cross-service call. Neither direction of the pass may link it. */
+TEST(cross_repo_caller_local_handler_blocks_cross_http_issue1459) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "mono-1459", "api-1459", "/api/users", "mono") &&
+        cross_repo_seed_local_handler(&fixture, "mono-1459", "mono");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed caller-local route fixture");
+    }
+    const char *target = "api-1459";
+    cbm_cross_repo_result_t fwd = cbm_cross_repo_match("mono-1459", &target, 1);
+    const char *consumer = "mono-1459";
+    cbm_cross_repo_result_t rev = cbm_cross_repo_match("api-1459", &consumer, 1);
+    int mono_edges = cross_repo_count_edges(&fixture, "mono-1459", "CROSS_HTTP_CALLS");
+    int api_edges = cross_repo_count_edges(&fixture, "api-1459", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(fwd.failed);
+    ASSERT_FALSE(rev.failed);
+    ASSERT_EQ(fwd.http_edges, 0);
+    ASSERT_EQ(rev.http_edges, 0);
+    ASSERT_EQ(mono_edges, 0);
+    ASSERT_EQ(api_edges, 0);
+    PASS();
+}
+
+/* #1459 floor, real-world shape: a method-less client call points at the ANY
+ * Route node, while the caller's own handler sits on the GET node for the same
+ * path. The call is still served in-project and must not cross. */
+TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "mono2-1459", "api3-1459", "/api/users", "mono2") &&
+        cross_repo_exec(&fixture, "mono2-1459",
+                        "UPDATE edges SET properties = '{\"url_path\":\"/api/users\"}' "
+                        "WHERE type = 'HTTP_CALLS';") &&
+        cross_repo_seed_local_get_route(&fixture, "mono2-1459", "/api/users");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed method-less caller-local fixture");
+    }
+    const char *target = "api3-1459";
+    cbm_cross_repo_result_t fwd = cbm_cross_repo_match("mono2-1459", &target, 1);
+    const char *consumer = "mono2-1459";
+    cbm_cross_repo_result_t rev = cbm_cross_repo_match("api3-1459", &consumer, 1);
+    int mono_edges = cross_repo_count_edges(&fixture, "mono2-1459", "CROSS_HTTP_CALLS");
+    int api_edges = cross_repo_count_edges(&fixture, "api3-1459", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(fwd.failed);
+    ASSERT_FALSE(rev.failed);
+    ASSERT_EQ(fwd.http_edges, 0);
+    ASSERT_EQ(rev.http_edges, 0);
+    ASSERT_EQ(mono_edges, 0);
+    ASSERT_EQ(api_edges, 0);
+    PASS();
+}
+
+/* Control for the #1459 floor: without a caller-local handler the path match
+ * still links the caller to the remote handler, in both run directions. */
+TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "client-1459", "api2-1459", "/api/users", "client");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed remote-only route fixture");
+    }
+    const char *target = "api2-1459";
+    cbm_cross_repo_result_t fwd = cbm_cross_repo_match("client-1459", &target, 1);
+    int client_edges = cross_repo_count_edges(&fixture, "client-1459", "CROSS_HTTP_CALLS");
+    int api_edges = cross_repo_count_edges(&fixture, "api2-1459", "CROSS_HTTP_CALLS");
+    const char *consumer = "client-1459";
+    cbm_cross_repo_result_t rev = cbm_cross_repo_match("api2-1459", &consumer, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(fwd.failed);
+    ASSERT_FALSE(rev.failed);
+    ASSERT_EQ(fwd.http_edges, 1);
+    ASSERT_EQ(rev.http_edges, 1);
+    ASSERT_EQ(client_edges, 1);
+    ASSERT_EQ(api_edges, 1);
+    PASS();
+}
+
 SUITE(cross_repo) {
+    RUN_TEST(cross_repo_caller_local_handler_blocks_cross_http_issue1459);
+    RUN_TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459);
+    RUN_TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459);
     RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
+    RUN_TEST(cross_repo_wildcard_skips_pre768_store_issue2133);
+    RUN_TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133);
     RUN_TEST(cross_repo_scan_bound_counts_examined_rows_not_matches);
     RUN_TEST(cross_repo_propagates_delete_failure);
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);
     RUN_TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_target);
     RUN_TEST(cross_repo_pre_cancel_preserves_existing_cross_edges);
+    RUN_TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133);
+    RUN_TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133);
 }

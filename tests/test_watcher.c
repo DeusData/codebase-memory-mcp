@@ -2121,21 +2121,34 @@ TEST(watcher_sustained_failure_logs_once_issue2015) {
     failing_index_calls = 0;
     failing_index_fail_first_n = 100; /* never succeeds */
 
-    cbm_watcher_poll_once(w); /* baseline */
+    /* Baseline poll. Its outcome is not asserted: if a git probe fails here,
+     * the first loop poll takes the baseline instead. */
+    cbm_watcher_poll_once(w);
 
+    /* The change is a DIRTY worktree, not a commit. The baseline leaves the
+     * dirty signature at "clean known", so this change is seen whenever the
+     * baseline lands. A commit made before a late (or HEAD-less) baseline
+     * would be adopted as the baseline HEAD and never reindexed. */
     {
         char p[300];
         th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
     }
-    wt_git(tmpdir, "add file.txt");
-    wt_git(tmpdir, "commit -q -m add-world");
 
     sustained_log_hits = 0;
     cbm_log_set_sink(sustained_log_sink);
 
-    /* Drive well past the threshold (10). touch clears the deadline each time
-     * so every iteration actually attempts a reindex. */
-    for (int i = 0; i < 14; i++) {
+    /* Drive well past the threshold (10): poll until the 14th failed reindex.
+     * A poll does not always reach the index callback: when one of its git
+     * probes fails transiently (spawn refused under runner load) it is a
+     * fail-closed no-op by design (#937) and the next poll retries. So the
+     * loop waits for the attempt count instead of assuming one per poll;
+     * touch clears the backoff deadline each time. Each poll runs at most one
+     * attempt for this single project, so the loop stops at exactly 14. A
+     * watcher that never reindexes hangs here, which the runner reports as a
+     * failure, never a pass. No-op polls cannot add log lines to the count:
+     * sustained_failure is emitted only on a failed index attempt, when the
+     * streak EQUALS the threshold. */
+    while (failing_index_calls < 14) {
         cbm_watcher_touch(w, "sust-repo");
         cbm_watcher_poll_once(w);
     }
@@ -2892,10 +2905,41 @@ TEST(watcher_fallback_still_detects) {
     PASS();
 }
 
+/* Reindex counts for watcher_poll_only_watched_projects, split by project:
+ * the watched one, and anything else. */
+static int ow_watched_calls = 0;
+static int ow_other_calls = 0;
+static int ow_index_callback(const char *name, const char *path, void *ud) {
+    (void)path;
+    (void)ud;
+    if (name && strcmp(name, "projA-ow") == 0) {
+        ow_watched_calls++;
+    } else {
+        ow_other_calls++;
+    }
+    return 0;
+}
+
 TEST(watcher_poll_only_watched_projects) {
-    /* Port of TestPollAllOnlyWatched:
-     * Two repos exist, only one is watched → only the watched one
-     * gets polled and can trigger reindex. */
+    /* Port of TestPollAllOnlyWatched (#49: the watcher polls its explicit
+     * watch list, never every project the store knows). Two repos exist and
+     * BOTH are registered in the store, as in the Go original; only A is
+     * watched. Contract: B never gets watcher state and is never reindexed,
+     * and A's change is reindexed.
+     *
+     * No verdict depends on one git probe succeeding. The earlier version
+     * asserted that ONE poll after the change reindexed exactly once, and it
+     * never registered B anywhere the watcher could see, so its B half could
+     * not fail. A poll whose git probe fails transiently (spawn refused under
+     * runner load) is a fail-closed no-op by design (#937: the baseline stays
+     * uncommitted and the next poll retries), so that assert read
+     * `index_call_count == 0, expected 1` on a loaded macOS runner. Holding
+     * one exhausted spawn with cbm_subprocess_force_spawn_eagain_for_testing
+     * at that poll reproduces the CI line exactly. The test now polls until
+     * A's reindex has happened, and after every poll asserts the states that
+     * hold whatever git answers: B has no watcher state and no reindex. A
+     * watcher that never reindexes A hangs here, which the runner reports as
+     * a failure, never a pass. */
     char tmpdirA[256];
     snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_owA_XXXXXX");
     char tmpdirB[256];
@@ -2928,19 +2972,32 @@ TEST(watcher_poll_only_watched_projects) {
     wt_git(tmpdirB, "add b.txt");
     wt_git(tmpdirB, "commit -q -m init");
 
+    /* Both projects are known to the store. A watcher that polled stored
+     * projects instead of its watch list (the pre-#49 scan-all) adopts B. */
     cbm_store_t *store = cbm_store_open_memory();
-    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    ASSERT_EQ(cbm_store_upsert_project(store, "projA-ow", tmpdirA), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(store, "projB-ow", tmpdirB), CBM_STORE_OK);
+    cbm_watcher_t *w = cbm_watcher_new(store, ow_index_callback, NULL);
 
     /* Only watch A — B is NOT watched */
     cbm_watcher_watch(w, "projA-ow", tmpdirA);
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
-    index_call_count = 0;
+    ow_watched_calls = 0;
+    ow_other_calls = 0;
 
-    /* Baseline */
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 0);
+    /* Baseline poll. Its git outcome is not asserted: if a probe fails here,
+     * a later poll takes the baseline instead. A baseline poll never indexes,
+     * whatever git answers, and it must not adopt B. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ow_watched_calls + ow_other_calls, 0);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "projB-ow"), -1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
 
-    /* Make BOTH repos dirty */
+    /* Make BOTH repos dirty. A dirty worktree, not a commit: the baseline
+     * keeps the dirty signature at "clean known", so A's change is seen
+     * whenever the baseline lands, even if the baseline poll above failed. A
+     * commit made before a late baseline would be adopted as the baseline
+     * HEAD and never reindexed. */
     {
         char _p[1024];
         snprintf(_p, sizeof(_p), "%s/a.txt", tmpdirA);
@@ -2952,10 +3009,18 @@ TEST(watcher_poll_only_watched_projects) {
         th_append_file(_p, "dirty\n");
     }
 
-    /* Poll — only A should trigger (B is not watched) */
-    cbm_watcher_touch(w, "projA-ow");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
+    /* Poll until A's reindex. touch clears the adaptive interval so every
+     * poll checks A; each poll runs at most one attempt for A, so the loop
+     * stops at exactly one. After EVERY poll, B has no watcher state and no
+     * reindex, whether or not that poll's git probes succeeded. */
+    while (ow_watched_calls == 0) {
+        cbm_watcher_touch(w, "projA-ow");
+        cbm_watcher_poll_once(w);
+        ASSERT_EQ(ow_other_calls, 0);
+        ASSERT_EQ(cbm_watcher_index_failure_count(w, "projB-ow"), -1);
+        ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    }
+    ASSERT_EQ(ow_watched_calls, 1);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -3361,8 +3426,22 @@ TEST(watcher_callback_data_passed) {
 }
 
 TEST(watcher_unwatch_drains_pending_free) {
-    /* Unwatch moves project_state to pending_free; the next poll_once
-     * must drain it without crash or leak. */
+    /* Contract: unwatch parks the project's state on the deferred-free list
+     * (an in-flight poll snapshot may still hold it), and the NEXT poll_once
+     * frees it, exactly once, without admitting index work for the unwatched
+     * project.
+     *
+     * No assertion here depends on a git probe succeeding. The earlier
+     * version asserted as a precondition that one dirty poll reindexed
+     * exactly once, which needs every git subprocess of that poll to
+     * succeed. A transient probe failure (spawn refused under runner load, a
+     * non-zero exit) makes that poll a fail-closed no-op by design (#937:
+     * the baseline stays uncommitted and the next poll retries), so the
+     * precondition read 0 on loaded macos-14 runners. Holding a spawn
+     * failure with cbm_subprocess_force_spawn_eagain_for_testing reproduces
+     * that CI log exactly. Dirty-poll-reindexes stays covered by
+     * watcher_detects_dirty_worktree and watcher_modify_tracked_file; this
+     * test pins the drain itself, through the pending-free seam. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_df_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -3383,28 +3462,35 @@ TEST(watcher_unwatch_drains_pending_free) {
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
     cbm_watcher_watch(w, "df-repo", tmpdir);
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
     index_call_count = 0;
 
-    /* Baseline */
+    /* Baseline: the state goes through a poll snapshot. Its outcome is not
+     * asserted; a baseline poll never indexes, whatever git answers. */
     cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 0);
 
-    /* Make dirty + detect change */
+    /* Leave a new dirty state behind: if the unwatched state were still
+     * polled, the next poll would index it. */
     {
         char p[300];
         th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
     }
     cbm_watcher_touch(w, "df-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
 
-    /* Unwatch — state moves to pending_free */
+    /* Unwatch: the state leaves the table and is parked, not freed. */
     cbm_watcher_unwatch(w, "df-repo");
     ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 1);
 
-    /* Next poll drains pending_free — no crash, no double-free */
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
+    /* The next poll drains it and admits no index work. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* A further poll finds nothing left to free (no double free). */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
+    ASSERT_EQ(index_call_count, 0);
 
     cbm_watcher_free(w);
     cbm_store_close(store);

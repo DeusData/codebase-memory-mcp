@@ -45,6 +45,10 @@ enum {
     MAIN_MAX_PORT = 65536,
     MAIN_PATH_CAP = 4096,
     MAIN_CONNECT_TIMEOUT_MS = 1000,
+    /* #2277: the conflict-remedy STATUS probe runs only after a refusal, so it
+     * gets the same budget as `daemon status`: the daemon hashes the peer's
+     * (~300 MB) image before answering, which can exceed a 1 s connect budget. */
+    MAIN_CONFLICT_STATUS_PROBE_TIMEOUT_MS = 3000,
     MAIN_STARTUP_TIMEOUT_MS = 10000,
     /* Backstop for waiting out a held startup transition — see
      * main_local_transition_acquire. Not a budget for healthy contention: a busy
@@ -675,13 +679,7 @@ static bool client_start_parent_watchdog(DWORD initial_ppid) {
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE                                                                             \
-    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
-    "[json_args]\n"                                                                           \
-    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
-    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
-    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
-    "  --json      Print the raw MCP result envelope\n"
+#define CLI_USAGE CBM_CLI_USAGE /* `cli --help`; wording lives in cli.h (#2102) */
 
 /* Extract text content from MCP tool result envelope and print it.
  * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
@@ -1704,6 +1702,10 @@ static bool main_semver_newer(const char *candidate, const char *active) {
     return false;
 }
 
+/* A conflict refusal plus its remedy (#2277), joined by one space. */
+#define MAIN_CLIENT_FAILURE_DETAIL_CAP \
+    (CBM_DAEMON_CONFLICT_MESSAGE_SIZE + CBM_DAEMON_CONFLICT_REMEDY_SIZE + 1U)
+
 /* A client that cannot reach the daemon must SAY SO, in the caller's own
  * protocol. An MCP client speaks JSON-RPC over stdout, and the old path
  * returned EXIT_FAILURE having written nothing at all: agents saw a transport
@@ -1727,7 +1729,7 @@ static bool main_semver_newer(const char *candidate, const char *active) {
  * just the one that happened to be fixed first. */
 static void main_report_client_failure(cbm_daemon_process_role_t role, const char *detail) {
     if (cbm_daemon_process_role_requires_client(role)) {
-        char escaped[CBM_DAEMON_CONFLICT_MESSAGE_SIZE * 2];
+        char escaped[MAIN_CLIENT_FAILURE_DETAIL_CAP * 2];
         size_t out = 0;
         for (size_t i = 0; detail[i] && out + 2 < sizeof(escaped); i++) {
             unsigned char c = (unsigned char)detail[i];
@@ -1752,10 +1754,35 @@ static void main_report_client_failure(cbm_daemon_process_role_t role, const cha
 
 static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
                                                  const cbm_daemon_bootstrap_result_t *result) {
-    main_report_client_failure(role, (result && result->message[0])
-                                         ? result->message
-                                         : "CBM daemon connection failed before the session was "
-                                           "established");
+    const char *message = (result && result->message[0])
+                              ? result->message
+                              : "CBM daemon connection failed before the session was "
+                                "established";
+    char detail[MAIN_CLIENT_FAILURE_DETAIL_CAP];
+    (void)snprintf(detail, sizeof(detail), "%s%s%s", message,
+                   (result && result->remedy[0]) ? " " : "", result ? result->remedy : "");
+    main_report_client_failure(role, detail);
+}
+
+/* #2277: a conflict is a legitimate refusal (another build owns the account
+ * daemon), but it must name that daemon and the way out. known_active is a
+ * STATUS answer the caller already holds; without one this probes STATUS
+ * (cross-build by design) itself. When nothing answers, the remedy falls
+ * back to pointing at `daemon status`. */
+static void main_conflict_remedy_probe(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                       const cbm_daemon_build_identity_t *identity,
+                                       const cbm_daemon_runtime_status_t *known_active, char *out,
+                                       size_t out_size) {
+    cbm_daemon_runtime_status_t probed;
+    const cbm_daemon_runtime_status_t *active = known_active;
+    if (!active && endpoint && identity &&
+        cbm_daemon_runtime_request_status(endpoint, identity, MAIN_CONFLICT_STATUS_PROBE_TIMEOUT_MS,
+                                          &probed)) {
+        active = &probed;
+    }
+    if (!cbm_daemon_conflict_remedy_format(active, out, out_size)) {
+        out[0] = '\0';
+    }
 }
 
 /* Client bootstrap with the upgrade policy: a CONFLICT against a PERMANENT
@@ -1772,10 +1799,13 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
         return status;
     }
     cbm_daemon_runtime_status_t active;
-    if (!cbm_daemon_runtime_request_status(config->endpoint, config->identity,
-                                           MAIN_CONNECT_TIMEOUT_MS, &active) ||
-        !active.permanent ||
+    bool active_known = cbm_daemon_runtime_request_status(config->endpoint, config->identity,
+                                                          MAIN_CONNECT_TIMEOUT_MS, &active);
+    if (!active_known || !active.permanent ||
         !main_semver_newer(config->identity->semantic_version, active.semantic_version)) {
+        main_conflict_remedy_probe(config->endpoint, config->identity,
+                                   active_known ? &active : NULL, result->remedy,
+                                   sizeof(result->remedy));
         return status;
     }
     if (report_lifecycle) {
@@ -1792,9 +1822,16 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
         !drain.accepted) {
         (void)fprintf(stderr, "codebase-memory-mcp: the active daemon did not accept the "
                               "upgrade drain; run `codebase-memory-mcp daemon stop`\n");
+        main_conflict_remedy_probe(config->endpoint, config->identity, &active, result->remedy,
+                                   sizeof(result->remedy));
         return status;
     }
-    return cbm_daemon_bootstrap_execute(config, result);
+    status = cbm_daemon_bootstrap_execute(config, result);
+    if (status == CBM_DAEMON_BOOTSTRAP_CONFLICT) {
+        main_conflict_remedy_probe(config->endpoint, config->identity, NULL, result->remedy,
+                                   sizeof(result->remedy));
+    }
+    return status;
 }
 
 /* One-shot CLI commands execute through the shared daemon, exactly like MCP
@@ -1831,6 +1868,9 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
         (void)fprintf(stderr, "error: %s\n",
                       bootstrap.message[0] ? bootstrap.message
                                            : "no CBM daemon connection for CLI execution");
+        if (bootstrap.remedy[0]) {
+            (void)fprintf(stderr, "hint: %s\n", bootstrap.remedy);
+        }
         return NULL;
     }
     if (bootstrap.daemon_spawned && cbm_log_get_level() <= CBM_LOG_INFO) {
@@ -2876,13 +2916,17 @@ int main(int argc, char **argv) {
             char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
             bool formatted = cohort_status == CBM_VERSION_COHORT_CONFLICT &&
                              cbm_daemon_conflict_format(&cohort_conflict, message, sizeof(message));
+            char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE] = "";
             if (cohort_status == CBM_VERSION_COHORT_CONFLICT) {
                 (void)cbm_version_cohort_log_conflict(&cohort_conflict);
+                main_conflict_remedy_probe(local_endpoint, &local_identity, NULL, remedy,
+                                           sizeof(remedy));
             }
-            (void)fprintf(stderr, "codebase-memory-mcp: %s\n",
+            (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n",
                           formatted ? message
                                     : "CLI exact-build admission could not be verified; retry "
-                                      "after active CBM operations exit");
+                                      "after active CBM operations exit",
+                          remedy[0] ? " " : "", remedy);
             goto local_cli_cleanup;
         }
         main_local_maintenance_context_init(&maintenance_context);
@@ -3204,11 +3248,17 @@ int main(int argc, char **argv) {
         bool formatted =
             client_cohort_status == CBM_VERSION_COHORT_CONFLICT &&
             cbm_daemon_conflict_format(&client_cohort_conflict, message, sizeof(message));
+        char remedy[CBM_DAEMON_CONFLICT_REMEDY_SIZE] = "";
         if (client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
             (void)cbm_version_cohort_log_conflict(&client_cohort_conflict);
+            /* Hooks fail open on a tight budget; they skip the extra probe. */
+            if (role != CBM_DAEMON_PROCESS_HOOK_CLIENT) {
+                main_conflict_remedy_probe(endpoint, &identity, NULL, remedy, sizeof(remedy));
+            }
         }
-        (void)fprintf(stderr, "codebase-memory-mcp: %s\n",
-                      formatted ? message : "client exact-build admission failed");
+        (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n",
+                      formatted ? message : "client exact-build admission failed",
+                      remedy[0] ? " " : "", remedy);
         if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT &&
             client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
             main_hook_report_conflicted_daemon(hook_dialect);

@@ -393,6 +393,7 @@ static watcher_git_status_t watcher_git_run(cbm_watcher_t *w, project_state_t *s
         .quiet_timeout_ms = 0,
         .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
         .delete_log_on_exit = false,
+        .strip_git_repo_env = true, /* #2003: an inherited GIT_DIR must not redirect -C */
     };
     cbm_subprocess_t *process = NULL;
     if (cbm_subprocess_spawn(&options, &process) != 0) {
@@ -1653,3 +1654,15 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
     cbm_log_info("watcher.stop");
     return 0;
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+int cbm_watcher_test_pending_free_count(cbm_watcher_t *w) {
+    if (!w) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    int count = w->pending_free_count;
+    cbm_mutex_unlock(&w->projects_lock);
+    return count;
+}
+#endif

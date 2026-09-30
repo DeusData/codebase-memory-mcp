@@ -18,11 +18,13 @@
 #include <cli/cli.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
+#include <daemon/ipc.h>
 #include <daemon/runtime.h>
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
 #include <foundation/log.h>
 #include <foundation/platform.h>
+#include <foundation/private_file_lock.h>
 #include <foundation/sha256.h>
 #include <mcp/mcp.h>
 #include <mcp/index_supervisor.h>
@@ -1653,8 +1655,9 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     (void)write(ready_fd, &ready, 1);
     close(ready_fd);
     bool drained = false;
-    uint64_t deadline = cbm_now_ms() + 120000U;
-    while (ready_ok && cbm_now_ms() < deadline) {
+    /* The parent owns the release pipe. If it exits, poll observes POLLHUP;
+     * a fixed lifetime can stop a healthy host during a slow binary install. */
+    while (ready_ok) {
         if (cbm_daemon_runtime_service_wait_exited(service, 50U)) {
             drained = true;
             break;
@@ -2036,6 +2039,139 @@ TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing) {
     ASSERT_TRUE(nothing_drained);
     PASS();
 }
+
+/* cli_scope_install with the activation's stdout captured into out. */
+static int cli_scope_install_captured(cli_scope_fixture_t *fixture, const char *home,
+                                      const char *cache, const char *bin_dir, bool skip_binary,
+                                      char *out, size_t out_size) {
+    out[0] = '\0';
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    bool redirected = false;
+    if (capture && saved_stdout >= 0) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
+    }
+    int rc = redirected ? cli_scope_install(fixture, home, cache, bin_dir, skip_binary) : -1;
+    if (redirected) {
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(out, 1, out_size - 1U, capture);
+        out[count] = '\0';
+        fclose(capture);
+    }
+    return rc;
+}
+
+/* The notice an activation prints when it leaves a daemon it could not
+ * confirm as its own: names the daemon by pid and tells the user how to stop
+ * it themselves. Never the "Stopping ..." banner of a drain. */
+static bool cli_scope_kept_notice_names_host(const char *output, pid_t host) {
+    char pid_text[48];
+    snprintf(pid_text, sizeof(pid_text), "(pid %ld, version %s)", (long)host, CBM_VERSION);
+    return strstr(output, "Leaving the running CBM daemon untouched") != NULL &&
+           strstr(output, pid_text) != NULL &&
+           strstr(output, "codebase-memory-mcp daemon stop") != NULL &&
+           strstr(output, "Stopping active CBM sessions") == NULL;
+}
+
+/* (e) USER DECISION 2026-09-28, "unknown = foreign, keep it": the scope read
+ * reaches the active cohort but cannot read its cache identity. Ownership is
+ * unconfirmed, so the sandbox install must leave the host daemon serving,
+ * stop no session, and say which daemon it left and how to stop it. The
+ * install publishes a binary (no --skip-binary): an activation that replaces
+ * nothing never consults the cohort at all (test d). */
+TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "unread");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    bool prepared = ready && cbm_mkdir_p(foreign_home, 0700);
+    char output[16384];
+    output[0] = '\0';
+    cbm_cli_set_activation_scope_cache_unreadable_for_test(true);
+    int install_rc = prepared
+                         ? cli_scope_install_captured(&fixture, foreign_home, foreign_cache,
+                                                      foreign_bin, false, output, sizeof(output))
+                         : -1;
+    cbm_cli_set_activation_scope_cache_unreadable_for_test(false);
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    bool notice = cli_scope_kept_notice_names_host(output, fixture.host);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(nothing_drained);
+    ASSERT_TRUE(notice);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(completed);
+    PASS();
+}
+
+/* (f) Same decision, busy group: another activation holds the cohort
+ * maintenance gate, so the scope read cannot reach the active identity at
+ * all. Unconfirmed ownership keeps the host daemon; the sandbox install
+ * completes without draining anyone. The gate is held through the product's
+ * own lock-directory handle on the name version_cohort.c uses. */
+TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "busy");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    cbm_private_lock_directory_t *lock_directory = NULL;
+    cbm_private_file_lock_t *maintenance = NULL;
+    bool held = ready &&
+                cbm_daemon_ipc_private_lock_directory_new(fixture.endpoint, &lock_directory) ==
+                    CBM_PRIVATE_FILE_LOCK_OK &&
+                cbm_private_file_lock_try_acquire(
+                    lock_directory, "cbm-version-cohort-maintenance-v1.lock",
+                    CBM_PRIVATE_FILE_LOCK_EX, &maintenance) == CBM_PRIVATE_FILE_LOCK_OK;
+    bool prepared = held && cbm_mkdir_p(foreign_home, 0700);
+    char output[16384];
+    output[0] = '\0';
+    int install_rc = prepared
+                         ? cli_scope_install_captured(&fixture, foreign_home, foreign_cache,
+                                                      foreign_bin, false, output, sizeof(output))
+                         : -1;
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    bool released =
+        maintenance && cbm_private_file_lock_release(&maintenance) == CBM_PRIVATE_FILE_LOCK_OK;
+    if (lock_directory) {
+        cbm_private_lock_directory_close(lock_directory);
+    }
+    bool notice = cli_scope_kept_notice_names_host(output, fixture.host);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(held);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(nothing_drained);
+    ASSERT_TRUE(notice);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(released);
+    PASS();
+}
 #endif
 
 TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
@@ -2282,6 +2418,71 @@ TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054) {
     ASSERT_TRUE(db_absent);
     ASSERT_TRUE(wal_absent);
     ASSERT_TRUE(shm_absent);
+    PASS();
+}
+
+/* The cache directory also holds internal stores next to the project
+ * indexes: the user's settings (_config.db) and the cross-repo store
+ * (_cross_repo.db). Index enumeration treated every *.db as a project, so
+ * install --reset-indexes / uninstall deleted the user's config along with
+ * the indexes, and list/count over-reported. Internal stores are exact
+ * filenames: a real project whose name starts with "_" is still an index. */
+TEST(cli_index_enumeration_skips_internal_cache_dbs) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-internal-dbs-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    int set_rc = cfg ? cbm_config_set(cfg, "auto_index", "true") : -1;
+    cbm_config_close(cfg);
+
+    char config_path[640];
+    char cross_path[640];
+    char proj_path[640];
+    char underscore_proj_path[640];
+    snprintf(config_path, sizeof(config_path), "%s/_config.db", cache_dir);
+    snprintf(cross_path, sizeof(cross_path), "%s/_cross_repo.db", cache_dir);
+    snprintf(proj_path, sizeof(proj_path), "%s/proj.db", cache_dir);
+    snprintf(underscore_proj_path, sizeof(underscore_proj_path), "%s/_work-api.db", cache_dir);
+    write_test_file(cross_path, "cross");
+    write_test_file(proj_path, "db");
+    write_test_file(underscore_proj_path, "db");
+
+    int listed = cbm_list_indexes(tmpdir);
+    int removed = cbm_remove_indexes(tmpdir);
+
+    struct stat st;
+    bool config_kept = stat(config_path, &st) == 0;
+    bool cross_kept = stat(cross_path, &st) == 0;
+    bool proj_absent = stat(proj_path, &st) != 0;
+    bool underscore_proj_absent = stat(underscore_proj_path, &st) != 0;
+    char value[32] = "";
+    cfg = cbm_config_open(cache_dir);
+    if (cfg) {
+        snprintf(value, sizeof(value), "%s", cbm_config_get(cfg, "auto_index", ""));
+        cbm_config_close(cfg);
+    }
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(listed, 2);
+    ASSERT_EQ(removed, 2);
+    ASSERT_TRUE(config_kept);
+    ASSERT_TRUE(cross_kept);
+    ASSERT_TRUE(proj_absent);
+    ASSERT_TRUE(underscore_proj_absent);
+    ASSERT_STR_EQ(value, "true");
     PASS();
 }
 
@@ -7412,6 +7613,109 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
     PASS();
 }
 
+/* The OpenCode subagent profile as v0.10.8 wrote it: today's rendering minus
+ * the tool_search / tool_search_regex permission lines #1933 added in
+ * v0.11.0. Derived by deleting exactly those lines, so the test states the
+ * released bytes without going through any production legacy renderer. */
+static char *opencode_profile_before_tool_search(cbm_graph_tier_t tier) {
+    char *current =
+        cbm_render_graph_profile(CBM_GRAPH_DIALECT_OPENCODE, tier, CBM_GRAPH_ACCESS_DIRECT, NULL);
+    if (!current) {
+        return NULL;
+    }
+    const char *const added[] = {"  tool_search: allow\n", "  tool_search_regex: allow\n"};
+    for (size_t i = 0U; i < sizeof(added) / sizeof(added[0]); i++) {
+        char *at = strstr(current, added[i]);
+        if (!at) {
+            free(current);
+            return NULL;
+        }
+        size_t len = strlen(added[i]);
+        memmove(at, at + len, strlen(at + len) + 1U);
+    }
+    return current;
+}
+
+/* #2264: upgrading v0.10.8 -> v0.11.0 reported all three OpenCode profiles
+ * as "preserved modified profile" + op=agent_install errors and stopped the
+ * activation, although nobody had edited them: the release render changed
+ * and the previous render was not recognised as ours. */
+TEST(cli_tiered_opencode_profiles_migrate_v0108_render) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-tiered-opencode-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {
+        "HOME",           "PATH",      "CODEX_HOME",      "QWEN_HOME",          "COPILOT_HOME",
+        "CLINE_DATA_DIR", "KIRO_HOME", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char agents_dir[512];
+    snprintf(agents_dir, sizeof(agents_dir), "%s/.config/opencode/agents", tmpdir);
+    test_mkdirp(agents_dir);
+    char paths[CBM_GRAPH_TIER_COUNT][640];
+    bool seeded = true;
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        cbm_graph_tier_t tier = (cbm_graph_tier_t)t;
+        snprintf(paths[t], sizeof(paths[t]), "%s/%s.md", agents_dir, cbm_graph_tier_slug(tier));
+        char *old = opencode_profile_before_tool_search(tier);
+        seeded = seeded && old != NULL;
+        if (old) {
+            write_test_file(paths[t], old);
+            free(old);
+        }
+    }
+
+    char installed_binary[640];
+    snprintf(installed_binary, sizeof(installed_binary), "%s/.local/bin/codebase-memory-mcp",
+             tmpdir);
+    int install_rc = cbm_install_agent_configs(tmpdir, installed_binary, false, false);
+    bool migrated = true;
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        char *after = read_test_file_alloc(paths[t]);
+        migrated = migrated && after && strstr(after, "  tool_search: allow\n") &&
+                   strstr(after, "  tool_search_regex: allow\n");
+        free(after);
+    }
+
+    /* Uninstall must also recognise the v0.10.8 bytes as ours. */
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        char *old = opencode_profile_before_tool_search((cbm_graph_tier_t)t);
+        if (old) {
+            write_test_file(paths[t], old);
+            free(old);
+        }
+    }
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    bool removed = true;
+    struct stat state;
+    for (int t = 0; t < (int)CBM_GRAPH_TIER_COUNT; t++) {
+        removed = removed && stat(paths[t], &state) != 0;
+    }
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!seeded)
+        FAIL("v0.10.8 OpenCode profile bytes could not be derived");
+    ASSERT_EQ(install_rc, 0);
+    if (!migrated)
+        FAIL("v0.10.8 OpenCode profiles must be upgraded in place, not preserved as modified");
+    ASSERT_EQ(uninstall_rc, 0);
+    if (!removed)
+        FAIL("uninstall must remove v0.10.8 OpenCode profiles as owned");
+    PASS();
+}
+
 TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-tiered-vibe-XXXXXX");
@@ -10379,6 +10683,175 @@ TEST(cli_hook_session_exhausts_project_registry_pages) {
         FAIL("SessionStart must exhaust list_projects pages before resolving root_path");
     PASS();
 }
+
+#ifndef _WIN32
+/* A linked git worktree is indexed as its OWN project, keyed by its checkout
+ * path. The SessionStart hook must return that project for a payload cwd inside
+ * the worktree (or a subdir of it) — never the main checkout's — and the main
+ * checkout's own resolution must be unchanged. Pins the payload-cwd → project
+ * resolution so a worktree can never regress to resolving a sibling checkout or
+ * to nothing (the historical silent-0-bytes worktree bug). */
+TEST(cli_hook_worktree_cwd_resolves_own_indexed_project) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-worktree-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char maindir[512];
+    char wtdir[512];
+    char subdir[600];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(maindir, sizeof(maindir), "%s/checkout-main", tmpdir);
+    snprintf(wtdir, sizeof(wtdir), "%s/checkout-side", tmpdir);
+    snprintf(subdir, sizeof(subdir), "%s/nested", wtdir);
+    test_mkdirp(cache);
+    test_mkdirp(maindir);
+
+    /* A real linked worktree so is_worktree/git_common_dir/canonical_root are
+     * exactly what the hook resolves against in the field. */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "cd \"%s\" && git init -q && git config user.email t@t && git config user.name t && "
+             ": > f.txt && git add f.txt && git commit -qm init && "
+             "git worktree add -q \"%s\" -b agl7branch",
+             maindir, wtdir);
+    if (system(cmd) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("git worktree setup failed");
+    }
+    test_mkdirp(subdir);
+
+    /* Register each checkout as its own indexed project under the exact
+     * path-derived name the indexer uses (the db filename == that name). */
+    char *main_name = cbm_project_name_from_path(maindir);
+    char *wt_name = cbm_project_name_from_path(wtdir);
+    ASSERT_NOT_NULL(main_name);
+    ASSERT_NOT_NULL(wt_name);
+    ASSERT_STR_NEQ(main_name, wt_name);
+    char db_main[900];
+    char db_wt[900];
+    snprintf(db_main, sizeof(db_main), "%s/%s.db", cache, main_name);
+    snprintf(db_wt, sizeof(db_wt), "%s/%s.db", cache, wt_name);
+    cbm_store_t *sm = cbm_store_open_path(db_main);
+    ASSERT_NOT_NULL(sm);
+    ASSERT_EQ(cbm_store_upsert_project(sm, main_name, maindir), CBM_STORE_OK);
+    cbm_store_close(sm);
+    cbm_store_t *sw = cbm_store_open_path(db_wt);
+    ASSERT_NOT_NULL(sw);
+    ASSERT_EQ(cbm_store_upsert_project(sw, wt_name, wtdir), CBM_STORE_OK);
+    cbm_store_close(sw);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* The two names share a prefix but diverge (checkout-main vs checkout-side),
+     * so a bare-name strstr for one never matches the other's context. */
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
+    char *wt_out = cbm_hook_augment_lifecycle_json(input);
+    bool wt_ok = wt_out && strstr(wt_out, wt_name) && strstr(wt_out, "is indexed") &&
+                 !strstr(wt_out, main_name);
+    free(wt_out);
+
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", subdir);
+    char *sub_out = cbm_hook_augment_lifecycle_json(input);
+    bool sub_ok = sub_out && strstr(sub_out, wt_name) && strstr(sub_out, "is indexed");
+    free(sub_out);
+
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             maindir);
+    char *main_out = cbm_hook_augment_lifecycle_json(input);
+    bool main_ok = main_out && strstr(main_out, main_name) && strstr(main_out, "is indexed") &&
+                   !strstr(main_out, wt_name);
+    free(main_out);
+
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    free(main_name);
+    free(wt_name);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
+             maindir, wtdir);
+    (void)system(cmd);
+    test_rmdir_r(tmpdir);
+
+    if (!wt_ok)
+        FAIL("worktree cwd must resolve the worktree's own indexed project");
+    if (!sub_ok)
+        FAIL("a subdir of the worktree must resolve the worktree's own project");
+    if (!main_ok)
+        FAIL("main-checkout resolution must be unchanged and not leak the worktree project");
+    PASS();
+}
+
+/* Completes the payload-cwd matrix (with the indexed-worktree test above and the
+ * deadline/logging contract in cli_hook_augment_deadline_breadcrumb_issue858): a
+ * linked worktree that was never indexed must yield a deliberate, non-empty "no
+ * project matched — run index_repository" notice, never a silent 0-byte reply
+ * that an agent cannot distinguish from "no matches". */
+TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-unindexed-wt-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char maindir[512];
+    char wtdir[512];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(maindir, sizeof(maindir), "%s/checkout-main", tmpdir);
+    snprintf(wtdir, sizeof(wtdir), "%s/checkout-side", tmpdir);
+    test_mkdirp(cache);
+    test_mkdirp(maindir);
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "cd \"%s\" && git init -q && git config user.email t@t && git config user.name t && "
+             ": > f.txt && git add f.txt && git commit -qm init && "
+             "git worktree add -q \"%s\" -b agl7unindexed",
+             maindir, wtdir);
+    if (system(cmd) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("git worktree setup failed");
+    }
+
+    /* Index ONLY the main checkout; the worktree is deliberately left out. */
+    char *main_name = cbm_project_name_from_path(maindir);
+    ASSERT_NOT_NULL(main_name);
+    char db_main[900];
+    snprintf(db_main, sizeof(db_main), "%s/%s.db", cache, main_name);
+    cbm_store_t *sm = cbm_store_open_path(db_main);
+    ASSERT_NOT_NULL(sm);
+    ASSERT_EQ(cbm_store_upsert_project(sm, main_name, maindir), CBM_STORE_OK);
+    cbm_store_close(sm);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
+    char *wt_out = cbm_hook_augment_lifecycle_json(input);
+    bool deliberate = wt_out && wt_out[0] && strstr(wt_out, "no indexed graph project matched") &&
+                      !strstr(wt_out, "is indexed");
+    free(wt_out);
+
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             maindir);
+    char *main_out = cbm_hook_augment_lifecycle_json(input);
+    bool main_ok = main_out && strstr(main_out, main_name) && strstr(main_out, "is indexed");
+    free(main_out);
+
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    free(main_name);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
+             maindir, wtdir);
+    (void)system(cmd);
+    test_rmdir_r(tmpdir);
+
+    if (!deliberate)
+        FAIL("unindexed worktree must get a deliberate no-match notice, never a silent 0 bytes");
+    if (!main_ok)
+        FAIL("the indexed main checkout must still resolve in the same matrix");
+    PASS();
+}
+#endif
 
 TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
     char tmpdir[256];
@@ -15232,6 +15705,28 @@ TEST(cli_build_args_json_array_flag_accepts_json_literal) {
     PASS();
 }
 
+/* #1133: `index_repository --target-projects '["*"]'` (the form the help
+ * documents) must reach the cross-repo matcher as a one-element array, not as
+ * a single string holding the literal text -- that shape resolved to zero
+ * targets and returned a silent "success" with projects_scanned:0. */
+TEST(cli_build_args_json_target_projects_literal_issue1133) {
+    char *err = NULL;
+    char *argv[] = {"--repo-path",       "/r",     "--mode", "cross-repo-intelligence",
+                    "--target-projects", "[\"*\"]"};
+    char *json = cbm_cli_build_args_json("index_repository", 6, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"target_projects\":[\"*\"]") != NULL);
+    free(json);
+
+    char *argv2[] = {"--repo-path", "/r", "--target-projects", "[\"svc-a\",\"svc-b\"]"};
+    json = cbm_cli_build_args_json("index_repository", 4, argv2, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"target_projects\":[\"svc-a\",\"svc-b\"]") != NULL);
+    free(json);
+    PASS();
+}
+
 /* An unknown flag for a KNOWN tool must be rejected loudly, not silently
  * typed as a string and dropped server-side (#997). GF1 eval: `trace_path
  * --max-depth 1` was accepted, the real --depth stayed at default 3, and
@@ -15254,6 +15749,81 @@ TEST(cli_build_args_json_unknown_flag_rejected) {
 TEST(cli_build_args_json_repeated_array_issue680) {
     char *err = NULL;
     char *argv[] = {"--semantic-query", "send", "--semantic-query", "publish"};
+    char *json = cbm_cli_build_args_json("search_graph", 4, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"send\",\"publish\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* An array-typed flag also accepts the JSON-array spelling shown by the MCP
+ * schemas, expanding it into individual items instead of one opaque keyword. */
+TEST(cli_build_args_json_array_literal) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"create\",\"billing\",\"account\"]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"create\",\"billing\",\"account\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* An explicit empty JSON array contributes no items; it must not turn into
+ * the literal keyword "[]". */
+TEST(cli_build_args_json_array_literal_empty) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[]") != NULL);
+    ASSERT(strstr(json, "\"[]\"") == NULL);
+    free(json);
+    PASS();
+}
+
+/* Malformed JSON keeps the pre-existing behaviour: the value stays one
+ * literal string and no error is raised. */
+TEST(cli_build_args_json_array_literal_malformed) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"create\","};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"semantic_query\":[\"[\\\"create\\\",\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* Non-string items of a well-formed JSON array are copied as typed values,
+ * not stringified and not collapsed into one literal element. */
+TEST(cli_build_args_json_array_literal_non_string_items) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[1,2]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[1,2]") != NULL);
+    ASSERT(strstr(json, "\"[1,2]\"") == NULL);
+    free(json);
+    PASS();
+}
+
+/* Repeated flags and array literals may be mixed; items accumulate in
+ * argument order. */
+TEST(cli_build_args_json_array_literal_mixed_with_repeated) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "send",  "--semantic-query", "[\"publish\",\"emit\"]",
+                    "--semantic-query", "notify"};
+    char *json = cbm_cli_build_args_json("search_graph", 6, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"send\",\"publish\",\"emit\",\"notify\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* A repeated array literal accumulates into one array. */
+TEST(cli_build_args_json_array_literal_repeated) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"send\"]", "--semantic-query", "[\"publish\"]"};
     char *json = cbm_cli_build_args_json("search_graph", 4, argv, &err);
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "\"semantic_query\":[\"send\",\"publish\"]") != NULL);
@@ -15337,6 +15907,21 @@ TEST(cli_print_tool_help_issue680) {
                                 "full]"));
     ASSERT_EQ(cli_tool_help_capture("nope_not_a_tool", out, sizeof(out)), -1);
     ASSERT_STR_EQ(out, "");
+    PASS();
+}
+
+/* #2102: top-level `cli --help` (CLI_USAGE) must point at tool-level
+ * `--format json` and distinguish it from outer `--json`. This is help-only:
+ * the usage synopsis still has no session-wide --format / CBM_CLI_FORMAT. */
+TEST(cli_usage_points_to_tool_format_json_issue2102) {
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "--format tree|json"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "payload JSON"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "full MCP envelope"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "--json      Print the raw MCP result envelope"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "cli [--quiet] [--progress] [--verbose] [--json] "
+                                          "<tool_name>"));
+    ASSERT_NULL(strstr(CBM_CLI_USAGE, "[--format"));
+    ASSERT_NULL(strstr(CBM_CLI_USAGE, "CBM_CLI_FORMAT"));
     PASS();
 }
 
@@ -15967,6 +16552,60 @@ TEST(cli_update_only_names_an_installer_that_exists_issue1632) {
     PASS();
 }
 
+/* #2200: on 0.9.0, `update -y` in a non-interactive shell auto-confirmed
+ * "Delete these indexes and continue with update?", removed every project
+ * index, and THEN failed at the variant chooser -- no binary, no indexes.
+ * The release dispatch now hands off to install.sh (which keeps indexes by
+ * default, #607) and never asks a variant question. Pin that on every
+ * platform: `update -y` and `update -y --standard`, with the activation seam
+ * OFF (the exact path a release binary ships), exit 0 and leave every .db in
+ * the cache byte-for-byte intact. A generic -y must never be read as consent
+ * to delete indexes. */
+TEST(cli_update_yes_keeps_every_index_issue2200) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-update-2200-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    static const char *const projects[] = {"alpha", "beta", "gamma"};
+    enum { PROJECT_COUNT = 3 };
+    char db_paths[PROJECT_COUNT][640];
+    for (int i = 0; i < PROJECT_COUNT; i++) {
+        snprintf(db_paths[i], sizeof(db_paths[i]), "%s/%s.db", cache_dir, projects[i]);
+        write_test_file(db_paths[i], projects[i]);
+    }
+
+    char *yes_argv[] = {"-y"};
+    char *legacy_argv[] = {"-y", "--standard"};
+    int yes_rc = cbm_cmd_update(1, yes_argv);
+    int legacy_rc = cbm_cmd_update(2, legacy_argv);
+    cbm_set_auto_answer_for_test(0);
+
+    int kept = 0;
+    for (int i = 0; i < PROJECT_COUNT; i++) {
+        const char *content = read_test_file(db_paths[i]);
+        if (content && strcmp(content, projects[i]) == 0) {
+            kept++;
+        }
+    }
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(yes_rc, 0);
+    ASSERT_EQ(legacy_rc, 0);
+    ASSERT_EQ(kept, PROJECT_COUNT);
+    PASS();
+}
+
 SUITE(cli) {
     if (!th_secure_runtime_parent_new(g_cli_suite_runtime_parent,
                                       sizeof(g_cli_suite_runtime_parent), "cli-suite")) {
@@ -15979,6 +16618,7 @@ SUITE(cli) {
 
     RUN_TEST(cli_suite_uses_private_activation_runtime);
     RUN_TEST(cli_update_only_names_an_installer_that_exists_issue1632);
+    RUN_TEST(cli_update_yes_keeps_every_index_issue2200);
 #ifndef _WIN32
     RUN_TEST(cli_hook_deadline_ignores_an_unreadable_value);
 #endif
@@ -16016,12 +16656,15 @@ SUITE(cli) {
     RUN_TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort);
     RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
     RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
+    RUN_TEST(cli_install_foreign_home_unreadable_cohort_cache_keeps_host_daemon);
+    RUN_TEST(cli_install_foreign_home_busy_cohort_keeps_host_daemon);
 #endif
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
     RUN_TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054);
+    RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);
     RUN_TEST(cli_install_config_only_waits_for_cohort_drain);
     RUN_TEST(cli_install_config_and_path_finish_before_guard_release);
     RUN_TEST(cli_install_config_failure_keeps_published_binary);
@@ -16187,6 +16830,7 @@ SUITE(cli) {
     RUN_TEST(cli_warp_installs_shared_skill_without_mcp_or_permissions);
     RUN_TEST(cli_owned_durable_profiles_preserve_user_files);
     RUN_TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall);
+    RUN_TEST(cli_tiered_opencode_profiles_migrate_v0108_render);
     RUN_TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets);
     RUN_TEST(cli_tiered_grok_installs_profiles_and_withholds_hooks);
     RUN_TEST(cli_grok_mcp_preserves_foreign_table);
@@ -16235,6 +16879,10 @@ SUITE(cli) {
     RUN_TEST(cli_augment_session_uses_workspace_roots);
     RUN_TEST(cli_hook_session_resolves_custom_named_index_by_root_path);
     RUN_TEST(cli_hook_session_exhausts_project_registry_pages);
+#ifndef _WIN32
+    RUN_TEST(cli_hook_worktree_cwd_resolves_own_indexed_project);
+    RUN_TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent);
+#endif
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
     RUN_TEST(cli_hook_ownership_requires_exact_command_identity);
     RUN_TEST(cli_gemini_hook_upgrade_migrates_released_exact_commands);
@@ -16388,12 +17036,20 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_integer_flag_issue680);
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
+    RUN_TEST(cli_build_args_json_target_projects_literal_issue1133);
     RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
+    RUN_TEST(cli_build_args_json_array_literal);
+    RUN_TEST(cli_build_args_json_array_literal_empty);
+    RUN_TEST(cli_build_args_json_array_literal_malformed);
+    RUN_TEST(cli_build_args_json_array_literal_non_string_items);
+    RUN_TEST(cli_build_args_json_array_literal_mixed_with_repeated);
+    RUN_TEST(cli_build_args_json_array_literal_repeated);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
     RUN_TEST(cli_print_tool_help_issue680);
+    RUN_TEST(cli_usage_points_to_tool_format_json_issue2102);
 
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);

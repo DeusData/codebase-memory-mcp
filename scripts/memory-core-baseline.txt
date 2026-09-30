@@ -6,7 +6,7 @@
 internal/cbm/ac.c	20
 internal/cbm/arena.c	3
 internal/cbm/cbm.c	13
-internal/cbm/extract_defs.c	5
+internal/cbm/extract_defs.c	4
 internal/cbm/helpers.c	3
 internal/cbm/lsp/c_lsp.c	4
 internal/cbm/lsp/perl_lsp.c	21
@@ -17,7 +17,7 @@ internal/cbm/sqlite_writer.c	74
 src/cli/activation_transaction.c	80
 src/cli/agent_clients.c	73
 src/cli/agent_profiles.c	7
-src/cli/cli.c	173
+src/cli/cli.c	170
 src/cli/client_adapter.c	3
 src/cli/config_edit_path.c	2
 src/cli/config_json_like.c	142
@@ -57,7 +57,7 @@ src/pipeline/artifact.c	38
 src/pipeline/fqn.c	23
 src/pipeline/lsp_resolve.h	4
 src/pipeline/lsp_surface.c	5
-src/pipeline/pass_calls.c	23
+src/pipeline/pass_calls.c	22
 src/pipeline/pass_compile_commands.c	17
 src/pipeline/pass_complexity.c	15
 src/pipeline/pass_configlink.c	3

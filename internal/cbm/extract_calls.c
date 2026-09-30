@@ -79,8 +79,9 @@ static const char *strip_quotes(CBMArena *a, const char *text) {
 
 // Callee suffixes for IRIS Python interop string-dispatch. Kept at file scope
 // (not inside the function) to satisfy cppcheck variableScope.
-static const char *s_py_dispatch_suffixes[] = {".classMethodValue", ".classMethodVoid",
-                                               ".classMethodBoolean", ".classMethodObject", NULL};
+static const char *s_py_dispatch_suffixes[] = {".classMethodValue",   ".classMethodVoid",
+                                               ".classMethodBoolean", ".classMethodObject",
+                                               ".invokeClassMethod",  NULL};
 
 // Per-language callee-suffix dispatch table — returns a NULL-terminated list of
 // method-name suffixes whose calls should be resolved by extracting class+method
@@ -2039,6 +2040,49 @@ static const char *extract_nth_string_arg(CBMExtractCtx *ctx, TSNode args, uint3
     return NULL;
 }
 
+// IRIS embedded Python names the target class in the receiver:
+// iris.cls("Pkg.Class").Method(...) calls ClassMethod Pkg.Class.Method.
+// Returns "Pkg.Class.Method", or NULL unless the receiver is iris.cls() with
+// a string-literal first argument. A non-literal class names nothing, so it
+// gets no class-qualified callee rather than a guessed one.
+static const char *python_iris_cls_callee(CBMExtractCtx *ctx, TSNode call_node) {
+    TSNode fn = ts_node_child_by_field_name(call_node, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "attribute") != 0) {
+        return NULL;
+    }
+    TSNode recv = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+    TSNode meth = ts_node_child_by_field_name(fn, TS_FIELD("attribute"));
+    if (ts_node_is_null(recv) || ts_node_is_null(meth) || strcmp(ts_node_type(recv), "call") != 0) {
+        return NULL;
+    }
+    TSNode recv_fn = ts_node_child_by_field_name(recv, TS_FIELD("function"));
+    TSNode recv_args = ts_node_child_by_field_name(recv, TS_FIELD("arguments"));
+    if (ts_node_is_null(recv_fn) || ts_node_is_null(recv_args) ||
+        ts_node_named_child_count(recv_args) == 0) {
+        return NULL;
+    }
+    const char *recv_text = cbm_node_text(ctx->arena, recv_fn, ctx->source);
+    if (!recv_text || strcmp(recv_text, "iris.cls") != 0) {
+        return NULL;
+    }
+    TSNode cls_arg = ts_node_named_child(recv_args, 0);
+    if (!is_string_like(ts_node_type(cls_arg))) {
+        return NULL;
+    }
+    // Plain quoted literals only: an f-string or other prefixed string is a
+    // "string" node too, but its text is not a class name.
+    char *cls_text = cbm_node_text(ctx->arena, cls_arg, ctx->source);
+    if (!cls_text || (cls_text[0] != '"' && cls_text[0] != '\'')) {
+        return NULL;
+    }
+    const char *cls = strip_and_validate_string_arg(ctx->arena, cls_text);
+    const char *mth = cbm_node_text(ctx->arena, meth, ctx->source);
+    if (!cls || !cls[0] || !mth || !mth[0]) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s.%s", cls, mth);
+}
+
 // --- Unified handler: called once per node by the cursor walk ---
 
 // Process a keyword argument (keyword_argument or pair node).
@@ -2059,6 +2103,56 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
             ca->value = strip_quotes(ctx->arena, ca->expr);
         }
     }
+}
+
+static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node);
+
+/* A JS/TS request-config object -- `http({url: `/users/${id}`, method: 'GET'})`,
+ * `axios({url: '/orders'})`, the shape Orval and similar generators emit -- names
+ * its request URL in the `url` property. Return that URL (template literals
+ * flattened to the canonical "{}" form, like a bare template argument), or NULL.
+ * Only the `url` key counts: `path`/`endpoint` in an options object name other
+ * things too often. Route registrations are excluded: an object there is the
+ * route definition (Fastify `route({url, handler})`), not a client request, and
+ * its handler lives inside the object where the route pass cannot read it. So is
+ * axios `getUri(config)`: it takes the same config but only formats the URL and
+ * sends nothing (Orval's `get<Op>Url` helpers). (#2235) */
+static bool config_object_callee_eligible(const CBMExtractCtx *ctx, const char *callee_name) {
+    if (ctx->language != CBM_LANG_JAVASCRIPT && ctx->language != CBM_LANG_TYPESCRIPT &&
+        ctx->language != CBM_LANG_TSX && ctx->language != CBM_LANG_ARKTS) {
+        return false;
+    }
+    if (!callee_name || cbm_service_pattern_route_method(callee_name) != NULL) {
+        return false;
+    }
+    static const char get_uri[] = "getUri";
+    size_t clen = strlen(callee_name);
+    size_t glen = sizeof(get_uri) - 1;
+    return !(clen >= glen && strcmp(callee_name + clen - glen, get_uri) == 0);
+}
+
+static const char *js_config_object_url(CBMExtractCtx *ctx, TSNode obj, const char *callee_name) {
+    if (strcmp(ts_node_type(obj), "object") != 0 ||
+        !config_object_callee_eligible(ctx, callee_name)) {
+        return NULL;
+    }
+    uint32_t n = ts_node_named_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(obj, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            continue;
+        }
+        TSNode key_n = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        TSNode val_n = ts_node_child_by_field_name(pair, TS_FIELD("value"));
+        if (ts_node_is_null(key_n) || ts_node_is_null(val_n)) {
+            continue;
+        }
+        const char *key = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, key_n, ctx->source));
+        if (key && strcmp(key, "url") == 0) {
+            return extract_string_value(ctx, val_n);
+        }
+    }
+    return NULL;
 }
 
 /* Extract all arguments from a call expression into call->args[]. */
@@ -2103,6 +2197,10 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
                 ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source);
             } else if (strcmp(ak, "identifier") == 0 && ca->expr) {
                 ca->value = lookup_string_constant(ctx, ca->expr);
+            } else if (strcmp(ak, "object") == 0) {
+                /* Request-config object: its `url` is what the arg-url
+                 * heuristic reads for a local fetch wrapper (#2235). */
+                ca->value = js_config_object_url(ctx, arg_node, call->callee_name);
             } else if (strcmp(ak, "call_expression") == 0) {
                 /* URL-builder helper call (issue #1009): resolve
                  * client(buildPath(id)) through the per-file builder map. */
@@ -2367,7 +2465,8 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
 }
 
 // Extract URL/topic from keyword or positional args.
-static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
+static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
+                                            const char *callee_name) {
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
@@ -2389,6 +2488,15 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
             const char *val = extract_keyword_url(ctx, arg);
+            if (val) {
+                return val;
+            }
+            continue;
+        }
+
+        /* JS/TS request-config object: `axios({url: '/orders'})` (#2235). */
+        if (strcmp(ak, "object") == 0) {
+            const char *val = js_config_object_url(ctx, arg, callee_name);
             if (val) {
                 return val;
             }
@@ -3832,7 +3940,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 args = swift_call_args(node);
             }
             if (!ts_node_is_null(args)) {
-                call.first_string_arg = extract_url_or_topic_arg(ctx, args);
+                call.first_string_arg = extract_url_or_topic_arg(ctx, args, call.callee_name);
                 /* #952: routes registered inside Laravel `prefix()->group()`
                  * closures must carry the composed path — the resolve passes
                  * only see the flat CBMCall, so the enclosing chain can only
@@ -3887,6 +3995,16 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 }
             }
 
+            // #1260: iris.cls("Pkg.X").M() names its class, so the qualified
+            // callee replaces the bare one. Keeping both would let the bare
+            // name weak-match an unrelated same-named method.
+            if (ctx->language == CBM_LANG_PYTHON) {
+                const char *iris_callee = python_iris_cls_callee(ctx, node);
+                if (iris_callee) {
+                    call.callee_name = iris_callee;
+                    call.is_method = false;
+                }
+            }
             cbm_calls_push(&ctx->result->calls, ctx->arena, call);
             invocation = describe_emitted_primary_call(node, &callee);
 

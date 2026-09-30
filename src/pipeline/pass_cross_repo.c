@@ -153,6 +153,13 @@ static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) 
     return matches;
 }
 
+/* True when `project` is a usable cross-repo input: its store holds exactly
+ * that project AND carries the schema the read-write open in
+ * cr_open_existing_project requires. Checking only the first let a pre-#768
+ * store (still readable, so list_projects shows it) pass validation and the
+ * ["*"] enumeration, then abort the whole run at its write open — after the
+ * source's previous CROSS_* generation had already been deleted. The probe is
+ * read-only, so the legacy store is left untouched for its reindex. (#2133) */
 static bool cr_project_exists(const char *project) {
     char path[CR_PATH_BUF];
     if (!cr_db_path(project, path, sizeof(path))) {
@@ -160,6 +167,11 @@ static bool cr_project_exists(const char *project) {
     }
     cbm_store_t *store = cbm_store_open_path_query(path);
     bool exists = cr_store_has_exact_project(store, project);
+    if (exists && !cbm_store_edges_schema_current(store)) {
+        cbm_log_warn("cross_repo.project_unusable", "project", project, "reason",
+                     "pre_768_schema_reindex_required");
+        exists = false;
+    }
     cbm_store_close(store);
     return exists;
 }
@@ -592,6 +604,80 @@ static bool emit_cross_route_bidirectional(
     return insert_cross_edge(tgt_store, tgt_project, handler_id, tgt_route_id, edge_type, rev, ctx);
 }
 
+/* A resolved route: the matched Route QN plus its handler's name and file. */
+typedef struct {
+    char qn[CR_QN_BUF];
+    char name[CBM_SZ_256];
+    char file[CBM_SZ_512];
+} cr_route_hit_t;
+
+/* Resolve a client call (method + canonical path) to a handled Route in
+ * store: exact method QN, then ANY, then segment-wise template matching,
+ * since a concrete client path ("/v2/orders/123") never exact-matches a
+ * templated route ("/v2/orders/{}") (#523). Returns the handler id, or 0. */
+static int64_t resolve_route_handler(cbm_store_t *store, const char *method, const char *curl,
+                                     cr_route_hit_t *hit, bool *failed, cr_run_context_t *ctx) {
+    snprintf(hit->qn, sizeof(hit->qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
+    int64_t handler_id = find_route_handler(store, hit->qn, hit->name, sizeof(hit->name), hit->file,
+                                            sizeof(hit->file), failed);
+    if (!*failed && handler_id == 0) {
+        snprintf(hit->qn, sizeof(hit->qn), "__route__ANY__%s", curl);
+        handler_id = find_route_handler(store, hit->qn, hit->name, sizeof(hit->name), hit->file,
+                                        sizeof(hit->file), failed);
+    }
+    if (!*failed && handler_id == 0) {
+        handler_id = find_route_handler_fuzzy(store, curl, method[0] ? method : NULL, hit->qn,
+                                              sizeof(hit->qn), hit->name, sizeof(hit->name),
+                                              hit->file, sizeof(hit->file), failed, ctx);
+    }
+    return *failed ? 0 : handler_id;
+}
+
+/* True when the caller's own project has a HANDLES edge into the local Route
+ * node its HTTP_CALLS points at. Sets *failed on a query error. (#1459) */
+static bool route_node_handled(struct sqlite3 *src_db, const char *src_project, int64_t route_id,
+                               bool *failed) {
+    *failed = false;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(src_db,
+                           "SELECT 1 FROM edges WHERE project = ?1 AND target_id = ?2 "
+                           "AND type = 'HANDLES' LIMIT 1",
+                           CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+        *failed = true;
+        return false;
+    }
+    if (sqlite3_bind_text(s, SKIP_ONE, src_project, CBM_NOT_FOUND, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_int64(s, PAIR_LEN, route_id) != SQLITE_OK) {
+        sqlite3_finalize(s);
+        *failed = true;
+        return false;
+    }
+    int step_rc = sqlite3_step(s);
+    if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) {
+        *failed = true;
+    }
+    if (sqlite3_finalize(s) != SQLITE_OK) {
+        *failed = true;
+    }
+    return !*failed && step_rc == SQLITE_ROW;
+}
+
+/* Caller-local floor (#1459): a call the caller's own project serves is an
+ * in-project call — another project exposing the same path is no evidence of
+ * a cross-service call. "Served" is the HANDLES edge on the Route node the
+ * HTTP_CALLS points at, or the same method/ANY/template resolution the target
+ * lookup uses, applied to the caller's own store: a method-less fetch() points
+ * at the ANY node while the local handler sits on the GET node. */
+static bool call_served_locally(cbm_store_t *src_store, struct sqlite3 *src_db,
+                                const char *src_project, int64_t route_id, const char *method,
+                                const char *curl, bool *failed, cr_run_context_t *ctx) {
+    if (route_node_handled(src_db, src_project, route_id, failed) || *failed) {
+        return !*failed;
+    }
+    cr_route_hit_t local;
+    return resolve_route_handler(src_store, method, curl, &local, failed, ctx) != 0;
+}
+
 static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *src_project,
                                            cbm_store_t *tgt_store, const char *tgt_project,
                                            cr_run_context_t *ctx) {
@@ -632,35 +718,26 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
             continue;
         }
 
-        /* Build the expected Route QN in the target project (authority-stripped
-         * and param-canonicalized so client url_path matches the server handler
-         * regardless of base URL and framework placeholder syntax). */
-        char route_qn[CR_QN_BUF];
+        /* Canonical client path: authority-stripped and param-canonicalized so
+         * it matches a server handler regardless of base URL and framework
+         * placeholder syntax. */
         char cpath[CBM_SZ_256];
         const char *curl = cbm_route_canon_path(cr_url_path(url_path), cpath, sizeof(cpath));
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
 
-        char handler_name[CBM_SZ_256] = {0};
-        char handler_file[CBM_SZ_512] = {0};
         bool query_failed = false;
+        bool served_locally = call_served_locally(src_store, src_db, src_project, route_id, method,
+                                                  curl, &query_failed, ctx);
+        if (query_failed) {
+            failed = true;
+            break;
+        }
+        if (served_locally) {
+            continue;
+        }
+
+        cr_route_hit_t hit;
         int64_t handler_id =
-            find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
-                               handler_file, sizeof(handler_file), &query_failed);
-        if (!query_failed && handler_id == 0) {
-            /* Try without method (ANY) */
-            snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s", curl);
-            handler_id = find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
-                                            handler_file, sizeof(handler_file), &query_failed);
-        }
-        if (!query_failed && handler_id == 0) {
-            /* Exact QN lookup missed. A concrete client path ("/v2/orders/123")
-             * never exact-matches a templated route ("/v2/orders/{}"), so fall
-             * back to segment-wise template matching. (#523) */
-            handler_id =
-                find_route_handler_fuzzy(tgt_store, curl, method[0] ? method : NULL, route_qn,
-                                         sizeof(route_qn), handler_name, sizeof(handler_name),
-                                         handler_file, sizeof(handler_file), &query_failed, ctx);
-        }
+            resolve_route_handler(tgt_store, method, curl, &hit, &query_failed, ctx);
         if (query_failed) {
             failed = true;
             break;
@@ -674,9 +751,8 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         }
 
         if (!emit_cross_route_bidirectional(src_store, src_project, src_db, caller_id, route_id,
-                                            tgt_store, tgt_project, handler_id, route_qn,
-                                            handler_name, handler_file, url_path, method,
-                                            "CROSS_HTTP_CALLS", ctx)) {
+                                            tgt_store, tgt_project, handler_id, hit.qn, hit.name,
+                                            hit.file, url_path, method, "CROSS_HTTP_CALLS", ctx)) {
             failed = !cr_cancel_requested(ctx);
             break;
         }
@@ -1094,15 +1170,13 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
             failed = true;
             break;
         }
+        /* Internal stores are exact filenames (cbm_is_internal_cache_db).
+         * Substring filtering would hide legitimate projects such as
+         * orders_config_service or api-wal. */
+        if (!cbm_is_project_index_db(ent->name)) {
+            continue;
+        }
         size_t len = strlen(ent->name);
-        if (len < CR_COL_4 || strcmp(ent->name + len - CR_DB_EXT_LEN, ".db") != 0) {
-            continue;
-        }
-        /* Internal stores are exact filenames. Substring filtering would hide
-         * legitimate projects such as orders_config_service or api-wal. */
-        if (strcmp(ent->name, "_cross_repo.db") == 0 || strcmp(ent->name, "_config.db") == 0) {
-            continue;
-        }
         if (count >= CR_MAX_PROJECTS) {
             failed = true;
             break;
@@ -1239,17 +1313,33 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         result.failed = !result.cancelled;
         return result;
     }
+    int other_targets = 0;
     for (int i = 0; i < resolved_count; i++) {
         if (cr_cancel_requested(&run)) {
             result.cancelled = true;
             free_project_list(resolved, resolved_count);
             return result;
         }
-        if (strcmp(resolved[i], project) != 0 && !cr_project_exists(resolved[i])) {
+        if (strcmp(resolved[i], project) == 0) {
+            continue;
+        }
+        if (!cr_project_exists(resolved[i])) {
             result.failed = true;
             free_project_list(resolved, resolved_count);
             return result;
         }
+        other_targets++;
+    }
+    /* Nothing but the source itself to match against (a self-only list, or
+     * ["*"] in a store holding only the source). Reporting that as success
+     * with projects_scanned:0 is indistinguishable from "these services share
+     * no routes", and the source's existing CROSS_* edges would be wiped below
+     * with nothing to rebuild them. Fail before any write. (#1133) */
+    if (other_targets == 0) {
+        result.failed = true;
+        result.no_targets = true;
+        free_project_list(resolved, resolved_count);
+        return result;
     }
 
     /* Every input is known to exist before destructive source cleanup. The
