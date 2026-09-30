@@ -960,6 +960,26 @@ TEST(tslsp_nocrash_recursive_type) {
     PASS();
 }
 
+/* lookup_method walked extends/implements with no depth cap, so a registered
+ * type listing itself among its embedded types recursed until SIGBUS. Found on
+ * opencode's Effect services: `class Service extends Context.Service<Service,
+ * Interface>()(...)` resolves its extends clause back to the class itself, and
+ * `Service.use(...)` then searched Service -> Service -> ... forever. */
+TEST(tslsp_nocrash_self_extending_class_method_lookup) {
+    CBMFileResult *r = extract_ts("class Service extends Service {}\n"
+                                  "function go() { Service.use(); new Service().run(); }\n");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    r = extract_ts(
+        "import { Context, Effect } from \"effect\";\n"
+        "interface Interface { readonly register: () => void; }\n"
+        "export class Service extends Context.Service<Service, Interface>()(\"@x/Registry\") {}\n"
+        "export const layer = Service.use((registry) => Effect.succeed(registry.register));\n");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(tslsp_nocrash_unicode_identifier) {
     CBMFileResult *r = extract_ts("class \xc3\x84pf { ping(): void {} }\n"
                                   "function go(a: \xc3\x84pf) { a.ping(); }\n");
@@ -4366,6 +4386,7 @@ SUITE(ts_lsp) {
     /* Category 26: more crash safety */
     RUN_TEST(tslsp_nocrash_circular_extends);
     RUN_TEST(tslsp_nocrash_recursive_type);
+    RUN_TEST(tslsp_nocrash_self_extending_class_method_lookup);
     RUN_TEST(tslsp_nocrash_unicode_identifier);
     RUN_TEST(tslsp_nocrash_template_with_call);
     RUN_TEST(tslsp_nocrash_decorator);
