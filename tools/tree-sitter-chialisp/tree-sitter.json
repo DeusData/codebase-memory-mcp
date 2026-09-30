@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "chialisp",
+      "camelcase": "Chialisp",
+      "scope": "source.chialisp",
+      "path": ".",
+      "file-types": ["clsp", "clib", "clinc"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Chialisp (Chia smart-coin s-expression language) grammar for tree-sitter"
+  }
+}

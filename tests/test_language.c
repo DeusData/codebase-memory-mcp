@@ -4,6 +4,7 @@
  * RED phase: These tests define the expected behavior for registered languages.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "discover/discover.h"
 
@@ -87,6 +88,20 @@ TEST(lang_ext_ixx) {
 }
 TEST(lang_ext_csharp) {
     ASSERT_EQ(cbm_language_for_extension(".cs"), CBM_LANG_CSHARP);
+    PASS();
+}
+/* Blazor components were unmapped, so a .razor file was never discovered at
+ * all: indexing a Blazor app produced no nodes for any component, and reaching
+ * them required an undocumented extra_extensions entry in a per-project
+ * .codebase-memory.json. */
+TEST(lang_ext_razor) {
+    ASSERT_EQ(cbm_language_for_extension(".razor"), CBM_LANG_CSHARP);
+    PASS();
+}
+/* Razor Pages / MVC views were unmapped for the same reason .razor was, so an
+ * ASP.NET Core app's entire view layer was invisible to discovery. */
+TEST(lang_ext_cshtml) {
+    ASSERT_EQ(cbm_language_for_extension(".cshtml"), CBM_LANG_CSHARP);
     PASS();
 }
 TEST(lang_ext_php) {
@@ -399,6 +414,36 @@ TEST(lang_ext_svg) {
     ASSERT_EQ(cbm_language_for_extension(".svg"), CBM_LANG_XML);
     PASS();
 }
+/* Issue #2229: the XML documents that make up a .NET repository's project
+ * system were unmapped, so a solution's package references, target frameworks,
+ * localized strings and app manifests were never indexed or searchable. */
+TEST(lang_ext_msbuild_projects) {
+    ASSERT_EQ(cbm_language_for_extension(".csproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".vbproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".fsproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".props"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".targets"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".nuspec"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".slnx"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".runsettings"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_resx) {
+    ASSERT_EQ(cbm_language_for_extension(".resx"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_xaml) {
+    ASSERT_EQ(cbm_language_for_extension(".xaml"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".axaml"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_app_manifests) {
+    ASSERT_EQ(cbm_language_for_extension(".plist"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".xcprivacy"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".manifest"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".appxmanifest"), CBM_LANG_XML);
+    PASS();
+}
 TEST(lang_ext_markdown) {
     ASSERT_EQ(cbm_language_for_extension(".md"), CBM_LANG_MARKDOWN);
     PASS();
@@ -609,6 +654,187 @@ TEST(lang_m_default_on_read_fail) {
     PASS();
 }
 
+/* ── .cfc disambiguation (tag vs script dialect) ───────────────── */
+
+/* Helper: write content to a temp .cfc and return its disambiguated language. */
+static CBMLanguage disambiguate_cfc_content(const char *name, const char *content) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", cbm_tmpdir(), name);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return CBM_LANG_COUNT;
+    }
+    fputs(content, f);
+    fclose(f);
+    CBMLanguage lang = cbm_disambiguate_cfc(path);
+    remove(path);
+    return lang;
+}
+
+/* ── .cls / .frm: VB6 vs Apex / ObjectScript / FORM (#721) ────────── */
+
+static bool write_probe_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    fputs(content, f);
+    fclose(f);
+    return true;
+}
+
+TEST(lang_cls_vb6_class_module_unsupported) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_vb6.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "VERSION 1.0 CLASS\r\nBEGIN\r\n  MultiUse = -1  'True\r\n"
+                                       "END\r\nAttribute VB_Name = \"Widget\"\r\n"
+                                       "Option Explicit\r\n\r\nPublic Sub Go()\r\nEnd Sub\r\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_cls_apex_stays_apex) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_apex.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "public with sharing class Widget {\n"
+                                       "  public void go() {}\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_APEX);
+    remove(path);
+    /* Unreadable file keeps the pre-existing owner. */
+    ASSERT_EQ(cbm_disambiguate_cls("/tmp/nonexistent_file_12345.cls"), CBM_LANG_APEX);
+    PASS();
+}
+
+TEST(lang_cls_objectscript_stays_objectscript) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_udl.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "Class MyPkg.Widget Extends %RegisteredObject\n{\n\n"
+                                       "Method Go()\n{\n}\n\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_OBJECTSCRIPT_UDL);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_frm_vb6_form_unsupported) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_vb6.frm", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "VERSION 5.00\r\nBegin VB.Form Form1 \r\n"
+                                       "   Caption         =   \"Hi\"\r\nEnd\r\n"
+                                       "Attribute VB_Name = \"Form1\"\r\nOption Explicit\r\n"));
+    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_frm_form_stays_form) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_form.frm", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "Symbols x, y;\nLocal F = x + y;\nPrint;\n.end\n"));
+    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_FORM);
+    remove(path);
+    ASSERT_EQ(cbm_disambiguate_frm("/tmp/nonexistent_file_12345.frm"), CBM_LANG_FORM);
+    PASS();
+}
+
+/* #2176: a Godot binary resource shares the .res extension with ReScript.
+ * Parsed as ReScript it produced an error tree that never finished indexing;
+ * binary content is not ReScript source and must not be indexed as such. */
+TEST(lang_res_binary_resource_unsupported) {
+    static const unsigned char godot_head[] = {'R',  'S',  'R',  'C',  0x00, 0x00, 0x00, 0x00,
+                                               0x04, 0x00, 0x00, 0x00, 'A',  'r',  'r',  'a',
+                                               'y',  'M',  'e',  's',  'h',  0x00, 0xff, 0x80};
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_godot.res", cbm_tmpdir());
+    FILE *f = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fwrite(godot_head, 1, sizeof(godot_head), f), sizeof(godot_head));
+    fclose(f);
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_res_rescript_stays_rescript) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_rescript.res", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "let greet = name => `Hello ${name}`\n"
+                                       "module M = {\n  let x = 1\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_RESCRIPT);
+    remove(path);
+    ASSERT_EQ(cbm_disambiguate_res("/tmp/nonexistent_file_12345.res"), CBM_LANG_RESCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_tag_component) {
+    /* <cfcomponent> wrapper ⇒ tag dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_tag.cfc",
+                                       "<cfcomponent>\n<cffunction name=\"f\"></cffunction>\n"
+                                       "</cfcomponent>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_bare_cffunction) {
+    /* A component that omits <cfcomponent> but uses <cffunction> is still tag. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_bare.cfc",
+                                       "<cffunction name=\"f\" output=\"false\">\n"
+                                       "<cfreturn 1>\n</cffunction>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_script_component) {
+    /* Plain "component { ... }" ⇒ script dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_script.cfc",
+                                       "component {\n    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_script_bare_keyword) {
+    /* "component" on its own line (brace on the next) ⇒ script dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_kw.cfc",
+                                       "component\n{\n    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_cfscript_wrapped_script) {
+    /* A script component wrapped in a leading <cfscript> is still script — the
+     * leading '<' must NOT route it to the tag grammar. */
+    ASSERT_EQ(
+        disambiguate_cfc_content("test_cfc_wrapped.cfc",
+                                 "<cfscript>\ncomponent {\n    function f() { return 1; }\n}\n"
+                                 "</cfscript>\n"),
+        CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_tag_after_license_comment) {
+    /* A leading <!--- ---> license comment before <cfcomponent> ⇒ tag. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_licensed.cfc",
+                                       "<!---\n  Copyright\n--->\n<cfcomponent>\n</cfcomponent>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_script_after_license_comment) {
+    /* A leading <!--- ---> comment before a script component ⇒ script (the
+     * comment's '<' must be skipped, not treated as a tag opener). */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_lic_script.cfc",
+                                       "<!--- header ---> \ncomponent {\n"
+                                       "    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_default_on_read_fail) {
+    /* Non-existent file defaults to script dialect. */
+    ASSERT_EQ(cbm_disambiguate_cfc("/tmp/nonexistent_file_98765.cfc"), CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
 /* --- New languages (auto-generated) --- */
 TEST(lang_ext_solidity) {
     ASSERT_EQ(cbm_language_for_extension(".sol"), CBM_LANG_SOLIDITY);
@@ -659,6 +885,15 @@ TEST(lang_ext_nim) {
 TEST(lang_ext_scheme) {
     ASSERT_EQ(cbm_language_for_extension(".scm"), CBM_LANG_SCHEME);
     ASSERT_EQ(cbm_language_for_extension(".ss"), CBM_LANG_SCHEME);
+    PASS();
+}
+
+TEST(lang_ext_chialisp) {
+    ASSERT_EQ(cbm_language_for_extension(".clsp"), CBM_LANG_CHIALISP);
+    ASSERT_EQ(cbm_language_for_extension(".clib"), CBM_LANG_CHIALISP);
+    ASSERT_EQ(cbm_language_for_extension(".clinc"), CBM_LANG_CHIALISP);
+    /* .clj stays Clojure — the Chialisp extensions must not widen it. */
+    ASSERT_EQ(cbm_language_for_extension(".clj"), CBM_LANG_CLOJURE);
     PASS();
 }
 
@@ -961,6 +1196,29 @@ TEST(lang_ext_mojo) {
     PASS();
 }
 
+TEST(lang_ext_arkts) {
+    ASSERT_EQ(cbm_language_for_extension(".ets"), CBM_LANG_ARKTS);
+    PASS();
+}
+
+TEST(lang_ext_plsql) {
+    ASSERT_EQ(cbm_language_for_extension(".pks"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pkb"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pck"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pls"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".plb"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".plsql"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".fnc"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".trg"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".bdy"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".tps"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".tpb"), CBM_LANG_PLSQL);
+    /* .sql stays generic SQL; .prc stays FORM */
+    ASSERT_EQ(cbm_language_for_extension(".sql"), CBM_LANG_SQL);
+    ASSERT_EQ(cbm_language_for_extension(".prc"), CBM_LANG_FORM);
+    PASS();
+}
+
 TEST(lang_ext_squirrel) {
     ASSERT_EQ(cbm_language_for_extension(".nut"), CBM_LANG_SQUIRREL);
     PASS();
@@ -1079,6 +1337,8 @@ SUITE(language) {
     RUN_TEST(lang_ext_h);
     RUN_TEST(lang_ext_ixx);
     RUN_TEST(lang_ext_csharp);
+    RUN_TEST(lang_ext_razor);
+    RUN_TEST(lang_ext_cshtml);
     RUN_TEST(lang_ext_php);
     RUN_TEST(lang_ext_lua);
     RUN_TEST(lang_ext_scala);
@@ -1161,6 +1421,10 @@ SUITE(language) {
     RUN_TEST(lang_ext_xsl);
     RUN_TEST(lang_ext_xsd);
     RUN_TEST(lang_ext_svg);
+    RUN_TEST(lang_ext_msbuild_projects);
+    RUN_TEST(lang_ext_resx);
+    RUN_TEST(lang_ext_xaml);
+    RUN_TEST(lang_ext_app_manifests);
     RUN_TEST(lang_ext_markdown);
     RUN_TEST(lang_ext_mdx);
     RUN_TEST(lang_ext_makefile);
@@ -1209,6 +1473,21 @@ SUITE(language) {
     RUN_TEST(lang_m_magma);
     RUN_TEST(lang_m_matlab);
     RUN_TEST(lang_m_default_on_read_fail);
+    RUN_TEST(lang_cfc_tag_component);
+    RUN_TEST(lang_cfc_bare_cffunction);
+    RUN_TEST(lang_cfc_script_component);
+    RUN_TEST(lang_cfc_script_bare_keyword);
+    RUN_TEST(lang_cfc_cfscript_wrapped_script);
+    RUN_TEST(lang_cfc_tag_after_license_comment);
+    RUN_TEST(lang_cfc_script_after_license_comment);
+    RUN_TEST(lang_cfc_default_on_read_fail);
+    RUN_TEST(lang_cls_vb6_class_module_unsupported);
+    RUN_TEST(lang_cls_apex_stays_apex);
+    RUN_TEST(lang_cls_objectscript_stays_objectscript);
+    RUN_TEST(lang_frm_vb6_form_unsupported);
+    RUN_TEST(lang_frm_form_stays_form);
+    RUN_TEST(lang_res_binary_resource_unsupported);
+    RUN_TEST(lang_res_rescript_stays_rescript);
 
     /* Go test ports */
     /* New languages */
@@ -1221,6 +1500,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_d);
     RUN_TEST(lang_ext_nim);
     RUN_TEST(lang_ext_scheme);
+    RUN_TEST(lang_ext_chialisp);
     RUN_TEST(lang_ext_fennel);
     RUN_TEST(lang_ext_fish);
     RUN_TEST(lang_ext_awk);
@@ -1277,6 +1557,8 @@ SUITE(language) {
     RUN_TEST(lang_ext_cairo);
     RUN_TEST(lang_ext_move);
     RUN_TEST(lang_ext_mojo);
+    RUN_TEST(lang_ext_arkts);
+    RUN_TEST(lang_ext_plsql);
     RUN_TEST(lang_ext_squirrel);
     RUN_TEST(lang_ext_func);
     RUN_TEST(lang_ext_rst);

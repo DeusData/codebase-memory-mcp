@@ -16,12 +16,14 @@ int tf_skip_count = 0;
 #include "foundation/constants.h"  /* CBM_SZ_4K — forced stderr buffer */
 #include "foundation/log.h"        /* crash-durable worker log probe */
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
+#include "foundation/log.h"        /* worker liveness heartbeat probe */
 #include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
+#include "ui/http_server.h"        /* deleted-self executable probe */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -31,7 +33,10 @@ int tf_skip_count = 0;
 #include <string.h>
 #include <signal.h>
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
+#include <windows.h>
 #else
 #include <unistd.h>
 #ifdef __APPLE__
@@ -48,6 +53,29 @@ int tf_skip_count = 0;
  * invocations see the marker and exit cleanly, allowing the parent shell to
  * unwind after either production containment or the test's verified backstop. */
 #define TF_BLOCKING_GIT_MARKER_ENV "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE"
+
+/* Native child for subprocess_windows_job_object_enforces_memory_limit. The
+ * fixed-size commit keeps the RED path bounded: without a Job memory limit it
+ * succeeds and exits 0; with the limit it is denied and exits with the sentinel
+ * code expected by the parent test. */
+static int tf_maybe_run_windows_memory_limit_probe(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc == 2 && argv && strcmp(argv[1], "__cbm_windows_memory_limit_probe") == 0) {
+        const SIZE_T allocation_size = (SIZE_T)2U * 1024U * 1024U * 1024U;
+        void *allocation =
+            VirtualAlloc(NULL, allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!allocation) {
+            return 73;
+        }
+        (void)VirtualFree(allocation, 0, MEM_RELEASE);
+        return 0;
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
+    return -1;
+}
 
 #ifdef _WIN32
 static bool tf_invoked_as_windows_git_module(void) {
@@ -195,6 +223,8 @@ static const char *const tf_client_home_overrides[] = {
     "CBM_TRAE_CONFIG_PATH",
     "CBM_ROO_CONFIG_PATH",
     "CBM_CODY_CONFIG_PATH",
+    "OMP_PROFILE",
+    "PI_CODING_AGENT_DIR",
 };
 
 static bool tf_setup_cache_sentinel(void) {
@@ -228,6 +258,17 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
             (void)fclose(response);
         }
         (void)fprintf(stderr, "async worker clean probe\n");
+        fflush(NULL);
+        _Exit(response ? 0 : 1);
+    }
+    if (strstr(args_json, "\"heartbeat\"")) {
+        FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
+        if (response) {
+            (void)fputs("{\"probe\":\"heartbeat\"}", response);
+            (void)fclose(response);
+        }
+        cbm_log_info("pipeline.discover", "files", "1");
+        (void)fprintf(stderr, "async worker heartbeat probe ready\n");
         fflush(NULL);
         _Exit(response ? 0 : 1);
     }
@@ -343,6 +384,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
+    cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
@@ -500,9 +542,19 @@ static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
     Sleep(INFINITE);
     return 25;
 #else
-    (void)argc;
-    (void)argv;
-    return -1;
+    /* POSIX copied-image holder: block reading stdin until the parent closes
+     * the release pipe, exactly like the cat(1) donor this replaced. A system
+     * utility cannot serve as the copied image — a multi-call coreutils
+     * binary (uutils cat) refuses to execute under the copied name. */
+    if (argc != 2 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
+        return -1;
+    }
+    char release[16];
+    ssize_t count;
+    do {
+        count = read(STDIN_FILENO, release, sizeof(release));
+    } while (count > 0 || (count < 0 && errno == EINTR));
+    return count == 0 ? 0 : 25;
 #endif
 }
 
@@ -615,6 +667,55 @@ static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
 #endif
 }
 
+static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (argc != 5 || strcmp(argv[1], "__cbm_deleted_self_probe") != 0) {
+        return -1;
+    }
+    int ready_fd = atoi(argv[2]);
+    int continue_fd = atoi(argv[3]);
+    cbm_http_server_set_binary_path(argv[4]);
+    if (write(ready_fd, "R", 1) != 1) {
+        return 41;
+    }
+    char go = '\0';
+    if (read(continue_fd, &go, 1) != 1) {
+        return 42;
+    }
+    char resolved[1024];
+    bool ok = cbm_http_server_resolve_binary_path(NULL, resolved, sizeof(resolved));
+#if defined(__linux__)
+    /* Contract (#1204 strategy ruling): after a rename-over, the resolver
+     * hands back the /proc/self/exe magic link — the in-memory OLD build,
+     * the only spawn the worker's build-fingerprint gate accepts. First
+     * prove we really are in the deleted state, or the assertions below
+     * would pass vacuously on an intact image. */
+    char link_target[1024];
+    ssize_t n = readlink("/proc/self/exe", link_target, sizeof(link_target) - 1);
+    if (n <= 0) {
+        return 45;
+    }
+    link_target[n] = '\0';
+    if (strstr(link_target, " (deleted)") == NULL) {
+        return 46;
+    }
+    if (!ok) {
+        return 43;
+    }
+    return strcmp(resolved, "/proc/self/exe") == 0 && access(resolved, X_OK) == 0 ? 0 : 44;
+#else
+    /* macOS has no magic link: the ruling is fail-closed. Success here is
+     * the resolver REFUSING, so the supervisor logs no_self_path instead of
+     * spawning a missing or mismatched binary. */
+    return ok ? 44 : 0;
+#endif
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 static bool *g_suite_arg_matched = NULL;
@@ -677,6 +778,7 @@ extern void suite_dyn_array(void);
 extern void suite_str_intern(void);
 extern void suite_log(void);
 extern void suite_str_util(void);
+extern void suite_index_policy(void);
 extern void suite_workspace(void);
 extern void suite_platform(void);
 extern void suite_diagnostics(void);
@@ -716,9 +818,11 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_importance(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
 extern void suite_index_resilience(void);
+extern void suite_index_format(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
@@ -751,6 +855,7 @@ extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
+extern void suite_doclinks(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
@@ -780,6 +885,7 @@ extern void suite_repro_harness_cleanup(void);
 extern void suite_repro_runner_filter(void);
 extern void suite_call_reference_contract(void);
 extern void suite_mem(void);
+extern void suite_mem_events(void);
 extern void suite_ui(void);
 extern void suite_httpd(void);
 extern void suite_security(void);
@@ -818,16 +924,9 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
-    /* Skip the multi-hundred-MB executable-image hash that computes the exact
-     * build fingerprint: it is tens of seconds per spawned worker/daemon under
-     * ASan on constrained CI runners and the sole cause of the daemon-family
-     * readiness-timeout flakes. Set once here; every forked child and re-exec'd
-     * worker inherits it, so exact-build match/mismatch still works (a
-     * mismatch test still passes a DIFFERENT fingerprint via argv). Honoured
-     * only under CBM_CLI_ENABLE_TEST_API — never in a production binary. */
-    if (!getenv("CBM_TEST_BUILD_FINGERPRINT")) {
-        (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
-                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
+    int memory_limit_probe_rc = tf_maybe_run_windows_memory_limit_probe(argc, argv);
+    if (memory_limit_probe_rc >= 0) {
+        return memory_limit_probe_rc;
     }
     int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
     if (blocking_git_rc >= 0) {
@@ -839,6 +938,57 @@ int main(int argc, char **argv) {
         (void)puts("codebase-memory-mcp test-runner");
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--build-config") == 0) {
+#ifdef _WIN32
+        if (_setmode(cbm_fileno(stdout), _O_BINARY) == -1) {
+            fprintf(stderr, "failed to set build-config stdout to binary mode\n");
+            return 2;
+        }
+#endif
+#if defined(CBM_SANITIZED_BUILD) && CBM_SANITIZED_BUILD
+        const int sanitized = 1;
+#else
+        const int sanitized = 0;
+#endif
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        const int test_seams = 1;
+#else
+        const int test_seams = 0;
+#endif
+        (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
+        return 0;
+    }
+    /* Skip the multi-hundred-MB executable-image hash that computes the exact
+     * build fingerprint: it is tens of seconds per spawned worker/daemon under
+     * ASan on constrained CI runners and the sole cause of the daemon-family
+     * readiness-timeout flakes. Set once here; every forked child and re-exec'd
+     * worker inherits it, so exact-build match/mismatch still works (a
+     * mismatch test still passes a DIFFERENT fingerprint via argv). Honoured
+     * only under CBM_CLI_ENABLE_TEST_API — never in a production binary. */
+    if (!getenv("CBM_TEST_BUILD_FINGERPRINT")) {
+        (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
+                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
+    }
+    /* #1830 userns smoke probe -- see the test that spawns it.
+     *
+     * The ancestor overflow uid is derived ONCE per process (pthread_once in
+     * src/daemon/ipc.c) from /proc/self/uid_map. That file is not immutable:
+     * unshare(CLONE_NEWUSER) is exactly what changes it, and pthread_once state
+     * survives fork(). A forked child therefore keeps the HOST answer and never
+     * re-derives inside its new namespace, so a fork-only smoke test refuses and
+     * cannot pass once anything earlier in the suite has primed the cache --
+     * seven call sites do. Re-exec into this probe so the decision is made by a
+     * process that STARTED inside the namespace, which is the production shape
+     * the test means to cover. */
+#if defined(__linux__) && defined(CBM_ENABLE_TEST_SEAMS)
+    if (argc == 3 && strcmp(argv[1], "--userns-secure-probe") == 0) {
+        /* _exit, not return: this process exists to answer ONE boolean. A
+         * return runs the atexit chain, and the runner is built with
+         * -fsanitize=address, so a future leak anywhere in the prologue would
+         * exit 23 and read as a security verdict on a test that has none. */
+        _exit(cbm_daemon_ipc_private_directory_secure(argv[2]) ? 0 : 1);
+    }
+#endif
     int mcp_idxfailclosed_rc = tf_maybe_run_mcp_idxfailclosed_probe(argc, argv);
     if (mcp_idxfailclosed_rc >= 0) {
         return mcp_idxfailclosed_rc;
@@ -866,6 +1016,10 @@ int main(int argc, char **argv) {
     int daemon_ipc_probe_rc = tf_maybe_run_daemon_ipc_lock_probe(argc, argv);
     if (daemon_ipc_probe_rc >= 0) {
         return daemon_ipc_probe_rc;
+    }
+    int deleted_self_rc = tf_maybe_run_deleted_self_probe(argc, argv);
+    if (deleted_self_rc >= 0) {
+        return deleted_self_rc;
     }
 
     /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
@@ -925,6 +1079,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(str_intern);
     RUN_SELECTED_SUITE(log);
     RUN_SELECTED_SUITE(str_util);
+    RUN_SELECTED_SUITE(index_policy);
     RUN_SELECTED_SUITE(workspace);
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(diagnostics);
@@ -985,6 +1140,8 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(importance);
+    RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);
     RUN_SELECTED_SUITE(call_reference_contract);
     RUN_SELECTED_SUITE(call_reference_language_complex_contract);
@@ -1049,6 +1206,9 @@ int main(int argc, char **argv) {
     /* Config link */
     RUN_SELECTED_SUITE(configlink);
 
+    /* Markdown file reference link */
+    RUN_SELECTED_SUITE(doclinks);
+
     /* Infrastructure scanning */
     RUN_SELECTED_SUITE(infrascan);
 
@@ -1075,6 +1235,7 @@ int main(int argc, char **argv) {
     /* mem + arena + slab integration */
     RUN_SELECTED_SUITE(slab_alloc);
     RUN_SELECTED_SUITE(mem);
+    RUN_SELECTED_SUITE(mem_events);
 
     /* UI (config, external asset pack, layout) */
     RUN_SELECTED_SUITE(ui);

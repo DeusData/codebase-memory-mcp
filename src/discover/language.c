@@ -11,6 +11,7 @@
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
 #include "foundation/constants.h"
+#include "foundation/compat.h" // cbm_strcasestr
 #include "foundation/compat_fs.h"
 
 enum { LANG_SCAN_PASSES = 2 };
@@ -49,6 +50,19 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* C# */
     {".cs", CBM_LANG_CSHARP},
+    /* Blazor components. The C# grammar recovers the @code block; the
+     * surrounding markup parses as ERROR regions and is reported via
+     * parse_partial, which is why this is a best-effort mapping rather
+     * than a dedicated grammar. */
+    {".razor", CBM_LANG_CSHARP},
+    /* Razor Pages / MVC views. Same Razor syntax and the same C# host as
+     * .razor, and equally unmapped before this: an ASP.NET Core app's views
+     * produced no nodes at all. The `@page` directive that defines a Razor
+     * Page lives in this file type, so the route extraction below matters
+     * more here than it does for components. Best-effort on the same terms:
+     * the C# grammar recovers the @{ } / @functions blocks, the surrounding
+     * markup lands in ERROR regions and is reported via parse_partial. */
+    {".cshtml", CBM_LANG_CSHARP},
 
     /* Clojure */
     {".clj", CBM_LANG_CLOJURE},
@@ -89,6 +103,9 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Elm */
     {".elm", CBM_LANG_ELM},
+
+    /* ArkTS (HarmonyOS/OpenHarmony) */
+    {".ets", CBM_LANG_ARKTS},
 
     /* Emacs Lisp */
     {".el", CBM_LANG_EMACSLISP},
@@ -204,6 +221,19 @@ static const ext_entry_t EXT_TABLE[] = {
     /* PHP */
     {".php", CBM_LANG_PHP},
 
+    /* Oracle PL/SQL (do not map .sql — stays generic SQL; .prc stays FORM) */
+    {".pks", CBM_LANG_PLSQL},
+    {".pkb", CBM_LANG_PLSQL},
+    {".pck", CBM_LANG_PLSQL},
+    {".pls", CBM_LANG_PLSQL},
+    {".plb", CBM_LANG_PLSQL},
+    {".plsql", CBM_LANG_PLSQL},
+    {".fnc", CBM_LANG_PLSQL},
+    {".trg", CBM_LANG_PLSQL},
+    {".bdy", CBM_LANG_PLSQL},
+    {".tps", CBM_LANG_PLSQL},
+    {".tpb", CBM_LANG_PLSQL},
+
     /* Protobuf */
     {".proto", CBM_LANG_PROTOBUF},
 
@@ -291,6 +321,28 @@ static const ext_entry_t EXT_TABLE[] = {
     {".xsd", CBM_LANG_XML},
     {".xsl", CBM_LANG_XML},
     {".svg", CBM_LANG_XML},
+    /* MSBuild project system. Plain XML documents, and the files that carry a
+     * .NET repository's package references, target frameworks, build hooks and
+     * project layout — none of which were reachable while these were unmapped. */
+    {".csproj", CBM_LANG_XML},
+    {".vbproj", CBM_LANG_XML},
+    {".fsproj", CBM_LANG_XML},
+    {".props", CBM_LANG_XML},
+    {".targets", CBM_LANG_XML},
+    {".nuspec", CBM_LANG_XML},
+    {".slnx", CBM_LANG_XML},
+    {".runsettings", CBM_LANG_XML},
+    /* .NET resource files: the localized strings a UI reads back by key. */
+    {".resx", CBM_LANG_XML},
+    /* XAML views: WPF, WinUI, MAUI (.xaml) and Avalonia (.axaml). */
+    {".xaml", CBM_LANG_XML},
+    {".axaml", CBM_LANG_XML},
+    /* Application manifests: Apple property lists and privacy manifests, Win32
+     * side-by-side manifests and MSIX packages. */
+    {".plist", CBM_LANG_XML},
+    {".xcprivacy", CBM_LANG_XML},
+    {".manifest", CBM_LANG_XML},
+    {".appxmanifest", CBM_LANG_XML},
 
     /* YAML */
     {".yaml", CBM_LANG_YAML},
@@ -453,7 +505,10 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Qt QML */
     {".qml", CBM_LANG_QML},
 
-    /* CFML / ColdFusion — .cfc components are script-dialect; .cfm are tag templates */
+    /* CFML / ColdFusion — .cfm are tag templates; .cfc components may be EITHER
+     * script-dialect (component { ... }) or tag-dialect (<cfcomponent> ...). The
+     * table default is script; tag-based .cfc are resolved by content in
+     * cbm_disambiguate_cfc(). */
     {".cfc", CBM_LANG_CFSCRIPT},
     {".cfm", CBM_LANG_CFML},
 
@@ -553,6 +608,11 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Scheme */
     {".scm", CBM_LANG_SCHEME},
+
+    /* Chialisp — .clsp puzzles, .clib/.clinc includable libraries */
+    {".clsp", CBM_LANG_CHIALISP},
+    {".clib", CBM_LANG_CHIALISP},
+    {".clinc", CBM_LANG_CHIALISP},
 
     /* Slang */
     {".slang", CBM_LANG_SLANG},
@@ -763,6 +823,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_DLANG] = "D",
     [CBM_LANG_NIM] = "Nim",
     [CBM_LANG_SCHEME] = "Scheme",
+    [CBM_LANG_CHIALISP] = "Chialisp",
     [CBM_LANG_FENNEL] = "Fennel",
     [CBM_LANG_FISH] = "Fish",
     [CBM_LANG_AWK] = "AWK",
@@ -850,6 +911,8 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
+    [CBM_LANG_ARKTS] = "ArkTS",
+    [CBM_LANG_PLSQL] = "PL/SQL",
 
 };
 
@@ -1208,9 +1271,70 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     return CBM_LANG_MATLAB;
 }
 
-/* Disambiguate .cls files: shared by InterSystems ObjectScript UDL and
- * Salesforce Apex. ObjectScript class files begin with a line of the form
- * "Class <UppercasePackage>...". Defaults to Apex on any doubt. */
+/* Visual Basic 6 / VBA source exports are recognisable from their header (#721):
+ * every module carries `Attribute VB_Name = "..."`, class modules open with
+ * `VERSION 1.0 CLASS`, forms/controls with `VERSION 5.00` + `Begin VB.Form` /
+ * `Begin VB.UserControl`. None of these occur in Apex or ObjectScript classes
+ * or in FORM programs, whose .cls / .frm extensions VB6 happens to share. */
+static bool has_vb6_markers(const char *buf) {
+    return str_contains(buf, "Attribute VB_Name") || str_contains(buf, "VERSION 1.0 CLASS") ||
+           str_contains(buf, "Begin VB.") || str_contains(buf, "\nOption Explicit");
+}
+
+/* Disambiguate .frm files: shared by the FORM symbolic-manipulation language
+ * and Visual Basic 6 forms (#721). There is no Visual Basic language yet, so a
+ * VB6 form is reported as unsupported (CBM_LANG_COUNT) rather than handed to
+ * the FORM grammar, which yields no defs and stray junk nodes. Defaults to
+ * FORM on any doubt (preserves existing behaviour). */
+CBMLanguage cbm_disambiguate_frm(const char *path) {
+    if (!path) {
+        return CBM_LANG_FORM;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_FORM;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    /* VB6 form files open with "VERSION x.yy" on line 1. */
+    if (strncmp(buf, "VERSION ", SLEN("VERSION ")) == 0 &&
+        isdigit((unsigned char)buf[SLEN("VERSION ")])) {
+        return CBM_LANG_COUNT;
+    }
+    return has_vb6_markers(buf) ? CBM_LANG_COUNT : CBM_LANG_FORM;
+}
+
+/* Disambiguate .res files (#2176): ReScript source shares the extension with
+ * two binary formats -- Godot resources (RSRC/RSCC magic, the default save
+ * format for imported meshes) and Windows compiled resource files. Binary
+ * content has no ReScript meaning, and a NUL byte never occurs in ReScript
+ * text while both binary formats carry NULs in their first bytes. */
+CBMLanguage cbm_disambiguate_res(const char *path) {
+    if (!path) {
+        return CBM_LANG_RESCRIPT;
+    }
+
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return CBM_LANG_RESCRIPT;
+    }
+
+    char buf[CBM_SZ_4K];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    (void)fclose(f);
+    return memchr(buf, '\0', n) ? CBM_LANG_COUNT : CBM_LANG_RESCRIPT;
+}
+
+/* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
+ * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
+ * with a line of the form "Class <UppercasePackage>..."; VB6 class modules
+ * carry the VB6 header markers and are reported as unsupported (CBM_LANG_COUNT)
+ * until a Visual Basic grammar exists. Defaults to Apex on any doubt. */
 CBMLanguage cbm_disambiguate_cls(const char *path) {
     if (!path) {
         return CBM_LANG_APEX;
@@ -1225,6 +1349,10 @@ CBMLanguage cbm_disambiguate_cls(const char *path) {
     size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
     buf[n] = '\0';
     (void)fclose(f);
+
+    if (has_vb6_markers(buf)) {
+        return CBM_LANG_COUNT;
+    }
 
     const char *line = buf;
     while (*line) {
@@ -1287,4 +1415,75 @@ CBMLanguage cbm_disambiguate_inc(const char *path) {
         line = nl + SKIP_ONE;
     }
     return CBM_LANG_BITBAKE;
+}
+
+/* Case-insensitive prefix match (portable — no strncasecmp dependency). */
+static bool starts_with_ci(const char *s, const char *prefix) {
+    for (; *prefix; s++, prefix++) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Disambiguate .cfc files: a ColdFusion component may be written in the script
+ * dialect ("component { ... }", parsed by the JS-like cfscript grammar) or the
+ * tag dialect ("<cfcomponent> ... <cffunction>", parsed by the HTML-derived cfml
+ * grammar). The extension table defaults to cfscript because that is what modern
+ * Lucee/ACF templates use, but large legacy codebases are predominantly tag-based
+ * and feeding those to the wrong grammar fails wholesale. Routing rules:
+ *   1. A "<cfcomponent" or top-level "<cffunction" tag ⇒ tag dialect. (The latter
+ *      catches "bare" tag components that omit the <cfcomponent> wrapper.) This
+ *      wins regardless of any leading <!---/<cfscript>, so it is checked first.
+ *   2. Otherwise the file is script-dialect content. Find the first significant
+ *      token, skipping whitespace and <!--- ---> comments:
+ *        - a leading "<cfscript>" wrapper is still script content ⇒ cfscript;
+ *        - a different leading tag (e.g. <cfquery> in a bare-tag file) ⇒ cfml;
+ *        - anything else ("component { ... }") ⇒ cfscript.
+ * Defaults to CBM_LANG_CFSCRIPT on any doubt (preserves table behaviour). */
+CBMLanguage cbm_disambiguate_cfc(const char *path) {
+    if (!path) {
+        return CBM_LANG_CFSCRIPT;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_CFSCRIPT;
+    }
+
+    /* Read a generous head: tag components can carry a large license/revision
+     * comment block before the <cfcomponent> opener. */
+    char buf[CBM_SZ_16K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_16K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    /* Rule 1: explicit tag-component markers ⇒ tag dialect. */
+    if (cbm_strcasestr(buf, "<cfcomponent") != NULL || cbm_strcasestr(buf, "<cffunction") != NULL) {
+        return CBM_LANG_CFML;
+    }
+
+    /* Rule 2: locate the first significant token, past whitespace and comments. */
+    const char *p = buf;
+    for (;;) {
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (starts_with_ci(p, "<!---")) {
+            const char *end = strstr(p + SLEN("<!---"), "--->");
+            if (!end) {
+                break; /* comment runs past the buffer — treat as no token */
+            }
+            p = end + SLEN("--->");
+            continue;
+        }
+        break;
+    }
+    if (*p == '<') {
+        /* A leading <cfscript> wrapper is script content; any other leading tag
+         * (bare-tag file) is tag content. */
+        return starts_with_ci(p, "<cfscript") ? CBM_LANG_CFSCRIPT : CBM_LANG_CFML;
+    }
+    return CBM_LANG_CFSCRIPT;
 }

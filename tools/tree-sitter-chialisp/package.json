@@ -1,0 +1,21 @@
+{
+  "name": "tree-sitter-chialisp",
+  "version": "0.1.0",
+  "description": "Chialisp (Chia smart-coin s-expression language) grammar for tree-sitter",
+  "main": "bindings/node",
+  "keywords": ["tree-sitter", "chialisp", "chia", "clvm", "lisp"],
+  "license": "MIT",
+  "dependencies": {
+    "nan": "^2.18.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.25.0"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.chialisp",
+      "file-types": ["clsp", "clib", "clinc"],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

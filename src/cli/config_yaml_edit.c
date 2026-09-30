@@ -7,6 +7,7 @@
  */
 #include "cli/config_yaml_edit.h"
 
+#include "cli/config_edit_path.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
@@ -694,13 +695,26 @@ static int yaml_read_file(const char *path, char **out_data, size_t *out_len,
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    int descriptor = open(path, flags);
+    /* A symlink the invoking user owns, inside an opted-in configuration
+     * root, is read through the descriptor the helper validated on the
+     * target's pinned parent directory (#1954); everything else is opened by
+     * name with O_NOFOLLOW exactly as before. */
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(path, &target) < 0) {
+        return YAML_ERROR;
+    }
+    int descriptor = target.fd;
+    target.fd = -1;
+    if (target.status != CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        descriptor = open(target.path, flags);
+    }
+    cbm_config_edit_target_close(&target);
     if (descriptor < 0) {
         if (errno != ENOENT) {
             return YAML_ERROR;
         }
         struct stat path_state;
-        if (lstat(path, &path_state) == 0 || errno != ENOENT) {
+        if (lstat(target.path, &path_state) == 0 || errno != ENOENT) {
             return YAML_ERROR;
         }
         char *empty = (char *)calloc(YAML_UNIT, YAML_UNIT);
@@ -869,9 +883,30 @@ static int yaml_replace_file(const char *temp_path, const char *path, bool desti
 #endif
 }
 
-static int yaml_write_atomic(const char *path, const char *data, size_t len,
-                             const char *expected_data, size_t expected_len,
-                             const yaml_file_snapshot_t *expected_snapshot) {
+static const char *yaml_temp_name(const char *temp_path) {
+    const char *slash = strrchr(temp_path, '/');
+    return slash ? slash + 1 : temp_path;
+}
+
+/* Drop a staged temp file: through the pinned parent for a followed link,
+ * by name otherwise. */
+static void yaml_discard_temp(const cbm_config_edit_target_t *target, const char *temp_path) {
+    if (target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        (void)cbm_config_edit_target_unlink(target, yaml_temp_name(temp_path));
+    } else {
+        (void)cbm_unlink(temp_path);
+    }
+}
+
+/* For a followed link (#1954) the temp file is created with openat() beside
+ * the target and published with renameat() on the pinned parent, so the link
+ * itself is never replaced; every pre-publish comparison runs against the
+ * resolved path. A direct path keeps the by-name sequence unchanged. */
+static int yaml_write_atomic_at(const cbm_config_edit_target_t *target, const char *data,
+                                size_t len, const char *expected_data, size_t expected_len,
+                                const yaml_file_snapshot_t *expected_snapshot) {
+    const char *path = target->path;
+    bool followed = target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED;
     size_t path_len = 0U;
     if (yaml_bounded_strlen(path, YAML_OUTPUT_MAX, &path_len) != 0 ||
         path_len > SIZE_MAX - YAML_TMP_SUFFIX_MAX - YAML_UNIT) {
@@ -901,12 +936,14 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
-        int descriptor = open(temp_path, flags, YAML_NEW_FILE_MODE);
+        int descriptor = followed ? cbm_config_edit_target_create_temp(
+                                        target, yaml_temp_name(temp_path), YAML_NEW_FILE_MODE)
+                                  : open(temp_path, flags, YAML_NEW_FILE_MODE);
         if (descriptor >= 0) {
             file = fdopen(descriptor, "wb");
             if (!file) {
                 (void)close(descriptor);
-                (void)cbm_unlink(temp_path);
+                yaml_discard_temp(target, temp_path);
                 free(temp_path);
                 return YAML_ERROR;
             }
@@ -947,7 +984,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
         failed = true;
     }
     if (failed) {
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -958,7 +995,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
         !temp_snapshot.exists || temp_len != len ||
         (len != 0U && memcmp(temp_data, data, len) != 0)) {
         free(temp_data);
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -970,7 +1007,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
     }
 #endif
     if (yaml_snapshot_matches_path(path, expected_data, expected_len, expected_snapshot) != 0) {
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -981,13 +1018,27 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
 #endif
     if (yaml_snapshot_matches_path(path, expected_data, expected_len, expected_snapshot) != 0 ||
         yaml_snapshot_matches_path(temp_path, data, len, &temp_snapshot) != 0 ||
-        yaml_replace_file(temp_path, path, expected_snapshot->exists) != 0) {
-        (void)cbm_unlink(temp_path);
+        (followed ? cbm_config_edit_target_commit(target, yaml_temp_name(temp_path))
+                  : yaml_replace_file(temp_path, path, expected_snapshot->exists)) != 0) {
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
     free(temp_path);
     return 0;
+}
+
+static int yaml_write_atomic(const char *requested_path, const char *data, size_t len,
+                             const char *expected_data, size_t expected_len,
+                             const yaml_file_snapshot_t *expected_snapshot) {
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(requested_path, &target) < 0) {
+        return YAML_ERROR;
+    }
+    int result =
+        yaml_write_atomic_at(&target, data, len, expected_data, expected_len, expected_snapshot);
+    cbm_config_edit_target_close(&target);
+    return result;
 }
 
 #ifdef CBM_YAML_ENABLE_TEST_API
@@ -2624,8 +2675,18 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
         if (value == '#' && (i == start || doc->data[i - YAML_UNIT] == ' ')) {
             break;
         }
+        /* Block-scalar (`|`, `>`) and flow-sequence (`[`, `]`) indicators
+         * count only where a NODE begins, the same positional rule
+         * yaml_range_has_unsupported_ex applies to `&`/`*`. Interior ones are
+         * text: `probe: kaomoji face >w< here` is a plain scalar, and a real
+         * Hermes config carried two such personas (#1924). `probe: >`,
+         * `probe: |` and `probe: [a, b]` still begin a value and stay
+         * unsupported here. */
         if (value == '[' || value == ']' || value == '|' || value == '>') {
-            return YAML_MATCH;
+            bool begins_node = previous == '\0' || previous == ':' || previous == '-';
+            if (begins_node) {
+                return YAML_MATCH;
+            }
         }
         if (value != ' ' && value != '\t') {
             previous = value;
@@ -3601,8 +3662,49 @@ int cbm_yaml_upsert_mapping_entry(const char *file_path, const char *section_key
     return result == 0 && release_result == 0 ? 0 : YAML_ERROR;
 }
 
+/* Removal is idempotent: a config that does not exist has nothing to remove.
+ * The JSON removers already answer OK here (cbm_json_like_read_document's
+ * "missing" result); the YAML removers instead took the lock first, and the
+ * lock directory is created beside the target — so with the parent directory
+ * absent (`~/.hermes/` never created because Hermes was detected by its
+ * binary on PATH, not by its home) every uninstall reported
+ * "does not exist or cannot be inspected" and refused to remove the
+ * executable. Only a true ENOENT short-circuits: a dangling symlink still
+ * reaches the reader and its byte-identical rejection. */
+static bool yaml_remove_target_absent(const char *path) {
+    if (!path) {
+        return false;
+    }
+#ifdef _WIN32
+    /* FILE_FLAG_OPEN_REPARSE_POINT, as in toml_read_file: opens the link
+     * itself rather than following it, so a dangling symlink does NOT count as
+     * absent and still reaches the reader — matching the POSIX branch, where
+     * lstat does not follow either. */
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE handle = CreateFileW(
+        wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    free(wide);
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+        return false;
+    }
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+#else
+    struct stat path_state;
+    return lstat(path, &path_state) != 0 && errno == ENOENT;
+#endif
+}
+
 int cbm_yaml_remove_mapping_entry(const char *file_path, const char *section_key,
                                   const char *entry_key) {
+    if (yaml_remove_target_absent(file_path)) {
+        return 0;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return YAML_ERROR;
@@ -3626,6 +3728,9 @@ int cbm_yaml_upsert_owned_mapping_entry(const char *file_path, const char *secti
 
 int cbm_yaml_remove_owned_mapping_entry(const char *file_path, const char *section_key,
                                         const char *entry_key, const char *canonical_entry_block) {
+    if (yaml_remove_target_absent(file_path)) {
+        return CBM_YAML_IDENTITY_EDIT_OK;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return CBM_YAML_IDENTITY_EDIT_ERROR;
@@ -3653,6 +3758,9 @@ int cbm_yaml_upsert_mapping_sequence_item(const char *file_path, const char *con
 int cbm_yaml_remove_mapping_sequence_item(const char *file_path, const char *const *sequence_path,
                                           size_t sequence_path_len, const char *identity_key,
                                           const char *identity_scalar, const char *canonical_item) {
+    if (yaml_remove_target_absent(file_path)) {
+        return CBM_YAML_IDENTITY_EDIT_OK;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return CBM_YAML_IDENTITY_EDIT_ERROR;
@@ -3675,6 +3783,9 @@ int cbm_yaml_upsert_string_list_item(const char *file_path, const char *key, con
 }
 
 int cbm_yaml_remove_string_list_item(const char *file_path, const char *key, const char *item) {
+    if (yaml_remove_target_absent(file_path)) {
+        return 0;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return YAML_ERROR;

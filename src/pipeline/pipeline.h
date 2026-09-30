@@ -53,6 +53,20 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Apply a validated discovery resource policy. The value is copied. */
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Copy the exact discovery violation from the most recent run. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation);
+
+/* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
+ * when the run succeeded / did not reach post-publish export. Used to
+ * truthfully attribute a failed run to the persistence export (#1665) instead
+ * of the generic pipeline-error hint. Valid until the next cbm_pipeline_run or
+ * cbm_pipeline_free(). Returns "" for NULL p. */
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
@@ -63,9 +77,16 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * need to know whether the PREVIOUS generation survived can distinguish the
  * failures by value: the run publishes by renaming a fully validated staging
  * database over the destination, so every abort before that rename leaves the
- * existing database in place. Those codes (CBM_PIPELINE_ABORT_PRESERVE_DB and
- * CBM_PIPELINE_PERSIST_FAILED) are defined in pipeline_internal.h alongside the
- * stages that raise them. */
+ * existing database in place. */
+#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2) /* aborted pre-publication; previous DB intact */
+#define CBM_PIPELINE_PERSIST_FAILED (-4)    /* staging/rollback failure during publication */
+/* Resident memory stayed above the budget after back-pressure and one
+ * confirmation cycle: the run stops before publication, no partial graph is
+ * written, the previous DB is intact (#1997 #832). Distinct from the cancel
+ * sentinel so callers can name the cause instead of "pipeline failed". */
+#define CBM_PIPELINE_ABORT_OVER_BUDGET (-5)
+/* Opt-in discovery/resource policy breach: fail the attempt, keep serving DB. */
+#define CBM_PIPELINE_RESOURCE_LIMIT (-6)
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
@@ -92,6 +113,8 @@ int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
  * valid until cbm_pipeline_free()); *count receives its length. Both are set
  * to NULL/0 when p is NULL or nothing was excluded. Do not free. */
 void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count);
+
+bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p);
 
 /* Committed node/edge counts captured at dump time (-1 when dump did not run).
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
@@ -211,10 +234,21 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
- * Returns result with qualified_name="" if unresolved. */
+ * Returns result with qualified_name="" if unresolved.
+ * Never returns a data relation (Table/View): relations are lineage-only
+ * registry members and common table names (users, orders, config) collide with
+ * code identifiers in every language, so the default resolve vetoes them
+ * centrally instead of relying on per-consumer label checks. */
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
+
+/* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
+ * consumer allowed to bind Table/View targets. Uncached (the per-file resolve
+ * cache stores the default variant's relation-vetoed answers). */
+cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count);
 
 /* Per-file memoization cache for is_import_reachable. Thread-local —
  * each resolve worker owns its own cache. Call _begin at the start
@@ -256,13 +290,42 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
-/* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
- * drop (#592/#606): true only for TS/JS, only for a member call with a
- * non-this/super receiver (is_method), and only when the match used a weak
- * short-name strategy (suffix_match / unique_name / field_type_hint / fuzzy).
+/* Decide whether a resolved member-call edge is weak-strategy noise to drop
+ * (#592/#606/#1276): true only when the CALLER's per-language gate says the
+ * guard applies (`enabled`), only for a member call with an unresolved receiver
+ * (is_method), and only when the match used a weak short-name strategy
+ * (suffix_match / unique_name / field_type_hint / fuzzy).
  * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
+ * The language set lives at the call sites (pass_calls.c / pass_parallel.c) and
+ * must be identical in both, or the sequential and parallel resolvers diverge.
  * Pure; unit-tested in test_registry.c. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
+
+/* True if `name` is a method of a Python builtin type (str/bytes/list/dict/set/
+ * file) or a builtin function seen as an attribute call. A language fact, kept
+ * as a sorted table like the Perl builtins. */
+bool cbm_python_is_builtin_member(const char *name);
+
+/* The member guard's exemption: a Python member call whose receiver is an
+ * attribute chain rooted at self/cls (an object the class owns), whose callee has
+ * exactly one project definition (strategy unique_name) and is not a builtin
+ * type's own method keeps its edge. Combine at the call sites as
+ * `suppress && !exempt`; both pass_calls.c and pass_parallel.c must do the same.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
+                                        const char *callee_name, const char *strategy);
+
+/* Bare-call counterpart of the guard above. True when a resolved BARE call edge
+ * binds a callee that is shadowed by an enclosing parameter, and the match came
+ * from a weak short-name strategy — so the edge is fabricated by construction
+ * (`def f(run): run()` must not bind an unrelated `SatoriLive.run`). Shares the
+ * member guard's drop-list, so lsp_* / import / same-module matches are kept.
+ * Deliberately keyed on the SCOPE FACT, not on the callee's spelling. The
+ * language set lives at the call sites (pass_calls.c / pass_parallel.c) and must
+ * be identical in both, or the sequential and parallel resolvers diverge.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
+                                          const char *strategy);
 
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
@@ -271,6 +334,22 @@ bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const cha
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
+
+/* #1928: USAGE/WRITES/READS analog of the CALLS guard above. Reference edges
+ * resolved by the short-name registry carry no import-closure evidence, so a
+ * cross-language binding is a bare-name collision for EVERY strategy — drop
+ * it whenever the caller's language and the target file's language disagree
+ * (JS/TS family members and the C/C++ header family excepted). Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
+
+/* #1942: a bare (dot-less) Go reference can never denote a struct field —
+ * field access is always a selector expression, and selector references
+ * resolve on the LSP path. Drops a READS/WRITES/USAGE bind whose target is a
+ * Field when the reference text carries no '.'. Go only: other OO languages
+ * legitimately reference their own members bare inside method bodies. Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

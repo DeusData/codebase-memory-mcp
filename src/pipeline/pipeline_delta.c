@@ -21,12 +21,17 @@
  * deleted individually on existing databases; their rowids can never alias
  * a live node again (AUTOINCREMENT), so dead entries simply drop out of the
  * rowid join at query time. The patch inserts rows for exactly the new
- * nodes, via the same cbm_camel_split SQL function the wholesale rebuild
- * uses.
+ * nodes through cbm_store_fts_rebuild() — the SAME writer the wholesale
+ * rebuild uses, so the two paths cannot index different column sets. This
+ * path is the one most users actually hit: a hand-written INSERT here that
+ * named only the identifier columns would leave nodes_fts.body NULL for
+ * every node arriving by delta merge, invisibly, while a full reindex
+ * looked perfect (#518/#519).
  */
 #include "foundation/constants.h"
 #include "pipeline/pipeline_internal.h"
 
+#include <stdint.h> /* intptr_t — SQLITE_TRANSIENT wrapper */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +42,25 @@
 #include "store/store.h"
 
 enum { DELTA_IN_CHUNK = 200 };
+
+/* Positional bind indices for the snapshot re-link statement. */
+enum {
+    DELTA_BIND_1 = 1,
+    DELTA_BIND_2 = 2,
+    DELTA_BIND_3 = 3,
+    DELTA_BIND_4 = 4,
+    DELTA_BIND_5 = 5,
+};
+
+/* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
+ * Same pattern as store.c's BIND_TRANSIENT and mcp.c's MCP_SQLITE_TRANSIENT. */
+static sqlite3_destructor_type delta_sqlite_transient(void) {
+    static const volatile intptr_t raw = -1;
+    sqlite3_destructor_type dtor = NULL;
+    memcpy(&dtor, (const void *)&raw, sizeof(dtor));
+    return dtor;
+}
+#define DELTA_SQLITE_TRANSIENT (delta_sqlite_transient())
 
 /* Assemble "?,?,...,?" for a chunked IN list. buf must hold 2*count. */
 static void delta_placeholders(char *buf, int count) {
@@ -448,6 +472,42 @@ static void delta_patch_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     ctx->edges++;
 }
 
+/* Re-link the snapshotted inbound edges by qualified name. A target whose QN
+ * no longer exists simply matches no row — full-reindex semantics for deleted
+ * symbols, dedup by the UNIQUE edge constraint. Returns false on failure.
+ *
+ * Extracted from cbm_delta_patch to keep that function inside the
+ * cognitive-complexity budget; behaviour is unchanged. */
+static bool delta_relink_snapshot(sqlite3 *db, const char *project,
+                                  const cbm_delta_saved_edge_t *snapshot, int snapshot_count) {
+    sqlite3_stmt *relink = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "INSERT OR IGNORE INTO edges (project, source_id, target_id,"
+                           " type, properties)"
+                           " SELECT ?1, s.id, t.id, ?2, ?3 FROM nodes s, nodes t"
+                           " WHERE s.project = ?1 AND s.qualified_name = ?4"
+                           " AND t.project = ?1 AND t.qualified_name = ?5",
+                           CBM_NOT_FOUND, &relink, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool ok = true;
+    for (int i = 0; i < snapshot_count && ok; i++) {
+        sqlite3_reset(relink);
+        sqlite3_bind_text(relink, DELTA_BIND_1, project, CBM_NOT_FOUND, DELTA_SQLITE_TRANSIENT);
+        sqlite3_bind_text(relink, DELTA_BIND_2, snapshot[i].type, CBM_NOT_FOUND,
+                          DELTA_SQLITE_TRANSIENT);
+        sqlite3_bind_text(relink, DELTA_BIND_3, snapshot[i].props, CBM_NOT_FOUND,
+                          DELTA_SQLITE_TRANSIENT);
+        sqlite3_bind_text(relink, DELTA_BIND_4, snapshot[i].source_qn, CBM_NOT_FOUND,
+                          DELTA_SQLITE_TRANSIENT);
+        sqlite3_bind_text(relink, DELTA_BIND_5, snapshot[i].target_qn, CBM_NOT_FOUND,
+                          DELTA_SQLITE_TRANSIENT);
+        ok = sqlite3_step(relink) == SQLITE_DONE;
+    }
+    sqlite3_finalize(relink);
+    return ok;
+}
+
 int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, int64_t max_db_id,
                     const cbm_delta_saved_edge_t *snapshot, int snapshot_count) {
     sqlite3 *db = cbm_store_get_db(store);
@@ -489,57 +549,21 @@ int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, i
     sqlite3_finalize(ctx.edge_stmt);
     sqlite3_finalize(ctx.qn_lookup);
 
-    /* Re-link the snapshotted inbound edges by qualified name. A target
-     * whose QN no longer exists simply matches no row — full-reindex
-     * semantics for deleted symbols, dedup by the UNIQUE edge constraint. */
-    if (!ctx.failed && snapshot_count > 0) {
-        sqlite3_stmt *relink = NULL;
-        if (sqlite3_prepare_v2(db,
-                               "INSERT OR IGNORE INTO edges (project, source_id, target_id,"
-                               " type, properties)"
-                               " SELECT ?1, s.id, t.id, ?2, ?3 FROM nodes s, nodes t"
-                               " WHERE s.project = ?1 AND s.qualified_name = ?4"
-                               " AND t.project = ?1 AND t.qualified_name = ?5",
-                               CBM_NOT_FOUND, &relink, NULL) != SQLITE_OK) {
-            ctx.failed = true;
-        } else {
-            for (int i = 0; i < snapshot_count && !ctx.failed; i++) {
-                sqlite3_reset(relink);
-                sqlite3_bind_text(relink, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 2, snapshot[i].type, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 3, snapshot[i].props, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 4, snapshot[i].source_qn, CBM_NOT_FOUND,
-                                  SQLITE_TRANSIENT);
-                sqlite3_bind_text(relink, 5, snapshot[i].target_qn, CBM_NOT_FOUND,
-                                  SQLITE_TRANSIENT);
-                if (sqlite3_step(relink) != SQLITE_DONE) {
-                    ctx.failed = true;
-                }
-            }
-            sqlite3_finalize(relink);
-        }
+    if (!ctx.failed && snapshot_count > 0 &&
+        !delta_relink_snapshot(db, project, snapshot, snapshot_count)) {
+        ctx.failed = true;
     }
 
-    /* Row-level FTS for exactly the new nodes, through the same tokenizer
-     * function the wholesale rebuild uses. */
+    /* Row-level FTS for exactly the new nodes, through the shared writer —
+     * same columns, same tokenizer, same prose backfill as the wholesale
+     * rebuild. NOT_FOUND means the index could not be written at all (FTS5
+     * compiled out); search then runs without it, matching the dump path. */
     if (!ctx.failed) {
-        sqlite3_stmt *fts = NULL;
-        if (sqlite3_prepare_v2(db,
-                               "INSERT INTO nodes_fts (rowid, name, qualified_name, label,"
-                               " file_path)"
-                               " SELECT id, cbm_camel_split(name), qualified_name, label,"
-                               " file_path FROM nodes WHERE project = ?1 AND id > ?2",
-                               CBM_NOT_FOUND, &fts, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(fts, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(fts, 2, max_db_id);
-            if (sqlite3_step(fts) != SQLITE_DONE) {
-                ctx.failed = true;
-            }
-            sqlite3_finalize(fts);
-        } else {
-            /* FTS5 may be compiled out; the table then never existed and
-             * search runs without it — matching the dump path's behavior. */
+        int fts_rc = cbm_store_fts_rebuild(store, project, max_db_id);
+        if (fts_rc == CBM_STORE_NOT_FOUND) {
             cbm_log_warn("delta.fts_insert_unavailable", "project", project);
+        } else if (fts_rc != CBM_STORE_OK) {
+            ctx.failed = true;
         }
     }
 

@@ -4,6 +4,8 @@
 #include "test_framework.h"
 #include "../src/foundation/hash_table.h"
 
+#include <string.h>
+
 TEST(ht_create_free) {
     CBMHashTable *ht = cbm_ht_create(16);
     ASSERT_NOT_NULL(ht);
@@ -33,6 +35,29 @@ TEST(ht_set_overwrite) {
     ASSERT_EQ(prev, &v1); /* returns old value */
     ASSERT_EQ(*(int *)cbm_ht_get(ht, "key"), 2);
     ASSERT_EQ(cbm_ht_count(ht), 1); /* still 1 entry */
+    cbm_ht_free(ht);
+    PASS();
+}
+
+/* Keys are BORROWED. Overwriting an existing key must adopt the new key pointer
+ * too, because the caller may free the old string right after: cbm_ht_set does
+ * one probe now (get_or_insert) instead of get-then-insert, and the replace of
+ * both key and value is what _insert used to do implicitly. */
+TEST(ht_set_overwrite_adopts_the_new_key_pointer) {
+    CBMHashTable *ht = cbm_ht_create(8);
+    char first[8];
+    char second[8];
+    memcpy(first, "shared", 7);
+    memcpy(second, "shared", 7);
+    int v1 = 1;
+    int v2 = 2;
+    ASSERT_NULL(cbm_ht_set(ht, first, &v1));
+    ASSERT_EQ(cbm_ht_get_key(ht, "shared"), first);
+    ASSERT_EQ(cbm_ht_set(ht, second, &v2), &v1);
+    ASSERT_EQ(cbm_ht_get_key(ht, "shared"), second); /* the old buffer is no longer referenced */
+    memcpy(first, "gone!!", 7);                      /* the caller reuses the old buffer */
+    ASSERT_EQ(*(int *)cbm_ht_get(ht, "shared"), 2);
+    ASSERT_EQ(cbm_ht_count(ht), 1);
     cbm_ht_free(ht);
     PASS();
 }
@@ -367,6 +392,7 @@ SUITE(hash_table) {
     RUN_TEST(ht_create_free);
     RUN_TEST(ht_set_get);
     RUN_TEST(ht_set_overwrite);
+    RUN_TEST(ht_set_overwrite_adopts_the_new_key_pointer);
     RUN_TEST(ht_get_missing);
     RUN_TEST(ht_has);
     RUN_TEST(ht_delete);

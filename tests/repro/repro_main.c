@@ -91,6 +91,7 @@ extern void suite_repro_issue581(void);
 extern void suite_repro_issue787(void);
 extern void suite_repro_issue842(void);
 extern void suite_repro_issue964(void);
+extern void suite_repro_issue1692(void);
 /* NEW bugs found by the discovery sweep */
 extern void suite_repro_new_ts_class_field_arrow(void);
 extern void suite_repro_new_py_tuple_unpack(void);
@@ -192,6 +193,7 @@ int main(void) {
     RUN_SUITE(repro_issue787);
     RUN_SUITE(repro_issue842);
     RUN_SUITE(repro_issue964);
+    RUN_SUITE(repro_issue1692);
     RUN_SUITE(repro_invariant_calls);
     RUN_SUITE(repro_invariant_graph);
     RUN_SUITE(repro_invariant_breadth);

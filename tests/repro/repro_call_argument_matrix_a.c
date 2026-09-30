@@ -605,6 +605,14 @@ SEMANTIC_CASE(tsx, TSX, "main.tsx",
               "function bare(handler: number): number { return handler; }\n",
               "handler", "call_expression", 2, 2);
 
+SEMANTIC_CASE(arkts, ARKTS, "main.ets",
+              "function handler(): number { return 0; }\n"
+              "function accept(value: number): number { return value; }\n"
+              "function argument(handler: number): number { return accept(handler); }\n"
+              "function direct(): number { return handler(); }\n"
+              "function bare(handler: number): number { return handler; }\n",
+              "handler", "call_expression", 2, 2);
+
 SEMANTIC_CASE(rust, RUST, "main.rs",
               "fn handler() -> i32 { 0 }\n"
               "fn accept(value: i32) -> i32 { value }\n"
@@ -1244,7 +1252,8 @@ SEMANTIC_CASE(agda, AGDA, "Main.agda",
     X(zsh)                \
     X(tcl)                \
     X(ada)                \
-    X(agda)
+    X(agda)               \
+    X(arkts)
 
 #define DEFINE_MATRIX_TEST(tag_)                        \
     TEST(repro_call_argument_matrix_a_##tag_) {         \
@@ -1259,8 +1268,8 @@ MATRIX_A_CASES(DEFINE_MATRIX_TEST)
 static const MatrixCase *const MATRIX_A_CASE_ROWS[] = {MATRIX_A_CASES(MATRIX_CASE_POINTER)};
 #undef MATRIX_CASE_POINTER
 
-_Static_assert(sizeof(MATRIX_A_CASE_ROWS) / sizeof(MATRIX_A_CASE_ROWS[0]) == 67,
-               "GO..AGDA call-capable matrix must contain exactly 67 language rows");
+_Static_assert(sizeof(MATRIX_A_CASE_ROWS) / sizeof(MATRIX_A_CASE_ROWS[0]) == 68,
+               "GO..ARKTS call-capable matrix must contain exactly 68 language rows");
 
 size_t repro_call_argument_matrix_a_copy_language_ids(CBMLanguage *language_ids, size_t capacity) {
     size_t row_count = sizeof(MATRIX_A_CASE_ROWS) / sizeof(MATRIX_A_CASE_ROWS[0]);

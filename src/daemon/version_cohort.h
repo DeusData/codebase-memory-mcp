@@ -58,10 +58,14 @@ cbm_version_cohort_manager_t *cbm_version_cohort_manager_new(
 /* Admission first takes the maintenance gate SH without waiting, holds it
  * across the short admission EX transition, then retains SH on the cohort
  * lifetime file. Active maintenance therefore fails fast with BUSY. Exact
- * identity peers share SH; a different version, build, or ABI returns
- * CONFLICT with conflict_out populated. deadline_ms is an absolute
- * cbm_now_ms() deadline; UINT64_MAX waits indefinitely. Every non-NULL
- * lease_out, including cleanup-only IO state, must be released. */
+ * identity peers share SH; a different version, build, ABI, or cache root
+ * is a CONFLICT — retried, with every guard released between attempts, until
+ * deadline_ms, because the mismatched holder is often a draining daemon or a
+ * short-lived CLI that is about to leave (#2046). Only when the deadline
+ * passes is CONFLICT returned with conflict_out populated. deadline_ms is an
+ * absolute cbm_now_ms() deadline; UINT64_MAX waits indefinitely for locks but
+ * never for a conflicting holder. Every non-NULL lease_out, including
+ * cleanup-only IO state, must be released. */
 cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manager_t *manager,
                                                        const cbm_daemon_build_identity_t *identity,
                                                        uint64_t deadline_ms,
@@ -152,5 +156,12 @@ bool cbm_version_cohort_log_conflict(const cbm_daemon_conflict_t *conflict);
 /* Persist the fail-closed migration case where the stable daemon reservation
  * is active but no current-generation coordination marker can be verified. */
 bool cbm_version_cohort_log_uncoordinated_daemon(const cbm_daemon_build_identity_t *requested);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Monotonic count of admission attempts that met a mismatched live holder and
+ * retried (#2046). Lets a test prove the waiter observed the conflict before
+ * the holder left, instead of passing vacuously by arriving late. */
+uint64_t cbm_version_cohort_conflict_retries_for_testing(void);
+#endif
 
 #endif /* CBM_DAEMON_VERSION_COHORT_H */

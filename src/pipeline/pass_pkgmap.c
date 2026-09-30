@@ -1397,7 +1397,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 1. Try relative import resolution (existing logic) */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
     if (resolved) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+        /* The relative resolver has already removed an explicit JS/TS file
+         * extension.  Treat the remaining path as a module path verbatim so a
+         * dotted extensionless basename such as `featureX.engine` is not
+         * stripped a second time by cbm_pipeline_fqn_module. */
+        char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
         free(resolved);
         return qn;
     }
@@ -1539,6 +1543,21 @@ static bool import_targetable_label(const char *label) {
     return false;
 }
 
+/* #1934: whether the name-guess import fallbacks — Strategy 1b (sibling file,
+ * whose label filter admits symbols) and Strategy 3 (symbol name) — may run
+ * for imports from this language. A Go import path names a package — never a
+ * function, method
+ * or field — and every correct Go import resolves in Strategy 1 (module path
+ * → the package's Folder node); when that misses the import is external and
+ * the correct result is NO edge. The fallback instead bound the last path
+ * segment to an arbitrary same-named project symbol (`import "os/exec"` → a
+ * test harness's exec() method, two imports → a Makefile target). Languages
+ * whose import genuinely can name a member (Python `from m import f`, Java
+ * `import com.example.Foo`, Rust `use crate::ops::helper`) keep it. */
+bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
+    return lang != CBM_LANG_GO;
+}
+
 static const char *path_leaf(const char *path) {
     const char *leaf = path;
     for (const char *p = path; p && *p; p++) {
@@ -1578,6 +1597,49 @@ static bool is_c_family_source(const char *source_rel) {
         }
     }
     return false;
+}
+
+/* Directory depth of a repo-relative path: how many directories sit above it. */
+static int include_path_depth(const char *path) {
+    int depth = 0;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Total order among nodes whose file path ends with the include path. The
+ * by-name hits arrive in node-registration order, which under parallel
+ * extraction is the workers' merge order and differs run to run; taking the
+ * first hit made `#include <linux/device.h>` target include/linux/device.h in
+ * one index of the kernel and tools/virtio/linux/device.h in the next (5,821
+ * IMPORTS edges moved, and every CALLS edge resolved through those files'
+ * import maps moved with them). The include names a file, so a File node
+ * outranks a symbol declared in it; among files the least nested path wins
+ * (include/ over tools/virtio/), then the smaller path, then the smaller QN
+ * — a function of the candidate set alone (O9). */
+static bool include_target_outranks(const cbm_gbuf_node_t *cand, const cbm_gbuf_node_t *best) {
+    if (!best) {
+        return true;
+    }
+    bool cand_file = strcmp(cand->label, "File") == 0;
+    bool best_file = strcmp(best->label, "File") == 0;
+    if (cand_file != best_file) {
+        return cand_file;
+    }
+    int cd = include_path_depth(cand->file_path);
+    int bd = include_path_depth(best->file_path);
+    if (cd != bd) {
+        return cd < bd;
+    }
+    int by_path = strcmp(cand->file_path, best->file_path);
+    if (by_path != 0) {
+        return by_path < 0;
+    }
+    return cand->qualified_name && best->qualified_name &&
+           strcmp(cand->qualified_name, best->qualified_name) < 0;
 }
 
 static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *ctx,
@@ -1632,18 +1694,12 @@ static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *
                 strcmp(cand->qualified_name, source_file_qn) == 0) {
                 continue;
             }
-            if (strcmp(cand->label, "File") == 0) {
-                return cand;
-            }
-            if (!best) {
+            if (include_target_outranks(cand, best)) {
                 best = cand;
             }
         }
-        if (best) {
-            return best;
-        }
     }
-    return NULL;
+    return best;
 }
 
 static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *ctx,
@@ -1817,10 +1873,24 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return target;
     }
 
+    /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
+     * symbol-name) are gated per importing-file language — see
+     * cbm_import_symbol_fallback_allowed (#1934). */
+    const char *src_base = source_rel ? source_rel : "";
+    for (const char *pb = src_base; *pb; pb++) {
+        if (*pb == '/' || *pb == '\\') {
+            src_base = pb + SKIP_ONE;
+        }
+    }
+    const bool symbol_fallback_allowed =
+        cbm_import_symbol_fallback_allowed(cbm_language_for_filename(src_base));
+
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
      * import string is a sibling filename or directory (SCSS partials, Just/
-     * BitBake/func includes, Meson subdir, Pony use). */
-    {
+     * BitBake/func includes, Meson subdir, Pony use). Its label filter admits
+     * symbols too, so for Go it re-creates the Strategy-3 bug one directory
+     * closer (`os/exec` → a same-package exec() method) — gated the same. */
+    if (symbol_fallback_allowed) {
         const cbm_gbuf_node_t *sib =
             resolve_sibling_file(ctx, source_rel, source_file_qn, imp->module_path);
         if (sib) {
@@ -1898,7 +1968,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     /* Strategy 3: symbol-name fallback.  Derive a representative imported
      * symbol (handling alias / glob / grouped forms) and match it against an
      * in-graph definition of the same simple name in another file
-     * (Rust `helper`, Java `Util`, Kotlin grouped, ...). */
+     * (Rust `helper`, Java `Util`, Kotlin grouped, ...).
+     * Gated per importing-file language, like Strategy 1b above (#1934). */
     char symbuf[256];
     /* Prefer the clean candidate from the module path; the local_name may be an
      * alias (Rust `as h`, Kotlin `as U`) that names no real symbol. */
@@ -1962,7 +2033,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             *dot = '\0';
             end = dot;
         }
-        for (int ci = 0; ci < ncands; ci++) {
+        for (int ci = 0; symbol_fallback_allowed && ci < ncands; ci++) {
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
             if (cbm_gbuf_find_by_name(ctx->gbuf, cands[ci], &hits, &n) == 0 && hits) {
@@ -2066,13 +2137,19 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
 /* ── Namespace map ───────────────────────────────────────────────── */
 
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count) {
+/* The namespace names themselves, so a caller that has parked some results on
+ * disk can still contribute their namespaces (see
+ * cbm_result_spill_namespace). A file missing from this map does not fail to
+ * resolve -- it resolves DIFFERENTLY, through the looser fallback, which is why
+ * an incomplete map changed edge counts in both directions rather than only
+ * losing edges. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count) {
     CBMHashTable *map = NULL;
     for (int i = 0; i < count; i++) {
-        const CBMFileResult *r = results[i];
-        if (!r || !r->namespace_name || !r->namespace_name[0] || !rels[i]) {
+        const char *namespace_name = namespaces[i];
+        if (!namespace_name || !namespace_name[0] || !rels[i]) {
             continue;
         }
         if (!map) {
@@ -2088,7 +2165,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(r->namespace_name);
+        char *key = strdup(namespace_name);
         if (!key) {
             free(file_qn);
             continue;
@@ -2125,6 +2202,25 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
             free(file_qn); /* content copied into combined */
         }
     }
+    return map;
+}
+
+/* Convenience for callers whose results are all in memory (the sequential
+ * definitions pass). A caller that can SPILL must use the _names variant and
+ * fill the parked slots from cbm_result_spill_namespace, or its map silently
+ * loses those files. */
+CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
+                                               CBMFileResult *const *results,
+                                               const char *const *rels, int count) {
+    const char **names = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        names[i] = results[i] ? results[i]->namespace_name : NULL;
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build_names(project_name, names, rels, count);
+    cbm_free(CBM_MEM_CLASS_OTHER, names);
     return map;
 }
 

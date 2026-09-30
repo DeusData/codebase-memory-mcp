@@ -16,6 +16,11 @@
  * TLA+ bound_op is historical direct-call metadata. Bounded quantification is
  * not a historical ledger row; repro_call_argument_matrix_b is its separate
  * negative behavior guard.
+ *
+ * The historical-snapshot column is the audited ledger, not an archaeology
+ * record: every registered call node owns a row, so a newly registered kind
+ * (Pkl's access/new expressions) joins the snapshot with the change that
+ * registers it.
  */
 #include "test_framework.h"
 #include "lang_specs.h"
@@ -54,10 +59,10 @@ typedef struct {
 } CallNodeManifestEntry;
 
 enum {
-    EXPECTED_HISTORICAL_CALL_NODE_TOTAL = 219,
-    EXPECTED_ACTIVE_PRIMARY_TOTAL = 189,
-    EXPECTED_DIRECT_CALLS = 155,
-    EXPECTED_CONSTRUCTOR_CALLS = 20,
+    EXPECTED_HISTORICAL_CALL_NODE_TOTAL = 226,
+    EXPECTED_ACTIVE_PRIMARY_TOTAL = 196,
+    EXPECTED_DIRECT_CALLS = 160,
+    EXPECTED_CONSTRUCTOR_CALLS = 22,
     EXPECTED_OPERATOR_CALLS = 12,
     EXPECTED_IMPLICIT_CALLS = 2,
     EXPECTED_DSL_INVOCATIONS = 14,
@@ -65,7 +70,7 @@ enum {
     EXPECTED_CALLEE_WRAPPERS = 8,
     EXPECTED_ARGUMENT_WRAPPERS = 1,
     EXPECTED_CONTROL_OR_DOCUMENT_NONCALLS = 6,
-    EXPECTED_PRIMARY_OWNERS = 189,
+    EXPECTED_PRIMARY_OWNERS = 196,
     EXPECTED_SYNTHETIC_OWNERS = 10,
     EXPECTED_NO_CALL_EDGE_OWNERS = 20,
     EXPECTED_PRIMARY_OPERATOR_CALLS = 4,
@@ -220,6 +225,7 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
     ENTRY(CBM_LANG_DLANG, "function_call_expression", DIRECT_CALL, NO_CALL_EDGE, true, false),
     ENTRY(CBM_LANG_DLANG, "new_expression", CONSTRUCTOR_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_SCHEME, "list", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
+    ENTRY(CBM_LANG_CHIALISP, "list", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_FENNEL, "list", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_FISH, "command", DSL_INVOCATION, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_AWK, "func_call", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
@@ -296,6 +302,9 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
     ENTRY(CBM_LANG_TLAPLUS, "function_evaluation", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_TLAPLUS, "call", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_TLAPLUS, "bound_op", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
+    ENTRY(CBM_LANG_PKL, "unqualifiedAccessExpr", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
+    ENTRY(CBM_LANG_PKL, "qualifiedAccessExpr", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
+    ENTRY(CBM_LANG_PKL, "newExpr", CONSTRUCTOR_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_APEX, "method_invocation", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_PINE, "call", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
     ENTRY(CBM_LANG_MOJO, "call", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
@@ -309,6 +318,9 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
           true),
     ENTRY(CBM_LANG_OBJECTSCRIPT_ROUTINE, "routine_tag_call", DIRECT_CALL, PRIMARY_EXTRACTOR, true,
           true),
+    ENTRY(CBM_LANG_ARKTS, "call_expression", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
+    ENTRY(CBM_LANG_ARKTS, "new_expression", CONSTRUCTOR_CALL, PRIMARY_EXTRACTOR, true, true),
+    ENTRY(CBM_LANG_PLSQL, "ref_call", DIRECT_CALL, PRIMARY_EXTRACTOR, true, true),
 };
 
 #undef ENTRY
@@ -316,7 +328,7 @@ static const CallNodeManifestEntry CALL_NODE_MANIFEST[] = {
 #define MANIFEST_COUNT (sizeof(CALL_NODE_MANIFEST) / sizeof(CALL_NODE_MANIFEST[0]))
 
 _Static_assert(MANIFEST_COUNT == EXPECTED_HISTORICAL_CALL_NODE_TOTAL,
-               "call-node manifest must contain exactly 219 entries");
+               "call-node manifest must contain exactly 222 entries");
 _Static_assert(EXPECTED_DIRECT_CALLS + EXPECTED_CONSTRUCTOR_CALLS + EXPECTED_OPERATOR_CALLS +
                        EXPECTED_IMPLICIT_CALLS + EXPECTED_DSL_INVOCATIONS +
                        EXPECTED_BUILD_DEPENDENCIES + EXPECTED_CALLEE_WRAPPERS +

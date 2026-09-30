@@ -30,8 +30,9 @@
 /* Emit a pi extension registering every tool in the MCP registry.
  *
  * pi has no MCP client, so this bridge is the only route to the graph for it.
- * Each registered tool shells out to `<binary> cli <tool> '<json-args>'`, which
- * is an existing public entry point rather than a private one.
+ * Each registered tool shells out to `<binary> cli --json <tool>` and writes
+ * its JSON arguments to stdin, using an existing public entry point without
+ * the deprecated positional-JSON transport.
  *
  * `binary_path` is embedded as a JS string literal and is escaped; a Windows
  * path such as C:\Users\x\bin\cbm.exe must not corrupt the module or, worse,
