@@ -5936,6 +5936,35 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     }
 }
 
+/* Go var/const specs. A single `var x = 1` / any `const (...)` group holds its
+ * specs as direct children, but a parenthesized `var ( a = 1; b = 2 )` nests
+ * them under a `var_spec_list` (tree-sitter-go has no const_spec_list). */
+static void extract_go_spec(CBMExtractCtx *ctx, TSNode spec, CBMArena *a) {
+    const char *sk = ts_node_type(spec);
+    if (strcmp(sk, "var_spec") != 0 && strcmp(sk, "const_spec") != 0) {
+        return;
+    }
+    TSNode vname = ts_node_child_by_field_name(spec, TS_FIELD("name"));
+    if (!ts_node_is_null(vname)) {
+        push_var_def(ctx, cbm_node_text(a, vname, ctx->source), spec);
+    }
+}
+
+static void extract_go_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(child), "var_spec_list") != 0) {
+            extract_go_spec(ctx, child, a);
+            continue;
+        }
+        uint32_t ln = ts_node_named_child_count(child);
+        for (uint32_t j = 0; j < ln; j++) {
+            extract_go_spec(ctx, ts_node_named_child(child, j), a);
+        }
+    }
+}
+
 static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a,
                                     const char *kind) {
     (void)kind;
@@ -5962,20 +5991,9 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
         }
         break;
     }
-    case CBM_LANG_GO: {
-        uint32_t n = ts_node_named_child_count(node);
-        for (uint32_t i = 0; i < n; i++) {
-            TSNode child = ts_node_named_child(node, i);
-            const char *ck = ts_node_type(child);
-            if (strcmp(ck, "var_spec") == 0 || strcmp(ck, "const_spec") == 0) {
-                TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
-                if (!ts_node_is_null(vname)) {
-                    push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
-                }
-            }
-        }
+    case CBM_LANG_GO:
+        extract_go_vars(ctx, node, a);
         break;
-    }
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
