@@ -1202,6 +1202,41 @@ TEST(mcp_initialize_response) {
     PASS();
 }
 
+TEST(mcp_attach_runtime_config_respects_caller_ownership) {
+    char *cache = th_mktempdir("cbm_mcp_runtime_config");
+    ASSERT_NOT_NULL(cache);
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_config_t *config = cbm_config_open(cache);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    bool stored = config && cbm_config_set(config, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    bool default_off = server && !cbm_mcp_ignore_worktrees_enabled(server);
+    cbm_config_t *attached = server ? cbm_mcp_server_attach_runtime_config(server) : NULL;
+    bool enabled = attached && cbm_mcp_ignore_worktrees_enabled(server);
+    bool not_replaced = server && cbm_mcp_server_attach_runtime_config(server) == NULL;
+    if (server) {
+        cbm_mcp_server_set_config(server, config);
+    }
+    cbm_config_close(attached);
+    bool caller_config_kept = server && cbm_mcp_server_attach_runtime_config(server) == NULL &&
+                              cbm_mcp_ignore_worktrees_enabled(server);
+    cbm_mcp_server_free(server);
+    cbm_config_close(config);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    int removed = th_rmtree(cache);
+
+    ASSERT(stored);
+    ASSERT(default_off);
+    ASSERT(enabled);
+    ASSERT(not_replaced);
+    ASSERT(caller_config_kept);
+    ASSERT_EQ(removed, 0);
+    PASS();
+}
+
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
@@ -21147,6 +21182,7 @@ SUITE(mcp) {
 
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
+    RUN_TEST(mcp_attach_runtime_config_respects_caller_ownership);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_help_list_matches_registry);
     RUN_TEST(mcp_tools_list_latest_metadata);
