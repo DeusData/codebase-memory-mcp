@@ -26,10 +26,14 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
 #include "foundation/str_util.h"
+#include "foundation/dyn_array.h"
+#include "foundation/mem_core.h"
 #include "cbm.h"
+#include "discover/discover.h"
 #include "arena.h"
 #include "iris_export_xml.h"
 #include "simhash/minhash.h"
+#include "yyjson/yyjson.h"
 #include "semantic/ast_profile.h"
 
 #include <stdio.h>
@@ -445,6 +449,329 @@ int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
     }
     free(file_qn);
     return count;
+}
+
+/* ── google/wire BINDS edges ─────────────────────────────────────────
+ * `wire.Bind(new(I), new(*T))` declares that provider-set/injector code binds
+ * interface I to concrete T.  We emit (Variable-or-Function) -BINDS-> T only
+ * when T resolves EXACTLY to a type-like node; nothing is ever invented. */
+#define WIRE_IMPORT_PATH "github.com/google/wire"
+enum {
+    WIRE_QUOTE_PAIR = 2, /* surrounding quote characters of an import path */
+    WIRE_SKIP_ONE = 1,   /* one character or element */
+    WIRE_BIND_ARGS = 2,  /* wire.Bind(iface, impl) */
+    WIRE_IMPL_ARG = 1,   /* index of the concrete-type argument */
+};
+
+/* Local name of the google/wire import, or NULL (absent, dot or blank). */
+static const char *wire_import_local_name(const CBMFileResult *result) {
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        if (!imp->module_path || !imp->local_name || !imp->local_name[0]) {
+            continue;
+        }
+        const char *mp = imp->module_path;
+        size_t len = strlen(mp);
+        if (len >= WIRE_QUOTE_PAIR && (mp[0] == '"' || mp[0] == '`')) {
+            mp++;
+            len -= WIRE_QUOTE_PAIR;
+        }
+        if (len != strlen(WIRE_IMPORT_PATH) || strncmp(mp, WIRE_IMPORT_PATH, len) != 0) {
+            continue;
+        }
+        if (strcmp(imp->local_name, ".") == 0 || strcmp(imp->local_name, "_") == 0) {
+            return NULL;
+        }
+        return imp->local_name;
+    }
+    return NULL;
+}
+
+static bool wire_is_ident(const char *s, size_t len) {
+    if (len == 0 || isdigit((unsigned char)s[0])) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Parse `new(T)`, `new(*T)`, `new(pkg.T)`, `new(*pkg.T)` into out ("T" or
+ * "pkg.T").  Anything else (generics, parens, extra tokens) is rejected. */
+static bool wire_parse_new_arg(const char *expr, char *out, size_t out_sz) {
+    static const char open[] = "new(";
+    if (!expr) {
+        return false;
+    }
+    while (isspace((unsigned char)*expr)) {
+        expr++;
+    }
+    if (strncmp(expr, open, strlen(open)) != 0) {
+        return false;
+    }
+    expr += strlen(open);
+    const char *end = expr + strlen(expr);
+    while (end > expr && isspace((unsigned char)end[-WIRE_SKIP_ONE])) {
+        end--;
+    }
+    if (end == expr || end[-WIRE_SKIP_ONE] != ')') {
+        return false;
+    }
+    end--;
+    while (expr < end && isspace((unsigned char)*expr)) {
+        expr++;
+    }
+    if (expr < end && *expr == '*') {
+        expr++;
+    }
+    while (end > expr && isspace((unsigned char)end[-WIRE_SKIP_ONE])) {
+        end--;
+    }
+    size_t len = (size_t)(end - expr);
+    const char *dot = memchr(expr, '.', len);
+    size_t head = dot ? (size_t)(dot - expr) : len;
+    if (!wire_is_ident(expr, head) ||
+        (dot && !wire_is_ident(dot + WIRE_SKIP_ONE, len - head - WIRE_SKIP_ONE)) || len >= out_sz) {
+        return false;
+    }
+    memcpy(out, expr, len);
+    out[len] = '\0';
+    return true;
+}
+
+/* Resolve "T" (same package) or "pkg.T" (via the file's imports) to an exact
+ * type-like node.  Go packages are directory modules: QN = <dir module>.<T>. */
+static const cbm_gbuf_node_t *wire_resolve_type(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result, const char *rel,
+                                                const char *name) {
+    const char *type_name = name;
+    const char *dot = strchr(name, '.');
+    const char *mod = NULL;
+    if (!dot) {
+        mod = result->module_qn; /* Go: the package directory module */
+    } else {
+        type_name = dot + WIRE_SKIP_ONE;
+        char mod_buf[CBM_SZ_512];
+        snprintf(mod_buf, sizeof(mod_buf), "%.*s", (int)(dot - name), name);
+        for (int i = 0; i < result->imports.count; i++) {
+            const CBMImport *imp = &result->imports.items[i];
+            if (imp->local_name && strcmp(imp->local_name, mod_buf) == 0) {
+                const cbm_gbuf_node_t *pkg =
+                    cbm_pipeline_resolve_import_node(ctx, rel, NULL, imp, NULL);
+                mod = pkg ? pkg->qualified_name : NULL;
+                break;
+            }
+        }
+    }
+    const cbm_gbuf_node_t *node = NULL;
+    if (mod && mod[0]) {
+        char qn[CBM_SZ_1K];
+        snprintf(qn, sizeof(qn), "%s.%s", mod, type_name);
+        node = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+        if (node && !cbm_label_is_type_like(node->label)) {
+            node = NULL;
+        }
+    }
+    return node;
+}
+
+/* Source node: the innermost package-level Variable whose span contains the
+ * call (provider-set shape), else the enclosing Function/Method (injector). */
+static const cbm_gbuf_node_t *wire_bind_source(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                               const CBMCall *call) {
+    const CBMDefinition *best = NULL;
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (!d->label || strcmp(d->label, "Variable") != 0 || !d->qualified_name ||
+            (int)d->start_line > call->start_line || (int)d->end_line < call->start_line) {
+            continue;
+        }
+        if (!best || (d->end_line - d->start_line) < (best->end_line - best->start_line)) {
+            best = d;
+        }
+    }
+    const cbm_gbuf_node_t *var = best ? cbm_gbuf_find_by_qn(ctx->gbuf, best->qualified_name) : NULL;
+    if (var) {
+        return var;
+    }
+    const cbm_gbuf_node_t *fn = (call->enclosing_func_qn && call->enclosing_func_qn[0])
+                                    ? cbm_gbuf_find_by_qn(ctx->gbuf, call->enclosing_func_qn)
+                                    : NULL;
+    if (fn && fn->label &&
+        (strcmp(fn->label, "Function") == 0 || strcmp(fn->label, "Method") == 0)) {
+        return fn;
+    }
+    return NULL;
+}
+
+/* One accepted wire.Bind: source -> concrete type, plus the interface as a
+ * resolved graph QN or the raw as-written name.  Collected per file so all
+ * interfaces bound to the same (src, dst) land in ONE edge (the graph buffer
+ * dedups on src/dst/type and would otherwise keep only one interface). */
+typedef struct {
+    int64_t src;
+    int64_t dst;
+    char *name; /* owned: resolved QN, or raw name when !resolved */
+    bool resolved;
+} wire_bind_rec_t;
+typedef CBM_DYN_ARRAY(wire_bind_rec_t) wire_bind_list_t;
+
+static void wire_bind_list_free(wire_bind_list_t *list) {
+    for (int i = 0; i < list->count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, list->items[i].name);
+    }
+    cbm_da_free(list);
+}
+
+/* Collect one wire.Bind call (skipped silently unless both args are `new(T)`,
+ * the concrete type resolves exactly, and a source node exists). */
+static void wire_collect_bind(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result, const char *rel,
+                              const CBMCall *call, wire_bind_list_t *out) {
+    char iface[CBM_SZ_256];
+    char impl[CBM_SZ_256];
+    if (!wire_parse_new_arg(call->args[0].expr, iface, sizeof(iface)) ||
+        !wire_parse_new_arg(call->args[WIRE_IMPL_ARG].expr, impl, sizeof(impl))) {
+        return;
+    }
+    const cbm_gbuf_node_t *dst = wire_resolve_type(ctx, result, rel, impl);
+    const cbm_gbuf_node_t *src = dst ? wire_bind_source(ctx, result, call) : NULL;
+    if (!src) {
+        return;
+    }
+    const cbm_gbuf_node_t *inode = wire_resolve_type(ctx, result, rel, iface);
+    char *name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, inode ? inode->qualified_name : iface);
+    if (!name) {
+        return;
+    }
+    wire_bind_rec_t rec = {.src = src->id, .dst = dst->id, .name = name, .resolved = inode != NULL};
+    int before = out->count;
+    cbm_da_push(out, rec);
+    if (out->count == before) {
+        cbm_free(CBM_MEM_CLASS_OTHER, name);
+    }
+}
+
+static int wire_cmp_id(int64_t a, int64_t b) {
+    return (a > b) - (a < b);
+}
+
+/* Order: src, dst, resolved before unresolved, then name. */
+static int wire_bind_rec_cmp(const void *a, const void *b) {
+    const wire_bind_rec_t *x = a;
+    const wire_bind_rec_t *y = b;
+    int c = wire_cmp_id(x->src, y->src);
+    if (c == 0) {
+        c = wire_cmp_id(x->dst, y->dst);
+    }
+    if (c == 0) {
+        c = (int)y->resolved - (int)x->resolved;
+    }
+    return c != 0 ? c : strcmp(x->name, y->name);
+}
+
+/* Add the names of group [from,to) whose resolved flag equals `resolved` (the
+ * list is pre-sorted) to a JSON array, skipping duplicates. */
+static void wire_add_names(yyjson_mut_doc *doc, yyjson_mut_val *arr, const wire_bind_rec_t *recs,
+                           int from, int to, bool resolved) {
+    const char *prev = NULL;
+    for (int i = from; i < to; i++) {
+        if (recs[i].resolved == resolved && !(prev && strcmp(prev, recs[i].name) == 0)) {
+            yyjson_mut_arr_add_strcpy(doc, arr, recs[i].name);
+            prev = recs[i].name;
+        }
+    }
+}
+
+/* yyjson allocator on the tracked heap, so the props buffer is cbm_free'd. */
+static void *wire_alc_malloc(void *ctx, size_t size) {
+    (void)ctx;
+    return cbm_alloc(CBM_MEM_CLASS_OTHER, size);
+}
+static void *wire_alc_realloc(void *ctx, void *ptr, size_t old_size, size_t size) {
+    (void)ctx;
+    (void)old_size;
+    return cbm_realloc(CBM_MEM_CLASS_OTHER, ptr, size);
+}
+static void wire_alc_free(void *ctx, void *ptr) {
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_OTHER, ptr);
+}
+static const yyjson_alc WIRE_ALC = {wire_alc_malloc, wire_alc_realloc, wire_alc_free, NULL};
+
+/* Emit one BINDS edge for group [from,to) of the sorted list. */
+static bool wire_emit_group(cbm_pipeline_ctx_t *ctx, const wire_bind_rec_t *recs, int from,
+                            int to) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&WIRE_ALC);
+    if (!doc) {
+        return false;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "strategy", "wire_bind");
+    yyjson_mut_val *ifaces = yyjson_mut_arr(doc);
+    yyjson_mut_val *unres = yyjson_mut_arr(doc);
+    yyjson_mut_obj_add_val(doc, root, "interfaces", ifaces);
+    yyjson_mut_obj_add_val(doc, root, "unresolved_interfaces", unres);
+    wire_add_names(doc, ifaces, recs, from, to, true);
+    wire_add_names(doc, unres, recs, from, to, false);
+    char *json = yyjson_mut_write_opts(doc, 0, &WIRE_ALC, NULL, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        return false;
+    }
+    cbm_gbuf_insert_edge(ctx->gbuf, recs[from].src, recs[from].dst, "BINDS", json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+    return true;
+}
+
+/* Sort the collected binds and emit one edge per (src,dst); returns edges. */
+static int wire_emit_groups(cbm_pipeline_ctx_t *ctx, wire_bind_list_t *list) {
+    qsort(list->items, (size_t)list->count, sizeof(*list->items), wire_bind_rec_cmp);
+    int edges = 0;
+    int from = 0;
+    while (from < list->count) {
+        int to = from + WIRE_SKIP_ONE;
+        while (to < list->count && list->items[to].src == list->items[from].src &&
+               list->items[to].dst == list->items[from].dst) {
+            to++;
+        }
+        edges += (int)wire_emit_group(ctx, list->items, from, to);
+        from = to;
+    }
+    return edges;
+}
+
+/* Create BINDS edges for one Go file's google/wire `wire.Bind(new(I), new(T))`
+ * calls.  Called at every site that calls the env-CONFIGURES helper so the
+ * sequential, parallel and incremental paths produce identical edges.  All
+ * interfaces bound to the same (source, concrete) pair share one edge, since
+ * the graph buffer dedups on (src, dst, type). */
+int cbm_pipeline_create_wire_binds_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                            const char *rel) {
+    if (!ctx || !result || !rel || result->calls.count == 0 ||
+        cbm_language_for_filename(rel) != CBM_LANG_GO) {
+        return 0;
+    }
+    const char *wire = wire_import_local_name(result);
+    if (!wire) {
+        return 0;
+    }
+    char callee[CBM_SZ_128];
+    snprintf(callee, sizeof(callee), "%s.Bind", wire);
+    wire_bind_list_t list = {0};
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, callee) == 0 &&
+            call->arg_count == WIRE_BIND_ARGS && call->args) {
+            wire_collect_bind(ctx, result, rel, call, &list);
+        }
+    }
+    int edges = wire_emit_groups(ctx, &list);
+    wire_bind_list_free(&list);
+    return edges;
 }
 
 /* Create IMPORTS edges for one file's imports.  Mirrors the resolution
@@ -877,6 +1204,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
             create_channel_edges_for_file(ctx, result, rel);
             cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
+            cbm_pipeline_create_wire_binds_for_file(ctx, result, rel);
             cbm_free_result(result);
         }
     }
@@ -910,6 +1238,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
+            cbm_pipeline_create_wire_binds_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
         if (owns_local_cache) {

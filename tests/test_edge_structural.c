@@ -238,7 +238,8 @@ static void es_lang_cleanup(ES_LangProj *lp, cbm_store_t *store) {
 }
 
 /* Every graph edge type the pipeline can emit — used in diagnostic dumps. */
-static const char *ES_ALL_EDGE_TYPES[] = {"CALLS",
+static const char *ES_ALL_EDGE_TYPES[] = {"BINDS",
+                                          "CALLS",
                                           "CALL_REFERENCE",
                                           "CONFIGURES",
                                           "CONTAINS_FILE",

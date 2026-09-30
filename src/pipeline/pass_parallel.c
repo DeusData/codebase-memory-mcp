@@ -1748,6 +1748,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
+        cbm_pipeline_create_wire_binds_for_file(ctx, result, rel);
         if (loaded) {
             cbm_free_result(result);
         }
