@@ -143,6 +143,35 @@ TEST(store_generation_tracks_mutations) {
     PASS();
 }
 
+/* Existing store_meta is authoritative: a partially-written or malformed
+ * table is corruption, not a legacy database. Generation reads and the
+ * project-upsert mutation choke point must both fail closed, and a failed
+ * generation advance must not leave the project row committed. */
+TEST(store_generation_rejects_malformed_metadata_atomically) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_exec(s, "CREATE TABLE store_meta (k TEXT PRIMARY KEY, v TEXT);"
+                                "INSERT INTO store_meta VALUES('db_uid','0123456789abcdef');"),
+              CBM_STORE_OK);
+
+    char generation[128] = {0};
+    ASSERT_EQ(cbm_store_generation(s, generation, sizeof(generation)), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_upsert_project(s, "must-not-commit", "/tmp/must-not-commit"),
+              CBM_STORE_ERR);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "must-not-commit", &project), CBM_STORE_NOT_FOUND);
+
+    ASSERT_EQ(cbm_store_exec(s, "INSERT INTO store_meta VALUES('mutation_gen','not-a-number');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(s, generation, sizeof(generation)), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_exec(s, "UPDATE store_meta SET v=CAST(X'31006a756e6b' AS TEXT) "
+                                "WHERE k='mutation_gen';"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(s, generation, sizeof(generation)), CBM_STORE_ERR);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #896: a row-scan that dies mid-stream (SQLITE_CORRUPT) must surface a
  * loud store error, not masquerade as a clean end of results. Counts are
  * answered from covering indexes (still correct) while row fetches die at
@@ -236,6 +265,7 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
 SUITE(store_pragmas) {
     RUN_TEST(journal_size_limit_bounds_wal_issue1083);
     RUN_TEST(store_generation_tracks_mutations);
+    RUN_TEST(store_generation_rejects_malformed_metadata_atomically);
     RUN_TEST(corrupt_page_scan_returns_error_not_truncation);
     RUN_TEST(mmap_size_default_when_unset);
     RUN_TEST(mmap_size_zero_disables_mmap);

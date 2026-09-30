@@ -63,6 +63,7 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
     ctx->source = source;
     ctx->source_len = source_len;
     ctx->registry = registry;
+    ctx->registry_head = (CBMTypeRegistry *)registry;
     ctx->module_qn = module_qn;
     ctx->module_qn_len = module_qn ? strlen(module_qn) : 0;
     ctx->enclosing_func_qn = module_qn;
@@ -2818,8 +2819,11 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         const char *shortn = dot ? dot + 1 : type_qn;
         size_t slen = strlen(shortn);
         const char *best_qn = NULL;
-        for (int i = 0; i < ctx->registry->type_count; i++) {
-            const char *q = ctx->registry->types[i].qualified_name;
+        CBMTypeShortIter it;
+        cbm_registry_types_by_short_name_chain(ctx->registry, shortn, &it);
+        int i;
+        while ((i = cbm_type_short_iter_next(&it)) >= 0) {
+            const char *q = it.reg->types[i].qualified_name;
             if (!q) {
                 continue;
             }
@@ -3667,12 +3671,12 @@ static const CBMRegisteredFunc *c_lookup_free_operator(CLSPContext *ctx, const c
     const char *right_ns = extract_namespace_from_qn(ctx->arena, right_qn);
     const CBMRegisteredFunc *match = NULL;
     CBMFreeFuncIter it;
-    cbm_registry_free_funcs_by_short_name(ctx->registry, operator_name, &it);
+    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, operator_name, &it);
     for (int index = cbm_free_func_iter_next(&it); index >= 0;
          index = cbm_free_func_iter_next(&it)) {
-        if (index >= ctx->registry->func_count)
+        if (index >= it.reg->func_count)
             continue;
-        const CBMRegisteredFunc *candidate = &ctx->registry->funcs[index];
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[index];
         if (candidate->receiver_type || !candidate->short_name ||
             strcmp(candidate->short_name, operator_name) != 0 || !candidate->qualified_name) {
             continue;
@@ -3727,13 +3731,13 @@ static const CBMRegisteredFunc *c_lookup_free_unary_operator(CLSPContext *ctx,
     const CBMRegisteredFunc *match = NULL;
     const CBMType *actuals[1] = {operand_type};
     CBMFreeFuncIter it;
-    cbm_registry_free_funcs_by_short_name(ctx->registry, operator_name, &it);
+    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, operator_name, &it);
     for (int index = cbm_free_func_iter_next(&it); index >= 0;
          index = cbm_free_func_iter_next(&it)) {
-        if (index >= ctx->registry->func_count) {
+        if (index >= it.reg->func_count) {
             continue;
         }
-        const CBMRegisteredFunc *candidate = &ctx->registry->funcs[index];
+        const CBMRegisteredFunc *candidate = &it.reg->funcs[index];
         if (candidate->receiver_type || !candidate->short_name ||
             strcmp(candidate->short_name, operator_name) != 0 || !candidate->qualified_name) {
             continue;
@@ -4879,18 +4883,16 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     // indexing bitcoin). Cross-phase template deduction then relies on the
     // positional fallback, which is graceful degradation.
     if (ctx->in_template && ctx->template_param_count > 0 && !ctx->registry_shared) {
-        // Find the registered function and set type_param_names
-        for (int ri = 0; ri < ((CBMTypeRegistry *)ctx->registry)->func_count; ri++) {
-            CBMRegisteredFunc *rf = &((CBMTypeRegistry *)ctx->registry)->funcs[ri];
-            if (strcmp(rf->qualified_name, func_qn) == 0 && !rf->type_param_names) {
-                const char **tpn = (const char **)cbm_arena_alloc(
-                    ctx->arena, (ctx->template_param_count + 1) * sizeof(const char *));
-                for (int ti = 0; ti < ctx->template_param_count; ti++)
-                    tpn[ti] = ctx->template_param_names[ti];
-                tpn[ctx->template_param_count] = NULL;
-                rf->type_param_names = tpn;
-                break;
-            }
+        // Set type_param_names on the registered function -- on the head's
+        // own copy of it (copy-on-write), never on a shared base entry.
+        CBMRegisteredFunc *rf = cbm_registry_func_for_update(ctx->registry_head, func_qn);
+        if (rf && !rf->type_param_names) {
+            const char **tpn = (const char **)cbm_arena_alloc(
+                ctx->arena, (ctx->template_param_count + 1) * sizeof(const char *));
+            for (int ti = 0; ti < ctx->template_param_count; ti++)
+                tpn[ti] = ctx->template_param_names[ti];
+            tpn[ctx->template_param_count] = NULL;
+            rf->type_param_names = tpn;
         }
     }
 
@@ -4926,12 +4928,9 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     }
     // Set min_params on the registered function (for default-arg overload matching)
     if (total_params > 0 && defaulted_params > 0) {
-        for (int ri = 0; ri < ((CBMTypeRegistry *)ctx->registry)->func_count; ri++) {
-            CBMRegisteredFunc *rf = &((CBMTypeRegistry *)ctx->registry)->funcs[ri];
-            if (strcmp(rf->qualified_name, func_qn) == 0 && rf->min_params < 0) {
-                rf->min_params = total_params - defaulted_params;
-                break;
-            }
+        CBMRegisteredFunc *rf = cbm_registry_func_for_update(ctx->registry_head, func_qn);
+        if (rf && rf->min_params < 0) {
+            rf->min_params = total_params - defaulted_params;
         }
     }
 
@@ -5056,7 +5055,7 @@ static void c_process_body_child(CLSPContext *ctx, TSNode child) {
                                         tpn[ctx->template_param_count] = NULL;
                                         rf.type_param_names = tpn;
                                     }
-                                    cbm_registry_add_func((CBMTypeRegistry *)ctx->registry, rf);
+                                    cbm_registry_add_func(ctx->registry_head, rf);
                                 }
                             }
                         }
@@ -5158,14 +5157,7 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
 
             // Store template param names on the registered type (for substitution)
             if (ctx->in_template && ctx->template_param_names && ctx->template_param_count > 0) {
-                CBMRegisteredType *rt = NULL;
-                for (int ri = 0; ri < ((CBMTypeRegistry *)ctx->registry)->type_count; ri++) {
-                    if (strcmp(((CBMTypeRegistry *)ctx->registry)->types[ri].qualified_name,
-                               class_qn) == 0) {
-                        rt = &((CBMTypeRegistry *)ctx->registry)->types[ri];
-                        break;
-                    }
-                }
+                CBMRegisteredType *rt = cbm_registry_type_for_update(ctx->registry_head, class_qn);
                 if (rt && !rt->type_param_names) {
                     const char **tpn = (const char **)cbm_arena_alloc(
                         ctx->arena, (ctx->template_param_count + 1) * sizeof(const char *));
@@ -5338,14 +5330,25 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
                                         should_upgrade = true;
                                 }
                                 if (should_upgrade) {
-                                    // Update existing entry's signature return type
-                                    const CBMType **new_rets = (const CBMType **)cbm_arena_alloc(
-                                        ctx->arena, 2 * sizeof(const CBMType *));
-                                    new_rets[0] = actual_ret;
-                                    new_rets[1] = NULL;
-                                    CBMRegisteredFunc *mut = (CBMRegisteredFunc *)existing;
-                                    mut->signature = cbm_type_func_replace_returns(
-                                        ctx->arena, existing->signature, new_rets);
+                                    /* Refine the return type on the HEAD copy only
+                                     * (copy-on-write). `existing` may live in the
+                                     * sealed shared base; writing a scratch-arena
+                                     * signature into it was read by other workers
+                                     * after this file's arena died (ASan heap-use-
+                                     * after-free in c_adl_resolve on dotnet/runtime,
+                                     * 2026-09-14). NULL = the head is sealed too:
+                                     * skip the refinement. */
+                                    CBMRegisteredFunc *mut = cbm_registry_func_for_update(
+                                        ctx->registry_head, existing->qualified_name);
+                                    if (mut) {
+                                        const CBMType **new_rets =
+                                            (const CBMType **)cbm_arena_alloc(
+                                                ctx->arena, 2 * sizeof(const CBMType *));
+                                        new_rets[0] = actual_ret;
+                                        new_rets[1] = NULL;
+                                        mut->signature = cbm_type_func_replace_returns(
+                                            ctx->arena, mut->signature, new_rets);
+                                    }
                                 }
                                 break;
                             }
@@ -5361,7 +5364,7 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
                             rf.receiver_type = ctx->enclosing_class_qn;
                             rf.signature = cbm_type_func(ctx->arena, NULL, NULL, rets);
                             rf.min_params = -1;
-                            cbm_registry_add_func((CBMTypeRegistry *)ctx->registry, rf);
+                            cbm_registry_add_func(ctx->registry_head, rf);
                             break;
                         } else if (strcmp(dk, "reference_declarator") == 0) {
                             actual_ret = cbm_type_reference(ctx->arena, actual_ret);
@@ -5972,6 +5975,7 @@ CBMTypeRegistry *cbm_c_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, in
         c_register_lsp_defs(arena, reg, "", d, 1);
     }
     cbm_registry_finalize(reg);
+    cbm_registry_build_type_short_index(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
@@ -6055,6 +6059,7 @@ void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, co
     // Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
     // comment for the rationale (linear-scan fallback otherwise).
     cbm_registry_finalize(&reg);
+    cbm_registry_build_type_short_index(&reg);
 
     // Initialize context and run
     CLSPContext ctx;

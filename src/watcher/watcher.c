@@ -31,6 +31,7 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
+#include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
 #define WIN32_LEAN_AND_MEAN
@@ -75,6 +76,18 @@ typedef struct {
     uint64_t last_dirty_sig;       /* committed dirty-state signature */
     uint64_t pending_dirty_sig;    /* observed at check time */
     char pending_head[CBM_SZ_128]; /* HEAD observed at check time */
+    /* Consecutive hard index failures (index_fn < 0). A hard error is
+     * usually persistent — a poisoned coordination endpoint, an unreadable
+     * DB — so retrying it at the plain poll interval re-forks a worker that
+     * fails identically, for as long as the daemon lives. #937 deliberately
+     * leaves the baseline uncommitted so the change is never lost; this
+     * decays the retry cadence so "never lost" does not also mean "retried
+     * forever". Reset to 0 by any successful reindex. */
+    int index_failures;
+    /* Hop from root_path up to the repository root ("" when they are the same),
+     * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
+     * the signature needs this to stat them. Resolved once at baseline. */
+    char repo_cdup[CBM_SZ_4K];
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -110,6 +123,16 @@ struct cbm_watcher {
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
 
+/* Hard index-failure backoff. Doubling per consecutive failure, capped, so a
+ * persistently failing project costs ~12 attempts/hour instead of ~480 while
+ * still recovering on its own within the ceiling once the cause clears. The
+ * shift cap keeps the intermediate value well inside int64 for any interval. */
+#define INDEX_FAIL_SHIFT_MAX 6
+#define INDEX_FAIL_CEILING_MS 300000 /* 5 min */
+/* Log a distinct line once the failures are clearly not transient, so the
+ * daemon log names the stuck project instead of only repeating the warning. */
+#define INDEX_FAIL_SUSTAINED 10
+
 /* Stale-root pruning (#286): a watched project whose root directory stays
  * missing is pruned — its cached DB is deleted and the watch entry removed.
  * Deletion is destructive (the DB can hold user-authored data such as the
@@ -138,6 +161,27 @@ static int64_t now_ns(void) {
 }
 
 /* ── Adaptive interval ──────────────────────────────────────────── */
+
+int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures) {
+    if (interval_ms < 0) {
+        interval_ms = 0;
+    }
+    if (consecutive_failures <= 0) {
+        return interval_ms;
+    }
+    int shift =
+        consecutive_failures < INDEX_FAIL_SHIFT_MAX ? consecutive_failures : INDEX_FAIL_SHIFT_MAX;
+    int64_t delay = (int64_t)interval_ms << shift;
+    if (delay > INDEX_FAIL_CEILING_MS) {
+        delay = INDEX_FAIL_CEILING_MS;
+    }
+    /* Backing off must never schedule SOONER than the project's own cadence.
+     * Unreachable today (POLL_MAX_MS < the ceiling), but clamping here keeps
+     * the function monotonic for every input rather than only for the inputs
+     * the current constants can produce — the caller's contract is "a delay
+     * that never shrinks as failures accumulate". */
+    return (int)(delay < interval_ms ? interval_ms : delay);
+}
 
 int cbm_watcher_poll_interval_ms(int file_count) {
     int ms = POLL_BASE_MS + ((file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
@@ -452,6 +496,86 @@ static watcher_git_status_t git_repo_status(cbm_watcher_t *w, project_state_t *s
     return watcher_git_run(w, state, argv, 0, NULL);
 }
 
+/* True when root_path carries its OWN repository marker: a `.git` directory, or
+ * a `.git` file (the gitlink form used by linked worktrees and initialized
+ * submodules). Deliberately a filesystem check, not a git invocation — the whole
+ * point is to learn something `rev-parse` cannot tell us, because it walks up. */
+static bool git_has_own_dot_git(const char *root_path) {
+    char path[CBM_SZ_4K];
+    int written = snprintf(path, sizeof(path), "%s/.git", root_path);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    struct stat st;
+    return stat(path, &st) == 0 && (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode));
+}
+
+/* Does the ancestor repository actually track anything inside this directory?
+ * Emptiness distinguishes "a scratch folder that merely sits under a repo" from
+ * "a genuine subdirectory of one". Output is capped: we only care whether the
+ * first byte exists, never what it is. */
+static watcher_git_status_t git_tracks_anything_here(cbm_watcher_t *w, project_state_t *state,
+                                                     bool *tracked_out) {
+    *tracked_out = false;
+    const char *argv[] = {"git", "-C", state->root_path, "ls-files", "-z", "--", ".", NULL};
+    watcher_git_output_t output;
+    watcher_git_status_t status = watcher_git_run(w, state, argv, WATCHER_GIT_HEAD_MAX, &output);
+    if (status != WATCHER_GIT_OK) {
+        return status;
+    }
+    FILE *fp = cbm_fopen(output.path, "rb");
+    if (fp) {
+        *tracked_out = fgetc(fp) != EOF;
+        (void)fclose(fp);
+    }
+    watcher_git_output_cleanup(&output);
+    return fp ? WATCHER_GIT_OK : WATCHER_GIT_SUPERVISION_FAILED;
+}
+
+/* Relative hop from root_path up to the repository root, as `git rev-parse
+ * --show-cdup` reports it ("" at the root, "../" one level down, and so on).
+ *
+ * This matters because `git status --porcelain` prints paths relative to the
+ * REPOSITORY root, while the signature stats them relative to root_path. For a
+ * project watched at the repository root the two coincide and the bug is
+ * invisible; for a subdirectory project every stat silently misses, and the
+ * signature quietly degrades to text-only — losing the size/mtime component
+ * that makes an edit to an already-dirty file detectable.
+ *
+ * --show-cdup rather than --show-toplevel: under MSYS/Cygwin git, --show-toplevel
+ * returns a translated absolute path (/c/... or a drive-letter form) that does
+ * not join cleanly onto the native root_path we hold. A relative hop composes
+ * correctly on every platform because it never leaves our own path space. */
+static watcher_git_status_t git_repo_cdup(cbm_watcher_t *w, project_state_t *state, char *out,
+                                          size_t out_size) {
+    if (!out || out_size < 2) {
+        return WATCHER_GIT_SUPERVISION_FAILED;
+    }
+    out[0] = '\0';
+    const char *argv[] = {"git", "-C", state->root_path, "rev-parse", "--show-cdup", NULL};
+    watcher_git_output_t output;
+    watcher_git_status_t status = watcher_git_run(w, state, argv, WATCHER_GIT_HEAD_MAX, &output);
+    if (status != WATCHER_GIT_OK) {
+        return status;
+    }
+    FILE *file = cbm_fopen(output.path, "rb");
+    bool read = file && fgets(out, (int)out_size, file) != NULL;
+    if (file) {
+        (void)fclose(file);
+    }
+    watcher_git_output_cleanup(&output);
+    if (!read) {
+        /* At the repository root git prints an empty line; that is success. */
+        out[0] = '\0';
+        return WATCHER_GIT_OK;
+    }
+    size_t len = strlen(out);
+    while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r')) {
+        out[--len] = '\0';
+    }
+    return WATCHER_GIT_OK;
+}
+
 static watcher_git_status_t git_head(cbm_watcher_t *w, project_state_t *state, char *out,
                                      size_t out_size) {
     if (!out || out_size < 2) {
@@ -511,9 +635,14 @@ static int64_t sig_stat_mtime_ns(const struct stat *st) {
  * of an already-dirty file still produces a new signature. A failed stat
  * (deleted file, quoting artifact) degrades to the entry text alone — the
  * deletion itself is represented by the porcelain status. */
-static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char *rel) {
+/* `rel` is repository-relative (that is what porcelain prints), so it is joined
+ * through `cdup` — the hop from root_path up to the repository root — rather than
+ * onto root_path directly. cdup is "" when the project IS the repository root,
+ * which reduces this to the original join. */
+static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char *cdup,
+                                   const char *rel) {
     char abs[CBM_SZ_4K];
-    snprintf(abs, sizeof(abs), "%s/%s", root_path, rel);
+    snprintf(abs, sizeof(abs), "%s/%s%s", root_path, cdup ? cdup : "", rel);
     struct stat st;
     if (stat(abs, &st) == 0) {
         int64_t mt = sig_stat_mtime_ns(&st);
@@ -538,8 +667,35 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
     *signature_out = 0;
-    const char *status_argv[] = {"git",    "--no-optional-locks", "-C",    state->root_path,
-                                 "status", "--porcelain",         "-uall", "-z",
+    /* `-- .` scopes the report to the watched directory. Without it a project
+     * watched at a sub-package of a monorepo reindexes whenever any SIBLING
+     * package changes, because git reports the whole repository's dirty state
+     * regardless of -C. Paths stay repository-relative either way, which is
+     * what repo_cdup is for.
+     *
+     * `:(exclude).codebase-memory` drops the indexer's OWN output. After every
+     * publish the pipeline re-exports <root>/.codebase-memory/ whenever an
+     * artifact already lives there (once persisted, or committed by the team
+     * and checked out into every worktree). Folding that write into the
+     * signature made each successful reindex look like a NEW dirty state on
+     * the next poll, and the daemon re-triggered itself forever (#1953: reap
+     * clean -> watcher.changed, 100+ times in 15 minutes, index workers
+     * pinned). Nothing under that directory is ever an index input (discovery
+     * skips it), so a change there can never require a reindex. The pathspec
+     * is CWD-relative, so a project watched at a monorepo sub-package excludes
+     * its own artifact directory; it is the same pathspec the exporter's
+     * clean-tree probe uses, for the same reason. */
+    const char *status_argv[] = {"git",
+                                 "--no-optional-locks",
+                                 "-C",
+                                 state->root_path,
+                                 "status",
+                                 "--porcelain",
+                                 "-uall",
+                                 "-z",
+                                 "--",
+                                 ".",
+                                 ":(exclude)" CBM_ARTIFACT_DIR,
                                  NULL};
     watcher_git_output_t output;
     watcher_git_status_t status =
@@ -585,7 +741,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
                 if (entry[0] == 'R' || entry[0] == 'C') {
                     origin_token = true;
                 }
-                h = sig_fold_path_stat(h, state->root_path, entry + 3);
+                h = sig_fold_path_stat(h, state->root_path, state->repo_cdup, entry + 3);
             }
         }
         elen = 0;
@@ -638,7 +794,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
             h = sig_fold(h, line, len);
             h = sig_fold(h, "", 1);
             if (len > 3 && line[2] == ' ') {
-                h = sig_fold_path_stat(h, state->root_path, line + 3);
+                h = sig_fold_path_stat(h, state->root_path, state->repo_cdup, line + 3);
             }
         }
         parsed = !ferror(fp) && fclose(fp) == 0;
@@ -1033,6 +1189,17 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_unlock(&w->projects_lock);
 }
 
+int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    int failures = s ? s->index_failures : -1;
+    cbm_mutex_unlock(&w->projects_lock);
+    return failures;
+}
+
 int cbm_watcher_watch_count(cbm_watcher_t *w) {
     if (!w) {
         return 0;
@@ -1060,9 +1227,39 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
         return false;
     }
     s->is_git = repository_status == WATCHER_GIT_OK;
+
+    /* `rev-parse --git-dir` walks UP, so an ordinary folder that merely happens
+     * to live under some unrelated repository answers yes. Treating it as a git
+     * project is what produced the runaway churn: it inherits the ancestor's
+     * dirty state, which is permanently non-empty and has nothing to do with
+     * this directory, so every poll looked like a change.
+     *
+     * A directory is only really git-managed here if it carries its own .git,
+     * or the ancestor repository actually tracks something inside it. A
+     * genuine sub-package of a monorepo passes the second test; a scratch or
+     * gitignored folder sitting under a repo fails both and is polled as a
+     * plain directory instead. */
+    if (s->is_git && !git_has_own_dot_git(s->root_path)) {
+        bool tracked = false;
+        watcher_git_status_t tracked_status = git_tracks_anything_here(w, s, &tracked);
+        if (tracked_status != WATCHER_GIT_OK && tracked_status != WATCHER_GIT_COMMAND_FAILED) {
+            return false;
+        }
+        if (!tracked) {
+            s->is_git = false;
+            cbm_log_info("watcher.nested_non_git", "project", s->project_name, "path",
+                         s->root_path);
+        }
+    }
+
     s->baseline_done = true;
 
     if (s->is_git) {
+        watcher_git_status_t cdup_status = git_repo_cdup(w, s, s->repo_cdup, sizeof(s->repo_cdup));
+        if (cdup_status != WATCHER_GIT_OK && cdup_status != WATCHER_GIT_COMMAND_FAILED) {
+            s->baseline_done = false;
+            return false;
+        }
         watcher_git_status_t head_status = git_head(w, s, s->last_head, sizeof(s->last_head));
         if (head_status != WATCHER_GIT_OK && head_status != WATCHER_GIT_COMMAND_FAILED) {
             s->baseline_done = false;
@@ -1302,6 +1499,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
+            s->index_failures = 0;
             /* Commit the baselines OBSERVED AT CHECK TIME — the state whose
              * reindex just succeeded. A commit/edit landing during the
              * reindex is deliberately not absorbed: the next poll sees it
@@ -1320,11 +1518,28 @@ static void poll_project(const char *key, void *val, void *ud) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
             cbm_log_info("watcher.index.retry", "project", s->project_name);
         } else {
-            cbm_log_warn("watcher.index.err", "project", s->project_name);
+            /* itoa_buf returns one shared per-thread buffer, so two of them
+             * in one call would print the same value twice. */
+            char rc_text[CBM_SZ_32];
+            char streak_text[CBM_SZ_32];
+            if (s->index_failures < INT_MAX) {
+                s->index_failures++;
+            }
+            snprintf(rc_text, sizeof(rc_text), "%d", rc);
+            snprintf(streak_text, sizeof(streak_text), "%d", s->index_failures);
+            cbm_log_warn("watcher.index.err", "project", s->project_name, "rc", rc_text,
+                         "consecutive", streak_text);
+            if (s->index_failures == INDEX_FAIL_SUSTAINED) {
+                cbm_log_warn("watcher.index.sustained_failure", "project", s->project_name,
+                             "consecutive", streak_text);
+            }
         }
     }
 
-    s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+    /* Failures back off; success and busy-skip keep the adaptive cadence. */
+    s->next_poll_ns =
+        ctx->now +
+        ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS);
 }
 
 /* Callback to snapshot project state pointers into an array. */
@@ -1438,3 +1653,15 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
     cbm_log_info("watcher.stop");
     return 0;
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+int cbm_watcher_test_pending_free_count(cbm_watcher_t *w) {
+    if (!w) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    int count = w->pending_free_count;
+    cbm_mutex_unlock(&w->projects_lock);
+    return count;
+}
+#endif

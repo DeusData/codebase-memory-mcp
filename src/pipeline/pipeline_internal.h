@@ -29,12 +29,12 @@
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
 
-/* Incremental integrity failure: abort the run and preserve the existing DB.
- * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
+/* CBM_PIPELINE_ABORT_PRESERVE_DB / CBM_PIPELINE_PERSIST_FAILED moved to
+ * pipeline.h — callers legitimately distinguish them (the header's contract
+ * always said so). FORCE_FULL_REINDEX never escapes the orchestrator and
+ * stays internal. All three are distinct from CBM_NOT_FOUND, the normal
  * "no incremental route; continue with a full index" sentinel. */
-#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
-#define CBM_PIPELINE_PERSIST_FAILED (-4)
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
@@ -136,7 +136,40 @@ typedef struct {
     /* ObjectScript method-return-type table built from extracted definitions
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
+
+    /* Spill / admission control (2026-09-13). spill_mode latches on the first
+     * over-budget observation in the extract gate (or on CBM_MEM_SPILL=1):
+     * from then on every compacted result is parked on disk instead of held
+     * in the cache, results already cached are swept out, and every later
+     * consumer (registry build, def collection, resolve) loads a result only
+     * for the moment it reads it. Memory then sits at the floor -- graph +
+     * registries + in-flight files -- and the run pays with disk reads.
+     * NULL/0 = results stay in memory as always. Owned by pipeline.c. */
+    struct cbm_result_spill *spill;
+    _Atomic int spill_mode;
+    /* Set by the ONE owner whose every result-cache consumer goes through
+     * cbm_pipeline_result_acquire()/release() and that closes the store
+     * (run_parallel_pipeline). An owner that leaves it false never spills:
+     * the incremental and probe routes still hand the cache array to passes
+     * that index it directly, so they keep results in memory (follow-up). */
+    bool spill_allowed;
 } cbm_pipeline_ctx_t;
+
+/* ── Result-cache access contract (spill mode) ────────────────────────
+ * After extraction a slot of the result cache is either the in-memory result
+ * or NULL with the result parked on disk (ctx->spill). Every consumer reads a
+ * slot through this pair; a pass that indexes the array itself is blind to
+ * parked results (the infra-route passes lost every __route__infra__ node
+ * that way, 2026-09-13). `want` (NULL = always) sees the parked HEADER first
+ * -- counts are valid, pointers are not -- and can veto the load, so a pass
+ * after one rare list does not read every parked result back from disk. */
+typedef bool (*cbm_result_want_fn)(const CBMFileResult *header);
+CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                           int i, cbm_result_want_fn want, bool *loaded);
+void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
+
+/* Log the store counters, close and delete the store, drop the latch. */
+void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
 
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
@@ -205,6 +238,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                                                CBMFileResult *const *results,
                                                const char *const *rels, int count);
+/* The same map built from the namespace names directly. The parallel pass needs
+ * this: results it has spilled are NULL in its cache, and a file missing from
+ * the map does not fail to resolve -- it resolves through the looser fallback,
+ * so an incomplete map CHANGES the graph instead of shrinking it. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
@@ -233,6 +273,14 @@ static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
 }
 
 /* ── Testable helpers ────────────────────────────────────────────── */
+
+/* #1934: whether the import resolver's name-guess fallbacks — Strategy 1b
+ * (sibling file; its label filter admits symbols) and Strategy 3 (symbol
+ * name) — may run for imports from this language. False for Go: an import
+ * path names a package, never a symbol, so a Strategy-1 miss means the import
+ * is external and the correct result is no edge. Pure; exercised through
+ * ei_go_import_never_binds_symbol. */
+bool cbm_import_symbol_fallback_allowed(CBMLanguage lang);
 
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
@@ -617,6 +665,9 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project);
 /* Pre-dump pass: config ↔ code linking. */
 int cbm_pipeline_pass_configlink(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
+int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
+
 /* Pre-dump pass: SIMILAR_TO edges via MinHash fingerprinting. */
 int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
 
@@ -629,6 +680,61 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
  * worst-case nested-loop estimate (transitive_loop_depth) and flags call-graph
  * cycles (recursive). Runs on the graph buffer before the dump. */
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
+
+/* Pre-dump pass: per-symbol importance score (weighted degree).
+ *   importance = sqrt(num_refs) * priv * generic * distinct * test_penalty
+ * Stored as a numeric "importance" key inside the node's EXISTING
+ * properties_json — no schema change and no index-format bump; indexes written
+ * by older builds simply lack the key and consumers must tolerate its absence.
+ * MUST run after pass_tests and after CALLS/USAGE extraction — a pass ordered
+ * earlier would see zero TESTS edges and num_refs = 0 everywhere. It is
+ * therefore registered last in run_predump_passes and last in the incremental
+ * post-pass sequence. */
+void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx);
+
+/* Gathered inputs for one symbol. Each scoring route fills this its own way
+ * (gbuf lookups, or SQL aggregates) and then calls the ONE rule below. */
+typedef struct {
+    const char *name;
+    const char *file_path;
+    int num_refs;            /* incoming CALLS + USAGE */
+    int name_distinct_files; /* distinct files the NAME is defined in */
+    bool tests_target;       /* has an incoming TESTS edge */
+} cbm_importance_inputs_t;
+
+/* THE scoring rule — single definition, shared by every route, so the two
+ * gathering strategies cannot drift apart in what a score means. */
+double cbm_pipeline_importance_score(const cbm_importance_inputs_t *in);
+
+/* Produce a copy of `json` with the numeric "importance" key set to `score`,
+ * or NULL when `json` is not a JSON object or allocation fails. Caller owns
+ * the result. IDEMPOTENT: an existing key is overwritten in place, never
+ * appended twice — every re-scoring route sees nodes that already carry it.
+ * Single definition, shared by the in-memory and SQL writers alike. */
+char *cbm_pipeline_importance_set_prop(const char *json, double score);
+
+/* gbuf-node convenience wrapper around cbm_pipeline_importance_set_prop. */
+void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score);
+
+/* Recompute importance for an ENTIRE project directly in a store, in SQL.
+ * Used by the closure-delta incremental route, whose in-RAM graph is a proxy
+ * buffer with no project-wide edges — scoring there would persist a near-zero
+ * in-degree for heavily-referenced symbols in the changed files. Must be
+ * called on the STAGING store AFTER cbm_delta_patch has merged nodes and
+ * re-linked inbound edges. Returns 0 on success; the caller treats failure as
+ * a delta-route failure and falls back to a full rebuild. */
+int cbm_pipeline_importance_recompute_store(cbm_store_t *store, const char *project);
+
+/* Work counters for the importance pass (pass_importance.c). Deltas are read
+ * by the complexity suite's linearity gate; never reset by the pass itself, so
+ * nested/repeated runs compose. g_importance_name_visits counts same-name-group
+ * member visits during distinct-file counting — the quantity that goes
+ * superlinear if the per-distinct-name memoization is ever lost. */
+extern _Atomic uint64_t g_importance_nodes;
+extern _Atomic uint64_t g_importance_name_visits;
+/* Rows rescored by the SQL-level store recompute. Lets a test prove the
+ * closure-delta route actually took that path instead of passing vacuously. */
+extern _Atomic uint64_t g_importance_store_rows;
 
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
@@ -678,7 +784,7 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
                                            const cbm_file_hash_t *right, int right_count);
 /* Re-run discovery and hash its exact semantic inputs. Used at the publication
  * boundary so late additions/deletions cannot escape a frozen file list. */
-int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
@@ -729,6 +835,17 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
  * executor; the dump path uses it internally). malloc'd, caller frees. */
 char *cbm_pipeline_create_staging_path(const char *final_path);
 
+/* Stage ownership (#1839). Every stage minted by cbm_pipeline_create_staging_path
+ * is owned through an exclusive kernel lock on the sidecar "<stage>.lock" for
+ * as long as the stage exists; the lock -- and the sidecar -- go away when the
+ * stage is discarded or renamed into place, and the kernel drops the lock
+ * when the writer dies. Hold/drop are the same primitive, exposed so a test
+ * can stand in for a live writer. hold returns a descriptor >= 0, or -1 when
+ * another holder is live or the sidecar cannot be created. drop releases the
+ * lock and unlinks the sidecar. */
+int cbm_pipeline_stage_lock_hold(const char *stage_path);
+void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd);
+
 /* ── Delta-repair staging primitives (pipeline_delta.c) ──────────
  * Closure-route-only subsystem: clone the live generation, patch exactly
  * the repaired node/edge set, publish through the shared finalize leg. */
@@ -760,6 +877,8 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
@@ -801,6 +920,12 @@ void cbm_pp_bp_nap_cycles_reset(void);
 uint64_t cbm_pp_lsp_linear_fallback_rows(void);
 void cbm_pp_lsp_linear_fallback_rows_reset(void);
 
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test-only view of the Studio Export range join, so the ",+<N>" truncation
+ * marker rules can be checked without building a 256-region export file. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part);
+#endif
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 /* Deterministic test-only operation count for the shared semantic-reference
  * matcher used by both sequential and fused-parallel usage materialization. */
@@ -828,6 +953,15 @@ void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);
+/* Fires from create_staging_path(), right after the stage's main file is
+ * created with O_EXCL. In the current lock-before-visible ordering its sidecar
+ * lock is already held at this point, so a test hook installed here can run a
+ * concurrent sweep (via another cbm_pipeline_run() against the same
+ * final_path) and confirm the just-created stage survives it. Under the OLD
+ * create-then-lock ordering this was the unlocked window, so the hook also
+ * binds RED if that ordering regresses. */
+void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_hook_fn hook,
+                                                            void *userdata);
 cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
 void cbm_pipeline_incremental_test_reset_faults(void);
 
@@ -837,6 +971,7 @@ bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_predump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_destination_prepare(void);
 void cbm_pipeline_persist_test_run_before_final_manifest(void);
+void cbm_pipeline_persist_test_run_after_stage_created(void);
 void cbm_pipeline_persist_test_reset_faults(void);
 #endif
 

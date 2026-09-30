@@ -17,12 +17,16 @@
  *     bytes is the early-cutoff key: a body edit reserializes identically.
  */
 #include "pipeline/lsp_surface.h"
+#include "pipeline/pipeline_internal.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "cbm.h" /* cbm_label_is_relation — reg-only surface membership */
 #include "foundation/log.h"
 #include "foundation/sha256.h"
+#include "pipeline/worker_pool.h"
 #include "yyjson/yyjson.h"
 
 enum { SURFACE_CODEC_VERSION = 1 };
@@ -30,12 +34,13 @@ enum { SURFACE_CODEC_VERSION = 1 };
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
  * participate in the surface hash, or renaming one would slip past the
- * early cutoff while stale references to it survive in dependent files.
- * KEEP IN SYNC with pxc_map_label (pass_lsp_cross.c) and
- * incr_label_is_registry_symbol (pipeline_incremental.c); the codec unit
- * test cross-checks the three. */
+ * early cutoff while stale references to it survive in dependent files —
+ * for Table/View that means a renamed table keeping stale FROM/JOIN lineage
+ * edges from dependent SQL files. KEEP IN SYNC with pxc_map_label
+ * (pass_lsp_cross.c) and incr_label_is_registry_symbol
+ * (pipeline_incremental.c); the codec unit test cross-checks the three. */
 static bool surface_reg_only_label(const char *label) {
-    return label && strcmp(label, "Field") == 0;
+    return label && (strcmp(label, "Field") == 0 || cbm_label_is_relation(label));
 }
 
 static void add_str_or_null(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
@@ -67,9 +72,10 @@ static void add_str_array_or_null(yyjson_mut_doc *doc, yyjson_mut_val *obj, cons
 }
 
 /* Serialize one file's surface: its slice of all_defs plus the registry-only
- * symbols from its raw extraction defs. Returns a malloc'd JSON string. */
-static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *defs,
-                                  int def_count) {
+ * symbols from its raw extraction defs. Returns a malloc'd JSON string and its
+ * length. */
+static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *defs, int def_count,
+                                  size_t *out_len) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
         return NULL;
@@ -119,13 +125,66 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
     }
     yyjson_mut_obj_add_val(doc, root, "reg", reg);
 
-    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *json = yyjson_mut_write(doc, 0, out_len);
     yyjson_mut_doc_free(doc);
     return json;
 }
 
-int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
-                               const cbm_file_info_t *files, int file_count,
+/* One file's row, written in place: files are independent (their own result,
+ * their own def slice), so the pass runs them in parallel. Sequentially it was
+ * 1.15 s of the Go corpus's cross-LSP prepare (profile, 2026-09-17). */
+typedef struct {
+    const cbm_pipeline_ctx_t *ctx;
+    const char *project;
+    CBMFileResult **cache;
+    const cbm_file_info_t *files;
+    const CBMLSPDef *all_defs;
+    const int *def_starts;
+    cbm_lsp_surface_row_t *rows;
+    _Atomic bool failed;
+} surface_job_t;
+
+static void surface_row_one(int i, void *arg) {
+    surface_job_t *job = (surface_job_t *)arg;
+    if (atomic_load_explicit(&job->failed, memory_order_relaxed)) {
+        return;
+    }
+    bool loaded = false;
+    CBMFileResult *fr = cbm_pipeline_result_acquire(job->ctx, job->cache, i, NULL, &loaded);
+    if (!fr) {
+        /* Never parsed this run (read/extract skip): no surface claim.
+         * The routing layer treats a missing row as "must full-rebuild
+         * before this file can be reasoned about", which is the correct
+         * fail-closed default for an unreadable file. */
+        return;
+    }
+    int start = job->def_starts ? job->def_starts[i] : 0;
+    int end = job->def_starts ? job->def_starts[i + 1] : 0;
+    size_t json_len = 0;
+    char *json = surface_file_to_json(fr, job->all_defs ? job->all_defs + start : NULL, end - start,
+                                      &json_len);
+    cbm_pipeline_result_release(fr, loaded);
+    if (!json) {
+        atomic_store_explicit(&job->failed, true, memory_order_relaxed);
+        return;
+    }
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(json, json_len, sha);
+    cbm_lsp_surface_row_t *r = &job->rows[i];
+    r->defs_json = json; /* set first: it marks the row present for the compaction */
+    r->project = strdup(job->project);
+    r->rel_path = strdup(job->files[i].rel_path);
+    r->surface_sha = strdup(sha);
+    r->ref_bloom = NULL;
+    r->ref_bloom_len = 0;
+    r->config_ctx = strdup("");
+    if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
+        atomic_store_explicit(&job->failed, true, memory_order_relaxed);
+    }
+}
+
+int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *project,
+                               CBMFileResult **cache, const cbm_file_info_t *files, int file_count,
                                const CBMLSPDef *all_defs, const int *def_starts,
                                cbm_lsp_surface_row_t **out_rows, int *out_count) {
     *out_rows = NULL;
@@ -137,37 +196,32 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
     if (!rows) {
         return -1;
     }
+    surface_job_t job = {
+        .ctx = ctx,
+        .project = project,
+        .cache = cache,
+        .files = files,
+        .all_defs = all_defs,
+        .def_starts = def_starts,
+        .rows = rows,
+    };
+    atomic_init(&job.failed, false);
+    cbm_parallel_for(file_count, surface_row_one, &job,
+                     (cbm_parallel_for_opts_t){.max_workers = 0, .force_pthreads = false});
+    if (atomic_load_explicit(&job.failed, memory_order_relaxed)) {
+        cbm_store_free_lsp_surfaces(rows, file_count); /* untouched rows are all NULL */
+        return -1;
+    }
+    /* Present rows to the front, in file order: the same rows, in the same
+     * order, as the sequential loop produced. */
     int n = 0;
     for (int i = 0; i < file_count; i++) {
-        if (!cache[i]) {
-            /* Never parsed this run (read/extract skip): no surface claim.
-             * The routing layer treats a missing row as "must full-rebuild
-             * before this file can be reasoned about", which is the correct
-             * fail-closed default for an unreadable file. */
+        if (!rows[i].defs_json) {
             continue;
         }
-        int start = def_starts ? def_starts[i] : 0;
-        int end = def_starts ? def_starts[i + 1] : 0;
-        char *json =
-            surface_file_to_json(cache[i], all_defs ? all_defs + start : NULL, end - start);
-        if (!json) {
-            cbm_store_free_lsp_surfaces(rows, n);
-            return -1;
-        }
-        char sha[CBM_SHA256_HEX_LEN + 1];
-        cbm_sha256_hex(json, strlen(json), sha);
-        cbm_lsp_surface_row_t *r = &rows[n];
-        r->project = strdup(project);
-        r->rel_path = strdup(files[i].rel_path);
-        r->surface_sha = strdup(sha);
-        r->defs_json = json;
-        r->ref_bloom = NULL;
-        r->ref_bloom_len = 0;
-        r->config_ctx = strdup("");
-        if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
-            n++;
-            cbm_store_free_lsp_surfaces(rows, n);
-            return -1;
+        if (n != i) {
+            rows[n] = rows[i];
+            memset(&rows[i], 0, sizeof(rows[i]));
         }
         n++;
     }
@@ -196,9 +250,15 @@ static const char **arena_str_array(CBMArena *arena, yyjson_val *arr, bool null_
     if (!items) {
         return NULL;
     }
-    for (int i = 0; i < count; i++) {
-        const char *s = yyjson_get_str(yyjson_arr_get(arr, (size_t)i));
-        items[i] = s ? cbm_arena_strdup(arena, s) : "?";
+    /* Iterate instead of yyjson_arr_get(i): that call is a linear scan for
+     * non-flat arrays (arrays of objects are not flat), which turns this loop
+     * into O(n^2) in the element count. */
+    yyjson_arr_iter iter = yyjson_arr_iter_with(arr);
+    int i = 0;
+    yyjson_val *item;
+    while ((item = yyjson_arr_iter_next(&iter))) {
+        const char *s = yyjson_get_str(item);
+        items[i++] = s ? cbm_arena_strdup(arena, s) : "?";
     }
     if (null_terminated) {
         items[count] = NULL;
@@ -234,9 +294,15 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         return -1;
     }
     memset(defs, 0, (size_t)count * sizeof(CBMLSPDef));
-    for (int i = 0; i < count; i++) {
-        yyjson_val *o = yyjson_arr_get(lsp, (size_t)i);
-        CBMLSPDef *d = &defs[i];
+    /* Iterate instead of yyjson_arr_get(i). `lsp` is an array of objects, which
+     * is not flat, so indexing rescans the preceding elements and the whole
+     * decode becomes O(n^2). One generated data file with ~300k defs made this
+     * step take minutes. */
+    yyjson_arr_iter iter = yyjson_arr_iter_with(lsp);
+    int i = 0;
+    yyjson_val *o;
+    while ((o = yyjson_arr_iter_next(&iter))) {
+        CBMLSPDef *d = &defs[i++];
         d->qualified_name = arena_str_or_null(arena, yyjson_obj_get(o, "qn"));
         d->short_name = arena_str_or_null(arena, yyjson_obj_get(o, "sn"));
         d->label = arena_str_or_null(arena, yyjson_obj_get(o, "lb"));

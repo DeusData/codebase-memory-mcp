@@ -19,6 +19,7 @@
 #include "foundation/platform.h"
 #include "foundation/log.h"
 #include "cbm.h"
+#include "result_spill.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +117,33 @@ static int setup_parallel_repo(void) {
         return -1;
     fprintf(f, "package probe;\npublic class Base extends Circle {\n"
                "    @Override\n    public double area() { return 0.0; }\n}\n");
+    fclose(f);
+
+    /* NAMESPACE-declaring files whose import resolves through the namespace
+     * map (PHP `use`; C# `using` and Java package imports take the same path).
+     * Without these the spill-parity test compared a Go+Java fixture that never
+     * touches that map, so it passed while spilling silently changed import
+     * resolution for every namespaced repository: the map is built from the
+     * in-memory result cache, where a PARKED result is NULL, so a spilled file
+     * contributed no namespace at all and its imports fell through to the
+     * looser fallback (php corpus, 2026-09-18: 57,182 edges in memory against
+     * 59,379 while spilling, same binary, reproducible 3/3 each way). */
+    snprintf(path, sizeof(path), "%s/app", g_par_tmpdir);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/app/Models.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Models;\n\n"
+               "class User {\n    public function name() { return \"u\"; }\n}\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/app/Services.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Services;\n\nuse App\\Models\\User;\n\n"
+               "class UserService {\n"
+               "    public function make() { $u = new User(); return $u->name(); }\n}\n");
     fclose(f);
 
     return 0;
@@ -271,6 +299,11 @@ static cbm_gbuf_t *run_sequential_with_lsp_cross(const char *project, const char
 
 /* ── Run parallel pipeline on files, returning gbuf ───────────────── */
 
+/* Spill mode for the harness: the run below opts its context in (the way
+ * run_parallel_pipeline does) and records how many results the store parked. */
+static bool g_harness_spill = false;
+static int64_t g_harness_parked = -1;
+
 static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     const char *project, const char *repo_path, cbm_file_info_t *files, int file_count,
     int worker_count, const cbm_parallel_extract_opts_t *extract_opts,
@@ -286,6 +319,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         .gbuf = gbuf,
         .registry = reg,
         .cancelled = &cancelled,
+        .spill_allowed = g_harness_spill,
     };
 
     if (seed_structure) {
@@ -306,6 +340,14 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
     }
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
+    if (g_harness_spill) {
+        int64_t bytes = 0;
+        int64_t loads = 0;
+        g_harness_parked = -1;
+        if (ctx.spill) {
+            cbm_result_spill_stats(ctx.spill, &g_harness_parked, &bytes, &loads);
+        }
+    }
 
     if (mutator) {
         mutator(result_cache, file_count, mutator_ud);
@@ -323,9 +365,11 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
      * cbm_pxc_run_one(_ts) per file BEFORE materializing CALLS edges. */
     char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
     int def_count = 0;
+    CBMArena cross_arena;
+    cbm_arena_init(&cross_arena);
     CBMLSPDef *all_defs =
-        def_modules ? cbm_pxc_collect_all_defs(result_cache, files, file_count, ctx.project_name,
-                                               def_modules, &def_count, NULL)
+        def_modules ? cbm_pxc_collect_all_defs(&ctx, &cross_arena, result_cache, files, file_count,
+                                               ctx.project_name, def_modules, &def_count, NULL)
                     : NULL;
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
@@ -337,6 +381,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
 
     cbm_pxc_free_module_def_index(module_def_index);
     free(all_defs);
+    cbm_arena_destroy(&cross_arena);
     if (def_modules) {
         for (int i = 0; i < file_count; i++) {
             free(def_modules[i]);
@@ -348,9 +393,16 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         if (result_cache[i])
             cbm_free_result(result_cache[i]);
     free(result_cache);
+    cbm_pipeline_spill_close(&ctx);
 
     harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
+    /* cbm_parallel_extract installs a process-global package map whose
+     * production owner is the surrounding pipeline lifecycle.  This direct
+     * pass harness owns that lifecycle itself, so mirror production teardown
+     * before returning the graph to the test. */
+    cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+    cbm_pipeline_set_pkgmap(NULL);
     return gbuf;
 }
 
@@ -519,6 +571,48 @@ TEST(parallel_total_edges) {
     int par = cbm_gbuf_edge_count(g_par_gbuf);
     ASSERT_GT(seq, 0);
     ASSERT_EQ(seq, par);
+    PASS();
+}
+
+/* ── Spill mode: the graph is the in-memory graph ─────────────────── */
+
+/* CBM_MEM_SPILL=1 parks every compacted result on disk the moment it is
+ * extracted; registry build, def collection, surfaces, resolve and the infra
+ * passes read each one back only for the moment they need it. The graph must
+ * not be able to tell: same nodes, same edges per type as the in-memory run
+ * of the same repo -- and every file must actually have gone through the
+ * store (a store that failed to open would silently test nothing). */
+TEST(parallel_spill_mode_builds_the_same_graph) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_setenv("CBM_MEM_SPILL", "1", 1);
+    g_harness_spill = true;
+    cbm_gbuf_t *spilled = run_parallel("par-test", g_par_tmpdir, files, file_count, 2);
+    g_harness_spill = false;
+    cbm_unsetenv("CBM_MEM_SPILL");
+    cbm_discover_free(files, file_count);
+    ASSERT(spilled != NULL);
+
+    ASSERT_EQ((int)g_harness_parked, file_count);
+    ASSERT_EQ(cbm_gbuf_node_count(spilled), cbm_gbuf_node_count(g_par_gbuf));
+    ASSERT_EQ(cbm_gbuf_edge_count(spilled), cbm_gbuf_edge_count(g_par_gbuf));
+    static const char *const types[] = {"CALLS", "DEFINES",  "DEFINES_METHOD", "IMPORTS",
+                                        "USES",  "INHERITS", "IMPLEMENTS"};
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int in_memory = cbm_gbuf_edge_count_by_type(g_par_gbuf, types[t]);
+        int on_disk = cbm_gbuf_edge_count_by_type(spilled, types[t]);
+        if (in_memory != on_disk) {
+            printf("  FAIL: %s edges: in_memory=%d spilled=%d\n", types[t], in_memory, on_disk);
+        }
+        ASSERT_EQ(in_memory, on_disk);
+    }
+    cbm_gbuf_free(spilled);
     PASS();
 }
 
@@ -925,6 +1019,25 @@ static bool callable_has_call_target_fragment(const cbm_gbuf_t *gbuf, const char
     return false;
 }
 
+static const cbm_gbuf_edge_t *find_call_edge_to_target_fragment(const cbm_gbuf_t *gbuf,
+                                                                const char *source_tail,
+                                                                const char *target_fragment) {
+    const cbm_gbuf_node_t *source = find_unique_callable_node_by_tail(gbuf, source_tail);
+    if (!source || !target_fragment)
+        return NULL;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source->id, "CALLS", &edges, &count) != 0)
+        return NULL;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *target =
+            edges[i] ? cbm_gbuf_find_by_id(gbuf, edges[i]->target_id) : NULL;
+        if (target && target->qualified_name && strstr(target->qualified_name, target_fragment))
+            return edges[i];
+    }
+    return NULL;
+}
+
 static int count_calls_edges_to_tail(const cbm_gbuf_t *gbuf, const char *target_tail) {
     const cbm_gbuf_node_t *target = find_unique_callable_node_by_tail(gbuf, target_tail);
     if (!target)
@@ -1283,7 +1396,7 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     const cbm_gbuf_edge_t *legacy_edge =
         find_calls_edge_by_tails(gbuf, "Caller.run", "Legacy.render");
     if (!probe.ambiguity.injected || !probe.legacy_injected || !probe.carrier_allows_fallback ||
-        !probe.shared_matcher_failed_closed || alpha_edges != 1 || beta_edges != 0 ||
+        !probe.shared_matcher_failed_closed || alpha_edges != 0 || beta_edges != 0 ||
         legacy_edges != 0) {
         printf("  exact ambiguity + legacy diagnostic: exact_ambiguity=%d legacy=%d "
                "fallback_allowed=%d shared_failed_closed=%d alpha=%d beta=%d legacy_edge=%d "
@@ -1300,9 +1413,26 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     ASSERT_TRUE(probe.legacy_injected);
     ASSERT_TRUE(probe.carrier_allows_fallback);
     ASSERT_TRUE(probe.shared_matcher_failed_closed);
-    /* The ordinary registry/type fallback may still recover the source-proven
-     * Alpha receiver. Only the lower-ranked legacy semantic row is forbidden. */
-    ASSERT_EQ(alpha_edges, 1);
+    /* alpha_edges is a SIDE EFFECT of this test, not its subject. The subject is
+     * beta_edges == 0 and legacy_edges == 0 below: an ambiguous exact LSP match
+     * must not fall through to the lower-ranked legacy semantic row. Both are
+     * unchanged, as are all four probe assertions above.
+     *
+     * It used to be 1 because this harness DELIBERATELY injects an ambiguous
+     * exact match and forces the shared matcher to fail closed, so
+     * `value.render()` drops past the LSP into the registry with THREE
+     * same-named candidates (Alpha/Beta/Legacy.render) and bound by
+     * suffix_match — MEASURED: strategy=suffix_match, cands=3, conf=0.5500.
+     * That is a 1-in-3 guess that happened to land on Alpha: exactly the weak
+     * member-call class the Python guard now suppresses (#1276), and the same
+     * accepted trade recorded on python/S6 in test_lsp_resolution_probe.c.
+     *
+     * NOT over-suppression: sibling tests in this suite index the same
+     * `value.render()` source and resolve it via lsp_method (cands=1,
+     * conf=0.9000), a strategy the guard keeps — they still assert 1. Only the
+     * sabotaged-LSP path degrades to a weak textual guess.
+     * Flips back to 1 once py_lsp_cross resolves the receiver on this path. */
+    ASSERT_EQ(alpha_edges, 0);
     ASSERT_EQ(beta_edges, 0);
     ASSERT_EQ(legacy_edges, 0);
     PASS();
@@ -2534,6 +2664,133 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
     PASS();
 }
 
+/* Build the smallest real Cargo workspace that exercises the direct parallel
+ * resolve API.  crate_a is a declared workspace member, while unlisted is a
+ * graph-visible decoy with the same helper name.  That decoy is intentional:
+ * without manifest-aware routing, a bare-name match cannot accidentally make
+ * the test green.  The optional crate_b-local helper pins the second failure
+ * mode where a confident in-file resolution used to suppress cross-LSP. */
+static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
+    static const char workspace_toml[] = "[workspace]\n"
+                                         "members = [\"crate_a\", \"crate_b\"]\n"
+                                         "resolver = \"2\"\n";
+    static const char crate_a_toml[] =
+        "[package]\nname = \"crate_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    static const char crate_b_toml[] =
+        "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+        "\n[dependencies]\ncrate_a = { path = \"../crate_a\" }\n";
+    static const char crate_a_source[] = "pub fn helper() {}\n";
+    static const char unlisted_source[] = "pub fn helper() {}\n";
+    static const char caller_without_local[] = "fn run() { crate_a::helper(); }\n"
+                                               "fn main() { run(); }\n";
+    static const char caller_with_local[] = "fn helper() {}\n"
+                                            "fn run() { crate_a::helper(); }\n"
+                                            "fn main() { run(); }\n";
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_issue56_parallel_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        return NULL;
+
+    char crate_a[512];
+    char crate_a_src[512];
+    char crate_b[512];
+    char crate_b_src[512];
+    char unlisted[512];
+    char unlisted_src[512];
+    snprintf(crate_a, sizeof(crate_a), "%s/crate_a", tmpdir);
+    snprintf(crate_a_src, sizeof(crate_a_src), "%s/src", crate_a);
+    snprintf(crate_b, sizeof(crate_b), "%s/crate_b", tmpdir);
+    snprintf(crate_b_src, sizeof(crate_b_src), "%s/src", crate_b);
+    snprintf(unlisted, sizeof(unlisted), "%s/unlisted", tmpdir);
+    snprintf(unlisted_src, sizeof(unlisted_src), "%s/src", unlisted);
+    if (cbm_mkdir(crate_a) != 0 || cbm_mkdir(crate_a_src) != 0 || cbm_mkdir(crate_b) != 0 ||
+        cbm_mkdir(crate_b_src) != 0 || cbm_mkdir(unlisted) != 0 || cbm_mkdir(unlisted_src) != 0) {
+        th_rmtree(tmpdir);
+        return NULL;
+    }
+
+    char root_manifest[512];
+    char crate_a_manifest[512];
+    char crate_b_manifest[512];
+    char crate_a_file[512];
+    char crate_b_file[512];
+    char unlisted_file[512];
+    snprintf(root_manifest, sizeof(root_manifest), "%s/Cargo.toml", tmpdir);
+    snprintf(crate_a_manifest, sizeof(crate_a_manifest), "%s/Cargo.toml", crate_a);
+    snprintf(crate_b_manifest, sizeof(crate_b_manifest), "%s/Cargo.toml", crate_b);
+    snprintf(crate_a_file, sizeof(crate_a_file), "%s/lib.rs", crate_a_src);
+    snprintf(crate_b_file, sizeof(crate_b_file), "%s/main.rs", crate_b_src);
+    snprintf(unlisted_file, sizeof(unlisted_file), "%s/lib.rs", unlisted_src);
+    if (th_write_file(root_manifest, workspace_toml) != 0 ||
+        th_write_file(crate_a_manifest, crate_a_toml) != 0 ||
+        th_write_file(crate_b_manifest, crate_b_toml) != 0 ||
+        th_write_file(crate_a_file, crate_a_source) != 0 ||
+        th_write_file(crate_b_file, local_decoy ? caller_with_local : caller_without_local) != 0 ||
+        th_write_file(unlisted_file, unlisted_source) != 0) {
+        th_rmtree(tmpdir);
+        return NULL;
+    }
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    if (cbm_discover(tmpdir, &opts, &files, &file_count) != 0 || file_count < 3) {
+        cbm_discover_free(files, file_count);
+        th_rmtree(tmpdir);
+        return NULL;
+    }
+    cbm_gbuf_t *gbuf =
+        run_parallel("cbm_issue56_parallel", tmpdir, files, file_count, 2 /* real workers */);
+    cbm_discover_free(files, file_count);
+    th_rmtree(tmpdir);
+    return gbuf;
+}
+
+TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest) {
+    cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(false);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_edge_t *correct =
+        find_call_edge_to_target_fragment(gbuf, "main.run", ".crate_a.");
+    const bool correct_found = correct != NULL;
+    const bool unlisted = callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
+    const bool manifest_strategy =
+        correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
+    if (!correct || unlisted || !manifest_strategy) {
+        printf("  issue56 manifest diagnostic: correct=%d unlisted=%d strategy=%d\n", correct_found,
+               unlisted, manifest_strategy);
+    }
+    cbm_gbuf_free(gbuf);
+
+    ASSERT_TRUE(correct_found);
+    ASSERT_FALSE(unlisted);
+    ASSERT_TRUE(manifest_strategy);
+    PASS();
+}
+
+TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution) {
+    cbm_gbuf_t *gbuf = run_issue56_parallel_workspace(true);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_edge_t *correct =
+        find_call_edge_to_target_fragment(gbuf, "main.run", ".crate_a.");
+    const bool correct_found = correct != NULL;
+    const bool wrong_local = callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
+    const bool manifest_strategy =
+        correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
+    if (!correct || wrong_local || !manifest_strategy) {
+        printf("  issue56 local-shadow diagnostic: correct=%d wrong_local=%d strategy=%d\n",
+               correct_found, wrong_local, manifest_strategy);
+    }
+    cbm_gbuf_free(gbuf);
+
+    ASSERT_TRUE(correct_found);
+    ASSERT_FALSE(wrong_local);
+    ASSERT_TRUE(manifest_strategy);
+    PASS();
+}
+
 /* A known external macro semantic owns its parser occurrence even when the
  * external target is not materialized as a graph node.  It must not fall back
  * to a same-named local function in either pipeline. */
@@ -3029,6 +3286,241 @@ TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     PASS();
 }
 
+/* ── Go cross-package field-chain fixture (field_defs fold) ─────── */
+
+/* Production's sequential driver seeds Folder nodes via pass_structure; the
+ * compact harness (run_sequential_with_lsp_cross_*) does not. Go imports
+ * resolve to Folder nodes, so a Go import-map fixture must seed File and
+ * Folder nodes itself — replicating the production shape. */
+static cbm_gbuf_t *run_go_field_chain_sequential(const char *project, const char *repo_path,
+                                                 cbm_file_info_t *files, int file_count) {
+    cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
+    cbm_registry_t *reg = cbm_registry_new();
+    CBMFileResult **cache = (CBMFileResult **)calloc((size_t)file_count, sizeof(CBMFileResult *));
+    if (!gbuf || !reg || !cache) {
+        cbm_gbuf_free(gbuf);
+        cbm_registry_free(reg);
+        free(cache);
+        return NULL;
+    }
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = project,
+        .repo_path = repo_path,
+        .gbuf = gbuf,
+        .registry = reg,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+
+    seed_test_file_nodes(gbuf, project, files, file_count);
+    char *svc_dir_qn = cbm_pipeline_fqn_folder(project, "svc");
+    if (svc_dir_qn) {
+        cbm_gbuf_upsert_node(gbuf, "Folder", "svc", svc_dir_qn, "svc", 0, 0, "{}");
+        free(svc_dir_qn);
+    }
+
+    cbm_init();
+    cbm_pipeline_pass_definitions(&ctx, files, file_count);
+    cbm_pipeline_pass_lsp_cross(&ctx, files, file_count, cache);
+    cbm_pipeline_pass_calls(&ctx, files, file_count);
+    cbm_pipeline_pass_usages(&ctx, files, file_count);
+    cbm_pipeline_pass_semantic(&ctx, files, file_count);
+
+    /* CBM_GO_FIELD_DIAG dump. NOTE: resolved-call records may borrow QN
+     * strings across file results (cross-file resolution in pass_lsp_cross),
+     * so every result must stay alive while ANY is inspected. Print all
+     * first, free all second. */
+    if (getenv("CBM_GO_FIELD_DIAG")) {
+        for (int i = 0; i < file_count; i++) {
+            if (!cache[i]) {
+                continue;
+            }
+            const CBMFileResult *r = cache[i];
+            printf("  [diag] file %s defs=%d imports=%d calls=%d resolved=%d\n", files[i].rel_path,
+                   r->defs.count, r->imports.count, r->calls.count, r->resolved_calls.count);
+            for (int j = 0; j < r->resolved_calls.count; j++) {
+                const CBMResolvedCall *rc = &r->resolved_calls.items[j];
+                printf("  [diag]   rc caller=%s callee=%s strategy=%s conf=%.2f kind=%d "
+                       "span=[%u,%u)\n",
+                       rc->caller_qn ? rc->caller_qn : "?", rc->callee_qn ? rc->callee_qn : "?",
+                       rc->strategy ? rc->strategy : "?", rc->confidence, (int)rc->kind,
+                       (unsigned)rc->site_start_byte, (unsigned)rc->site_end_byte);
+            }
+            for (int j = 0; j < r->calls.count; j++) {
+                const CBMCall *c = &r->calls.items[j];
+                printf("  [diag]   call callee=%s enclosing=%s span=[%u,%u) req=%d\n",
+                       c->callee_name ? c->callee_name : "?",
+                       c->enclosing_func_qn ? c->enclosing_func_qn : "?",
+                       (unsigned)c->site_start_byte, (unsigned)c->site_end_byte,
+                       (int)c->requires_lsp_resolution);
+            }
+            for (int j = 0; j < r->defs.count; j++) {
+                const CBMDefinition *d = &r->defs.items[j];
+                printf("  [diag]   def label=%s qn=%s parent=%s ret=%s\n",
+                       d->label ? d->label : "?", d->qualified_name ? d->qualified_name : "?",
+                       d->parent_class ? d->parent_class : "?",
+                       d->return_type ? d->return_type : "?");
+            }
+        }
+    }
+    for (int i = 0; i < file_count; i++) {
+        cbm_free_result(cache[i]);
+    }
+    free(cache);
+    harness_ctx_free_tables(&ctx);
+    cbm_registry_free(reg);
+    if (ctx.seq_cross_arena_live) {
+        cbm_arena_destroy(&ctx.seq_cross_arena);
+        ctx.seq_cross_arena_live = false;
+    }
+    if (ctx.seq_cross_def_modules) {
+        for (int i = 0; i < ctx.seq_cross_def_module_count; i++) {
+            free(ctx.seq_cross_def_modules[i]);
+        }
+        free(ctx.seq_cross_def_modules);
+        ctx.seq_cross_def_modules = NULL;
+    }
+    return gbuf;
+}
+
+/* Cross-package field chains (h.S.Ping()) resolve end to end through the
+ * shared prebuilt Go registry. Regression for the field_defs fold: Go struct
+ * fields are extracted as flat "Field" definitions that pxc_map_label drops,
+ * so structs registered with zero fields and field chains never resolved.
+ * Mirrors the real-world handler shape — an app package holds an aliased
+ * cross-package field ("S *s.Svc") and app.Call calls through it. */
+TEST(parallel_go_cross_package_field_chain_resolves) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_gofold_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    char svc_path[512];
+    char app_path[512];
+    snprintf(svc_path, sizeof(svc_path), "%s/acme-order/internal/service/order_service.go", tmpdir);
+    snprintf(app_path, sizeof(app_path), "%s/acme-order/internal/handler/order_handler.go", tmpdir);
+    if (th_write_file(svc_path, "package service\n"
+                                "\n"
+                                "import (\n"
+                                "    \"context\"\n"
+                                "    pb \"acme-sdk/apis/order\"\n"
+                                ")\n"
+                                "\n"
+                                "type OrderService struct{}\n"
+                                "\n"
+                                "func (s *OrderService) PlaceOrder(ctx context.Context, req "
+                                "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
+                                "    return nil, nil\n"
+                                "}\n"
+                                "\n"
+                                "func (s *OrderService) ListOrders(ctx context.Context, req "
+                                "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
+                                "    return nil, nil\n"
+                                "}\n") != 0 ||
+        th_write_file(app_path, "package handler\n"
+                                "\n"
+                                "import (\n"
+                                "    \"context\"\n"
+                                "\n"
+                                "    pb \"acme-sdk/apis/order\"\n"
+                                "\n"
+                                "    \"acme-order/internal/service\"\n"
+                                ")\n"
+                                "\n"
+                                "type OrderHandler struct {\n"
+                                "    pb.UnimplementedOrderServer\n"
+                                "    cartSvc      *service.CartService\n"
+                                "    userSvc      *service.UserService\n"
+                                "    orderSvc     *service.OrderService\n"
+                                "    inventorySvc *service.InventoryService\n"
+                                "    paymentSvc   *service.PaymentService\n"
+                                "    shipmentSvc  *service.ShipmentService\n"
+                                "    couponSvc    *service.CouponService\n"
+                                "    searchSvc    *service.SearchService\n"
+                                "}\n"
+                                "\n"
+                                "func (h *OrderHandler) ListOrders(ctx context.Context, req "
+                                "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
+                                "    return h.orderSvc.ListOrders(ctx, req)\n"
+                                "}\n"
+                                "\n"
+                                "func (h *OrderHandler) PlaceOrder(ctx context.Context, req "
+                                "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
+                                "    return h.orderSvc.PlaceOrder(ctx, req)\n"
+                                "}\n"
+                                "\n"
+                                "func (h *OrderHandler) UpdateCart(ctx context.Context, req "
+                                "*pb.UpdateCartReq) (*pb.UpdateCartRsp, error) {\n"
+                                "    return h.cartSvc.UpdateCart(ctx, req)\n"
+                                "}\n") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("write fixture failed");
+    }
+
+    cbm_file_info_t files[2] = {0};
+    files[0].path = svc_path;
+    files[0].rel_path = (char *)"acme-order/internal/service/order_service.go";
+    files[0].language = CBM_LANG_GO;
+    files[1].path = app_path;
+    files[1].rel_path = (char *)"acme-order/internal/handler/order_handler.go";
+    files[1].language = CBM_LANG_GO;
+
+    cbm_gbuf_t *gbuf = run_go_field_chain_sequential("go_field_fold", tmpdir, files, 2);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_edge_t *edge =
+        find_call_edge_to_target_fragment(gbuf, "handler.PlaceOrder", ".service.PlaceOrder");
+    const bool found = edge != NULL;
+    const bool dispatch = edge && edge->properties_json &&
+                          strstr(edge->properties_json, "\"strategy\":\"lsp_type_dispatch\"");
+    if (!found || !dispatch) {
+        printf("  go field chain diagnostic: found=%d dispatch=%d\n", found, dispatch);
+        if (edge && edge->properties_json) {
+            printf("  go field chain props: %s\n", edge->properties_json);
+        }
+        /* Dump all callable nodes and CALLS edges for cross-referencing */
+        {
+            const cbm_gbuf_node_t **nodes = NULL;
+            int ncount = 0;
+            if (cbm_gbuf_find_by_label(gbuf, "Function", &nodes, &ncount) == 0) {
+                for (int i = 0; i < ncount; i++) {
+                    printf("  node Function: %s\n", nodes[i]->qualified_name);
+                }
+            }
+            if (cbm_gbuf_find_by_label(gbuf, "Method", &nodes, &ncount) == 0) {
+                for (int i = 0; i < ncount; i++) {
+                    printf("  node Method: %s\n", nodes[i]->qualified_name);
+                }
+            }
+            cbm_gbuf_edge_visitor_fn edge_dump = NULL;
+            (void)edge_dump;
+            /* print every CALLS edge with endpoints */
+            const cbm_gbuf_edge_t **all = NULL;
+            int ecount = 0;
+            if (cbm_gbuf_find_edges_by_type(gbuf, "CALLS", &all, &ecount) == 0) {
+                for (int i = 0; i < ecount; i++) {
+                    const cbm_gbuf_node_t *src =
+                        all[i] ? cbm_gbuf_find_by_id(gbuf, all[i]->source_id) : NULL;
+                    const cbm_gbuf_node_t *dst =
+                        all[i] ? cbm_gbuf_find_by_id(gbuf, all[i]->target_id) : NULL;
+                    printf("  CALLS edge: %s -> %s  props=%s\n", src ? src->qualified_name : "?",
+                           dst ? dst->qualified_name : "?",
+                           all[i]->properties_json ? all[i]->properties_json : "{}");
+                }
+            }
+        }
+    }
+    cbm_gbuf_free(gbuf);
+    th_rmtree(tmpdir);
+
+    ASSERT_TRUE(found);
+    ASSERT_TRUE(dispatch);
+    PASS();
+}
+
 /* Cross-file regression for the QN-mismatch bug: py_lsp's per-file mode
  * emits resolved_calls.callee_qn as the raw import-module path (e.g.
  * `greeter.Greeter` from `from greeter import Greeter`) rather than the
@@ -3396,8 +3888,8 @@ TEST(lsp_resolve_project_prefixed_duplicate_is_not_ambiguous) {
     const char *project = "proj";
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, "/tmp");
     ASSERT_NOT_NULL(gbuf);
-    int64_t target_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler",
-                                             "proj.mod.Target.handler", "target.py", 1, 1, "{}");
+    int64_t target_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler", "proj.mod.Target.handler",
+                                             "target.py", 1, 1, "{}");
     ASSERT_GT(target_id, 0);
 
     CBMCall call = make_call("proj.mod.Caller.run", "handler");
@@ -3406,8 +3898,7 @@ TEST(lsp_resolve_project_prefixed_duplicate_is_not_ambiguous) {
     CBMResolvedCall raw = make_rc("proj.mod.Caller.run", "mod.Target.handler", 0.75f);
     raw.site_start_byte = call.site_start_byte;
     raw.site_end_byte = call.site_end_byte;
-    CBMResolvedCall prefixed =
-        make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
+    CBMResolvedCall prefixed = make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
     prefixed.site_start_byte = call.site_start_byte;
     prefixed.site_end_byte = call.site_end_byte;
     CBMResolvedCall items[] = {raw, prefixed};
@@ -3426,9 +3917,8 @@ TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist) 
     ASSERT_NOT_NULL(gbuf);
     int64_t raw_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler", "mod.Target.handler",
                                           "raw.py", 1, 1, "{}");
-    int64_t prefixed_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler",
-                                               "proj.mod.Target.handler", "prefixed.py", 1, 1,
-                                               "{}");
+    int64_t prefixed_id = cbm_gbuf_upsert_node(
+        gbuf, "Function", "handler", "proj.mod.Target.handler", "prefixed.py", 1, 1, "{}");
     ASSERT_GT(raw_id, 0);
     ASSERT_GT(prefixed_id, 0);
     ASSERT(raw_id != prefixed_id);
@@ -3439,8 +3929,7 @@ TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist) 
     CBMResolvedCall raw = make_rc("proj.mod.Caller.run", "mod.Target.handler", 0.75f);
     raw.site_start_byte = call.site_start_byte;
     raw.site_end_byte = call.site_end_byte;
-    CBMResolvedCall prefixed =
-        make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
+    CBMResolvedCall prefixed = make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
     prefixed.site_start_byte = call.site_start_byte;
     prefixed.site_end_byte = call.site_end_byte;
     CBMResolvedCall items[] = {raw, prefixed};
@@ -3926,12 +4415,15 @@ SUITE(parallel) {
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
+    RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);
+    RUN_TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution);
     RUN_TEST(parallel_rust_known_macro_does_not_fallback_to_local_function);
     RUN_TEST(parallel_rust_proc_macros_are_decorates_and_usage_only);
     RUN_TEST(parallel_c_preprocessed_coordinate_collision_preserves_hidden_target);
     RUN_TEST(parallel_cpp_preprocessed_coordinate_collision_preserves_hidden_target);
     RUN_TEST(parallel_cuda_preprocessed_coordinate_collision_preserves_hidden_target);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_go_cross_package_field_chain_resolves);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
@@ -3944,6 +4436,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_implements_parity);
     RUN_TEST(parallel_semantic_fixture_expected_counts);
     RUN_TEST(parallel_total_edges);
+    RUN_TEST(parallel_spill_mode_builds_the_same_graph);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
 

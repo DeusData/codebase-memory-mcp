@@ -30,6 +30,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "../foundation/constants.h"
 
 /* Maximum request head (request line + headers + terminating CRLFCRLF). */
 #define CBM_HTTP_MAX_HEAD (16 * 1024)
@@ -51,14 +52,14 @@ typedef enum {
  * Selected headers are copied for the routing/security layer ("" when
  * absent). `body` is heap-allocated and NUL-terminated. */
 typedef struct {
-    char method[16];
-    char path[2048];
-    char query[2048];
+    char method[CBM_SZ_16];
+    char path[CBM_SZ_2K];
+    char query[CBM_SZ_2K];
     unsigned char http_minor; /* 0 for HTTP/1.0, 1 for HTTP/1.1 */
-    char origin[256];
-    char host[256];
-    char content_type[128];
-    char accept_language[256];
+    char origin[CBM_SZ_256];
+    char host[CBM_SZ_256];
+    char content_type[CBM_SZ_128];
+    char accept_language[CBM_SZ_256];
     char *body;
     size_t body_len;
 } cbm_http_req_t;

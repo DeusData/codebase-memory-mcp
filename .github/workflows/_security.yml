@@ -41,8 +41,16 @@ jobs:
   codeql-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    # Without security-events:read this job inherits the workflow's
+    # contents:read, the code-scanning alert API answers 403, and the gate
+    # below reported "0 alerts" on every run it has ever made. actions:read is
+    # what the CodeQL-run poll above needs for the same reason.
+    permissions:
+      contents: read
+      security-events: read
+      actions: read
     steps:
-      - name: Wait for CodeQL on current commit (max 45 min)
+      - name: Wait for CodeQL on current commit (max 150 min)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -50,11 +58,17 @@ jobs:
           # CodeQL runs are recorded against the PR head SHA.
           CURRENT_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
           echo "Waiting for CodeQL to complete on $CURRENT_SHA..."
-          for attempt in $(seq 1 90); do
+          # 300 attempts x 30s = 150 min. The previous budget was 90 x 30s = 45 min,
+          # which is shorter than CodeQL actually takes on this repository: a measured
+          # run on PR #1426 (head 7b72652a) completed with conclusion=success after
+          # 124 min, 7 minutes AFTER this gate had already given up. That marked at
+          # least five contributor PRs red for a scan that passed. The job's own
+          # timeout-minutes is 240, so 150 still leaves headroom.
+          for attempt in $(seq 1 300); do
             LATEST=$(gh api "repos/${{ github.repository }}/actions/workflows/codeql.yml/runs?head_sha=$CURRENT_SHA&per_page=1" \
               --jq '.workflow_runs[] | "\(.conclusion) \(.status)"' 2>/dev/null | head -1 || echo "")
             if [ -z "$LATEST" ]; then
-              echo "  $attempt/90: no run yet..."; sleep 30; continue
+              echo "  $attempt/300: no run yet..."; sleep 30; continue
             fi
             CONCLUSION=$(echo "$LATEST" | cut -d' ' -f1)
             STATUS=$(echo "$LATEST" | cut -d' ' -f2)
@@ -63,7 +77,7 @@ jobs:
             elif [ "$STATUS" = "completed" ]; then
               echo "BLOCKED: CodeQL $CONCLUSION"; exit 1
             fi
-            echo "  $attempt/90: $STATUS..."; sleep 30
+            echo "  $attempt/300: $STATUS..."; sleep 30
           done
           echo "BLOCKED: CodeQL timeout"; exit 1
 
@@ -71,11 +85,43 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # FAIL CLOSED. The previous form was `gh api ... 2>/dev/null || echo "0"`,
+          # which looks defensive and is the opposite. gh writes the API error
+          # BODY to stdout, so a 403 made ALERTS the string
+          #   {"message":"Resource not accessible by integration",...,"status":"403"}0
+          # every `[` comparison then failed as non-integer, the `if` took its
+          # false branch, and the step printed "CodeQL gate passed (0 alerts)"
+          # and exited 0. That is exactly how a security gate should NEVER fail:
+          # silently, in the direction of "everything is fine". An unreadable
+          # alert list is now an error, not a zero.
+          # NOTE: this runs in a command substitution, so it must `return`, not
+          # `exit` -- an `exit` here would only end the subshell and let the
+          # caller continue with an empty count, recreating the very bug this
+          # replaces. The callers below check the status explicitly.
+          count_open_alerts() {
+            local body status
+            body=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' \
+                     --jq 'length' 2>/dev/null)
+            status=$?
+            if [ $status -ne 0 ]; then
+              echo "BLOCKED: cannot read code scanning alerts (gh exit $status)." >&2
+              echo "  Refusing to treat an unreadable alert list as zero." >&2
+              echo "  Most likely cause: the job lacks security-events:read." >&2
+              return 1
+            fi
+            case "$body" in
+              ''|*[!0-9]*)
+                echo "BLOCKED: alert count was not a number: ${body:-<empty>}" >&2
+                return 1
+                ;;
+            esac
+            printf '%s' "$body"
+          }
           echo "Waiting 60s for alert API to settle..."
           sleep 60
-          ALERTS=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
+          ALERTS=$(count_open_alerts) || exit 1
           sleep 15
-          ALERTS2=$(gh api 'repos/${{ github.repository }}/code-scanning/alerts?state=open' --jq 'length' 2>/dev/null || echo "0")
+          ALERTS2=$(count_open_alerts) || exit 1
           [ "$ALERTS" -lt "$ALERTS2" ] && ALERTS=$ALERTS2
           if [ "$ALERTS" -gt 0 ]; then
             echo "BLOCKED: $ALERTS open alert(s)"

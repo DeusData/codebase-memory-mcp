@@ -15250,12 +15250,170 @@ TEST(clsp_tier2_shared_registry_readonly_c) {
     PASS();
 }
 
-/* Direct guard for the finalize-time short-name / embedded-type indexes and their
- * iterators (type_registry.c), which the Rust trait/free-func fast paths rely on.
- * Verifies: embed index yields exactly the types whose embedded_types carry a
- * matching BARE name, in ascending registry order, deduped when a type lists the
- * same bare twice; free-func index yields only free funcs (receiver_type==NULL) with
- * the given short_name, not methods. */
+/* The method-return refinement in the C++ class walk used to cast the chained
+ * lookup result and write a scratch-arena signature into it. With the entry in
+ * the sealed shared base, every other worker read that signature after the
+ * arena of this file had died (ASan heap-use-after-free in c_adl_resolve on
+ * dotnet/runtime, 2026-09-14). Contract: the refinement is copy-on-write into
+ * the overlay; the base signature pointer never changes. min_params = 7 is a
+ * marker only a COPY of the base entry carries (a fresh registration sets -1),
+ * so the assertion proves the upgrade path ran, not a re-registration. */
+TEST(clsp_method_return_refinement_is_copy_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    const CBMType *rets[2] = {cbm_type_named(&arena, "test.mod.Item"), NULL};
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "test.mod.Box.items";
+    f.short_name = "items";
+    f.receiver_type = "test.mod.Box";
+    f.signature = cbm_type_func(&arena, NULL, NULL, rets);
+    f.min_params = 7;
+    cbm_registry_add_func(&base, f);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+    const CBMRegisteredFunc *base_entry = cbm_registry_lookup_func(&base, "test.mod.Box.items");
+    ASSERT_NOT_NULL(base_entry);
+    const CBMType *base_sig = base_entry->signature;
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+    /* The in-class declaration refines the NAMED return to a POINTER. */
+    const char *src = "struct Item { int v; };\n"
+                      "struct Box {\n"
+                      "    Item *items();\n"
+                      "};\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&scratch, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/true, &overlay, NULL, NULL, 0, NULL, &out);
+
+    ASSERT(base_entry->signature == base_sig);
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+    const CBMRegisteredFunc *refined = cbm_registry_lookup_func(&overlay, "test.mod.Box.items");
+    ASSERT_NOT_NULL(refined);
+    ASSERT(refined >= overlay.funcs && refined < overlay.funcs + overlay.func_count);
+    ASSERT_EQ(refined->min_params, 7);
+    ASSERT_EQ(refined->signature->data.func.return_types[0]->kind, CBM_TYPE_POINTER);
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* The per-file overlay contract (type_registry.c chain API): a walk is handed
+ * an overlay chained to a sealed base. Lookups and iterators see the base
+ * through the overlay, every yielded index belongs to it.reg, a refinement is
+ * copy-on-write into the overlay (the base never changes), and an overlay copy
+ * shadows its base original in chained iteration. */
+TEST(registry_overlay_chain_iterates_and_copies_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.alpha";
+    f.short_name = "alpha";
+    f.min_params = -1;
+    cbm_registry_add_func(&base, f);
+    f.qualified_name = "pkg.beta";
+    f.short_name = "beta";
+    cbm_registry_add_func(&base, f);
+    CBMRegisteredType t;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.T";
+    t.short_name = "T";
+    cbm_registry_add_type(&base, t);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+
+    /* Lookups chain through the empty overlay. */
+    ASSERT_NOT_NULL(cbm_registry_lookup_func(&overlay, "pkg.alpha"));
+    ASSERT_NOT_NULL(cbm_registry_lookup_type(&overlay, "pkg.T"));
+
+    /* Chained iteration reaches the base; it.reg names where the index lives. */
+    CBMFreeFuncIter it;
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int i = cbm_free_func_iter_next(&it);
+    ASSERT(i >= 0);
+    ASSERT(it.reg == &base);
+    ASSERT(strcmp(it.reg->funcs[i].qualified_name, "pkg.alpha") == 0);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+    /* The plain iterator on the overlay alone sees nothing -- unchanged. */
+    cbm_registry_free_funcs_by_short_name(&overlay, "alpha", &it);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+
+    /* Copy-on-write: the refinement lands in the overlay, the base is untouched,
+     * and chained lookup now returns the refined copy. */
+    CBMRegisteredFunc *w = cbm_registry_func_for_update(&overlay, "pkg.alpha");
+    ASSERT_NOT_NULL(w);
+    ASSERT(w >= overlay.funcs && w < overlay.funcs + overlay.func_count);
+    w->min_params = 2;
+    ASSERT_EQ(base.funcs[0].min_params, -1);
+    ASSERT_EQ(cbm_registry_lookup_func(&overlay, "pkg.alpha")->min_params, 2);
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.alpha") ==
+           w); /* own entry, no second copy */
+    ASSERT_EQ(overlay.func_count, 1);
+
+    /* The base original is shadowed: chained iteration yields exactly one alpha,
+     * from the overlay. */
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        ASSERT(it.reg == &overlay);
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+    /* Linear chain over everything: alpha (overlay copy) + beta (base). */
+    cbm_registry_all_funcs_chain(&overlay, &it);
+    seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 2);
+
+    /* Types: same contract. */
+    CBMTypeShortIter ti;
+    cbm_registry_types_by_short_name_chain(&overlay, "T", &ti);
+    int k = cbm_type_short_iter_next(&ti);
+    ASSERT(k >= 0);
+    ASSERT(ti.reg == &base);
+    CBMRegisteredType *wt = cbm_registry_type_for_update(&overlay, "pkg.T");
+    ASSERT_NOT_NULL(wt);
+    ASSERT_EQ(overlay.type_count, 1);
+    cbm_registry_all_types_chain(&overlay, &ti);
+    seen = 0;
+    while (cbm_type_short_iter_next(&ti) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+
+    /* A sealed head refuses refinement; an unknown QN yields nothing. */
+    overlay.read_only = true;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.beta") == NULL);
+    overlay.read_only = false;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.nope") == NULL);
+    ASSERT_EQ(base.func_count, 2);
+
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Direct guard for the type-name / embedded-type / free-function registry
+ * indexes and their iterators (type_registry.c). Verifies that every iterator
+ * preserves ascending registry order, which is part of resolver tie-breaking. */
 TEST(registry_short_name_indexes) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -15288,6 +15446,25 @@ TEST(registry_short_name_indexes) {
     t.short_name = "C";
     t.embedded_types = c_emb;
     cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "other.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+
+    /* Populate enough distinct names to force many hash-bucket collisions, with
+     * repeated short names spread across the registry. The differential check
+     * below compares the index against the exact former linear-scan order. */
+    for (int i = 0; i < 512; i++) {
+        memset(&t, 0, sizeof(t));
+        t.qualified_name = cbm_arena_sprintf(&arena, "bulk.mod%d.Name%d", i, i % 23);
+        ASSERT_NOT_NULL(t.qualified_name);
+        t.short_name = strrchr(t.qualified_name, '.') + 1;
+        cbm_registry_add_type(&reg, t);
+    }
 
     /* free func "helper" (x2 — different QNs), method "M.helper", free func "other". */
     CBMRegisteredFunc f;
@@ -15310,6 +15487,77 @@ TEST(registry_short_name_indexes) {
     cbm_registry_add_func(&reg, f);
 
     cbm_registry_finalize(&reg);
+    cbm_registry_build_type_short_index(&reg);
+
+    /* Qualified-name bare segment "Trait": types 0, 4, then the bare-QN type
+     * 5. The iterator is a hash prefilter, so apply the exact predicate before
+     * asserting its order just like production consumers do. */
+    CBMTypeShortIter nit;
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    {
+        int expected[] = {0, 4, 5};
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+                continue;
+            ASSERT_TRUE(exact_count < 3);
+            ASSERT_EQ(candidate, expected[exact_count++]);
+        }
+        ASSERT_EQ(exact_count, 3);
+    }
+    cbm_registry_types_by_short_name(&reg, "Missing", &nit);
+    {
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (candidate_short && strcmp(candidate_short, "Missing") == 0)
+                exact_count++;
+        }
+        ASSERT_EQ(exact_count, 0);
+    }
+
+    for (int name_i = 0; name_i < 23; name_i++) {
+        char short_name[32];
+        snprintf(short_name, sizeof(short_name), "Name%d", name_i);
+        cbm_registry_types_by_short_name(&reg, short_name, &nit);
+        int linear_i = 0;
+        for (;;) {
+            int expected = -1;
+            while (linear_i < reg.type_count) {
+                int candidate = linear_i++;
+                const char *qn = reg.types[candidate].qualified_name;
+                const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+                const char *candidate_short = last_dot ? last_dot + 1 : qn;
+                if (candidate_short && strcmp(candidate_short, short_name) == 0) {
+                    expected = candidate;
+                    break;
+                }
+            }
+
+            int actual;
+            for (;;) {
+                actual = cbm_type_short_iter_next(&nit);
+                if (actual < 0)
+                    break;
+                const char *qn = reg.types[actual].qualified_name;
+                const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+                const char *candidate_short = last_dot ? last_dot + 1 : qn;
+                if (candidate_short && strcmp(candidate_short, short_name) == 0)
+                    break;
+            }
+
+            ASSERT_EQ(actual, expected);
+            if (expected < 0)
+                break;
+        }
+    }
 
     /* Embed index for bare "Trait": types 1 (A) then 2 (B), ascending, B once. */
     CBMTypeEmbedIter it;
@@ -15338,6 +15586,70 @@ TEST(registry_short_name_indexes) {
     cbm_registry_free_funcs_by_short_name(&reg, "other", &fit);
     ASSERT_EQ(cbm_free_func_iter_next(&fit), 3);
     ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    /* A type appended after finalize is covered by the iterator tail. If the
+     * auxiliary allocation is unavailable, the iterator falls back to the same
+     * complete linear scan rather than silently dropping candidates. Keep this
+     * after the other iterator assertions because their tails intentionally
+     * expose post-finalize candidates for caller-side exact filtering too. */
+    int tail_type_i = reg.type_count;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "tail.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 0);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 4);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 5);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), tail_type_i);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), -1);
+
+    int *saved_type_short_buckets = reg.type_short_buckets;
+    reg.type_short_buckets = NULL;
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    int fallback_expected[] = {0, 4, 5, tail_type_i};
+    int fallback_count = 0;
+    int candidate;
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+        const char *qn = reg.types[candidate].qualified_name;
+        const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+        const char *candidate_short = last_dot ? last_dot + 1 : qn;
+        if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+            continue;
+        ASSERT_TRUE(fallback_count < 4);
+        ASSERT_EQ(candidate, fallback_expected[fallback_count++]);
+    }
+    ASSERT_EQ(fallback_count, 4);
+    reg.type_short_buckets = saved_type_short_buckets;
+
+    /* A failed rebuild must discard the previous auxiliary index. Re-finalize
+     * after adding the tail type so the QN boundary advances, then force arena
+     * exhaustion for the optional rebuild. The iterator must fall back to the
+     * complete linear scan instead of retaining the stale pre-tail index. */
+    cbm_registry_finalize(&reg);
+    int saved_nblocks = arena.nblocks;
+    size_t saved_used = arena.used;
+    arena.nblocks = CBM_ARENA_MAX_BLOCKS;
+    arena.used = arena.block_size;
+    cbm_registry_build_type_short_index(&reg);
+    arena.nblocks = saved_nblocks;
+    arena.used = saved_used;
+    ASSERT_NULL(reg.type_short_buckets);
+    ASSERT_NULL(reg.type_short_entries);
+    ASSERT_EQ(reg.type_short_bucket_count, 0);
+
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    fallback_count = 0;
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+        const char *qn = reg.types[candidate].qualified_name;
+        const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+        const char *candidate_short = last_dot ? last_dot + 1 : qn;
+        if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+            continue;
+        ASSERT_TRUE(fallback_count < 4);
+        ASSERT_EQ(candidate, fallback_expected[fallback_count++]);
+    }
+    ASSERT_EQ(fallback_count, 4);
 
     cbm_arena_destroy(&arena);
     PASS();
@@ -16065,6 +16377,8 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_tier2_shared_registry_readonly_c);
     RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
     RUN_TEST(seal_py_shared_registry_readonly);
+    RUN_TEST(registry_overlay_chain_iterates_and_copies_on_write);
+    RUN_TEST(clsp_method_return_refinement_is_copy_on_write);
     RUN_TEST(seal_py_shared_registry_readonly_fields);
     RUN_TEST(seal_cs_shared_registry_readonly);
     RUN_TEST(seal_ts_shared_registry_readonly);

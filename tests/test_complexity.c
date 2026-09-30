@@ -49,6 +49,8 @@
 #include "../src/foundation/profile.h"
 #include "cbm.h"
 #include "discover/discover.h"
+#include "lang_specs.h"
+#include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
@@ -353,6 +355,8 @@ typedef struct {
     uint64_t tail_lookups;
     uint64_t tail_candidates;
     uint64_t fallback_rows;
+    uint64_t imp_nodes;       /* symbols scored by the importance pass */
+    uint64_t imp_name_visits; /* same-name-group members visited by that pass */
     double wall_s;
 } CxMetrics;
 
@@ -373,6 +377,8 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     uint64_t tl0 = atomic_load_explicit(&g_lsp_tail_lookups, memory_order_relaxed);
     uint64_t tc0 = atomic_load_explicit(&g_lsp_tail_candidates, memory_order_relaxed);
     uint64_t fb0 = cbm_pp_lsp_linear_fallback_rows();
+    uint64_t in0 = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed);
+    uint64_t iv0 = atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed);
 
     atomic_store_explicit(&g_cx_pass_count, 0, memory_order_relaxed);
     cbm_log_set_sink_ex(cx_pass_sink, CBM_LOG_SINK_TEE);
@@ -407,6 +413,9 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     out->tail_lookups = atomic_load_explicit(&g_lsp_tail_lookups, memory_order_relaxed) - tl0;
     out->tail_candidates = atomic_load_explicit(&g_lsp_tail_candidates, memory_order_relaxed) - tc0;
     out->fallback_rows = cbm_pp_lsp_linear_fallback_rows() - fb0;
+    out->imp_nodes = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed) - in0;
+    out->imp_name_visits =
+        atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed) - iv0;
 
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
@@ -717,9 +726,121 @@ TEST(complexity_throughput_report_written) {
     PASS();
 }
 
+/* Importance scoring must stay linear in the graph. Its generic-name
+ * multiplier needs |{files a name is defined in}|; computing that per NODE
+ * instead of once per distinct NAME makes a same-name group of size k cost
+ * O(k^3) — measured on a large Java corpus as a multi-minute cost for a
+ * handful of names. Under replication the same-name groups grow with the copy
+ * count, so the per-node shape lands at ~4x per doubling here while the
+ * memoized shape stays at ~2x. Gated on the counter ratio, never on wall time
+ * (O9). This counter is GATED, not merely recorded: the whole point of the
+ * work is that this quantity must not go superlinear. */
+TEST(complexity_importance_scoring_is_linear) {
+    if (cx_measure_pair() != 0) {
+        FAIL("failed to build/run the complexity corpus pair");
+    }
+    const CxMetrics *a = &g_cx_base;
+    const CxMetrics *b = &g_cx_doubled;
+
+    printf("    imp_nodes %llu -> %llu  imp_name_visits %llu -> %llu\n",
+           (unsigned long long)a->imp_nodes, (unsigned long long)b->imp_nodes,
+           (unsigned long long)a->imp_name_visits, (unsigned long long)b->imp_name_visits);
+
+    /* Non-vacuous, twice over: the pass must have run at all (a miscounted
+     * PREDUMP_PASS_COUNT would silently skip it and zero both counters), and
+     * the base leg must have produced enough work for a ratio to mean
+     * anything. A zero here is a wiring defect to fix, never a pass. */
+    ASSERT_GT((long long)a->imp_nodes, 0);
+    ASSERT_GT((long long)a->imp_name_visits, (long long)CX_MIN_BASE_WORK);
+
+    double node_r = cx_ratio((double)b->imp_nodes, (double)a->imp_nodes);
+    double visit_r = cx_ratio((double)b->imp_name_visits, (double)a->imp_name_visits);
+    printf("    imp_nodes ratio %.2f  imp_name_visits ratio %.2f (linear ~2, per-node ~4)\n",
+           node_r, visit_r);
+    ASSERT_TRUE(node_r >= CX_RATIO_LO && node_r <= CX_RATIO_HI);
+    ASSERT_TRUE(visit_r <= CX_RATIO_HI);
+    PASS();
+}
+
+/* ── Lexer work in error recovery (#2176) ──────────────────────────────
+ * tree-sitter lexes an unparseable stretch by retrying at every byte with
+ * every external token marked valid. The ReScript scanner then ran its
+ * template-string loop from each byte to the next '`', '$', '\\' or NUL — to
+ * the end of the file when there is none — and threw the result away. That
+ * is O(stretch) per byte, O(n^2) per file, all inside lexing where the parse
+ * budget's progress callback never runs; a binary Godot `.res` of high bytes
+ * (or plain text such as a run of '~') was dropped by the clock instead of
+ * parsed. Work is counted as the bytes the lexer pulls through a chunked
+ * TSInput: a pure function of (grammar, input), independent of speed. */
+enum { CX_LEX_CHUNK = 64, CX_LEX_BASE_BYTES = 4096 };
+
+typedef struct {
+    const char *src;
+    uint32_t len;
+    uint64_t bytes_pulled;
+} CxLexInput;
+
+static const char *cx_lex_read(void *payload, uint32_t byte_index, TSPoint position,
+                               uint32_t *bytes_read) {
+    (void)position;
+    CxLexInput *in = (CxLexInput *)payload;
+    if (byte_index >= in->len) {
+        *bytes_read = 0;
+        return "";
+    }
+    uint32_t n = in->len - byte_index;
+    if (n > CX_LEX_CHUNK) {
+        n = CX_LEX_CHUNK;
+    }
+    in->bytes_pulled += n;
+    *bytes_read = n;
+    return in->src + byte_index;
+}
+
+/* Bytes pulled while parsing `len` copies of `fill` as ReScript; 0 on failure. */
+static uint64_t cx_rescript_lex_work(unsigned char fill, uint32_t len) {
+    char *src = malloc(len);
+    TSParser *parser = ts_parser_new();
+    uint64_t work = 0;
+    if (src && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RESCRIPT))) {
+        memset(src, fill, len);
+        CxLexInput in = {src, len, 0};
+        TSInput input = {&in, cx_lex_read, TSInputEncodingUTF8, NULL};
+        TSTree *tree = ts_parser_parse(parser, NULL, input);
+        if (tree) {
+            work = in.bytes_pulled;
+            ts_tree_delete(tree);
+        }
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    free(src);
+    return work;
+}
+
+TEST(complexity_rescript_error_recovery_lexing_is_linear) {
+    /* 0xFF: the reporter's binary bytes (invalid UTF-8). '~': plain ASCII text
+     * that ReScript cannot parse either — the defect is not binary-only. */
+    static const unsigned char fills[] = {0xFF, '~'};
+    for (size_t i = 0; i < sizeof(fills); i++) {
+        uint64_t base = cx_rescript_lex_work(fills[i], CX_LEX_BASE_BYTES);
+        uint64_t doubled = cx_rescript_lex_work(fills[i], 2 * CX_LEX_BASE_BYTES);
+        double r = cx_ratio((double)doubled, (double)base);
+        printf("    fill 0x%02x: lexer bytes %llu -> %llu  ratio %.2f (linear ~2, quadratic ~4)\n",
+               fills[i], (unsigned long long)base, (unsigned long long)doubled, r);
+        /* Non-vacuous: the lexer must at least have read the input once. */
+        ASSERT_GTE(base, (uint64_t)CX_LEX_BASE_BYTES);
+        ASSERT_TRUE(r >= CX_RATIO_LO && r <= CX_RATIO_HI);
+    }
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
     RUN_TEST(complexity_replicated_modules_scale_linearly);
     RUN_TEST(complexity_perfile_registry_work_is_linear);
+    RUN_TEST(complexity_importance_scoring_is_linear);
     RUN_TEST(complexity_shared_package_growth_stays_linear);
     RUN_TEST(complexity_throughput_report_written);
 }

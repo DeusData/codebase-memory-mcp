@@ -2,7 +2,7 @@
  * repro_grammar_misc.c -- FINAL per-grammar INVARIANT battery covering the
  * remaining MISCELLANEOUS language family (hardware-description, CFML dialects,
  * niche scripting, structural assembly/linker/tablegen/ledger/IaC). This file
- * completes the all-161-grammar reproduce-first coverage: every grammar-backed
+ * completes the all-162-grammar reproduce-first coverage: every grammar-backed
  * CBM_LANG_* now has a per-language RED/GREEN row on the bug-repro board.
  * CBM_LANG_OBJECTSCRIPT_EXPORT is intentionally excluded from the grammar
  * count because Studio Export XML is transformed to ObjectScript UDL first.
@@ -39,6 +39,8 @@
  *     OBJECTSCRIPT_ROUTINE -> CBM_LANG_OBJECTSCRIPT_ROUTINE
  *                                             (func: tag; call: extrinsic_function/
  *                                              routine_tag_call)
+ *     PLSQL         -> CBM_LANG_PLSQL         (func: create_function/procedure +
+ *                                              definitions/declarations; call: ref_call)
  *
  *   STRUCTURAL family (asm / linker / data / IaC) -> extract-clean +
  *   labels/fqn/ranges valid + defs-present (the entities each should extract) +
@@ -538,6 +540,38 @@ TEST(repro_grammar_misc_objectscript_routine) {
     return misc_pipeline_battery("OBJECTSCRIPT_ROUTINE", "Sample.mac", src);
 }
 
+/* ── PLSQL (callable) ────────────────────────────────────────────────────────
+ * A package body defines two functions; `run` applies `accept` with a local
+ * value argument through the registered ref_call form. plsql_func_types
+ * includes function_definition -> "Function"; create_package_body ->
+ * "Class"; plsql_call_types = {"ref_call"} -> call extraction.
+ *
+ * Dims asserted: 1-8 + R.
+ */
+TEST(repro_grammar_misc_plsql) {
+    static const char src[] = "CREATE OR REPLACE PACKAGE BODY sample_pkg AS\n"
+                              "  FUNCTION accept(value NUMBER) RETURN NUMBER IS\n"
+                              "  BEGIN\n"
+                              "    RETURN value;\n"
+                              "  END;\n"
+                              "  FUNCTION run(watched NUMBER) RETURN NUMBER IS\n"
+                              "  BEGIN\n"
+                              "    RETURN accept(watched);\n"
+                              "  END;\n"
+                              "END sample_pkg;\n"
+                              "/\n";
+    static const char bad[] = "CREATE OR REPLACE PACKAGE BODY sample_pkg AS\n"
+                              "  FUNCTION run(watched NUMBER) RETURN NUMBER IS\n"
+                              "  BEGIN\n"
+                              "    RETURN accept(\n";
+    if (misc_single_file_battery("PLSQL", src, CBM_LANG_PLSQL, "sample_pkg.pkb", "Class",
+                                 "Function", "accept") != 0)
+        return 1;
+    if (misc_robustness("PLSQL", bad, CBM_LANG_PLSQL, "sample_pkg.pkb") != 0)
+        return 1;
+    return misc_pipeline_battery("PLSQL", "sample_pkg.pkb", src);
+}
+
 /* ── PINE (callable) ─────────────────────────────────────────────────────────
  * Idiomatic Pine Script v5 indicator: a user function `ema2` defined with
  * function_declaration_statement, and a call to the built-in `plot()` plus an
@@ -862,6 +896,7 @@ SUITE(repro_grammar_misc) {
     RUN_TEST(repro_grammar_misc_linkerscript);
     RUN_TEST(repro_grammar_misc_objectscript_udl);
     RUN_TEST(repro_grammar_misc_objectscript_routine);
+    RUN_TEST(repro_grammar_misc_plsql);
     RUN_TEST(repro_grammar_misc_pine);
     RUN_TEST(repro_grammar_misc_rescript);
     RUN_TEST(repro_grammar_misc_sql);

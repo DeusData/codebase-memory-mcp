@@ -106,6 +106,14 @@ parse_format:;
      * silently change the operator-selected output shape. */
 }
 
+void cbm_log_init_for_process(bool quiet_by_default, bool require_info_liveness) {
+    cbm_log_set_level(quiet_by_default ? CBM_LOG_WARN : CBM_LOG_INFO);
+    cbm_log_init_from_env();
+    if (require_info_liveness && cbm_log_get_level() > CBM_LOG_INFO) {
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
+}
+
 void cbm_log_set_sink(cbm_log_sink_fn fn) {
     cbm_log_set_sink_ex(fn, CBM_LOG_SINK_REPLACE);
 }

@@ -111,9 +111,15 @@ typedef struct CBMTypeRegistry {
     int method_bucket_count;
     int method_entry_count;
 
-    // Auxiliary short-name / embedded-type indexes (built by finalize alongside the
-    // QN buckets). Turn the Rust trait- and free-function fallback scans from
-    // O(type_count)/O(func_count) into O(chain). Read-only after finalize.
+    // Auxiliary short-name / embedded-type indexes. The type short-name index is
+    // opt-in after finalize; the others are built by finalize. Current C/C++ cross
+    // registries opt in, while other languages incur no construction cost.
+    // Type short-name index: fnv1a(last-'.'-segment of qualified_name) -> chain
+    // of TYPE indices. payload_index = type index.
+    int *type_short_buckets;
+    CBMRegistryHashEntry *type_short_entries;
+    int type_short_bucket_count;
+    int type_short_entry_count;
     // Embedded-type index: fnv1a(bare last-'.'-segment of each embedded_type) -> chain
     // of TYPE indices declaring it. payload_index = type index (a type may appear once
     // per embedded entry; consumers dedup adjacent same-type via the iterator).
@@ -123,10 +129,6 @@ typedef struct CBMTypeRegistry {
     int type_embed_entry_count;
     // Free-function short-name index: fnv1a(short_name) -> chain of FREE-function
     // (receiver_type==NULL) indices. payload_index = func index.
-    int *type_short_buckets;
-    CBMRegistryHashEntry *type_short_entries;
-    int type_short_bucket_count;
-    int type_short_entry_count;
     int *ffunc_short_buckets;
     CBMRegistryHashEntry *ffunc_short_entries;
     int ffunc_short_bucket_count;
@@ -159,6 +161,11 @@ void cbm_registry_finalize(CBMTypeRegistry *reg);
 // pipeline-lifetime result arena, and per-file index allocations accumulated
 // there add GBs across a large repo (FastAPI incremental test: +1.1 GB RSS).
 void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena);
+
+// Build the optional final-QN-segment type index. Call immediately after
+// finalization. Consumers that do not opt in avoid its type_count-sized allocation
+// and scan. Allocation failure preserves the iterator's linear fallback.
+void cbm_registry_build_type_short_index(CBMTypeRegistry *reg);
 
 // Register a function/method.
 void cbm_registry_add_func(CBMTypeRegistry *reg, CBMRegisteredFunc func);
@@ -219,8 +226,37 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
                                                              const CBMType **arg_types,
                                                              int arg_count);
 
-// --- Auxiliary index iterators (Rust trait / free-function fallback fast paths) ---
+// --- Auxiliary index iterators (language fallback fast paths) ---
 //
+// Iterate registry TYPE indices whose qualified-name final segment may equal
+// `short_name`. When the optional index is present this walks its hash chain plus
+// any post-finalize tail; otherwise it degrades to the original full scan. Results
+// preserve ascending registry order. The index is a hash prefilter; callers must
+// re-check their exact predicate, including tail entries.
+// Built by finalize into type_short_buckets. Shared by the C++ short-name lookup
+// and by cs_resolve_type_name's step-9 fallback, which scanned type_count per
+// unresolved name — quadratic against the shared Tier-2 registry.
+typedef struct {
+    const CBMTypeRegistry *reg;
+    uint64_t hash;
+    int chain_idx;
+    int tail_i;
+    int tail_end;
+    /* Chain mode (see cbm_registry_*_chain): when this registry is exhausted
+     * the iterator re-opens on reg->fallback; `reg` then names the registry
+     * the yielded index belongs to, so callers deref it->reg->types[i], never
+     * the registry they started from. `key` re-opens the same query on the
+     * next link; NULL = linear scan. `shadow` is the head: fallback entries
+     * whose qualified_name the head also holds are skipped (an overlay copy
+     * hides its base original). */
+    bool chain;
+    const char *key;
+    const CBMTypeRegistry *shadow;
+} CBMTypeShortIter;
+void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
+                                      CBMTypeShortIter *out);
+int cbm_type_short_iter_next(CBMTypeShortIter *it);
+
 // Iterate registry TYPE indices whose embedded_types contain an entry whose BARE
 // name (last '.'-segment) equals `bare`. On a finalized registry this walks the
 // embedded-type index plus any post-finalize tail; on an unfinalized registry it
@@ -237,6 +273,9 @@ typedef struct {
     int tail_i;    // next tail/linear type index
     int tail_end;  // reg->type_count snapshot
     int prev_type; // last yielded type index (adjacent-dedup); -1 = none
+    bool chain;
+    const char *key;
+    const CBMTypeRegistry *shadow;
 } CBMTypeEmbedIter;
 void cbm_registry_types_by_embedded_bare(const CBMTypeRegistry *reg, const char *bare,
                                          CBMTypeEmbedIter *out);
@@ -251,22 +290,10 @@ typedef struct {
     int chain_idx;
     int tail_i;
     int tail_end;
+    bool chain;
+    const char *key;
+    const CBMTypeRegistry *shadow;
 } CBMFreeFuncIter;
-/* Iterate TYPE indices sharing a short name — the type-side twin of the free-
- * function iterator. Built by finalize into type_short_buckets; degrades to a
- * full types[] scan on an unfinalized registry (same correctness, old cost).
- * Added for cs_resolve_type_name's step-9 fallback, which scanned type_count
- * per unresolved name — quadratic against the shared Tier-2 registry. */
-typedef struct {
-    const CBMTypeRegistry *reg;
-    uint64_t hash;
-    int chain_idx;
-    int tail_i;
-    int tail_end;
-} CBMTypeShortIter;
-void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
-                                      CBMTypeShortIter *out);
-int cbm_type_short_iter_next(CBMTypeShortIter *it);
 
 void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
                                            CBMFreeFuncIter *out);
@@ -285,10 +312,40 @@ typedef struct {
     int chain_idx;
     int tail_i;
     int tail_end;
+    bool chain;
+    const CBMTypeRegistry *shadow;
 } CBMMethodIter;
 void cbm_registry_methods(const CBMTypeRegistry *reg, const char *receiver_qn,
                           const char *method_name, CBMMethodIter *out);
 int cbm_method_iter_next(CBMMethodIter *it);
+
+/* ── Chain-aware iteration and copy-on-write (per-file overlay contract) ──
+ *
+ * A resolve walk is handed a per-file OVERLAY registry chained (`fallback`) to
+ * the immutable shared base. Lookups already chain; these make the index
+ * iterators and the whole-registry scans chain too, and give a walk one way
+ * to refine an entry: copy it into the head first. Nothing behind `fallback`
+ * is ever written. Every yielded index belongs to it->reg at that moment. */
+void cbm_registry_types_by_short_name_chain(const CBMTypeRegistry *head, const char *short_name,
+                                            CBMTypeShortIter *out);
+void cbm_registry_types_by_embedded_bare_chain(const CBMTypeRegistry *head, const char *bare,
+                                               CBMTypeEmbedIter *out);
+void cbm_registry_free_funcs_by_short_name_chain(const CBMTypeRegistry *head,
+                                                 const char *short_name, CBMFreeFuncIter *out);
+void cbm_registry_methods_chain(const CBMTypeRegistry *head, const char *receiver_qn,
+                                const char *method_name, CBMMethodIter *out);
+/* Linear scans over every func / type in the chain (head first, shadowed
+ * base entries skipped). Same iterator types, same it->reg contract. */
+void cbm_registry_all_funcs_chain(const CBMTypeRegistry *head, CBMFreeFuncIter *out);
+void cbm_registry_all_types_chain(const CBMTypeRegistry *head, CBMTypeShortIter *out);
+
+/* The writable entry for qualified_name: the head's own entry if it has one,
+ * else a copy of the first fallback entry added to the head (copy-on-write),
+ * else NULL. NULL also when the head is sealed (read_only) -- a walk must never
+ * mutate a shared registry, so the caller skips the refinement, exactly as the
+ * sealed-registry no-op in cbm_registry_add_func does today. */
+CBMRegisteredFunc *cbm_registry_func_for_update(CBMTypeRegistry *head, const char *qualified_name);
+CBMRegisteredType *cbm_registry_type_for_update(CBMTypeRegistry *head, const char *qualified_name);
 
 // --- TS-specific helpers (return NULL for types without these signatures) ---
 

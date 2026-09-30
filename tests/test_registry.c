@@ -301,8 +301,7 @@ TEST(resolve_qualified_disambiguates_same_name) {
     ASSERT_TRUE(!nomatch.strategy || strcmp(nomatch.strategy, "qualified_suffix") != 0);
 
     /* A bare call stays ambiguous (no qualifier → no disambiguation signal). */
-    cbm_resolution_t bare =
-        cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
+    cbm_resolution_t bare = cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
     ASSERT_TRUE(!bare.strategy || strcmp(bare.strategy, "qualified_suffix") != 0);
 
     cbm_registry_free(r);
@@ -321,6 +320,56 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
     cbm_resolution_t res =
         cbm_registry_resolve(r, "Foo::Bar::run", "proj.svcA.Caller", NULL, NULL, 0);
     ASSERT_TRUE(!res.strategy || strcmp(res.strategy, "qualified_suffix") != 0);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* cbm_registry_add used to discard its `name` argument and re-derive the
+ * lookup key from the QN's last dot segment. That made the QN's tail load
+ * bearing for the bare-name index every language shares: a Rust cfg twin,
+ * minted as "add#cfg(test)", was indexed under that literal string and no bare
+ * `add` callee could ever reach it. */
+TEST(registry_indexes_by_passed_name_not_qn_tail) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function");
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "add", "proj.lib.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.lib.add#cfg(test)");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The derived key stays unconditional, and this pins that.
+ *
+ * A name may carry segments the QN's tail drops, and then the tail is the key
+ * callers actually spell. An HCL block is named "resource.aws_instance.web" by
+ * find_hcl_block_name while its QN tail is bare "web", which is how an
+ * `aws_instance.web.id` reference reaches it. Re-keying the index on the passed
+ * name would lose that lookup outright, so the fence gate above leaves these
+ * shapes exactly as they were.
+ *
+ * The Module row registers a shape production cannot produce: every caller of
+ * cbm_registry_add gates on cbm_label_is_registry_symbol, which does not admit
+ * "Module". It is here because the registry's own contract is per-label-string,
+ * not per-caller, and a future label change should not silently drop the stem
+ * lookup a bare module reference needs. */
+TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "resource.aws_instance.web", "proj.main.resource.aws_instance.web",
+                     "Class");
+    cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module");
+
+    cbm_resolution_t tail = cbm_registry_resolve(r, "web", "proj.main", NULL, NULL, 0);
+    ASSERT_STR_EQ(tail.qualified_name, "proj.main.resource.aws_instance.web");
+
+    cbm_resolution_t whole =
+        cbm_registry_resolve(r, "resource.aws_instance.web", "proj.main", NULL, NULL, 0);
+    ASSERT_STR_EQ(whole.qualified_name, "proj.main.resource.aws_instance.web");
+
+    cbm_resolution_t stem = cbm_registry_resolve(r, "helper", "proj.pkg.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(stem.qualified_name, "proj.pkg.helper");
 
     cbm_registry_free(r);
     PASS();
@@ -578,6 +627,44 @@ TEST(resolve_import_reachable_prefix) {
     PASS();
 }
 
+/* The per-file reachability memo answers exactly what the uncached check
+ * answers, file after file: its key arena opens on the first memoized key and
+ * is destroyed with the file, and one key is longer than the arena's first
+ * block. The two files import different packages, so a memo leaking between
+ * files would flip an answer. */
+TEST(reach_cache_memo_matches_uncached_across_files) {
+    static char long_qn[6000];
+    memset(long_qn, 'a', sizeof(long_qn) - 1);
+    long_qn[sizeof(long_qn) - 1] = '\0';
+    memcpy(long_qn, "pkg.io.", 7);
+    long_qn[5000] = '.';
+    const char *cands[] = {"pkg.io.Reader", "pkg.net.Dial", "other.fmt.Println", long_qn};
+    enum { NCANDS = 4 };
+    const char *imports_io[] = {"pkg.io"};
+    const char *imports_net[] = {"pkg.net", "other.fmt"};
+    for (int file = 0; file < 4; file++) {
+        bool io = (file % 2) == 0;
+        const char **imports = io ? imports_io : imports_net;
+        int nimports = io ? 1 : 2;
+        bool expect[NCANDS];
+        for (int i = 0; i < NCANDS; i++) {
+            expect[i] = cbm_registry_is_import_reachable(cands[i], imports, nimports);
+        }
+        /* the uncached answers really differ between the files */
+        ASSERT_EQ(expect[0], io);
+        ASSERT_EQ(expect[1], !io);
+        ASSERT_EQ(expect[3], io);
+        cbm_registry_reach_cache_begin(8);
+        for (int pass = 0; pass < 2; pass++) { /* the second pass is served by the memo */
+            for (int i = 0; i < NCANDS; i++) {
+                ASSERT_EQ(cbm_registry_is_import_reachable(cands[i], imports, nimports), expect[i]);
+            }
+        }
+        cbm_registry_reach_cache_end();
+    }
+    PASS();
+}
+
 /* ── Negative import evidence ─────────────────────────────────── */
 
 TEST(negative_import_rejects_unimported) {
@@ -783,49 +870,188 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+/* 2026-09-16 probe on torvalds/linux: a Makefile target bound the C function
+ * `sk_psock.eval` through unique_name. Build and configuration languages have
+ * no cross-language call semantics, so for them a unique match into another
+ * language is a collision by construction; a code caller keeps #1572. */
+TEST(cross_language_config_caller_drops_unique_name_too) {
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "include/linux/skmsg.h",
+                                                         "unique_name"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_CMAKE, "src/main.c", "unique_name"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_YAML, "app/models.py", "unique_name"));
+    /* A code caller's unique_name into another language is still #1572. */
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
+        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "unique_name"));
+    /* Same-language config targets are untouched. */
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "lib/Makefile", "unique_name"));
+    /* Receiver-aware strategies are never this guard's business. */
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "src/main.c", "same_module"));
+    PASS();
+}
+
+/* Same-named candidates that tie on test-status and namespace proximity used
+ * to be settled by bucket position, i.e. by the order files were registered:
+ * two indexes of one kernel tree differed by 632 CALLS edges, `dev_name`
+ * landing on any of twenty same-named struct fields or on nothing at all.
+ * The tie is now a function of the candidate set: the least nested
+ * definition, then the smaller QN — whichever order the registry was built
+ * in (O9). */
+TEST(registry_tie_break_is_independent_of_registration_order) {
+    const char *cands[] = {
+        "proj.drivers.media.cec.i2c.ch7322.ch7322_conn_match.dev_name", /* struct field */
+        "proj.sound.soc.codecs.tas2783-sdw.tas2783_prv.dev_name",       /* struct field */
+        "proj.include.linux.device.dev_name",                           /* the function */
+        "proj.arch.um.drivers.pty.pty_chan.dev_name",                   /* struct field */
+    };
+    const char *labels[] = {"Field", "Field", "Function", "Field"};
+    const int n = 4;
+
+    cbm_registry_t *forward = cbm_registry_new();
+    cbm_registry_t *backward = cbm_registry_new();
+    for (int i = 0; i < n; i++) {
+        cbm_registry_add(forward, "dev_name", cands[i], labels[i]);
+        cbm_registry_add(backward, "dev_name", cands[n - 1 - i], labels[n - 1 - i]);
+    }
+
+    /* A far-away caller with no imports: every candidate scores the same. */
+    cbm_resolution_t f =
+        cbm_registry_resolve(forward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
+    cbm_resolution_t b =
+        cbm_registry_resolve(backward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
+    ASSERT_NOT_NULL(f.qualified_name);
+    ASSERT_NOT_NULL(b.qualified_name);
+    ASSERT_STR_EQ(f.qualified_name, "proj.include.linux.device.dev_name");
+    ASSERT_STR_EQ(b.qualified_name, "proj.include.linux.device.dev_name");
+    ASSERT_STR_EQ(f.strategy, "suffix_match");
+    ASSERT_STR_EQ(b.strategy, "suffix_match");
+
+    /* Equal depth: the smaller QN, from either order. */
+    cbm_registry_t *lex_a = cbm_registry_new();
+    cbm_registry_t *lex_b = cbm_registry_new();
+    cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_a, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_b, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_b, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
+    cbm_resolution_t la =
+        cbm_registry_resolve(lex_a, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
+    cbm_resolution_t lb =
+        cbm_registry_resolve(lex_b, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
+    ASSERT_STR_EQ(la.qualified_name, "proj.include.linux.scatterlist.sg_next");
+    ASSERT_STR_EQ(lb.qualified_name, "proj.include.linux.scatterlist.sg_next");
+
+    /* Proximity still outranks depth: the sibling wins over a shallower stranger. */
+    cbm_registry_t *near = cbm_registry_new();
+    cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
+    cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
+                     "Function");
+    cbm_resolution_t nr = cbm_registry_resolve(near, "vnic_rq_free",
+                                               "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
+    ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
+
+    cbm_registry_free(forward);
+    cbm_registry_free(backward);
+    cbm_registry_free(lex_a);
+    cbm_registry_free(lex_b);
+    cbm_registry_free(near);
+    PASS();
+}
+
 TEST(cross_language_suffix_match_drops_py_vs_js) {
     /* #725: two same-named symbols in different languages. suffix_match is the
      * strategy that collapses them; unique_name is #1572 and must stay. */
     ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
                                                          "suffix_match"));
-    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "store.py",
-                                                         "suffix_match"));
-    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_BASH, "cli/main.py",
-                                                         "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py",
-                                                          "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
-                                                          "unique_name"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
-                                                          "same_module"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
-                                                          "import_map"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "store.py", "suffix_match"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_BASH, "cli/main.py", "suffix_match"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py", "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
+        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
+        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "same_module"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON,
+                                                          "web/src/pages/Editor.js", "import_map"));
     /* JS/TS/TSX are one family. */
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "lib/util.ts",
                                                           "suffix_match"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx",
                                                           "suffix_match"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, NULL, "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_COUNT, "store.py",
-                                                          "suffix_match"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_COUNT, "store.py", "suffix_match"));
     PASS();
 }
 
-TEST(tsjs_suppress_drops_weak_method_matches) {
-    /* #592/#606: a TS/JS member call whose receiver the LSP could not type, that
+TEST(cross_language_ref_drops_go_vs_c) {
+    /* #1928: the USAGE/WRITES/READS analog of #725. Reference edges carry no
+     * import-closure evidence, so EVERY registry strategy is a bare-name
+     * guess and no strategy-level carve-out applies — the predicate takes no
+     * strategy at all. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.c"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "driver/mock.hpp"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_C, "pkg/events/event.go"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_PYTHON, "web/src/pages/Editor.js"));
+    /* Same language → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "pkg/state/state.go"));
+    /* C and C++ are one family: .h maps to CBM_LANG_CPP, and a .c file
+     * referencing its own header's declarations is not a boundary. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_C, "bpf/probe.h"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_CPP, "driver/compat.c"));
+    /* …but Go into a header is still a boundary. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.h"));
+    /* JS/TS/TSX/ArkTS are one family. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_JAVASCRIPT, "lib/util.ts"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx"));
+    /* Unknown caller/target language or no path → nothing to judge → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_COUNT, "store.py"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, NULL));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, ""));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "Makefile.inc.unknownext"));
+    PASS();
+}
+
+TEST(go_bare_ref_never_binds_field) {
+    /* #1942/#1962: a bare Go identifier can never denote a struct field —
+     * field access is always a selector expression. The extractor strips the
+     * receiver before the resolver runs (resolve_lhs_write_name writes the
+     * trailing name; is_reference_node records the inner field_identifier),
+     * so the selector-vs-bare distinction arrives as the recorded
+     * is_member_access signal, never as a dot in the reference text. */
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, false, "Field"));
+    /* The member half of a selector may bind a field. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, true, "Field"));
+    /* Bare references to non-fields are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Function"));
+    /* Other languages reference their own members bare inside methods —
+     * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
+    PASS();
+}
+
+TEST(dynamic_suppress_drops_weak_method_matches) {
+    /* #592/#606/#1276: a member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
      * The strategies that actually reach the guards are the registry's
      * suffix_match / unique_name and the parallel field_type_hint; "fuzzy" is
      * covered defensively (cbm_registry_fuzzy_resolve is not wired into the
      * resolvers today) so a future wiring cannot silently reintroduce it. */
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "suffix_match"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "unique_name"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "field_type_hint"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "fuzzy"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "fuzzy"));
     PASS();
 }
 
-TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
+TEST(dynamic_suppress_keeps_high_confidence_and_non_methods) {
     /* Keep every receiver-/import-aware strategy. Because the PARALLEL resolver
      * runs lsp_* strategies through this same guard variable, an explicit
      * drop-list must never touch them — asserting the lsp_* keeps here is the
@@ -833,23 +1059,141 @@ TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
      * enumerates the resolver's non-weak strategies: registry
      * {import_map, import_map_suffix, same_module, qualified_suffix}, parallel
      * {callee_suffix, service_pattern}, and lsp_*. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "same_module"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "qualified_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "callee_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "service_pattern"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_method"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_cross"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_local"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "import_map"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_ts_method"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_ts_local"));
     /* A bare call (is_method=false) is a free-function call → never suppressed. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "unique_name"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "suffix_match"));
-    /* Non-TS/JS languages are never affected. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(false, true, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, false, "suffix_match"));
+    /* Languages outside the caller's guard set are never affected. */
+    ASSERT_FALSE(cbm_suppress_weak_member_match(false, true, "suffix_match"));
     /* No match (NULL/empty strategy) → nothing to suppress. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, NULL));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, ""));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, ""));
+    PASS();
+}
+
+TEST(python_builtin_member_table_matches_builtin_type_methods) {
+    /* Ends and middle of the sorted table, so a mis-sorted insert shows up. */
+    ASSERT_TRUE(cbm_python_is_builtin_member("add"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("extend"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("items"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("print"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("startswith"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("zfill"));
+    /* Project-specific spellings are not builtin members. */
+    ASSERT_FALSE(cbm_python_is_builtin_member("apply_converters"));
+    ASSERT_FALSE(cbm_python_is_builtin_member("lazy_model_operation"));
+    ASSERT_FALSE(cbm_python_is_builtin_member("describe"));
+    ASSERT_FALSE(cbm_python_is_builtin_member(NULL));
+    ASSERT_FALSE(cbm_python_is_builtin_member(""));
+    PASS();
+}
+
+TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only) {
+    /* The exemption: Python, self/cls-rooted receiver, unique_name, callee not
+     * a builtin member. */
+    ASSERT_TRUE(cbm_weak_member_unique_name_exempt(true, true, "self.compiler.apply_converters",
+                                                   "unique_name"));
+    ASSERT_TRUE(cbm_weak_member_unique_name_exempt(true, true, "cls.registry.lazy_model_operation",
+                                                   "unique_name"));
+    /* A bare parameter/local receiver carries no ownership evidence: #1276's
+     * accelerator.backward() and c.describe() stay suppressed. */
+    ASSERT_FALSE(
+        cbm_weak_member_unique_name_exempt(true, false, "accelerator.backward", "unique_name"));
+    /* A builtin type's own method stays suppressed even on self. */
+    ASSERT_FALSE(
+        cbm_weak_member_unique_name_exempt(true, true, "self.parts.extend", "unique_name"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.out.print", "unique_name"));
+    /* Only unique_name carries the one-definition evidence. */
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.compiler.apply_converters",
+                                                    "suffix_match"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.compiler.apply_converters",
+                                                    "field_type_hint"));
+    /* Python only: the JS/TS family keeps its recorded trade. */
+    ASSERT_FALSE(
+        cbm_weak_member_unique_name_exempt(false, true, "this.compiler.apply", "unique_name"));
+    /* Degenerate inputs never exempt. */
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, NULL, "unique_name"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "", "unique_name"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.x.y", NULL));
+    PASS();
+}
+
+TEST(local_binding_suppress_drops_weak_shadowed_bare_calls) {
+    /* A bare `run()` whose callee is a parameter of an enclosing scope cannot be
+     * the module-level `run`, so a weak short-name match fabricates the edge. */
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "fuzzy"));
+    PASS();
+}
+
+TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies) {
+    /* THE RECALL PIN. A bare call to a genuine module-level function is NOT
+     * locally bound, so it is never suppressed — whatever the callee is spelled.
+     * This is the assertion a name-keyed guard (get/run/execute) would fail: it
+     * would drop these purely because of how the callee reads. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "field_type_hint"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "fuzzy"));
+    /* Every receiver-/import-aware strategy is kept even when shadowed. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "import_map"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_py_method"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_direct"));
+    /* Languages outside the caller's gate are never affected. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(false, true, "suffix_match"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, ""));
+    PASS();
+}
+
+TEST(weak_call_guards_share_one_drop_list) {
+    /* The member guard and the local-binding guard must agree on what "weak"
+     * means. They share a single static predicate for exactly this reason; if
+     * someone re-inlines one of the lists and edits only that copy, the two
+     * guards start disagreeing and this test catches it at the contract level
+     * rather than in a corpus months later. */
+    static const char *const strategies[] = {"suffix_match",
+                                             "unique_name",
+                                             "field_type_hint",
+                                             "fuzzy",
+                                             "same_module",
+                                             "import_map",
+                                             "import_map_suffix",
+                                             "qualified_suffix",
+                                             "callee_suffix",
+                                             "service_pattern",
+                                             "lsp_cross",
+                                             "lsp_ts_method",
+                                             "lsp_py_method",
+                                             "lsp_direct",
+                                             "",
+                                             NULL};
+    for (int i = 0; strategies[i] != NULL; i++) {
+        bool member = cbm_suppress_weak_member_match(true, true, strategies[i]);
+        bool binding = cbm_suppress_weak_local_binding_call(true, true, strategies[i]);
+        if (member != binding) {
+            printf("  drop-list divergence on strategy \"%s\": member=%d binding=%d\n",
+                   strategies[i], member, binding);
+        }
+        ASSERT_EQ(member, binding);
+    }
     PASS();
 }
 
@@ -907,6 +1251,8 @@ SUITE(registry) {
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
+    RUN_TEST(registry_indexes_by_passed_name_not_qn_tail);
+    RUN_TEST(registry_indexes_a_dotted_name_under_its_tail_too);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);
@@ -926,6 +1272,7 @@ SUITE(registry) {
     /* Import reachability */
     RUN_TEST(resolve_is_import_reachable);
     RUN_TEST(resolve_import_reachable_prefix);
+    RUN_TEST(reach_cache_memo_matches_uncached_across_files);
     /* Negative import evidence */
     RUN_TEST(negative_import_rejects_unimported);
     /* Fuzzy resolve */
@@ -945,6 +1292,15 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
-    RUN_TEST(tsjs_suppress_drops_weak_method_matches);
-    RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(cross_language_config_caller_drops_unique_name_too);
+    RUN_TEST(registry_tie_break_is_independent_of_registration_order);
+    RUN_TEST(cross_language_ref_drops_go_vs_c);
+    RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(dynamic_suppress_drops_weak_method_matches);
+    RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
+    RUN_TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only);
+    RUN_TEST(local_binding_suppress_drops_weak_shadowed_bare_calls);
+    RUN_TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies);
+    RUN_TEST(weak_call_guards_share_one_drop_list);
 }

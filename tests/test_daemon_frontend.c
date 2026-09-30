@@ -34,6 +34,23 @@ typedef struct {
     cbm_version_cohort_manager_t *manager;
 } frontend_maintenance_fixture_t;
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    frontend_maintenance_fixture_t maintenance;
+    char conflict_log[FRONTEND_TEST_PATH_CAP];
+    cbm_daemon_runtime_service_t *service;
+    cbm_daemon_runtime_client_t *client;
+} frontend_idle_fixture_t;
+
+typedef struct {
+    cbm_daemon_runtime_client_t *client;
+    cbm_version_cohort_manager_t *manager;
+    FILE *input;
+    FILE *output;
+    int result;
+} frontend_idle_run_t;
+#endif
+
 static bool frontend_maintenance_fixture_start(frontend_maintenance_fixture_t *fixture,
                                                const char *tag) {
     memset(fixture, 0, sizeof(*fixture));
@@ -58,6 +75,148 @@ static void frontend_maintenance_fixture_finish(frontend_maintenance_fixture_t *
     }
     memset(fixture, 0, sizeof(*fixture));
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static cbm_daemon_runtime_application_session_t *frontend_idle_session_open(
+    void *context, cbm_daemon_client_id_t client_id, uint64_t authenticated_process_id) {
+    return context && client_id != CBM_DAEMON_CLIENT_ID_INVALID && authenticated_process_id != 0
+               ? (cbm_daemon_runtime_application_session_t *)context
+               : NULL;
+}
+
+static cbm_daemon_runtime_application_status_t frontend_idle_request(
+    void *context, cbm_daemon_runtime_application_session_t *session,
+    cbm_daemon_runtime_application_token_t request_token, const uint8_t *request,
+    uint32_t request_length, uint8_t **response_out, uint32_t *response_length_out) {
+    (void)request_token;
+    if (!context || session != (cbm_daemon_runtime_application_session_t *)context ||
+        !response_out || !response_length_out || (request_length > 0 && !request)) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+    }
+    *response_out = NULL;
+    *response_length_out = 0;
+    return CBM_DAEMON_RUNTIME_APPLICATION_OK;
+}
+
+static void frontend_idle_request_cancel(
+    void *context, cbm_daemon_runtime_application_session_t *session,
+    cbm_daemon_runtime_application_token_t request_token) {
+    (void)context;
+    (void)session;
+    (void)request_token;
+}
+
+static void frontend_idle_session_cancel(
+    void *context, cbm_daemon_runtime_application_session_t *session) {
+    (void)context;
+    (void)session;
+}
+
+static void frontend_idle_session_close(
+    void *context, cbm_daemon_runtime_application_session_t *session) {
+    (void)context;
+    (void)session;
+}
+
+static uint64_t frontend_test_process_id(void) {
+#ifdef _WIN32
+    return (uint64_t)GetCurrentProcessId();
+#else
+    return (uint64_t)getpid();
+#endif
+}
+
+static bool frontend_idle_fixture_start(frontend_idle_fixture_t *fixture) {
+    static const char cache[] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    memset(fixture, 0, sizeof(*fixture));
+    if (!frontend_maintenance_fixture_start(&fixture->maintenance, "idle-observer")) {
+        return false;
+    }
+    char build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    int log_written = snprintf(fixture->conflict_log, sizeof(fixture->conflict_log),
+                               "%s/conflicts.ndjson", fixture->maintenance.parent);
+    if (log_written <= 0 || log_written >= (int)sizeof(fixture->conflict_log) ||
+        !cbm_daemon_runtime_process_build_fingerprint(frontend_test_process_id(), build)) {
+        return false;
+    }
+    cbm_daemon_build_identity_t identity = {
+        .semantic_version = "2.4.0",
+        .build_fingerprint = build,
+        .cache_fingerprint = cache,
+        .protocol_abi = 3,
+        .store_abi = 11,
+        .feature_abi = 7,
+    };
+    cbm_daemon_runtime_application_callbacks_t callbacks = {
+        .context = fixture,
+        .session_open = frontend_idle_session_open,
+        .request = frontend_idle_request,
+        .request_cancel = frontend_idle_request_cancel,
+        .session_cancel = frontend_idle_session_cancel,
+        .session_close = frontend_idle_session_close,
+    };
+    cbm_daemon_runtime_service_config_t config = {
+        .endpoint = fixture->maintenance.endpoint,
+        .identity = identity,
+        .conflict_log_path = fixture->conflict_log,
+        .conflict_log_cap_bytes = 64U * 1024U,
+        .max_clients = 2,
+        .lease_timeout_ms = 5000,
+        .request_timeout_ms = 30000,
+        .shutdown_timeout_ms = 30000,
+        .application = callbacks,
+    };
+    fixture->service = cbm_daemon_runtime_service_start(&config);
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    fixture->client = fixture->service
+                          ? cbm_daemon_runtime_client_connect(fixture->maintenance.endpoint, &identity,
+                                                              30000, &connect_result)
+                          : NULL;
+    return fixture->client && connect_result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED;
+}
+
+static bool frontend_idle_fixture_finish(frontend_idle_fixture_t *fixture) {
+    bool ok = true;
+    if (fixture->client) {
+        ok = cbm_daemon_runtime_client_close(fixture->client, 30000) && ok;
+        fixture->client = NULL;
+    }
+    if (fixture->service) {
+        if (cbm_daemon_runtime_service_state(fixture->service) !=
+            CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
+            ok = cbm_daemon_runtime_service_stop(fixture->service, 30000) && ok;
+        }
+        ok = cbm_daemon_runtime_service_free(fixture->service) && ok;
+        fixture->service = NULL;
+    }
+    frontend_maintenance_fixture_finish(&fixture->maintenance);
+    return ok;
+}
+
+static FILE *frontend_test_fdopen_read(int fd) {
+#ifdef _WIN32
+    return _fdopen(fd, "rb");
+#else
+    return fdopen(fd, "rb");
+#endif
+}
+
+static int frontend_test_close_fd(int fd) {
+#ifdef _WIN32
+    return _close(fd);
+#else
+    return close(fd);
+#endif
+}
+
+static void *frontend_idle_run(void *opaque) {
+    frontend_idle_run_t *run = opaque;
+    run->result =
+        cbm_daemon_frontend_mcp_run(run->client, run->manager, run->input, run->output);
+    return NULL;
+}
+#endif
 
 #ifndef _WIN32
 static const char FRONTEND_TEST_BUILD[] =
@@ -1142,6 +1301,66 @@ TEST(daemon_frontend_rejects_non_notification_cancellation_shapes) {
     PASS();
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* An idle frontend has one independent maintenance observer. Hold that
+ * observer before its first secure presence read, then require the real worker
+ * to complete an idle cycle. Any worker-side presence read is therefore an
+ * exact duplicate, independent of elapsed time or scheduler cadence. */
+TEST(daemon_frontend_idle_uses_one_maintenance_observer) {
+    frontend_idle_fixture_t fixture;
+    bool fixture_ready = frontend_idle_fixture_start(&fixture);
+    int input_pipe[2] = {-1, -1};
+    bool pipe_ready = fixture_ready && cbm_pipe(input_pipe) == 0;
+    FILE *input = pipe_ready ? frontend_test_fdopen_read(input_pipe[0]) : NULL;
+    FILE *output = input ? tmpfile() : NULL;
+    frontend_idle_run_t run = {
+        .client = fixture.client,
+        .manager = fixture.maintenance.manager,
+        .input = input,
+        .output = output,
+        .result = -1,
+    };
+    if (output) {
+        fixture.client = NULL; /* cbm_daemon_frontend_mcp_run consumes it. */
+    }
+    cbm_daemon_frontend_test_observer_reset(true);
+    cbm_thread_t frontend_thread;
+    bool thread_started =
+        output && cbm_thread_create(&frontend_thread, 0, frontend_idle_run, &run) == 0;
+    uint64_t deadline = cbm_now_ms() + 10000U;
+    while (thread_started && cbm_now_ms() < deadline &&
+           (!cbm_daemon_frontend_test_monitor_waiting() ||
+            cbm_daemon_frontend_test_worker_idle_cycles() == 0)) {
+        cbm_usleep(1000);
+    }
+    bool monitor_waiting = cbm_daemon_frontend_test_monitor_waiting();
+    uint64_t monitor_observations = cbm_daemon_frontend_test_monitor_observations();
+    uint64_t worker_observations = cbm_daemon_frontend_test_worker_observations();
+    uint64_t idle_cycles = cbm_daemon_frontend_test_worker_idle_cycles();
+    cbm_daemon_frontend_test_observer_release();
+    bool input_closed = !pipe_ready || frontend_test_close_fd(input_pipe[1]) == 0;
+    bool joined = thread_started && cbm_thread_join(&frontend_thread) == 0;
+    bool input_stream_closed = !input || fclose(input) == 0;
+    bool output_closed = !output || fclose(output) == 0;
+    bool fixture_closed = frontend_idle_fixture_finish(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_TRUE(pipe_ready);
+    ASSERT_TRUE(thread_started);
+    ASSERT_TRUE(monitor_waiting);
+    ASSERT_EQ(monitor_observations, 1);
+    ASSERT_TRUE(idle_cycles > 0);
+    ASSERT_EQ(worker_observations, 0);
+    ASSERT_TRUE(input_closed);
+    ASSERT_TRUE(joined);
+    ASSERT_EQ(run.result, 0);
+    ASSERT_TRUE(input_stream_closed);
+    ASSERT_TRUE(output_closed);
+    ASSERT_TRUE(fixture_closed);
+    PASS();
+}
+#endif
+
 #ifndef _WIN32
 /* RED: an MCP frontend's main thread can remain blocked forever in stdio while
  * install/update/uninstall owns maintenance intent. The already-present
@@ -1442,6 +1661,9 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_frontend_correlates_cancellation_to_exact_request);
     RUN_TEST(daemon_frontend_ignores_cancellation_text_in_string_content);
     RUN_TEST(daemon_frontend_rejects_non_notification_cancellation_shapes);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_frontend_idle_uses_one_maintenance_observer);
+#endif
 #ifndef _WIN32
     RUN_TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked);
     RUN_TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation);

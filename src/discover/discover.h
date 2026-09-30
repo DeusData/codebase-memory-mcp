@@ -17,6 +17,7 @@
 
 /* Use the existing CBMLanguage enum from extraction layer */
 #include "cbm.h"
+#include "foundation/index_policy.h"
 
 /* ── Language detection ──────────────────────────────────────────── */
 
@@ -41,8 +42,20 @@ CBMLanguage cbm_disambiguate_m(const char *path);
 
 /* Disambiguate .cls files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_UDL if a line starts with "Class <Uppercase>",
+ * CBM_LANG_COUNT (unsupported) for a Visual Basic 6 class module (#721),
  * otherwise CBM_LANG_APEX. On read failure, defaults to CBM_LANG_APEX. */
 CBMLanguage cbm_disambiguate_cls(const char *path);
+
+/* Disambiguate .frm files by reading first 4KB of content (#721).
+ * Returns CBM_LANG_COUNT (unsupported) for a Visual Basic 6 form, otherwise
+ * CBM_LANG_FORM. On read failure, defaults to CBM_LANG_FORM. */
+CBMLanguage cbm_disambiguate_frm(const char *path);
+
+/* Disambiguate .res files by reading first 4KB of content (#2176).
+ * Returns CBM_LANG_COUNT (not indexed) for binary content -- a Godot resource
+ * or a Windows compiled resource file, recognised by a NUL byte -- otherwise
+ * CBM_LANG_RESCRIPT. On read failure, defaults to CBM_LANG_RESCRIPT. */
+CBMLanguage cbm_disambiguate_res(const char *path);
 
 /* Disambiguate .inc files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
@@ -63,6 +76,12 @@ CBMLanguage cbm_disambiguate_inc(const char *path);
  * Fails closed (returns CBM_LANG_COUNT) on read error, missing/malformed
  * shebang, an embedded NUL in the first line, or an unknown interpreter. */
 CBMLanguage cbm_language_from_shebang(const char *path);
+
+/* Disambiguate .cfc files by reading the head of the content.
+ * Returns CBM_LANG_CFML if the component is tag-based (a "<cfcomponent" tag, or a
+ * leading '<'), otherwise CBM_LANG_CFSCRIPT for script-dialect components.
+ * On read failure, defaults to CBM_LANG_CFSCRIPT. */
+CBMLanguage cbm_disambiguate_cfc(const char *path);
 
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
@@ -131,9 +150,11 @@ typedef struct {
 } cbm_file_info_t;
 
 typedef struct {
-    cbm_index_mode_t mode;   /* CBM_MODE_FULL or CBM_MODE_FAST */
-    const char *ignore_file; /* path to .cbmignore file, or NULL */
-    int64_t max_file_size;   /* 0 = no limit */
+    cbm_index_mode_t mode;                              /* discovery filtering mode */
+    const char *ignore_file;                            /* .cbmignore path, or NULL */
+    int64_t max_file_size;                              /* 0 = no per-file limit */
+    const cbm_index_resource_policy_t *resource_policy; /* NULL = no resource limits */
+    cbm_index_resource_violation_t *resource_violation; /* optional exact diagnostic */
 } cbm_discover_opts_t;
 
 typedef enum {

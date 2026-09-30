@@ -195,7 +195,7 @@ static const LanguageCapabilityEntry LANGUAGE_CAPABILITIES[CBM_LANG_COUNT] = {
     NO_CALL(SMITHY),
     NO_CALL(WIT),
     CALL_WITH_REFERENCE_VOCAB(TLAPLUS),
-    NO_CALL(PKL),
+    CALL_WITH_REFERENCE_VOCAB(PKL),
     NO_CALL(GOMOD),
     CALL_WITH_REFERENCE_VOCAB(APEX),
     NO_CALL(SOQL),
@@ -210,6 +210,9 @@ static const LanguageCapabilityEntry LANGUAGE_CAPABILITIES[CBM_LANG_COUNT] = {
     CALL_WITH_REFERENCE_VOCAB(OBJECTSCRIPT_UDL),
     CALL_WITH_REFERENCE_VOCAB(OBJECTSCRIPT_ROUTINE),
     TRANSFORM_ONLY(OBJECTSCRIPT_EXPORT),
+    CALL_WITH_REFERENCE_VOCAB(ARKTS),
+    CALL_WITHOUT_REFERENCE_VOCAB(PLSQL),
+    CALL_WITHOUT_REFERENCE_VOCAB(CHIALISP),
 };
 
 #undef CALL_WITH_REFERENCE_VOCAB
@@ -298,8 +301,8 @@ TEST(repro_language_capability_ledger_covers_every_enum) {
         }
     }
 
-    if (counts[CAP_CALL_WITH_REFERENCE_VOCAB] != 86 ||
-        counts[CAP_CALL_WITHOUT_REFERENCE_VOCAB] != 25 || counts[CAP_NO_CALL] != 50 ||
+    if (counts[CAP_CALL_WITH_REFERENCE_VOCAB] != 88 ||
+        counts[CAP_CALL_WITHOUT_REFERENCE_VOCAB] != 27 || counts[CAP_NO_CALL] != 49 ||
         counts[CAP_TRANSFORM_ONLY] != 1 || counts[CAP_UNSUPPORTED] != 1) {
         fprintf(stderr,
                 "  [language-registry] invariant=capability_partition call_ref_vocab=%d ref_gap=%d "
@@ -315,10 +318,10 @@ TEST(repro_language_capability_ledger_covers_every_enum) {
 
 TEST(repro_call_argument_matrices_equal_call_capability_ledger) {
     enum {
-        EXPECTED_MATRIX_A_ROWS = 67,
-        EXPECTED_MATRIX_B_ROWS = 46,
-        EXPECTED_CALL_CAPABLE_LANGUAGES = 111,
-        EXPECTED_NON_CALL_LANGUAGES = 52,
+        EXPECTED_MATRIX_A_ROWS = 68,
+        EXPECTED_MATRIX_B_ROWS = 49,
+        EXPECTED_CALL_CAPABLE_LANGUAGES = 115,
+        EXPECTED_NON_CALL_LANGUAGES = 51,
         EXPECTED_NON_CALL_DOMAIN_CONTROLS = 2,
     };
     CBMLanguage matrix_a_ids[CBM_LANG_COUNT];

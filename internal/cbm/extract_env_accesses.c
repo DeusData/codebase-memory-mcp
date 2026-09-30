@@ -140,8 +140,8 @@ static bool is_env_var_name(const char *s) {
 // Iterative env access walker — explicit stack
 static void walk_env_accesses(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, 4096);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, 4096);
+    ts_nstack_push(&stack, root);
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
@@ -163,7 +163,7 @@ static void walk_env_accesses(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
             continue; // don't push children (avoid double-counting)
         }
 
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 

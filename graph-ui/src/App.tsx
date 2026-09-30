@@ -33,7 +33,23 @@ function routeUrl(tab: TabId, project: string | null): string {
 export function App() {
   const t = useUiMessages();
   const [route, setRoute] = useState<RouteState>(readRoute);
+  const [version, setVersion] = useState<string | null>(null);
   const { tab: activeTab, project: selectedProject } = route;
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/ui-config")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((config) => {
+        if (!cancelled && typeof config?.version === "string" && config.version) {
+          setVersion(config.version);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   /* Normalize the URL on first load so it always carries the current route. */
   useEffect(() => {
@@ -73,6 +89,14 @@ export function App() {
             <span className="text-[13px] font-semibold text-foreground/90 tracking-tight">
               Codebase Memory
             </span>
+            {version && (
+              <span
+                className="translate-y-px text-[10px] font-mono text-foreground/30"
+                title="Server version"
+              >
+                {version.startsWith("v") ? version : `v${version}`}
+              </span>
+            )}
           </div>
 
           {/* Tabs inline in header */}

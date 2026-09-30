@@ -7,8 +7,22 @@
 
 $ErrorActionPreference = "Stop"
 
-# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects).
+#
+# TLS 1.3 is added ONLY where schannel can actually negotiate it: Windows 11 and
+# Server 2022 (build 20348+). On Windows 10 the enum value still exists from
+# .NET Framework 4.8 onward, so the assignment succeeds and nothing warns -- but
+# the handshake then fails outright with "The request was aborted: Could not
+# create SSL/TLS secure channel". An unsupported protocol flag in this bitmask
+# is a hard failure, not a graceful downgrade, so every Windows 10 user was
+# blocked at the first download (#1856). The enum-name probe additionally keeps
+# the script parsing on .NET Framework 4.7, where Tls13 is not defined at all.
+$CbmProtocols = [Net.SecurityProtocolType]::Tls12
+if ([Environment]::OSVersion.Version.Build -ge 20348 -and
+    ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13')) {
+    $CbmProtocols = $CbmProtocols -bor [Net.SecurityProtocolType]::Tls13
+}
+[Net.ServicePointManager]::SecurityProtocol = $CbmProtocols
 Add-Type -AssemblyName System.Net.Http
 
 $Repo = "DeusData/codebase-memory-mcp"
@@ -281,8 +295,21 @@ if ($binaryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
 }
 
 # Prove the downloaded binary runs before touching an existing installation.
+# PS 5.1 wraps redirected native stderr into ErrorRecords, so under the global
+# ErrorActionPreference=Stop a HEALTHY binary that prints one warning while
+# exiting 0 becomes a terminating error here. Relax to Continue for the probe
+# only; failure detection stays on $LASTEXITCODE, and the pre-seed guarantees
+# a binary that fails to START (stale $LASTEXITCODE from an earlier native
+# call) can never read as success.
 try {
-    $candidateVersion = & $DownloadedBinary --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $candidateVersion = & $DownloadedBinary --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "candidate exited with $LASTEXITCODE" }
     Write-Host "Verified candidate: $candidateVersion"
 } catch {
@@ -349,8 +376,18 @@ if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
 }
 
 # Verify
+# Same PS 5.1 stderr-wrapping guard as the candidate probe above; the pre-seed
+# matters MOST here, because prior successful native calls leave a stale
+# $LASTEXITCODE=0 that a start-failure would otherwise inherit.
 try {
-    $ver = & $Dest --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $ver = & $Dest --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "installed binary exited with $LASTEXITCODE" }
     Write-Host "Installed: $ver"
 } catch {

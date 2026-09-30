@@ -1,7 +1,7 @@
 # Smoke invariants across the WIDEST set of GitHub-hosted runners. Builds the
 # production source path with explicit fault-injection test seams and runs
 # scripts/smoke-invariants.sh
-# (version/help, MCP initialize handshake [#513], all 14 tools invocable, malformed-
+# (version/help, MCP initialize handshake [#513], all registered tools invocable, malformed-
 # input resilience, clean EOF exit, shared-lib resolution, install dry-run).
 #
 # Maximizing platforms is the point: ubuntu-22.04 (older glibc → AlmaLinux/#182

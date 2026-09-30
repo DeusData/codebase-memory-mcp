@@ -122,6 +122,43 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// Find every child node matching `kind` (unlike cbm_find_child_by_kind,
+// which stops at the first match). Writes up to `max` nodes into `out`;
+// returns how many were found. Repeated sibling nodes of the same kind are
+// common in some grammars (e.g. C#/PHP stack each `[Attr]` as its own
+// attribute_list child) — see #1692.
+int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max);
+
+/* --- Lisp-family shared gates ---------------------------------------------
+ * The defs, calls and unified extractors each walk the same generic `list`
+ * node and must agree on what it means. The predicates below therefore live
+ * here rather than being copied per translation unit: a private copy in each
+ * drifts, and the drift is silent — defs and call-scope simply stop describing
+ * the same tree.
+ */
+
+/* True when any ancestor list of `node` is headed by a quote symbol
+ * (`q` / `quote` / `qq`) — its contents are DATA, not code, so no def and no
+ * call may be minted from them. Bounded ancestor walk; the arena is used only
+ * for the head-text reads. */
+bool cbm_lisp_node_in_quote(CBMArena *a, TSNode node, const char *source);
+
+/* The `want`-th named child of `node`, skipping `comment` nodes. Comments are
+ * named in the s-expression grammars and so occupy named-child indices: a
+ * comment between a def head and its name shifts every later index by one.
+ * Definition extraction and call-scope attribution MUST use this same skipping
+ * rule or they desynchronise on exactly the files that carry doc comments. */
+TSNode cbm_lisp_named_child_skip_comments(TSNode node, uint32_t want);
+
+/* True for a Chialisp definition-form head. Deliberately separate from the
+ * Clojure/Scheme def-head set: Chialisp shares the generic `list` kind, and
+ * treating `mod`/`defconstant` as defs must not leak into the other lisps (in
+ * Scheme `(mod x y)` is a call). Excludes the expression-local binding forms
+ * (`let`, `assign`, `lambda`), which would fragment call attribution, and
+ * excludes `export`/`namespace`, which NAME an already-defined function rather
+ * than defining one. */
+bool cbm_chialisp_is_def_head(const char *t);
+
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
 
@@ -137,7 +174,29 @@ void cbm_kind_in_set_free_cache(void);
 // Check if node has an ancestor of the given kind, within max_depth levels.
 bool cbm_has_ancestor_kind(TSNode node, const char *kind, int max_depth);
 
+// Growable pending-node stack for the iterative AST walkers.
+//
+// No work cap may decide graph content, so walker stacks never truncate: a
+// walker starts on a small caller-owned on-stack chunk (`inline_buf`) and spills
+// to the heap (through the memory core, class EXTRACT) only for trees whose
+// pending set outgrows it. Traversal order is unaffected by where the frames
+// live. Ensures room for `need` frames in total; on success `*items`/`*cap`
+// describe the (possibly moved) stack and true is returned. On allocation
+// failure the stack is left intact, the failure is logged at error level under
+// "extract.walk_stack_alloc_failed" (walker=<walker>), and false is returned —
+// the caller then reports its documented failure sentinel instead of a
+// silently truncated result.
+bool cbm_walk_stack_reserve(void **items, int *cap, int need, size_t elem_size,
+                            const void *inline_buf, const char *walker);
+// Release a stack grown by cbm_walk_stack_reserve (no-op for the inline chunk).
+void cbm_walk_stack_release(void *items, const void *inline_buf);
+
+// Sentinel reported by the walkers below when their pending stack could not be
+// grown (allocation failure): the metric is unavailable, never an undercount.
+#define CBM_WALK_METRIC_UNAVAILABLE (-1)
+
 // Count nodes of given kinds in subtree (for complexity metric).
+// Returns CBM_WALK_METRIC_UNAVAILABLE on allocation failure.
 int cbm_count_branching(TSNode node, const char **branching_types);
 
 // Per-function structural complexity, computed in a single AST walk.
@@ -151,6 +210,7 @@ typedef struct {
 
 // Compute the metrics above in one traversal of `node`'s subtree.
 // `branching_types` is the language's branching node-type set.
+// On allocation failure every field is CBM_WALK_METRIC_UNAVAILABLE.
 void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
 
 // Is `kind` a loop construct node type? Language-agnostic curated set (for/while/

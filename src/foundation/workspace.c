@@ -211,6 +211,34 @@ static bool ws_any_component_matches(const char *path, const char *const *names,
     return false;
 }
 
+/* The default per-user Windows application prefix. Match from the drive root,
+ * by whole segments, so a project merely containing the same sequence (or a
+ * sibling such as Programs-src) is not captured. The second segment is the one
+ * and only user name; its spelling is deliberately unrestricted. */
+static bool ws_is_windows_user_programs_tree(const char *path) {
+    if (!ws_is_windows_style(path)) {
+        return false;
+    }
+    static const char *const expected[] = {"Users", NULL, "AppData", "Local", "Programs"};
+    const char *p = path + ws_volume_prefix_len(path);
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        while (ws_is_sep(*p)) {
+            p++;
+        }
+        if (!*p) {
+            return false;
+        }
+        const char *start = p;
+        while (*p && !ws_is_sep(*p)) {
+            p++;
+        }
+        if (expected[i] && !ws_component_equals(start, (size_t)(p - start), expected[i], true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* True when b is a or lives under a. Compares on a separator boundary so
  * "/a/bc" is not treated as living under "/a/b". */
 static bool ws_is_ancestor_or_equal(const char *a, const char *b) {
@@ -297,6 +325,10 @@ cbm_ws_verdict_t cbm_workspace_classify_root(const char *canonical_path, const c
         return CBM_WS_DENY_SENSITIVE;
     }
 
+    if (ws_is_windows_user_programs_tree(canonical_path)) {
+        return CBM_WS_DENY_SENSITIVE;
+    }
+
     /* "C:/Users" is the user tree itself — refuse it as a root, but leave the
      * projects below it alone; that is where Windows users actually work. */
     if (windows_style && depth == 1 &&
@@ -316,7 +348,7 @@ const char *cbm_workspace_verdict_reason(cbm_ws_verdict_t verdict) {
     case CBM_WS_DENY_ABSOLUTE:
         return "path is a volume root or holds the codebase-memory cache; it cannot be indexed";
     case CBM_WS_DENY_SENSITIVE:
-        return "path is a home or credential directory";
+        return "path is a home, credential, system, or application-install directory";
     default:
         break;
     }
@@ -455,10 +487,15 @@ bool cbm_workspace_grant_add(const char *cache_dir, const char *home_dir,
         }
     }
 
-    /* Already present is success, not a duplicate error. */
+    bool sensitive = verdict == CBM_WS_DENY_SENSITIVE;
+
+    /* Already present is success, not a duplicate error. A sensitive approval
+     * is narrower: an old ordinary grant (or an ordinary ancestor) establishes
+     * containment, but does not record the exact human-approved exception that
+     * cbm_workspace_root_allowed requires. Append that exact marked entry once. */
     ws_match_t existing = {canonical_path, false, false};
     (void)ws_grant_walk(cache_dir, ws_match_visit, &existing);
-    if (existing.contained) {
+    if (existing.contained && (!sensitive || existing.exact_sensitive)) {
         return true;
     }
 
@@ -476,7 +513,6 @@ bool cbm_workspace_grant_add(const char *cache_dir, const char *home_dir,
         }
         return false;
     }
-    bool sensitive = verdict == CBM_WS_DENY_SENSITIVE;
     (void)fprintf(f, "%s%s\n", sensitive ? "!" : "", canonical_path);
     bool ok = fclose(f) == 0;
     if (!ok && err) {

@@ -41,6 +41,8 @@ typedef enum {
     CBM_GRAPH_DIALECT_CURSOR,
     CBM_GRAPH_DIALECT_ROVO,
     CBM_GRAPH_DIALECT_POCHI,
+    CBM_GRAPH_DIALECT_OMP,
+    CBM_GRAPH_DIALECT_GROK,
     CBM_GRAPH_DIALECT_COUNT
 } cbm_graph_profile_dialect_t;
 
@@ -57,6 +59,10 @@ char *cbm_render_graph_profile(cbm_graph_profile_dialect_t dialect, cbm_graph_ti
 /* v0.9.1-rc.1 direct Codex rendering (server table without a transport), kept
  * so install/uninstall can recognize and migrate those files. */
 char *cbm_render_graph_profile_codex_rc1(cbm_graph_tier_t tier);
+
+/* v0.10.8 OpenCode rendering (before the tool_search permissions of #1933),
+ * kept so install/uninstall can recognize and migrate those files (#2264). */
+char *cbm_render_graph_profile_opencode_v0108(cbm_graph_tier_t tier, cbm_graph_access_t access);
 
 /* Vibe stores the behavioral prompt separately from its TOML agent definition.
  * Other integrations may also use this as the canonical contract text. */

@@ -31,6 +31,9 @@ static FILE *s_out;
 static atomic_int s_needs_newline;
 static int s_gbuf_nodes = NOT_SET;
 static int s_gbuf_edges = NOT_SET;
+static CBMLogLevel s_previous_log_level = CBM_LOG_WARN;
+static bool s_raised_log_level;
+static bool s_preserve_details;
 static cbm_mutex_t s_sink_mutex;
 static atomic_int s_sink_mutex_state = ATOMIC_VAR_INIT(LOCK_UNINITIALIZED);
 
@@ -47,8 +50,69 @@ static void progress_sink_mutex_ensure(void) {
     while (atomic_load_explicit(&s_sink_mutex_state, memory_order_acquire) != LOCK_READY) {}
 }
 
-bool cbm_cli_progress_enabled(bool explicitly_requested, bool stderr_is_tty) {
-    return explicitly_requested || stderr_is_tty;
+bool cbm_cli_output_flags_parse(int *argc, char **argv, cbm_cli_output_flags_t *flags, char *error,
+                                size_t error_size) {
+    if (!argc || !argv || !flags) {
+        return false;
+    }
+    memset(flags, 0, sizeof(*flags));
+    if (error && error_size > 0) {
+        error[0] = '\0';
+    }
+
+    /* --quiet and --progress are reserved process controls wherever they
+     * appear, matching the existing --progress behavior. --verbose remains
+     * outer-only because tools such as index_status own a verbose input. */
+    bool before_tool = true;
+    int output_index = 0;
+    for (int input_index = 0; input_index < *argc; input_index++) {
+        char *arg = argv[input_index];
+        bool quiet = arg && strcmp(arg, "--quiet") == 0;
+        bool progress = arg && strcmp(arg, "--progress") == 0;
+        bool verbose = before_tool && arg && strcmp(arg, "--verbose") == 0;
+        if (quiet) {
+            flags->quiet_requested = true;
+        } else if (progress) {
+            flags->progress_requested = true;
+        } else if (verbose) {
+            flags->verbose_requested = true;
+        } else {
+            argv[output_index++] = arg;
+            if (before_tool && arg && arg[0] != '-') {
+                before_tool = false;
+            }
+        }
+    }
+    *argc = output_index;
+
+    if (flags->quiet_requested && (flags->progress_requested || flags->verbose_requested)) {
+        if (error && error_size > 0) {
+            (void)snprintf(error, error_size,
+                           "--quiet cannot be combined with --progress or outer --verbose; "
+                           "use --quiet for errors-only stderr, --progress for lifecycle "
+                           "feedback, or --verbose for informational diagnostics");
+        }
+        return false;
+    }
+    return true;
+}
+
+void cbm_cli_diagnostics_configure(bool quiet_requested, bool verbose_requested) {
+    if (quiet_requested) {
+        /* Keep ERROR records visible while suppressing DEBUG/INFO/WARN. An
+         * explicit CBM_LOG_LEVEL=none remains stronger than --quiet. */
+        if (cbm_log_get_level() < CBM_LOG_ERROR) {
+            cbm_log_set_level(CBM_LOG_ERROR);
+        }
+        return;
+    }
+    if (verbose_requested && cbm_log_get_level() > CBM_LOG_INFO) {
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
+}
+
+bool cbm_cli_progress_enabled(bool explicitly_requested, bool quiet_requested, bool stderr_is_tty) {
+    return !quiet_requested && (explicitly_requested || stderr_is_tty);
 }
 
 static void progress_tool_name(const char *tool_name, char out[CBM_SZ_64]) {
@@ -184,6 +248,14 @@ void cbm_progress_sink_init(FILE *out) {
     atomic_store(&s_needs_newline, 0);
     s_gbuf_nodes = NOT_SET;
     s_gbuf_edges = NOT_SET;
+    s_previous_log_level = cbm_log_get_level();
+    s_preserve_details = s_previous_log_level <= CBM_LOG_INFO;
+    s_raised_log_level = s_previous_log_level > CBM_LOG_INFO;
+    if (s_raised_log_level) {
+        /* Progress is an explicit INFO opt-in. The replacement sink below
+         * keeps only recognized lifecycle events plus warnings/errors. */
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
     cbm_log_set_sink(cbm_progress_sink_fn);
     cbm_mutex_unlock(&s_sink_mutex);
 }
@@ -197,6 +269,11 @@ void cbm_progress_sink_fini(void) {
         (void)fflush(s_out);
     }
     s_out = NULL;
+    if (s_raised_log_level) {
+        cbm_log_set_level(s_previous_log_level);
+        s_raised_log_level = false;
+    }
+    s_preserve_details = false;
     cbm_mutex_unlock(&s_sink_mutex);
 }
 
@@ -338,6 +415,20 @@ static const event_handler_t handlers[] = {
 
 enum { HANDLER_COUNT = sizeof(handlers) / sizeof(handlers[0]) };
 
+/* The progress sink replaces normal logger output. Preserve actionable
+ * failures verbatim and, when INFO/DEBUG was already selected before progress
+ * initialization, preserve unrecognized diagnostic lines as well. Logger
+ * callbacks do not include a trailing newline. */
+static void passthrough_line(const char *line) {
+    flush_carriage();
+    (void)fputs(line, s_out);
+    size_t line_len = strlen(line);
+    if (line_len == 0 || line[line_len - 1] != '\n') {
+        (void)fputc('\n', s_out);
+    }
+    (void)fflush(s_out);
+}
+
 void cbm_progress_sink_fn(const char *line) {
     progress_sink_mutex_ensure();
     cbm_mutex_lock(&s_sink_mutex);
@@ -345,6 +436,28 @@ void cbm_progress_sink_fn(const char *line) {
         cbm_mutex_unlock(&s_sink_mutex);
         return;
     }
+    char level[CBM_SZ_32] = {0};
+    if (!extract_kv(line, "level", level, (int)sizeof(level))) {
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+    if (strcmp(level, "warn") == 0 || strcmp(level, "error") == 0) {
+        passthrough_line(line);
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+    if (strcmp(level, "debug") == 0) {
+        if (s_preserve_details) {
+            passthrough_line(line);
+        }
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+    if (strcmp(level, "info") != 0) {
+        cbm_mutex_unlock(&s_sink_mutex);
+        return;
+    }
+
     char msg[CBM_SZ_64] = {0};
     if (!extract_kv(line, "msg", msg, (int)sizeof(msg))) {
         cbm_mutex_unlock(&s_sink_mutex);
@@ -356,6 +469,9 @@ void cbm_progress_sink_fn(const char *line) {
             cbm_mutex_unlock(&s_sink_mutex);
             return;
         }
+    }
+    if (s_preserve_details) {
+        passthrough_line(line);
     }
     cbm_mutex_unlock(&s_sink_mutex);
 }

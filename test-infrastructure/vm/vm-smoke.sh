@@ -221,6 +221,8 @@ env \
     -u CBM_TRAE_CONFIG_PATH \
     -u CBM_ROO_CONFIG_PATH \
     -u CBM_CODY_CONFIG_PATH \
+    -u OMP_PROFILE \
+    -u PI_CODING_AGENT_DIR \
     -u CBM_TEST_WINDOWS_USER_PATH_RUN_ID \
     HOME="$(cygpath -m "$SMOKE_HOME")" \
     USERPROFILE="$(cygpath -m "$SMOKE_HOME")" \

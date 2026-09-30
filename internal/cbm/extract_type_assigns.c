@@ -186,12 +186,12 @@ static void process_type_assign_node(CBMExtractCtx *ctx, TSNode node, const CBML
 // Walk AST for assignment patterns where RHS is a constructor call.
 static void walk_type_assigns(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, 4096);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, 4096);
+    ts_nstack_push(&stack, root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         process_type_assign_node(ctx, node, spec, cbm_enclosing_func_qn_cached(ctx, node));
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 

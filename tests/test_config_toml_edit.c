@@ -5,6 +5,8 @@
  */
 #define CBM_TOML_EDIT_ENABLE_TEST_API 1
 #include "cli/config_toml_edit.h"
+#define CBM_CONFIG_EDIT_PATH_ENABLE_TEST_API 1
+#include "cli/config_edit_path.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "test_framework.h"
@@ -312,7 +314,13 @@ TEST(config_toml_rejects_symlink_hardlink_and_preserves_metadata) {
     ASSERT(snprintf(alias, sizeof(alias), "%s/alias.toml", dir) > 0);
     ASSERT_EQ(th_write_file(target, "target = true\n"), 0);
     ASSERT_EQ(symlink(target, path), 0);
-    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned = true\n"), -1);
+    /* Foreign-owned link (observer moved by the test seam): still refused. */
+    ASSERT_EQ(cbm_config_edit_path_follow_add_root(dir), 0);
+    cbm_config_edit_path_set_invoking_uid_for_test((unsigned)geteuid() + 1U, 1);
+    int foreign_rc = cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned = true\n");
+    cbm_config_edit_path_set_invoking_uid_for_test(0U, 0);
+    cbm_config_edit_path_follow_clear();
+    ASSERT_EQ(foreign_rc, -1);
     struct stat link_state;
     ASSERT_EQ(lstat(path, &link_state), 0);
     ASSERT(S_ISLNK(link_state.st_mode));
@@ -346,6 +354,59 @@ TEST(config_toml_rejects_symlink_hardlink_and_preserves_metadata) {
     ASSERT_EQ(after.st_gid, before.st_gid);
     ASSERT_EQ(after.st_mode & 07777, before.st_mode & 07777);
     ASSERT_EQ(cbm_unlink(target), 0);
+    th_cleanup(dir);
+    PASS();
+}
+#endif
+
+#ifndef _WIN32
+/* Decision C (#1954): a managed block behind a user-owned symlink is edited
+ * through the link — the link survives and the target carries the same bytes
+ * the same edit produces on a plain file. */
+TEST(config_toml_follows_user_owned_symlink_in_place) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char target[CTE_PATH_CAP];
+    char control[CTE_PATH_CAP];
+    char through[CTE_FILE_CAP];
+    char plain[CTE_FILE_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT(snprintf(target, sizeof(target), "%s/target.toml", dir) > 0);
+    ASSERT(snprintf(control, sizeof(control), "%s/control.toml", dir) > 0);
+    ASSERT_EQ(th_write_file(target, "target = true\n"), 0);
+    ASSERT_EQ(th_write_file(control, "target = true\n"), 0);
+    ASSERT_EQ(symlink("target.toml", path), 0);
+    ASSERT_EQ(cbm_config_edit_path_follow_add_root(dir), 0);
+
+    int through_rc = cbm_toml_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned = true\n");
+    int plain_rc = cbm_toml_upsert_managed_block(control, CTE_BEGIN, CTE_END, "owned = true\n");
+    if (through_rc != 0 || plain_rc != 0) {
+        cbm_config_edit_path_follow_clear();
+    }
+    ASSERT_EQ(through_rc, 0);
+    ASSERT_EQ(plain_rc, 0);
+    struct stat link_state;
+    ASSERT_EQ(lstat(path, &link_state), 0);
+    ASSERT(S_ISLNK(link_state.st_mode));
+    ASSERT_EQ(cte_read(target, through, sizeof(through)), 0);
+    ASSERT_EQ(cte_read(control, plain, sizeof(plain)), 0);
+    ASSERT_STR_EQ(through, plain);
+    ASSERT_NOT_NULL(strstr(through, "owned = true"));
+
+    int through_remove_rc = cbm_toml_remove_managed_block(path, CTE_BEGIN, CTE_END);
+    int plain_remove_rc = cbm_toml_remove_managed_block(control, CTE_BEGIN, CTE_END);
+    cbm_config_edit_path_follow_clear();
+    ASSERT_EQ(through_remove_rc, 0);
+    ASSERT_EQ(plain_remove_rc, 0);
+    ASSERT_EQ(lstat(path, &link_state), 0);
+    ASSERT(S_ISLNK(link_state.st_mode));
+    ASSERT_EQ(cte_read(target, through, sizeof(through)), 0);
+    ASSERT_EQ(cte_read(control, plain, sizeof(plain)), 0);
+    ASSERT_STR_EQ(through, plain);
+    ASSERT_NULL(strstr(through, "owned = true"));
+    ASSERT_EQ(cte_temp_count(dir), 0U);
+    ASSERT_EQ(cbm_unlink(target), 0);
+    ASSERT_EQ(cbm_unlink(control), 0);
     th_cleanup(dir);
     PASS();
 }
@@ -1411,6 +1472,7 @@ SUITE(config_toml_edit) {
     RUN_TEST(config_toml_rejects_non_regular_path);
 #ifndef _WIN32
     RUN_TEST(config_toml_rejects_symlink_hardlink_and_preserves_metadata);
+    RUN_TEST(config_toml_follows_user_owned_symlink_in_place);
 #endif
     RUN_TEST(config_toml_managed_markers_ignore_multiline_strings);
     RUN_TEST(config_toml_managed_rejects_marker_in_block_and_unclosed_multiline);

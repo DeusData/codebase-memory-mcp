@@ -265,6 +265,137 @@ TEST(version_cohort_rejects_exact_build_with_different_cache_root) {
     PASS();
 }
 
+typedef struct {
+    cbm_version_cohort_manager_t *manager;
+    cbm_daemon_build_identity_t identity;
+    uint64_t deadline_ms;
+    cbm_version_cohort_status_t status;
+    cbm_version_cohort_lease_t *lease;
+    cbm_daemon_conflict_t conflict;
+    atomic_bool finished;
+} version_cohort_acquire_wait_t;
+
+static void *version_cohort_acquire_wait_thread(void *context) {
+    version_cohort_acquire_wait_t *wait = context;
+    wait->status = cbm_version_cohort_acquire(wait->manager, &wait->identity, wait->deadline_ms,
+                                              &wait->lease, &wait->conflict);
+    atomic_store_explicit(&wait->finished, true, memory_order_release);
+    return NULL;
+}
+
+static bool version_cohort_wait_for_retries_above(uint64_t baseline, uint64_t deadline_ms) {
+    while (cbm_version_cohort_conflict_retries_for_testing() <= baseline &&
+           cbm_now_ms() < deadline_ms) {
+        cbm_usleep(1000);
+    }
+    return cbm_version_cohort_conflict_retries_for_testing() > baseline;
+}
+
+/* #2046: a mismatched holder that never leaves is still a conflict — but the
+ * caller's deadline is the budget for waiting it out, so the refusal may only
+ * arrive once that budget is spent, and must carry the same detail as before.
+ * The lower bound is the contract under test, not a timing guess: the holder
+ * is released only after the call returns. */
+TEST(version_cohort_conflict_is_retried_until_the_deadline) {
+    version_cohort_fixture_t fixture;
+    ASSERT_TRUE(version_cohort_fixture_start(&fixture, "conflict-deadline"));
+    cbm_version_cohort_manager_t *first = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_manager_t *second = cbm_version_cohort_manager_new(fixture.endpoint);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+
+    cbm_daemon_build_identity_t active = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_A);
+    cbm_daemon_build_identity_t requested = active;
+    active.cache_fingerprint = VERSION_COHORT_CACHE_A;
+    requested.cache_fingerprint = VERSION_COHORT_CACHE_B;
+    cbm_version_cohort_lease_t *active_lease = NULL;
+    cbm_version_cohort_lease_t *requested_lease = NULL;
+    cbm_daemon_conflict_t conflict;
+    ASSERT_EQ(cbm_version_cohort_acquire(first, &active, UINT64_MAX, &active_lease, &conflict),
+              CBM_VERSION_COHORT_OK);
+
+    uint64_t retries_before = cbm_version_cohort_conflict_retries_for_testing();
+    uint64_t deadline = cbm_now_ms() + 300U;
+    cbm_version_cohort_status_t status =
+        cbm_version_cohort_acquire(second, &requested, deadline, &requested_lease, &conflict);
+    uint64_t returned_at = cbm_now_ms();
+
+    ASSERT_EQ(status, CBM_VERSION_COHORT_CONFLICT);
+    ASSERT_NULL(requested_lease);
+    ASSERT_TRUE(returned_at >= deadline);
+    ASSERT_TRUE(cbm_version_cohort_conflict_retries_for_testing() > retries_before);
+    ASSERT_EQ(conflict.status, CBM_DAEMON_HELLO_CACHE_CONFLICT);
+    ASSERT_STR_EQ(conflict.active_cache_fingerprint, VERSION_COHORT_CACHE_A);
+    ASSERT_STR_EQ(conflict.requested_cache_fingerprint, VERSION_COHORT_CACHE_B);
+
+    /* An indefinite deadline never waits on a conflicting holder. */
+    retries_before = cbm_version_cohort_conflict_retries_for_testing();
+    ASSERT_EQ(cbm_version_cohort_acquire(second, &requested, UINT64_MAX, &requested_lease,
+                                         &conflict),
+              CBM_VERSION_COHORT_CONFLICT);
+    ASSERT_NULL(requested_lease);
+    ASSERT_EQ(cbm_version_cohort_conflict_retries_for_testing(), retries_before);
+
+    version_cohort_release(&active_lease);
+    version_cohort_manager_close(&second);
+    version_cohort_manager_close(&first);
+    version_cohort_fixture_finish(&fixture);
+    PASS();
+}
+
+/* #2046: the draining-daemon handoff. The waiter is admitted once the
+ * mismatched holder leaves — and the test releases that holder only after the
+ * seam proves the waiter already met it, so "admitted" cannot mean "arrived
+ * late". The waiter's deadline is a backstop against a hang, never the
+ * decider: the asserted state is OK-with-lease after the release. */
+TEST(version_cohort_conflict_waiter_is_admitted_when_the_holder_leaves) {
+    version_cohort_fixture_t fixture;
+    ASSERT_TRUE(version_cohort_fixture_start(&fixture, "conflict-handoff"));
+    cbm_version_cohort_manager_t *first = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_manager_t *second = cbm_version_cohort_manager_new(fixture.endpoint);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+
+    cbm_daemon_build_identity_t active = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_A);
+    active.cache_fingerprint = VERSION_COHORT_CACHE_A;
+    cbm_version_cohort_lease_t *active_lease = NULL;
+    cbm_daemon_conflict_t conflict;
+    ASSERT_EQ(cbm_version_cohort_acquire(first, &active, UINT64_MAX, &active_lease, &conflict),
+              CBM_VERSION_COHORT_OK);
+
+    version_cohort_acquire_wait_t wait;
+    memset(&wait, 0, sizeof(wait));
+    wait.manager = second;
+    wait.identity = active;
+    wait.identity.cache_fingerprint = VERSION_COHORT_CACHE_B;
+    wait.deadline_ms = cbm_now_ms() + 10000U;
+    wait.status = CBM_VERSION_COHORT_IO;
+    atomic_init(&wait.finished, false);
+
+    uint64_t retries_before = cbm_version_cohort_conflict_retries_for_testing();
+    cbm_thread_t thread;
+    bool started = cbm_thread_create(&thread, 0, version_cohort_acquire_wait_thread, &wait) == 0;
+    bool met_holder =
+        started && version_cohort_wait_for_retries_above(retries_before, cbm_now_ms() + 5000U);
+    bool still_waiting = started && !atomic_load_explicit(&wait.finished, memory_order_acquire);
+    version_cohort_release(&active_lease);
+    bool finished = started && version_cohort_wait_for_atomic(&wait.finished, cbm_now_ms() + 5000U);
+    bool joined = started && cbm_thread_join(&thread) == 0;
+
+    version_cohort_release(&wait.lease);
+    version_cohort_manager_close(&second);
+    version_cohort_manager_close(&first);
+    version_cohort_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(met_holder);
+    ASSERT_TRUE(still_waiting);
+    ASSERT_TRUE(finished);
+    ASSERT_TRUE(joined);
+    ASSERT_EQ(wait.status, CBM_VERSION_COHORT_OK);
+    PASS();
+}
+
 TEST(version_cohort_exclusive_activation_blocks_and_is_blocked_by_participants) {
     version_cohort_fixture_t fixture;
     ASSERT_TRUE(version_cohort_fixture_start(&fixture, "activation"));
@@ -896,6 +1027,8 @@ SUITE(version_cohort) {
     RUN_TEST(version_cohort_rejects_same_hash_with_different_abi);
     RUN_TEST(version_cohort_rejects_missing_cache_fingerprint);
     RUN_TEST(version_cohort_rejects_exact_build_with_different_cache_root);
+    RUN_TEST(version_cohort_conflict_is_retried_until_the_deadline);
+    RUN_TEST(version_cohort_conflict_waiter_is_admitted_when_the_holder_leaves);
     RUN_TEST(version_cohort_exclusive_activation_blocks_and_is_blocked_by_participants);
     RUN_TEST(version_cohort_mutation_intent_fails_new_admission_and_spans_lease);
     RUN_TEST(version_cohort_mutation_waits_for_every_lifetime_participant);

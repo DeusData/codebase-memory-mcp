@@ -128,7 +128,7 @@ const uint64_t OP_SYMBOL_SUPPRESSOR[OPERATOR_COUNT] = {
     0, // EQ_EQ,
     0, // PLUS_THEN_WS,
     0, // MINUS_THEN_WS,
-    1UL << FAKE_TRY_BANG, // BANG,
+    1ULL << FAKE_TRY_BANG, // BANG,
         0, // THROWS_KEYWORD,
         0, // RETHROWS_KEYWORD,
         0, // DEFAULT_KEYWORD,
@@ -511,7 +511,7 @@ static bool eat_operators(
         uint64_t suppressing_symbols = OP_SYMBOL_SUPPRESSOR[full_match];
         if (suppressing_symbols) {
             for (uint64_t suppressor = 0; suppressor < TOKEN_COUNT; suppressor++) {
-                if (!(suppressing_symbols & 1 << suppressor)) {
+                if (!(suppressing_symbols & 1ULL << suppressor)) {
                     continue;
                 }
 
