@@ -844,6 +844,87 @@ static void ruby_resolve_super(RubyLSPContext *ctx, TSNode site) {
     /* No known parent or unresolved — zero-edge guarantee. */
 }
 
+/* ── local scope (Ruby scope gates) ─────────────────────────────── */
+
+/* Ruby scoping, as modeled here:
+ *   - `def`, `class` and `module` bodies are SCOPE GATES: no outer local is
+ *     visible inside, so each gets a fresh, unparented scope.
+ *   - Blocks (`{ }`, `do end`, `-> { }`) close over the enclosing locals, so
+ *     they get a CHAINED child scope. Block parameters shadow outer names
+ *     for the block's extent only.
+ *   - Assigning to a name that is already bound in an enclosing frame
+ *     rebinds THAT frame (closure assignment), otherwise binds locally.
+ *   - Parameters and any reassignment whose right-hand side has no proven
+ *     type bind the name to UNKNOWN. A stale type must never survive a
+ *     write the resolver could not read (zero-edge guarantee). */
+
+/* Assign `type` to `name`: rebind the nearest existing binding in place, or
+ * bind in the current frame when the name is new. */
+static void ruby_scope_assign(RubyLSPContext *ctx, const char *name, const CBMType *type) {
+    if (!ctx->current_scope || !name || !name[0])
+        return;
+    for (CBMScope *s = ctx->current_scope; s != NULL; s = s->parent) {
+        for (CBMScopeChunk *c = s->chunks; c != NULL; c = c->next) {
+            for (int i = 0; i < c->used; i++) {
+                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0) {
+                    c->bindings[i].type = type;
+                    c->bindings[i].callable_qn = NULL;
+                    return;
+                }
+            }
+        }
+    }
+    cbm_scope_bind(ctx->current_scope, name, type);
+}
+
+/* Bind every name introduced by a parameter list (method, block or lambda
+ * parameters, including destructured groups and block-local `; x` names) to
+ * UNKNOWN in the current frame. Parameters arrive untyped, and a parameter
+ * that shares its name with an outer local must shadow it. */
+static void ruby_bind_params_unknown(RubyLSPContext *ctx, TSNode params) {
+    if (ts_node_is_null(params))
+        return;
+    const char *k = ts_node_type(params);
+    if (strcmp(k, "identifier") == 0) {
+        char *nm = ruby_node_text(ctx, params);
+        if (nm && nm[0])
+            cbm_scope_bind(ctx->current_scope, nm, cbm_type_unknown());
+        return;
+    }
+    if (strcmp(k, "optional_parameter") == 0 || strcmp(k, "keyword_parameter") == 0 ||
+        strcmp(k, "splat_parameter") == 0 || strcmp(k, "hash_splat_parameter") == 0 ||
+        strcmp(k, "block_parameter") == 0) {
+        ruby_bind_params_unknown(ctx, ts_node_child_by_field_name(params, "name", 4));
+        return;
+    }
+    if (strcmp(k, "method_parameters") == 0 || strcmp(k, "block_parameters") == 0 ||
+        strcmp(k, "lambda_parameters") == 0 || strcmp(k, "destructured_parameter") == 0) {
+        uint32_t nc = ts_node_named_child_count(params);
+        for (uint32_t i = 0; i < nc; i++)
+            ruby_bind_params_unknown(ctx, ts_node_named_child(params, i));
+    }
+}
+
+/* Rebind every local named on the left of a multiple assignment
+ * (`a, b = ...`, `a, (b, c) = ...`, `a, *rest = ...`) to UNKNOWN. */
+static void ruby_unbind_assignment_list(RubyLSPContext *ctx, TSNode lhs) {
+    if (ts_node_is_null(lhs))
+        return;
+    const char *k = ts_node_type(lhs);
+    if (strcmp(k, "identifier") == 0) {
+        char *nm = ruby_node_text(ctx, lhs);
+        if (nm && nm[0])
+            ruby_scope_assign(ctx, nm, cbm_type_unknown());
+        return;
+    }
+    if (strcmp(k, "left_assignment_list") == 0 || strcmp(k, "destructured_left_assignment") == 0 ||
+        strcmp(k, "rest_assignment") == 0) {
+        uint32_t nc = ts_node_named_child_count(lhs);
+        for (uint32_t i = 0; i < nc; i++)
+            ruby_unbind_assignment_list(ctx, ts_node_named_child(lhs, i));
+    }
+}
+
 /* ── assignment observer (scope binding) ────────────────────────── */
 
 static void ruby_process_assignment(RubyLSPContext *ctx, TSNode assign) {
@@ -851,26 +932,66 @@ static void ruby_process_assignment(RubyLSPContext *ctx, TSNode assign) {
     TSNode right = ts_node_child_by_field_name(assign, "right", 5);
     if (ts_node_is_null(left) || ts_node_is_null(right))
         return;
-    if (strcmp(ts_node_type(left), "identifier") != 0)
+    const char *lk = ts_node_type(left);
+    if (strcmp(lk, "left_assignment_list") == 0) {
+        ruby_unbind_assignment_list(ctx, left); /* no per-element typing */
+        return;
+    }
+    if (strcmp(lk, "identifier") != 0)
         return; /* only simple local targets are tracked */
     char *vname = ruby_node_text(ctx, left);
     if (!vname || !vname[0])
         return;
     const CBMType *rt = ruby_eval_expr_type(ctx, right);
-    if (rt && rt->kind == CBM_TYPE_NAMED)
-        cbm_scope_bind(ctx->current_scope, vname, rt);
+    /* An untyped right-hand side REBINDS to unknown — `a = Foo.new; a = x`
+     * must not leave `a` typed Foo. */
+    ruby_scope_assign(ctx, vname, (rt && rt->kind == CBM_TYPE_NAMED) ? rt : cbm_type_unknown());
+}
+
+/* `a ||= expr` and the other compound assignments. `||=` on a name with no
+ * binding yet takes the right-hand type; on a name already bound to the same
+ * type it keeps it; every other case (untyped right-hand side, different
+ * type, or any non-`||=` operator) fails closed to UNKNOWN. */
+static void ruby_process_operator_assignment(RubyLSPContext *ctx, TSNode assign) {
+    TSNode left = ts_node_child_by_field_name(assign, "left", 4);
+    TSNode op = ts_node_child_by_field_name(assign, "operator", 8);
+    TSNode right = ts_node_child_by_field_name(assign, "right", 5);
+    if (ts_node_is_null(left) || ts_node_is_null(right))
+        return;
+    if (strcmp(ts_node_type(left), "identifier") != 0)
+        return;
+    char *vname = ruby_node_text(ctx, left);
+    if (!vname || !vname[0])
+        return;
+    char *optxt = ts_node_is_null(op) ? NULL : ruby_node_text(ctx, op);
+    const CBMType *result = cbm_type_unknown();
+    if (optxt && strcmp(optxt, "||=") == 0) {
+        const CBMType *rt = ruby_eval_expr_type(ctx, right);
+        if (rt && rt->kind == CBM_TYPE_NAMED) {
+            const CBMVarBinding *cur = cbm_scope_lookup_binding(ctx->current_scope, vname);
+            if (!cur)
+                result = rt; /* nil || Foo.new → Foo */
+            else if (cur->type && cur->type->kind == CBM_TYPE_NAMED &&
+                     strcmp(cur->type->data.named.qualified_name, rt->data.named.qualified_name) ==
+                         0)
+                result = rt;
+        }
+    }
+    ruby_scope_assign(ctx, vname, result);
 }
 
 /* ── PASS 2: resolution walk ────────────────────────────────────── */
 
-/* Process one method/singleton_method definition node. */
+/* Process one method/singleton_method definition node. `def` is a scope
+ * gate: the body starts from a FRESH scope holding only its parameters. */
 static void ruby_process_method(RubyLSPContext *ctx, TSNode node, bool singleton) {
     CBMScope *saved_scope = ctx->current_scope;
     const char *saved_func = ctx->enclosing_func_qn;
     bool saved_singleton = ctx->in_singleton_method;
 
-    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    ctx->current_scope = cbm_scope_push(ctx->arena, NULL);
     ctx->in_singleton_method = singleton;
+    ruby_bind_params_unknown(ctx, ts_node_child_by_field_name(node, "parameters", 10));
 
     TSNode name = ts_node_child_by_field_name(node, "name", 4);
     char *mname = ts_node_is_null(name) ? NULL : ruby_node_text(ctx, name);
@@ -891,17 +1012,39 @@ static void ruby_process_method(RubyLSPContext *ctx, TSNode node, bool singleton
     ctx->in_singleton_method = saved_singleton;
 }
 
+/* Process a block / do-block / lambda: a CHAINED scope (closures see the
+ * enclosing locals) in which the block parameters shadow as UNKNOWN. */
+static void ruby_process_block(RubyLSPContext *ctx, TSNode node) {
+    CBMScope *saved_scope = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    ruby_bind_params_unknown(ctx, ts_node_child_by_field_name(node, "parameters", 10));
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (ts_node_is_null(c))
+            continue;
+        /* Parameters were consumed above; walking them would be harmless
+         * (identifiers are not calls) but default values may hold calls. */
+        ruby_resolve_calls_in_node(ctx, c);
+    }
+    ctx->current_scope = saved_scope;
+}
+
 /* Process a class/module node during PASS 2: update nesting + enclosing
- * class, then walk the body. */
+ * class, then walk the body from a fresh scope (class bodies are scope
+ * gates too). */
 static void ruby_process_class_body(RubyLSPContext *ctx, TSNode node) {
     RubyClassFrame fr;
     if (!ruby_class_enter(ctx, node, &fr))
         return;
+    CBMScope *saved_scope = ctx->current_scope;
+    ctx->current_scope = cbm_scope_push(ctx->arena, NULL);
 
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
     if (!ts_node_is_null(body))
         ruby_resolve_calls_in_node(ctx, body);
 
+    ctx->current_scope = saved_scope;
     ruby_class_leave(ctx, &fr);
 }
 
@@ -940,9 +1083,15 @@ static void ruby_resolve_calls_in_node_inner(RubyLSPContext *ctx, TSNode node) {
         ruby_process_method(ctx, node, true);
         return;
     }
+    if (strcmp(k, "block") == 0 || strcmp(k, "do_block") == 0 || strcmp(k, "lambda") == 0) {
+        ruby_process_block(ctx, node);
+        return;
+    }
 
     if (strcmp(k, "assignment") == 0)
         ruby_process_assignment(ctx, node);
+    else if (strcmp(k, "operator_assignment") == 0)
+        ruby_process_operator_assignment(ctx, node);
 
     if (strcmp(k, "call") == 0) {
         TSNode meth = ts_node_child_by_field_name(node, "method", 6);

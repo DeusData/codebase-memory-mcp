@@ -123,6 +123,19 @@ static int require_resolved_exact(const CBMFileResult *r, const char *caller_qn,
     return idx;
 }
 
+/* Number of rows with exactly this caller and callee. */
+static int count_resolved_exact(const CBMFileResult *r, const char *caller_qn,
+                                const char *callee_qn) {
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && rc->callee_qn && strcmp(rc->caller_qn, caller_qn) == 0 &&
+            strcmp(rc->callee_qn, callee_qn) == 0)
+            n++;
+    }
+    return n;
+}
+
 static const CBMDefinition *find_def(const CBMFileResult *r, const char *label, const char *name) {
     for (int i = 0; i < r->defs.count; i++) {
         const CBMDefinition *d = &r->defs.items[i];
@@ -700,6 +713,149 @@ TEST(rubylsp_unknown_receiver_no_edge) {
     PASS();
 }
 
+/* ── 15b. `def` is a scope gate ─────────────────────────────────── */
+
+/* Ruby locals do not cross a `def`: a typed local in the enclosing body (or
+ * a sibling method) is invisible inside, and a parameter of the same name is
+ * a brand-new, untyped binding. A resolver that chained the method scope to
+ * its parent would type `a` from the outside and emit a wrong edge. */
+TEST(rubylsp_def_is_scope_gate) {
+    const char *src = "class Foo\n"
+                      "  def bar\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "a = Foo.new\n"
+                      "def top\n"
+                      "  a.bar\n"
+                      "end\n"
+                      "class Worker\n"
+                      "  def run\n"
+                      "    a = Foo.new\n"
+                      "    a.bar\n"
+                      "    helper(a)\n"
+                      "  end\n"
+                      "  def helper(a)\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def later\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    /* Positive control: the typed local inside its own method resolves. */
+    ASSERT(require_resolved_exact(r, "test.main.Worker.run", "test.main.Foo.bar") >= 0);
+    /* Top-level `a` is not visible inside `def top`. */
+    ASSERT(find_resolved(r, "main.top", "Foo.bar") < 0);
+    /* Parameter `a` is untyped, whatever the caller passed. */
+    ASSERT(find_resolved(r, "Worker.helper", "Foo.bar") < 0);
+    /* Sibling method's local is not visible either. */
+    ASSERT(find_resolved(r, "Worker.later", "Foo.bar") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Block parameters shadow the enclosing local for the block's extent only:
+ * `|a|` inside the block is untyped, and `a` after the block is still Foo. */
+TEST(rubylsp_block_param_shadows_local) {
+    const char *src = "class Foo\n"
+                      "  def bar\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "class Worker\n"
+                      "  def run\n"
+                      "    a = Foo.new\n"
+                      "    [1].each { |a| a.bar }\n"
+                      "    [1].each do |x, (y, z), *rest; loc|\n"
+                      "      x.bar\n"
+                      "      y.bar\n"
+                      "      rest.bar\n"
+                      "      loc.bar\n"
+                      "    end\n"
+                      "    f = ->(a) { a.bar }\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    /* Exactly ONE row: the `a.bar` after the blocks. Every `.bar` inside a
+     * block is on an untyped block parameter. */
+    if (count_resolved_exact(r, "test.main.Worker.run", "test.main.Foo.bar") != 1)
+        dump_resolved(r);
+    ASSERT(count_resolved_exact(r, "test.main.Worker.run", "test.main.Foo.bar") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Reassigning a typed local to anything the resolver cannot type must drop
+ * the old type. `a = Foo.new; a = x; a.bar` is NOT a call on Foo. Covers
+ * plain reassignment, multiple assignment, `||=` and other compound forms. */
+TEST(rubylsp_untyped_reassignment_drops_type) {
+    const char *src = "class Foo\n"
+                      "  def bar\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "class Worker\n"
+                      "  def plain(x)\n"
+                      "    a = Foo.new\n"
+                      "    a = x\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def multi(x)\n"
+                      "    a = Foo.new\n"
+                      "    a, b = x, 1\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def nested_multi(x)\n"
+                      "    a = Foo.new\n"
+                      "    (a, b), c = x, 1\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def splat_multi(x)\n"
+                      "    a = Foo.new\n"
+                      "    b, *a = x\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def or_assign(x)\n"
+                      "    a = Foo.new\n"
+                      "    a ||= x\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def compound(x)\n"
+                      "    a = Foo.new\n"
+                      "    a += x\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def in_block(x)\n"
+                      "    a = Foo.new\n"
+                      "    [1].each { a = x }\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "  def fresh_or_assign\n"
+                      "    a ||= Foo.new\n"
+                      "    a.bar\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(find_resolved(r, "Worker.plain", "Foo.bar") < 0);
+    ASSERT(find_resolved(r, "Worker.multi", "Foo.bar") < 0);
+    ASSERT(find_resolved(r, "Worker.nested_multi", "Foo.bar") < 0);
+    ASSERT(find_resolved(r, "Worker.splat_multi", "Foo.bar") < 0);
+    ASSERT(find_resolved(r, "Worker.or_assign", "Foo.bar") < 0);
+    ASSERT(find_resolved(r, "Worker.compound", "Foo.bar") < 0);
+    /* Assignment inside a block rebinds the enclosing local (closure). */
+    ASSERT(find_resolved(r, "Worker.in_block", "Foo.bar") < 0);
+    /* Positive control: `||=` on a fresh name with a typed RHS is a
+     * constructor assignment. */
+    ASSERT(require_resolved_exact(r, "test.main.Worker.fresh_or_assign", "test.main.Foo.bar") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 16. Negative: dynamic dispatch emits no edge ───────────────── */
 
 TEST(rubylsp_send_no_edge) {
@@ -780,6 +936,9 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_activerecord_model_typing);
     RUN_TEST(rubylsp_top_level_function);
     RUN_TEST(rubylsp_unknown_receiver_no_edge);
+    RUN_TEST(rubylsp_def_is_scope_gate);
+    RUN_TEST(rubylsp_block_param_shadows_local);
+    RUN_TEST(rubylsp_untyped_reassignment_drops_type);
     RUN_TEST(rubylsp_send_no_edge);
     RUN_TEST(rubylsp_dynamic_dispatch_family_no_edge);
 }
