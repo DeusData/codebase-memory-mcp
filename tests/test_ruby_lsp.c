@@ -989,7 +989,14 @@ TEST(rubylsp_send_no_edge) {
 
 /* `send` has its own row above. The zero-edge guarantee is advertised for the
  * whole reflective family, so pin the rest of it too: a resolver that treated
- * any of these as an ordinary call would invent an edge to `hidden`. */
+ * any of these as an ordinary call would invent an edge to `hidden`.
+ *
+ * `Meta` deliberately defines its OWN `hidden`: inside `instance_eval { }`
+ * self is the Target, not the Meta, so a resolver that dispatched the bare
+ * `hidden()` on the enclosing class would emit Meta.via_instance_eval ->
+ * Meta.hidden — a wrong edge that an empty Meta would never reveal. The
+ * bare calls are written with `()` because tree-sitter-ruby parses a lone
+ * `hidden` as an identifier, which the extractor never emits as a call. */
 TEST(rubylsp_dynamic_dispatch_family_no_edge) {
     const char *src = "class Target\n"
                       "  def hidden\n"
@@ -997,6 +1004,9 @@ TEST(rubylsp_dynamic_dispatch_family_no_edge) {
                       "  end\n"
                       "end\n"
                       "class Meta\n"
+                      "  def hidden\n"
+                      "    0\n"
+                      "  end\n"
                       "  def via_public_send\n"
                       "    Target.new.public_send(:hidden)\n"
                       "  end\n"
@@ -1007,7 +1017,7 @@ TEST(rubylsp_dynamic_dispatch_family_no_edge) {
                       "    Target.define_method(:hidden) { 2 }\n"
                       "  end\n"
                       "  def via_instance_eval\n"
-                      "    Target.new.instance_eval { hidden }\n"
+                      "    Target.new.instance_eval { hidden() }\n"
                       "  end\n"
                       "end\n";
     CBMFileResult *r = extract_ruby(src);
@@ -1016,6 +1026,83 @@ TEST(rubylsp_dynamic_dispatch_family_no_edge) {
     ASSERT(find_resolved(r, "Meta.via_underscore_send", "hidden") < 0);
     ASSERT(find_resolved(r, "Meta.via_define_method", "hidden") < 0);
     ASSERT(find_resolved(r, "Meta.via_instance_eval", "hidden") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── 16c. Negative: blocks that rebind `self` ───────────────────── */
+
+/* instance_eval/exec, class_eval/exec, module_eval/exec, define_method and
+ * Class.new/Module.new run their block with a different `self`. Bare calls,
+ * `self.` calls and `super` inside them must not dispatch on the enclosing
+ * class. Every enclosing class here HAS the method being called, so the old
+ * behaviour would emit a wrong edge in each row. Receiver and argument
+ * expressions of the same call are ordinary and still resolve. */
+TEST(rubylsp_self_rebinding_blocks_no_edge) {
+    const char *src = "class Target\n"
+                      "  def hidden\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "class Meta\n"
+                      "  def hidden\n"
+                      "    0\n"
+                      "  end\n"
+                      "  def target\n"
+                      "    Target.new\n"
+                      "  end\n"
+                      "  def via_instance_exec\n"
+                      "    target().instance_exec(1) { |x| hidden(); self.hidden }\n"
+                      "  end\n"
+                      "  def via_class_eval\n"
+                      "    Target.class_eval do\n"
+                      "      hidden()\n"
+                      "    end\n"
+                      "  end\n"
+                      "  def via_class_exec\n"
+                      "    Target.class_exec { hidden() }\n"
+                      "  end\n"
+                      "  def via_module_eval\n"
+                      "    Target.module_eval { self.hidden }\n"
+                      "  end\n"
+                      "  def via_module_exec\n"
+                      "    Target.module_exec { hidden() }\n"
+                      "  end\n"
+                      "  def via_define_method_body\n"
+                      "    Target.define_method(:other) { hidden() }\n"
+                      "  end\n"
+                      "  def via_class_new\n"
+                      "    Class.new do\n"
+                      "      hidden()\n"
+                      "      def hidden\n"
+                      "        super\n"
+                      "      end\n"
+                      "    end\n"
+                      "  end\n"
+                      "  def via_module_new\n"
+                      "    Module.new { self.hidden }\n"
+                      "  end\n"
+                      "  def after_block\n"
+                      "    Target.new.instance_eval { hidden() }\n"
+                      "    self.hidden\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(find_resolved(r, "Meta.via_instance_exec", "hidden") < 0);
+    /* ...but the receiver expression of that same call still resolves. */
+    ASSERT(require_resolved_exact(r, "test.main.Meta.via_instance_exec", "test.main.Meta.target") >=
+           0);
+    ASSERT(find_resolved(r, "Meta.via_class_eval", "hidden") < 0);
+    ASSERT(find_resolved(r, "Meta.via_class_exec", "hidden") < 0);
+    ASSERT(find_resolved(r, "Meta.via_module_eval", "hidden") < 0);
+    ASSERT(find_resolved(r, "Meta.via_module_exec", "hidden") < 0);
+    ASSERT(find_resolved(r, "Meta.via_define_method_body", "hidden") < 0);
+    ASSERT(find_resolved(r, "Meta.via_class_new", "hidden") < 0);
+    ASSERT(find_resolved(r, "Meta.via_module_new", "hidden") < 0);
+    /* The suppression ends with the block: the following statement is an
+     * ordinary self dispatch on Meta. */
+    ASSERT(count_resolved_exact(r, "test.main.Meta.after_block", "test.main.Meta.hidden") == 1);
     cbm_free_result(r);
     PASS();
 }
@@ -1051,4 +1138,5 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_untyped_reassignment_drops_type);
     RUN_TEST(rubylsp_send_no_edge);
     RUN_TEST(rubylsp_dynamic_dispatch_family_no_edge);
+    RUN_TEST(rubylsp_self_rebinding_blocks_no_edge);
 }

@@ -109,6 +109,11 @@ typedef struct {
     const char *enclosing_class_qn; /* class QN, or NULL at top level */
     const char *enclosing_func_qn;  /* enclosing method QN, or NULL */
     bool in_singleton_method;       /* `def self.m` / class << self scope */
+    /* Inside a block that rebinds `self` (instance_eval/exec, class_eval/
+     * exec, module_eval/exec, define_method, Class.new/Module.new): the
+     * receiver of bare and `self.` calls is NOT the enclosing class, and
+     * the resolver cannot know what it is — so they emit nothing. */
+    bool self_unknown;
     const char *module_qn;
 
     /* Output: resolved calls accumulate here. */

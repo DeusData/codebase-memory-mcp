@@ -83,6 +83,7 @@ static void ruby_pass1_scan_inner(RubyLSPContext *ctx, TSNode node);
 static void ruby_ivar_scan(RubyLSPContext *ctx, TSNode node);
 static void ruby_ivar_scan_inner(RubyLSPContext *ctx, TSNode node);
 static const CBMType *ruby_eval_call_type(RubyLSPContext *ctx, TSNode call, bool emit);
+static bool ruby_call_rebinds_self(RubyLSPContext *ctx, TSNode call);
 
 /* ── helpers ────────────────────────────────────────────────────── */
 
@@ -159,6 +160,7 @@ typedef struct {
     const char *saved_nesting;
     const char *saved_class;
     bool saved_singleton;
+    bool saved_self_unknown;
 } RubyClassFrame;
 
 /* Enter a class/module node: compute names, push nesting + enclosing class.
@@ -175,6 +177,7 @@ static bool ruby_class_enter(RubyLSPContext *ctx, TSNode node, RubyClassFrame *f
     fr->saved_nesting = ctx->nesting;
     fr->saved_class = ctx->enclosing_class_qn;
     fr->saved_singleton = ctx->in_singleton_method;
+    fr->saved_self_unknown = ctx->self_unknown;
 
     fr->path = ruby_path_join(ctx->arena, ruby_dotted(ctx->arena, fr->saved_nesting), cpath);
     if (fr->saved_class)
@@ -187,6 +190,7 @@ static bool ruby_class_enter(RubyLSPContext *ctx, TSNode node, RubyClassFrame *f
     ctx->nesting = ruby_path_join(ctx->arena, fr->saved_nesting, fr->raw_name);
     ctx->enclosing_class_qn = fr->qn;
     ctx->in_singleton_method = false;
+    ctx->self_unknown = false; /* a class body names its self again */
     return true;
 }
 
@@ -194,6 +198,7 @@ static void ruby_class_leave(RubyLSPContext *ctx, const RubyClassFrame *fr) {
     ctx->nesting = fr->saved_nesting;
     ctx->enclosing_class_qn = fr->saved_class;
     ctx->in_singleton_method = fr->saved_singleton;
+    ctx->self_unknown = fr->saved_self_unknown;
 }
 
 /* True when a QN belongs to the indexed project (module_qn's first segment
@@ -630,7 +635,7 @@ const CBMType *ruby_eval_expr_type(RubyLSPContext *ctx, TSNode node) {
         if (tqn)
             result = cbm_type_named(ctx->arena, tqn);
     } else if (strcmp(k, "self") == 0) {
-        if (ctx->enclosing_class_qn && !ctx->in_singleton_method)
+        if (ctx->enclosing_class_qn && !ctx->in_singleton_method && !ctx->self_unknown)
             result = cbm_type_named(ctx->arena, ctx->enclosing_class_qn);
     } else if (strcmp(k, "call") == 0) {
         result = ruby_eval_call_type(ctx, node, false);
@@ -679,9 +684,40 @@ const CBMType *ruby_eval_expr_type(RubyLSPContext *ctx, TSNode node) {
 static bool ruby_is_dynamic_dispatch(const char *m) {
     return strcmp(m, "send") == 0 || strcmp(m, "public_send") == 0 || strcmp(m, "__send__") == 0 ||
            strcmp(m, "method_missing") == 0 || strcmp(m, "define_method") == 0 ||
-           strcmp(m, "instance_eval") == 0 || strcmp(m, "class_eval") == 0 ||
-           strcmp(m, "module_eval") == 0 || strcmp(m, "instance_variable_get") == 0 ||
-           strcmp(m, "instance_variable_set") == 0;
+           strcmp(m, "instance_eval") == 0 || strcmp(m, "instance_exec") == 0 ||
+           strcmp(m, "class_eval") == 0 || strcmp(m, "class_exec") == 0 ||
+           strcmp(m, "module_eval") == 0 || strcmp(m, "module_exec") == 0 ||
+           strcmp(m, "instance_variable_get") == 0 || strcmp(m, "instance_variable_set") == 0;
+}
+
+/* True when `call` carries a block whose body runs with a DIFFERENT `self`
+ * than the enclosing lexical scope: the eval/exec family, define_method
+ * (self is the future receiver), and `Class.new { }` / `Module.new { }`
+ * (self is the anonymous class). Bare and `self.` calls in such a block
+ * must not dispatch on the enclosing class. */
+static bool ruby_call_rebinds_self(RubyLSPContext *ctx, TSNode call) {
+    if (ts_node_is_null(ts_node_child_by_field_name(call, "block", 5)))
+        return false;
+    TSNode meth = ts_node_child_by_field_name(call, "method", 6);
+    if (ts_node_is_null(meth))
+        return false;
+    char *m = ruby_node_text(ctx, meth);
+    if (!m)
+        return false;
+    if (strcmp(m, "instance_eval") == 0 || strcmp(m, "instance_exec") == 0 ||
+        strcmp(m, "class_eval") == 0 || strcmp(m, "class_exec") == 0 ||
+        strcmp(m, "module_eval") == 0 || strcmp(m, "module_exec") == 0 ||
+        strcmp(m, "define_method") == 0)
+        return true;
+    if (strcmp(m, "new") == 0) {
+        TSNode recv = ts_node_child_by_field_name(call, "receiver", 8);
+        if (!ts_node_is_null(recv) && strcmp(ts_node_type(recv), "constant") == 0) {
+            char *r = ruby_node_text(ctx, recv);
+            if (r && (strcmp(r, "Class") == 0 || strcmp(r, "Module") == 0))
+                return true;
+        }
+    }
+    return false;
 }
 
 /* Class-body macro-ish names PASS 1 already interpreted (or that never
@@ -770,6 +806,8 @@ static const CBMType *ruby_eval_call_type(RubyLSPContext *ctx, TSNode call, bool
         /* Bare call: self-dispatch inside methods, then file-level funcs. */
         if (ruby_is_body_macro(mname))
             return cbm_type_unknown();
+        if (ctx->self_unknown)
+            return cbm_type_unknown(); /* receiver is a rebound self — zero-edge */
         if (ctx->enclosing_class_qn) {
             const CBMRegisteredFunc *f =
                 ctx->in_singleton_method
@@ -799,7 +837,7 @@ static const CBMType *ruby_eval_call_type(RubyLSPContext *ctx, TSNode call, bool
 
     /* self.m — explicit self dispatch. */
     if (strcmp(rk, "self") == 0) {
-        if (!ctx->enclosing_class_qn)
+        if (!ctx->enclosing_class_qn || ctx->self_unknown)
             return cbm_type_unknown();
         const CBMRegisteredFunc *f =
             ctx->in_singleton_method
@@ -845,7 +883,7 @@ static const CBMType *ruby_eval_call_type(RubyLSPContext *ctx, TSNode call, bool
 /* `super` / `super(...)`: resolve the enclosing method's name starting at
  * the enclosing class's ancestry (own def skipped — that IS the caller). */
 static void ruby_resolve_super(RubyLSPContext *ctx, TSNode site) {
-    if (!ctx->enclosing_class_qn || !ctx->enclosing_func_qn)
+    if (!ctx->enclosing_class_qn || !ctx->enclosing_func_qn || ctx->self_unknown)
         return;
     const char *fq = ctx->enclosing_func_qn;
     const char *mname = strrchr(fq, '.');
@@ -1123,6 +1161,26 @@ static void ruby_resolve_calls_in_node_inner(RubyLSPContext *ctx, TSNode node) {
             ruby_resolve_super(ctx, node);
         else
             ruby_eval_call_type(ctx, node, true);
+        if (ruby_call_rebinds_self(ctx, node)) {
+            /* Receiver and arguments are ordinary expressions; the block
+             * body runs with a `self` this resolver cannot name. */
+            TSNode blk = ts_node_child_by_field_name(node, "block", 5);
+            uint32_t cc = ts_node_child_count(node);
+            for (uint32_t i = 0; i < cc; i++) {
+                TSNode c = ts_node_child(node, i);
+                if (ts_node_is_null(c))
+                    continue;
+                if (ts_node_eq(c, blk)) {
+                    bool saved = ctx->self_unknown;
+                    ctx->self_unknown = true;
+                    ruby_resolve_calls_in_node(ctx, c);
+                    ctx->self_unknown = saved;
+                } else {
+                    ruby_resolve_calls_in_node(ctx, c);
+                }
+            }
+            return;
+        }
         /* Recurse into receiver/arguments/blocks for nested calls. */
     } else if (strcmp(k, "super") == 0) {
         /* Bare `super` (no argument list) appears as a standalone node. */
@@ -1462,10 +1520,16 @@ static void ruby_ivar_scan_inner(RubyLSPContext *ctx, TSNode node) {
         }
     }
 
+    /* A block that rebinds `self` writes ivars on some OTHER object; do not
+     * attribute them to the enclosing class. */
+    TSNode skip_blk = {0};
+    if (strcmp(k, "call") == 0 && ruby_call_rebinds_self(ctx, node))
+        skip_blk = ts_node_child_by_field_name(node, "block", 5);
+
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(node, i);
-        if (!ts_node_is_null(c))
+        if (!ts_node_is_null(c) && !(!ts_node_is_null(skip_blk) && ts_node_eq(c, skip_blk)))
             ruby_ivar_scan(ctx, c);
     }
 }
