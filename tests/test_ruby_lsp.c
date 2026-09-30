@@ -16,10 +16,14 @@
  *   10. Instance-variable typing       (@thing = Foo.new; @thing.bar)
  *   11. Chained call typing            (Foo.new.bar)
  *   12. Nested modules                 (lexical nesting + `A::B` references)
+ *   12b. Compact `class A::B` names    (exact extractor spelling, scope)
  *   13. ActiveRecord model typing      (User.find(1).full_name)
  *   14. Top-level function calls
  *   15. Unresolvable receiver emits NO spurious edge (negative)
+ *   15b. Scope gates                    (def, params, blocks, reassignment)
  *   16. send() / the whole dynamic-dispatch family emits NO edge (negative)
+ *   16c. Blocks that rebind self emit NO self edge (negative)
+ *   Fail-closed ancestry (7c) and block-nested defs (7d) sit with mixins.
  *
  * Scope: every row here is SINGLE-FILE, driven through cbm_extract_file so it
  * exercises the per-file resolver exactly as the extraction pipeline calls it.
@@ -27,9 +31,10 @@
  * pass_lsp_cross.c) is a separate tier and is covered by its own rows.
  *
  * The resolver populates result->resolved_calls with CBMResolvedCall rows.
- * Ruby defs weave the class path into the QN (module_qn.Animal.speak), so
- * for these single-file fixtures ("test"/"main.rb" -> module QN test.main)
- * callee fragments like "main.Animal.speak" are unique join keys.
+ * The pipeline joins a row to its caller def by EXACT QN equality, so every
+ * row that pins a class-path spelling (nested or compact) asserts the full
+ * caller and callee QN with strcmp ("test"/"main.rb" -> module QN test.main).
+ * Substring helpers remain for rows where only presence/absence matters.
  */
 #include "test_framework.h"
 #include "cbm.h"
@@ -832,11 +837,18 @@ TEST(rubylsp_nested_modules) {
                       "end\n";
     CBMFileResult *r = extract_ruby(src);
     ASSERT(r);
+    /* Exact spellings: lexically nested declarations join with '.', matching
+     * the extractor's `<enclosing_qn>.<name>` — a substring match would let
+     * a wrongly-spelled row pass. */
     /* Lexical reference from sibling class inside the module. */
-    ASSERT(require_resolved(r, "Panel.show", "User.lookup") >= 0);
-    ASSERT(require_resolved(r, "Panel.show", "User.name") >= 0);
+    ASSERT(require_resolved_exact(r, "test.main.Admin.Panel.show", "test.main.Admin.User.lookup") >=
+           0);
+    ASSERT(require_resolved_exact(r, "test.main.Admin.Panel.show", "test.main.Admin.User") >= 0);
+    ASSERT(require_resolved_exact(r, "test.main.Admin.Panel.show", "test.main.Admin.User.name") >=
+           0);
     /* Fully-qualified reference from outside. */
-    ASSERT(require_resolved(r, "Outside.probe", "User.lookup") >= 0);
+    ASSERT(require_resolved_exact(r, "test.main.Outside.probe", "test.main.Admin.User.lookup") >=
+           0);
     cbm_free_result(r);
     PASS();
 }

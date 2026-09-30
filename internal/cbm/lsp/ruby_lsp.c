@@ -12,27 +12,41 @@
  *        PASS 1 — collect class/module declarations (with lexical nesting),
  *          superclasses, include/prepend/extend mixins, and method tables
  *          (instance vs singleton classified from the AST — `def m` vs
- *          `def self.m` / `class << self`).
+ *          `def self.m` / `class << self`). Defs and mixin calls inside a
+ *          BLOCK (`class_methods do … end`, `included do … end`) belong to
+ *          some other module and are not recorded.
  *        PASS 1.5 — infer instance-variable types from `@x = Const.new`
- *          assignments inside method bodies (conflicting types latch to
- *          "conflicted" and resolve to nothing).
+ *          (and `@x ||= Const.new`) inside method bodies. Any other write
+ *          to the ivar latches it as untypable.
  *        PASS 2 — walk method bodies, track local variable types through
- *          assignments, and resolve call expressions into CBMResolvedCall
- *          edges via Ruby method lookup (prepends → own → includes →
- *          superclass chain; extends feed the singleton side).
+ *          assignments with Ruby's scope gates (fresh scope per def/class,
+ *          chained scope per block, parameters unknown, untyped writes
+ *          rebind to unknown), and resolve call expressions into
+ *          CBMResolvedCall edges via Ruby method lookup (prepends → own →
+ *          includes → superclass chain; extends feed the singleton side).
+ *          The walk fails closed the moment an ancestor is unresolved.
  *
  * Verified tree-sitter-ruby node/field names (vendored compiled grammar at
  * internal/cbm/vendored/grammars/ruby/parser.c — ts_symbol_names and
  * ts_field_names tables):
  *   - call : fields `receiver`, `method`, `arguments`, `block`. Both
- *     `foo(x)` and command calls (`foo x`) surface as "call" nodes.
+ *     `foo(x)` and command calls (`foo x`) surface as "call" nodes. A lone
+ *     `foo` is an `identifier`, never a call — and the extractor emits no
+ *     call for it either, so the resolver does not treat it as one.
  *   - class : fields `name` (constant | scope_resolution), `superclass`
  *     (a `superclass` wrapper node), `body` (body_statement).
  *   - module : fields `name`, `body`.
  *   - method : fields `name`, `parameters`, `body`.
  *   - singleton_method : fields `object` (self | constant), `name`, `body`.
  *   - singleton_class : `class << self` — fields `value`, body children.
- *   - assignment : fields `left`, `right`.
+ *   - assignment : fields `left`, `right` (`left` may be a
+ *     left_assignment_list for `a, b = …`).
+ *   - operator_assignment : fields `left`, `operator`, `right` (`||=` etc.).
+ *   - block / do_block / lambda : field `parameters` (block_parameters /
+ *     lambda_parameters), body.
+ *   - method_parameters children: identifier | optional_parameter |
+ *     keyword_parameter | splat_parameter | hash_splat_parameter |
+ *     block_parameter (each with a `name` field) | destructured_parameter.
  *   - scope_resolution : fields `scope` (may be absent for ::Foo), `name`.
  *   - leaves: constant, identifier, self, instance_variable, super,
  *     string, array, hash, integer, float, simple_symbol, regex.
@@ -50,9 +64,17 @@
  * the edge lands on the Class node, exactly like Python's lsp_constructor.
  *
  * Zero-edge guarantee: if a receiver's type is unknown/unindexed, NO edge
- * is emitted (false edges are worse than missing edges). Dynamic dispatch
- * (`send`, `public_send`, `method_missing`, `define_method`) is
- * intentionally ignored.
+ * is emitted (false edges are worse than missing edges). Concretely:
+ *   - dynamic dispatch (`send`, `public_send`, `__send__`, `method_missing`,
+ *     `define_method`, the eval/exec family) is never guessed through;
+ *   - a block that rebinds `self` (instance_eval/exec, class_eval/exec,
+ *     module_eval/exec, define_method, Class.new/Module.new) suppresses bare,
+ *     `self.` and `super` dispatch inside it;
+ *   - an unresolved prepend blocks even an own-method hit, an unresolved
+ *     include/extend/superclass stops the walk, and a blocked walk never
+ *     falls through to a same-named top-level def or the Object fallback;
+ *   - a local or ivar written with anything the resolver cannot type loses
+ *     its type rather than keeping a stale one.
  */
 
 #include "ruby_lsp.h"
