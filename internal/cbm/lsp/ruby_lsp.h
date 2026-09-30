@@ -17,10 +17,16 @@ typedef enum {
 } RubyMixinKind;
 
 /* One class/module discovered in the file (or, cross-file, in the project).
- * `path` is the dotted source-level constant path (e.g. "Admin.User" for
- * `Admin::User`); `qn` is the full graph QN (module_qn.path for file-local
- * classes; the extractor QN for cross-file defs). `superclass_qn` is resolved
- * against the class table + stdlib after collection; NULL when unknown. */
+ * `path` is the dotted constant path used ONLY for constant lookup ("Admin.User"
+ * for both `module Admin; class User` and `class Admin::User`). `qn` is the
+ * graph QN built exactly the way the structural extractor builds it: each
+ * declaration's raw name text appended to the enclosing class QN (or the
+ * module QN at top level), so a compact `class Admin::User` yields
+ * "<module_qn>.Admin::User" while the lexically nested form yields
+ * "<module_qn>.Admin.User". Emitted rows must carry the extractor spelling
+ * or the pipeline's exact-name join silently drops them. `superclass_qn` is
+ * resolved against the class table + stdlib after collection; NULL when
+ * unknown. */
 typedef struct {
     const char *path;
     const char *qn;
@@ -71,8 +77,11 @@ typedef struct {
     CBMTypeRegistry *build_reg;
     CBMScope *current_scope;
 
-    /* Lexical nesting: dotted constant path of the enclosing class/module
-     * chain ("" at top level, "A.B" inside `module A; class B`). */
+    /* Lexical nesting: one frame per enclosing class/module declaration,
+     * frames joined by '.', each frame keeping its raw source spelling ("" at
+     * top level, "M.A::B" inside `module M; class A::B`). Ruby's constant
+     * lookup walks the frames outward — inside `class A::B` the nesting is
+     * [A::B] only, so A's constants are NOT probed. */
     const char *nesting;
 
     /* Class/module table (pass 1). */

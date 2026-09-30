@@ -38,11 +38,16 @@
  *     string, array, hash, integer, float, simple_symbol, regex.
  *
  * QN scheme (matches the structural extractor): Ruby HAS class node types
- * (class/module), so defs are named `module_qn.<ConstPath>.<method>` with
- * parent_class = `module_qn.<ConstPath>`. Constructor calls: the textual
- * extractor rewrites `Widget.new` to callee "Widget" (extract_calls.c), so
- * constructor rows emit the CLASS QN — the edge lands on the Class node,
- * exactly like Python's lsp_constructor.
+ * (class/module), so defs are named `<class_qn>.<method>` with
+ * parent_class = `<class_qn>`, where a class QN is the enclosing class QN
+ * (or the module QN at top level) joined with the declaration's RAW name
+ * text. A compact `class Admin::User` therefore yields `module_qn.Admin::User`
+ * while `module Admin; class User` yields `module_qn.Admin.User` — both are
+ * reproduced here byte-for-byte because the pipeline joins resolved rows to
+ * defs by exact caller name. The dotted form is used only for constant
+ * lookup. Constructor calls: the textual extractor rewrites `Widget.new` to
+ * callee "Widget" (extract_calls.c), so constructor rows emit the CLASS QN —
+ * the edge lands on the Class node, exactly like Python's lsp_constructor.
  *
  * Zero-edge guarantee: if a receiver's type is unknown/unindexed, NO edge
  * is emitted (false edges are worse than missing edges). Dynamic dispatch
@@ -121,6 +126,76 @@ static const char *ruby_path_join(CBMArena *a, const char *left, const char *rig
     return cbm_arena_sprintf(a, "%s.%s", left, right);
 }
 
+/* Dotted form of a raw constant spelling: every "::" becomes ".". Used to
+ * turn nesting frames (raw) into class-table paths (dotted). */
+static const char *ruby_dotted(CBMArena *a, const char *raw) {
+    if (!raw)
+        return NULL;
+    size_t n = strlen(raw);
+    char *out = (char *)cbm_arena_alloc(a, n + 1);
+    if (!out)
+        return raw;
+    size_t j = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (raw[i] == ':' && i + 1 < n && raw[i + 1] == ':') {
+            out[j++] = '.';
+            i++;
+            continue;
+        }
+        out[j++] = raw[i];
+    }
+    out[j] = '\0';
+    return out;
+}
+
+/* Class-declaration frame shared by every pass, so PASS 1, PASS 1.5 and
+ * PASS 2 compute identical nesting + class QNs. `raw_name` is the name
+ * field's source text (the extractor's spelling, "Admin::User"); `qn` is
+ * the extractor-shaped class QN; `path` is the dotted constant-table path. */
+typedef struct {
+    const char *raw_name;
+    const char *path;
+    const char *qn;
+    const char *saved_nesting;
+    const char *saved_class;
+    bool saved_singleton;
+} RubyClassFrame;
+
+/* Enter a class/module node: compute names, push nesting + enclosing class.
+ * Returns false (nothing pushed) when the name is not a constant path. */
+static bool ruby_class_enter(RubyLSPContext *ctx, TSNode node, RubyClassFrame *fr) {
+    TSNode name = ts_node_child_by_field_name(node, "name", 4);
+    const char *cpath = ruby_const_path(ctx, name);
+    if (!cpath)
+        return false;
+    memset(fr, 0, sizeof(*fr));
+    fr->raw_name = ruby_node_text(ctx, name);
+    if (!fr->raw_name || !fr->raw_name[0])
+        return false;
+    fr->saved_nesting = ctx->nesting;
+    fr->saved_class = ctx->enclosing_class_qn;
+    fr->saved_singleton = ctx->in_singleton_method;
+
+    fr->path = ruby_path_join(ctx->arena, ruby_dotted(ctx->arena, fr->saved_nesting), cpath);
+    if (fr->saved_class)
+        fr->qn = cbm_arena_sprintf(ctx->arena, "%s.%s", fr->saved_class, fr->raw_name);
+    else if (ctx->module_qn)
+        fr->qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fr->raw_name);
+    else
+        fr->qn = fr->raw_name;
+
+    ctx->nesting = ruby_path_join(ctx->arena, fr->saved_nesting, fr->raw_name);
+    ctx->enclosing_class_qn = fr->qn;
+    ctx->in_singleton_method = false;
+    return true;
+}
+
+static void ruby_class_leave(RubyLSPContext *ctx, const RubyClassFrame *fr) {
+    ctx->nesting = fr->saved_nesting;
+    ctx->enclosing_class_qn = fr->saved_class;
+    ctx->in_singleton_method = fr->saved_singleton;
+}
+
 /* True when a QN belongs to the indexed project (module_qn's first segment
  * is its prefix). Stdlib seed QNs ("String.upcase", "ActiveRecord.Base")
  * never carry the project prefix, so edges are only ever emitted at
@@ -139,9 +214,12 @@ static RubyClassInfo *ruby_add_class(RubyLSPContext *ctx, const char *path, cons
                                      bool is_module) {
     if (!ctx || !path || !qn)
         return NULL;
-    /* Reopened class/module: reuse the existing record. */
+    /* Reopened class/module: reuse the existing record. Keyed on the
+     * extractor QN, so `module A; class B` and `class A::B` in one file each
+     * keep their own spelling (constant lookup returns whichever was
+     * declared first; a miss on the other fails closed at the join). */
     for (int i = 0; i < ctx->class_count; i++) {
-        if (strcmp(ctx->classes[i].path, path) == 0)
+        if (strcmp(ctx->classes[i].qn, qn) == 0)
             return &ctx->classes[i];
     }
     if (ctx->class_count >= ctx->class_cap) {
@@ -266,37 +344,45 @@ static const char *ruby_superclass_qn(RubyLSPContext *ctx, const char *class_qn)
 
 /* ── constant resolution ────────────────────────────────────────── */
 
+/* Class-table probe by dotted path. */
+static const char *ruby_class_qn_by_path(RubyLSPContext *ctx, const char *path) {
+    for (int i = 0; i < ctx->class_count; i++) {
+        if (strcmp(ctx->classes[i].path, path) == 0)
+            return ctx->classes[i].qn;
+    }
+    return NULL;
+}
+
 const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
     if (!ctx || !path || !path[0])
         return NULL;
-    /* Lexical nesting probe: for nesting "A.B" try "A.B.path", "A.path",
-     * then "path" (innermost first — Ruby's constant lookup order). */
+    /* Lexical nesting probe, innermost frame first — Ruby's constant lookup
+     * order. The nesting string holds one RAW frame per declaration joined
+     * by '.', so stripping at the last '.' drops exactly one frame: inside
+     * `module M; class A::B` (nesting "M.A::B") the probes are "M.A.B.path",
+     * "M.path", "path" — never "M.A.path", because `class A::B` does not
+     * open A's scope. */
     const char *nest = ctx->nesting ? ctx->nesting : "";
     char prefix[512];
     size_t nlen = strlen(nest);
     if (nlen < sizeof(prefix)) {
         memcpy(prefix, nest, nlen + 1);
-        while (1) {
-            if (prefix[0]) {
-                const char *cand = cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, path);
-                for (int i = 0; i < ctx->class_count; i++) {
-                    if (strcmp(ctx->classes[i].path, cand) == 0)
-                        return ctx->classes[i].qn;
-                }
-                char *last_dot = strrchr(prefix, '.');
-                if (last_dot)
-                    *last_dot = '\0';
-                else
-                    prefix[0] = '\0';
-                continue;
-            }
-            break;
+        while (prefix[0]) {
+            const char *cand =
+                cbm_arena_sprintf(ctx->arena, "%s.%s", ruby_dotted(ctx->arena, prefix), path);
+            const char *qn = ruby_class_qn_by_path(ctx, cand);
+            if (qn)
+                return qn;
+            char *last_dot = strrchr(prefix, '.');
+            if (last_dot)
+                *last_dot = '\0';
+            else
+                prefix[0] = '\0';
         }
     }
-    for (int i = 0; i < ctx->class_count; i++) {
-        if (strcmp(ctx->classes[i].path, path) == 0)
-            return ctx->classes[i].qn;
-    }
+    const char *qn = ruby_class_qn_by_path(ctx, path);
+    if (qn)
+        return qn;
     /* Stdlib types are keyed by their dotted bare path. */
     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, path);
     if (t)
@@ -808,27 +894,15 @@ static void ruby_process_method(RubyLSPContext *ctx, TSNode node, bool singleton
 /* Process a class/module node during PASS 2: update nesting + enclosing
  * class, then walk the body. */
 static void ruby_process_class_body(RubyLSPContext *ctx, TSNode node) {
-    TSNode name = ts_node_child_by_field_name(node, "name", 4);
-    const char *cpath = ruby_const_path(ctx, name);
-    if (!cpath)
+    RubyClassFrame fr;
+    if (!ruby_class_enter(ctx, node, &fr))
         return;
-
-    const char *saved_nesting = ctx->nesting;
-    const char *saved_class = ctx->enclosing_class_qn;
-    bool saved_singleton = ctx->in_singleton_method;
-
-    ctx->nesting = ruby_path_join(ctx->arena, saved_nesting, cpath);
-    const char *qn = ruby_resolve_constant(ctx, cpath);
-    ctx->enclosing_class_qn = qn;
-    ctx->in_singleton_method = false;
 
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
     if (!ts_node_is_null(body))
         ruby_resolve_calls_in_node(ctx, body);
 
-    ctx->nesting = saved_nesting;
-    ctx->enclosing_class_qn = saved_class;
-    ctx->in_singleton_method = saved_singleton;
+    ruby_class_leave(ctx, &fr);
 }
 
 static void ruby_resolve_calls_in_node(RubyLSPContext *ctx, TSNode node) {
@@ -992,20 +1066,15 @@ static void ruby_collect_mixin_call(RubyLSPContext *ctx, TSNode call) {
 }
 
 static void ruby_pass1_class(RubyLSPContext *ctx, TSNode node, bool is_module) {
-    TSNode name = ts_node_child_by_field_name(node, "name", 4);
-    const char *cpath = ruby_const_path(ctx, name);
-    if (!cpath)
+    RubyClassFrame fr;
+    if (!ruby_class_enter(ctx, node, &fr))
         return;
-
-    const char *saved_nesting = ctx->nesting;
-    const char *full_path = ruby_path_join(ctx->arena, saved_nesting, cpath);
-    const char *qn = ctx->module_qn
-                         ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, full_path)
-                         : full_path;
-    RubyClassInfo *ci = ruby_add_class(ctx, full_path, qn, is_module);
+    RubyClassInfo *ci = ruby_add_class(ctx, fr.path, fr.qn, is_module);
 
     /* Superclass: `class C < Base` — the `superclass` field wraps the
-     * expression after `<`. */
+     * expression after `<`. The ref is resolved from the DECLARING scope
+     * (the frame just pushed does not apply to its own superclass), so pack
+     * it with the outer nesting. */
     if (ci && !is_module && !ci->superclass_ref) {
         TSNode sup = ts_node_child_by_field_name(node, "superclass", 10);
         if (!ts_node_is_null(sup)) {
@@ -1013,24 +1082,20 @@ static void ruby_pass1_class(RubyLSPContext *ctx, TSNode node, bool is_module) {
             for (uint32_t i = 0; i < sc; i++) {
                 const char *spath = ruby_const_path(ctx, ts_node_named_child(sup, i));
                 if (spath) {
+                    const char *inner = ctx->nesting;
+                    ctx->nesting = fr.saved_nesting;
                     ci->superclass_ref = ruby_pack_ref(ctx, spath);
+                    ctx->nesting = inner;
                     break;
                 }
             }
         }
     }
 
-    ctx->nesting = full_path;
-    const char *saved_class = ctx->enclosing_class_qn;
-    bool saved_singleton = ctx->in_singleton_method;
-    ctx->enclosing_class_qn = qn;
-    ctx->in_singleton_method = false;
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
     if (!ts_node_is_null(body))
         ruby_pass1_scan(ctx, body);
-    ctx->nesting = saved_nesting;
-    ctx->enclosing_class_qn = saved_class;
-    ctx->in_singleton_method = saved_singleton;
+    ruby_class_leave(ctx, &fr);
 }
 
 static void ruby_pass1_scan(RubyLSPContext *ctx, TSNode node) {
@@ -1145,19 +1210,13 @@ static void ruby_ivar_scan_inner(RubyLSPContext *ctx, TSNode node) {
     const char *k = ts_node_type(node);
 
     if (strcmp(k, "class") == 0 || strcmp(k, "module") == 0) {
-        TSNode name = ts_node_child_by_field_name(node, "name", 4);
-        const char *cpath = ruby_const_path(ctx, name);
-        if (!cpath)
+        RubyClassFrame fr;
+        if (!ruby_class_enter(ctx, node, &fr))
             return;
-        const char *saved_nesting = ctx->nesting;
-        const char *saved_class = ctx->enclosing_class_qn;
-        ctx->nesting = ruby_path_join(ctx->arena, saved_nesting, cpath);
-        ctx->enclosing_class_qn = ruby_resolve_constant(ctx, cpath);
         TSNode body = ts_node_child_by_field_name(node, "body", 4);
         if (!ts_node_is_null(body))
             ruby_ivar_scan(ctx, body);
-        ctx->nesting = saved_nesting;
-        ctx->enclosing_class_qn = saved_class;
+        ruby_class_leave(ctx, &fr);
         return;
     }
 

@@ -88,6 +88,41 @@ static const CBMResolvedCall *find_resolved_with_strategy(const CBMFileResult *r
     return NULL;
 }
 
+/* Exact-name match on BOTH ends. The pipeline joins a resolved row to its
+ * caller def by exact QN equality, so a row whose caller is spelled even
+ * slightly differently from the extractor's def is silently dropped —
+ * substring matching would hide exactly that failure. */
+static int find_resolved_exact(const CBMFileResult *r, const char *caller_qn,
+                               const char *callee_qn) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && rc->callee_qn && strcmp(rc->caller_qn, caller_qn) == 0 &&
+            strcmp(rc->callee_qn, callee_qn) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void dump_resolved(const CBMFileResult *r) {
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        printf("    %s -> %s [%s %.2f]\n", rc->caller_qn ? rc->caller_qn : "(null)",
+               rc->callee_qn ? rc->callee_qn : "(null)", rc->strategy ? rc->strategy : "(null)",
+               rc->confidence);
+    }
+}
+
+static int require_resolved_exact(const CBMFileResult *r, const char *caller_qn,
+                                  const char *callee_qn) {
+    int idx = find_resolved_exact(r, caller_qn, callee_qn);
+    if (idx < 0) {
+        printf("  MISSING exact resolved call: %s -> %s (have %d)\n", caller_qn, callee_qn,
+               r->resolved_calls.count);
+        dump_resolved(r);
+    }
+    return idx;
+}
+
 static const CBMDefinition *find_def(const CBMFileResult *r, const char *label, const char *name) {
     for (int i = 0; i < r->defs.count; i++) {
         const CBMDefinition *d = &r->defs.items[i];
@@ -487,6 +522,117 @@ TEST(rubylsp_nested_modules) {
     PASS();
 }
 
+/* ── 12b. Compact `class A::B` names match the extractor byte-for-byte ── */
+
+/* The structural extractor names a compact declaration with its RAW name text
+ * (`Admin::User`), and the pipeline joins a resolved row to its caller def by
+ * exact QN equality. A resolver that normalised the name to `Admin.User` would
+ * have every row from or to such a class dropped at the join — silently, since
+ * substring assertions would still pass. Pin the exact spelling on both ends,
+ * and pin that the extractor's def really is spelled that way. */
+TEST(rubylsp_compact_class_name_exact) {
+    const char *src = "class Admin::User\n"
+                      "  def initialize\n"
+                      "  end\n"
+                      "  def name\n"
+                      "    'n'\n"
+                      "  end\n"
+                      "  def shout\n"
+                      "    self.name\n"
+                      "  end\n"
+                      "end\n"
+                      "class Outside\n"
+                      "  def probe\n"
+                      "    u = Admin::User.new\n"
+                      "    u.name\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    /* The extractor's contract this resolver must reproduce. */
+    const CBMDefinition *m = find_def(r, "Method", "name");
+    ASSERT(m);
+    ASSERT(strcmp(m->qualified_name, "test.main.Admin::User.name") == 0);
+    ASSERT(m->parent_class && strcmp(m->parent_class, "test.main.Admin::User") == 0);
+    /* Caller inside the compact class, callee inside it. */
+    ASSERT(require_resolved_exact(r, "test.main.Admin::User.shout", "test.main.Admin::User.name") >=
+           0);
+    /* Caller outside: constructor row lands on the class QN, typed call on
+     * the method QN — both in the extractor's spelling. */
+    ASSERT(require_resolved_exact(r, "test.main.Outside.probe", "test.main.Admin::User") >= 0);
+    ASSERT(require_resolved_exact(r, "test.main.Outside.probe", "test.main.Admin::User.name") >= 0);
+    /* And the dotted spelling must NOT appear anywhere. */
+    ASSERT(find_resolved(r, "Outside.probe", "Admin.User") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Compact declaration nested inside a lexical module: the extractor joins the
+ * enclosing class QN with the raw name, giving `Admin.Foo::Bar`. */
+TEST(rubylsp_compact_class_inside_module_exact) {
+    const char *src = "module Admin\n"
+                      "  class Foo::Bar\n"
+                      "    def m\n"
+                      "      1\n"
+                      "    end\n"
+                      "  end\n"
+                      "  class Panel\n"
+                      "    def show\n"
+                      "      Foo::Bar.new.m\n"
+                      "    end\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    const CBMDefinition *m = find_def(r, "Method", "m");
+    ASSERT(m);
+    ASSERT(strcmp(m->qualified_name, "test.main.Admin.Foo::Bar.m") == 0);
+    ASSERT(require_resolved_exact(r, "test.main.Admin.Panel.show", "test.main.Admin.Foo::Bar") >=
+           0);
+    ASSERT(require_resolved_exact(r, "test.main.Admin.Panel.show", "test.main.Admin.Foo::Bar.m") >=
+           0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Inside `class Admin::User`, Ruby's lexical nesting is [Admin::User] only —
+ * `Admin` is not opened, so a bare `Helper` does NOT see Admin::Helper. A
+ * resolver that probed the dotted prefixes (Admin.User, Admin, "") would
+ * invent that constant and emit a wrong constructor edge. The explicit
+ * `Admin::Helper` still resolves. */
+TEST(rubylsp_compact_class_does_not_open_outer_scope) {
+    const char *src = "module Admin\n"
+                      "  class Helper\n"
+                      "    def initialize\n"
+                      "    end\n"
+                      "    def assist\n"
+                      "      1\n"
+                      "    end\n"
+                      "  end\n"
+                      "end\n"
+                      "class Admin::User\n"
+                      "  def bare\n"
+                      "    h = Helper.new\n"
+                      "    h.assist\n"
+                      "  end\n"
+                      "  def explicit\n"
+                      "    h = Admin::Helper.new\n"
+                      "    h.assist\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    /* Bare `Helper` inside the compact class: no edge at all. */
+    ASSERT(find_resolved(r, "Admin::User.bare", "Helper") < 0);
+    /* Fully qualified reference resolves, in exact extractor spelling. */
+    ASSERT(require_resolved_exact(r, "test.main.Admin::User.explicit", "test.main.Admin.Helper") >=
+           0);
+    ASSERT(require_resolved_exact(r, "test.main.Admin::User.explicit",
+                                  "test.main.Admin.Helper.assist") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 13. ActiveRecord model typing ──────────────────────────────── */
 
 TEST(rubylsp_activerecord_model_typing) {
@@ -628,6 +774,9 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_ivar_conflict_no_edge);
     RUN_TEST(rubylsp_chained_constructor_call);
     RUN_TEST(rubylsp_nested_modules);
+    RUN_TEST(rubylsp_compact_class_name_exact);
+    RUN_TEST(rubylsp_compact_class_inside_module_exact);
+    RUN_TEST(rubylsp_compact_class_does_not_open_outer_scope);
     RUN_TEST(rubylsp_activerecord_model_typing);
     RUN_TEST(rubylsp_top_level_function);
     RUN_TEST(rubylsp_unknown_receiver_no_edge);
