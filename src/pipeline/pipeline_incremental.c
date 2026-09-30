@@ -1625,6 +1625,8 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
      * leaked one map per probed run (LSan, macOS CI). */
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(NULL);
     cbm_path_alias_collection_free(aliases);
     cbm_gbuf_free(probe_gbuf);
     return rc;
@@ -2196,6 +2198,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     }
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(NULL);
     if (phase_rc != 0) {
         cbm_log_error("delta.err", "phase", "extract_resolve", "rc", itoa_buf(phase_rc));
         goto out;
@@ -2775,6 +2779,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * full pipeline's ownership boundary on both success and failure. */
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(NULL);
 
     if (phase_rc != 0) {
         cbm_log_error("incremental.err", "phase", "extract_resolve", "rc", itoa_buf(phase_rc));

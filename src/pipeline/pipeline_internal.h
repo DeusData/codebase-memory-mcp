@@ -205,6 +205,16 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 
+/* Get the current pipeline's declared-package map (NULL if none): the
+ * namespace/package → File-QN map built by cbm_pipeline_namespace_map_build
+ * from every indexed file's own `package`/`namespace`/`using` declaration.
+ * The import passes build it to resolve namespace imports; it is published
+ * here so the call passes can ask whether a package-path specifier names a
+ * package the tree itself declares (#1355). Set before resolve starts, read
+ * only afterwards — same single-writer contract as the pkgmap above. */
+CBMHashTable *cbm_pipeline_get_nsmap(void);
+void cbm_pipeline_set_nsmap(CBMHashTable *map);
+
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
  * Caller must free() the returned string. */

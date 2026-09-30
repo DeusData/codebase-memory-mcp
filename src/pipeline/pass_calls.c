@@ -476,7 +476,8 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
-                               const CBMResolvedCallArray *lsp_calls, const char *rel,
+                               const CBMResolvedCallArray *lsp_calls,
+                               const CBMImportArray *file_imports, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
                                int imp_count, CBMLanguage lang) {
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
@@ -644,13 +645,25 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     /* The member guard's one exemption (Python, self/cls-rooted receiver,
      * unique_name, not a builtin type's method) — see
      * cbm_weak_member_unique_name_exempt. MUST match pass_parallel.c exactly. */
+    /* #1355: `import { eq } from "drizzle-orm"` binds `eq` to a package that is
+     * not in the indexed tree, so a project-wide same-name guess must not turn
+     * `eq(...)` into a CALLS edge to an unrelated project `eq`. Joined to
+     * drop_plain_call for the reason spelled out above: dropping the call here
+     * would also skip route/HTTP/CONFIG classification, and a route
+     * registration reached through a static import (`import static
+     * spark.Spark.get` + `get("/x", handler)`) is exactly a bare call bound by
+     * a package specifier. Suppressing only the plain-CALLS fall-through keeps
+     * every Route node and service edge main-identical. */
     bool drop_plain_call =
         (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
          !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                              call->receiver_is_self_attribute, call->callee_name,
                                              res.strategy)) ||
         cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
-                                             call->callee_is_locally_bound, res.strategy);
+                                             call->callee_is_locally_bound, res.strategy) ||
+        cbm_suppress_external_import_shadow(call->callee_name, res.strategy, file_imports, imp_keys,
+                                            imp_count, cbm_pipeline_get_pkgmap(),
+                                            cbm_pipeline_get_nsmap());
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -841,8 +854,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+            if (resolve_single_call(ctx, call, &result->resolved_calls, &result->imports, rel,
+                                    module_qn, imp_keys, imp_vals, imp_count, files[i].language)) {
                 resolved++;
             } else {
                 unresolved++;
