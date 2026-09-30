@@ -1491,6 +1491,11 @@ TEST(config_toml_remove_self_heals_orphan_opening_marker_issue1558) {
     "[mcp_servers.codebase-memory-mcp]\ncommand = \"/opt/new/codebase-memory-mcp\"\nargs = " \
     "[]\nenv_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
 static const char *CTE_2228_HEADER = "[mcp_servers.codebase-memory-mcp]";
+static const char *CTE_2228_HOOKS_BLOCK =
+    "[[hooks]]\n"
+    "event = \"UserPromptSubmit\"\n"
+    "command = \"/new/codebase-memory-mcp hook-augment --dialect kimi\"\n"
+    "timeout = 5\n";
 
 /* The LF text as is, or as Windows writes it: a BOM first and CRLF line ends. */
 static int cte_variant(int windows, const char *text, char *output, size_t output_size) {
@@ -1582,6 +1587,7 @@ TEST(config_toml_managed_upsert_merges_owned_table_issue2228) {
                            "[mcp_servers.\"codebase-memory-mcp\"]\n"
                            "# raised for the large index\n"
                            "startup_timeout_sec = 90\n"
+                           "experimental.flag = true\n"
                            "command = \"/tmp/old/codebase-memory-mcp\"\n"
                            "\n"
                            "[mcp_servers.codebase-memory-mcp.env]\n"
@@ -1643,11 +1649,7 @@ TEST(config_toml_managed_array_block_keeps_foreign_entries_issue2228) {
     char path[CTE_PATH_CAP];
     char expected[CTE_FILE_CAP];
     /* The Kimi hook shape: a second [[hooks]] element is a foreign entry, not
-     * a duplicate of ours. */
-    const char *block = "[[hooks]]\n"
-                        "event = \"UserPromptSubmit\"\n"
-                        "command = \"/new/codebase-memory-mcp hook-augment --dialect kimi\"\n"
-                        "timeout = 5\n";
+     * a duplicate of ours, and [hooks.meta] behind it belongs to that entry. */
     const char *original = "# BEGIN codebase-memory-mcp\n"
                            "[[hooks]]\n"
                            "event = \"UserPromptSubmit\"\n"
@@ -1657,12 +1659,16 @@ TEST(config_toml_managed_array_block_keeps_foreign_entries_issue2228) {
                            "[[hooks]]\n"
                            "event = \"PreToolUse\"\n"
                            "command = \"my-linter\"\n"
+                           "[hooks.meta]\n"
+                           "owner = \"me\"\n"
                            "# END codebase-memory-mcp\n";
     ASSERT_EQ(cte_replace_once(original, "/old/", "/new/", expected, sizeof(expected)), 0);
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
-    ASSERT(cte_managed_upsert_yields(path, original, block, expected));
-    ASSERT(cte_managed_remove_yields(
-        path, "[[hooks]]", "\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"my-linter\"\n"));
+    ASSERT(cte_managed_upsert_yields(path, original, CTE_2228_HOOKS_BLOCK, expected));
+    ASSERT(
+        cte_managed_remove_yields(path, "[[hooks]]",
+                                  "\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"my-linter\"\n"
+                                  "[hooks.meta]\nowner = \"me\"\n"));
     th_cleanup(dir);
     PASS();
 }
@@ -1694,12 +1700,33 @@ TEST(config_toml_managed_fails_closed_on_ambiguous_span_issue2228) {
         "[mcp_servers]\n\"codebase-memory-mcp\" = { command = \"x\" }\n# END codebase-memory-mcp\n",
         "# BEGIN codebase-memory-mcp\n[mcp_servers.codebase-memory-mcp]\ncommand = \"old\"\n"
         "args = [\n  \"--x\",\n]\n# END codebase-memory-mcp\n",
+        /* Keys the block writes, defined again as a dotted key or a sub-table. */
+        "# BEGIN codebase-memory-mcp\n[mcp_servers.codebase-memory-mcp]\ncommand.detail = \"x\"\n"
+        "# END codebase-memory-mcp\n",
+        "# BEGIN codebase-memory-mcp\n[mcp_servers.codebase-memory-mcp]\ncommand = \"old\"\n"
+        "[mcp_servers.codebase-memory-mcp.env_vars]\nA = \"1\"\n# END codebase-memory-mcp\n",
     };
     for (size_t i = 0; i < sizeof(unmergeable) / sizeof(unmergeable[0]); ++i) {
         ASSERT(cte_assert_unchanged_after_managed_upsert(path, unmergeable[i], CTE_2228_BLOCK));
     }
     /* Removal needs no merge, so the multi-line array goes with the table. */
+    ASSERT_EQ(th_write_file(path, unmergeable[1]), 0);
     ASSERT(cte_managed_remove_yields(path, CTE_2228_HEADER, ""));
+    /* An array block: [hooks] on the same path, or a sub-table of our element
+     * behind unrelated content, cannot be kept next to a [[hooks]] entry. */
+    static const char *array_conflicts[] = {
+        "# BEGIN codebase-memory-mcp\n[hooks]\nenabled = true\n# END codebase-memory-mcp\n",
+        "# BEGIN codebase-memory-mcp\n[[hooks]]\nevent = \"UserPromptSubmit\"\n[hooks]\n"
+        "enabled = true\n# END codebase-memory-mcp\n",
+        "# BEGIN codebase-memory-mcp\n[[hooks]]\nevent = \"UserPromptSubmit\"\n\n[desktop]\n"
+        "mode = \"steer\"\n\n[hooks.meta]\nowner = \"me\"\n# END codebase-memory-mcp\n",
+    };
+    for (size_t i = 0; i < sizeof(array_conflicts) / sizeof(array_conflicts[0]); ++i) {
+        ASSERT(cte_assert_unchanged_after_managed_upsert(path, array_conflicts[i],
+                                                         CTE_2228_HOOKS_BLOCK));
+        ASSERT_EQ(cbm_toml_remove_managed_block(path, CTE_BEGIN, CTE_END, "[[hooks]]"), -1);
+        ASSERT(cte_file_equals(path, array_conflicts[i]));
+    }
     /* A block is bare assignments or exactly one table with its assignments. */
     static const char *blocks[] = {"[a]\nx = 1\n[b]\ny = 2\n", "x = 1\n[t]\ny = 2\n"};
     for (size_t i = 0; i < sizeof(blocks) / sizeof(blocks[0]); ++i) {

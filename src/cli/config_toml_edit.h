@@ -27,14 +27,16 @@ int cbm_toml_escape_basic_string(const char *input, char *out, size_t out_size);
  * by single-line assignments. Duplicate or unbalanced markers are rejected
  * without changing the file.
  *
- * #2228: other writers may place content between the markers (Codex Desktop
- * appends its tables above a trailing closing marker), so only the block's own
+ * Other writers may leave content between the markers, so only the block's own
  * content is rewritten: the span's first table when it matches the block
  * header, plus the descendant tables right behind it. Keys the block defines
  * are replaced in place; every other line keeps its bytes. A missing owned
- * table is inserted in front of the span's first table. The edit fails closed
- * when the owned table or a descendant reappears behind unrelated content, or
- * when its own body is not single-line assignments. */
+ * table is inserted in front of the span's first table. For an array block a
+ * later element of the same array is foreign, with its sub-tables. The edit
+ * fails closed when a piece of the owned table reappears behind unrelated
+ * content, when a same-path table sits next to an array block, or when the
+ * owned body is not single-line assignments or redefines a key the block
+ * writes as a dotted key or sub-table. */
 int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker, const char *block);
 /* Remove the two marker lines and the block's own content, classified as
