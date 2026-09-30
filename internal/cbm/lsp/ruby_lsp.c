@@ -161,6 +161,7 @@ typedef struct {
     const char *saved_class;
     bool saved_singleton;
     bool saved_self_unknown;
+    int saved_block_depth;
 } RubyClassFrame;
 
 /* Enter a class/module node: compute names, push nesting + enclosing class.
@@ -178,6 +179,7 @@ static bool ruby_class_enter(RubyLSPContext *ctx, TSNode node, RubyClassFrame *f
     fr->saved_class = ctx->enclosing_class_qn;
     fr->saved_singleton = ctx->in_singleton_method;
     fr->saved_self_unknown = ctx->self_unknown;
+    fr->saved_block_depth = ctx->block_depth;
 
     fr->path = ruby_path_join(ctx->arena, ruby_dotted(ctx->arena, fr->saved_nesting), cpath);
     if (fr->saved_class)
@@ -191,6 +193,7 @@ static bool ruby_class_enter(RubyLSPContext *ctx, TSNode node, RubyClassFrame *f
     ctx->enclosing_class_qn = fr->qn;
     ctx->in_singleton_method = false;
     ctx->self_unknown = false; /* a class body names its self again */
+    ctx->block_depth = 0;
     return true;
 }
 
@@ -199,6 +202,7 @@ static void ruby_class_leave(RubyLSPContext *ctx, const RubyClassFrame *fr) {
     ctx->enclosing_class_qn = fr->saved_class;
     ctx->in_singleton_method = fr->saved_singleton;
     ctx->self_unknown = fr->saved_self_unknown;
+    ctx->block_depth = fr->saved_block_depth;
 }
 
 /* True when a QN belongs to the indexed project (module_qn's first segment
@@ -1192,16 +1196,29 @@ static void ruby_resolve_calls_in_node_inner(RubyLSPContext *ctx, TSNode node) {
         ctx->in_singleton_method = saved;
         return;
     }
-    if (strcmp(k, "method") == 0) {
-        ruby_process_method(ctx, node, ctx->in_singleton_method);
-        return;
-    }
-    if (strcmp(k, "singleton_method") == 0) {
-        ruby_process_method(ctx, node, true);
+    if (strcmp(k, "method") == 0 || strcmp(k, "singleton_method") == 0) {
+        bool singleton = ctx->in_singleton_method || strcmp(k, "singleton_method") == 0;
+        if (ctx->block_depth > 0) {
+            /* A def inside a block. Inside a class body the extractor emits
+             * no def for it, so no row could ever join: skip it. At top
+             * level the extractor emits a plain Function, so typed-receiver
+             * calls in its body may resolve — but its `self` is whatever
+             * the block's DSL made it, so bare and self. calls emit nothing. */
+            if (ctx->enclosing_class_qn)
+                return;
+            bool saved = ctx->self_unknown;
+            ctx->self_unknown = true;
+            ruby_process_method(ctx, node, singleton);
+            ctx->self_unknown = saved;
+            return;
+        }
+        ruby_process_method(ctx, node, singleton);
         return;
     }
     if (strcmp(k, "block") == 0 || strcmp(k, "do_block") == 0 || strcmp(k, "lambda") == 0) {
+        ctx->block_depth++;
         ruby_process_block(ctx, node);
+        ctx->block_depth--;
         return;
     }
 
@@ -1418,6 +1435,11 @@ static void ruby_pass1_scan_inner(RubyLSPContext *ctx, TSNode node) {
         return;
     }
     if (strcmp(k, "method") == 0 || strcmp(k, "singleton_method") == 0) {
+        /* A def inside a block (`class_methods do … end`, `included do …
+         * end`, a describe group) is not a method of the enclosing
+         * class/module — and not a file-level function either. */
+        if (ctx->block_depth > 0)
+            return;
         bool singleton = ctx->in_singleton_method || strcmp(k, "singleton_method") == 0;
         TSNode name = ts_node_child_by_field_name(node, "name", 4);
         char *mname = ts_node_is_null(name) ? NULL : ruby_node_text(ctx, name);
@@ -1425,7 +1447,9 @@ static void ruby_pass1_scan_inner(RubyLSPContext *ctx, TSNode node) {
             ruby_register_method(ctx, ctx->build_reg, ctx->enclosing_class_qn, mname, singleton);
         return; /* method bodies are PASS-2 territory */
     }
-    if (strcmp(k, "call") == 0) {
+    if (strcmp(k, "call") == 0 && ctx->block_depth == 0) {
+        /* `include X` inside a block (`included do include X end`,
+         * `Foo.class_eval { include X }`) applies to some other module. */
         TSNode meth = ts_node_child_by_field_name(node, "method", 6);
         if (!ts_node_is_null(meth)) {
             char *mn = ruby_node_text(ctx, meth);
@@ -1437,12 +1461,18 @@ static void ruby_pass1_scan_inner(RubyLSPContext *ctx, TSNode node) {
         }
     }
 
+    bool is_block =
+        strcmp(k, "block") == 0 || strcmp(k, "do_block") == 0 || strcmp(k, "lambda") == 0;
+    if (is_block)
+        ctx->block_depth++;
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(node, i);
         if (!ts_node_is_null(c))
             ruby_pass1_scan(ctx, c);
     }
+    if (is_block)
+        ctx->block_depth--;
 }
 
 /* Finalize PASS 1: resolve superclass + mixin references now that the class

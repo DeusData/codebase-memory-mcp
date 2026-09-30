@@ -498,6 +498,85 @@ TEST(rubylsp_resolved_ancestry_still_resolves) {
     PASS();
 }
 
+/* ── 7d. Methods defined inside blocks are not members of the module ── */
+
+/* ActiveSupport's `class_methods do … end` / `included do … end` define
+ * methods on whatever class includes the concern (class-side, for
+ * class_methods), never instance methods of the concern module itself. A
+ * resolver that registered them on the module would then find them through
+ * `include Concern` and emit `Foo.new.build` -> Concern.build — an edge to a
+ * def the extractor does not even emit. Same for `include X` written INSIDE
+ * such a block: it applies to the includer, not the concern. */
+TEST(rubylsp_block_defs_not_module_members) {
+    const char *src = "module Other\n"
+                      "  def other_m\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "module Concern\n"
+                      "  class_methods do\n"
+                      "    def build\n"
+                      "      1\n"
+                      "    end\n"
+                      "  end\n"
+                      "  included do\n"
+                      "    include Other\n"
+                      "    def injected\n"
+                      "      2\n"
+                      "    end\n"
+                      "  end\n"
+                      "  def real\n"
+                      "    3\n"
+                      "  end\n"
+                      "end\n"
+                      "class Foo\n"
+                      "  include Concern\n"
+                      "  def initialize\n"
+                      "  end\n"
+                      "end\n"
+                      "class User\n"
+                      "  def run\n"
+                      "    f = Foo.new\n"
+                      "    f.build\n"
+                      "    f.injected\n"
+                      "    f.other_m\n"
+                      "    f.real\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(find_resolved(r, "User.run", "build") < 0);
+    ASSERT(find_resolved(r, "User.run", "injected") < 0);
+    ASSERT(find_resolved(r, "User.run", "other_m") < 0);
+    /* Positive control: a def directly in the module body IS a member. */
+    ASSERT(require_resolved_exact(r, "test.main.User.run", "test.main.Concern.real") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A def inside a top-level block (an RSpec group) has whatever `self` the
+ * DSL gave it: bare calls in its body emit nothing, and it is not a
+ * file-level function other top-level code can reach. */
+TEST(rubylsp_top_level_block_defs_fail_closed) {
+    const char *src = "def util\n"
+                      "  1\n"
+                      "end\n"
+                      "describe 'x' do\n"
+                      "  def helper\n"
+                      "    util()\n"
+                      "  end\n"
+                      "end\n"
+                      "def caller_fn\n"
+                      "  helper()\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(find_resolved(r, "helper", "util") < 0);
+    ASSERT(find_resolved(r, "caller_fn", "helper") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 8. extend mixin (class-side) ───────────────────────────────── */
 
 TEST(rubylsp_extend_mixin) {
@@ -1240,6 +1319,8 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_prepend_mixin);
     RUN_TEST(rubylsp_unresolved_ancestry_fails_closed);
     RUN_TEST(rubylsp_resolved_ancestry_still_resolves);
+    RUN_TEST(rubylsp_block_defs_not_module_members);
+    RUN_TEST(rubylsp_top_level_block_defs_fail_closed);
     RUN_TEST(rubylsp_extend_mixin);
     RUN_TEST(rubylsp_super_dispatch);
     RUN_TEST(rubylsp_ivar_typing);

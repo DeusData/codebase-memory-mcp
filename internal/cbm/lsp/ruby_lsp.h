@@ -114,6 +114,12 @@ typedef struct {
      * receiver of bare and `self.` calls is NOT the enclosing class, and
      * the resolver cannot know what it is — so they emit nothing. */
     bool self_unknown;
+    /* Number of enclosing blocks (`{ }`, `do end`, `-> { }`) since the
+     * nearest class/module body. A `def` met here is NOT a method of the
+     * enclosing class — ActiveSupport's `class_methods do … end`,
+     * `included do … end`, RSpec groups — so PASS 1 registers nothing for
+     * it and collects no mixins from it. */
+    int block_depth;
     const char *module_qn;
 
     /* Output: resolved calls accumulate here. */
