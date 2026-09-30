@@ -1110,6 +1110,9 @@ static void print_help(void) {
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp daemon <start|stop|status>\n");
+    printf("                                      start keeps a daemon warm so CLI calls and\n");
+    printf("                                      hooks skip the per-command daemon start-up\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
     printf("\nCLI output options:\n");
