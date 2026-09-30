@@ -1614,6 +1614,18 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             application_refresh_watch_locked(session);
             continue;
         }
+        /* ignore_worktrees can be turned on after this session was queued for
+         * a capacity slot. Initial admission already skips linked worktrees;
+         * retry must apply the same gate or the pending checkout is indexed
+         * once a slot opens. */
+        if (cbm_mcp_ignore_worktrees_enabled(session->mcp) &&
+            cbm_git_is_linked_worktree(root_path)) {
+            session->auto_index_retry_pending = false;
+            cbm_log_info("daemon.autoindex.skipped", "project", project, "reason",
+                         "linked_worktree");
+            application_refresh_watch_locked(session);
+            continue;
+        }
         char *args = application_auto_index_args(application, root_path);
         if (!args) {
             continue;
