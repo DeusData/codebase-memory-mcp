@@ -379,6 +379,125 @@ TEST(rubylsp_prepend_mixin) {
     PASS();
 }
 
+/* ── 7c. Unresolved ancestry fails closed ───────────────────────── */
+
+/* Three cases where an ancestor the resolver cannot see could define (or
+ * shadow) the method being called. Each one has a tempting local answer —
+ * the class's own method, a superclass method, a same-named top-level def —
+ * and each answer may be wrong, so none may be emitted. */
+TEST(rubylsp_unresolved_ancestry_fails_closed) {
+    const char *src = /* (a) unresolved PREPEND blocks an own-method hit: the
+                       * prepended module may shadow `save`. */
+        "class Record\n"
+        "  prepend UnseenAudit\n"
+        "  def save\n"
+        "    1\n"
+        "  end\n"
+        "  def persist\n"
+        "    self.save\n"
+        "  end\n"
+        "end\n"
+        "class RecordUser\n"
+        "  def run\n"
+        "    r = Record.new\n"
+        "    r.save\n"
+        "  end\n"
+        "end\n"
+        /* (b) unresolved INCLUDE stops the walk before the superclass chain:
+         * the included module may define `helper` ahead of Base. */
+        "class Base\n"
+        "  def helper\n"
+        "    1\n"
+        "  end\n"
+        "end\n"
+        "class Child < Base\n"
+        "  include UnseenConcern\n"
+        "  def work\n"
+        "    self.helper\n"
+        "  end\n"
+        "end\n"
+        "class ChildUser\n"
+        "  def run\n"
+        "    c = Child.new\n"
+        "    c.helper\n"
+        "  end\n"
+        "end\n"
+        /* (c) a bare call in a class with an unresolved SUPERCLASS must not
+         * fall through to a same-named top-level def. */
+        "def util\n"
+        "  1\n"
+        "end\n"
+        "class Orphan < UnseenBase\n"
+        "  def go\n"
+        "    util()\n"
+        "  end\n"
+        "  def again\n"
+        "    super\n"
+        "  end\n"
+        "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    /* (a) */
+    ASSERT(find_resolved(r, "Record.persist", "save") < 0);
+    ASSERT(find_resolved(r, "RecordUser.run", "save") < 0);
+    /* (b) */
+    ASSERT(find_resolved(r, "Child.work", "helper") < 0);
+    ASSERT(find_resolved(r, "ChildUser.run", "helper") < 0);
+    /* (c) */
+    ASSERT(find_resolved(r, "Orphan.go", "util") < 0);
+    ASSERT(find_resolved(r, "Orphan.again", "again") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Positive controls for the rule above: resolved ancestry still reaches the
+ * superclass and still falls through to a top-level def, and a hit found
+ * BEFORE the unseen ancestor in Ruby's lookup order is still emitted. */
+TEST(rubylsp_resolved_ancestry_still_resolves) {
+    const char *src = "module Seen\n"
+                      "  def greet\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "def util\n"
+                      "  1\n"
+                      "end\n"
+                      "class Base\n"
+                      "  def helper\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "class Child < Base\n"
+                      "  include Seen\n"
+                      "  def work\n"
+                      "    self.helper\n"
+                      "    util()\n"
+                      "  end\n"
+                      "end\n"
+                      "class Mixed < UnseenBase\n"
+                      "  include UnseenConcern\n"
+                      "  include Seen\n"
+                      "  def own\n"
+                      "    2\n"
+                      "  end\n"
+                      "  def work\n"
+                      "    self.own\n"
+                      "    self.greet\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(require_resolved_exact(r, "test.main.Child.work", "test.main.Base.helper") >= 0);
+    ASSERT(require_resolved_exact(r, "test.main.Child.work", "test.main.util") >= 0);
+    /* Own method precedes includes and the superclass in lookup order. */
+    ASSERT(require_resolved_exact(r, "test.main.Mixed.work", "test.main.Mixed.own") >= 0);
+    /* `include Seen` comes AFTER `include UnseenConcern`, so Seen is searched
+     * first and its hit is trustworthy. */
+    ASSERT(require_resolved_exact(r, "test.main.Mixed.work", "test.main.Seen.greet") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 8. extend mixin (class-side) ───────────────────────────────── */
 
 TEST(rubylsp_extend_mixin) {
@@ -1119,6 +1238,8 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_inheritance);
     RUN_TEST(rubylsp_include_mixin);
     RUN_TEST(rubylsp_prepend_mixin);
+    RUN_TEST(rubylsp_unresolved_ancestry_fails_closed);
+    RUN_TEST(rubylsp_resolved_ancestry_still_resolves);
     RUN_TEST(rubylsp_extend_mixin);
     RUN_TEST(rubylsp_super_dispatch);
     RUN_TEST(rubylsp_ivar_typing);
