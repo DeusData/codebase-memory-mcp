@@ -263,24 +263,21 @@ static void ruby_add_mixin(RubyLSPContext *ctx, const char *owner_qn, const char
     mi->kind = kind;
 }
 
-static void ruby_add_ivar(RubyLSPContext *ctx, const char *class_qn, const char *ivar_name,
-                          const char *type_qn) {
-    if (!ctx || !class_qn || !ivar_name || !type_qn)
-        return;
+/* Find-or-create the (class, @ivar) record. `type_qn` may be NULL when the
+ * caller only wants to latch a conflict on a name never typed. */
+static RubyIvarInfo *ruby_ivar_slot(RubyLSPContext *ctx, const char *class_qn,
+                                    const char *ivar_name) {
     for (int i = 0; i < ctx->ivar_count; i++) {
         RubyIvarInfo *iv = &ctx->ivars[i];
-        if (strcmp(iv->class_qn, class_qn) == 0 && strcmp(iv->ivar_name, ivar_name) == 0) {
-            if (strcmp(iv->type_qn, type_qn) != 0)
-                iv->conflicted = true; /* disagreeing assignments — no type */
-            return;
-        }
+        if (strcmp(iv->class_qn, class_qn) == 0 && strcmp(iv->ivar_name, ivar_name) == 0)
+            return iv;
     }
     if (ctx->ivar_count >= ctx->ivar_cap) {
         int newcap = ctx->ivar_cap ? ctx->ivar_cap * 2 : 8;
         RubyIvarInfo *ni =
             (RubyIvarInfo *)cbm_arena_alloc(ctx->arena, (size_t)newcap * sizeof(RubyIvarInfo));
         if (!ni)
-            return;
+            return NULL;
         for (int i = 0; i < ctx->ivar_count; i++)
             ni[i] = ctx->ivars[i];
         ctx->ivars = ni;
@@ -290,7 +287,34 @@ static void ruby_add_ivar(RubyLSPContext *ctx, const char *class_qn, const char 
     memset(iv, 0, sizeof(*iv));
     iv->class_qn = cbm_arena_strdup(ctx->arena, class_qn);
     iv->ivar_name = cbm_arena_strdup(ctx->arena, ivar_name);
-    iv->type_qn = cbm_arena_strdup(ctx->arena, type_qn);
+    return iv;
+}
+
+/* Record `@x = <type_qn>` (a resolved constructor). A second, different
+ * type latches the conflict. */
+static void ruby_add_ivar(RubyLSPContext *ctx, const char *class_qn, const char *ivar_name,
+                          const char *type_qn) {
+    if (!ctx || !class_qn || !ivar_name || !type_qn)
+        return;
+    RubyIvarInfo *iv = ruby_ivar_slot(ctx, class_qn, ivar_name);
+    if (!iv)
+        return;
+    if (!iv->type_qn)
+        iv->type_qn = cbm_arena_strdup(ctx->arena, type_qn);
+    else if (strcmp(iv->type_qn, type_qn) != 0)
+        iv->conflicted = true; /* disagreeing assignments — no type */
+}
+
+/* Latch `@x` as untypable: some write to it was not a resolved constructor
+ * (or `nil`). Lookup then returns nothing regardless of other assignments —
+ * the zero-edge guarantee beats a coin-flip type. */
+static void ruby_ivar_mark_conflict(RubyLSPContext *ctx, const char *class_qn,
+                                    const char *ivar_name) {
+    if (!ctx || !class_qn || !ivar_name)
+        return;
+    RubyIvarInfo *iv = ruby_ivar_slot(ctx, class_qn, ivar_name);
+    if (iv)
+        iv->conflicted = true;
 }
 
 static const char *ruby_ivar_type(RubyLSPContext *ctx, const char *class_qn,
@@ -299,7 +323,7 @@ static const char *ruby_ivar_type(RubyLSPContext *ctx, const char *class_qn,
         return NULL;
     for (int i = 0; i < ctx->ivar_count; i++) {
         RubyIvarInfo *iv = &ctx->ivars[i];
-        if (!iv->conflicted && strcmp(iv->class_qn, class_qn) == 0 &&
+        if (!iv->conflicted && iv->type_qn && strcmp(iv->class_qn, class_qn) == 0 &&
             strcmp(iv->ivar_name, ivar_name) == 0)
             return iv->type_qn;
     }
@@ -1345,6 +1369,44 @@ static const char *ruby_static_ctor_type(RubyLSPContext *ctx, TSNode expr) {
     return ruby_resolve_constant(ctx, cpath);
 }
 
+/* Observe one write to `@x` (the `left` node) with right-hand side `right`.
+ * Only a RESOLVED `Const.new` types the ivar; `nil` is neutral (a common
+ * reset that says nothing about the type); every other right-hand side —
+ * an unresolved constant's `.new`, a method result, a parameter, a literal
+ * — latches the conflict, exactly like two different constructors do. */
+static void ruby_ivar_observe_write(RubyLSPContext *ctx, TSNode left, TSNode right) {
+    char *ivar = ruby_node_text(ctx, left);
+    if (!ivar || !ivar[0])
+        return;
+    if (!ts_node_is_null(right) && strcmp(ts_node_type(right), "nil") == 0)
+        return;
+    const char *tqn = ruby_static_ctor_type(ctx, right);
+    if (tqn)
+        ruby_add_ivar(ctx, ctx->enclosing_class_qn, ivar, tqn);
+    else
+        ruby_ivar_mark_conflict(ctx, ctx->enclosing_class_qn, ivar);
+}
+
+/* Latch every instance variable named on the left of a multiple assignment
+ * (`@a, @b = ...`): per-element typing is not attempted. */
+static void ruby_ivar_conflict_assignment_list(RubyLSPContext *ctx, TSNode lhs) {
+    if (ts_node_is_null(lhs))
+        return;
+    const char *k = ts_node_type(lhs);
+    if (strcmp(k, "instance_variable") == 0) {
+        char *ivar = ruby_node_text(ctx, lhs);
+        if (ivar && ivar[0])
+            ruby_ivar_mark_conflict(ctx, ctx->enclosing_class_qn, ivar);
+        return;
+    }
+    if (strcmp(k, "left_assignment_list") == 0 || strcmp(k, "destructured_left_assignment") == 0 ||
+        strcmp(k, "rest_assignment") == 0) {
+        uint32_t nc = ts_node_named_child_count(lhs);
+        for (uint32_t i = 0; i < nc; i++)
+            ruby_ivar_conflict_assignment_list(ctx, ts_node_named_child(lhs, i));
+    }
+}
+
 static void ruby_ivar_scan(RubyLSPContext *ctx, TSNode node) {
     if (ctx->walk_depth >= CBM_LSP_RUBY_MAX_WALK_DEPTH)
         return;
@@ -1369,15 +1431,33 @@ static void ruby_ivar_scan_inner(RubyLSPContext *ctx, TSNode node) {
         return;
     }
 
-    if (strcmp(k, "assignment") == 0 && ctx->enclosing_class_qn) {
-        TSNode left = ts_node_child_by_field_name(node, "left", 4);
-        TSNode right = ts_node_child_by_field_name(node, "right", 5);
-        if (!ts_node_is_null(left) && !ts_node_is_null(right) &&
-            strcmp(ts_node_type(left), "instance_variable") == 0) {
-            const char *tqn = ruby_static_ctor_type(ctx, right);
-            if (tqn) {
-                char *ivar = ruby_node_text(ctx, left);
-                ruby_add_ivar(ctx, ctx->enclosing_class_qn, ivar, tqn);
+    if (ctx->enclosing_class_qn) {
+        if (strcmp(k, "assignment") == 0) {
+            TSNode left = ts_node_child_by_field_name(node, "left", 4);
+            TSNode right = ts_node_child_by_field_name(node, "right", 5);
+            if (!ts_node_is_null(left)) {
+                const char *lk = ts_node_type(left);
+                if (strcmp(lk, "instance_variable") == 0)
+                    ruby_ivar_observe_write(ctx, left, right);
+                else if (strcmp(lk, "left_assignment_list") == 0)
+                    ruby_ivar_conflict_assignment_list(ctx, left);
+            }
+        } else if (strcmp(k, "operator_assignment") == 0) {
+            /* `@x ||= Const.new` is the memoised-constructor idiom and counts
+             * as a constructor assignment; any other operator is an untyped
+             * write. */
+            TSNode left = ts_node_child_by_field_name(node, "left", 4);
+            TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+            TSNode right = ts_node_child_by_field_name(node, "right", 5);
+            if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "instance_variable") == 0) {
+                char *optxt = ts_node_is_null(op) ? NULL : ruby_node_text(ctx, op);
+                if (optxt && strcmp(optxt, "||=") == 0) {
+                    ruby_ivar_observe_write(ctx, left, right);
+                } else {
+                    char *ivar = ruby_node_text(ctx, left);
+                    if (ivar && ivar[0])
+                        ruby_ivar_mark_conflict(ctx, ctx->enclosing_class_qn, ivar);
+                }
             }
         }
     }

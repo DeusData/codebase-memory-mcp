@@ -479,6 +479,114 @@ TEST(rubylsp_ivar_conflict_no_edge) {
     PASS();
 }
 
+/* Any write to @x that is not a resolved constructor (or nil) must latch the
+ * conflict, the same way two different constructors do — a method result, a
+ * parameter, an unresolved constant's `.new`, a compound operator, or a
+ * multiple assignment. Otherwise `@x = Foo.new` in one method silently types
+ * every other method's `@x` even after it was reassigned to who-knows-what. */
+TEST(rubylsp_ivar_non_constructor_write_latches) {
+    const char *src = "class Engine\n"
+                      "  def start\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "class ViaMethod\n"
+                      "  def initialize\n"
+                      "    @e = Engine.new\n"
+                      "  end\n"
+                      "  def reset\n"
+                      "    @e = compute\n"
+                      "  end\n"
+                      "  def go\n"
+                      "    @e.start\n"
+                      "  end\n"
+                      "end\n"
+                      "class ViaParam\n"
+                      "  def initialize(e)\n"
+                      "    @e = Engine.new\n"
+                      "    @e = e\n"
+                      "  end\n"
+                      "  def go\n"
+                      "    @e.start\n"
+                      "  end\n"
+                      "end\n"
+                      "class ViaUnknownCtor\n"
+                      "  def initialize\n"
+                      "    @e = Engine.new\n"
+                      "    @e = Mystery.new\n"
+                      "  end\n"
+                      "  def go\n"
+                      "    @e.start\n"
+                      "  end\n"
+                      "end\n"
+                      "class ViaCompound\n"
+                      "  def initialize\n"
+                      "    @e = Engine.new\n"
+                      "    @e += 1\n"
+                      "  end\n"
+                      "  def go\n"
+                      "    @e.start\n"
+                      "  end\n"
+                      "end\n"
+                      "class ViaMulti\n"
+                      "  def initialize(a)\n"
+                      "    @e = Engine.new\n"
+                      "    @e, @f = a\n"
+                      "  end\n"
+                      "  def go\n"
+                      "    @e.start\n"
+                      "  end\n"
+                      "end\n"
+                      "class ViaOrUntyped\n"
+                      "  def initialize\n"
+                      "    @e = Engine.new\n"
+                      "  end\n"
+                      "  def lazy\n"
+                      "    @e ||= build\n"
+                      "  end\n"
+                      "  def go\n"
+                      "    @e.start\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(find_resolved(r, "ViaMethod.go", "Engine.start") < 0);
+    ASSERT(find_resolved(r, "ViaParam.go", "Engine.start") < 0);
+    ASSERT(find_resolved(r, "ViaUnknownCtor.go", "Engine.start") < 0);
+    ASSERT(find_resolved(r, "ViaCompound.go", "Engine.start") < 0);
+    ASSERT(find_resolved(r, "ViaMulti.go", "Engine.start") < 0);
+    ASSERT(find_resolved(r, "ViaOrUntyped.go", "Engine.start") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `@x ||= Const.new` is the memoised-constructor idiom and counts as a
+ * constructor assignment; a `nil` reset says nothing about the type. */
+TEST(rubylsp_ivar_or_assign_constructor_types) {
+    const char *src = "class Engine\n"
+                      "  def start\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "class Car\n"
+                      "  def engine\n"
+                      "    @engine ||= Engine.new\n"
+                      "  end\n"
+                      "  def clear\n"
+                      "    @engine = nil\n"
+                      "  end\n"
+                      "  def drive\n"
+                      "    @engine.start\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(require_resolved_exact(r, "test.main.Car.drive", "test.main.Engine.start") >= 0);
+    ASSERT(find_resolved_with_strategy(r, "Car.drive", "Engine.start", "ruby_ivar_method"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 11. Chained calls ──────────────────────────────────────────── */
 
 TEST(rubylsp_chained_constructor_call) {
@@ -928,6 +1036,8 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_super_dispatch);
     RUN_TEST(rubylsp_ivar_typing);
     RUN_TEST(rubylsp_ivar_conflict_no_edge);
+    RUN_TEST(rubylsp_ivar_non_constructor_write_latches);
+    RUN_TEST(rubylsp_ivar_or_assign_constructor_types);
     RUN_TEST(rubylsp_chained_constructor_call);
     RUN_TEST(rubylsp_nested_modules);
     RUN_TEST(rubylsp_compact_class_name_exact);
