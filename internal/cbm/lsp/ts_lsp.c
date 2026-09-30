@@ -1786,8 +1786,30 @@ static const CBMType *eval_indexed_access(TSLSPContext *ctx, const CBMType *obj,
 }
 
 // Look up a method on a receiver type — returns the registered func.
+static const CBMRegisteredFunc *lookup_method_inner(TSLSPContext *ctx, const CBMType *recv,
+                                                    const char *method_name);
+
+#define TS_LSP_MAX_METHOD_DEPTH 64
+
+/* Depth-guarded entry, mirroring lookup_member_type: method lookup recurses
+ * through wrapper classes, union members and extends/implements. A registered
+ * type that lists itself among its embedded types (opencode's
+ * `class Service extends Context.Service<Service, Interface>()(...)` in
+ * packages/core/src/tool/registry.ts) recursed without bound — SIGBUS stack
+ * overflow under endless lookup_method frames, killing the whole index run.
+ * Past the cap the method is unresolved — graceful degradation, not a crash. */
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name) {
+    if (!ctx || ctx->method_depth >= TS_LSP_MAX_METHOD_DEPTH)
+        return NULL;
+    ctx->method_depth++;
+    const CBMRegisteredFunc *f = lookup_method_inner(ctx, recv, method_name);
+    ctx->method_depth--;
+    return f;
+}
+
+static const CBMRegisteredFunc *lookup_method_inner(TSLSPContext *ctx, const CBMType *recv,
+                                                    const char *method_name) {
     if (!ctx || !recv || !method_name)
         return NULL;
     const CBMType *base = simplify_type(ctx, recv);

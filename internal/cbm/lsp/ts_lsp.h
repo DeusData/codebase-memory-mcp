@@ -69,6 +69,11 @@ typedef struct {
     // recursive unions/wrappers across registered types) otherwise recurse
     // without bound — stack overflow on real repos.
     int member_depth;
+    // Same guard for lookup_method, which walks the identical wrapper / union /
+    // extends graph. A registered type whose embedded_types names itself (e.g.
+    // an Effect `class Service extends Context.Service<Service, I>()(...)` whose
+    // extends clause resolves back to the class) sent it into endless frames.
+    int method_depth;
 } TSLSPContext;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
