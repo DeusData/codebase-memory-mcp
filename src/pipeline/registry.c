@@ -30,6 +30,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
+#include "callable_sig.h" /* cbm_qn_callable_base_len_named: overloads share the name key */
 
 #include <math.h>
 #include <stdio.h>
@@ -943,15 +944,24 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
      * their dotted form would only widen the bucket the scorer walks.
      *
      * `name` is NULL or empty only for callers that have no symbol name to
-     * give; those have the derived key and nothing else. */
+     * give; those have the derived key and nothing else.
+     *
+     * A signature-qualified callable (#2061) is indexed by its bare `name` in
+     * place of the derived key, so every overload shares one bucket; any other
+     * QN keeps its historical last-segment key. */
     const char *derived = simple_name(qualified_name);
-    index_under_name(r, derived, owned_qn);
+    const char *primary =
+        name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
+    index_under_name(r, primary, owned_qn);
     /* '#' is a QN fence, and extract_defs.c's rust_cfg_qualified_name is the
      * only thing in the tree that mints one today. A grammar that starts
      * minting a '#' opts into this second key by doing so, whatever it means by
      * the fence: its symbols become reachable under the passed name as well,
-     * and they share that name's bucket with everything else filed under it. */
-    if (name && name[0] && strchr(derived, '#') && strcmp(name, derived) != 0) {
+     * and they share that name's bucket with everything else filed under it.
+     * The passed name is compared with the key already written: a
+     * signature-qualified callable is filed under `name` already, and its
+     * capped suffix may carry a '#' of its own. */
+    if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
         index_under_name(r, name, owned_qn);
     }
 }

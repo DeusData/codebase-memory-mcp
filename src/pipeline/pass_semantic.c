@@ -23,6 +23,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
 #include "cbm.h"
+#include "callable_sig.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -356,7 +357,14 @@ static void go_index_add(go_method_index_t *ix, const char *name, int type_index
 static void go_index_visit_node(const cbm_gbuf_node_t *node, void *userdata) {
     go_method_index_t *ix = userdata;
     const char *qn = node->qualified_name;
-    const char *dot = qn ? strrchr(qn, '.') : NULL;
+    /* Last '.' of the base QN (a callable identity suffix never holds one). */
+    const char *dot = NULL;
+    size_t base_len = cbm_qn_callable_base_len_named(qn, node->name);
+    for (size_t i = 0; qn && i < base_len; i++) {
+        if (qn[i] == '.') {
+            dot = qn + i;
+        }
+    }
     if (!dot || dot == qn || !dot[SKIP_ONE]) {
         return;
     }
