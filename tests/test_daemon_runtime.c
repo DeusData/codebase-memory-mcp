@@ -1918,6 +1918,59 @@ TEST(daemon_runtime_unverifiable_image_is_admitted_issue1539) {
     PASS();
 }
 
+/* #1955: a client whose binary is a DIFFERENT file with identical bytes (a
+ * second install path, a package-manager copy) misses the active-image
+ * comparison, so the daemon proves it by hashing the peer's whole image. With
+ * a ~300 MB release binary that hash costs more than the client's 1000 ms
+ * HELLO budget: the client gave up, re-probed, and every re-probe started the
+ * same hash again on a fresh worker, so such a client waited out the full
+ * 30 s startup deadline against a healthy daemon (worse under indexing load).
+ * A verified image must be remembered: repeated admissions of the same copy
+ * hash it once. Asserted on the hash count, never on time. */
+TEST(daemon_runtime_verified_peer_copy_is_hashed_once_issue1955) {
+    /* The first admission really hashes the test binary (hundreds of MB,
+     * slower still under sanitizers), so its HELLO gets a hang-guard ceiling,
+     * not a budget: the verdict is the hash count below. */
+    enum { ADMISSIONS = 3, HASHED_HELLO_CEILING_MS = 120000 };
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "image-copy-cache", &identity);
+    int admitted = 0;
+    /* An owner session keeps the ephemeral generation alive across the
+     * sequential admissions below (the last committed client leaving retires
+     * it). It connects before the seam, through the active-image fast path. */
+    cbm_daemon_runtime_connect_result_t owner_result = {0};
+    cbm_daemon_runtime_client_t *owner =
+        started ? cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                    RUNTIME_TEST_TIMEOUT_MS, &owner_result)
+                : NULL;
+    uint64_t hashes_before = cbm_daemon_runtime_peer_image_hashes_for_testing();
+
+    cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(true);
+    for (int i = 0; owner && i < ADMISSIONS; i++) {
+        cbm_daemon_runtime_connect_result_t result = {0};
+        cbm_daemon_runtime_client_t *client = cbm_daemon_runtime_client_connect(
+            fixture.endpoint, &identity, HASHED_HELLO_CEILING_MS, &result);
+        if (client && result.status == CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED &&
+            cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS)) {
+            admitted++;
+        } else if (client) {
+            (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+        }
+    }
+    cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(false);
+    uint64_t hashes = cbm_daemon_runtime_peer_image_hashes_for_testing() - hashes_before;
+    bool owner_closed = owner && cbm_daemon_runtime_client_close(owner, RUNTIME_TEST_TIMEOUT_MS);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(owner_closed);
+    ASSERT_EQ(admitted, ADMISSIONS);
+    ASSERT_EQ(hashes, 1);
+    PASS();
+}
+
 TEST(daemon_runtime_unexpected_frame_payload_is_freed_once) {
     static const uint8_t unexpected_payload[] = {0xde, 0xad, 0xbe, 0xef};
     cbm_daemon_build_identity_t identity =
@@ -5119,6 +5172,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
     RUN_TEST(daemon_runtime_image_rejection_reaches_client_issue1383);
     RUN_TEST(daemon_runtime_unverifiable_image_is_admitted_issue1539);
+    RUN_TEST(daemon_runtime_verified_peer_copy_is_hashed_once_issue1955);
     RUN_TEST(daemon_runtime_unexpected_frame_payload_is_freed_once);
     RUN_TEST(daemon_runtime_activation_rejects_forged_and_malformed_without_stop);
     RUN_TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients);

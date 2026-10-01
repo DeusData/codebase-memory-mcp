@@ -70,4 +70,15 @@ void cbm_result_spill_close(cbm_result_spill_t *sp);
  * `new_base`. Exposed for tests. */
 void cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len, char *new_base);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test builds only: open's free-space reading (and so its low-disk refusal and
+ * its disk-share cap) answers `bytes` instead of asking the disk; 0 asks the
+ * disk again. Returns the previous pin. A test's verdict must not depend on how
+ * full the machine's disk happens to be, so the test runner pins ample space
+ * for the whole process and the refusal test pins a low value on purpose. */
+size_t cbm_result_spill_pin_free_bytes_for_tests(size_t bytes);
+/* The production floor: below this much free space, open refuses. */
+size_t cbm_result_spill_free_floor_bytes_for_tests(void);
+#endif
+
 #endif /* CBM_RESULT_SPILL_H */

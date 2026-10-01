@@ -404,7 +404,8 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
  * Prints each file path to stdout. Returns count of .db files found. */
 int cbm_list_indexes(const char *home_dir);
 
-/* Remove all .db files in the cache directory. Returns count removed. */
+/* Remove every project index .db (and its sidecars) in the cache directory.
+ * Internal stores (_config.db, _cross_repo.db) are kept. Returns count removed. */
 int cbm_remove_indexes(const char *home_dir);
 
 /* ── Config store (persistent key-value, backed by _config.db) ── */
@@ -503,6 +504,12 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
 const char *cbm_cli_activation_runtime_parent_for_test(void);
+
+/* Internal integration-test seam: the activation scope read reports the active
+ * cohort's cache fingerprint as unreadable (blank), exactly what the scope
+ * decision sees when that field cannot be recovered. false restores the real
+ * read. Not a command-line or environment override. */
+void cbm_cli_set_activation_scope_cache_unreadable_for_test(bool unreadable);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 

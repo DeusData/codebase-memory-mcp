@@ -5,6 +5,7 @@
 #include "../arena.h"
 #include <stdatomic.h> /* relaxed cache for cbm_lsp_max_walk_depth */
 #include <stdlib.h>     /* getenv, atoi (cbm_lsp_max_walk_depth) */
+#include <string.h>     /* strcmp (cbm_scope_lookup_binding) */
 
 typedef struct {
     const char* name;
@@ -29,6 +30,25 @@ typedef struct CBMScope {
     CBMScopeChunk* chunks;
     CBMArena* arena;        // owning arena, propagated to children at push time
 } CBMScope;
+
+/* Return the complete nearest binding in one scope-chain walk, or NULL when
+ * unbound. Keep this internal hot-path primitive inline: all language
+ * resolvers use cbm_scope_lookup(), while Python also consumes the complete
+ * record to avoid repeating the same linear scan. */
+static inline const CBMVarBinding *cbm_scope_lookup_binding(const CBMScope *scope,
+                                                            const char *name) {
+    if (!name)
+        return NULL;
+    for (const CBMScope *s = scope; s != NULL; s = s->parent) {
+        for (const CBMScopeChunk *c = s->chunks; c != NULL; c = c->next) {
+            for (int i = 0; i < c->used; i++) {
+                if (c->bindings[i].name && strcmp(c->bindings[i].name, name) == 0)
+                    return &c->bindings[i];
+            }
+        }
+    }
+    return NULL;
+}
 
 // Bail-to-UNKNOWN depth for type-lookup chains: alias resolution, MRO walks,
 // embedded-field/struct-traversal. Exceeding this collapses to cbm_type_unknown
