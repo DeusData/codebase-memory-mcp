@@ -60,6 +60,13 @@ void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resourc
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);
 
+/* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
+ * when the run succeeded / did not reach post-publish export. Used to
+ * truthfully attribute a failed run to the persistence export (#1665) instead
+ * of the generic pipeline-error hint. Valid until the next cbm_pipeline_run or
+ * cbm_pipeline_free(). Returns "" for NULL p. */
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
@@ -205,6 +212,13 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
  * Replaces / and : with -, collapses --, trims leading -.
  * Caller must free() the returned string. */
 char *cbm_project_name_from_path(const char *abs_path);
+
+/* The name-mapping half of cbm_project_name_from_path, WITHOUT path
+ * canonicalization: maps any string to the stored project-name form (unsafe
+ * ASCII -> '-', non-ASCII bytes -> two hex digits, dash/dot collapse, trim,
+ * #624 length cap). Lets a selector such as a bare non-ASCII folder name be
+ * encoded exactly like the segment it came from (#1827). Caller frees. */
+char *cbm_project_name_sanitize(const char *name_path);
 
 /* ── Function Registry ──────────────────────────────────────────── */
 

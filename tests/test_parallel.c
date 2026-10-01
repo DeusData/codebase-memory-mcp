@@ -18,6 +18,7 @@
 #include "discover/discover.h"
 #include "foundation/platform.h"
 #include "foundation/log.h"
+#include "foundation/mem.h"
 #include "cbm.h"
 #include "result_spill.h"
 
@@ -613,6 +614,148 @@ TEST(parallel_spill_mode_builds_the_same_graph) {
         ASSERT_EQ(in_memory, on_disk);
     }
     cbm_gbuf_free(spilled);
+    PASS();
+}
+
+/* ── #2184: the post-extraction phases are charged before they run ─── */
+
+/* Order-independent fingerprint of a whole graph: every node (label, QN, file,
+ * lines, properties) and every edge (type, source QN, target QN, properties)
+ * hashed and folded with a sum and an xor. Two graphs that differ in any field
+ * of any node or edge -- not just in a per-type count -- disagree here. */
+typedef struct {
+    const cbm_gbuf_t *gb;
+    uint64_t sum;
+    uint64_t xr;
+    long count;
+} graph_fp_t;
+
+static uint64_t fp_mix(uint64_t h, const char *s) {
+    for (const unsigned char *p = (const unsigned char *)(s ? s : "\x01"); *p; p++) {
+        h = (h ^ *p) * 1099511628211ULL; /* FNV-1a */
+    }
+    return (h ^ 0xffU) * 1099511628211ULL; /* field separator */
+}
+
+static uint64_t fp_mix_int(uint64_t h, long long v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", v);
+    return fp_mix(h, buf);
+}
+
+static void fp_fold(graph_fp_t *fp, uint64_t h) {
+    fp->sum += h;
+    fp->xr ^= h * 0x9E3779B97F4A7C15ULL;
+    fp->count++;
+}
+
+static void fp_visit_node(const cbm_gbuf_node_t *n, void *ud) {
+    uint64_t h = fp_mix(1469598103934665603ULL, "N");
+    h = fp_mix(h, n->label);
+    h = fp_mix(h, n->qualified_name);
+    h = fp_mix(h, n->file_path);
+    h = fp_mix_int(h, n->start_line);
+    h = fp_mix_int(h, n->end_line);
+    h = fp_mix(h, n->properties_json);
+    fp_fold(ud, h);
+}
+
+static void fp_visit_edge(const cbm_gbuf_edge_t *e, void *ud) {
+    graph_fp_t *fp = ud;
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(fp->gb, e->source_id);
+    const cbm_gbuf_node_t *dst = cbm_gbuf_find_by_id(fp->gb, e->target_id);
+    uint64_t h = fp_mix(1469598103934665603ULL, "E");
+    h = fp_mix(h, e->type);
+    h = fp_mix(h, src ? src->qualified_name : NULL);
+    h = fp_mix(h, dst ? dst->qualified_name : NULL);
+    h = fp_mix(h, e->properties_json);
+    fp_fold(fp, h);
+}
+
+static graph_fp_t graph_fingerprint(const cbm_gbuf_t *gb) {
+    graph_fp_t fp = {.gb = gb};
+    cbm_gbuf_foreach_node(gb, fp_visit_node, &fp);
+    cbm_gbuf_foreach_edge(gb, fp_visit_edge, &fp);
+    return fp;
+}
+
+/* Mutator hook: runs between extraction and registry build, i.e. exactly where
+ * the post-extraction phases start. Records how many results are still held
+ * in memory there. */
+static void count_cached_results(CBMFileResult **cache, int file_count, void *ud) {
+    int n = 0;
+    for (int i = 0; i < file_count; i++) {
+        n += cache[i] != NULL;
+    }
+    *(int *)ud = n;
+}
+
+/* #2184: spill was entered only DURING extraction, when the charge crossed
+ * budget - budget/16. A run that ended extraction just under that line kept
+ * every result in memory, and the phases that cannot spill (registry build,
+ * cross-LSP prepare, resolve) then grew the process past the budget -- openclaw
+ * at 8 workers, 4079 MB budget: 3678 MB at extraction end, 5829 MB in resolve.
+ * The extraction end now projects that growth from the result counts and
+ * spills first when budget - budget/16 would be crossed.
+ *
+ * The charge is pinned through the test seam (it is the process footprint
+ * otherwise): run A ends extraction ONE BYTE under the latch -- the extraction
+ * gate never fires, only the projection can spill; run B has the whole budget
+ * free -- the projection fits and nothing may spill. Both graphs must be
+ * identical, field for field, to each other and to the plain in-memory run. */
+TEST(parallel_post_extract_projection_spills_before_resolve) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    const size_t saved_budget = cbm_mem_budget();
+    const size_t budget = (size_t)1024 * 1024 * 1024;
+    const size_t latch = budget - budget / 16; /* spill latches on charged > latch */
+    cbm_mem_set_budget_for_tests(budget);
+    g_harness_spill = true;
+
+    cbm_mem_set_charged_for_tests(latch);
+    int cached_near = -1;
+    cbm_gbuf_t *gb_near =
+        run_parallel_with_extract_opts_and_mutator("par-test", g_par_tmpdir, files, file_count, 2,
+                                                   NULL, count_cached_results, &cached_near, false);
+    int64_t parked_near = g_harness_parked;
+
+    cbm_mem_set_charged_for_tests((size_t)1);
+    int cached_roomy = -1;
+    cbm_gbuf_t *roomy = run_parallel_with_extract_opts_and_mutator(
+        "par-test", g_par_tmpdir, files, file_count, 2, NULL, count_cached_results, &cached_roomy,
+        false);
+    int64_t parked_roomy = g_harness_parked;
+
+    cbm_mem_set_charged_for_tests(0);
+    g_harness_spill = false;
+    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_discover_free(files, file_count);
+    ASSERT(gb_near != NULL);
+    ASSERT(roomy != NULL);
+
+    /* A: every result went to disk before registry build. */
+    ASSERT_EQ((int)parked_near, file_count);
+    ASSERT_EQ(cached_near, 0);
+    /* B: the projection fits, so no store was opened and results stay cached. */
+    ASSERT_EQ((int)parked_roomy, -1);
+    ASSERT_GT(cached_roomy, 0);
+
+    graph_fp_t fp_near = graph_fingerprint(gb_near);
+    graph_fp_t fp_roomy = graph_fingerprint(roomy);
+    graph_fp_t fp_mem = graph_fingerprint(g_par_gbuf);
+    ASSERT_GT(fp_mem.count, 0);
+    ASSERT_EQ(fp_near.count, fp_mem.count);
+    ASSERT_EQ(fp_roomy.count, fp_mem.count);
+    ASSERT_TRUE(fp_near.sum == fp_mem.sum && fp_near.xr == fp_mem.xr);
+    ASSERT_TRUE(fp_roomy.sum == fp_mem.sum && fp_roomy.xr == fp_mem.xr);
+    cbm_gbuf_free(gb_near);
+    cbm_gbuf_free(roomy);
     PASS();
 }
 
@@ -3180,6 +3323,40 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
+/* #2053 contract for cbm_pipeline_rust_external_target: only a Rust row whose
+ * strategy names a registered target, and whose QN lies outside the project
+ * prefix, counts as external. The end-to-end probes live in test_pipeline.c
+ * (pipeline_rust_std_receiver_never_binds_project_method*). */
+TEST(parallel_rust_external_target_contract) {
+    const char *proj = "proj";
+    /* External: registered std / seeded-crate targets. */
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_deref_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_constructor",
+                                                  "core.sync.atomic.AtomicUsize.new", proj));
+    /* A prefix that is not a whole segment is still outside the project. */
+    ASSERT_TRUE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "projx.helper", proj));
+    /* Project-prefixed targets keep the registry fallback. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                   "proj.src.lib.EvidenceTier.join", proj));
+    /* Synthesized / non-registered strategies are not evidence. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_prelude_trait",
+                                                   "std.path.PathBuf.clone", proj));
+    ASSERT_FALSE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_unresolved", "root.join", proj));
+    /* Per-language: no other language is affected. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_GO, "lsp_method_dispatch",
+                                                   "std.path.Path.join", proj));
+    /* Defensive NULL/empty inputs. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, NULL, "std.x", proj));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "std.x", NULL));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "", proj));
+    PASS();
+}
+
 /* Gate guard for the JVM-only unique-tail fallbacks (lsp_resolve.h).
  *
  * The tail fallbacks join LSP overrides across QN drift by unique
@@ -4485,6 +4662,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_go_cross_package_field_chain_resolves);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_rust_external_target_contract);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
@@ -4496,6 +4674,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_semantic_fixture_expected_counts);
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_spill_mode_builds_the_same_graph);
+    RUN_TEST(parallel_post_extract_projection_spills_before_resolve);
     RUN_TEST(sequential_definitions_cache_drops_trees_and_compacts);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);

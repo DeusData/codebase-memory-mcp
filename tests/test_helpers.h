@@ -180,15 +180,19 @@ static inline char *th_mktempdir(const char *prefix) {
  * leaf made by cbm_mkdtemp() has a private DACL. Keep these security-sensitive
  * fixtures under LocalAppData on Windows; preserve the ordinary temporary-root
  * behavior on POSIX. */
+static inline const char *th_secure_runtime_base(void) {
+#ifdef _WIN32
+    return cbm_app_local_dir();
+#else
+    return cbm_tmpdir();
+#endif
+}
+
 static inline bool th_secure_runtime_parent_new(char *out, size_t out_cap, const char *tag) {
     if (!out || out_cap == 0 || !tag || !tag[0]) {
         return false;
     }
-#ifdef _WIN32
-    const char *base = cbm_app_local_dir();
-#else
-    const char *base = cbm_tmpdir();
-#endif
+    const char *base = th_secure_runtime_base();
     if (!base || !base[0]) {
         out[0] = '\0';
         return false;

@@ -401,6 +401,7 @@ static int ipc_test_win_lock_child(const char *kind, const char *key, const char
 typedef struct {
     const cbm_daemon_ipc_endpoint_t *endpoint;
     int result;
+    atomic_bool finished; /* set once the startup call has fully returned */
 } ipc_test_win_startup_call_t;
 
 typedef struct {
@@ -421,16 +422,22 @@ static void ipc_test_startup_gate(void *context) {
     }
 }
 
-static bool ipc_test_startup_gate_wait_acquired(ipc_test_startup_gate_t *gate) {
-    /* `acquired` never clears, so this wait cannot miss the event; the bound
-     * only catches a thread that never started at all. */
-    for (size_t attempt = 0; attempt < 50000U; attempt++) {
-        if (atomic_load(&gate->acquired)) {
-            return true;
-        }
+/* Waits until the startup thread has either parked in the gate or returned
+ * without reaching it. Both flags only ever go false -> true, and one of them
+ * is always eventually set: before the gate the startup path only try-acquires
+ * (no blocking wait on anything this test holds), and a thread parked in the
+ * gate cannot return until the test releases it. So no attempt or time bound
+ * is needed, and none may decide the verdict: the previous 50000 x
+ * cbm_usleep(200) budget meant ~10 s on POSIX but, since cbm_usleep(200) is
+ * Sleep(0) on Windows, only 50000 bare yields there -- a loaded CI runner
+ * exhausted them before the thread reached the gate. A thread that never
+ * started is caught by the caller's thread_started check. */
+static bool ipc_test_startup_gate_wait_acquired(ipc_test_startup_gate_t *gate,
+                                                ipc_test_win_startup_call_t *call) {
+    while (!atomic_load(&gate->acquired) && !atomic_load(&call->finished)) {
         cbm_usleep(200);
     }
-    return false;
+    return atomic_load(&gate->acquired);
 }
 
 static void *ipc_test_win_startup_call(void *opaque) {
@@ -441,6 +448,7 @@ static void *ipc_test_win_startup_call(void *opaque) {
         call->result = 0;
     }
     cbm_daemon_ipc_startup_lock_release(&startup);
+    atomic_store(&call->finished, true);
     return NULL;
 }
 
@@ -1395,6 +1403,7 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     bool startup_observed = false;
     int join_status = -1;
     ipc_test_win_startup_call_t call = {.result = -1};
+    atomic_init(&call.finished, false);
     ipc_test_startup_gate_t gate;
     atomic_init(&gate.acquired, false);
     atomic_init(&gate.may_proceed, false);
@@ -1420,7 +1429,7 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
     if (thread_started) {
-        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate, &call);
     }
     ipc_test_win_lock_release(&record_reader);
     atomic_store(&gate.may_proceed, true);
@@ -1441,7 +1450,14 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     ASSERT_EQ(directory_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_EQ(record_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_TRUE(thread_started);
-    ASSERT_TRUE(startup_observed);
+    if (!startup_observed) {
+        /* The startup thread returned without reaching the gate; its
+         * try-acquire status is the true reason. */
+        char reason[96];
+        (void)snprintf(reason, sizeof(reason), "startup call returned %d without reaching the gate",
+                       call.result);
+        FAIL(reason);
+    }
     ASSERT_EQ(join_status, 0);
     ASSERT_EQ(call.result, 1);
     ASSERT_TRUE(address[0] != '\0');
@@ -1464,6 +1480,7 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     bool startup_observed = false;
     int join_status = -1;
     ipc_test_win_startup_call_t call = {.result = -1};
+    atomic_init(&call.finished, false);
 
     bool parent_ok = ipc_test_parent_new(parent, "win-lifetime-bridge");
     if (parent_ok) {
@@ -1501,7 +1518,7 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
     if (thread_started) {
-        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate, &call);
     }
     /* Claim the lifetime lock while startup is parked in the gate, so the
      * concurrent-owner bridge under test is exercised deterministically. */
@@ -1534,7 +1551,14 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     ASSERT_EQ(directory_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_EQ(record_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_TRUE(thread_started);
-    ASSERT_TRUE(startup_observed);
+    if (!startup_observed) {
+        /* The startup thread returned without reaching the gate; its
+         * try-acquire status is the true reason. */
+        char reason[96];
+        (void)snprintf(reason, sizeof(reason), "startup call returned %d without reaching the gate",
+                       call.result);
+        FAIL(reason);
+    }
     ASSERT_EQ(lifetime_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_EQ(join_status, 0);
     ASSERT_EQ(call.result, 0);
@@ -2442,6 +2466,7 @@ typedef struct {
     cbm_daemon_ipc_listener_t *listener;
     cbm_daemon_ipc_connection_t *connection;
     atomic_bool waiting;
+    atomic_bool finished; /* set once the server thread has returned */
     int receive_result;
 } ipc_forever_wait_server_t;
 
@@ -2464,6 +2489,7 @@ static void *ipc_forever_wait_server(void *opaque) {
             server->connection, CBM_DAEMON_IPC_WAIT_FOREVER, &frame, &payload);
     }
     free(payload);
+    atomic_store_explicit(&server->finished, true, memory_order_release);
     return NULL;
 }
 
@@ -2480,6 +2506,7 @@ TEST(daemon_ipc_wait_forever_is_interruptible) {
     int join_result = -1;
     ipc_forever_wait_server_t server = {0};
     atomic_init(&server.waiting, false);
+    atomic_init(&server.finished, false);
 
     if (ipc_test_parent_new(parent, "wait-forever")) {
         endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
@@ -2495,9 +2522,11 @@ TEST(daemon_ipc_wait_forever_is_interruptible) {
     if (thread_started) {
         client = cbm_daemon_ipc_connect(endpoint, 2000);
     }
-    uint64_t deadline = cbm_now_ms() + 2000;
-    while (client && cbm_now_ms() < deadline &&
-           !atomic_load_explicit(&server.waiting, memory_order_acquire)) {
+    /* Wait for the event itself, never a deadline: the server either enters
+     * its forever-wait or returns (its accept is bounded by the call's own
+     * timeout), and both flags only ever go false -> true. */
+    while (client && !atomic_load_explicit(&server.waiting, memory_order_acquire) &&
+           !atomic_load_explicit(&server.finished, memory_order_acquire)) {
         cbm_usleep(1000);
     }
     reached_wait = atomic_load_explicit(&server.waiting, memory_order_acquire);
@@ -2561,14 +2590,13 @@ TEST(daemon_ipc_connect_waits_for_delayed_listener) {
         thread_started = cbm_thread_create(&thread, 0, ipc_delayed_listener_start, &delayed) == 0;
     }
     if (thread_started) {
+        /* `delay_started` is the thread's first store, so it cannot return
+         * without setting it: wait for that event with no attempt bound. */
         struct timespec poll_delay = {.tv_sec = 0, .tv_nsec = 1000000};
-        for (size_t i = 0; i < 2000; i++) {
-            if (atomic_load_explicit(&delayed.delay_started, memory_order_acquire)) {
-                delay_observed = true;
-                break;
-            }
+        while (!atomic_load_explicit(&delayed.delay_started, memory_order_acquire)) {
             (void)cbm_nanosleep(&poll_delay, NULL);
         }
+        delay_observed = true;
     }
     if (delay_observed) {
         client = cbm_daemon_ipc_connect(endpoint, 1500);
@@ -5193,6 +5221,59 @@ TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537) {
 }
 
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* #1687: on a WSL DrvFs mount (/mnt/e, default 0777) the ancestor refusal is
+ * correct but used to leave the user guessing. The gate must still refuse, and
+ * the detail must now name the containing directory AND the WSL remedy. */
+TEST(daemon_ipc_posix_wsl_drvfs_refusal_names_remedy_issue1687) {
+    char parent[TEST_PATH_CAP];
+    char ancestor[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    char detail[512] = {0};
+    char plain_detail[512] = {0};
+    bool paths_ok = false;
+    bool ancestor_ready = false;
+    bool refused = false;
+    bool plain_refused = false;
+
+    if (ipc_test_parent_new(parent, "posix-wsl-drvfs")) {
+        int a = snprintf(ancestor, sizeof(ancestor), "%s/e", parent);
+        int c = snprintf(cache, sizeof(cache), "%s/codebase_memory_cache", ancestor);
+        paths_ok = a > 0 && a < (int)sizeof(ancestor) && c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        ancestor_ready = mkdir(ancestor, 0777) == 0 && chmod(ancestor, 0777) == 0;
+    }
+    if (ancestor_ready) {
+        cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(true);
+        refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(false);
+        (void)snprintf(detail, sizeof(detail), "%s", cbm_daemon_ipc_validation_detail());
+        plain_refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        (void)snprintf(plain_detail, sizeof(plain_detail), "%s",
+                       cbm_daemon_ipc_validation_detail());
+    }
+
+    (void)rmdir(cache);
+    (void)rmdir(ancestor);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(refused); /* policy unchanged: still refused */
+    ASSERT_NOT_NULL(strstr(detail, "CONTAINING 'codebase_memory_cache'"));
+    ASSERT_NOT_NULL(strstr(detail, "/etc/wsl.conf"));
+    ASSERT_NOT_NULL(strstr(detail, "metadata,umask=22,fmask=11"));
+    ASSERT_NOT_NULL(strstr(detail, "wsl --shutdown"));
+    ASSERT_NOT_NULL(strstr(detail, "~/.cache"));
+    /* The remedy must fit whole, not be clipped by the detail buffer. */
+    ASSERT_NOT_NULL(strstr(detail, "(e.g. ~/.cache)"));
+    /* Off DrvFs the generic message stays and carries no WSL advice. */
+    ASSERT_TRUE(plain_refused);
+    ASSERT_NOT_NULL(strstr(plain_detail, "CONTAINING 'codebase_memory_cache'"));
+    ASSERT_NULL(strstr(plain_detail, "wsl.conf"));
+    PASS();
+}
+
 /* #1830: /proc/self/uid_map single-uid detection. A single-uid map is exactly
  * one line "<inside> <outside> 1" whose inside id is our euid; anything else —
  * the init map, a count other than 1, a foreign inside id, extra lines, or junk
@@ -5517,6 +5598,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537);
     RUN_TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537);
 #ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_ipc_posix_wsl_drvfs_refusal_names_remedy_issue1687);
     RUN_TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830);
