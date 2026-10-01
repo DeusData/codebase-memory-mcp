@@ -2916,6 +2916,115 @@ TEST(pipeline_incremental_repoints_call_reference_without_stale_edge) {
     PASS();
 }
 
+/* #1419: every index publishes through a private staging DB in WAL mode that
+ * cbm_store_seal_for_atomic_publish() checkpoints at synchronous=FULL and
+ * switches to DELETE mode before the atomic rename. A crash before that rename
+ * discards the stage, so a WAL commit at FULL only adds an fsync per
+ * transaction without protecting anything; SQLite documents NORMAL as
+ * corruption-safe under WAL. The probe reads the EFFECTIVE synchronous level
+ * of the committing handle from a WAL hook on every connection the run opens.
+ *
+ * SQLite installs its default autocheckpoint WAL hook after auto-extensions
+ * run, so the auto-extension installs a statement trace and the trace installs
+ * the probe once the connection is fully open. The probe keeps SQLite's
+ * default 1000-frame autocheckpoint, so it does not change what the run
+ * writes. */
+enum { I1419_SYNC_FULL = 2, I1419_DEFAULT_AUTOCHECKPOINT = 1000 };
+static atomic_int g_i1419_wal_commits;
+static atomic_int g_i1419_full_sync_commits;
+
+static int i1419_wal_probe(void *arg, sqlite3 *db, const char *db_name, int wal_frames) {
+    (void)arg;
+    atomic_fetch_add(&g_i1419_wal_commits, 1);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "PRAGMA synchronous;", -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) >= I1419_SYNC_FULL) {
+        atomic_fetch_add(&g_i1419_full_sync_commits, 1);
+    }
+    sqlite3_finalize(stmt);
+    if (wal_frames >= I1419_DEFAULT_AUTOCHECKPOINT) {
+        (void)sqlite3_wal_checkpoint(db, db_name);
+    }
+    return SQLITE_OK;
+}
+
+static int i1419_trace(unsigned type, void *ctx, void *stmt, void *sql) {
+    (void)type;
+    (void)ctx;
+    (void)sql;
+    (void)sqlite3_wal_hook(sqlite3_db_handle((sqlite3_stmt *)stmt), i1419_wal_probe, NULL);
+    return 0;
+}
+
+static int i1419_install_probe(sqlite3 *db, char **errmsg, const sqlite3_api_routines *api) {
+    (void)errmsg;
+    (void)api;
+    return sqlite3_trace_v2(db, SQLITE_TRACE_STMT, i1419_trace, NULL);
+}
+
+static int i1419_index(const char *repo, const char *db_path) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_staged_publish_commits_below_full_sync_issue1419) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_i1419_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* Equal lengths + equal mtimes: the second run must route on content
+     * bytes to the closure-repair (delta) publish, not a full rebuild. */
+    static const char initial_source[] =
+        "package syncprobe\n"
+        "func alphaSyncTarget() {}\n"
+        "func bravoSyncTarget() {}\n"
+        "func syncProbeAccept(callback func()) {}\n"
+        "func syncProbeSite() { syncProbeAccept(alphaSyncTarget) }\n";
+    static const char replacement_source[] =
+        "package syncprobe\n"
+        "func alphaSyncTarget() {}\n"
+        "func bravoSyncTarget() {}\n"
+        "func syncProbeAccept(callback func()) {}\n"
+        "func syncProbeSite() { syncProbeAccept(bravoSyncTarget) }\n";
+    ASSERT_EQ(sizeof(initial_source), sizeof(replacement_source));
+    write_temp_file(tmp, "probe.go", initial_source);
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/probe.go", tmp);
+    const time_t fixed_mtime = 1700000000;
+    ASSERT_EQ(pipeline_test_set_mtime(source_path, fixed_mtime, 123456789L), 0);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/i1419.db", tmp);
+
+    atomic_store(&g_i1419_wal_commits, 0);
+    atomic_store(&g_i1419_full_sync_commits, 0);
+    ASSERT_EQ(sqlite3_auto_extension((void (*)(void))i1419_install_probe), SQLITE_OK);
+    /* Both publish routes run before any assertion, so the probe is always
+     * unregistered again even when a run fails. */
+    int full_rc = i1419_index(tmp, db_path);
+    write_temp_file(tmp, "probe.go", replacement_source);
+    int mtime_rc = pipeline_test_set_mtime(source_path, fixed_mtime, 123456789L);
+    cbm_pipeline_incremental_test_reset_faults();
+    int delta_rc = i1419_index(tmp, db_path);
+    cbm_incremental_route_t delta_route = cbm_pipeline_incremental_test_last_route();
+    (void)sqlite3_cancel_auto_extension((void (*)(void))i1419_install_probe);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(mtime_rc, 0);
+    ASSERT_EQ(delta_rc, 0);
+    ASSERT_EQ(delta_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Non-vacuous: both publishes commit through the WAL. */
+    ASSERT_GT(atomic_load(&g_i1419_wal_commits), 0);
+    ASSERT_EQ(atomic_load(&g_i1419_full_sync_commits), 0);
+    PASS();
+}
+
 /* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
  * while the shared name registry must NOT leak those relations into other
  * languages' textual resolution: a Python call or identifier sharing the
@@ -16644,6 +16753,7 @@ SUITE(pipeline) {
 SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete);
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
+    RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

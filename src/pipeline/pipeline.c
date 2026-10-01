@@ -2267,10 +2267,15 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
         free(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
-    bool ok = cbm_store_exec(store, "PRAGMA synchronous=FULL;") == CBM_STORE_OK;
-    ok = ok && cbm_store_delete_file_hashes(store, generation->project) == CBM_STORE_OK &&
-         cbm_store_upsert_file_hash_batch(store, generation->manifest,
-                                          generation->manifest_count) == CBM_STORE_OK;
+    /* No synchronous=FULL for these writes (#1419): the stage is private until
+     * the atomic rename and a crash discards it, so an fsync per WAL commit
+     * protects nothing here. The store's NORMAL level is SQLite's
+     * corruption-safe setting under WAL, and cbm_store_seal_for_atomic_publish()
+     * raises this connection to FULL for the checkpoint that makes the
+     * published file durable. */
+    bool ok = cbm_store_delete_file_hashes(store, generation->project) == CBM_STORE_OK &&
+              cbm_store_upsert_file_hash_batch(store, generation->manifest,
+                                               generation->manifest_count) == CBM_STORE_OK;
     /* LSP surfaces belong to the generation: written inside the same staging
      * store, before the atomic rename, so graph and surface data can never
      * publish separately. The delete guards the incremental path, whose

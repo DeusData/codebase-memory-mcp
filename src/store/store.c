@@ -539,6 +539,16 @@ int64_t cbm_store_resolve_mmap_size(void) {
     return (int64_t)parsed;
 }
 
+/* #1419: page cache for read-write on-disk connections, in SQLite's negative
+ * KiB form. sqlite_writer.c gives every index 64 KiB pages, so SQLite's
+ * default 2000 KiB holds only ~31 of them, while a delta's purge and patch
+ * dirty pages across the node and edge tables and all of their indexes. The
+ * transaction then spills dirty pages into the WAL and rewrites them over and
+ * over (5.2 GiB of WAL writes for a one-line change on a 294 MB django index).
+ * 64 MiB = 1024 pages, the budget bulk mode already used; the cache only grows
+ * as pages are touched. Query connections keep the default. */
+static const char ST_WRITE_CACHE_SQL[] = "PRAGMA cache_size = -65536;";
+
 /* Configure connection pragmas.
  *   in_memory  — :memory: DB (synchronous OFF, no journal file).
  *   read_only  — query-only connection opened SQLITE_OPEN_READONLY. Runs
@@ -594,13 +604,18 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
          * cbm_store_checkpoint's SIGBUS note), so without a size limit the -wal
          * file only ever grows; journal_size_limit truncates it back to N bytes
          * on the next successful
-         * reset. N is far above the healthy WAL (~4 MiB under the default
-         * 1000-page autocheckpoint), so normal indexing never triggers
+         * reset. N is far above the healthy WAL (~64 MiB: the default
+         * 1000-page autocheckpoint at the 64 KiB page size sqlite_writer.c
+         * gives every index), so normal indexing never triggers
          * truncate/regrow churn — it only fires after abnormal growth.
          * Shared/live paths do NOT use a TRUNCATE checkpoint: truncating the WAL
          * to zero can raise SIGBUS in a sibling process that has the DB mmap'd
          * on macOS. Exclusive staging publication seals separately below. */
         rc = exec_sql(s, "PRAGMA journal_size_limit = 268435456;"); /* 256 MiB */
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        rc = exec_sql(s, ST_WRITE_CACHE_SQL);
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -1811,12 +1826,12 @@ int cbm_store_begin_bulk(cbm_store_t *s) {
      * because the in-memory rollback journal is lost on crash.
      * WAL mode is crash-safe: uncommitted WAL entries are simply discarded
      * on the next open. Performance is preserved via synchronous=OFF and a
-     * larger cache, which are safe with WAL. */
+     * 64 MiB cache, which are safe with WAL. */
     int rc = exec_sql(s, "PRAGMA synchronous = OFF;");
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    return exec_sql(s, "PRAGMA cache_size = -65536;"); /* CBM_SZ_64 MB */
+    return exec_sql(s, ST_WRITE_CACHE_SQL);
 }
 
 int cbm_store_end_bulk(cbm_store_t *s) {
@@ -1824,7 +1839,8 @@ int cbm_store_end_bulk(cbm_store_t *s) {
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    return exec_sql(s, "PRAGMA cache_size = -2000;"); /* default ~2 MB */
+    /* Back to the read-write cache, not SQLite's 2000 KiB default (#1419). */
+    return exec_sql(s, ST_WRITE_CACHE_SQL);
 }
 
 int cbm_store_drop_indexes(cbm_store_t *s) {
