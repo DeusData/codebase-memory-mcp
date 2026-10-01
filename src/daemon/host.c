@@ -52,6 +52,9 @@ enum {
     HOST_HTTP_RETRY_INITIAL_MS = 1000,
     HOST_HTTP_RETRY_MAX_MS = 30000,
     HOST_WATCH_INTERVAL_MS = 5000,
+    /* Age-based temp cleaners need days of inactivity (macOS tmp_cleaner: 3);
+     * a minute bounds the blind window after a long sleep (#2178). */
+    HOST_COORDINATION_TOUCH_MS = 60000,
     HOST_CONFLICT_LOG_CAP = 1024 * 1024,
     HOST_OPERATION_LOG_CAP = 5 * 1024 * 1024,
     HOST_PATH_CAP = 4096,
@@ -868,10 +871,58 @@ static bool host_background_start(host_state_t *host) {
     return true;
 }
 
+/* Coordination handles the host retains for the generation's whole lifetime. */
+typedef struct {
+    const cbm_daemon_ipc_endpoint_t *endpoint;
+    cbm_version_cohort_lease_t *cohort_lease;
+    cbm_version_cohort_daemon_claim_t *daemon_claim;
+    cbm_daemon_ipc_participant_guard_t *participant_guard;
+} host_coordination_t;
+
+typedef struct {
+    const char *lost;      /* first held file whose path no longer names it */
+    const char *transient; /* first still-valid file that could not be refreshed */
+} host_touch_result_t;
+
+static void host_touch_note(host_touch_result_t *result, const char *file, int status) {
+    if (status == 0 && !result->lost) {
+        result->lost = file;
+    } else if (status < 0 && !result->transient) {
+        result->transient = file;
+    }
+}
+
+static int host_cohort_touch_status(cbm_version_cohort_status_t status) {
+    return status == CBM_VERSION_COHORT_OK ? 1 : (status == CBM_VERSION_COHORT_IO ? -1 : 0);
+}
+
+/* Refresh every long-held runtime file. A held lock whose path now names
+ * another inode coordinates nothing: forked index workers read the daemon as
+ * uncoordinated and a peer can start a second generation (#2178). Every file
+ * is visited even after one fails so the rest keep being refreshed. */
+static host_touch_result_t host_coordination_touch(const host_coordination_t *coordination,
+                                                   cbm_daemon_runtime_service_t *service) {
+    host_touch_result_t result = {0};
+    host_touch_note(&result, "cohort_daemon_claim",
+                    host_cohort_touch_status(
+                        cbm_version_cohort_daemon_claim_touch(coordination->daemon_claim)));
+    host_touch_note(
+        &result, "cohort_lease",
+        host_cohort_touch_status(cbm_version_cohort_lease_touch(coordination->cohort_lease)));
+    host_touch_note(&result, "participant_guard",
+                    cbm_daemon_ipc_participant_guard_touch(coordination->endpoint,
+                                                           coordination->participant_guard));
+    host_touch_note(&result, "listener", cbm_daemon_runtime_service_touch_listener(service));
+    return result;
+}
+
 static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
-                                   atomic_int *stop_requested, host_state_t *host, bool permanent) {
+                                   atomic_int *stop_requested, host_state_t *host, bool permanent,
+                                   const host_coordination_t *coordination) {
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
     uint64_t stopping_deadline = 0;
+    uint64_t next_touch = 0;
+    bool touch_degraded = false;
     for (;;) {
         cbm_daemon_runtime_service_state_t state = cbm_daemon_runtime_service_state(service);
         if (state == CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
@@ -903,6 +954,28 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
                          stop ? "stop_requested" : "initial_window_expired");
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
         }
+        /* Permanent generations too: exiting lets the next client start a
+         * coordinated generation, while re-claiming would race that client. */
+        if (cbm_now_ms() >= next_touch) {
+            next_touch = cbm_now_ms() + HOST_COORDINATION_TOUCH_MS;
+            host_touch_result_t touched = host_coordination_touch(coordination, service);
+            if (touched.lost) {
+                cbm_log_warn("daemon.lifetime_end", "reason", "coordination_file_lost", "file",
+                             touched.lost);
+                return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
+            }
+            /* A refresh failure on a still-valid file (read-only remount,
+             * EMFILE) is not loss: keep serving, retry next tick, and log
+             * only transitions so a persistent condition cannot flood. */
+            if ((touched.transient != NULL) != touch_degraded) {
+                touch_degraded = touched.transient != NULL;
+                if (touch_degraded) {
+                    cbm_log_warn("daemon.coordination_touch_failed", "file", touched.transient);
+                } else {
+                    cbm_log_info("daemon.coordination_touch_recovered");
+                }
+            }
+        }
         host_http_reconcile_at(host, cbm_now_ms(), false);
         /* Retire an ephemeral generation that lingered for cold-storm cohort
          * participants once they drain, or once its bounded linger elapses.
@@ -910,6 +983,22 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
         cbm_daemon_runtime_service_reconcile_lifetime(service);
         (void)cbm_daemon_runtime_service_wait_exited(service, HOST_WAIT_TICK_MS);
     }
+}
+
+bool cbm_daemon_host_wait_for_lifetime_for_test(cbm_daemon_runtime_service_t *service,
+                                                const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                cbm_version_cohort_lease_t *cohort_lease,
+                                                cbm_version_cohort_daemon_claim_t *daemon_claim,
+                                                cbm_daemon_ipc_participant_guard_t *guard) {
+    host_state_t host = {0};
+    atomic_int stop_requested = 0;
+    host_coordination_t coordination = {
+        .endpoint = endpoint,
+        .cohort_lease = cohort_lease,
+        .daemon_claim = daemon_claim,
+        .participant_guard = guard,
+    };
+    return host_wait_for_lifetime(service, &stop_requested, &host, false, &coordination);
 }
 
 static bool host_application_shutdown(host_state_t *host) {
@@ -1123,7 +1212,14 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
                                                     : "unavailable",
                  "memory_budget_bytes", memory_budget, "physical_job_limit", physical_job_limit,
                  "worker_memory_budget_bytes", worker_memory_budget);
-    if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent)) {
+    host_coordination_t coordination = {
+        .endpoint = config->endpoint,
+        .cohort_lease = cohort_lease,
+        .daemon_claim = daemon_claim,
+        .participant_guard = participant_guard,
+    };
+    if (!host_wait_for_lifetime(service, config->stop_requested, &host, config->permanent,
+                                &coordination)) {
         host_force_terminate("runtime");
     }
 

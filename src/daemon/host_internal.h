@@ -9,6 +9,10 @@
 #include <stdint.h>
 
 struct cbm_daemon_ipc_endpoint;
+struct cbm_daemon_ipc_participant_guard;
+struct cbm_daemon_runtime_service;
+struct cbm_version_cohort_daemon_claim;
+struct cbm_version_cohort_lease;
 
 typedef bool (*cbm_daemon_host_cleanup_release_for_test_fn)(void *context);
 
@@ -67,5 +71,15 @@ bool cbm_daemon_host_http_reconcile_free_refusal_for_test(
  * create failure. The callback verifies free is refused while SCHEDULED; after
  * the failure, the adapter must cancel so the final free succeeds. */
 bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void);
+
+/* Run the production lifetime loop over caller-held coordination handles with
+ * no HTTP host state and no stop request. The generation is ephemeral, so a
+ * loop that misses a loss still ends at the initial client window instead of
+ * hanging the test. Returns the loop's own result. */
+bool cbm_daemon_host_wait_for_lifetime_for_test(
+    struct cbm_daemon_runtime_service *service, const struct cbm_daemon_ipc_endpoint *endpoint,
+    struct cbm_version_cohort_lease *cohort_lease,
+    struct cbm_version_cohort_daemon_claim *daemon_claim,
+    struct cbm_daemon_ipc_participant_guard *guard);
 
 #endif /* CBM_DAEMON_HOST_INTERNAL_H */
