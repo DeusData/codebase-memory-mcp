@@ -1381,10 +1381,10 @@ fuzz:
 		CC=$(FUZZ_CC) CXX=$(FUZZ_CXX) SANITIZE="$(FUZZ_SANITIZE)"
 
 $(BUILD_DIR)/cbm-fuzz: $(FUZZ_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -o $@ \
+	$(CXX) $(CFLAGS_TEST) -x c -fsanitize=fuzzer -o $@ \
 		$(FUZZ_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
-		$(OBJS_VENDORED_TEST) \
+		-x none $(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
 
 # Path-sensitive memory analysis: leak paths, null derefs, uninitialized reads.
