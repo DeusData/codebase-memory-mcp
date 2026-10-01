@@ -29,8 +29,8 @@
  * heap strings; release with cbm_store_free_lsp_surfaces. Files with an
  * empty surface still get a row (empty arrays hash too — "no defs" must be
  * distinguishable from "no data"). Returns 0, or -1 on allocation failure. */
-int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
-                               const cbm_file_info_t *files, int file_count,
+int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *project,
+                               CBMFileResult **cache, const cbm_file_info_t *files, int file_count,
                                const CBMLSPDef *all_defs, const int *def_starts,
                                cbm_lsp_surface_row_t **out_rows, int *out_count);
 

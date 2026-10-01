@@ -1,0 +1,1 @@
+MATCH (f:Function) OPTIONAL MATCH (f)-[:CALLS]->(g) RETURN f.name, collect(g.name)

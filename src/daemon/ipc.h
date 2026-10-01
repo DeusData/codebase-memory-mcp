@@ -131,6 +131,9 @@ bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, un
 bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
                                                     unsigned long euid, bool overflow_active,
                                                     unsigned long overflow_uid);
+/* #1687: treat every directory as on a WSL DrvFs mount so the remedy text in
+ * the private-directory refusal is testable off WSL. Diagnostic only. */
+void cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(bool force);
 #if defined(__linux__)
 /* Number of REAL overflow-uid derivations so far. The value is meaningless on
  * its own; the point is that it must rise on every ancestor check, proving no

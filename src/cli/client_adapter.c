@@ -7,6 +7,7 @@
 
 #include "foundation/constants.h"
 #include "mcp/mcp.h"
+#include "yyjson/yyjson.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -138,6 +139,167 @@ static void emit_header(adapter_sb_t *sb, const char *client) {
               "// are overwritten; edit outside it, or remove the markers to take ownership.\n");
 }
 
+static void append_typebox_type(adapter_sb_t *sb, yyjson_val *val, const char *description,
+                                bool include_description) {
+    yyjson_val *type_val = yyjson_obj_get(val, "type");
+    yyjson_val *enum_val = yyjson_obj_get(val, "enum");
+    yyjson_val *items_val = yyjson_obj_get(val, "items");
+    const char *type_str = yyjson_get_str(type_val);
+
+    if (type_str && strcmp(type_str, "string") == 0 && enum_val && yyjson_is_arr(enum_val) &&
+        yyjson_arr_size(enum_val) > 0) {
+        sb_append(sb, "Type.Union([");
+        size_t enum_idx = 0;
+        size_t enum_max = yyjson_arr_size(enum_val);
+        bool first_enum = true;
+        for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+            yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
+            const char *enum_str = yyjson_get_str(enum_item);
+            if (!enum_str) {
+                continue;
+            }
+            if (!first_enum) {
+                sb_append(sb, ", ");
+            }
+            first_enum = false;
+            sb_append(sb, "Type.Literal(");
+            sb_append_js_string(sb, enum_str);
+            sb_append(sb, ")");
+        }
+        if (first_enum) {
+            sb_append(sb, "Type.String()");
+        } else {
+            sb_append(sb, "]");
+            if (include_description && description) {
+                sb_append(sb, ", { description: ");
+                sb_append_js_string(sb, description);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+            return;
+        }
+        sb_append(sb, ")");
+        return;
+    }
+
+    const char *typebox_name = "Any";
+    if (type_str && strcmp(type_str, "string") == 0) {
+        typebox_name = "String";
+    } else if (type_str && strcmp(type_str, "integer") == 0) {
+        typebox_name = "Integer";
+    } else if (type_str && strcmp(type_str, "number") == 0) {
+        typebox_name = "Number";
+    } else if (type_str && strcmp(type_str, "boolean") == 0) {
+        typebox_name = "Boolean";
+    }
+
+    if (type_str && strcmp(type_str, "array") == 0) {
+        sb_append(sb, "Type.Array(");
+        if (items_val) {
+            append_typebox_type(sb, items_val, NULL, false);
+        } else {
+            sb_append(sb, "Type.Any()");
+        }
+        if (include_description && description) {
+            sb_append(sb, ", { description: ");
+            sb_append_js_string(sb, description);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+        return;
+    }
+
+    sb_append(sb, "Type.");
+    sb_append(sb, typebox_name);
+    sb_append(sb, "(");
+    if (include_description && description) {
+        sb_append(sb, "{ description: ");
+        sb_append_js_string(sb, description);
+        sb_append(sb, " }");
+    }
+    sb_append(sb, ")");
+}
+
+static bool typebox_property_is_required(yyjson_val *required, const char *prop_name) {
+    if (!required || !yyjson_is_arr(required)) {
+        return false;
+    }
+    size_t idx = 0;
+    size_t max = yyjson_arr_size(required);
+    for (idx = 0; idx < max; idx++) {
+        const char *required_name = yyjson_get_str(yyjson_arr_get(required, idx));
+        if (required_name && strcmp(required_name, prop_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_str) {
+    if (!schema_str) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+
+    /* Parse the JSON schema to extract properties and convert to TypeBox */
+    yyjson_doc *doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    if (!doc) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!root) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    yyjson_val *properties = yyjson_obj_get(root, "properties");
+    yyjson_val *required = yyjson_obj_get(root, "required");
+    if (!properties) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    sb_append(sb, "Type.Object({\n");
+
+    bool first_prop = true;
+    size_t idx = 0, max = 0;
+    yyjson_val *key = NULL, *val = NULL;
+
+    yyjson_obj_foreach(properties, idx, max, key, val) {
+        const char *prop_name = yyjson_get_str(key);
+        if (!prop_name) {
+            continue;
+        }
+
+        if (!first_prop) {
+            sb_append(sb, ",\n");
+        }
+        first_prop = false;
+
+        sb_append(sb, "      ");
+        sb_append(sb, prop_name);
+        sb_append(sb, ": ");
+
+        yyjson_val *description_val = yyjson_obj_get(val, "description");
+        const char *description = yyjson_get_str(description_val);
+        bool is_required = typebox_property_is_required(required, prop_name);
+        if (!is_required) {
+            sb_append(sb, "Type.Optional(");
+        }
+        append_typebox_type(sb, val, description, true);
+        if (!is_required) {
+            sb_append(sb, ")");
+        }
+    }
+
+    sb_append(sb, "\n    })");
+    yyjson_doc_free(doc);
+}
+
 char *cbm_client_adapter_pi(const char *binary_path) {
     if (!binary_path || !binary_path[0]) {
         return NULL;
@@ -157,7 +319,8 @@ char *cbm_client_adapter_pi(const char *binary_path) {
      * (pods CLI) or an old AgentTool arity cannot be mistaken for this file. */
     sb_append(&sb, "// Target: @earendil-works/pi-coding-agent >= 0.74.0 (verified 0.84.2)\n"
                    "// ToolDefinition.execute(toolCallId, params, signal, onUpdate, ctx)\n");
-    sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
+    sb_append(&sb, "import { spawn } from 'node:child_process';\n");
+    sb_append(&sb, "import { Type } from 'typebox';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
     sb_append(&sb, "';\n\n");
@@ -224,10 +387,8 @@ char *cbm_client_adapter_pi(const char *binary_path) {
         sb_append(&sb, ",\n    description: ");
         sb_append_js_string(&sb, description ? description : "");
         sb_append(&sb, ",\n    parameters: ");
-        /* input_schema is compact JSON, which is a valid JavaScript object
-         * literal; embedding it directly keeps the generated module free of a
-         * JSON.parse indirection and of any escaping drift. */
-        sb_append(&sb, schema ? schema : "{}");
+        /* Convert JSON schema to TypeBox format */
+        convert_json_schema_to_typebox(&sb, schema);
         /* 0.84.2 calls execute(toolCallId, params, signal, onUpdate, ctx).
          * The previous (args, ctx) shape bound the call id as the MCP args. */
         sb_append(&sb, ",\n    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {\n");
@@ -300,57 +461,64 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
                    "  });\n"
                    "}\n\n");
 
-    sb_append(&sb,
-              "export const CodebaseMemory = async (ctx) => {\n"
-              "  const dir = ctx?.directory;\n"
-              "  const seen = new Set();\n"
-              "  const lifecycle = () =>\n"
-              "    augment({ hook_event_name: 'SessionStart', cwd: dir });\n"
-              "  return {\n"
-              "    'tool.execute.after': async (input, output) => {\n"
-              "      if (typeof output?.output !== 'string') return;\n"
-              "      const pieces = [];\n"
-              "      const sid = input?.sessionID;\n"
-              "      if (typeof sid === 'string' && !seen.has(sid)) {\n"
-              "        seen.add(sid);\n"
-              "        pieces.push(await lifecycle());\n"
-              "      }\n"
-              "      const args = input?.args ?? {};\n"
-              "      const search =\n"
-              "        input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' : null;\n"
-              "      if (search) {\n"
-              "        pieces.push(await augment({\n"
-              "          hook_event_name: 'PreToolUse',\n"
-              "          tool_name: search,\n"
-              "          tool_input: args,\n"
-              "          cwd: dir,\n"
-              "        }));\n"
-              "      } else if (input?.tool === 'read') {\n"
-              "        const filePath = args.filePath ?? args.file_path ?? args.path;\n"
-              "        if (typeof filePath === 'string' && filePath) {\n"
-              "          pieces.push(await augment({\n"
-              "            hook_event_name: 'PostToolUse',\n"
-              "            tool_name: 'Read',\n"
-              "            tool_input: { file_path: filePath },\n"
-              "            cwd: dir,\n"
-              "          }));\n"
-              "        }\n"
-              "      }\n"
-              "      const extra = pieces.filter(Boolean).join('\\n');\n"
-              "      if (extra) {\n"
-              "        output.output += '\\n' + extra;\n"
-              "      }\n"
-              "    },\n"
-              "    // Documented (experimental) compaction surface: output.context is the\n"
-              "    // mutable array of context strings for the rebuilt session.\n"
-              "    'experimental.session.compacting': async (_input, output) => {\n"
-              "      const note = await lifecycle();\n"
-              "      if (note && Array.isArray(output?.context)) {\n"
-              "        output.context.push(note);\n"
-              "      }\n"
-              "    },\n"
-              "  };\n"
-              "};\n");
+    sb_append(
+        &sb, "export default {\n"
+             "  id: 'codebase-memory-augment',\n"
+             "  // V2 config loader: requires id + setup|effect; no tool domain yet\n"
+             "  // at this point, so there is nothing to register here.\n"
+             "  setup() {},\n"
+             "  // Server runtime: reads default.server and dispatches the hooks it returns.\n"
+             "  server: async (ctx) => {\n"
+             "    const dir = ctx?.directory;\n"
+             "    const seen = new Set();\n"
+             "    const lifecycle = () =>\n"
+             "      augment({ hook_event_name: 'SessionStart', cwd: dir });\n"
+             "    return {\n"
+             "      'tool.execute.after': async (input, output) => {\n"
+             "        if (typeof output?.output !== 'string') return;\n"
+             "        const pieces = [];\n"
+             "        const sid = input?.sessionID;\n"
+             "        if (typeof sid === 'string' && !seen.has(sid)) {\n"
+             "          seen.add(sid);\n"
+             "          pieces.push(await lifecycle());\n"
+             "        }\n"
+             "        const args = input?.args ?? {};\n"
+             "        const search =\n"
+             "          input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' : null;\n"
+             "        if (search) {\n"
+             "          pieces.push(await augment({\n"
+             "            hook_event_name: 'PreToolUse',\n"
+             "            tool_name: search,\n"
+             "            tool_input: args,\n"
+             "            cwd: dir,\n"
+             "          }));\n"
+             "        } else if (input?.tool === 'read') {\n"
+             "          const filePath = args.filePath ?? args.file_path ?? args.path;\n"
+             "          if (typeof filePath === 'string' && filePath) {\n"
+             "            pieces.push(await augment({\n"
+             "              hook_event_name: 'PostToolUse',\n"
+             "              tool_name: 'Read',\n"
+             "              tool_input: { file_path: filePath },\n"
+             "              cwd: dir,\n"
+             "            }));\n"
+             "          }\n"
+             "        }\n"
+             "        const extra = pieces.filter(Boolean).join('\\n');\n"
+             "        if (extra) {\n"
+             "          output.output += '\\n' + extra;\n"
+             "        }\n"
+             "      },\n"
+             "      // Documented (experimental) compaction surface: output.context is the\n"
+             "      // mutable array of context strings for the rebuilt session.\n"
+             "      'experimental.session.compacting': async (_input, output) => {\n"
+             "        const note = await lifecycle();\n"
+             "        if (note && Array.isArray(output?.context)) {\n"
+             "          output.context.push(note);\n"
+             "        }\n"
+             "      },\n"
+             "    };\n"
+             "  },\n"
+             "};\n");
 
     if (sb.failed) {
         free(sb.buf);

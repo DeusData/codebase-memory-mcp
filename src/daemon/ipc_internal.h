@@ -110,4 +110,15 @@ void cbm_daemon_ipc_posix_record_write_failure_set_for_test(int errno_value);
 typedef void (*cbm_daemon_ipc_startup_gate_fn)(void *context);
 void cbm_daemon_ipc_startup_gate_set_for_test(cbm_daemon_ipc_startup_gate_fn gate, void *context);
 
+/* Deterministic-interleaving seam for the Windows private-directory walk:
+ * fires after a path component was observed ABSENT and before this process
+ * tries to create it. A test plays the concurrent process that wins that
+ * creation, which pins the cold-start race (N processes first-starting
+ * against a runtime directory that does not exist yet) by construction
+ * instead of by thread timing. `path` is the NUL-terminated component path at
+ * the walk position. No-op off Windows. */
+typedef void (*cbm_daemon_ipc_win_directory_create_hook_fn)(const wchar_t *path, void *context);
+void cbm_daemon_ipc_win_directory_create_hook_set_for_test(
+    cbm_daemon_ipc_win_directory_create_hook_fn hook, void *context);
+
 #endif /* CBM_DAEMON_IPC_INTERNAL_H */

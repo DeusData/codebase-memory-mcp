@@ -1830,20 +1830,27 @@ tail:
         }
     }
 
-    /* Optional SKIP */
+    /* Optional SKIP. A non-numeric operand is a loud parse error: expect() has
+     * already filled p->error, and dropping the clause instead would leave
+     * r->skip at its "none" default while the query still reports success. */
     if (match(p, TOK_SKIP)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
-    /* Optional LIMIT */
+    /* Optional LIMIT. Same rule: a dropped LIMIT is the failure mode #1334
+     * banned - the caller would silently receive the whole result set. */
     if (match(p, TOK_LIMIT)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     *out = r;
@@ -2293,7 +2300,6 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
 /* Get node property by name.
  * store may be NULL; only needed for virtual degree properties. */
 static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
-static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
 static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
     if (!n || !prop) {
@@ -2303,8 +2309,6 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     if (str && str[0]) {
         return str;
     }
-    /* Note: a string field that exists but is empty ("") falls through here so a
-     * WITH-aggregation node stub (below) can re-fetch it. */
     /* Computed and JSON-derived values live in rotating thread-local buffers:
      * a single row (or an ORDER-BY comparison) reads several of these before any
      * of them is copied out, so returning one shared static buffer would alias
@@ -2340,40 +2344,6 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512);
         if (v && v[0]) {
             return v;
-        }
-    }
-    /* WITH aggregation carries a node group var by id + name only (the group key
-     * is the node name), so every other property is absent on the stub. Detect
-     * the stub (id set, but the full string fields were never populated) and
-     * re-fetch the node so RETURN g.file_path / g.label / g.<metric> project
-     * correctly instead of returning blank. The gate is heuristic, not an exact
-     * stub discriminator: a real bound node with NULL label AND file_path would
-     * also match, but in that case the worst case is one redundant indexed fetch
-     * that returns the same value — never a wrong result. */
-    if (store && n->id > 0 && !n->file_path && !n->label) {
-        cbm_node_t full = {0};
-        if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
-            const char *res = NULL;
-            const char *rv = node_string_field(&full, prop);
-            if (rv && rv[0]) {
-                snprintf(out, CBM_SZ_512, "%s", rv);
-                res = out;
-            } else if (strcmp(prop, "start_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.start_line);
-                res = out;
-            } else if (strcmp(prop, "end_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.end_line);
-                res = out;
-            } else if (full.properties_json && full.properties_json[0] == '{') {
-                const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
-                if (jv && jv[0]) {
-                    res = out;
-                }
-            }
-            node_fields_free(&full);
-            if (res) {
-                return res;
-            }
         }
     }
     return "";
@@ -3835,6 +3805,30 @@ static void distinct_list_add(char ***list, int *count, const char *val) {
     (*list)[idx] = heap_strdup(val);
 }
 
+/* Resolve one WITH ORDER BY key on a projected binding. The key is either a
+ * projected name (`c`, or an unaliased `f.name`) or a property of a carried
+ * node (`g.start_line` after `WITH f AS g`, #2208): an exact projected name
+ * wins, otherwise `var.prop` is split and resolved on the carried node. */
+static const char *order_key_value(binding_t *b, const char *key) {
+    const char *dot = strchr(key, '.');
+    if (!dot) {
+        return binding_get_virtual(b, key, NULL);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], key) == 0) {
+            return binding_get_virtual(b, key, NULL);
+        }
+    }
+    char var[CBM_SZ_256];
+    size_t vlen = (size_t)(dot - key);
+    if (vlen >= sizeof(var)) {
+        return "";
+    }
+    memcpy(var, key, vlen);
+    var[vlen] = '\0';
+    return binding_get_virtual(b, var, dot + SKIP_ONE);
+}
+
 /* Sort bindings by the ORDER BY key list (virtual variables) using bubble
  * sort; later keys break ties, direction is per key (#1334). */
 static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clause_t *wc) {
@@ -3842,9 +3836,8 @@ static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clau
         for (int j = 0; j < count - i - SKIP_ONE; j++) {
             int cmp = 0;
             for (int k = 0; k < wc->order_key_count && cmp == 0; k++) {
-                const char *va = binding_get_virtual(&vbindings[j], wc->order_keys[k], NULL);
-                const char *vb2 =
-                    binding_get_virtual(&vbindings[j + SKIP_ONE], wc->order_keys[k], NULL);
+                const char *va = order_key_value(&vbindings[j], wc->order_keys[k]);
+                const char *vb2 = order_key_value(&vbindings[j + SKIP_ONE], wc->order_keys[k]);
                 char *ea = NULL;
                 char *eb = NULL;
                 double da = strtod(va, &ea);
@@ -3918,8 +3911,27 @@ typedef struct {
     double *mins, *maxs;
     char ***distinct_lists;  /* per-item set of seen values for COUNT(DISTINCT) */
     int *distinct_n;         /* per-item distinct count (#239) */
-    int64_t *group_node_ids; /* per-item node id when the group var is a node (0 = not) */
+    cbm_node_t *group_nodes; /* per-item carried node (deep copy; id 0 = not a node) */
 } with_agg_t;
+
+/* A WITH item that is a bare, bound node variable (`WITH f`, `WITH f AS g`)
+ * carries the node itself, not a scalar: return that node, else NULL. Property
+ * items, functions (labels/id/keys/...) and unbound OPTIONAL vars (id 0) stay
+ * scalar. The carried node keeps every field, so a later g.<prop> resolves
+ * exactly as it would without the WITH (#2208). */
+static const cbm_node_t *with_item_carried_node(const cbm_return_item_t *item, binding_t *b) {
+    if (item->func || item->property || !item->variable) {
+        return NULL;
+    }
+    const cbm_node_t *n = binding_get(b, item->variable);
+    return (n && n->id > 0) ? n : NULL;
+}
+
+/* Name a carried node is bound under: the AST-owned alias or variable, which
+ * outlives every binding of the query (binding_set does not copy the name). */
+static const char *with_item_node_alias(const cbm_return_item_t *item) {
+    return item->alias ? item->alias : item->variable;
+}
 
 /* Build a group key from non-aggregate WITH items */
 static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
@@ -3929,7 +3941,12 @@ static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, 
             continue;
         }
         char vbuf[CBM_SZ_512];
-        const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
+        const cbm_node_t *gn = with_item_carried_node(&wc->items[ci], b);
+        if (gn) {
+            /* Group a node by identity, never by its (non-unique) name. */
+            snprintf(vbuf, sizeof(vbuf), "#%lld", (long long)gn->id);
+        }
+        const char *v = gn ? vbuf : project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         kl += snprintf(key + kl, key_sz - (size_t)kl, "%s|", v);
         if (kl >= (int)key_sz) {
             kl = (int)key_sz - SKIP_ONE;
@@ -3959,7 +3976,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     (*aggs)[found].maxs = calloc(wc->count, sizeof(double));
     (*aggs)[found].distinct_lists = calloc(wc->count, sizeof(char **));
     (*aggs)[found].distinct_n = calloc(wc->count, sizeof(int));
-    (*aggs)[found].group_node_ids = calloc(wc->count, sizeof(int64_t));
+    (*aggs)[found].group_nodes = calloc(wc->count, sizeof(cbm_node_t));
     for (int ci = 0; ci < wc->count; ci++) {
         (*aggs)[found].mins[ci] = CYP_DBL_MAX;
         (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
@@ -3972,18 +3989,9 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         char vbuf[CBM_SZ_512];
         const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
-        /* If this group item is a bare node variable, remember its id so the
-         * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). Excludes entity-introspection funcs (labels/id/keys/
-         * properties): those project a scalar off the node (via project_item
-         * above), not the node itself, so the carried id must not be set or a
-         * later alias.property re-fetches the source node's real properties
-         * instead of returning empty for the non-node alias. */
-        if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
-            cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
-            if (gn) {
-                (*aggs)[found].group_node_ids[ci] = gn->id;
-            }
+        const cbm_node_t *gn = with_item_carried_node(&wc->items[ci], b);
+        if (gn) {
+            node_deep_copy(&(*aggs)[found].group_nodes[ci], gn);
         }
     }
     return found;
@@ -4026,11 +4034,14 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
     }
 }
 
-/* Add a virtual variable binding for one WITH item */
+/* Add a scalar virtual variable binding for one WITH item. The value lives in
+ * .name; the owned alias string (var_names points at it) lives in .project,
+ * which no property accessor exposes. It used to live in .qualified_name, so
+ * alias.qualified_name / keys(alias) returned the variable name as data (#2208). */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
-    cbm_node_t vn = {.name = heap_strdup(val), .qualified_name = heap_strdup(alias)};
+    cbm_node_t vn = {.name = heap_strdup(val), .project = heap_strdup(alias)};
     if (vb->var_count < CYP_BUF_16) {
-        vb->var_names[vb->var_count] = vn.qualified_name;
+        vb->var_names[vb->var_count] = vn.project;
         vb->var_nodes[vb->var_count] = vn;
         vb->var_count++;
     }
@@ -4055,7 +4066,12 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
         free(aggs[a].maxs);
         free(aggs[a].distinct_lists);
         free(aggs[a].distinct_n);
-        free(aggs[a].group_node_ids);
+        if (aggs[a].group_nodes) {
+            for (int ci = 0; ci < item_count; ci++) {
+                node_fields_free(&aggs[a].group_nodes[ci]);
+            }
+        }
+        free(aggs[a].group_nodes);
     }
     free(aggs);
 }
@@ -4095,13 +4111,10 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                     with_agg_format(wc->items[ci].func, &aggs[a], ci, vbuf, sizeof(vbuf));
                 }
                 with_add_vbinding_var(&vb, alias, vbuf);
+            } else if (aggs[a].group_nodes[ci].id > 0) {
+                binding_set(&vb, with_item_node_alias(&wc->items[ci]), &aggs[a].group_nodes[ci]);
             } else {
                 with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
-                /* Tag the carried virtual var with the node id (when the group
-                 * var is a node) so node_prop can re-fetch its full properties. */
-                if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
-                    vb.var_nodes[vb.var_count - 1].id = aggs[a].group_node_ids[ci];
-                }
             }
         }
         (*vbindings)[(*vcount)++] = vb;
@@ -4118,6 +4131,11 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
+            const cbm_node_t *carried = with_item_carried_node(&wc->items[ci], &bindings[bi]);
+            if (carried) {
+                binding_set(&vb, with_item_node_alias(&wc->items[ci]), carried);
+                continue;
+            }
             char func_buf[CBM_SZ_512];
             const char *val =
                 project_item(&bindings[bi], &wc->items[ci], func_buf, sizeof(func_buf));
@@ -4450,9 +4468,31 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 }
 
 /* Accumulate a binding into RETURN aggregation */
+static bool binding_has_value(binding_t *b, const char *var, const char *prop) {
+    if (!var || strcmp(var, "*") == 0) {
+        return true;
+    }
+    char full[CBM_SZ_256];
+    if (prop) {
+        snprintf(full, sizeof(full), "%s.%s", var, prop);
+    } else {
+        snprintf(full, sizeof(full), "%s", var);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], full) == 0) {
+            return true;
+        }
+    }
+    return binding_get_edge(b, var) != NULL || binding_get(b, var) != NULL;
+}
+
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
         if (!is_aggregate_func(ret->items[ci].func)) {
+            continue;
+        }
+        if (strcmp(ret->items[ci].func, "COUNT") == 0 &&
+            !binding_has_value(b, ret->items[ci].variable, ret->items[ci].property)) {
             continue;
         }
         entry->counts[ci]++;
@@ -4782,9 +4822,12 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
             free(tmp);
         }
         if (opt && extra_count == 0) {
+            /* OPTIONAL with no start node: keep the row, pattern vars unbound.
+             * The buffer was sized for a single row when extra_count == 0, so
+             * this write must grow it like every other writer here. */
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
-            new_bindings[new_count++] = nb;
+            (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
         }
     }
     for (int bi = 0; bi < *bind_count; bi++) {
@@ -4985,8 +5028,107 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
                         limit_is_engine_budget);
 }
 
+/* ── Planner: seed a single-hop pattern from its selective end ──────────────
+ *
+ * The executor scans pattern node 0 and expands from there. Written as
+ * `MATCH (a)-[:CALLS]->(b) WHERE b.name = '_printk'`, that scans every node
+ * in the store before the filter on `b` can discard any — on an 8.5 M node
+ * kernel graph the query hit the execution-time limit while the anchored
+ * spelling `MATCH (b:Function {name:'_printk'})<-[:CALLS]-(a)` answered in
+ * seconds (2026-09-16 probe). A reader should not have to know which end to
+ * write first: when the far node carries an equality on name/qualified_name,
+ * an inline property, or a label and the near node carries less, the pattern
+ * is walked from the far end with the relationship direction inverted. The
+ * result set is identical; only the enumeration order changes. Restricted to
+ * one single-relationship pattern with an explicit RETURN, and never to an
+ * OPTIONAL MATCH, whose anchor is part of its meaning. */
+static int cypher_cond_selectivity(const cbm_condition_t *c, const char *var) {
+    if (!c || !c->variable || !var || strcmp(c->variable, var) != 0 || c->negated) {
+        return 0;
+    }
+    if (!c->op || strcmp(c->op, "=") != 0 || !c->property) {
+        return 0;
+    }
+    return (strcmp(c->property, "name") == 0 || strcmp(c->property, "qualified_name") == 0) ? 3 : 2;
+}
+
+static int cypher_expr_selectivity(const cbm_expr_t *e, const char *var) {
+    if (!e) {
+        return 0;
+    }
+    if (e->type == EXPR_CONDITION) {
+        return cypher_cond_selectivity(&e->cond, var);
+    }
+    if (e->type == EXPR_AND) {
+        int l = cypher_expr_selectivity(e->left, var);
+        int r = cypher_expr_selectivity(e->right, var);
+        return l > r ? l : r;
+    }
+    return 0; /* OR / NOT / XOR: no single equality to seed from */
+}
+
+static int cypher_node_selectivity(const cbm_node_pattern_t *n, const cbm_where_clause_t *w) {
+    int s = 0;
+    for (int i = 0; i < n->prop_count; i++) {
+        const char *k = n->props[i].key;
+        int v = (k && (strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0)) ? 3 : 2;
+        if (v > s) {
+            s = v;
+        }
+    }
+    if (w && n->variable) {
+        int v = 0;
+        if (w->root) {
+            v = cypher_expr_selectivity(w->root, n->variable);
+        } else if (!w->op || strcmp(w->op, "AND") == 0) {
+            for (int i = 0; i < w->count; i++) {
+                int c = cypher_cond_selectivity(&w->conditions[i], n->variable);
+                if (c > v) {
+                    v = c;
+                }
+            }
+        }
+        if (v > s) {
+            s = v;
+        }
+    }
+    if (s == 0 && n->label) {
+        s = 1;
+    }
+    return s;
+}
+
+static void cypher_plan_seed_from_selective_end(cbm_query_t *q) {
+    if (!q || q->pattern_count != 1 || !q->ret || (q->pattern_optional && q->pattern_optional[0])) {
+        return;
+    }
+    cbm_pattern_t *p = &q->patterns[0];
+    if (p->rel_count != 1 || p->node_count != 2) {
+        return;
+    }
+    if (cypher_node_selectivity(&p->nodes[1], q->where) <=
+        cypher_node_selectivity(&p->nodes[0], q->where)) {
+        return;
+    }
+    cbm_node_pattern_t tmp = p->nodes[0];
+    p->nodes[0] = p->nodes[1];
+    p->nodes[1] = tmp;
+    cbm_rel_pattern_t *r = &p->rels[0];
+    const char *inverted = NULL;
+    if (r->direction && strcmp(r->direction, "outbound") == 0) {
+        inverted = "inbound";
+    } else if (r->direction && strcmp(r->direction, "inbound") == 0) {
+        inverted = "outbound";
+    }
+    if (inverted) {
+        safe_str_free(&r->direction);
+        r->direction = heap_strdup(inverted);
+    }
+}
+
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
                           result_builder_t *rb) {
+    cypher_plan_seed_from_selective_end(q);
     cbm_pattern_t *pat0 = &q->patterns[0];
 
     /* Step 1: Scan initial nodes */

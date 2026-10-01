@@ -400,6 +400,11 @@ TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
     char relocated_runtime[BOOTSTRAP_TEST_PATH_CAP] = {0};
     char explicit_runtime[BOOTSTRAP_TEST_PATH_CAP] = {0};
     char unusable[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    /* The runner isolates the rendezvous for the whole run through this same
+     * variable, so the test must hand back exactly what it found. */
+    char previous_value[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    const char *previous =
+        cbm_safe_getenv("CBM_RUNTIME_DIR", previous_value, sizeof(previous_value), NULL);
     int written = snprintf(override_parent, sizeof(override_parent),
                            "%s/cbm-bootstrap-runtime-env-XXXXXX", cbm_tmpdir());
     if (written <= 0 || written >= (int)sizeof(override_parent) || !cbm_mkdtemp(override_parent)) {
@@ -436,8 +441,10 @@ TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
         unusable_set ? cbm_daemon_bootstrap_endpoint_new(NULL) : NULL;
 
     /* Restore before asserting: a failed assertion returns immediately, and a
-     * leaked CBM_RUNTIME_DIR would follow every later suite in this process. */
-    (void)cbm_unsetenv("CBM_RUNTIME_DIR");
+     * leaked override, or a dropped run value, would follow every later suite
+     * in this process. */
+    bool restored = previous ? cbm_setenv("CBM_RUNTIME_DIR", previous_value, 1) == 0
+                             : cbm_unsetenv("CBM_RUNTIME_DIR") == 0;
     cbm_daemon_ipc_endpoint_free(refused);
     cbm_daemon_ipc_endpoint_free(relocated);
     if (relocated_runtime[0] != '\0') {
@@ -448,6 +455,7 @@ TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
     }
     (void)cbm_rmdir(override_parent);
 
+    ASSERT_TRUE(restored);
     ASSERT_TRUE(prepared);
     ASSERT_TRUE(explicit_started);
     ASSERT_TRUE(explicit_canonical);
@@ -893,6 +901,8 @@ typedef struct {
     char parent[BOOTSTRAP_TEST_PATH_CAP];
     cbm_daemon_build_identity_t identity;
     pid_t children[BOOTSTRAP_ENOSPC_MAX_CHILDREN];
+    int exit_status[BOOTSTRAP_ENOSPC_MAX_CHILDREN];
+    bool reaped[BOOTSTRAP_ENOSPC_MAX_CHILDREN];
     size_t child_count;
     size_t spawn_calls;
 } bootstrap_enospc_host_t;
@@ -928,19 +938,40 @@ static bool bootstrap_enospc_host_spawn(void *opaque,
         int run_result = endpoint ? cbm_daemon_host_run(&config) : 0;
         _exit(run_result == -1 ? 0 : 50);
     }
-    state->children[state->child_count++] = child;
+    /* SYNCHRONOUS on purpose. The daemon host writes its start-failure record
+     * and only then lets go of its lifetime reservation and exits, so once it
+     * has been reaped "record on disk, reservation released" is a STABLE state
+     * pinned by construction. The client's first look after the spawn (the
+     * wait loop always runs once and its first failure check is unthrottled)
+     * therefore finds the record however long the host took to get there.
+     *
+     * Returning while the host was still running made the verdict ride on the
+     * client's 30 s startup deadline: before it listens the host SHA-256s its
+     * own image, which for the ~450 MB test runner is ~3 s natively and ~26 s
+     * under MSan (48 CI samples: 20-32 s). The deadline won that race on slow
+     * runs and the reaper then SIGKILLed a host that had not failed yet --
+     * `ASSERT(daemon_named_cause)` red on PRs that touch no C at all (#2245,
+     * #2158, #2140). A deadline must never decide a test (O9). */
+    size_t slot = state->child_count++;
+    state->children[slot] = child;
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    state->reaped[slot] = waited == child;
+    state->exit_status[slot] = status;
     return true;
 }
 
 static void bootstrap_enospc_reap(bootstrap_enospc_host_t *state, int *nonzero_exits) {
     *nonzero_exits = 0;
     for (size_t i = 0; i < state->child_count; i++) {
-        int status = 0;
-        pid_t waited;
-        do {
-            waited = waitpid(state->children[i], &status, WNOHANG);
-        } while (waited < 0 && errno == EINTR);
-        if (waited == 0) {
+        int status = state->exit_status[i];
+        if (!state->reaped[i]) {
+            /* Only reachable when the synchronous wait in the spawn itself
+             * failed; never leave a host behind. */
+            pid_t waited;
             (void)kill(state->children[i], SIGKILL);
             do {
                 waited = waitpid(state->children[i], &status, 0);

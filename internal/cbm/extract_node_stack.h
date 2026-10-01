@@ -12,9 +12,9 @@
  *
  * Growth abandons the old buffer in that scratch arena, which is free because
  * the arena dies with the file. The initial capacities below are unchanged, but
- * they are no longer what a small file costs: cbm_extract_file_ex creates the
- * scratch arena's first block for every call, including calls that build no
- * stack at all, and reclaims it on the way out.
+ * they are no longer what a small file costs: cbm_extract_file_ex hands every
+ * call a lazy scratch arena, whose first block is taken by the first stack
+ * built, so a call that builds no stack allocates nothing.
  */
 #ifndef CBM_EXTRACT_NODE_STACK_H
 #define CBM_EXTRACT_NODE_STACK_H
@@ -84,13 +84,14 @@ static inline TSNode ts_nstack_pop(TSNodeStack *s) {
  */
 static inline void ts_nstack_push_children(TSNodeStack *s, TSNode node) {
     int base = s->count;
-    TSTreeCursor cursor = ts_tree_cursor_new(node);
-    if (ts_tree_cursor_goto_first_child(&cursor)) {
+    /* The thread's reusable cursor (cbm_thread_cursor): the walk completes
+     * before anything else on this thread can ask for it. */
+    TSTreeCursor *cursor = cbm_thread_cursor(node);
+    if (ts_tree_cursor_goto_first_child(cursor)) {
         do {
-            ts_nstack_push(s, ts_tree_cursor_current_node(&cursor));
-        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+            ts_nstack_push(s, ts_tree_cursor_current_node(cursor));
+        } while (ts_tree_cursor_goto_next_sibling(cursor));
     }
-    ts_tree_cursor_delete(&cursor);
     /* Reverse [base, count) so the first child pops first (forward order). */
     int lo = base, hi = s->count - 1;
     while (lo < hi) {

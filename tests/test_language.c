@@ -4,6 +4,7 @@
  * RED phase: These tests define the expected behavior for registered languages.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "discover/discover.h"
 
@@ -413,6 +414,36 @@ TEST(lang_ext_svg) {
     ASSERT_EQ(cbm_language_for_extension(".svg"), CBM_LANG_XML);
     PASS();
 }
+/* Issue #2229: the XML documents that make up a .NET repository's project
+ * system were unmapped, so a solution's package references, target frameworks,
+ * localized strings and app manifests were never indexed or searchable. */
+TEST(lang_ext_msbuild_projects) {
+    ASSERT_EQ(cbm_language_for_extension(".csproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".vbproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".fsproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".props"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".targets"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".nuspec"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".slnx"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".runsettings"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_resx) {
+    ASSERT_EQ(cbm_language_for_extension(".resx"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_xaml) {
+    ASSERT_EQ(cbm_language_for_extension(".xaml"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".axaml"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_app_manifests) {
+    ASSERT_EQ(cbm_language_for_extension(".plist"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".xcprivacy"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".manifest"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".appxmanifest"), CBM_LANG_XML);
+    PASS();
+}
 TEST(lang_ext_markdown) {
     ASSERT_EQ(cbm_language_for_extension(".md"), CBM_LANG_MARKDOWN);
     PASS();
@@ -703,6 +734,35 @@ TEST(lang_frm_form_stays_form) {
     ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_FORM);
     remove(path);
     ASSERT_EQ(cbm_disambiguate_frm("/tmp/nonexistent_file_12345.frm"), CBM_LANG_FORM);
+    PASS();
+}
+
+/* #2176: a Godot binary resource shares the .res extension with ReScript.
+ * Parsed as ReScript it produced an error tree that never finished indexing;
+ * binary content is not ReScript source and must not be indexed as such. */
+TEST(lang_res_binary_resource_unsupported) {
+    static const unsigned char godot_head[] = {'R',  'S',  'R',  'C',  0x00, 0x00, 0x00, 0x00,
+                                               0x04, 0x00, 0x00, 0x00, 'A',  'r',  'r',  'a',
+                                               'y',  'M',  'e',  's',  'h',  0x00, 0xff, 0x80};
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_godot.res", cbm_tmpdir());
+    FILE *f = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fwrite(godot_head, 1, sizeof(godot_head), f), sizeof(godot_head));
+    fclose(f);
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_res_rescript_stays_rescript) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_rescript.res", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "let greet = name => `Hello ${name}`\n"
+                                       "module M = {\n  let x = 1\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_RESCRIPT);
+    remove(path);
+    ASSERT_EQ(cbm_disambiguate_res("/tmp/nonexistent_file_12345.res"), CBM_LANG_RESCRIPT);
     PASS();
 }
 
@@ -1361,6 +1421,10 @@ SUITE(language) {
     RUN_TEST(lang_ext_xsl);
     RUN_TEST(lang_ext_xsd);
     RUN_TEST(lang_ext_svg);
+    RUN_TEST(lang_ext_msbuild_projects);
+    RUN_TEST(lang_ext_resx);
+    RUN_TEST(lang_ext_xaml);
+    RUN_TEST(lang_ext_app_manifests);
     RUN_TEST(lang_ext_markdown);
     RUN_TEST(lang_ext_mdx);
     RUN_TEST(lang_ext_makefile);
@@ -1422,6 +1486,8 @@ SUITE(language) {
     RUN_TEST(lang_cls_objectscript_stays_objectscript);
     RUN_TEST(lang_frm_vb6_form_unsupported);
     RUN_TEST(lang_frm_form_stays_form);
+    RUN_TEST(lang_res_binary_resource_unsupported);
+    RUN_TEST(lang_res_rescript_stays_rescript);
 
     /* Go test ports */
     /* New languages */

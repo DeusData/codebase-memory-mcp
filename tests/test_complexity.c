@@ -49,6 +49,8 @@
 #include "../src/foundation/profile.h"
 #include "cbm.h"
 #include "discover/discover.h"
+#include "lang_specs.h"
+#include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
@@ -433,36 +435,58 @@ static double cx_ratio(double num, double den) {
     return den > 0.0 ? num / den : 0.0;
 }
 
+typedef int (*CxCorpusBuilder)(const char *root, int k);
+
+static void cx_remove_corpus(const char *root) {
+    if (th_rmtree(root) != 0) {
+        fprintf(stderr, "  [complexity] WARN: could not remove temp corpus %s\n", root);
+    }
+}
+
+/* Build one corpus shape at k and 2k in two fresh temp dirs, run the pipeline
+ * on both, and remove both dirs before returning — on success and on every
+ * failure path. Only the metrics outlive the call; the corpora used to stay
+ * behind in the temp root, four per suite run. Only dirs this call created
+ * are removed (the temp root is shared with concurrent runs). */
+static int cx_measure(CxCorpusBuilder build, const char *prefix_a, const char *prefix_b,
+                      CxMetrics *out_a, CxMetrics *out_b) {
+    const char *tmp = cbm_tmpdir();
+    char root_a[512];
+    char root_b[512];
+    snprintf(root_a, sizeof(root_a), "%s/%s_XXXXXX", tmp, prefix_a);
+    snprintf(root_b, sizeof(root_b), "%s/%s_XXXXXX", tmp, prefix_b);
+    bool made_a = cbm_mkdtemp(root_a) != NULL;
+    bool made_b = made_a && cbm_mkdtemp(root_b) != NULL;
+    int rc = -1;
+    if (made_b && build(root_a, CX_K_BASE) == 0 && build(root_b, CX_K_BASE * 2) == 0) {
+        char db_a[600];
+        char db_b[600];
+        snprintf(db_a, sizeof(db_a), "%s/cx.db", root_a);
+        snprintf(db_b, sizeof(db_b), "%s/cx.db", root_b);
+        if (cx_run(root_a, db_a, out_a) == 0 && cx_run(root_b, db_b, out_b) == 0) {
+            rc = 0;
+        }
+    }
+    if (made_b) {
+        cx_remove_corpus(root_b);
+    }
+    if (made_a) {
+        cx_remove_corpus(root_a);
+    }
+    return rc;
+}
+
 /* Shared across the suite so the report test reuses the measured pair instead
  * of paying two more pipeline runs. */
 static CxMetrics g_cx_base;
 static CxMetrics g_cx_doubled;
 static bool g_cx_measured = false;
-static char g_cx_root_base[512];
-static char g_cx_root_doubled[512];
 
 static int cx_measure_pair(void) {
     if (g_cx_measured) {
         return 0;
     }
-    const char *tmp = cbm_tmpdir();
-    snprintf(g_cx_root_base, sizeof(g_cx_root_base), "%s/cbm_cx_base_XXXXXX", tmp);
-    snprintf(g_cx_root_doubled, sizeof(g_cx_root_doubled), "%s/cbm_cx_dbl_XXXXXX", tmp);
-    if (!cbm_mkdtemp(g_cx_root_base) || !cbm_mkdtemp(g_cx_root_doubled)) {
-        return -1;
-    }
-    if (cx_build_corpus(g_cx_root_base, CX_K_BASE) != 0 ||
-        cx_build_corpus(g_cx_root_doubled, CX_K_BASE * 2) != 0) {
-        return -1;
-    }
-    char db1[600];
-    char db2[600];
-    snprintf(db1, sizeof(db1), "%s/cx.db", g_cx_root_base);
-    snprintf(db2, sizeof(db2), "%s/cx.db", g_cx_root_doubled);
-    if (cx_run(g_cx_root_base, db1, &g_cx_base) != 0) {
-        return -1;
-    }
-    if (cx_run(g_cx_root_doubled, db2, &g_cx_doubled) != 0) {
+    if (cx_measure(cx_build_corpus, "cbm_cx_base", "cbm_cx_dbl", &g_cx_base, &g_cx_doubled) != 0) {
         return -1;
     }
     g_cx_measured = true;
@@ -553,25 +577,8 @@ static int cx_measure_bigpkg_pair(void) {
     if (g_cx_big_measured) {
         return 0;
     }
-    const char *tmp = cbm_tmpdir();
-    char ra[512];
-    char rb[512];
-    snprintf(ra, sizeof(ra), "%s/cbm_cxbig_a_XXXXXX", tmp);
-    snprintf(rb, sizeof(rb), "%s/cbm_cxbig_b_XXXXXX", tmp);
-    if (!cbm_mkdtemp(ra) || !cbm_mkdtemp(rb)) {
-        return -1;
-    }
-    if (cx_build_bigpkg(ra, CX_K_BASE) != 0 || cx_build_bigpkg(rb, CX_K_BASE * 2) != 0) {
-        return -1;
-    }
-    char db1[600];
-    char db2[600];
-    snprintf(db1, sizeof(db1), "%s/cx.db", ra);
-    snprintf(db2, sizeof(db2), "%s/cx.db", rb);
-    if (cx_run(ra, db1, &g_cx_big_base) != 0) {
-        return -1;
-    }
-    if (cx_run(rb, db2, &g_cx_big_doubled) != 0) {
+    if (cx_measure(cx_build_bigpkg, "cbm_cxbig_a", "cbm_cxbig_b", &g_cx_big_base,
+                   &g_cx_big_doubled) != 0) {
         return -1;
     }
     g_cx_big_measured = true;
@@ -760,7 +767,82 @@ TEST(complexity_importance_scoring_is_linear) {
     PASS();
 }
 
+/* ── Lexer work in error recovery (#2176) ──────────────────────────────
+ * tree-sitter lexes an unparseable stretch by retrying at every byte with
+ * every external token marked valid. The ReScript scanner then ran its
+ * template-string loop from each byte to the next '`', '$', '\\' or NUL — to
+ * the end of the file when there is none — and threw the result away. That
+ * is O(stretch) per byte, O(n^2) per file, all inside lexing where the parse
+ * budget's progress callback never runs; a binary Godot `.res` of high bytes
+ * (or plain text such as a run of '~') was dropped by the clock instead of
+ * parsed. Work is counted as the bytes the lexer pulls through a chunked
+ * TSInput: a pure function of (grammar, input), independent of speed. */
+enum { CX_LEX_CHUNK = 64, CX_LEX_BASE_BYTES = 4096 };
+
+typedef struct {
+    const char *src;
+    uint32_t len;
+    uint64_t bytes_pulled;
+} CxLexInput;
+
+static const char *cx_lex_read(void *payload, uint32_t byte_index, TSPoint position,
+                               uint32_t *bytes_read) {
+    (void)position;
+    CxLexInput *in = (CxLexInput *)payload;
+    if (byte_index >= in->len) {
+        *bytes_read = 0;
+        return "";
+    }
+    uint32_t n = in->len - byte_index;
+    if (n > CX_LEX_CHUNK) {
+        n = CX_LEX_CHUNK;
+    }
+    in->bytes_pulled += n;
+    *bytes_read = n;
+    return in->src + byte_index;
+}
+
+/* Bytes pulled while parsing `len` copies of `fill` as ReScript; 0 on failure. */
+static uint64_t cx_rescript_lex_work(unsigned char fill, uint32_t len) {
+    char *src = malloc(len);
+    TSParser *parser = ts_parser_new();
+    uint64_t work = 0;
+    if (src && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RESCRIPT))) {
+        memset(src, fill, len);
+        CxLexInput in = {src, len, 0};
+        TSInput input = {&in, cx_lex_read, TSInputEncodingUTF8, NULL};
+        TSTree *tree = ts_parser_parse(parser, NULL, input);
+        if (tree) {
+            work = in.bytes_pulled;
+            ts_tree_delete(tree);
+        }
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    free(src);
+    return work;
+}
+
+TEST(complexity_rescript_error_recovery_lexing_is_linear) {
+    /* 0xFF: the reporter's binary bytes (invalid UTF-8). '~': plain ASCII text
+     * that ReScript cannot parse either — the defect is not binary-only. */
+    static const unsigned char fills[] = {0xFF, '~'};
+    for (size_t i = 0; i < sizeof(fills); i++) {
+        uint64_t base = cx_rescript_lex_work(fills[i], CX_LEX_BASE_BYTES);
+        uint64_t doubled = cx_rescript_lex_work(fills[i], 2 * CX_LEX_BASE_BYTES);
+        double r = cx_ratio((double)doubled, (double)base);
+        printf("    fill 0x%02x: lexer bytes %llu -> %llu  ratio %.2f (linear ~2, quadratic ~4)\n",
+               fills[i], (unsigned long long)base, (unsigned long long)doubled, r);
+        /* Non-vacuous: the lexer must at least have read the input once. */
+        ASSERT_GTE(base, (uint64_t)CX_LEX_BASE_BYTES);
+        ASSERT_TRUE(r >= CX_RATIO_LO && r <= CX_RATIO_HI);
+    }
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
     RUN_TEST(complexity_replicated_modules_scale_linearly);
     RUN_TEST(complexity_perfile_registry_work_is_linear);
     RUN_TEST(complexity_importance_scoring_is_linear);

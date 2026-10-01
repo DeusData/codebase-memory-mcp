@@ -321,6 +321,28 @@ static const ext_entry_t EXT_TABLE[] = {
     {".xsd", CBM_LANG_XML},
     {".xsl", CBM_LANG_XML},
     {".svg", CBM_LANG_XML},
+    /* MSBuild project system. Plain XML documents, and the files that carry a
+     * .NET repository's package references, target frameworks, build hooks and
+     * project layout — none of which were reachable while these were unmapped. */
+    {".csproj", CBM_LANG_XML},
+    {".vbproj", CBM_LANG_XML},
+    {".fsproj", CBM_LANG_XML},
+    {".props", CBM_LANG_XML},
+    {".targets", CBM_LANG_XML},
+    {".nuspec", CBM_LANG_XML},
+    {".slnx", CBM_LANG_XML},
+    {".runsettings", CBM_LANG_XML},
+    /* .NET resource files: the localized strings a UI reads back by key. */
+    {".resx", CBM_LANG_XML},
+    /* XAML views: WPF, WinUI, MAUI (.xaml) and Avalonia (.axaml). */
+    {".xaml", CBM_LANG_XML},
+    {".axaml", CBM_LANG_XML},
+    /* Application manifests: Apple property lists and privacy manifests, Win32
+     * side-by-side manifests and MSIX packages. */
+    {".plist", CBM_LANG_XML},
+    {".xcprivacy", CBM_LANG_XML},
+    {".manifest", CBM_LANG_XML},
+    {".appxmanifest", CBM_LANG_XML},
 
     /* YAML */
     {".yaml", CBM_LANG_YAML},
@@ -1285,6 +1307,27 @@ CBMLanguage cbm_disambiguate_frm(const char *path) {
         return CBM_LANG_COUNT;
     }
     return has_vb6_markers(buf) ? CBM_LANG_COUNT : CBM_LANG_FORM;
+}
+
+/* Disambiguate .res files (#2176): ReScript source shares the extension with
+ * two binary formats -- Godot resources (RSRC/RSCC magic, the default save
+ * format for imported meshes) and Windows compiled resource files. Binary
+ * content has no ReScript meaning, and a NUL byte never occurs in ReScript
+ * text while both binary formats carry NULs in their first bytes. */
+CBMLanguage cbm_disambiguate_res(const char *path) {
+    if (!path) {
+        return CBM_LANG_RESCRIPT;
+    }
+
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return CBM_LANG_RESCRIPT;
+    }
+
+    char buf[CBM_SZ_4K];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    (void)fclose(f);
+    return memchr(buf, '\0', n) ? CBM_LANG_COUNT : CBM_LANG_RESCRIPT;
 }
 
 /* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce

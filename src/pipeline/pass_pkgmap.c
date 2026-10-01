@@ -1543,6 +1543,213 @@ static bool import_targetable_label(const char *label) {
     return false;
 }
 
+/* #2127: a Python import path spells the module chain that owns the imported
+ * name (`from unittest.mock import patch` -> unittest, mock). Strategy 3 matches
+ * the leaf name alone, so an EXTERNAL import (stdlib / third party: no project
+ * module, Strategy 1 misses) bound to any same-named project definition -- a
+ * REST view's `patch` handler became the target of every mock.patch call at
+ * import_map confidence. For such an external import, accept a symbol hit only
+ * when the module segments preceding `name` in the import path occur, in
+ * order, among the hit's enclosing QN segments -- a src/ layout or sys.path
+ * root the module resolver missed (`from template_tests.utils import setup` ->
+ * proj.tests.template_tests.utils.setup) still qualifies. Relative prefixes
+ * (leading dots) carry no segment and are skipped. Imports of project modules
+ * are never judged by it (they may re-export from anywhere). Python only. */
+enum { PY_IMPORT_MAX_SEGS = 64 };
+bool cbm_python_import_path_matches_qn(const char *module_path, const char *name,
+                                       const char *hit_qn) {
+    if (!module_path || !name || !hit_qn) {
+        return true;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s", module_path);
+    char *as = strstr(path, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    const char *p = path;
+    while (*p == '.') {
+        p++;
+    }
+    /* Segments of the import path; name_at = index of the LAST `name`. */
+    const char *segs[PY_IMPORT_MAX_SEGS];
+    size_t lens[PY_IMPORT_MAX_SEGS];
+    int nseg = 0;
+    int name_at = -1;
+    size_t name_len = strlen(name);
+    while (*p && nseg < PY_IMPORT_MAX_SEGS) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len == name_len && strncmp(p, name, len) == 0) {
+            name_at = nseg;
+        }
+        segs[nseg] = p;
+        lens[nseg] = len;
+        nseg++;
+        if (!dot) {
+            break;
+        }
+        p = dot + SKIP_ONE;
+    }
+    if (name_at <= 0) {
+        return true; /* no module chain before the name: nothing to check */
+    }
+    /* Ordered-subsequence match against the hit's enclosing segments (every
+     * segment before the hit's own leaf). */
+    const char *leaf = strrchr(hit_qn, '.');
+    const char *q = hit_qn;
+    int want = 0;
+    while (want < name_at && leaf && q < leaf) {
+        const char *dot = strchr(q, '.');
+        size_t len = (size_t)(dot - q);
+        if (len == lens[want] && strncmp(q, segs[want], len) == 0) {
+            want++;
+        }
+        q = dot + SKIP_ONE;
+    }
+    return want == name_at;
+}
+
+/* #2127, call side: an imported name binds the file's identifier to that
+ * import for the whole module, exactly like a parameter binds it for a body.
+ * When the import could not be materialized (external module) the resolver
+ * falls through to project-wide short-name strategies and binds `patch(...)`
+ * (or `mock.patch(...)`) to whatever project definition shares the leaf. True
+ * when the callee's root identifier is bound by this file's Python imports and
+ * EVERY such binding's module chain (`unittest.mock` for `from unittest.mock
+ * import patch`; the callee's own dotted path for a root `import a.b`) is
+ * absent from `resolved_qn`'s enclosing segments AND the binding is external
+ * (no IMPORTS edge materialized it: the module is not in the project). An
+ * internal binding is never judged here -- a project module can re-export a
+ * name from anywhere -- and a chain consistent with the target (src/ layout)
+ * keeps the edge. `gbuf` NULL means "no IMPORTS edges" (all external). */
+static bool python_import_local_materialized(const cbm_gbuf_t *gbuf, const char *project_name,
+                                             const char *rel_path, const char *local_name) {
+    if (!gbuf || !rel_path) {
+        return false;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
+    safe_free(file_qn);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!file_node || cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                         &edge_count) != 0) {
+        return false;
+    }
+    char needle[CBM_SZ_256];
+    snprintf(needle, sizeof(needle), "\"local_name\":\"%s\"", local_name);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i]->properties_json && strstr(edges[i]->properties_json, needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
+                                           const char *resolved_qn, const cbm_gbuf_t *gbuf,
+                                           const char *project_name, const char *rel_path) {
+    if (!imports || imports->count <= 0 || !callee_name || !callee_name[0] || !resolved_qn ||
+        !resolved_qn[0]) {
+        return false;
+    }
+    const char *root_end = strchr(callee_name, '.');
+    size_t root_len = root_end ? (size_t)(root_end - callee_name) : strlen(callee_name);
+    bool bound = false;
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || !imp->module_path || strlen(imp->local_name) != root_len ||
+            strncmp(imp->local_name, callee_name, root_len) != 0) {
+            continue;
+        }
+        char full[1024];
+        snprintf(full, sizeof(full), "%s", imp->module_path);
+        char *as = strstr(full, " as ");
+        if (as) {
+            *as = '\0';
+        }
+        const char *path_leaf_seg = strrchr(full, '.');
+        bool from_import = path_leaf_seg && strcmp(path_leaf_seg + SKIP_ONE, imp->local_name) == 0;
+        if (!as && !from_import && strncmp(full, callee_name, root_len) == 0 &&
+            (full[root_len] == '.' || full[root_len] == '\0')) {
+            /* `import a.b` binds the ROOT package `a`: the callee already
+             * spells its own full dotted path (`a.b.f()`). */
+            snprintf(full, sizeof(full), "%s", callee_name);
+        }
+        /* Otherwise (`from m import x [as y]`) only the import's own module
+         * chain is evidence: members reached THROUGH x (`x.objects.create`)
+         * may live on any type, so they are not compared. */
+        const char *leaf = strrchr(full, '.');
+        leaf = leaf ? leaf + SKIP_ONE : full;
+        if (cbm_python_import_path_matches_qn(full, leaf, resolved_qn) ||
+            python_import_local_materialized(gbuf, project_name, rel_path, imp->local_name)) {
+            return false; /* consistent with the target, or a project import */
+        }
+        bound = true;
+    }
+    return bound;
+}
+
+/* #2127: whether a Python import's module lives in this project. Relative
+ * imports always do; otherwise the module part (the path minus the imported
+ * name) must resolve to a graph node. Strategy 1 has already failed on the
+ * full path when this is asked. */
+static bool python_import_module_in_project(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                            const char *module_path) {
+    if (!module_path || module_path[0] == '.') {
+        return true;
+    }
+    char part[1024];
+    snprintf(part, sizeof(part), "%s", module_path);
+    char *as = strstr(part, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    char *dot = strrchr(part, '.');
+    if (!dot) {
+        return false; /* `import x`: Strategy 1 already missed x itself */
+    }
+    *dot = '\0';
+    char *qn = cbm_pipeline_resolve_module(ctx, source_rel, part);
+    bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
+    safe_free(qn);
+    return found;
+}
+
+/* `import a.b` / `import a` (as opposed to `from a import b`): every segment
+ * names a module. The extractor binds the ROOT (`a`) for a dotted plain
+ * import and the leaf for a from-import; a dot-less path is always a plain
+ * import. An aliased form is ambiguous and reads as a from-import. */
+static bool python_is_plain_module_import(const CBMImport *imp) {
+    const char *p = imp->module_path;
+    if (!p || p[0] == '.' || strstr(p, " as ")) {
+        return false;
+    }
+    const char *first_dot = strchr(p, '.');
+    if (!first_dot) {
+        return true;
+    }
+    const char *leaf = strrchr(p, '.') + SKIP_ONE;
+    size_t root_len = (size_t)(first_dot - p);
+    return imp->local_name && strlen(imp->local_name) == root_len &&
+           strncmp(imp->local_name, p, root_len) == 0 && strcmp(leaf, imp->local_name) != 0;
+}
+
+/* #2127: Strategy 3 hit filter for an EXTERNAL Python import. The hit must
+ * spell the import's module chain (a src/ layout the module resolver missed
+ * still does), and whatever names a module -- an enclosing path segment, or
+ * any segment of a plain `import x` -- can only be a Module/File node (`import
+ * copy` must not fall back to a project method called `copy`). */
+static bool python_external_hit_rejected(const CBMImport *imp, const char *name,
+                                         bool enclosing_segment, const cbm_gbuf_node_t *hit) {
+    if (!cbm_python_import_path_matches_qn(imp->module_path, name, hit->qualified_name)) {
+        return true;
+    }
+    bool names_module = enclosing_segment || python_is_plain_module_import(imp);
+    return names_module && strcmp(hit->label, "Module") != 0 && strcmp(hit->label, "File") != 0;
+}
+
 /* #1934: whether the name-guess import fallbacks — Strategy 1b (sibling file,
  * whose label filter admits symbols) and Strategy 3 (symbol name) — may run
  * for imports from this language. A Go import path names a package — never a
@@ -1599,6 +1806,49 @@ static bool is_c_family_source(const char *source_rel) {
     return false;
 }
 
+/* Directory depth of a repo-relative path: how many directories sit above it. */
+static int include_path_depth(const char *path) {
+    int depth = 0;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Total order among nodes whose file path ends with the include path. The
+ * by-name hits arrive in node-registration order, which under parallel
+ * extraction is the workers' merge order and differs run to run; taking the
+ * first hit made `#include <linux/device.h>` target include/linux/device.h in
+ * one index of the kernel and tools/virtio/linux/device.h in the next (5,821
+ * IMPORTS edges moved, and every CALLS edge resolved through those files'
+ * import maps moved with them). The include names a file, so a File node
+ * outranks a symbol declared in it; among files the least nested path wins
+ * (include/ over tools/virtio/), then the smaller path, then the smaller QN
+ * — a function of the candidate set alone (O9). */
+static bool include_target_outranks(const cbm_gbuf_node_t *cand, const cbm_gbuf_node_t *best) {
+    if (!best) {
+        return true;
+    }
+    bool cand_file = strcmp(cand->label, "File") == 0;
+    bool best_file = strcmp(best->label, "File") == 0;
+    if (cand_file != best_file) {
+        return cand_file;
+    }
+    int cd = include_path_depth(cand->file_path);
+    int bd = include_path_depth(best->file_path);
+    if (cd != bd) {
+        return cd < bd;
+    }
+    int by_path = strcmp(cand->file_path, best->file_path);
+    if (by_path != 0) {
+        return by_path < 0;
+    }
+    return cand->qualified_name && best->qualified_name &&
+           strcmp(cand->qualified_name, best->qualified_name) < 0;
+}
+
 static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *ctx,
                                                       const char *file_path,
                                                       const char *source_file_qn) {
@@ -1651,18 +1901,12 @@ static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *
                 strcmp(cand->qualified_name, source_file_qn) == 0) {
                 continue;
             }
-            if (strcmp(cand->label, "File") == 0) {
-                return cand;
-            }
-            if (!best) {
+            if (include_target_outranks(cand, best)) {
                 best = cand;
             }
         }
-        if (best) {
-            return best;
-        }
     }
-    return NULL;
+    return best;
 }
 
 static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *ctx,
@@ -1845,8 +2089,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             src_base = pb + SKIP_ONE;
         }
     }
-    const bool symbol_fallback_allowed =
-        cbm_import_symbol_fallback_allowed(cbm_language_for_filename(src_base));
+    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
+    const bool symbol_fallback_allowed = cbm_import_symbol_fallback_allowed(src_lang);
 
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
      * import string is a sibling filename or directory (SCSS partials, Just/
@@ -1996,6 +2240,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             *dot = '\0';
             end = dot;
         }
+        /* #2127: a Python import whose module is not in the project (stdlib /
+         * third party) may only fall back to a hit that spells its chain. */
+        const bool py_external =
+            symbol_fallback_allowed && src_lang == CBM_LANG_PYTHON &&
+            !python_import_module_in_project(ctx, source_rel, imp->module_path);
         for (int ci = 0; symbol_fallback_allowed && ci < ncands; ci++) {
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
@@ -2016,6 +2265,9 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                     if (source_file_qn && cand->qualified_name &&
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
+                    }
+                    if (py_external && python_external_hit_rejected(imp, cands[ci], ci > 0, cand)) {
+                        continue; /* #2127: not the external module's symbol */
                     }
                     if (!best || (cand->qualified_name && best->qualified_name &&
                                   strcmp(cand->qualified_name, best->qualified_name) < 0)) {
@@ -2100,13 +2352,19 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
 /* ── Namespace map ───────────────────────────────────────────────── */
 
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count) {
+/* The namespace names themselves, so a caller that has parked some results on
+ * disk can still contribute their namespaces (see
+ * cbm_result_spill_namespace). A file missing from this map does not fail to
+ * resolve -- it resolves DIFFERENTLY, through the looser fallback, which is why
+ * an incomplete map changed edge counts in both directions rather than only
+ * losing edges. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count) {
     CBMHashTable *map = NULL;
     for (int i = 0; i < count; i++) {
-        const CBMFileResult *r = results[i];
-        if (!r || !r->namespace_name || !r->namespace_name[0] || !rels[i]) {
+        const char *namespace_name = namespaces[i];
+        if (!namespace_name || !namespace_name[0] || !rels[i]) {
             continue;
         }
         if (!map) {
@@ -2122,7 +2380,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(r->namespace_name);
+        char *key = strdup(namespace_name);
         if (!key) {
             free(file_qn);
             continue;
@@ -2159,6 +2417,25 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
             free(file_qn); /* content copied into combined */
         }
     }
+    return map;
+}
+
+/* Convenience for callers whose results are all in memory (the sequential
+ * definitions pass). A caller that can SPILL must use the _names variant and
+ * fill the parked slots from cbm_result_spill_namespace, or its map silently
+ * loses those files. */
+CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
+                                               CBMFileResult *const *results,
+                                               const char *const *rels, int count) {
+    const char **names = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        names[i] = results[i] ? results[i]->namespace_name : NULL;
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build_names(project_name, names, rels, count);
+    cbm_free(CBM_MEM_CLASS_OTHER, names);
     return map;
 }
 

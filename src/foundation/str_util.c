@@ -310,6 +310,51 @@ bool cbm_validate_project_name(const char *name) {
     return true;
 }
 
+bool cbm_is_internal_cache_db(const char *filename) {
+    return filename && (strcmp(filename, CBM_CONFIG_DB_FILENAME) == 0 ||
+                        strcmp(filename, CBM_CROSS_REPO_DB_FILENAME) == 0);
+}
+
+bool cbm_is_project_index_db(const char *filename) {
+    static const char db_ext[] = ".db";
+    const size_t ext_len = sizeof(db_ext) - 1;
+    if (!filename) {
+        return false;
+    }
+    size_t len = strlen(filename);
+    if (len <= ext_len || strcmp(filename + len - ext_len, db_ext) != 0) {
+        return false;
+    }
+    return !cbm_is_internal_cache_db(filename);
+}
+
+int cbm_utf8_trim_partial(char *buf) {
+    if (!buf) {
+        return 0;
+    }
+    int pos = (int)strlen(buf);
+    if (pos == 0) {
+        return 0;
+    }
+    /* Walk back over continuation bytes to the lead byte; drop the sequence
+     * when fewer continuation bytes follow it than its lead byte announces. */
+    int back = pos - 1;
+    int cont = 0;
+    while (back >= 0 && ((unsigned char)buf[back] & 0xC0) == 0x80) {
+        back--;
+        cont++;
+    }
+    if (back >= 0) {
+        unsigned char lead = (unsigned char)buf[back];
+        int need = lead >= 0xF0 ? 3 : lead >= 0xE0 ? 2 : lead >= 0xC0 ? 1 : 0;
+        if (need > cont) {
+            pos = back;
+            buf[pos] = '\0';
+        }
+    }
+    return pos;
+}
+
 int cbm_json_escape(char *buf, int bufsize, const char *src) {
     if (!buf || bufsize <= 0) {
         return 0;
@@ -319,7 +364,8 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
         return 0;
     }
     int pos = 0;
-    for (int i = 0; src[i] && pos < bufsize - JSON_NUL_RESERVE; i++) {
+    int i = 0;
+    for (; src[i] && pos < bufsize - JSON_NUL_RESERVE; i++) {
         unsigned char c = (unsigned char)src[i];
         if (c == '"' || c == '\\') {
             if (pos + JSON_ESC_LEN > bufsize - JSON_NUL_RESERVE) {
@@ -356,5 +402,11 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
         }
     }
     buf[pos] = '\0';
+    /* A truncated output must never end inside a multibyte UTF-8 sequence: a
+     * callee cut mid-character persisted bytes SQLite cannot decode as text
+     * (2026-09-16 probe: nine CALLS rows across rust, java and typescript). */
+    if (src[i] != '\0') {
+        pos = cbm_utf8_trim_partial(buf);
+    }
     return pos;
 }

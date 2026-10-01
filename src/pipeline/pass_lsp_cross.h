@@ -63,10 +63,10 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * inputs pass_semantic uses to draw its INHERITS edge, so the LSP's
  * inheritance view and the graph's cannot diverge. Pass NULL to keep the raw
  * source spelling (surface-probe paths that build no registry). */
-CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
-                                    const cbm_file_info_t *files, int file_count,
-                                    const char *project_name, char **def_modules, int *out_count,
-                                    int *out_def_starts);
+CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                    CBMFileResult **cache, const cbm_file_info_t *files,
+                                    int file_count, const char *project_name, char **def_modules,
+                                    int *out_count, int *out_def_starts);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
@@ -187,6 +187,10 @@ struct CBMCargoManifest;
 bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
                                  struct CBMCargoManifest *out_manifest);
 void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
+/* A resolve worker keeps its per-file cross-LSP scratch arenas between files
+ * from _begin to _end; _end must run on the same thread before it exits. */
+void cbm_pxc_thread_scratch_begin(void);
+void cbm_pxc_thread_scratch_end(void);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends

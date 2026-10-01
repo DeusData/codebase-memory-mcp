@@ -1348,6 +1348,7 @@ TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
 }
 
 enum { APP_FAKE_MAX_ATTEMPTS = 16 };
+enum { APP_FAKE_ARGS_CAP = 2048 };
 
 typedef struct {
     atomic_int starts;
@@ -1368,6 +1369,11 @@ typedef struct {
     char marker_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
     char quarantine_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
     char quarantine_seen[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
+    char args_json[APP_FAKE_MAX_ATTEMPTS][APP_FAKE_ARGS_CAP];
+    /* `starts` is incremented before the slot is filled, so waiting on it says
+     * a worker began, not that its arguments are readable. Each slot publishes
+     * itself instead, which is the edge a reader on another thread needs. */
+    atomic_bool args_captured[APP_FAKE_MAX_ATTEMPTS];
     size_t memory_budgets[APP_FAKE_MAX_ATTEMPTS];
 } app_fake_worker_context_t;
 
@@ -1432,6 +1438,9 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
     atomic_init(&worker->cancelled, false);
     worker->result.exit_code = -1;
     if (worker->attempt < APP_FAKE_MAX_ATTEMPTS) {
+        (void)snprintf(context->args_json[worker->attempt], APP_FAKE_ARGS_CAP, "%s",
+                       args_json ? args_json : "");
+        atomic_store(&context->args_captured[worker->attempt], true);
         context->memory_budgets[worker->attempt] = memory_budget_bytes;
         if (marker_file) {
             (void)snprintf(context->marker_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
@@ -1454,6 +1463,33 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
     }
     *worker_out = worker;
     return 0;
+}
+
+static bool app_wait_for_atomic_bool(atomic_bool *value, bool expected);
+
+static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, int attempt,
+                                          const char *max_files, const char *max_source_mb) {
+    if (!context || attempt < 0 || attempt >= APP_FAKE_MAX_ATTEMPTS) {
+        return false;
+    }
+    if (!app_wait_for_atomic_bool(&context->args_captured[attempt], true)) {
+        return false;
+    }
+    const char *args = context->args_json[attempt];
+    yyjson_doc *document = yyjson_read(args, strlen(args), 0);
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *policy =
+        root && yyjson_is_obj(root) ? yyjson_obj_get(root, "_cbm_index_policy") : NULL;
+    yyjson_val *files =
+        policy && yyjson_is_obj(policy) ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_FILES) : NULL;
+    yyjson_val *bytes = policy && yyjson_is_obj(policy)
+                            ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_SOURCE_MB)
+                            : NULL;
+    bool equal = files && bytes && yyjson_is_str(files) && yyjson_is_str(bytes) &&
+                 strcmp(yyjson_get_str(files), max_files) == 0 &&
+                 strcmp(yyjson_get_str(bytes), max_source_mb) == 0;
+    yyjson_doc_free(document);
+    return equal;
 }
 
 static cbm_index_worker_poll_t app_fake_worker_poll(void *opaque,
@@ -1823,6 +1859,53 @@ static bool app_env_backup_restore(app_env_backup_t *backup) {
     return status == 0;
 }
 
+/* The Graph UI enters through the daemon's background coordinator rather than
+ * the MCP tool path. Keep that path UTF-8-safe as well. */
+TEST(daemon_application_ui_index_accepts_non_ascii_directory) {
+    app_env_backup_t cache_environment;
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    char root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root),
+                   "%s/cbm-app-ui-index-\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-ui-index-cache-XXXXXX", cbm_tmpdir());
+    bool dirs_created = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
+    bool cache_set = cache_saved && dirs_created && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = cache_set ? cbm_daemon_application_new(&config) : NULL;
+    int result = application ? cbm_daemon_application_index(application, "", root) : -1;
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    bool root_cleaned = th_rmtree(root) == 0;
+    bool cache_cleaned = th_rmtree(cache) == 0;
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+
+    ASSERT_TRUE(cache_saved);
+    ASSERT_TRUE(dirs_created);
+    ASSERT_TRUE(cache_set);
+    ASSERT_NOT_NULL(application);
+    ASSERT_EQ(result, 0);
+    ASSERT_EQ(atomic_load(&fake.starts), 1);
+    ASSERT_EQ(atomic_load(&fake.destroys), 1);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(root_cleaned);
+    ASSERT_TRUE(cache_cleaned);
+    ASSERT_TRUE(cache_restored);
+    PASS();
+}
+
 typedef struct {
     atomic_int starts;
     atomic_int start_failures_remaining;
@@ -2009,7 +2092,9 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     cbm_config_t *stored_config = cache_set ? cbm_config_open(cache) : NULL;
     bool config_ready = stored_config &&
                         cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
-                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0 &&
+                        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "3") == 0 &&
+                        cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "4") == 0;
     char canonical_root[APP_TEST_PATH_CAP] = {0};
     bool canonical = dirs_ok && cbm_canonical_path(root, canonical_root, sizeof(canonical_root));
     char *project = canonical ? cbm_project_name_from_path(canonical_root) : NULL;
@@ -2054,6 +2139,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     bool first_owned = first_initialized && project &&
                        app_wait_for_subscribers(application, project, 1) &&
                        app_wait_for_atomic_int(&fake.starts, 1);
+    bool auto_policy_propagated = first_owned && app_fake_worker_policy_equals(&fake, 0, "3", "4");
     bool second_initialized = app_test_initialize_profile(&callbacks, sessions[1], root,
                                                           CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
     bool coalesced = first_owned && second_initialized && project &&
@@ -2115,6 +2201,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_TRUE(restricted_started_nothing);
     ASSERT_TRUE(first_initialized);
     ASSERT_TRUE(first_owned);
+    ASSERT_TRUE(auto_policy_propagated);
     ASSERT_TRUE(second_initialized);
     ASSERT_TRUE(coalesced);
     ASSERT_TRUE(restricted_disconnect_kept_job);
@@ -2389,6 +2476,46 @@ TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
     PASS();
 }
 
+TEST(daemon_application_programmatic_index_injects_resource_policy) {
+    char *root = th_mktempdir("cbm_app_policy_root");
+    char *cache = th_mktempdir("cbm_app_policy_cache");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(cache);
+    cbm_config_t *stored_config = cbm_config_open(cache);
+    bool configured = stored_config &&
+                      cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_FILES, "5") == 0 &&
+                      cbm_config_set(stored_config, CBM_INDEX_CONFIG_MAX_SOURCE_MB, "6") == 0;
+
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .worker_ops = &worker_ops,
+    };
+    cbm_daemon_application_t *application = configured ? cbm_daemon_application_new(&config) : NULL;
+    int index_rc =
+        application ? cbm_daemon_application_index(application, "policy-programmatic", root) : -1;
+    bool policy_propagated = index_rc == 0 && app_fake_worker_policy_equals(&fake, 0, "5", "6");
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    th_cleanup(root);
+    th_cleanup(cache);
+    ASSERT_TRUE(configured);
+    ASSERT_TRUE(policy_propagated);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
 TEST(daemon_application_auto_index_honors_tracked_file_limit) {
     app_env_backup_t cache_environment;
     bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
@@ -2463,6 +2590,9 @@ TEST(daemon_application_auto_index_honors_tracked_file_limit) {
     ASSERT_TRUE(cache_restored);
     PASS();
 }
+
+/* Native discovery never interprets a repository path as command text. Valid
+ * non-Git paths containing shell metacharacters remain countable literally. */
 
 /* Native discovery never interprets a repository path as command text. Valid
  * non-Git paths containing shell metacharacters remain countable literally. */
@@ -5551,6 +5681,735 @@ TEST(daemon_application_index_args_compare_repo_path_separator_equivalently) {
     PASS();
 }
 
+/* ── #2144: async index_repository + status polling ─────────────────────────
+ *
+ * A client with a per-call deadline (Copilot for IntelliJ) gives up on a long
+ * synchronous index; its cancel makes the daemon drop the job's last
+ * subscriber and cancel the worker, so every retry starts over and a large
+ * repository never finishes. async:true starts the job detached from the
+ * request and session; status:true polls it. Every wait below is a bounded
+ * observation of a held fake worker (never a timing assertion). */
+
+typedef struct {
+    app_fake_worker_context_t fake;
+    cbm_daemon_application_worker_ops_t ops;
+    cbm_daemon_application_t *application;
+    cbm_daemon_runtime_application_callbacks_t callbacks;
+    char root[APP_TEST_PATH_CAP];
+    char *project;
+    uint8_t *context;
+    uint32_t context_length;
+} app_async_fixture_t;
+
+static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *label,
+                                   bool permanent) {
+    memset(fixture, 0, sizeof(*fixture));
+    app_fake_worker_context_init(&fixture->fake);
+    fixture->ops = (cbm_daemon_application_worker_ops_t){
+        .context = &fixture->fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &fixture->ops};
+    fixture->application = cbm_daemon_application_new(&config);
+    if (!fixture->application) {
+        return false;
+    }
+    /* permanent mirrors `daemon start`; false is the temporary generation an
+     * MCP client or one-shot command spawns. */
+    cbm_daemon_application_set_permanent(fixture->application, permanent);
+    fixture->callbacks = cbm_daemon_application_runtime_callbacks(fixture->application);
+    (void)snprintf(fixture->root, sizeof(fixture->root), "%s/cbm-app-%s-XXXXXX", cbm_tmpdir(),
+                   label);
+    if (!cbm_mkdtemp(fixture->root)) {
+        fixture->root[0] = '\0';
+        return false;
+    }
+    fixture->project = cbm_project_name_from_path(fixture->root);
+    return fixture->project &&
+           app_test_context_request(fixture->root, fixture->root, &fixture->context,
+                                    &fixture->context_length);
+}
+
+static cbm_daemon_runtime_application_session_t *app_async_session(app_async_fixture_t *fixture,
+                                                                   cbm_daemon_client_id_t id) {
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&fixture->callbacks, id);
+    uint8_t *empty = NULL;
+    uint32_t empty_length = 0;
+    bool ok = session && app_test_request(&fixture->callbacks, session, fixture->context,
+                                          fixture->context_length, &empty,
+                                          &empty_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(empty);
+    if (!ok && session) {
+        fixture->callbacks.session_close(fixture->callbacks.context, session);
+        session = NULL;
+    }
+    return session;
+}
+
+/* One index_repository request on its own thread, so a call that (wrongly)
+ * blocks for the whole index cannot hang the suite: the caller observes
+ * `done` within the hang-detector budget, then always releases the worker
+ * before joining. */
+typedef struct {
+    app_request_thread_t request;
+    uint8_t *tool;
+    cbm_thread_t thread;
+    bool started;
+} app_async_call_t;
+
+static bool app_async_call_start(app_async_fixture_t *fixture, app_async_call_t *call,
+                                 cbm_daemon_runtime_application_session_t *session,
+                                 cbm_daemon_runtime_application_token_t token,
+                                 const char *extra_args) {
+    memset(call, 0, sizeof(*call));
+    char args[APP_TEST_PATH_CAP + 128];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", fixture->root,
+                   extra_args ? extra_args : "");
+    uint32_t tool_length = 0;
+    if (!app_test_tool_request("index_repository", args, &call->tool, &tool_length)) {
+        return false;
+    }
+    call->request.callbacks = fixture->callbacks;
+    call->request.session = session;
+    call->request.request_token = token;
+    call->request.request = call->tool;
+    call->request.request_length = tool_length;
+    atomic_init(&call->request.done, false);
+    call->started = cbm_thread_create(&call->thread, 0, app_request_thread, &call->request) == 0;
+    return call->started;
+}
+
+static const char *app_async_call_response(app_async_call_t *call) {
+    return call->request.response ? (const char *)call->request.response : "";
+}
+
+static void app_async_call_join(app_async_call_t *call) {
+    if (call->started) {
+        (void)cbm_thread_join(&call->thread);
+        call->started = false;
+    }
+}
+
+static void app_async_call_free(app_async_call_t *call) {
+    app_async_call_join(call);
+    free(call->request.response);
+    free(call->tool);
+    memset(call, 0, sizeof(*call));
+}
+
+/* A request that must return promptly (status, validation, async start). */
+static char *app_async_call_now(app_async_fixture_t *fixture,
+                                cbm_daemon_runtime_application_session_t *session,
+                                const char *extra_args) {
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    char *response = NULL;
+    if (app_async_call_start(fixture, &call, session, CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID,
+                             extra_args) &&
+        app_wait_for_atomic_bool(&call.request.done, true)) {
+        response = strdup(app_async_call_response(&call));
+    }
+    /* Never strand a request thread that blocked on the held worker. */
+    if (call.started && !atomic_load(&call.request.done)) {
+        atomic_store(&fixture->fake.allow_completion, true);
+    }
+    app_async_call_free(&call);
+    return response;
+}
+
+static bool app_async_fixture_finish(app_async_fixture_t *fixture) {
+    atomic_store(&fixture->fake.allow_completion, true);
+    bool stopped = fixture->application &&
+                   cbm_daemon_application_shutdown(fixture->application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(fixture->application);
+    free(fixture->context);
+    free(fixture->project);
+    if (fixture->root[0]) {
+        (void)cbm_rmdir(fixture->root);
+    }
+    return stopped;
+}
+
+static bool app_async_contains(const char *text, const char *needle) {
+    return text && strstr(text, needle) != NULL;
+}
+
+TEST(daemon_application_async_index_returns_before_completion_and_status_polls) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-poll", true);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7101) : NULL;
+
+    /* The worker is held: a blocking call cannot return until it is released. */
+    char *started = session ? app_async_call_now(&fixture, session, ",\"async\":true") : NULL;
+    bool worker_running = started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    char *running =
+        worker_running ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    atomic_store(&fixture.fake.allow_completion, true);
+    bool drained = running && app_wait_for_active_jobs(fixture.application, 0);
+    char *finished = drained ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    int cancels = atomic_load(&fixture.fake.cancels);
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_NOT_NULL(session);
+    ASSERT_NOT_NULL(started);
+    ASSERT_TRUE(app_async_contains(started, "\"async\":true"));
+    ASSERT_FALSE(app_async_contains(started, "\"isError\":true"));
+    ASSERT_TRUE(worker_running);
+    ASSERT_NOT_NULL(running);
+    ASSERT_TRUE(app_async_contains(running, "\"state\":\"running\""));
+    ASSERT_TRUE(drained);
+    ASSERT_NOT_NULL(finished);
+    ASSERT_TRUE(app_async_contains(finished, "\"state\":\"succeeded\""));
+    ASSERT_TRUE(app_async_contains(finished, "\"finished_at\""));
+    ASSERT_EQ(cancels, 0);
+    ASSERT_EQ(atomic_load(&fixture.fake.starts), 1);
+    ASSERT_TRUE(stopped);
+    free(started);
+    free(running);
+    free(finished);
+    PASS();
+}
+
+/* The async job belongs to the daemon, not to the session that started it:
+ * closing that session (the client gave up and went away) leaves the worker
+ * running while another session still keeps this daemon generation alive. */
+TEST(daemon_application_async_index_survives_requesting_session_close) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-survive", false);
+    cbm_daemon_runtime_application_session_t *starter =
+        setup ? app_async_session(&fixture, 7201) : NULL;
+    cbm_daemon_runtime_application_session_t *observer =
+        starter ? app_async_session(&fixture, 7202) : NULL;
+    char *started = observer ? app_async_call_now(&fixture, starter, ",\"async\":true") : NULL;
+    bool worker_running = started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    if (worker_running) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, starter);
+        fixture.callbacks.session_close(fixture.callbacks.context, starter);
+        starter = NULL;
+    }
+    int cancels_after_close = atomic_load(&fixture.fake.cancels);
+    size_t jobs_after_close = cbm_daemon_application_active_jobs(fixture.application);
+    atomic_store(&fixture.fake.allow_completion, true);
+    bool drained = worker_running && app_wait_for_active_jobs(fixture.application, 0);
+    char *finished = drained ? app_async_call_now(&fixture, observer, ",\"status\":true") : NULL;
+    if (starter) {
+        fixture.callbacks.session_close(fixture.callbacks.context, starter);
+    }
+    if (observer) {
+        fixture.callbacks.session_close(fixture.callbacks.context, observer);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_NOT_NULL(observer);
+    ASSERT_TRUE(app_async_contains(started, "\"async\":true"));
+    ASSERT_TRUE(worker_running);
+    ASSERT_EQ(cancels_after_close, 0);
+    ASSERT_EQ(jobs_after_close, 1);
+    ASSERT_TRUE(drained);
+    ASSERT_TRUE(app_async_contains(finished, "\"state\":\"succeeded\""));
+    ASSERT_EQ(atomic_load(&fixture.fake.cancels), 0);
+    ASSERT_TRUE(stopped);
+    free(started);
+    free(finished);
+    PASS();
+}
+
+/* Regression guard for the unchanged synchronous contract, in the exact
+ * shape of the test above: the same close with a SYNC caller still cancels
+ * the worker once its last subscriber is gone, even though another session
+ * keeps the daemon generation alive. */
+TEST(daemon_application_sync_index_still_cancels_on_last_subscriber_close) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "sync-cancel", false);
+    cbm_daemon_runtime_application_session_t *starter =
+        setup ? app_async_session(&fixture, 7301) : NULL;
+    cbm_daemon_runtime_application_session_t *observer =
+        starter ? app_async_session(&fixture, 7302) : NULL;
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    bool call_started =
+        observer && app_async_call_start(&fixture, &call, starter, UINT64_C(7303), NULL);
+    bool worker_running = call_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    if (worker_running) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, starter);
+    }
+    bool cancelled = worker_running && app_wait_for_atomic_int(&fixture.fake.cancels, 1);
+    if (call_started) {
+        if (!atomic_load(&call.request.done)) {
+            atomic_store(&fixture.fake.allow_completion, true);
+        }
+        app_async_call_join(&call);
+    }
+    cbm_daemon_runtime_application_status_t status = call.request.status;
+    if (call_started) {
+        app_async_call_free(&call);
+    }
+    if (starter) {
+        fixture.callbacks.session_close(fixture.callbacks.context, starter);
+    }
+    if (observer) {
+        fixture.callbacks.session_close(fixture.callbacks.context, observer);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(call_started);
+    ASSERT_TRUE(worker_running);
+    ASSERT_TRUE(cancelled);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_async_and_status_validation_errors) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-validate", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7401) : NULL;
+    char *both =
+        session ? app_async_call_now(&fixture, session, ",\"async\":true,\"status\":true") : NULL;
+    char *not_bool = session ? app_async_call_now(&fixture, session, ",\"async\":\"yes\"") : NULL;
+    char *cross = session
+                      ? app_async_call_now(&fixture, session,
+                                           ",\"async\":true,\"mode\":\"cross-repo-intelligence\"")
+                      : NULL;
+    /* Nothing was ever indexed here and no job ran: status must say so, not
+     * report an empty success. */
+    char *unknown = session ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    int starts = atomic_load(&fixture.fake.starts);
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(app_async_contains(both, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(both, "exclusive"));
+    ASSERT_TRUE(app_async_contains(not_bool, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(not_bool, "must be booleans"));
+    ASSERT_TRUE(app_async_contains(cross, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(cross, "cross-repo-intelligence"));
+    ASSERT_TRUE(app_async_contains(unknown, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(unknown, "no index job or index is known"));
+    ASSERT_EQ(starts, 0);
+    ASSERT_TRUE(stopped);
+    free(both);
+    free(not_bool);
+    free(cross);
+    free(unknown);
+    PASS();
+}
+
+/* Cut-short advice (a): a synchronous caller whose job is cancelled out from
+ * under it (here: the daemon stops) receives the async alternative in the
+ * cancellation text it is actually delivered. */
+TEST(daemon_application_cancelled_sync_index_reply_offers_async) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "sync-hint", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7501) : NULL;
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    bool call_started =
+        session && app_async_call_start(&fixture, &call, session, UINT64_C(7502), NULL);
+    bool worker_running = call_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    /* Shutdown cancels the job but not the waiting request, so the waiter is
+     * handed the job's cancellation reply. */
+    bool stopped =
+        worker_running && cbm_daemon_application_shutdown(fixture.application, APP_TEST_TIMEOUT_MS);
+    if (call_started && !atomic_load(&call.request.done)) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    if (call_started) {
+        app_async_call_join(&call);
+    }
+    cbm_daemon_runtime_application_status_t status = call.request.status;
+    char *reply = call_started ? strdup(app_async_call_response(&call)) : NULL;
+    if (call_started) {
+        app_async_call_free(&call);
+    }
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    (void)app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(worker_running);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(app_async_contains(reply, "cancelled"));
+    ASSERT_TRUE(app_async_contains(reply, "async: true"));
+    ASSERT_TRUE(app_async_contains(reply, "status: true"));
+    free(reply);
+    PASS();
+}
+
+/* Cut-short advice (b): the Copilot-deadline case. The client cancels its
+ * synchronous call, which never sees a reply; the NEXT status call and the
+ * NEXT index_repository call for that project carry the advice, once. */
+TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "sync-next", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7601) : NULL;
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    cbm_daemon_runtime_application_token_t token = UINT64_C(7602);
+    bool call_started = session && app_async_call_start(&fixture, &call, session, token, NULL);
+    bool worker_running = call_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    if (worker_running) {
+        fixture.callbacks.request_cancel(fixture.callbacks.context, session, token);
+    }
+    bool cancelled_returned = worker_running && app_wait_for_atomic_bool(&call.request.done, true);
+    if (call_started && !atomic_load(&call.request.done)) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    if (call_started) {
+        app_async_call_free(&call);
+    }
+    bool drained = cancelled_returned && app_wait_for_active_jobs(fixture.application, 0);
+    char *status = drained ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    /* Every later worker completes at once. */
+    atomic_store(&fixture.fake.allow_completion, true);
+    char *next = status ? app_async_call_now(&fixture, session, NULL) : NULL;
+    char *after = next ? app_async_call_now(&fixture, session, NULL) : NULL;
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(worker_running);
+    ASSERT_TRUE(cancelled_returned);
+    ASSERT_TRUE(drained);
+    ASSERT_TRUE(app_async_contains(status, "\"state\":\"cancelled\""));
+    ASSERT_TRUE(app_async_contains(status, "\"notice\""));
+    ASSERT_TRUE(app_async_contains(status, "async: true"));
+    ASSERT_TRUE(app_async_contains(next, "indexed"));
+    ASSERT_TRUE(app_async_contains(next, "\"notice\""));
+    ASSERT_TRUE(app_async_contains(next, "cut short"));
+    ASSERT_TRUE(app_async_contains(after, "indexed"));
+    ASSERT_FALSE(app_async_contains(after, "\"notice\""));
+    ASSERT_TRUE(stopped);
+    free(status);
+    free(next);
+    free(after);
+    PASS();
+}
+
+/* #2144 user decision: on a temporary daemon, a one-shot `cli` request that is
+ * the daemon's only live session is refused async (the daemon would stop and
+ * cancel the job as soon as the command exits), while status stays allowed and
+ * a long-lived MCP session on the same temporary daemon remains a valid host. */
+TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-refuse", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7701) : NULL;
+    char *refused = session ? app_async_call_now(&fixture, session, ",\"async\":true") : NULL;
+    int starts_after_refusal = atomic_load(&fixture.fake.starts);
+    char *status = refused ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+
+    /* Same temporary daemon, same lone session, but the MCP channel. */
+    char message[APP_TEST_PATH_CAP + 256];
+    (void)snprintf(message, sizeof(message),
+                   "{\"jsonrpc\":\"2.0\",\"id\":7702,\"method\":\"tools/call\",\"params\":{"
+                   "\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"%s\","
+                   "\"async\":true}}}",
+                   fixture.root);
+    uint8_t *mcp_request = NULL;
+    uint32_t mcp_request_length = 0;
+    uint8_t *mcp_response = NULL;
+    uint32_t mcp_response_length = 0;
+    cbm_daemon_runtime_application_status_t mcp_status =
+        status && app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP, message, &mcp_request,
+                                        &mcp_request_length)
+            ? app_test_request(&fixture.callbacks, session, mcp_request, mcp_request_length,
+                               &mcp_response, &mcp_response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool worker_started = mcp_status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                          app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    int cancels_while_hosted = atomic_load(&fixture.fake.cancels);
+    atomic_store(&fixture.fake.allow_completion, true);
+    bool drained = worker_started && app_wait_for_active_jobs(fixture.application, 0);
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+    char *mcp_text = mcp_response ? strdup((const char *)mcp_response) : NULL;
+    free(mcp_response);
+    free(mcp_request);
+
+    ASSERT_TRUE(setup);
+    ASSERT_NOT_NULL(session);
+    ASSERT_TRUE(app_async_contains(refused, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(refused, "daemon start"));
+    ASSERT_EQ(starts_after_refusal, 0);
+    ASSERT_NOT_NULL(status);
+    ASSERT_FALSE(app_async_contains(status, "daemon start"));
+    ASSERT_EQ(mcp_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(app_async_contains(mcp_text, "\\\"async\\\":true"));
+    ASSERT_FALSE(app_async_contains(mcp_text, "daemon start"));
+    ASSERT_TRUE(worker_started);
+    ASSERT_EQ(cancels_while_hosted, 0);
+    ASSERT_TRUE(drained);
+    ASSERT_TRUE(stopped);
+    free(refused);
+    free(status);
+    free(mcp_text);
+    PASS();
+}
+
+/* ── #2134 x #2144: the unnamed status poll resolves the start's key ────────
+ *
+ * An unnamed index_repository of a root that another indexed project already
+ * owns adopts that owner's name (#2134), so the daemon keys the async job by
+ * it. The async reply tells the client to poll "with the same repo_path and
+ * status: true"; that unnamed poll must resolve the same key (owner first,
+ * then path-derived; several owners fail loudly), or it never finds the job
+ * it just started. Owners are real project databases in a private cache; the
+ * held fake worker never writes one, so the seeded state is all there is. */
+
+enum { APP_OWNER_CANONICAL_CAP = 4096 }; /* cbm_canonical_path needs >= 4096 */
+
+typedef struct {
+    char cache[APP_TEST_PATH_CAP];
+    char canonical_root[APP_OWNER_CANONICAL_CAP];
+    char *saved_cache;
+    bool had_cache;
+    bool cache_set;
+    app_async_fixture_t fixture;
+    cbm_daemon_runtime_application_session_t *session;
+} app_owner_fixture_t;
+
+typedef struct {
+    char *started;
+    char *running;
+    char *finished;
+    bool worker_running;
+    bool drained;
+} app_owner_run_t;
+
+static bool app_owner_fixture_init(app_owner_fixture_t *owner, const char *label) {
+    memset(owner, 0, sizeof(*owner));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    owner->had_cache = old_cache != NULL;
+    owner->saved_cache = old_cache ? strdup(old_cache) : NULL;
+    (void)snprintf(owner->cache, sizeof(owner->cache), "%s/cbm-app-owner-cache-XXXXXX",
+                   cbm_tmpdir());
+    if ((owner->had_cache && !owner->saved_cache) || !cbm_mkdtemp(owner->cache)) {
+        owner->cache[0] = '\0';
+        return false;
+    }
+    owner->cache_set = cbm_setenv("CBM_CACHE_DIR", owner->cache, 1) == 0;
+    if (!owner->cache_set || !app_async_fixture_init(&owner->fixture, label, true) ||
+        !cbm_canonical_path(owner->fixture.root, owner->canonical_root,
+                            sizeof(owner->canonical_root))) {
+        return false;
+    }
+    /* Stored root_path values use forward slashes on every platform. */
+    cbm_normalize_path_sep(owner->canonical_root);
+    return true;
+}
+
+/* One indexed project whose stored root is this fixture's root. */
+static bool app_owner_seed(const app_owner_fixture_t *owner, const char *project) {
+    char path[APP_TEST_PATH_CAP];
+    int written = snprintf(path, sizeof(path), "%s/%s.db", owner->cache, project);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path(path);
+    bool seeded =
+        store && cbm_store_upsert_project(store, project, owner->canonical_root) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return seeded;
+}
+
+/* An unnamed async start, then unnamed status polls naming the same
+ * repo_path: one while the held worker runs, one after it drained. */
+static void app_owner_run(app_owner_fixture_t *owner, app_owner_run_t *run) {
+    memset(run, 0, sizeof(*run));
+    app_async_fixture_t *fixture = &owner->fixture;
+    run->started = app_async_call_now(fixture, owner->session, ",\"async\":true");
+    run->worker_running = run->started && !app_async_contains(run->started, "\"isError\":true") &&
+                          app_wait_for_atomic_int(&fixture->fake.starts, 1);
+    run->running = app_async_call_now(fixture, owner->session, ",\"status\":true");
+    atomic_store(&fixture->fake.allow_completion, true);
+    run->drained = run->worker_running && app_wait_for_active_jobs(fixture->application, 0);
+    run->finished =
+        run->drained ? app_async_call_now(fixture, owner->session, ",\"status\":true") : NULL;
+}
+
+static void app_owner_run_free(app_owner_run_t *run) {
+    free(run->started);
+    free(run->running);
+    free(run->finished);
+    memset(run, 0, sizeof(*run));
+}
+
+static bool app_owner_fixture_finish(app_owner_fixture_t *owner) {
+    if (owner->session) {
+        owner->fixture.callbacks.session_close(owner->fixture.callbacks.context, owner->session);
+        owner->session = NULL;
+    }
+    bool stopped = app_async_fixture_finish(&owner->fixture);
+    if (owner->cache_set) {
+        if (owner->had_cache) {
+            (void)cbm_setenv("CBM_CACHE_DIR", owner->saved_cache, 1);
+        } else {
+            (void)cbm_unsetenv("CBM_CACHE_DIR");
+        }
+    }
+    free(owner->saved_cache);
+    owner->saved_cache = NULL;
+    if (owner->cache[0]) {
+        (void)th_rmtree(owner->cache);
+    }
+    return stopped;
+}
+
+static bool app_owner_names_project(const char *response, const char *project) {
+    char needle[APP_TEST_PATH_CAP];
+    int written = snprintf(needle, sizeof(needle), "\"project\":\"%s\"", project);
+    return written > 0 && (size_t)written < sizeof(needle) && app_async_contains(response, needle);
+}
+
+TEST(daemon_application_unnamed_status_finds_async_job_of_root_owner_issue2134) {
+    app_owner_fixture_t owner;
+    bool setup =
+        app_owner_fixture_init(&owner, "owner-poll") && app_owner_seed(&owner, "owned-2134s");
+    owner.session = setup ? app_async_session(&owner.fixture, 7801) : NULL;
+    bool session_opened = owner.session != NULL;
+    app_owner_run_t run;
+    memset(&run, 0, sizeof(run));
+    if (session_opened) {
+        app_owner_run(&owner, &run);
+    }
+    int cancels = atomic_load(&owner.fixture.fake.cancels);
+    bool stopped = app_owner_fixture_finish(&owner);
+    if (!app_async_contains(run.running, "\"state\":\"running\"")) {
+        fprintf(stderr, "  [2134x2144] unnamed status missed the owner's job: %.400s\n",
+                run.running ? run.running : "(null)");
+    }
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(session_opened);
+    /* #2134: the unnamed start adopted the owner; the daemon keyed its job so. */
+    ASSERT_TRUE(app_owner_names_project(run.started, "owned-2134s"));
+    ASSERT_TRUE(run.worker_running);
+    /* The unnamed poll with the same repo_path reports that live job ... */
+    ASSERT_FALSE(app_async_contains(run.running, "\"isError\":true"));
+    ASSERT_TRUE(app_owner_names_project(run.running, "owned-2134s"));
+    ASSERT_TRUE(app_async_contains(run.running, "\"state\":\"running\""));
+    /* ... and, once drained, the outcome recorded under the same key. */
+    ASSERT_TRUE(run.drained);
+    ASSERT_TRUE(app_owner_names_project(run.finished, "owned-2134s"));
+    ASSERT_TRUE(app_async_contains(run.finished, "\"state\":\"succeeded\""));
+    ASSERT_EQ(cancels, 0);
+    ASSERT_TRUE(stopped);
+    app_owner_run_free(&run);
+    PASS();
+}
+
+/* Control: the path-derived key is untouched where #2134 keeps it - a root no
+ * other project owns, and a root whose path-derived project exists even though
+ * a named twin shares it. Start and poll name the same project either way. */
+TEST(daemon_application_unnamed_status_keeps_path_derived_key_issue2134) {
+    app_owner_fixture_t fresh;
+    bool fresh_setup = app_owner_fixture_init(&fresh, "owner-fresh");
+    fresh.session = fresh_setup ? app_async_session(&fresh.fixture, 7811) : NULL;
+    char *fresh_project = fresh.fixture.project ? strdup(fresh.fixture.project) : NULL;
+    app_owner_run_t fresh_run;
+    memset(&fresh_run, 0, sizeof(fresh_run));
+    if (fresh.session) {
+        app_owner_run(&fresh, &fresh_run);
+    }
+    bool fresh_stopped = app_owner_fixture_finish(&fresh);
+
+    app_owner_fixture_t twin;
+    bool twin_setup = app_owner_fixture_init(&twin, "owner-twin") && twin.fixture.project &&
+                      app_owner_seed(&twin, twin.fixture.project) &&
+                      app_owner_seed(&twin, "twin-2134s");
+    twin.session = twin_setup ? app_async_session(&twin.fixture, 7812) : NULL;
+    char *twin_project = twin.fixture.project ? strdup(twin.fixture.project) : NULL;
+    app_owner_run_t twin_run;
+    memset(&twin_run, 0, sizeof(twin_run));
+    if (twin.session) {
+        app_owner_run(&twin, &twin_run);
+    }
+    bool twin_stopped = app_owner_fixture_finish(&twin);
+
+    ASSERT_TRUE(fresh_setup);
+    ASSERT_NOT_NULL(fresh_project);
+    ASSERT_TRUE(app_owner_names_project(fresh_run.started, fresh_project));
+    ASSERT_TRUE(fresh_run.worker_running);
+    ASSERT_TRUE(app_owner_names_project(fresh_run.running, fresh_project));
+    ASSERT_TRUE(app_async_contains(fresh_run.running, "\"state\":\"running\""));
+    ASSERT_TRUE(app_async_contains(fresh_run.finished, "\"state\":\"succeeded\""));
+    ASSERT_TRUE(fresh_stopped);
+
+    ASSERT_TRUE(twin_setup);
+    ASSERT_NOT_NULL(twin_project);
+    ASSERT_TRUE(app_owner_names_project(twin_run.started, twin_project));
+    ASSERT_FALSE(app_owner_names_project(twin_run.started, "twin-2134s"));
+    ASSERT_TRUE(twin_run.worker_running);
+    ASSERT_TRUE(app_owner_names_project(twin_run.running, twin_project));
+    ASSERT_TRUE(app_async_contains(twin_run.running, "\"state\":\"running\""));
+    ASSERT_TRUE(app_async_contains(twin_run.finished, "\"state\":\"succeeded\""));
+    ASSERT_TRUE(twin_stopped);
+    free(fresh_project);
+    free(twin_project);
+    app_owner_run_free(&fresh_run);
+    app_owner_run_free(&twin_run);
+    PASS();
+}
+
+/* Control: several owners and no path-derived project is ambiguous. The start
+ * still refuses and names them without spawning a worker, and the poll gives
+ * the same loud error instead of guessing (or pointing at a path-derived
+ * project nobody indexes). */
+TEST(daemon_application_unnamed_async_and_status_refuse_ambiguous_root_issue2134) {
+    app_owner_fixture_t owner;
+    bool setup = app_owner_fixture_init(&owner, "owner-ambiguous") &&
+                 app_owner_seed(&owner, "first-2134s") && app_owner_seed(&owner, "second-2134s");
+    owner.session = setup ? app_async_session(&owner.fixture, 7821) : NULL;
+    bool session_opened = owner.session != NULL;
+    app_owner_run_t run;
+    memset(&run, 0, sizeof(run));
+    if (session_opened) {
+        app_owner_run(&owner, &run);
+    }
+    int starts = atomic_load(&owner.fixture.fake.starts);
+    bool stopped = app_owner_fixture_finish(&owner);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(session_opened);
+    ASSERT_TRUE(app_async_contains(run.started, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(run.started, "several indexed projects share root_path"));
+    ASSERT_TRUE(app_async_contains(run.started, "first-2134s"));
+    ASSERT_TRUE(app_async_contains(run.started, "second-2134s"));
+    ASSERT_FALSE(run.worker_running);
+    ASSERT_EQ(starts, 0);
+    ASSERT_TRUE(app_async_contains(run.running, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(run.running, "several indexed projects share root_path"));
+    ASSERT_TRUE(app_async_contains(run.running, "first-2134s"));
+    ASSERT_TRUE(app_async_contains(run.running, "second-2134s"));
+    ASSERT_TRUE(stopped);
+    app_owner_run_free(&run);
+    PASS();
+}
+
 SUITE(daemon_application) {
     RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
@@ -5569,7 +6428,19 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
+    RUN_TEST(daemon_application_ui_index_accepts_non_ascii_directory);
     RUN_TEST(daemon_application_index_args_compare_repo_path_separator_equivalently);
+    RUN_TEST(daemon_application_async_index_returns_before_completion_and_status_polls);
+    RUN_TEST(daemon_application_async_index_survives_requesting_session_close);
+    RUN_TEST(daemon_application_sync_index_still_cancels_on_last_subscriber_close);
+    RUN_TEST(daemon_application_async_and_status_validation_errors);
+    RUN_TEST(daemon_application_cancelled_sync_index_reply_offers_async);
+    RUN_TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call);
+    RUN_TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon);
+    RUN_TEST(daemon_application_unnamed_status_finds_async_job_of_root_owner_issue2134);
+    RUN_TEST(daemon_application_unnamed_status_keeps_path_derived_key_issue2134);
+    RUN_TEST(daemon_application_unnamed_async_and_status_refuse_ambiguous_root_issue2134);
+    RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

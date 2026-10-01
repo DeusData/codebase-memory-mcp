@@ -1174,8 +1174,13 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     ASSERT_NOT_NULL(strstr(js, "result.content"));
     ASSERT_NULL(strstr(js, "run: (args, ctx)"));
     ASSERT_NOT_NULL(strstr(js, "parameters:"));
-    /* The registry input_schema is embedded as a JSON object literal. */
-    ASSERT_NOT_NULL(strstr(js, "\"type\":\"object\""));
+    /* TypeBox parameters schema is embedded with Type.Object syntax. */
+    ASSERT_NOT_NULL(strstr(js, "Type.Object("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String("));
+    /* A numeric registry property must remain numeric in the generated schema. */
+    ASSERT_NOT_NULL(strstr(js, "depth: Type.Optional(Type.Integer("));
+    /* TypeBox import should be present. */
+    ASSERT_NOT_NULL(strstr(js, "import { Type } from 'typebox';"));
     /* Raw JSON output is required so the bridge can parse the MCP result; the
      * human-readable path would leave `call` with nothing to JSON.parse. */
     ASSERT_NOT_NULL(strstr(js, "'cli', '--json'"));
@@ -1316,6 +1321,23 @@ TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
     PASS();
 }
 
+/* #2077: OpenCode's V2 loader only reads the default export and needs an
+ * id plus a setup()/effect() function; the old named export had neither. */
+TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "export default {"));
+    ASSERT_NOT_NULL(strstr(js, "id: 'codebase-memory-augment'"));
+    /* Hooks live under server(), which the server runtime reads; setup()
+     * stays empty since the V2 config loader has no tool domain yet. */
+    ASSERT_NOT_NULL(strstr(js, "setup() {}"));
+    ASSERT_NOT_NULL(strstr(js, "server: async (ctx) => {"));
+    ASSERT_NULL(strstr(js, "async setup(ctx) {"));
+    ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
+    free(js);
+    PASS();
+}
+
 /* Empty/NULL inputs must not produce a module at all. */
 TEST(client_adapter_rejects_missing_binary_path) {
     ASSERT_NULL(cbm_client_adapter_pi(NULL));
@@ -1362,5 +1384,6 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
+    RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }

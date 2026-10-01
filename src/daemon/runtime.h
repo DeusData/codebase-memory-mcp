@@ -301,6 +301,17 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
                                      uint32_t timeout_ms,
                                      cbm_daemon_runtime_stop_result_t *result_out);
 
+/* #2277: the actionable half of a version/build conflict refusal. The
+ * conflict text itself (cbm_daemon_conflict_format) is wire-validated
+ * byte-for-byte across generations and must not change, so the remedy is a
+ * separate, client-side sentence built from the cross-build STATUS probe:
+ * which daemon holds the endpoint (pid, version, lifetime), which CBM
+ * sessions keep it alive, and how to clear it. active may be NULL when the
+ * status probe did not answer. Returns false (out empty) on truncation. */
+#define CBM_DAEMON_CONFLICT_REMEDY_SIZE 640U
+bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active, char *out,
+                                       size_t out_size);
+
 /* Performs the complete guarded first-participant handoff, starts listening
  * synchronously, then owns both that participant claim and its
  * accept/connection threads. All config scalar/text data is copied. endpoint
@@ -439,6 +450,12 @@ void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force);
  * i.e. the tamper case that must still be rejected after unverifiable images
  * became admissible. */
 void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force);
+/* #1955 test seam: make the peer look like a different file with identical
+ * bytes (second install path, package-manager copy) so the fingerprint
+ * fallback runs; the counter reports how many full-image fingerprints the
+ * HELLO path has computed in this process. */
+void cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(bool force);
+uint64_t cbm_daemon_runtime_peer_image_hashes_for_testing(void);
 /* Abandoned-request containment seams (2026-08-29 zombie incident). The
  * timeout override shrinks the join ceiling to test scale; zero restores the
  * production constant. The hook replaces the terminal containment stop with a

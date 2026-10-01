@@ -89,6 +89,8 @@ Current keys:
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+| `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
+| `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
@@ -115,6 +117,14 @@ Current keys:
 > Disabling the watcher does not disable anything else: the daemon still starts,
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
+
+The two `index_max_*` settings are independent and disabled by default. They
+apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
+to `cross-repo-intelligence`, which does not scan repository source files.
+Equality is allowed; exceeding either setting fails the complete index request
+and preserves any previously serving database. See
+[Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
+error-response details.
 
 ## 3. UI Settings
 
@@ -190,7 +200,21 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
+**WSL2 and Windows drives (`/mnt/c`, `/mnt/e`, ...).** `CBM_CACHE_DIR` goes through
+the same private-directory check. With WSL's default automount options, DrvFs
+reports every directory as `0777` and ignores `chmod`, so a cache under
+`/mnt/<drive>` is refused, and the refusal names this remedy. Either turn on
+permission metadata in `/etc/wsl.conf`, then run `wsl --shutdown` and reopen WSL:
+
+```ini
+[automount]
+options = "metadata,umask=22,fmask=11"
+```
+
+or keep the cache on the Linux filesystem (the default `~/.cache/codebase-memory-mcp`),
+which is also much faster than a 9p-mounted Windows drive.
+
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running, so its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon — joining an already-running daemon, it inherits that daemon's already-captured values instead.
 
 
 ### Roots that are always refused

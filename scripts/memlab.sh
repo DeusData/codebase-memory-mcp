@@ -10,9 +10,14 @@
 #
 # Usage: scripts/memlab.sh <binary> [requests] [label]
 #
-# Output: memlab-<label>.jsonl  (profiler records, one block per sample)
+# <binary> must be the waste-sanitizer flavour (make -f Makefile.cbm cbm
+# MEMWASTE=1 BUILD_DIR=build/memwaste): the attribution comes from its event
+# layer, which observes every allocation on Linux, macOS and Windows alike.
+#
+# Output: memlab-<label>.jsonl  (a waste-layer dump at every request-stage phase mark)
 #         memlab-<label>.log    (daemon log with mem.census lines)
-# Analyse with: scripts/memlab-report.py memlab-<label>.jsonl --census memlab-<label>.log
+# Analyse with: scripts/memlab-report.py memlab-<label>.jsonl --census memlab-<label>.log \
+#                   --binary <binary>
 set -u
 
 BINARY="${1:?usage: memlab.sh <binary> [requests] [label]}"
@@ -23,6 +28,16 @@ if [ ! -x "$BINARY" ]; then
     echo "FAIL: $BINARY is not executable" >&2
     exit 2
 fi
+
+# The profiled process must reach a daemon rendezvous and cache this run owns:
+# only CBM_RUNTIME_DIR moves the rendezvous, so a private CBM_CACHE_DIR alone
+# joined the operator's account daemon (#1691, #1696). The helper also stops
+# that daemon before its cache is removed and leaves the root for diagnosis
+# when it will not stop.
+# shellcheck source=test-runtime.sh
+source "$(dirname "$0")/test-runtime.sh"
+cbm_test_runtime_init || exit 1
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 WORK=$(mktemp -d 2>/dev/null || mktemp -d -t memlab)
 
@@ -75,7 +90,12 @@ PROFILE_OUT="$PWD/memlab-${LABEL}.jsonl"
 RUN_LOG="$PWD/memlab-${LABEL}.log"
 rm -f "$PROFILE_OUT" "$RUN_LOG"
 
-cleanup() { rm -rf "$WORK" 2>/dev/null || true; rm -rf "${WIN_ROOT:-}" 2>/dev/null || true; }
+cleanup() {
+    # The helper probes with $BINARY, whose native-Windows copy lives in $WORK.
+    cbm_test_runtime_cleanup "$BINARY"
+    rm -rf "$WORK" 2>/dev/null || true
+    rm -rf "${WIN_ROOT:-}" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 # A fixed corpus: same file count and content on every platform, so a
@@ -108,15 +128,23 @@ done
 echo "=== memlab: binary=$BINARY requests=$REQUESTS label=$LABEL ==="
 echo "corpus: $(find "$CORPUS" -name '*.py' | wc -l | tr -d ' ') files"
 
-# The Windows binary needs a native path here; an msys /c/... path is not one.
-if command -v cygpath >/dev/null 2>&1 && ! command -v winepath >/dev/null 2>&1; then
+# The native Windows binary needs a native path here, under its stamped root;
+# an msys /c/... path is not one. Everywhere else the helper's owner-only cache
+# (already exported as CBM_CACHE_DIR) is the cache.
+if [ -n "${WIN_ROOT:-}" ]; then
     mkdir -p "$WORK/cache"
     export CBM_CACHE_DIR="$(cygpath -w "$WORK/cache")"
+    CACHE_HOST="$WORK/cache"
 else
-    export CBM_CACHE_DIR="$WORK/cache"
+    CACHE_HOST="$CBM_TEST_CACHE_DIR_HOST"
 fi
-export CBM_MEM_PROFILE=1
-export CBM_MEM_PROFILE_OUT="$PROFILE_OUT"
+export CBM_MEMWASTE=1
+export CBM_MEMWASTE_OUT="$PROFILE_OUT"
+# The server marks a memory phase at every request stage, and the layer dumps
+# at each mark: live bytes per site become a series over identical requests. The
+# series needs neither the fill scan nor the duplicate hash, which only cost time.
+export CBM_MEMWASTE_FILL=0
+export CBM_MEMWASTE_DUPES=0
 export CBM_MEM_CENSUS=1
 export CBM_LOG_LEVEL=info
 export CBM_LOG_FORMAT=text
@@ -139,7 +167,7 @@ python3 "$(dirname "$0")/memlab-drive.py" "$DRIVE_BINARY" "$DRIVE_CORPUS" "$REQU
 RC=$?
 # With CBM_CACHE_DIR set the process logs to its own file rather than stderr,
 # so fold that in or the census series is invisible.
-cat "$WORK"/cache/logs/*.log >> "$RUN_LOG" 2>/dev/null || true
+cat "$CACHE_HOST"/logs/*.log >> "$RUN_LOG" 2>/dev/null || true
 cat "$WORK/server-stderr.log" >> "$RUN_LOG" 2>/dev/null || true
 RESPONSES=$(sed -n "s/.*served=\\([0-9]*\\).*/\\1/p" "$WORK/drive.out" | head -1); RESPONSES=${RESPONSES:-0}
 CENSUS=$(grep -c "mem.census" "$RUN_LOG" 2>/dev/null | head -1); CENSUS=${CENSUS:-0}
@@ -155,9 +183,8 @@ if [ "$CENSUS" -eq 0 ]; then
     echo "WARN: no census samples — check CBM_MEM_CENSUS wiring" >&2
 fi
 if [ "$SITES" -eq 0 ]; then
-    # Not fatal, but never silent: on macOS there is no --wrap, so the
-    # profiler legitimately has no observation point.
-    echo "WARN: no profiler records — expected on macOS (no --wrap); a gap anywhere else" >&2
+    # Never silent: an empty dump means the binary is not the memwaste flavour.
+    echo "WARN: no waste-layer records -- is $BINARY built with MEMWASTE=1?" >&2
 fi
 echo "profile: $PROFILE_OUT"
 echo "log:     $RUN_LOG"
