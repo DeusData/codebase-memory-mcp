@@ -471,6 +471,31 @@ void cbm_daemon_runtime_set_containment_hook_for_testing(
  * in test time. UINT32_MAX restores the production constant; any other value
  * (0 = expire immediately) overrides. Process-global; reset it after use. */
 void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms);
+
+/* Executable-image fingerprint-cache seams. reset empties the cache, zeroes
+ * the hash counter and disarms the stub; a test that arms the stub must reset
+ * before its first assertion, because an armed stub replaces every later
+ * fingerprint in the process. resolve drives a synthetic file identity through
+ * the exact resolve-then-commit path the acquire sites use: `before` is the
+ * identity the digest is keyed on, `after` the identity observed after the
+ * hash, and the digest is committed only when the two agree. It refuses unless
+ * the stub is armed, since no native image backs a synthetic identity. */
+typedef struct {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t size;
+    int64_t mtime_seconds;
+    int64_t mtime_nanoseconds;
+    int64_t ctime_seconds;
+    int64_t ctime_nanoseconds;
+} cbm_daemon_runtime_fingerprint_identity_for_testing_t;
+void cbm_daemon_runtime_fingerprint_cache_reset_for_testing(void);
+void cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(const char *digest);
+int cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(void);
+bool cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t *before,
+    const cbm_daemon_runtime_fingerprint_identity_for_testing_t *after,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */
