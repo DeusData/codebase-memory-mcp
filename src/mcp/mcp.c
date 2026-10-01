@@ -1572,6 +1572,8 @@ static bool bare_project_encoding_usable(const char *encoded) {
     return strcmp(encoded, "root") != 0 && cbm_validate_project_name(encoded);
 }
 
+static char *resolve_path_owner(const char *path, char *derived); /* #1690, defined below */
+
 static char *normalize_project_arg(char *project) {
     if (!project) {
         return project;
@@ -1585,6 +1587,9 @@ static char *normalize_project_arg(char *project) {
     } else {
         project = canonicalize_repo_path_if_exists(project);
         normalized = cbm_project_name_from_path(project);
+        if (normalized) {
+            normalized = resolve_path_owner(project, normalized);
+        }
     }
     /* Keep exactly one of the two strings and release the other. */
     bool use_normalized = normalized && (!bare || bare_project_encoding_usable(normalized));
@@ -2640,10 +2645,13 @@ static char *build_project_list_error(const char *reason) {
     enum { ERR_BUF_SZ = 5120 };
     char buf[ERR_BUF_SZ];
     if (count > 0) {
+        /* #1690: say how to pick the project, so an agent that guessed a repo
+         * or folder name can recover instead of dropping the graph. */
         snprintf(buf, sizeof(buf),
-                 "{\"error\":\"%s\",\"hint\":\"Use list_projects to see all indexed projects, "
-                 "then pass it as the \\\"project\\\" "
-                 "argument.\",\"available_projects\":[%s],\"count\":%d}",
+                 "{\"error\":\"%s\",\"hint\":\"Use list_projects and pass the name whose "
+                 "root_path contains your working directory (or that absolute directory) as "
+                 "the \\\"project\\\" argument; never a repo or folder "
+                 "name.\",\"available_projects\":[%s],\"count\":%d}",
                  reason, projects, count);
     } else {
         snprintf(buf, sizeof(buf),
@@ -11999,6 +12007,66 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
         }
     }
     return false;
+}
+
+/* #1690: a path-shaped `project` names a directory; the installed guidance tells
+ * agents to pass their working directory. Turning it into the path-DERIVED name
+ * alone missed a checkout indexed under an explicit name and every directory
+ * below an indexed root, so the agent got "project not found" and dropped the
+ * graph. Keep the derived name when an index exists under it (the unchanged
+ * fast path); otherwise adopt the indexed project whose stored root_path owns
+ * the directory. The deepest owning root wins. Two projects owning that root
+ * are ambiguous and keep the derived name, so the not-found error lists every
+ * project instead of a guess. Takes ownership of `derived`; returns a heap name. */
+static char *resolve_path_owner(const char *path, char *derived) {
+    char db_path[CBM_SZ_1K];
+    project_db_path(derived, db_path, sizeof(db_path));
+    if (db_path[0] && cbm_file_exists(db_path)) {
+        return derived;
+    }
+    char real_path[CBM_SZ_4K];
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *d =
+        resolve_canonical_path(path, real_path, sizeof(real_path)) ? cbm_opendir(dir_path) : NULL;
+    if (!d) {
+        return derived;
+    }
+    char *owner = NULL;
+    size_t owner_depth = 0;
+    bool ambiguous = false;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        mcp_project_record_t record = {0};
+        if (!is_project_db_file(entry->name, strlen(entry->name)) ||
+            read_project_record_identity(dir_path, entry->name, 0, &record) != PROJECT_RECORD_OK) {
+            continue;
+        }
+        char real_root[CBM_SZ_4K];
+        if (record.root_path[0] &&
+            resolve_canonical_path(record.root_path, real_root, sizeof(real_root)) &&
+            canonical_path_has_root(real_root, real_path)) {
+            size_t depth = strlen(real_root);
+            if (depth > owner_depth) {
+                safe_free(owner);
+                owner = record.name;
+                record.name = NULL;
+                owner_depth = depth;
+                ambiguous = false;
+            } else if (depth == owner_depth) {
+                ambiguous = true;
+            }
+        }
+        project_record_clear(&record);
+    }
+    cbm_closedir(d);
+    if (!owner || ambiguous) {
+        safe_free(owner);
+        return derived;
+    }
+    cbm_log_info("mcp.project_path_resolved", "path", real_path, "resolved", owner);
+    safe_free(derived);
+    return owner;
 }
 
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,

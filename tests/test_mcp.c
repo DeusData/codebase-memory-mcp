@@ -8417,6 +8417,189 @@ TEST(tool_search_graph_accepts_project_name_alias_issue640) {
     PASS();
 }
 
+/* #1690: the installed skill tells an agent to pass its absolute working
+ * directory (or the list_projects name whose root_path contains it) as
+ * `project`, never a guessed repo or folder name. A path-shaped project used to
+ * be turned into the path-DERIVED name only, so it missed a checkout indexed
+ * under an explicit name and every directory below an indexed root: the agent
+ * got "project not found" and dropped the graph. It must resolve to the indexed
+ * project whose stored root_path owns the path, whatever that project is
+ * called; the deepest owning root wins, and two owners of one root are never
+ * guessed between. */
+static char *i1690_search(cbm_mcp_server_t *srv, const char *project) {
+    char args[CBM_SZ_4K];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*_fn_1690\"}", project);
+    return cbm_mcp_handle_tool(srv, "search_graph", args);
+}
+
+static char *i1690_index(cbm_mcp_server_t *srv, const char *repo, const char *name) {
+    char args[CBM_SZ_4K];
+    if (name) {
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"%s\"}", repo, name);
+    } else {
+        snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    }
+    return cbm_mcp_handle_tool(srv, "index_repository", args);
+}
+
+TEST(tool_project_path_resolves_owning_project_issue1690) {
+    char tmp[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm-i1690r-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i1690c-XXXXXX");
+    if (!cbm_mkdtemp(tmp) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    /* Forward slashes keep the JSON arguments valid on every platform. */
+    char base[CBM_SZ_4K]; /* cbm_canonical_path needs >= 4096 bytes */
+    if (!cbm_canonical_path(tmp, base, sizeof(base))) {
+        FAIL("cbm_canonical_path failed");
+    }
+    cbm_normalize_path_sep(base);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    const char *saved_sup = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sup_copy = saved_sup ? cbm_strdup(saved_sup) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    /* some_name: the checkout of "repo_name", indexed under that explicit name.
+     * some_name2: a similarly named checkout indexed by path (derived name).
+     * some_name_x: shares the "some_name" prefix and is NOT indexed.
+     * twin_root: one root indexed under two explicit names. */
+    char named[CBM_SZ_4K];
+    char named_sub[CBM_SZ_4K];
+    char similar[CBM_SZ_4K];
+    char similar_sub[CBM_SZ_4K];
+    char unindexed[CBM_SZ_4K];
+    char twin[CBM_SZ_4K];
+    snprintf(named, sizeof(named), "%s/some_name", base);
+    snprintf(named_sub, sizeof(named_sub), "%s/some_name/pkg", base);
+    snprintf(similar, sizeof(similar), "%s/some_name2", base);
+    snprintf(similar_sub, sizeof(similar_sub), "%s/some_name2/pkg", base);
+    snprintf(unindexed, sizeof(unindexed), "%s/some_name_x", base);
+    snprintf(twin, sizeof(twin), "%s/twin_root", base);
+    ASSERT_EQ(th_write_file(TH_PATH(named, "app.py"), "def named_fn_1690(x):\n    return x\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(named_sub, "entry.py"), "def sub_fn_1690():\n    return 1\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(similar, "app.py"), "def similar_fn_1690(x):\n    return x\n"),
+              0);
+    ASSERT_EQ(
+        th_write_file(TH_PATH(similar_sub, "entry.py"), "def deep_fn_1690():\n    return 2\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(unindexed, "app.py"), "def stray_fn_1690():\n    return 3\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(twin, "app.py"), "def twin_fn_1690():\n    return 4\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *r = i1690_index(srv, named, "repo_name1690");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "repo_name1690"));
+    free(r);
+    r = i1690_index(srv, similar, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "\"isError\":true"));
+    free(r);
+    r = i1690_index(srv, twin, "twin1690a");
+    ASSERT_NOT_NULL(r);
+    free(r);
+    r = i1690_index(srv, twin, "twin1690b");
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    /* 1. The explicitly named checkout's root path resolves to that project
+     *    (RED before the fix: the derived name has no index). */
+    r = i1690_search(srv, named);
+    ASSERT_NOT_NULL(r);
+    if (strstr(r, "project not found")) {
+        fprintf(stderr, "  [1690] FAIL named root path did not resolve: %.300s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "named_fn_1690"));
+    ASSERT_NULL(strstr(r, "similar_fn_1690"));
+    free(r);
+
+    /* 2. A working directory below that root resolves to the same project. */
+    r = i1690_search(srv, named_sub);
+    ASSERT_NOT_NULL(r);
+    if (strstr(r, "project not found")) {
+        fprintf(stderr, "  [1690] FAIL subdirectory path did not resolve: %.300s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "sub_fn_1690"));
+    free(r);
+
+    /* 3. index_status names the resolved identity, not the derived name. */
+    char status_args[CBM_SZ_4K];
+    snprintf(status_args, sizeof(status_args), "{\"project\":\"%s\",\"format\":\"json\"}",
+             named_sub);
+    r = cbm_mcp_handle_tool(srv, "index_status", status_args);
+    ASSERT_NOT_NULL(r);
+    char *status = extract_text_content(r);
+    ASSERT_NOT_NULL(status);
+    ASSERT_NOT_NULL(strstr(status, "\"project\":\"repo_name1690\""));
+    free(status);
+    free(r);
+
+    /* 4. Control, normal naming: a path-derived project resolves as before,
+     *    and its subdirectory resolves to it, never to the similar name. */
+    r = i1690_search(srv, similar);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "similar_fn_1690"));
+    ASSERT_NULL(strstr(r, "named_fn_1690"));
+    free(r);
+    r = i1690_search(srv, similar_sub);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "deep_fn_1690"));
+    ASSERT_NULL(strstr(r, "named_fn_1690"));
+    free(r);
+
+    /* 5. Control, similar names: a sibling that only shares the "some_name"
+     *    prefix is owned by no project and must not borrow one. */
+    r = i1690_search(srv, unindexed);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    /* 6. Two projects owning one root are ambiguous: never guess. */
+    r = i1690_search(srv, twin);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    /* 7. Control: the exact explicit name keeps working. */
+    r = i1690_search(srv, "repo_name1690");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "named_fn_1690"));
+    free(r);
+
+    /* 8. A guessed repo name stays unresolved (nothing is guessed), but the
+     *    error says how to pick the project so the agent can recover. */
+    r = i1690_search(srv, "repo_name");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "root_path contains your working directory"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_sup_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sup_copy, 1);
+        free(saved_sup_copy);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    th_rmtree(tmp);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* #1025: agents pass the repo FOLDER name ("codebase-memory-mcp"), but
  * indexed project names derive from the full path
  * (E:\project\graph\x -> "E-project-graph-x"), so exact lookup fails with
@@ -21126,6 +21309,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
+    RUN_TEST(tool_project_path_resolves_owning_project_issue1690);
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
     RUN_TEST(tool_project_arg_resolves_non_ascii_folder_issue1827);
     RUN_TEST(tool_index_repository_reuses_existing_project_for_root_issue2134);

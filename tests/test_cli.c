@@ -14154,6 +14154,33 @@ TEST(cli_agent_instructions_content) {
     PASS();
 }
 
+/* #1690: an agent in a checkout whose directory name differs from the repo
+ * name guessed the project from the repo name, got "project not found" and
+ * dropped the graph. Every installed guidance variant must say how to pick the
+ * project: the list_projects entry whose root_path contains the working
+ * directory, or that absolute directory itself, never a repo or folder name. */
+static int i1690_names_project_by_root(const char *text) {
+    return text && strstr(text, "root_path") != NULL &&
+           strstr(text, "contains your working directory") != NULL &&
+           strstr(text, "absolute directory") != NULL &&
+           strstr(text, "never a repo or folder name") != NULL;
+}
+
+TEST(cli_guidance_resolves_project_by_root_path_issue1690) {
+    const cbm_skill_t *skills = cbm_get_skills();
+    ASSERT_NOT_NULL(skills);
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        if (!i1690_names_project_by_root(skills[i].content)) {
+            fprintf(stderr, "  [1690] skill %s does not say how to pick the project\n",
+                    skills[i].name);
+        }
+        ASSERT(i1690_names_project_by_root(skills[i].content));
+    }
+    ASSERT(i1690_names_project_by_root(cbm_get_agent_instructions()));
+    ASSERT(i1690_names_project_by_root(cbm_get_aider_instructions()));
+    PASS();
+}
+
 TEST(cli_qwen_windows_hook_command_uses_powershell_schema) {
     char command[1024];
     char shell[32];
@@ -16964,6 +16991,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_instructions_no_duplicate);
     RUN_TEST(cli_remove_instructions);
     RUN_TEST(cli_agent_instructions_content);
+    RUN_TEST(cli_guidance_resolves_project_by_root_path_issue1690);
     RUN_TEST(cli_qwen_windows_hook_command_uses_powershell_schema);
     RUN_TEST(cli_windows_optional_hooks_require_a_documented_shell);
     RUN_TEST(cli_installed_skill_limits_match_server_contract);
