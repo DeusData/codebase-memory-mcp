@@ -74,6 +74,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "foundation/platform.h"     /* cbm_resolve_cache_dir */
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/laravel_routing.h"
 #include "lsp/rust_cargo.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
@@ -2209,13 +2210,18 @@ static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
 }
 
 /* Classify a resolved call by library identity and emit the appropriate edge. */
-/* Create Route node + CALLS + HANDLES edges for a route registration call. */
+/* Create Route node + CALLS + HANDLES edges for a route registration call.
+ * route_mount is the framework mount of the registering file ("/api" for a
+ * Laravel 11+ `withRouting(api: ...)` file, #1146) or "". */
 static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                     const CBMCall *call, const char *route_path,
                                     const char *handler_ref, const char *module_qn,
                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                                    const char **ik, const char **iv, int ic) {
+                                    const char **ik, const char **iv, int ic,
+                                    const char *route_mount) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
+    char mounted[CBM_SZ_256];
+    route_path = cbm_laravel_mount_route(route_mount, route_path, mounted, sizeof(mounted));
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(rqn, sizeof(rqn), "__route__%s__%s", method ? method : "ANY",
@@ -2526,7 +2532,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_resolution_t *res, const char *module_qn,
                               const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                               const char **imp_keys, const char **imp_vals, int imp_count,
-                              bool suppress_plain_calls) {
+                              bool suppress_plain_calls, const char *route_mount) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     const char *arg = call->first_string_arg;
 
@@ -2553,7 +2559,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         const char *route_path = find_route_path_in_args(call, &handler_ref);
         if (route_path) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
-                                    registry, main_gbuf, imp_keys, imp_vals, imp_count);
+                                    registry, main_gbuf, imp_keys, imp_vals, imp_count,
+                                    route_mount);
             return;
         }
         /* No path found — fall through to normal CALLS edge */
@@ -2827,6 +2834,10 @@ static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CB
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang) {
+    /* Framework mount of this file's routes (Laravel 11+ withRouting, #1146). */
+    char route_mount[CBM_SZ_128];
+    cbm_laravel_file_route_mount(rc->repo_path, rel, lang, result, route_mount,
+                                 sizeof(route_mount));
     /* Two occurrence-aware indexes preserve the authoritative matcher's
      * primary ordering without restoring its O(calls × resolutions) scan:
      * exact caller+leaf+span first, then the legacy caller+leaf fallback.
@@ -3096,7 +3107,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                             .strategy = "service_pattern"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
+                                  imp_count, false, route_mount);
                 continue;
             }
         }
@@ -3113,7 +3124,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                  * self-call, so it keeps only the route/service edges. */
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, rust_external);
+                                  imp_count, rust_external, route_mount);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
@@ -3165,7 +3176,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 if (url_or_topic) {
                     emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
                                       rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                                      false);
+                                      false, route_mount);
                     ws->calls_resolved++;
                 }
             }
@@ -3174,7 +3185,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          drop_plain_call);
+                          drop_plain_call, route_mount);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

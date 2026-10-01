@@ -436,6 +436,7 @@ PIPELINE_SRCS = \
     src/pipeline/lsp_surface.c \
     src/pipeline/pipeline_delta.c \
     src/pipeline/path_alias.c \
+    src/pipeline/laravel_routing.c \
     src/pipeline/registry.c \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \

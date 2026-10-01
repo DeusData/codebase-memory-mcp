@@ -144,12 +144,19 @@ static int et_edge_present(const EtFile *files, int nfiles, const char *edge, in
 
 enum { ET_ROUTE_ASSERT_MAX = 16 };
 
+static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int n_mean);
+
 /* Assert the exact Route node set. Edge-count smoke tests cannot catch partial
  * Spring paths such as "/orders" when the real route is "/api/orders", and a
- * presence-only assertion would still allow stale partial Route nodes to leak. */
-static int et_routes_exact(const EtFile *files, int nfiles, const char **routes) {
+ * presence-only assertion would still allow stale partial Route nodes to leak.
+ * parallel pads the fixture past MIN_FILES_FOR_PARALLEL so the parallel
+ * resolver mints the routes; must_qn (optional) is a Route qualified_name that
+ * must exist -- the identity cross-repo HTTP matching joins on. */
+static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes,
+                                bool parallel, const char *must_qn) {
     EtProj lp;
-    cbm_store_t *store = et_index_files(&lp, files, nfiles);
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
     cbm_node_t *nodes = NULL;
     int node_count = 0;
     int wanted = 0;
@@ -197,9 +204,24 @@ static int et_routes_exact(const EtFile *files, int nfiles, const char **routes)
         fprintf(stderr, "\n");
     }
 
+    if (store && must_qn) {
+        cbm_node_t qn_node;
+        memset(&qn_node, 0, sizeof(qn_node));
+        if (cbm_store_find_node_by_qn(store, lp.project, must_qn, &qn_node) != CBM_STORE_OK) {
+            fprintf(stderr, "  [ET-ROUTE] FAIL missing qualified_name %s\n", must_qn);
+            ok = 0;
+        } else {
+            cbm_node_free_fields(&qn_node);
+        }
+    }
+
     cbm_store_free_nodes(nodes, node_count);
     et_cleanup(&lp, store);
     return ok;
+}
+
+static int et_routes_exact(const EtFile *files, int nfiles, const char **routes) {
+    return et_routes_exact_mode(files, nfiles, routes, false, NULL);
 }
 
 /* Index meaningful[] plus PARALLEL_PAD_FILES trivial pad files to force the
@@ -648,6 +670,124 @@ TEST(handles_laravel_facade_no_junk_routes_issue952) {
          "$v = Cache::get('users.count');\n"
          "$w = Cache::get('/leading/slash/key');\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* #1146: Laravel 11+ mounts the files named in bootstrap/app.php's
+ * `->withRouting(api: ...)` under `apiPrefix` (default 'api'); the `web:` file
+ * gets no prefix. The prefix is declared in a DIFFERENT file than the routes,
+ * so per-file extraction alone minted `/users/me` where the runtime route is
+ * `/api/users/me`, and cross-repo HTTP matching (which joins on the Route
+ * qualified_name) never linked real callers. */
+#define ET_L11_BOOTSTRAP_HEAD                                                                      \
+    "<?php\n\nuse Illuminate\\Foundation\\Application;\n\n"                                        \
+    "return Application::configure(basePath: dirname(__DIR__))\n"                                  \
+    "    ->withRouting(\n"
+#define ET_L11_BOOTSTRAP_TAIL                                                                      \
+    "    )\n"                                                                                      \
+    "    ->withMiddleware(function ($middleware) {\n        //\n    })\n"                          \
+    "    ->create();\n"
+
+static const char ET_L11_API_ROUTES[] =
+    "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+    "Route::prefix('/users')->middleware('auth')->group(function (): void {\n"
+    "    Route::get('/me', [UserController::class, 'me']);\n"
+    "});\n"
+    "Route::post('/orders', [OrderController::class, 'store']);\n";
+
+static const char ET_L11_WEB_ROUTES[] = "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+                                        "Route::get('/dashboard', [HomeController::class, 'index']);\n";
+
+/* Default convention: `api:` given, no `apiPrefix:` -> '/api'. */
+TEST(routes_laravel_withrouting_api_default_prefix_issue1146) {
+    static const char *routes[] = {"/api/users/me", "/api/orders", NULL};
+    static const EtFile f[] = {
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        web: __DIR__.'/../routes/web.php',\n"
+         "        api: __DIR__.'/../routes/api.php',\n"
+         "        commands: __DIR__.'/../routes/console.php',\n"
+         "        health: '/up',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, false, "__route__GET__/api/users/me"));
+    PASS();
+}
+
+/* Explicit `apiPrefix:` (multi-segment, array form of `api:`) replaces the
+ * default for every mounted file. */
+TEST(routes_laravel_withrouting_api_custom_prefix_issue1146) {
+    static const char *routes[] = {"/v1/api/users/me", "/v1/api/orders", "/v1/api/partners",
+                                   NULL};
+    static const EtFile f[] = {
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        api: [__DIR__.'/../routes/api.php', __DIR__.'/../routes/partner.php'],\n"
+         "        apiPrefix: 'v1/api',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/api.php", ET_L11_API_ROUTES},
+        {"routes/partner.php", "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+                               "Route::get('/partners', [PartnerController::class, 'index']);\n"}};
+    ASSERT_TRUE(et_routes_exact_mode(f, 3, routes, false, "__route__GET__/v1/api/partners"));
+    PASS();
+}
+
+/* The `web:` file of the same app is NOT mounted under the api prefix. */
+TEST(routes_laravel_withrouting_web_no_prefix_issue1146) {
+    static const char *routes[] = {"/dashboard", "/api/users/me", "/api/orders", NULL};
+    static const EtFile f[] = {
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        web: __DIR__.'/../routes/web.php',\n"
+         "        api: __DIR__.'/../routes/api.php',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/web.php", ET_L11_WEB_ROUTES},
+        {"routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact(f, 3, routes));
+    PASS();
+}
+
+/* Control: the Laravel <= 10 RouteServiceProvider form (no withRouting, the
+ * prefix lives on a `->group(base_path(...))` call) is not composed today and
+ * must stay exactly as it is -- no filename-based `/api` inference. */
+TEST(routes_laravel_routeserviceprovider_control_issue1146) {
+    static const char *routes[] = {"/users/me", "/orders", NULL};
+    static const EtFile f[] = {
+        {"bootstrap/app.php",
+         "<?php\n\n$app = new Illuminate\\Foundation\\Application(\n"
+         "    $_ENV['APP_BASE_PATH'] ?? dirname(__DIR__)\n);\n\nreturn $app;\n"},
+        {"app/Providers/RouteServiceProvider.php",
+         "<?php\nnamespace App\\Providers;\n\n"
+         "use Illuminate\\Support\\Facades\\Route;\n\n"
+         "class RouteServiceProvider extends ServiceProvider {\n"
+         "    public function boot(): void {\n"
+         "        $this->routes(function () {\n"
+         "            Route::middleware('api')->prefix('api')"
+         "->group(base_path('routes/api.php'));\n"
+         "            Route::middleware('web')->group(base_path('routes/web.php'));\n"
+         "        });\n    }\n}\n"},
+        {"routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact(f, 3, routes));
+    PASS();
+}
+
+/* A non-literal `apiPrefix:` is unknown at index time: leave the paths alone
+ * rather than guess the default. */
+TEST(routes_laravel_withrouting_nonliteral_prefix_issue1146) {
+    static const char *routes[] = {"/users/me", "/orders", NULL};
+    static const EtFile f[] = {
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        api: __DIR__.'/../routes/api.php',\n"
+         "        apiPrefix: config('app.api_prefix'),\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact(f, 2, routes));
+    PASS();
+}
+
+/* Same contract on the PARALLEL resolver (> 50 files), with the Laravel app
+ * in a monorepo subdirectory: the nearest ancestor bootstrap/app.php owns it. */
+TEST(routes_laravel_withrouting_parallel_subdir_issue1146) {
+    static const char *routes[] = {"/api/users/me", "/api/orders", NULL};
+    static const EtFile f[] = {
+        {"gateway/bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        web: __DIR__.'/../routes/web.php',\n"
+         "        api: __DIR__.'/../routes/api.php',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"gateway/routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, true, "__route__POST__/api/orders"));
     PASS();
 }
 
@@ -1708,6 +1848,12 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
     RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
+    RUN_TEST(routes_laravel_withrouting_api_default_prefix_issue1146);
+    RUN_TEST(routes_laravel_withrouting_api_custom_prefix_issue1146);
+    RUN_TEST(routes_laravel_withrouting_web_no_prefix_issue1146);
+    RUN_TEST(routes_laravel_routeserviceprovider_control_issue1146);
+    RUN_TEST(routes_laravel_withrouting_nonliteral_prefix_issue1146);
+    RUN_TEST(routes_laravel_withrouting_parallel_subdir_issue1146);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 
