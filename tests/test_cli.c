@@ -13724,6 +13724,81 @@ TEST(cli_upsert_codex_mcp_escapes_windows_path) {
     PASS();
 }
 
+/* #2228: a 0.10.4 -> 0.11.0 upgrade deleted every table Codex Desktop had
+ * appended between our markers (the closing marker stayed the file's last
+ * line) and the startup_timeout_sec the user had added to our table. Install
+ * must keep all of it; uninstall must remove only our table. */
+TEST(cli_codex_mcp_keeps_foreign_tables_in_managed_region_issue2228) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-2228-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/config.toml", tmpdir);
+#define CLI_2228_PREFIX                                                       \
+    "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n" \
+    "args = [\"serve\", \"--mcp\"]\n"
+#define CLI_2228_FOREIGN                                                                   \
+    "[mcp_servers.node_repl]\nargs = []\n"                                                 \
+    "command = \"/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl\"\n"  \
+    "startup_timeout_sec = 120\n\n"                                                        \
+    "[mcp_servers.node_repl.env]\nNODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = \"5000\"\n\n" \
+    "[desktop]\nfollowUpQueueMode = \"steer\"\n\n"                                         \
+    "[marketplaces.openai-codex]\nsource_type = \"git\"\n"                                 \
+    "source = \"https://github.com/openai/codex-plugin-cc.git\"\n"
+    const char *before = CLI_2228_PREFIX "# >>> codebase-memory-mcp MCP >>>\n"
+                                         "[mcp_servers.codebase-memory-mcp]\n"
+                                         "command = \"/old/codebase-memory-mcp\"\n"
+                                         "args = []\n"
+                                         "startup_timeout_sec = 90\n\n" CLI_2228_FOREIGN
+                                         "# <<< codebase-memory-mcp MCP <<<\n";
+    const char *installed = CLI_2228_PREFIX "# >>> codebase-memory-mcp MCP >>>\n"
+                                            "[mcp_servers.codebase-memory-mcp]\n"
+                                            "command = \"/new/codebase-memory-mcp\"\n"
+                                            "args = []\n"
+                                            "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+                                            "startup_timeout_sec = 90\n"
+                                            "# <<< codebase-memory-mcp MCP <<<\n" CLI_2228_FOREIGN;
+    const char *uninstalled = CLI_2228_PREFIX CLI_2228_FOREIGN;
+#undef CLI_2228_PREFIX
+#undef CLI_2228_FOREIGN
+
+    write_test_file(configpath, before);
+    int install_rc = cbm_upsert_codex_mcp("/new/codebase-memory-mcp", configpath);
+    char *after_install = read_test_file_alloc(configpath);
+    int reinstall_rc = cbm_upsert_codex_mcp("/new/codebase-memory-mcp", configpath);
+    char *after_reinstall = read_test_file_alloc(configpath);
+    int remove_rc = cbm_remove_codex_mcp(configpath);
+    char *after_remove = read_test_file_alloc(configpath);
+    /* Uninstall straight from the reported state: the foreign tables are
+     * still inside the markers there. */
+    write_test_file(configpath, before);
+    int direct_remove_rc = cbm_remove_codex_mcp(configpath);
+    char *after_direct_remove = read_test_file_alloc(configpath);
+    bool install_kept = install_rc == 0 && after_install && strcmp(after_install, installed) == 0;
+    bool reinstall_stable =
+        reinstall_rc == 0 && after_reinstall && strcmp(after_reinstall, installed) == 0;
+    bool remove_kept = remove_rc == 0 && after_remove && strcmp(after_remove, uninstalled) == 0 &&
+                       direct_remove_rc == 0 && after_direct_remove &&
+                       strcmp(after_direct_remove, uninstalled) == 0;
+    if (!install_kept && after_install)
+        printf("  install produced:\n%s\n", after_install);
+    if (!remove_kept && after_direct_remove)
+        printf("  uninstall produced:\n%s\n", after_direct_remove);
+    free(after_install);
+    free(after_reinstall);
+    free(after_remove);
+    free(after_direct_remove);
+    test_rmdir_r(tmpdir);
+    if (!install_kept)
+        FAIL("Codex install must keep foreign tables and user keys found between its markers");
+    if (!reinstall_stable)
+        FAIL("Codex reinstall must be byte-identical once foreign tables sit outside the block");
+    if (!remove_kept)
+        FAIL("Codex uninstall must remove only its own table and keep foreign tables");
+    PASS();
+}
+
 TEST(cli_upsert_codex_mcp_existing) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-XXXXXX");
@@ -16990,6 +17065,7 @@ SUITE(cli) {
     /* Codex MCP config upsert (3 tests — group B) */
     RUN_TEST(cli_upsert_codex_mcp_fresh);
     RUN_TEST(cli_upsert_codex_mcp_escapes_windows_path);
+    RUN_TEST(cli_codex_mcp_keeps_foreign_tables_in_managed_region_issue2228);
     RUN_TEST(cli_upsert_codex_mcp_existing);
     RUN_TEST(cli_upsert_codex_mcp_replace);
     RUN_TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string);

@@ -3841,8 +3841,11 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
 }
 
 int cbm_remove_codex_mcp(const char *config_path) {
+    /* #2228: only our table goes; foreign tables found between the markers
+     * (Codex Desktop appends below a block that ends the file) stay. */
     if (!config_path ||
-        cbm_toml_remove_managed_block(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END) != 0) {
+        cbm_toml_remove_managed_block_owned(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END,
+                                            CODEX_CMM_SECTION "\n") != 0) {
         return CLI_ERR;
     }
     return cbm_remove_codex_legacy_mcp(config_path) >= 0 ? CLI_OK : CLI_ERR;
@@ -4466,7 +4469,8 @@ static int cbm_upsert_grok_mcp(const char *binary_path, const char *config_path)
 static int cbm_remove_grok_mcp_owned(const char *binary_path, const char *config_path) {
     (void)binary_path;
     if (!config_path ||
-        cbm_toml_remove_managed_block(config_path, GROK_MCP_BEGIN, GROK_MCP_END) != 0) {
+        cbm_toml_remove_managed_block_owned(config_path, GROK_MCP_BEGIN, GROK_MCP_END,
+                                            GROK_CMM_SECTION "\n") != 0) {
         return CLI_ERR;
     }
     return cbm_remove_grok_legacy_mcp(config_path) >= 0 ? CLI_OK : CLI_ERR;
@@ -5032,7 +5036,8 @@ static int cbm_upsert_kimi_context_hook(const char *config_path, const char *bin
 }
 
 static int cbm_remove_kimi_context_hook(const char *config_path) {
-    return cbm_toml_remove_managed_block(config_path, KIMI_HOOK_BEGIN, KIMI_HOOK_END) == 0
+    return cbm_toml_remove_managed_block_owned(config_path, KIMI_HOOK_BEGIN, KIMI_HOOK_END,
+                                               "[[hooks]]\n") == 0
                ? CLI_OK
                : CLI_ERR;
 }
