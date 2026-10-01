@@ -65,7 +65,9 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    FILE *fp = cbm_popen(cmd, "r");
+    /* A hook or editor may export GIT_DIR/GIT_WORK_TREE for another repo.
+     * Isolate this child so git -C selects repo_path rather than that repo. */
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
