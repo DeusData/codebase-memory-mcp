@@ -1,0 +1,2944 @@
+{
+  "settingsPanelOpens": true,
+  "runningModelFromProps": true,
+  "cacheModelsListed": 2,
+  "switchModelWorks": true,
+  "switchPersistsReload": true,
+  "statusBarNamesModel": true,
+  "noRouterExplained": true,
+  "suggestionsListed": 6,
+  "suggestionsShowMeasuredNumbers": true,
+  "freeRepoFieldAccepted": true,
+  "commandCopyable": true,
+  "downloadHonestyText": true,
+  "noFakeProgressBar": true,
+  "startScriptTakesModel": true,
+  "startScriptSaysHowToFetch": true,
+  "noWeightsInRepo": true,
+  "llmOffMakesNoRequests": true,
+  "panelExplainsItselfWhileOff": true,
+  "singleLineTruncatedIsUnmeasured": true,
+  "unmeasuredOutOfCitationRate": true,
+  "evalReportsUnmeasured": true,
+  "panelShowsUnmeasured": true,
+  "twoDimensionalMode": true,
+  "effectToggles": [
+    {
+      "name": "halos",
+      "label": "Leuchthoefe",
+      "changedTo": "false",
+      "before": 67,
+      "after": 66,
+      "band": 2.3,
+      "verdict": "no-difference",
+      "text": "before 67 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (2.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:14.131Z",
+      "resetTo": "true",
+      "resetBefore": 67,
+      "resetAfter": 65,
+      "resetVerdict": "no-difference"
+    },
+    {
+      "name": "bloom",
+      "label": "Bloom",
+      "changedTo": "false",
+      "before": 66,
+      "after": 67,
+      "band": 3.4,
+      "verdict": "no-difference",
+      "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (3.4 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:28.212Z",
+      "resetTo": "true",
+      "resetBefore": 66,
+      "resetAfter": 66,
+      "resetVerdict": "no-difference"
+    },
+    {
+      "name": "edges",
+      "label": "Kantendichte",
+      "changedTo": "off",
+      "before": 66,
+      "after": 66,
+      "band": 4.1,
+      "verdict": "no-difference",
+      "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (4.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:42.295Z",
+      "resetTo": "full",
+      "resetBefore": 66,
+      "resetAfter": 66,
+      "resetVerdict": "no-difference"
+    },
+    {
+      "name": "labels",
+      "label": "Beschriftungsentfernung",
+      "changedTo": "1",
+      "before": 66,
+      "after": 67,
+      "band": 5,
+      "verdict": "no-difference",
+      "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (5.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:56.386Z",
+      "resetTo": "0",
+      "resetBefore": 67,
+      "resetAfter": 66,
+      "resetVerdict": "no-difference"
+    },
+    {
+      "name": "agents",
+      "label": "Agentenebene",
+      "changedTo": "false",
+      "before": 66,
+      "after": 66,
+      "band": 2.4,
+      "verdict": "no-difference",
+      "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (2.4 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:10.471Z",
+      "resetTo": "true",
+      "resetBefore": 66,
+      "resetAfter": 67,
+      "resetVerdict": "no-difference"
+    }
+  ],
+  "thriftProfileWorks": true,
+  "frameCapWorks": true,
+  "settingsPersistReload": true,
+  "everyToggleNamesMeasuredEffect": true,
+  "noEffectSaysSo": true,
+  "viewOnlyControlsStayed": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "port": 4581,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w10",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "method": "Ein eigener llama-server im Router-Modus ueber ein eigenes Cache-Verzeichnis mit ZWEI Modellen, die als harte Links aus models/ dort liegen: kein Download, kein zusaetzlicher Platz, keine geloeschte Datei. Die Anwendung fragt weiter ihren Produktport 127.0.0.1:4141; ein addInitScript leitet an genau der Naht um, an der sie selbst fragt, und der Route-Handler bricht jede Anfrage an 4141 ab, statt sie durchzulassen (productPortRequests muss 0 sein). Die Modellnamen, die das Umschalten belegen, stammen aus den aufgezeichneten Antwortkoerpern der Anfragen, die die Anwendung selbst geschickt hat. Gemessen in headless Chromium mit SwiftShader, also in Software-GL. Die absoluten Bildraten sind darum NICHT die eines Lesers mit Metal auf derselben Maschine. Was dieser Lauf zeigt, ist die Mechanik jeder Einstellung und die Zahlen dieser Umgebung.",
+  "timings": {
+    "buildMs": 10782,
+    "routerReadyMs": 305,
+    "offWindowMs": 7502,
+    "totalMs": 302393
+  },
+  "generatedAt": "2026-08-30T17:35:33.479Z",
+  "error": null,
+  "extras": {
+    "frameRateEnvironment": "Gemessen in headless Chromium mit SwiftShader, also in Software-GL. Die absoluten Bildraten sind darum NICHT die eines Lesers mit Metal auf derselben Maschine. Was dieser Lauf zeigt, ist die Mechanik jeder Einstellung und die Zahlen dieser Umgebung.",
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "sidecarRequests": {
+      "total": 365,
+      "byPath": {
+        "/health": 91,
+        "/props": 181,
+        "/v1/models": 91,
+        "/v1/chat/completions": 2
+      },
+      "first": [
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 37680
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 37692
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 37694
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=LFM2.5-1.2B-Instruct-Q4_K_M",
+          "atMs": 37695
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 40680
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 40682
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 40684
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=LFM2.5-1.2B-Instruct-Q4_K_M",
+          "atMs": 40686
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 43680
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 43682
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 43684
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=LFM2.5-1.2B-Instruct-Q4_K_M",
+          "atMs": 43685
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 44354
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 44370
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 44372
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=LFM2.5-1.2B-Instruct-Q4_K_M",
+          "atMs": 44374
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 46681
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 46683
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 46685
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=LFM2.5-1.2B-Instruct-Q4_K_M",
+          "atMs": 46686
+        }
+      ],
+      "last": [
+        {
+          "url": "http://127.0.0.1:4582/props?model=MiniCPM5-1B-Q4_K_M",
+          "atMs": 282629
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 285624
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 285626
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 285627
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=MiniCPM5-1B-Q4_K_M",
+          "atMs": 285629
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 288624
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 288626
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 288627
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=MiniCPM5-1B-Q4_K_M",
+          "atMs": 288629
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 291624
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 291626
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 291628
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=MiniCPM5-1B-Q4_K_M",
+          "atMs": 291629
+        },
+        {
+          "url": "http://127.0.0.1:4582/health",
+          "atMs": 294642
+        },
+        {
+          "url": "http://127.0.0.1:4582/props",
+          "atMs": 294644
+        },
+        {
+          "url": "http://127.0.0.1:4582/v1/models",
+          "atMs": 294645
+        },
+        {
+          "url": "http://127.0.0.1:4582/props?model=MiniCPM5-1B-Q4_K_M",
+          "atMs": 294647
+        },
+        {
+          "url": "http://127.0.0.1:4583/health",
+          "atMs": 297691
+        },
+        {
+          "url": "http://127.0.0.1:4583/props",
+          "atMs": 297743
+        },
+        {
+          "url": "http://127.0.0.1:4583/v1/models",
+          "atMs": 297745
+        }
+      ]
+    },
+    "productPortRequests": [],
+    "chatResponses": [
+      {
+        "url": "http://127.0.0.1:4582/v1/chat/completions",
+        "status": 200,
+        "model": "LFM2.5-1.2B-Instruct-Q4_K_M",
+        "finishReason": "stop",
+        "contentChars": 170,
+        "atMs": 55345
+      },
+      {
+        "url": "http://127.0.0.1:4582/v1/chat/completions",
+        "status": 200,
+        "model": "MiniCPM5-1B-Q4_K_M",
+        "finishReason": "stop",
+        "contentChars": 56,
+        "atMs": 62741
+      }
+    ],
+    "readability": [
+      {
+        "name": "Einstellungen offen, lokales Modell aus",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 186,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 179,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Einstellungen offen, Modellgruppe",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 202,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 187,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Einstellungen offen, flache Ansicht",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 189,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 187,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Einstellungen offen, Leistungsgruppe",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 188,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 186,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "shots": [
+      {
+        "name": "settings.png",
+        "atRest": true,
+        "scrolledTo": "",
+        "bytes": 353468,
+        "shows": {
+          "atlas-settings-title": "in view",
+          "atlas-settings-running": "in view",
+          "atlas-settings-models": "in view",
+          "atlas-settings-cache-count": "in view",
+          "atlas-settings-honesty": "in view",
+          "atlas-settings-no-progress": "in view",
+          "atlas-settings-suggestions": "in view",
+          "atlas-settings-copy": "in view",
+          "atlas-settings-repo-input": "off screen",
+          "atlas-settings-repo-command": "off screen",
+          "atlas-settings-perf": "off screen",
+          "atlas-settings-llm-off": "absent",
+          "atlas-settings-profiles": "off screen",
+          "atlas-settings-keeps": "off screen",
+          "measuresInView": [],
+          "hintOpen": false
+        },
+        "framing": null,
+        "why": "",
+        "regions": [
+          {
+            "name": "atlas-settings",
+            "top": 0,
+            "left": 0,
+            "hidden": 2934
+          }
+        ]
+      },
+      {
+        "name": "settings-fetch.png",
+        "atRest": false,
+        "scrolledTo": "model-fetch",
+        "bytes": 343411,
+        "shows": {
+          "atlas-settings-title": "off screen",
+          "atlas-settings-running": "off screen",
+          "atlas-settings-models": "in view",
+          "atlas-settings-cache-count": "in view",
+          "atlas-settings-honesty": "in view",
+          "atlas-settings-no-progress": "in view",
+          "atlas-settings-suggestions": "in view",
+          "atlas-settings-copy": "in view",
+          "atlas-settings-repo-input": "off screen",
+          "atlas-settings-repo-command": "off screen",
+          "atlas-settings-perf": "off screen",
+          "atlas-settings-llm-off": "absent",
+          "atlas-settings-profiles": "off screen",
+          "atlas-settings-keeps": "off screen",
+          "measuresInView": [],
+          "hintOpen": false
+        },
+        "framing": null,
+        "why": "Das Panel ist hoeher als sein Fenster. Es wurde zur Gruppe \"model-fetch\" gescrollt, weil sie sonst auf keinem Beweisbild zu sehen waere.",
+        "regions": [
+          {
+            "name": "atlas-settings",
+            "top": 462,
+            "left": 0,
+            "hidden": 2934
+          }
+        ]
+      },
+      {
+        "name": "settings-switch.png",
+        "atRest": true,
+        "scrolledTo": "",
+        "bytes": 305685,
+        "shows": {
+          "atlas-settings-title": "in view",
+          "atlas-settings-running": "in view",
+          "atlas-settings-models": "in view",
+          "atlas-settings-cache-count": "in view",
+          "atlas-settings-honesty": "in view",
+          "atlas-settings-no-progress": "in view",
+          "atlas-settings-suggestions": "in view",
+          "atlas-settings-copy": "in view",
+          "atlas-settings-repo-input": "off screen",
+          "atlas-settings-repo-command": "absent",
+          "atlas-settings-perf": "off screen",
+          "atlas-settings-llm-off": "absent",
+          "atlas-settings-profiles": "off screen",
+          "atlas-settings-keeps": "off screen",
+          "measuresInView": [],
+          "hintOpen": false
+        },
+        "framing": null,
+        "why": "",
+        "regions": [
+          {
+            "name": "atlas-settings",
+            "top": 0,
+            "left": 0,
+            "hidden": 3212
+          },
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 904
+          }
+        ]
+      },
+      {
+        "name": "settings-performance.png",
+        "atRest": false,
+        "scrolledTo": "display",
+        "bytes": 352668,
+        "shows": {
+          "atlas-settings-title": "off screen",
+          "atlas-settings-running": "off screen",
+          "atlas-settings-models": "off screen",
+          "atlas-settings-cache-count": "off screen",
+          "atlas-settings-honesty": "off screen",
+          "atlas-settings-no-progress": "off screen",
+          "atlas-settings-suggestions": "off screen",
+          "atlas-settings-copy": "off screen",
+          "atlas-settings-repo-input": "off screen",
+          "atlas-settings-repo-command": "absent",
+          "atlas-settings-perf": "off screen",
+          "atlas-settings-llm-off": "absent",
+          "atlas-settings-profiles": "in view",
+          "atlas-settings-keeps": "in view",
+          "measuresInView": [
+            {
+              "setting": "agents",
+              "verdict": "no-difference",
+              "before": "30",
+              "after": "30"
+            },
+            {
+              "setting": "agentTails",
+              "verdict": "no-difference",
+              "before": "30",
+              "after": "30"
+            },
+            {
+              "setting": "agentTrails",
+              "verdict": "no-difference",
+              "before": "30",
+              "after": "30"
+            },
+            {
+              "setting": "agentWaves",
+              "verdict": "no-difference",
+              "before": "30",
+              "after": "30"
+            },
+            {
+              "setting": "agentTimeline",
+              "verdict": "no-difference",
+              "before": "30",
+              "after": "30"
+            },
+            {
+              "setting": "thrifty",
+              "verdict": "lower",
+              "before": "67",
+              "after": "30"
+            },
+            {
+              "setting": "default",
+              "verdict": "higher",
+              "before": "30",
+              "after": "67"
+            }
+          ],
+          "hintOpen": false
+        },
+        "framing": {
+          "section": "display",
+          "chosenTop": 3192,
+          "range": "1978 bis 3273",
+          "bestScore": 10,
+          "best": {
+            "top": 3192,
+            "perfIn": 0,
+            "profilesIn": 2,
+            "measuresIn": 6,
+            "measuresTotal": 13,
+            "points": 10
+          },
+          "tried": [
+            {
+              "top": 1978,
+              "perfIn": 1,
+              "profilesIn": 0,
+              "measuresIn": 4,
+              "measuresTotal": 13,
+              "points": 6
+            },
+            {
+              "top": 2059,
+              "perfIn": 1,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 7
+            },
+            {
+              "top": 2140,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2221,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2302,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2383,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2464,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2545,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2626,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2706,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2787,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 4,
+              "measuresTotal": 13,
+              "points": 4
+            },
+            {
+              "top": 2868,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 5
+            },
+            {
+              "top": 2949,
+              "perfIn": 0,
+              "profilesIn": 0,
+              "measuresIn": 4,
+              "measuresTotal": 13,
+              "points": 4
+            },
+            {
+              "top": 3030,
+              "perfIn": 0,
+              "profilesIn": 2,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 9
+            },
+            {
+              "top": 3111,
+              "perfIn": 0,
+              "profilesIn": 2,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 9
+            },
+            {
+              "top": 3192,
+              "perfIn": 0,
+              "profilesIn": 2,
+              "measuresIn": 6,
+              "measuresTotal": 13,
+              "points": 10
+            },
+            {
+              "top": 3273,
+              "perfIn": 0,
+              "profilesIn": 2,
+              "measuresIn": 5,
+              "measuresTotal": 13,
+              "points": 9
+            }
+          ],
+          "weights": "Lebendzaehler 2, je Profilknopf 2, je fertiger Messabsatz 1"
+        },
+        "why": "Das Panel ist hoeher als sein Fenster, und die Gruppe \"Darstellung und Leistung\" ist hoeher als das Fenster allein: der Lebendzaehler steht an ihrem Anfang, das Sparprofil an ihrem Ende, und zwischen beiden liegen die neun Messabsaetze. Es gibt darum keine Lage, die alles zeigt. Aufgenommen ist die BESTE verfuegbare, gesucht durch Abfahren der Gruppe in 17 Schritten und Zaehlen dessen, was an jeder Lage ganz im Bild steht (siehe framing.tried): sieben von acht Messabsaetzen mit ihren zwei Zahlen und beide Profilknoepfe. Der Lebendzaehler faellt dabei heraus; seine Zahlen stehen in extras.frameCap und in jeder Messung.",
+        "regions": [
+          {
+            "name": "atlas-settings",
+            "top": 3192,
+            "left": 0,
+            "hidden": 3291
+          }
+        ]
+      }
+    ],
+    "measurements": [
+      {
+        "label": "2D statt 3D (projection -> flat)",
+        "setting": "projection",
+        "clicked": "[data-setting=\"projection\"] [data-testid=\"atlas-settings-option\"][data-option=\"flat\"]",
+        "value": "flat",
+        "verdict": "lower",
+        "before": 69,
+        "after": 63,
+        "band": 3.2,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:31:51.166Z",
+        "text": "before 69 frames/s, after 63 frames/s, past the 3.2 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:31:51.166Z",
+        "seam": {
+          "before": 68.54,
+          "after": 62.71,
+          "band": 3.18,
+          "verdict": "lower",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 69.58,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 60,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zurueck auf 3D (projection -> spatial)",
+        "setting": "projection",
+        "clicked": "[data-setting=\"projection\"] [data-testid=\"atlas-settings-option\"][data-option=\"spatial\"]",
+        "value": "spatial",
+        "verdict": "no-difference",
+        "before": 64,
+        "after": 67,
+        "band": 3.9,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:07.093Z",
+        "text": "before 64 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (3.9 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:07.093Z",
+        "seam": {
+          "before": 64.11,
+          "after": 66.75,
+          "band": 3.87,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 65.22,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 64.71,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Leuchthoefe aus (halos -> false)",
+        "setting": "halos",
+        "clicked": "[data-setting=\"halos\"] [data-testid=\"atlas-settings-option\"][data-option=\"false\"]",
+        "value": "false",
+        "verdict": "no-difference",
+        "before": 67,
+        "after": 66,
+        "band": 2.3,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:14.131Z",
+        "text": "before 67 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (2.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:14.131Z",
+        "seam": {
+          "before": 66.8,
+          "after": 66.06,
+          "band": 2.25,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 66.93,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 66,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Leuchthoefe zurueck (halos -> true)",
+        "setting": "halos",
+        "clicked": "[data-setting=\"halos\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 67,
+        "after": 65,
+        "band": 2.9,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:21.174Z",
+        "text": "before 67 frames/s, after 65 frames/s. That is inside the spread this machine shows without any change at all (2.9 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:21.174Z",
+        "seam": {
+          "before": 66.64,
+          "after": 64.72,
+          "band": 2.88,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 65.35,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 62.99,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Bloom aus (bloom -> false)",
+        "setting": "bloom",
+        "clicked": "[data-setting=\"bloom\"] [data-testid=\"atlas-settings-option\"][data-option=\"false\"]",
+        "value": "false",
+        "verdict": "no-difference",
+        "before": 66,
+        "after": 67,
+        "band": 3.4,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:28.212Z",
+        "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (3.4 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:28.212Z",
+        "seam": {
+          "before": 66.39,
+          "after": 67.2,
+          "band": 3.42,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 66.67,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 64,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Bloom zurueck (bloom -> true)",
+        "setting": "bloom",
+        "clicked": "[data-setting=\"bloom\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 66,
+        "after": 66,
+        "band": 3.9,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:35.260Z",
+        "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (3.9 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:35.260Z",
+        "seam": {
+          "before": 66.38,
+          "after": 66.49,
+          "band": 3.91,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 66.28,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 65.09,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Kantendichte aus (edges -> off)",
+        "setting": "edges",
+        "clicked": "[data-setting=\"edges\"] [data-testid=\"atlas-settings-option\"][data-option=\"off\"]",
+        "value": "off",
+        "verdict": "no-difference",
+        "before": 66,
+        "after": 66,
+        "band": 4.1,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:42.295Z",
+        "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (4.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:42.295Z",
+        "seam": {
+          "before": 65.92,
+          "after": 66.04,
+          "band": 4.12,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 63.75,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 67.73,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Kantendichte zurueck (edges -> full)",
+        "setting": "edges",
+        "clicked": "[data-setting=\"edges\"] [data-testid=\"atlas-settings-option\"][data-option=\"full\"]",
+        "value": "full",
+        "verdict": "no-difference",
+        "before": 66,
+        "after": 66,
+        "band": 4.7,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:49.343Z",
+        "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (4.7 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:49.343Z",
+        "seam": {
+          "before": 66.46,
+          "after": 66.27,
+          "band": 4.75,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 68.49,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 64.58,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Beschriftungsentfernung aus (labels -> 1)",
+        "setting": "labels",
+        "clicked": "[data-setting=\"labels\"] [data-testid=\"atlas-settings-option\"][data-option=\"1\"]",
+        "value": "1",
+        "verdict": "no-difference",
+        "before": 66,
+        "after": 67,
+        "band": 5,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:32:56.386Z",
+        "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (5.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:56.386Z",
+        "seam": {
+          "before": 66.25,
+          "after": 66.84,
+          "band": 4.99,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 67.46,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 64.71,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Beschriftungsentfernung zurueck (labels -> 0)",
+        "setting": "labels",
+        "clicked": "[data-setting=\"labels\"] [data-testid=\"atlas-settings-option\"][data-option=\"0\"]",
+        "value": "0",
+        "verdict": "no-difference",
+        "before": 67,
+        "after": 66,
+        "band": 1.3,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:03.428Z",
+        "text": "before 67 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (1.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:03.428Z",
+        "seam": {
+          "before": 66.6,
+          "after": 65.58,
+          "band": 1.33,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 66.28,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 62.38,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Agentenebene aus (agents -> false)",
+        "setting": "agents",
+        "clicked": "[data-setting=\"agents\"] [data-testid=\"atlas-settings-option\"][data-option=\"false\"]",
+        "value": "false",
+        "verdict": "no-difference",
+        "before": 66,
+        "after": 66,
+        "band": 2.4,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:10.471Z",
+        "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (2.4 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:10.471Z",
+        "seam": {
+          "before": 66.4,
+          "after": 65.83,
+          "band": 2.39,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 65.61,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 65.87,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Agentenebene zurueck (agents -> true)",
+        "setting": "agents",
+        "clicked": "[data-setting=\"agents\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 66,
+        "after": 67,
+        "band": 4,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:17.513Z",
+        "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (4.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:17.513Z",
+        "seam": {
+          "before": 65.85,
+          "after": 67.02,
+          "band": 3.96,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 66.15,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 64.2,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Bildratendeckel 60 (frameCap -> 60)",
+        "setting": "frameCap",
+        "clicked": "[data-setting=\"frameCap\"] [data-testid=\"atlas-settings-option\"][data-option=\"60\"]",
+        "value": "60",
+        "verdict": "lower",
+        "before": 67,
+        "after": 60,
+        "band": 2.5,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:24.550Z",
+        "text": "before 67 frames/s, after 60 frames/s, past the 2.5 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:33:24.550Z",
+        "seam": {
+          "before": 66.73,
+          "after": 59.91,
+          "band": 2.49,
+          "verdict": "lower",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 68.09,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 60,
+          "cap": 60
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Bildratendeckel 30 (frameCap -> 30)",
+        "setting": "frameCap",
+        "clicked": "[data-setting=\"frameCap\"] [data-testid=\"atlas-settings-option\"][data-option=\"30\"]",
+        "value": "30",
+        "verdict": "lower",
+        "before": 60,
+        "after": 30,
+        "band": 0.4,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:31.587Z",
+        "text": "before 60 frames/s, after 30 frames/s, past the 0.4 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:33:31.587Z",
+        "seam": {
+          "before": 60,
+          "after": 30,
+          "band": 0.43,
+          "verdict": "lower",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 59.76,
+          "cap": 60
+        },
+        "frameSeamAfter": {
+          "fps": 29.96,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Bildratendeckel aus (frameCap -> 0)",
+        "setting": "frameCap",
+        "clicked": "[data-setting=\"frameCap\"] [data-testid=\"atlas-settings-option\"][data-option=\"0\"]",
+        "value": "0",
+        "verdict": "higher",
+        "before": 30,
+        "after": 67,
+        "band": 0.2,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:38.620Z",
+        "text": "before 30 frames/s, after 67 frames/s, past the 0.2 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:33:38.620Z",
+        "seam": {
+          "before": 30,
+          "after": 66.94,
+          "band": 0.17,
+          "verdict": "higher",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 29.91,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 64.83,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "Sparprofil",
+        "setting": "thrifty",
+        "clicked": "[data-testid=\"atlas-settings-profile\"][data-profile=\"thrifty\"]",
+        "value": "thrifty",
+        "verdict": "lower",
+        "before": 66,
+        "after": 30,
+        "band": 1.3,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:45.655Z",
+        "text": "before 66 frames/s, after 30 frames/s, past the 1.3 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:33:45.655Z",
+        "seam": {
+          "before": 66.47,
+          "after": 30,
+          "band": 1.32,
+          "verdict": "lower",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 67.06,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 30,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: projection",
+        "setting": "projection",
+        "clicked": "[data-setting=\"projection\"] [data-testid=\"atlas-settings-option\"][data-option=\"spatial\"]",
+        "value": "spatial",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:33:58.113Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:58.113Z",
+        "seam": {
+          "before": 30,
+          "after": 30.02,
+          "band": 0.02,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: halos",
+        "setting": "halos",
+        "clicked": "[data-setting=\"halos\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.2,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:05.145Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.2 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:05.145Z",
+        "seam": {
+          "before": 29.98,
+          "after": 30,
+          "band": 0.23,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 30,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: bloom",
+        "setting": "bloom",
+        "clicked": "[data-setting=\"bloom\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "lower",
+        "before": 30,
+        "after": 30,
+        "band": 0,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:12.179Z",
+        "text": "before 30 frames/s, after 30 frames/s, past the 0.0 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:34:12.179Z",
+        "seam": {
+          "before": 30,
+          "after": 29.96,
+          "band": 0,
+          "verdict": "lower",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: edges",
+        "setting": "edges",
+        "clicked": "[data-setting=\"edges\"] [data-testid=\"atlas-settings-option\"][data-option=\"full\"]",
+        "value": "full",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.3,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:19.211Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:19.211Z",
+        "seam": {
+          "before": 29.99,
+          "after": 30.01,
+          "band": 0.25,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 30.02,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: labels",
+        "setting": "labels",
+        "clicked": "[data-setting=\"labels\"] [data-testid=\"atlas-settings-option\"][data-option=\"0\"]",
+        "value": "0",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.1,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:26.236Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:26.236Z",
+        "seam": {
+          "before": 29.98,
+          "after": 30.03,
+          "band": 0.06,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 29.96,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: agents",
+        "setting": "agents",
+        "clicked": "[data-setting=\"agents\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.3,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:33.271Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:33.271Z",
+        "seam": {
+          "before": 30,
+          "after": 29.98,
+          "band": 0.25,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30.08,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: agentTails",
+        "setting": "agentTails",
+        "clicked": "[data-setting=\"agentTails\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.3,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:40.304Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:40.304Z",
+        "seam": {
+          "before": 30.02,
+          "after": 29.99,
+          "band": 0.25,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30.08,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 30.08,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: agentTrails",
+        "setting": "agentTrails",
+        "clicked": "[data-setting=\"agentTrails\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.1,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:47.338Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:47.338Z",
+        "seam": {
+          "before": 30,
+          "after": 30.02,
+          "band": 0.08,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 30.02,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: agentWaves",
+        "setting": "agentWaves",
+        "clicked": "[data-setting=\"agentWaves\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.1,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:34:54.370Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:54.370Z",
+        "seam": {
+          "before": 30.01,
+          "after": 29.99,
+          "band": 0.14,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: agentTimeline",
+        "setting": "agentTimeline",
+        "clicked": "[data-setting=\"agentTimeline\"] [data-testid=\"atlas-settings-option\"][data-option=\"true\"]",
+        "value": "true",
+        "verdict": "no-difference",
+        "before": 30,
+        "after": 30,
+        "band": 0.7,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:35:01.403Z",
+        "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.7 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:35:01.403Z",
+        "seam": {
+          "before": 29.92,
+          "after": 30.03,
+          "band": 0.66,
+          "verdict": "no-difference",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30.08,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 30.02,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: frameCap",
+        "setting": "frameCap",
+        "clicked": "[data-setting=\"frameCap\"] [data-testid=\"atlas-settings-option\"][data-option=\"0\"]",
+        "value": "0",
+        "verdict": "higher",
+        "before": 30,
+        "after": 65,
+        "band": 0.1,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:35:08.436Z",
+        "text": "before 30 frames/s, after 65 frames/s, past the 0.1 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:35:08.436Z",
+        "seam": {
+          "before": 29.99,
+          "after": 65.49,
+          "band": 0.14,
+          "verdict": "higher",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 29.94,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 65.61,
+          "cap": 0
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: thrifty",
+        "setting": "thrifty",
+        "clicked": "[data-testid=\"atlas-settings-profile\"][data-profile=\"thrifty\"]",
+        "value": "thrifty",
+        "verdict": "lower",
+        "before": 67,
+        "after": 30,
+        "band": 3.8,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:35:15.490Z",
+        "text": "before 67 frames/s, after 30 frames/s, past the 3.8 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:35:15.490Z",
+        "seam": {
+          "before": 66.56,
+          "after": 30.01,
+          "band": 3.77,
+          "verdict": "lower",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 68.23,
+          "cap": 0
+        },
+        "frameSeamAfter": {
+          "fps": 30,
+          "cap": 30
+        },
+        "seamAgrees": true
+      },
+      {
+        "label": "zweite Runde: default",
+        "setting": "default",
+        "clicked": "[data-testid=\"atlas-settings-profile\"][data-profile=\"default\"]",
+        "value": "default",
+        "verdict": "higher",
+        "before": 30,
+        "after": 67,
+        "band": 0.1,
+        "nodes": 76,
+        "edges": 178,
+        "at": "2026-08-30T17:35:22.523Z",
+        "text": "before 30 frames/s, after 67 frames/s, past the 0.1 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:35:22.523Z",
+        "seam": {
+          "before": 30,
+          "after": 66.93,
+          "band": 0.06,
+          "verdict": "higher",
+          "nodes": 76,
+          "edges": 178
+        },
+        "frameSeamBefore": {
+          "fps": 30,
+          "cap": 30
+        },
+        "frameSeamAfter": {
+          "fps": 67.59,
+          "cap": 0
+        },
+        "seamAgrees": true
+      }
+    ],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4580,
+    "cacheDir": {
+      "path": "/private/tmp/codeatlasweb-w10-cache-71EUO1",
+      "entries": [
+        {
+          "file": "MiniCPM5-1B-Q4_K_M.gguf",
+          "how": "link",
+          "bytes": 688065920,
+          "links": 2
+        },
+        {
+          "file": "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+          "how": "link",
+          "bytes": 730895168,
+          "links": 2
+        }
+      ]
+    },
+    "llmOff": {
+      "waitedMs": 7502,
+      "pollIntervalsCovered": 2.5,
+      "sidecarRequests": 0,
+      "probesBefore": 0,
+      "probesAfterLlmSeam": 0,
+      "probesAfterSettingsSeam": 0,
+      "productPortRequests": 0,
+      "panelState": "off",
+      "sections": [
+        "model-running",
+        "model-cache",
+        "model-fetch",
+        "display"
+      ],
+      "offNoteText": "The local model is off, and this panel asks it nothingNot one request goes to the sidecar while the model is off, not even to find out whether one is running. That is the whole meaning of the switch: an opt-out and not a different colour. Turn it on in the atlas menu with [l]ocal llm, and this block fills with the models in your cache, which one is answering, and a click to switch between them.Everything below about drawing works either way. It has nothing to do with a model.",
+      "refreshButtonPresent": false,
+      "refreshButtonPressed": false,
+      "cacheListShown": false,
+      "modelRowsShown": 0,
+      "factsShown": 0,
+      "settingsSeam": {
+        "open": true,
+        "llmOn": false,
+        "router": false,
+        "cacheModels": 0,
+        "suggestions": 6
+      }
+    },
+    "panelOpens": {
+      "byMenu": true,
+      "closedBetween": true,
+      "byCommandLine": true,
+      "menuSelector": "[data-menu=\"a-settings\"]",
+      "commandWord": "settings"
+    },
+    "runningModel": {
+      "activeId": "LFM2.5-1.2B-Instruct-Q4_K_M",
+      "askedByThisRun": {
+        "url": "http://127.0.0.1:4582/props?model=LFM2.5-1.2B-Instruct-Q4_K_M",
+        "model_path": "/private/tmp/codeatlasweb-w10-cache-71EUO1/LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+        "model_ftype": "Q4_K - Medium",
+        "n_ctx": 2048,
+        "n_ctx_train": 128000,
+        "size": 728509440,
+        "n_params": 1170340608
+      },
+      "shownInPanel": [
+        {
+          "fact": "name",
+          "label": "name",
+          "value": "/private/tmp/codeatlasweb-w10-cache-71EUO1/LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+          "source": "GET /props?model=<id> (model_path)"
+        },
+        {
+          "fact": "quantization",
+          "label": "quantisation",
+          "value": "Q4_K - Medium",
+          "source": "GET /props?model=<id> (model_ftype)"
+        },
+        {
+          "fact": "context",
+          "label": "context",
+          "value": "2048 of 128000 trained tokens",
+          "source": "GET /props?model=<id> (n_ctx), GET /v1/models (meta.n_ctx_train)"
+        },
+        {
+          "fact": "weights",
+          "label": "weights",
+          "value": "695 MB for 1.17B parameters",
+          "source": "GET /v1/models (meta.size, meta.n_params)"
+        }
+      ],
+      "seamRunning": {
+        "model": "LFM2.5-1.2B-Instruct",
+        "modelPath": "/private/tmp/codeatlasweb-w10-cache-71EUO1/LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+        "quantization": "Q4_K - Medium",
+        "contextTokens": 2048,
+        "trainedContextTokens": 128000,
+        "weightsBytes": 728509440,
+        "parameters": 1170340608
+      },
+      "comparison": {
+        "nameMatches": true,
+        "quantMatches": true,
+        "contextMatches": true,
+        "weightsMatch": true
+      },
+      "probesBeforeReading": 3,
+      "firstProbeNote": "Nach der ERSTEN Probe steht bei den Gewichten \"the process did not report this\", und das ist richtig: die Probe fragt /v1/models, bevor sie mit /props?model= das Modell laedt, und der Router fuehrt meta nur fuer geladene Instanzen. Gemessen wurde nach der dritten Probe, also in der Lage, die ein Leser nach wenigen Sekunden vor sich hat."
+    },
+    "cacheModels": {
+      "rowsInPanel": 2,
+      "countAttribute": 2,
+      "countText": "2 models in the cache",
+      "askedByThisRun": [
+        {
+          "id": "LFM2.5-1.2B-Instruct-Q4_K_M",
+          "status": "loaded",
+          "size": 728509440
+        },
+        {
+          "id": "MiniCPM5-1B-Q4_K_M",
+          "status": "unloaded",
+          "size": null
+        }
+      ],
+      "rows": [
+        {
+          "model": "LFM2.5-1.2B-Instruct-Q4_K_M",
+          "active": "true",
+          "loaded": "true",
+          "selectable": "true",
+          "text": "LFM2.5-1.2B-Instruct-Q4_K_Manswering now",
+          "pickable": true
+        },
+        {
+          "model": "MiniCPM5-1B-Q4_K_M",
+          "active": "false",
+          "loaded": "false",
+          "selectable": "true",
+          "text": "MiniCPM5-1B-Q4_K_Min the cache, not loaded",
+          "pickable": true
+        }
+      ]
+    },
+    "refreshButton": {
+      "presentWhileOn": true,
+      "label": "read the list again",
+      "pressed": true,
+      "probesBefore": 3,
+      "probesAfter": 4,
+      "sidecarRequestsBefore": 12,
+      "sidecarRequestsAfter": 16,
+      "countsInSameProbeCounter": true
+    },
+    "suggestions": {
+      "source": "verification/w5/eval.json (Trefferquote, Zitattreue, Tempo) und die Dateigroesse in models/ (Bytes)",
+      "checks": [
+        {
+          "id": "qwen3.5-2b",
+          "name": "Qwen3.5-2B",
+          "repo": "unsloth/Qwen3.5-2B-GGUF",
+          "shown": {
+            "passRate": 0.682,
+            "citation": 0.932,
+            "tokensPerSecond": 86.214,
+            "bytes": 1280835840,
+            "unmeasured": ""
+          },
+          "fromEvalJson": {
+            "passRate": 0.682,
+            "citation": 0.932,
+            "tokensPerSecond": 86.214,
+            "file": "Qwen3.5-2B-Q4_K_M.gguf"
+          },
+          "bytesOnDisk": 1280835840,
+          "passRateMatches": true,
+          "citationMatches": true,
+          "speedMatches": true,
+          "bytesMatchFile": true,
+          "textCarriesNumbers": true,
+          "ok": true
+        },
+        {
+          "id": "lfm2.5-1.2b",
+          "name": "LFM2.5-1.2B",
+          "repo": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+          "shown": {
+            "passRate": 0.295,
+            "citation": 0.432,
+            "tokensPerSecond": 109.945,
+            "bytes": 730895168,
+            "unmeasured": ""
+          },
+          "fromEvalJson": {
+            "passRate": 0.295,
+            "citation": 0.432,
+            "tokensPerSecond": 109.945,
+            "file": "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
+          },
+          "bytesOnDisk": 730895168,
+          "passRateMatches": true,
+          "citationMatches": true,
+          "speedMatches": true,
+          "bytesMatchFile": true,
+          "textCarriesNumbers": true,
+          "ok": true
+        },
+        {
+          "id": "minicpm5-1b",
+          "name": "MiniCPM5-1B",
+          "repo": "openbmb/MiniCPM5-1B-GGUF",
+          "shown": {
+            "passRate": 0.25,
+            "citation": 0.545,
+            "tokensPerSecond": 170.848,
+            "bytes": 688065920,
+            "unmeasured": ""
+          },
+          "fromEvalJson": {
+            "passRate": 0.25,
+            "citation": 0.545,
+            "tokensPerSecond": 170.848,
+            "file": "MiniCPM5-1B-Q4_K_M.gguf"
+          },
+          "bytesOnDisk": 688065920,
+          "passRateMatches": true,
+          "citationMatches": true,
+          "speedMatches": true,
+          "bytesMatchFile": true,
+          "textCarriesNumbers": true,
+          "ok": true
+        },
+        {
+          "id": "qwen2.5-coder-1.5b",
+          "name": "Qwen2.5-Coder-1.5B",
+          "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+          "shown": {
+            "passRate": 0.227,
+            "citation": 0.705,
+            "tokensPerSecond": 84.048,
+            "bytes": 1117320768,
+            "unmeasured": ""
+          },
+          "fromEvalJson": {
+            "passRate": 0.227,
+            "citation": 0.705,
+            "tokensPerSecond": 84.048,
+            "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+          },
+          "bytesOnDisk": 1117320768,
+          "passRateMatches": true,
+          "citationMatches": true,
+          "speedMatches": true,
+          "bytesMatchFile": true,
+          "textCarriesNumbers": true,
+          "ok": true
+        },
+        {
+          "id": "qwen3.5-4b",
+          "name": "Qwen3.5-4B",
+          "repo": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "shown": {
+            "passRate": 0.818,
+            "citation": 0.955,
+            "tokensPerSecond": 37.836,
+            "bytes": 2834975040,
+            "unmeasured": ""
+          },
+          "fromEvalJson": {
+            "passRate": 0.818,
+            "citation": 0.955,
+            "tokensPerSecond": 37.836,
+            "file": "Qwen3.5-4B-Q4_K_M.gguf"
+          },
+          "bytesOnDisk": 2834975040,
+          "passRateMatches": true,
+          "citationMatches": true,
+          "speedMatches": true,
+          "bytesMatchFile": true,
+          "textCarriesNumbers": true,
+          "ok": true
+        },
+        {
+          "id": "gemma-4-e4b",
+          "name": "gemma-4-E4B",
+          "repo": "unsloth/gemma-4-E4B-it-GGUF",
+          "shown": {
+            "passRate": 0.841,
+            "citation": 1,
+            "tokensPerSecond": 31.831,
+            "bytes": 4977171584,
+            "unmeasured": ""
+          },
+          "fromEvalJson": {
+            "passRate": 0.841,
+            "citation": 1,
+            "tokensPerSecond": 31.831,
+            "file": "gemma-4-E4B-it-Q4_K_M.gguf"
+          },
+          "bytesOnDisk": 4977171584,
+          "passRateMatches": true,
+          "citationMatches": true,
+          "speedMatches": true,
+          "bytesMatchFile": true,
+          "textCarriesNumbers": true,
+          "ok": true
+        }
+      ]
+    },
+    "panelUnmeasured": {
+      "rows": [
+        {
+          "id": "qwen3.5-2b",
+          "attribute": "",
+          "text": "the recorded run does not report unmeasured answers",
+          "insideCitationCell": true
+        },
+        {
+          "id": "lfm2.5-1.2b",
+          "attribute": "",
+          "text": "the recorded run does not report unmeasured answers",
+          "insideCitationCell": true
+        },
+        {
+          "id": "minicpm5-1b",
+          "attribute": "",
+          "text": "the recorded run does not report unmeasured answers",
+          "insideCitationCell": true
+        },
+        {
+          "id": "qwen2.5-coder-1.5b",
+          "attribute": "",
+          "text": "the recorded run does not report unmeasured answers",
+          "insideCitationCell": true
+        },
+        {
+          "id": "qwen3.5-4b",
+          "attribute": "",
+          "text": "the recorded run does not report unmeasured answers",
+          "insideCitationCell": true
+        },
+        {
+          "id": "gemma-4-e4b",
+          "attribute": "",
+          "text": "the recorded run does not report unmeasured answers",
+          "insideCitationCell": true
+        }
+      ],
+      "note": "Das Attribut ist bei allen sechs leer, und der Satz daneben sagt genau das: verification/w5/eval.json stammt von VOR der Aenderung an der Zitatpruefung und weist die Zahl nicht aus. Eine Null waere hier die Behauptung, es habe keine ungemessene Antwort gegeben."
+    },
+    "freeRepoField": {
+      "typed": "unsloth/Qwen3.5-9B-GGUF:Q4_K_M",
+      "state": {
+        "present": true,
+        "valid": "true",
+        "problem": "",
+        "text": "the shape is right. Whether it exists is decided by huggingface.co, not by this field."
+      },
+      "command": "llm/fetch-model.sh unsloth/Qwen3.5-9B-GGUF:Q4_K_M",
+      "commandText": "llm/fetch-model.sh unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
+    },
+    "copyButton": {
+      "method": "context.grantPermissions([clipboard-read, clipboard-write]) und danach navigator.clipboard.readText() in der Seite gelesen",
+      "clipboard": "llm/fetch-model.sh unsloth/Qwen3.5-9B-GGUF:Q4_K_M",
+      "expected": "llm/fetch-model.sh unsloth/Qwen3.5-9B-GGUF:Q4_K_M",
+      "clipboardMatches": true,
+      "copyFailedShown": false,
+      "visibleCommandText": "llm/fetch-model.sh unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
+    },
+    "honestyText": {
+      "text": "This line goes out to the network: it downloads from huggingface.co and writes the file into the model cache of this project, models/ next to the repository (ATLAS_MODELS_DIR or LLAMA_CACHE move it elsewhere). This application downloads nothing itself. It has no backend, it starts no process and it writes no file; what it can do is hand you the line and read the cache again afterwards.",
+      "parts": [
+        {
+          "part": "a) der Netzzugriff",
+          "pattern": "/goes out to the network/i",
+          "found": true,
+          "at": 10,
+          "excerpt": "goes out to the network"
+        },
+        {
+          "part": "b) das Ziel",
+          "pattern": "/huggingface\\.co/i",
+          "found": true,
+          "at": 53,
+          "excerpt": "huggingface.co"
+        },
+        {
+          "part": "c) wohin geladen wird",
+          "pattern": "/model cache of this project, models\\/ next to the repository \\(ATLAS_MODELS_DIR or LLAMA_CACHE move it elsewhere\\)/i",
+          "found": true,
+          "at": 97,
+          "excerpt": "model cache of this project, models/ next to the repository (ATLAS_MODELS_DIR or LLAMA_CACHE move it elsewhere)"
+        },
+        {
+          "part": "d) die Anwendung laedt selbst nichts",
+          "pattern": "/this application downloads nothing itself/i",
+          "found": true,
+          "at": 210,
+          "excerpt": "This application downloads nothing itself"
+        }
+      ]
+    },
+    "progressElements": {
+      "found": [],
+      "count": 0,
+      "searched": "progress, [role=\"progressbar\"], [aria-valuenow], [class*=\"progress\"], [class*=\"fortschritt\"], [data-testid*=\"progress\"], [data-testid*=\"fortschritt\"], im ganzen Panel",
+      "exempted": {
+        "testid": "atlas-settings-no-progress",
+        "why": "Der Absatz, der SAGT, dass es keinen Balken gibt. Seine Testmarke traegt das Wort, nach dem gesucht wird; ihn mitzuzaehlen hiesse, den Satz gegen sich selbst zu verwenden.",
+        "text": "There is no progress bar here because this window cannot see the download. A bar over a transfer that another process is running would be an animation, not a measurement."
+      }
+    },
+    "focusSymbol": "codeatlasweb-w10.src.services.userService.createUser",
+    "switching": {
+      "modelA": "MiniCPM5-1B-Q4_K_M",
+      "modelB": "LFM2.5-1.2B-Instruct-Q4_K_M",
+      "question": "@createUser explain this function",
+      "turns": [
+        {
+          "selected": "LFM2.5-1.2B-Instruct-Q4_K_M",
+          "selectedInSeam": "LFM2.5-1.2B-Instruct-Q4_K_M",
+          "activeRowInPanel": "LFM2.5-1.2B-Instruct-Q4_K_M",
+          "turnStatus": "answered",
+          "turnAnswerChars": 170,
+          "responses": [
+            {
+              "url": "http://127.0.0.1:4582/v1/chat/completions",
+              "status": 200,
+              "model": "LFM2.5-1.2B-Instruct-Q4_K_M",
+              "finishReason": "stop",
+              "contentChars": 170,
+              "atMs": 55345
+            }
+          ],
+          "modelInResponse": "LFM2.5-1.2B-Instruct-Q4_K_M"
+        },
+        {
+          "selected": "MiniCPM5-1B-Q4_K_M",
+          "selectedInSeam": "MiniCPM5-1B-Q4_K_M",
+          "activeRowInPanel": "MiniCPM5-1B-Q4_K_M",
+          "turnStatus": "answered",
+          "turnAnswerChars": 56,
+          "responses": [
+            {
+              "url": "http://127.0.0.1:4582/v1/chat/completions",
+              "status": 200,
+              "model": "MiniCPM5-1B-Q4_K_M",
+              "finishReason": "stop",
+              "contentChars": 56,
+              "atMs": 62741
+            }
+          ],
+          "modelInResponse": "MiniCPM5-1B-Q4_K_M"
+        }
+      ],
+      "modelNamesInAnswers": [
+        "LFM2.5-1.2B-Instruct-Q4_K_M",
+        "MiniCPM5-1B-Q4_K_M"
+      ],
+      "evidence": "Die Modellnamen stammen aus dem Antwortkoerper der Anfrage, die die ANWENDUNG selbst geschickt hat (page.on(\"response\") auf /v1/chat/completions), nicht aus einer eigenen Abfrage dieses Laufs."
+    },
+    "selectionAcrossReload": {
+      "before": "MiniCPM5-1B-Q4_K_M",
+      "after": "MiniCPM5-1B-Q4_K_M",
+      "storageKey": "atlas-model:codeatlasweb-w10",
+      "storedValue": "{\"id\":\"MiniCPM5-1B-Q4_K_M\"}"
+    },
+    "statusBar": {
+      "chip": {
+        "present": true,
+        "label": "local llm",
+        "text": "local llm ready: MiniCPM5-1B"
+      },
+      "expectedName": "MiniCPM5-1B",
+      "selected": "MiniCPM5-1B-Q4_K_M"
+    },
+    "frameRateAtStart": {
+      "fps": 54.580896686159846,
+      "frames": 28,
+      "windowMs": 513,
+      "samples": 4,
+      "running": true,
+      "sinceLastMs": 0,
+      "staleAfterMs": 1500,
+      "nodes": 76,
+      "edges": 178,
+      "cap": 0,
+      "noiseBand": 59.11663385826772,
+      "recent": [
+        7.8125,
+        45.09803921568628,
+        66.92913385826772,
+        54.580896686159846
+      ]
+    },
+    "sceneRect": {
+      "x": 1241,
+      "y": 714,
+      "width": 439,
+      "height": 245
+    },
+    "twoDimensional": {
+      "method": "Gemessen am gerenderten Bild und nicht am Schalter. Eine orthografische Kamera hat keinen Fluchtpunkt: ein Schwenk verschiebt das ganze Bild um denselben Betrag, die beiden Aufnahmen decken sich also wieder, sobald eine um genau diesen Betrag zurueckgeschoben wird. Eine perspektivische Kamera hat einen: nahe Punkte wandern weiter als ferne, und kein Versatz bringt die Bilder zur Deckung. Der beste Versatz wird ueber die Spaltensummen gesucht und dann am ganzen Bild nachgerechnet; die Zahlen sind mittlere Grauwertunterschiede je Pixel (0 bis 255).",
+      "spatialPan": {
+        "name": "spatial-pan",
+        "button": "right",
+        "dragPx": 120,
+        "idleDrift": 0,
+        "residualAtZero": 14.548,
+        "residualAtBestShift": 5.419,
+        "bestShift": -117,
+        "image": {
+          "width": 439,
+          "height": 245
+        }
+      },
+      "flatPan": {
+        "name": "flat-pan",
+        "button": "right",
+        "dragPx": 120,
+        "idleDrift": 0,
+        "residualAtZero": 32.156,
+        "residualAtBestShift": 0.946,
+        "bestShift": -120,
+        "image": {
+          "width": 439,
+          "height": 245
+        }
+      },
+      "spatialRotate": {
+        "name": "spatial-rotate",
+        "button": "left",
+        "dragPx": 120,
+        "idleDrift": 0,
+        "residualAtZero": 11.206,
+        "residualAtBestShift": 5.479,
+        "bestShift": -219,
+        "image": {
+          "width": 439,
+          "height": 245
+        }
+      },
+      "flatRotate": {
+        "name": "flat-rotate",
+        "button": "left",
+        "dragPx": 120,
+        "idleDrift": 0,
+        "residualAtZero": 0,
+        "residualAtBestShift": 0,
+        "bestShift": 0,
+        "image": {
+          "width": 439,
+          "height": 245
+        }
+      },
+      "rigidity": {
+        "what": "Rest nach dem besten Versatz, geteilt durch den Rest ohne Versatz. Null heisst: der Schwenk hat das Bild genau verschoben und sonst nichts.",
+        "flat": 0.0294,
+        "spatial": 0.3725
+      },
+      "verdicts": {
+        "flatIsRigidUnderPan": true,
+        "spatialIsNotRigidUnderPan": true,
+        "bothPansMovedTheImage": true,
+        "rotationDroppedInFlatView": true
+      },
+      "switchValue": "flat",
+      "seamValue": "flat"
+    },
+    "frameCap": {
+      "claim": "Der gewaehlte Deckel kommt in der Szene an und das Panel nennt zu jeder Wahl eine gemessene Zahl. Dass die Bildrate faellt, ist NICHT behauptet: siehe die Zahlen.",
+      "uncapped": {
+        "fps": 54.58,
+        "cap": 0
+      },
+      "at60": {
+        "fps": 60,
+        "cap": 60
+      },
+      "at30": {
+        "fps": 29.96,
+        "cap": 30
+      },
+      "backToNone": {
+        "fps": 64.83,
+        "cap": 0
+      },
+      "capsArriveInScene": true,
+      "everyChoiceMeasured": true,
+      "measurements": [
+        {
+          "label": "Bildratendeckel 60 (frameCap -> 60)",
+          "verdict": "lower",
+          "before": 67,
+          "after": 60
+        },
+        {
+          "label": "Bildratendeckel 30 (frameCap -> 30)",
+          "verdict": "lower",
+          "before": 60,
+          "after": 30
+        },
+        {
+          "label": "Bildratendeckel aus (frameCap -> 0)",
+          "verdict": "higher",
+          "before": 30,
+          "after": 67
+        }
+      ]
+    },
+    "thriftyProfile": {
+      "expected": {
+        "projection": "flat",
+        "halos": false,
+        "bloom": false,
+        "edges": "dim",
+        "labelDistanceFactor": 1,
+        "frameCap": 30
+      },
+      "afterClick": {
+        "projection": "flat",
+        "halos": false,
+        "bloom": false,
+        "edges": "dim",
+        "labelDistanceFactor": 1,
+        "frameCap": 30,
+        "agents": false,
+        "agentTails": false,
+        "agentTrails": false,
+        "agentWaves": false,
+        "agentTimeline": false
+      },
+      "allSixSetInOneStep": true,
+      "measurement": {
+        "verdict": "lower",
+        "before": 66,
+        "after": 30,
+        "band": 1.3,
+        "text": "before 66 frames/s, after 30 frames/s, past the 1.3 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:33:45.655Z"
+      }
+    },
+    "displayAcrossReload": {
+      "before": {
+        "projection": "flat",
+        "halos": false,
+        "bloom": false,
+        "edges": "dim",
+        "labelDistanceFactor": 1,
+        "frameCap": 30,
+        "agents": false,
+        "agentTails": false,
+        "agentTrails": false,
+        "agentWaves": false,
+        "agentTimeline": false
+      },
+      "after": {
+        "projection": "flat",
+        "halos": false,
+        "bloom": false,
+        "edges": "dim",
+        "labelDistanceFactor": 1,
+        "frameCap": 30,
+        "agents": false,
+        "agentTails": false,
+        "agentTrails": false,
+        "agentWaves": false,
+        "agentTimeline": false
+      },
+      "storageKey": "atlas-display:codeatlasweb-w10",
+      "storedValue": "{\"projection\":\"flat\",\"halos\":false,\"bloom\":false,\"edges\":\"dim\",\"labelDistanceFactor\":1,\"frameCap\":30,\"agents\":false,\"agentTails\":false,\"agentTrails\":false,\"agentWaves\":false,\"agentTimeline\":false}"
+    },
+    "toggleTexts": {
+      "rows": [
+        {
+          "setting": "projection",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.0",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:33:58.113Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:58.113Z"
+        },
+        {
+          "setting": "halos",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.2",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:05.145Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.2 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:05.145Z"
+        },
+        {
+          "setting": "bloom",
+          "verdict": "lower",
+          "before": "30",
+          "after": "30",
+          "band": "0.0",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:12.179Z",
+          "text": "before 30 frames/s, after 30 frames/s, past the 0.0 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:34:12.179Z"
+        },
+        {
+          "setting": "edges",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.3",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:19.211Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:19.211Z"
+        },
+        {
+          "setting": "labels",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.1",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:26.236Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:26.236Z"
+        },
+        {
+          "setting": "frameCap",
+          "verdict": "higher",
+          "before": "30",
+          "after": "65",
+          "band": "0.1",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:35:08.436Z",
+          "text": "before 30 frames/s, after 65 frames/s, past the 0.1 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:35:08.436Z"
+        },
+        {
+          "setting": "agents",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.3",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:33.271Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:33.271Z"
+        },
+        {
+          "setting": "agentTails",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.3",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:40.304Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:40.304Z"
+        },
+        {
+          "setting": "agentTrails",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.1",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:47.338Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:47.338Z"
+        },
+        {
+          "setting": "agentWaves",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.1",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:34:54.370Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:54.370Z"
+        },
+        {
+          "setting": "agentTimeline",
+          "verdict": "no-difference",
+          "before": "30",
+          "after": "30",
+          "band": "0.7",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:35:01.403Z",
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.7 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:35:01.403Z"
+        },
+        {
+          "setting": "thrifty",
+          "verdict": "lower",
+          "before": "67",
+          "after": "30",
+          "band": "3.8",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:35:15.490Z",
+          "text": "before 67 frames/s, after 30 frames/s, past the 3.8 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:35:15.490Z"
+        },
+        {
+          "setting": "default",
+          "verdict": "higher",
+          "before": "30",
+          "after": "67",
+          "band": "0.1",
+          "nodes": "76",
+          "edges": "178",
+          "at": "2026-08-30T17:35:22.523Z",
+          "text": "before 30 frames/s, after 67 frames/s, past the 0.1 frames/s this machine wobbles by on its own.measured on 76 nodes and 178 edges at 2026-08-30T17:35:22.523Z"
+        }
+      ],
+      "rowsWithoutNumbers": [],
+      "promiseWordsWithoutNumber": [],
+      "promiseWordsSearched": [
+        "faster",
+        "quicker",
+        "speeds up",
+        "speed up",
+        "better",
+        "boost",
+        "boosts",
+        "schneller",
+        "besser",
+        "spart",
+        "saves"
+      ],
+      "watchedWordsSearched": [
+        "cheaper",
+        "smoother",
+        "improve",
+        "optimise",
+        "optimize"
+      ],
+      "watchedWordHits": [
+        {
+          "word": "cheaper",
+          "sentence": "Dimming it to nothing would cost the same and only look cheaper.before 30 frames/s, after 30 frames/s.",
+          "hasNumber": true
+        }
+      ],
+      "watchedWordNote": "Diese Woerter tragen die Zusicherung nicht. Sie stehen hier mit ihrem Satz, damit ein Leser des Artefakts selbst sieht, was die Suche gefunden hat und warum es kein Versprechen ist."
+    },
+    "noDifference": {
+      "found": [
+        {
+          "label": "zurueck auf 3D (projection -> spatial)",
+          "before": 64,
+          "after": 67,
+          "band": 3.9,
+          "text": "before 64 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (3.9 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:07.093Z"
+        },
+        {
+          "label": "Leuchthoefe aus (halos -> false)",
+          "before": 67,
+          "after": 66,
+          "band": 2.3,
+          "text": "before 67 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (2.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:14.131Z"
+        },
+        {
+          "label": "Leuchthoefe zurueck (halos -> true)",
+          "before": 67,
+          "after": 65,
+          "band": 2.9,
+          "text": "before 67 frames/s, after 65 frames/s. That is inside the spread this machine shows without any change at all (2.9 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:21.174Z"
+        },
+        {
+          "label": "Bloom aus (bloom -> false)",
+          "before": 66,
+          "after": 67,
+          "band": 3.4,
+          "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (3.4 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:28.212Z"
+        },
+        {
+          "label": "Bloom zurueck (bloom -> true)",
+          "before": 66,
+          "after": 66,
+          "band": 3.9,
+          "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (3.9 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:35.260Z"
+        },
+        {
+          "label": "Kantendichte aus (edges -> off)",
+          "before": 66,
+          "after": 66,
+          "band": 4.1,
+          "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (4.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:42.295Z"
+        },
+        {
+          "label": "Kantendichte zurueck (edges -> full)",
+          "before": 66,
+          "after": 66,
+          "band": 4.7,
+          "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (4.7 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:49.343Z"
+        },
+        {
+          "label": "Beschriftungsentfernung aus (labels -> 1)",
+          "before": 66,
+          "after": 67,
+          "band": 5,
+          "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (5.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:32:56.386Z"
+        },
+        {
+          "label": "Beschriftungsentfernung zurueck (labels -> 0)",
+          "before": 67,
+          "after": 66,
+          "band": 1.3,
+          "text": "before 67 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (1.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:03.428Z"
+        },
+        {
+          "label": "Agentenebene aus (agents -> false)",
+          "before": 66,
+          "after": 66,
+          "band": 2.4,
+          "text": "before 66 frames/s, after 66 frames/s. That is inside the spread this machine shows without any change at all (2.4 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:10.471Z"
+        },
+        {
+          "label": "Agentenebene zurueck (agents -> true)",
+          "before": 66,
+          "after": 67,
+          "band": 4,
+          "text": "before 66 frames/s, after 67 frames/s. That is inside the spread this machine shows without any change at all (4.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:17.513Z"
+        },
+        {
+          "label": "zweite Runde: projection",
+          "before": 30,
+          "after": 30,
+          "band": 0,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.0 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:33:58.113Z"
+        },
+        {
+          "label": "zweite Runde: halos",
+          "before": 30,
+          "after": 30,
+          "band": 0.2,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.2 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:05.145Z"
+        },
+        {
+          "label": "zweite Runde: edges",
+          "before": 30,
+          "after": 30,
+          "band": 0.3,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:19.211Z"
+        },
+        {
+          "label": "zweite Runde: labels",
+          "before": 30,
+          "after": 30,
+          "band": 0.1,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:26.236Z"
+        },
+        {
+          "label": "zweite Runde: agents",
+          "before": 30,
+          "after": 30,
+          "band": 0.3,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:33.271Z"
+        },
+        {
+          "label": "zweite Runde: agentTails",
+          "before": 30,
+          "after": 30,
+          "band": 0.3,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.3 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:40.304Z"
+        },
+        {
+          "label": "zweite Runde: agentTrails",
+          "before": 30,
+          "after": 30,
+          "band": 0.1,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:47.338Z"
+        },
+        {
+          "label": "zweite Runde: agentWaves",
+          "before": 30,
+          "after": 30,
+          "band": 0.1,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.1 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:34:54.370Z"
+        },
+        {
+          "label": "zweite Runde: agentTimeline",
+          "before": 30,
+          "after": 30,
+          "band": 0.7,
+          "text": "before 30 frames/s, after 30 frames/s. That is inside the spread this machine shows without any change at all (0.7 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T17:35:01.403Z"
+        }
+      ],
+      "forced": null
+    },
+    "viewOnlyControls": {
+      "legendToggle": {
+        "present": true,
+        "opens": true,
+        "closesAgain": true
+      },
+      "graphModeChips": [
+        {
+          "mode": "galaxy",
+          "active": "true",
+          "rect": {
+            "width": 52,
+            "height": 22
+          }
+        },
+        {
+          "mode": "hierarchy",
+          "active": "false",
+          "rect": {
+            "width": 72,
+            "height": 22
+          }
+        }
+      ],
+      "edgeKindFilters": {
+        "count": 12,
+        "types": [
+          "DEFINES",
+          "USAGE",
+          "IMPORTS",
+          "CALLS",
+          "CONTAINS_FILE",
+          "CONFIGURES",
+          "CONTAINS_FOLDER",
+          "DEFINES_METHOD",
+          "IMPLEMENTS",
+          "RAISES",
+          "CALL_REFERENCE",
+          "HAS_BRANCH"
+        ]
+      },
+      "twinDetail": {
+        "present": true,
+        "rect": {
+          "width": 244,
+          "height": 16
+        },
+        "value": "2",
+        "name": "Technical"
+      },
+      "note": "Vier Bedienelemente ohne Rechenkosten, einzeln gezaehlt. AC9 verlangt die Buendelung des Teuren und ausdruecklich nicht ein Menue, in dem alles verschwindet."
+    },
+    "apiRoutes": {
+      "/api/layout": 3,
+      "/api/tree": 21
+    },
+    "startScript": {
+      "defaultCall": {
+        "command": "sh llm/start.sh --print-command",
+        "exit": 0,
+        "line": "/Users/bernhard/Desktop/CodeAtlasWeb/vendor/llama/llama-server --host 127.0.0.1 --port 4141 --models-dir /Users/bernhard/Desktop/CodeAtlasWeb/models --models-max 2 --models-autoload -c 3072",
+        "hasModelsDir": true,
+        "hasFixedModel": false
+      },
+      "withArgument": {
+        "command": "sh llm/start.sh --print-command class-a",
+        "exit": 0,
+        "line": "/Users/bernhard/Desktop/CodeAtlasWeb/vendor/llama/llama-server --host 127.0.0.1 --port 4141 -m models/Qwen3.5-2B-Q4_K_M.gguf -c 3072"
+      },
+      "withEnvironment": {
+        "command": "ATLAS_MODEL=models/Qwen3.5-4B-Q4_K_M.gguf sh llm/start.sh --print-command",
+        "exit": 0,
+        "line": "/Users/bernhard/Desktop/CodeAtlasWeb/vendor/llama/llama-server --host 127.0.0.1 --port 4141 -m models/Qwen3.5-4B-Q4_K_M.gguf -c 3072"
+      },
+      "emptyCache": {
+        "command": "ATLAS_MODELS_DIR=/private/tmp/codeatlasweb-w10-empty-rq0wB4 sh llm/start.sh",
+        "exit": 5,
+        "output": "Kein Modell im Cache-Verzeichnis: /private/tmp/codeatlasweb-w10-empty-rq0wB4\nDieses Programm liefert keines mit. So holen Sie eines (geht ins Netz):\n  llm/fetch-model.sh unsloth/Qwen3.5-2B-GGUF\noder direkt:\n  LLAMA_CACHE=\"/private/tmp/codeatlasweb-w10-empty-rq0wB4\" /Users/bernhard/Desktop/CodeAtlasWeb/vendor/llama/llama-server -hf unsloth/Qwen3.5-2B-GGUF:Q4_K_M\nEin anderes Verzeichnis: ATLAS_MODELS_DIR=/pfad/zum/cache llm/start.sh\nDie Vorschlaege mit ihren gemessenen Zahlen stehen im Einstellungen-Panel.",
+        "namesFetchScript": true,
+        "namesHfSwitch": true,
+        "startedNothing": "Der Aufruf endet vor jeder Port- und PID-Pruefung; 4141 wurde nicht angefasst."
+      }
+    },
+    "noWeightsInRepoParts": {
+      "a": {
+        "claim": "git ls-files models/ listet nur models/SHA256SUMS",
+        "tracked": [
+          "models/SHA256SUMS"
+        ],
+        "ok": true
+      },
+      "b": {
+        "claim": "jede models/*.gguf wird von git check-ignore bestaetigt",
+        "checks": [
+          {
+            "file": "models/gemma-4-E4B-it-Q4_K_M.gguf",
+            "exit": 0,
+            "ignored": true,
+            "rule": ".gitignore:23:models/*\tmodels/gemma-4-E4B-it-Q4_K_M.gguf"
+          },
+          {
+            "file": "models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+            "exit": 0,
+            "ignored": true,
+            "rule": ".gitignore:23:models/*\tmodels/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
+          },
+          {
+            "file": "models/MiniCPM5-1B-Q4_K_M.gguf",
+            "exit": 0,
+            "ignored": true,
+            "rule": ".gitignore:23:models/*\tmodels/MiniCPM5-1B-Q4_K_M.gguf"
+          },
+          {
+            "file": "models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+            "exit": 0,
+            "ignored": true,
+            "rule": ".gitignore:23:models/*\tmodels/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+          },
+          {
+            "file": "models/Qwen3.5-2B-Q4_K_M.gguf",
+            "exit": 0,
+            "ignored": true,
+            "rule": ".gitignore:23:models/*\tmodels/Qwen3.5-2B-Q4_K_M.gguf"
+          },
+          {
+            "file": "models/Qwen3.5-4B-Q4_K_M.gguf",
+            "exit": 0,
+            "ignored": true,
+            "rule": ".gitignore:23:models/*\tmodels/Qwen3.5-4B-Q4_K_M.gguf"
+          }
+        ],
+        "ok": true
+      },
+      "c": {
+        "claim": "llm/start.sh hat in seiner Vorgabe keinen Dateinamen",
+        "line": "/Users/bernhard/Desktop/CodeAtlasWeb/vendor/llama/llama-server --host 127.0.0.1 --port 4141 --models-dir /Users/bernhard/Desktop/CodeAtlasWeb/models --models-max 2 --models-autoload -c 3072",
+        "ok": true
+      }
+    },
+    "noWeightsInRepoMethod": "Die sechs Eval-Dateien liegen weiterhin im Arbeitsverzeichnis unter models/, weil tools/eval-check.mjs und die Laeufe w5a, w5b und w6 sie dort erwarten; versioniert ist keine von ihnen. Gemessen sind drei Dinge und nur diese drei: was git in models/ fuehrt, dass jede Gewichtsdatei ignoriert ist, und dass der Aufruf ohne Argument keinen Dateinamen enthaelt. Ueber den Inhalt eines fremden Arbeitsverzeichnisses sagt diese Zahl nichts.",
+    "compilerBundle": {
+      "inputs": 23,
+      "entry": "src/compiler/eval-entry.ts"
+    },
+    "citationCases": {
+      "method": "Die Funktion selbst, im Node-Prozess, ueber dieselbe Bruecke, die auch die Eval benutzt (tools/lib/compiler-bundle.mjs baut src/compiler/eval-entry.ts mit esbuild und importiert sie). Kein Nachbau der Regel, sondern die Regel.",
+      "results": {
+        "multiLineTruncated": {
+          "measured": true,
+          "ok": true,
+          "cited": [
+            "K2"
+          ],
+          "violations": 0
+        },
+        "singleLineTruncated": {
+          "measured": false,
+          "ok": false,
+          "cited": [],
+          "violations": 0
+        },
+        "singleLineComplete": {
+          "measured": true,
+          "ok": true,
+          "cited": [
+            "K2"
+          ],
+          "violations": 0
+        },
+        "singleLineCompleteUncited": {
+          "measured": true,
+          "ok": false,
+          "cited": [],
+          "violations": 1
+        }
+      }
+    },
+    "evalAggregation": {
+      "method": "Die Zeilen der Eval-Rechnung woertlich aus tools/eval-llm.mjs geschnitten und mit echten Pruefergebnissen gefahren. Ein vollstaendiger Eval-Lauf war nicht moeglich: er braucht sechs Modelle und Stunden und wuerde verification/w5/eval.json ueberschreiben, also die Aufzeichnung loeschen, gegen die dieser Lauf die Vorschlaege im Panel haelt. Gedeckt ist damit die Rechnung, nicht ein ganzer Lauf.",
+      "takenFrom": {
+        "file": "tools/eval-llm.mjs",
+        "filterLine": 539,
+        "unmeasuredLine": 540,
+        "rateBlockFromLine": 548,
+        "text": "const measuredResults = results.filter((entry) => entry.citationMeasured === true);\nconst unmeasured = results.length - measuredResults.length;\nreturn { citationCompliance: measuredResults.length === 0\n                    ? 0\n                    : round(\n                        measuredResults.filter((entry) => entry.citationOk).length\n                            / measuredResults.length,\n                    ),\n                citationMeasuredAnswers: measuredResults.length,\n                citationUnmeasured: unmeasured, };"
+      },
+      "input": [
+        {
+          "citationMeasured": true,
+          "citationOk": true
+        },
+        {
+          "citationMeasured": true,
+          "citationOk": false
+        },
+        {
+          "citationMeasured": false,
+          "citationOk": false
+        }
+      ],
+      "produced": {
+        "citationCompliance": 0.5,
+        "citationMeasuredAnswers": 2,
+        "citationUnmeasured": 1
+      },
+      "ifUnmeasuredCountedAsClean": 0.667,
+      "ifUnmeasuredCountedAsViolation": 0.333,
+      "note": "Drei Pruefungen aus der echten Funktion: eine sauber, eine mit Verstoss, eine nicht gemessen. Die Rechnung der Eval liefert 0.5 (eine von zwei gemessenen). Waere die ungemessene als sauber mitgezaehlt, staende 0.667; waere sie als Verstoss mitgezaehlt, staende 0.333."
+    },
+    "routerChildren": [
+      {
+        "pid": 23407,
+        "ports": [
+          49797
+        ]
+      },
+      {
+        "pid": 27831,
+        "ports": [
+          49968
+        ]
+      }
+    ],
+    "routerStop": {
+      "killedHard": []
+    },
+    "withoutRouter": {
+      "port": 4583,
+      "arguments": "-m models/MiniCPM5-1B-Q4_K_M.gguf -c 2048",
+      "panelRouterAttribute": "false",
+      "seamRouter": false,
+      "message": "This sidecar serves one fixed file, so there is nothing to switchIt was started with -m and a path. A sidecar in that shape ignores a different \"model\" field in a request SILENTLY: measured on 2026-08-29 against this build, a request naming another model came back with a normal answer from the loaded one, no error and no warning. A list to click here would therefore do nothing and say nothing about it, which is worse than no list.Start it over your cache directory instead. Then /v1/models lists what lies there, the \"model\" field really chooses, and this block becomes a choice:llm/start.sh",
+      "command": "llm/start.sh",
+      "modelRows": [
+        {
+          "model": "/Users/bernhard/Desktop/CodeAtlasWeb/models/MiniCPM5-1B-Q4_K_M.gguf",
+          "active": "true",
+          "loaded": "true",
+          "selectable": "false",
+          "text": "/Users/bernhard/Desktop/CodeAtlasWeb/models/MiniCPM5-1B-Q4_K_M.ggufanswering now",
+          "pickable": false
+        }
+      ],
+      "clickableModelRows": 0,
+      "state": "ready"
+    },
+    "singleChildren": [],
+    "leftovers": [
+      {
+        "port": 4580,
+        "listeners": 0
+      },
+      {
+        "port": 4581,
+        "listeners": 0
+      },
+      {
+        "port": 4582,
+        "listeners": 0
+      },
+      {
+        "port": 4583,
+        "listeners": 0
+      },
+      {
+        "port": 49797,
+        "listeners": 0
+      },
+      {
+        "port": 49968,
+        "listeners": 0
+      }
+    ],
+    "userPortsUntouched": {
+      "note": "Nur beobachtet. Dieser Lauf hat auf keinem dieser Ports etwas gestartet oder beendet.",
+      "ports": [
+        {
+          "port": 4141,
+          "listeners": 0
+        },
+        {
+          "port": 4390,
+          "listeners": 1
+        },
+        {
+          "port": 4391,
+          "listeners": 1
+        }
+      ]
+    },
+    "modelsAfterRun": {
+      "claim": "Alle sechs Dateien in models/ sind nach dem Lauf noch da. Ein harter Link haelt dieselbe Inode; sein Loeschen nimmt der Datei nur einen Verweis.",
+      "allPresent": true,
+      "files": [
+        {
+          "file": "gemma-4-E4B-it-Q4_K_M.gguf",
+          "bytes": 4977171584,
+          "links": 1,
+          "present": true
+        },
+        {
+          "file": "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+          "bytes": 730895168,
+          "links": 1,
+          "present": true
+        },
+        {
+          "file": "MiniCPM5-1B-Q4_K_M.gguf",
+          "bytes": 688065920,
+          "links": 1,
+          "present": true
+        },
+        {
+          "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+          "bytes": 1117320768,
+          "links": 1,
+          "present": true
+        },
+        {
+          "file": "Qwen3.5-2B-Q4_K_M.gguf",
+          "bytes": 1280835840,
+          "links": 1,
+          "present": true
+        },
+        {
+          "file": "Qwen3.5-4B-Q4_K_M.gguf",
+          "bytes": 2834975040,
+          "links": 1,
+          "present": true
+        }
+      ]
+    }
+  }
+}

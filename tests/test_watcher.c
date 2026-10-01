@@ -174,6 +174,66 @@ TEST(watcher_null_safety) {
     PASS();
 }
 
+TEST(watcher_project_status_tracks_registration) {
+    cbm_watcher_project_status_t status = cbm_watcher_project_status(NULL, "project-a");
+    ASSERT_FALSE(status.registered);
+    ASSERT_FALSE(status.running);
+
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    ASSERT_TRUE(cbm_watcher_watch(w, "project-a", "/unused/project-a"));
+    status = cbm_watcher_project_status(w, "project-a");
+    ASSERT_TRUE(status.registered);
+    ASSERT_FALSE(status.running);
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-b").registered);
+    ASSERT_FALSE(cbm_watcher_project_status(w, NULL).registered);
+
+    cbm_watcher_unwatch(w, "project-a");
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-a").registered);
+    ASSERT_TRUE(cbm_watcher_watch(w, "project-a", "/unused/project-a"));
+    cbm_watcher_stop(w);
+    status = cbm_watcher_project_status(w, "project-a");
+    ASSERT_TRUE(status.registered);
+    ASSERT_FALSE(status.running);
+    ASSERT_EQ(cbm_watcher_run(w, 10), 0);
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-a").running);
+    cbm_watcher_free(w);
+    PASS();
+}
+
+static void *watcher_status_run_thread(void *opaque) {
+    (void)cbm_watcher_run(opaque, 10);
+    return NULL;
+}
+
+TEST(watcher_project_status_tracks_run_loop) {
+    /* An empty watcher executes no Git commands. Once entered, running is a
+     * stable state until this test explicitly stops it, not a timing window. */
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    ASSERT_FALSE(cbm_watcher_project_status(w, NULL).running);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 0, watcher_status_run_thread, w), 0);
+    uint64_t deadline = cbm_now_ms() + 5000;
+    bool running = false;
+    do {
+        running = cbm_watcher_project_status(w, NULL).running;
+        if (!running)
+            cbm_usleep(1000);
+    } while (!running && cbm_now_ms() < deadline);
+
+    cbm_watcher_stop(w);
+    bool running_after_stop = cbm_watcher_project_status(w, NULL).running;
+    int joined = cbm_thread_join(&thread);
+    bool running_after_join = cbm_watcher_project_status(w, NULL).running;
+    cbm_watcher_free(w);
+    ASSERT_TRUE(running);
+    ASSERT_FALSE(running_after_stop);
+    ASSERT_EQ(joined, 0);
+    ASSERT_FALSE(running_after_join);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  POLL WITH REAL GIT REPO
  * ══════════════════════════════════════════════════════════════════ */
@@ -3192,6 +3252,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_replace);
     RUN_TEST(watcher_stopped_rejects_new_registration);
     RUN_TEST(watcher_null_safety);
+    RUN_TEST(watcher_project_status_tracks_registration);
+    RUN_TEST(watcher_project_status_tracks_run_loop);
 
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);

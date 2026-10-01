@@ -1,0 +1,1126 @@
+{
+  "overlayOpensAtDepth0": true,
+  "overlayOpensAtDepth3": true,
+  "overlayNotOccluded": true,
+  "lifelines": 4,
+  "arrowCount": 6,
+  "selfLoopShown": true,
+  "groupedSymbols": 7,
+  "absenceSentences": 4,
+  "stepperSyncsAll": true,
+  "escCloses": true,
+  "darkStyled": true,
+  "honestyParagraphs": 2,
+  "honestyProvenanceKept": true,
+  "indexedDotsVisible": 11,
+  "statusTooltipShown": true,
+  "legendExplainsGoodCase": true,
+  "graphPanelVisibleDuringTour": true,
+  "hierarchyVisibleDuringWalk": true,
+  "panelNeverScrolledAway": true,
+  "graphPanelMinHeight": 280,
+  "hierarchyLabelOverlapsSmallWalk": 0,
+  "hierarchyLabelOverlapsLargeWalk": 0,
+  "hierarchyBloomReduced": true,
+  "legendMaxShare": 0.197,
+  "graphMinShare": 0.6034,
+  "legendDefaultCollapsed": true,
+  "tabsOverflowScrolls": true,
+  "tabsNoWrap": true,
+  "tabsNoOverlap": true,
+  "activeTabInView": true,
+  "tabsOpenedForProof": 11,
+  "port": 4361,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w5c",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "target": "createUser",
+  "walks": {
+    "large": "createUser",
+    "small": "getOrder"
+  },
+  "timings": {
+    "buildMs": 10181,
+    "serverStartMs": 6911,
+    "totalMs": 52373
+  },
+  "generatedAt": "2026-08-29T17:18:00.613Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4360,
+    "panelAtStart": {
+      "present": true,
+      "rect": {
+        "x": 1241,
+        "y": 578.890625,
+        "width": 439,
+        "height": 408.71875
+      },
+      "minHeight": 280,
+      "viewport": {
+        "width": 1680,
+        "height": 1050
+      },
+      "inViewport": true,
+      "mode": "galaxy",
+      "scene": {
+        "x": 1241,
+        "y": 659.46875,
+        "width": 439,
+        "height": 299.546875
+      },
+      "legend": null,
+      "legendToggle": "false",
+      "collapsePresent": true,
+      "twinBodyScrolls": false,
+      "sideOverflow": 0
+    },
+    "dots": {
+      "total": 11,
+      "byState": {
+        "indexed": 11
+      },
+      "titled": 11,
+      "sampleTitle": "indexed: the graph carries this file and no source recorded an issue",
+      "legendGood": {
+        "hasDot": true,
+        "tone": "indexed",
+        "text": "indexed in the graph, no recorded issue"
+      }
+    },
+    "expandRounds": 0,
+    "treeFiles": [
+      "src/repo/db.ts",
+      "src/routes/orders.ts",
+      "src/routes/users.ts",
+      "src/services/orderService.ts",
+      "src/services/userService.ts",
+      "src/util/validate.ts",
+      "src/config.ts",
+      "src/server.ts",
+      "src/types.ts",
+      "test/userService.test.ts",
+      "HERKUNFT.md"
+    ],
+    "tabsViewport": {
+      "width": 960,
+      "height": 1050
+    },
+    "tabs": {
+      "before": {
+        "present": true,
+        "scrollLeft": 0,
+        "scrollWidth": 1433,
+        "clientWidth": 960,
+        "bar": {
+          "x": 0,
+          "y": 42.796875,
+          "width": 960,
+          "height": 30
+        },
+        "tabs": [
+          {
+            "path": "src/repo/db.ts",
+            "active": false,
+            "x": 0,
+            "y": 42.796875,
+            "width": 83.96875,
+            "height": 30
+          },
+          {
+            "path": "src/routes/orders.ts",
+            "active": false,
+            "x": 83.96875,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/routes/users.ts",
+            "active": false,
+            "x": 199.25,
+            "y": 42.796875,
+            "width": 107.453125,
+            "height": 30
+          },
+          {
+            "path": "src/services/orderService.ts",
+            "active": false,
+            "x": 306.703125,
+            "y": 42.796875,
+            "width": 162.234375,
+            "height": 30
+          },
+          {
+            "path": "src/services/userService.ts",
+            "active": false,
+            "x": 468.9375,
+            "y": 42.796875,
+            "width": 154.40625,
+            "height": 30
+          },
+          {
+            "path": "src/util/validate.ts",
+            "active": false,
+            "x": 623.34375,
+            "y": 42.796875,
+            "width": 130.921875,
+            "height": 30
+          },
+          {
+            "path": "src/config.ts",
+            "active": false,
+            "x": 754.265625,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/server.ts",
+            "active": false,
+            "x": 869.546875,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/types.ts",
+            "active": false,
+            "x": 984.828125,
+            "y": 42.796875,
+            "width": 107.453125,
+            "height": 30
+          },
+          {
+            "path": "test/userService.test.ts",
+            "active": false,
+            "x": 1092.28125,
+            "y": 42.796875,
+            "width": 193.546875,
+            "height": 30
+          },
+          {
+            "path": "HERKUNFT.md",
+            "active": true,
+            "x": 1285.828125,
+            "y": 42.796875,
+            "width": 146.75,
+            "height": 30
+          }
+        ],
+        "overflow": [
+          {
+            "side": "left",
+            "on": false
+          },
+          {
+            "side": "right",
+            "on": true
+          }
+        ],
+        "tree": {
+          "x": 0,
+          "y": 73.796875,
+          "width": 260,
+          "height": 913.8125
+        },
+        "twin": {
+          "x": 558,
+          "y": 225.390625,
+          "width": 402,
+          "height": 360
+        }
+      },
+      "afterWheel": {
+        "present": true,
+        "scrollLeft": 260,
+        "scrollWidth": 1433,
+        "clientWidth": 960,
+        "bar": {
+          "x": 0,
+          "y": 42.796875,
+          "width": 960,
+          "height": 30
+        },
+        "tabs": [
+          {
+            "path": "src/repo/db.ts",
+            "active": false,
+            "x": -260,
+            "y": 42.796875,
+            "width": 83.96875,
+            "height": 30
+          },
+          {
+            "path": "src/routes/orders.ts",
+            "active": false,
+            "x": -176.03125,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/routes/users.ts",
+            "active": false,
+            "x": -60.75,
+            "y": 42.796875,
+            "width": 107.453125,
+            "height": 30
+          },
+          {
+            "path": "src/services/orderService.ts",
+            "active": false,
+            "x": 46.703125,
+            "y": 42.796875,
+            "width": 162.234375,
+            "height": 30
+          },
+          {
+            "path": "src/services/userService.ts",
+            "active": false,
+            "x": 208.9375,
+            "y": 42.796875,
+            "width": 154.40625,
+            "height": 30
+          },
+          {
+            "path": "src/util/validate.ts",
+            "active": false,
+            "x": 363.34375,
+            "y": 42.796875,
+            "width": 130.921875,
+            "height": 30
+          },
+          {
+            "path": "src/config.ts",
+            "active": false,
+            "x": 494.265625,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/server.ts",
+            "active": false,
+            "x": 609.546875,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/types.ts",
+            "active": false,
+            "x": 724.828125,
+            "y": 42.796875,
+            "width": 107.453125,
+            "height": 30
+          },
+          {
+            "path": "test/userService.test.ts",
+            "active": false,
+            "x": 832.28125,
+            "y": 42.796875,
+            "width": 193.546875,
+            "height": 30
+          },
+          {
+            "path": "HERKUNFT.md",
+            "active": true,
+            "x": 1025.828125,
+            "y": 42.796875,
+            "width": 146.75,
+            "height": 30
+          }
+        ],
+        "overflow": [
+          {
+            "side": "left",
+            "on": true
+          },
+          {
+            "side": "right",
+            "on": true
+          }
+        ],
+        "tree": {
+          "x": 0,
+          "y": 73.796875,
+          "width": 260,
+          "height": 913.8125
+        },
+        "twin": {
+          "x": 558,
+          "y": 225.390625,
+          "width": 402,
+          "height": 360
+        }
+      },
+      "afterDrag": {
+        "present": true,
+        "scrollLeft": 473,
+        "scrollWidth": 1433,
+        "clientWidth": 960,
+        "bar": {
+          "x": 0,
+          "y": 42.796875,
+          "width": 960,
+          "height": 30
+        },
+        "tabs": [
+          {
+            "path": "src/repo/db.ts",
+            "active": false,
+            "x": -473,
+            "y": 42.796875,
+            "width": 83.96875,
+            "height": 30
+          },
+          {
+            "path": "src/routes/orders.ts",
+            "active": false,
+            "x": -389.03125,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/routes/users.ts",
+            "active": false,
+            "x": -273.75,
+            "y": 42.796875,
+            "width": 107.453125,
+            "height": 30
+          },
+          {
+            "path": "src/services/orderService.ts",
+            "active": false,
+            "x": -166.296875,
+            "y": 42.796875,
+            "width": 162.234375,
+            "height": 30
+          },
+          {
+            "path": "src/services/userService.ts",
+            "active": false,
+            "x": -4.0625,
+            "y": 42.796875,
+            "width": 154.40625,
+            "height": 30
+          },
+          {
+            "path": "src/util/validate.ts",
+            "active": false,
+            "x": 150.34375,
+            "y": 42.796875,
+            "width": 130.921875,
+            "height": 30
+          },
+          {
+            "path": "src/config.ts",
+            "active": false,
+            "x": 281.265625,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/server.ts",
+            "active": false,
+            "x": 396.546875,
+            "y": 42.796875,
+            "width": 115.28125,
+            "height": 30
+          },
+          {
+            "path": "src/types.ts",
+            "active": false,
+            "x": 511.828125,
+            "y": 42.796875,
+            "width": 107.453125,
+            "height": 30
+          },
+          {
+            "path": "test/userService.test.ts",
+            "active": false,
+            "x": 619.28125,
+            "y": 42.796875,
+            "width": 193.546875,
+            "height": 30
+          },
+          {
+            "path": "HERKUNFT.md",
+            "active": true,
+            "x": 812.828125,
+            "y": 42.796875,
+            "width": 146.75,
+            "height": 30
+          }
+        ],
+        "overflow": [
+          {
+            "side": "left",
+            "on": true
+          },
+          {
+            "side": "right",
+            "on": false
+          }
+        ],
+        "tree": {
+          "x": 0,
+          "y": 73.796875,
+          "width": 260,
+          "height": 913.8125
+        },
+        "twin": {
+          "x": 558,
+          "y": 225.390625,
+          "width": 402,
+          "height": 360
+        }
+      }
+    },
+    "tabsActive": {
+      "present": true,
+      "scrollLeft": 0,
+      "scrollWidth": 1433,
+      "clientWidth": 960,
+      "bar": {
+        "x": 0,
+        "y": 42.796875,
+        "width": 960,
+        "height": 30
+      },
+      "tabs": [
+        {
+          "path": "src/repo/db.ts",
+          "active": true,
+          "x": 0,
+          "y": 42.796875,
+          "width": 99.796875,
+          "height": 30
+        },
+        {
+          "path": "src/routes/orders.ts",
+          "active": false,
+          "x": 99.796875,
+          "y": 42.796875,
+          "width": 115.28125,
+          "height": 30
+        },
+        {
+          "path": "src/routes/users.ts",
+          "active": false,
+          "x": 215.078125,
+          "y": 42.796875,
+          "width": 107.453125,
+          "height": 30
+        },
+        {
+          "path": "src/services/orderService.ts",
+          "active": false,
+          "x": 322.53125,
+          "y": 42.796875,
+          "width": 162.234375,
+          "height": 30
+        },
+        {
+          "path": "src/services/userService.ts",
+          "active": false,
+          "x": 484.765625,
+          "y": 42.796875,
+          "width": 154.40625,
+          "height": 30
+        },
+        {
+          "path": "src/util/validate.ts",
+          "active": false,
+          "x": 639.171875,
+          "y": 42.796875,
+          "width": 130.921875,
+          "height": 30
+        },
+        {
+          "path": "src/config.ts",
+          "active": false,
+          "x": 770.09375,
+          "y": 42.796875,
+          "width": 115.28125,
+          "height": 30
+        },
+        {
+          "path": "src/server.ts",
+          "active": false,
+          "x": 885.375,
+          "y": 42.796875,
+          "width": 115.28125,
+          "height": 30
+        },
+        {
+          "path": "src/types.ts",
+          "active": false,
+          "x": 1000.65625,
+          "y": 42.796875,
+          "width": 107.453125,
+          "height": 30
+        },
+        {
+          "path": "test/userService.test.ts",
+          "active": false,
+          "x": 1108.109375,
+          "y": 42.796875,
+          "width": 193.546875,
+          "height": 30
+        },
+        {
+          "path": "HERKUNFT.md",
+          "active": false,
+          "x": 1301.65625,
+          "y": 42.796875,
+          "width": 130.921875,
+          "height": 30
+        }
+      ],
+      "overflow": [
+        {
+          "side": "left",
+          "on": false
+        },
+        {
+          "side": "right",
+          "on": true
+        }
+      ],
+      "tree": {
+        "x": 0,
+        "y": 73.796875,
+        "width": 260,
+        "height": 913.8125
+      },
+      "twin": {
+        "x": 558,
+        "y": 225.390625,
+        "width": 402,
+        "height": 360
+      }
+    },
+    "atDepth0": {
+      "present": true,
+      "title": "Flow from createUser",
+      "esc": "[esc] fold",
+      "closePresent": true,
+      "diagramPresent": true,
+      "lifelines": 4,
+      "participants": [
+        "userService.ts",
+        "db.ts",
+        "types.ts",
+        "validate.ts"
+      ],
+      "arrows": 6,
+      "loops": 1,
+      "groups": [
+        "createUser:",
+        "insert:",
+        "listUsers:",
+        "toUser:",
+        "UserEntity:",
+        "ValidationError:",
+        "validateUser:"
+      ],
+      "absences": [
+        "the index recorded no calls, raised errors or environment reads for insert",
+        "the index recorded no calls, raised errors or environment reads for toUser",
+        "the index recorded no calls, raised errors or environment reads for UserEntity",
+        "the index recorded no calls, raised errors or environment reads for ValidationError",
+        "and 1 more symbol not expanded: the walk stopped at its bound"
+      ],
+      "honesty": [
+        "Neither the picture nor the list shows a call the index did not resolve.",
+        "What those calls reach in turn is one hop further than this box draws."
+      ],
+      "provenance": "The diagram and the list are two readings of one walk: one lifeline per file, one line per call the index reported. Neither shows a call the index did not resolve. Derived from the index and nothing else: every line is a call, a raised error or an environment read that the analysis reported, in the order it reported them. Anything the index did not resolve is absent from this block, not absent from the code. Nobody drew this picture. CodeAtlas laid it out from what the index recorded for this walk, so it can be incomplete about the code and exact about what was reported. The picture shows the calls this symbol makes itself: the walk went 1 hop and kept at most 15 symbols. What those calls reach in turn is one hop further than this box draws.",
+      "generated": "",
+      "steps": 11,
+      "activeStep": -1,
+      "activeArrow": -1,
+      "markedSteps": [],
+      "position": "11 steps",
+      "backgroundColor": "rgb(10, 14, 13)",
+      "luminance": 0.04976470588235294,
+      "hits": [
+        "overlay",
+        "overlay",
+        "overlay",
+        "overlay"
+      ],
+      "hitChains": [
+        {
+          "x": 462,
+          "y": 742,
+          "chain": [
+            "DIV.atlas-flow-legend",
+            "DIV.atlas-flow",
+            "DIV.atlas-flow-overlay-split",
+            "DIV.atlas-flow-overlay",
+            "DIV.atlas-explain-body",
+            "SECTION.atlas-explain"
+          ]
+        },
+        {
+          "x": 1038,
+          "y": 742,
+          "chain": [
+            "H3.atlas-flow-steps-title",
+            "DIV.atlas-flow-steps",
+            "DIV.atlas-flow-overlay-split",
+            "DIV.atlas-flow-overlay",
+            "DIV.atlas-explain-body",
+            "SECTION.atlas-explain"
+          ]
+        },
+        {
+          "x": 462,
+          "y": 926,
+          "chain": [
+            "text.atlas-flow-arrow-label",
+            "g.atlas-flow-arrow",
+            "svg.atlas-flow-svg",
+            "DIV.atlas-flow-box",
+            "DIV.atlas-flow",
+            "DIV.atlas-flow-overlay-split"
+          ]
+        },
+        {
+          "x": 1038,
+          "y": 926,
+          "chain": [
+            "BUTTON.atlas-flow-step-line",
+            "LI.atlas-flow-step",
+            "OL.atlas-flow-step-list",
+            "DIV.atlas-flow-steps",
+            "DIV.atlas-flow-overlay-split",
+            "DIV.atlas-flow-overlay"
+          ]
+        }
+      ],
+      "rect": {
+        "x": 270,
+        "y": 681.203125,
+        "width": 960,
+        "height": 306.40625
+      }
+    },
+    "opened": {
+      "present": true,
+      "title": "Flow from createUser",
+      "esc": "[esc] fold",
+      "closePresent": true,
+      "diagramPresent": true,
+      "lifelines": 4,
+      "participants": [
+        "userService.ts",
+        "db.ts",
+        "types.ts",
+        "validate.ts"
+      ],
+      "arrows": 6,
+      "loops": [
+        {
+          "participant": "validate.ts",
+          "current": false,
+          "text": "may raise ValidationError"
+        }
+      ],
+      "groups": [
+        "createUser:",
+        "insert:",
+        "listUsers:",
+        "toUser:",
+        "UserEntity:",
+        "ValidationError:",
+        "validateUser:"
+      ],
+      "absences": [
+        "the index recorded no calls, raised errors or environment reads for insert",
+        "the index recorded no calls, raised errors or environment reads for toUser",
+        "the index recorded no calls, raised errors or environment reads for UserEntity",
+        "the index recorded no calls, raised errors or environment reads for ValidationError",
+        "and 1 more symbol not expanded: the walk stopped at its bound"
+      ],
+      "honesty": [
+        "Neither the picture nor the list shows a call the index did not resolve.",
+        "What those calls reach in turn is one hop further than this box draws."
+      ],
+      "provenance": "The diagram and the list are two readings of one walk: one lifeline per file, one line per call the index reported. Neither shows a call the index did not resolve. Derived from the index and nothing else: every line is a call, a raised error or an environment read that the analysis reported, in the order it reported them. Anything the index did not resolve is absent from this block, not absent from the code. Nobody drew this picture. CodeAtlas laid it out from what the index recorded for this walk, so it can be incomplete about the code and exact about what was reported. The picture shows the calls this symbol makes itself: the walk went 1 hop and kept at most 15 symbols. What those calls reach in turn is one hop further than this box draws.",
+      "generated": "",
+      "steps": 11,
+      "activeStep": -1,
+      "activeArrow": -1,
+      "markedSteps": [],
+      "position": "11 steps",
+      "backgroundColor": "rgb(10, 14, 13)",
+      "luminance": 0.04976470588235294,
+      "hits": [
+        "overlay",
+        "overlay",
+        "overlay",
+        "overlay"
+      ],
+      "hitChains": [
+        {
+          "x": 462,
+          "y": 742,
+          "chain": [
+            "DIV.atlas-flow-legend",
+            "DIV.atlas-flow",
+            "DIV.atlas-flow-overlay-split",
+            "DIV.atlas-flow-overlay",
+            "DIV.atlas-explain-body",
+            "SECTION.atlas-explain"
+          ]
+        },
+        {
+          "x": 1038,
+          "y": 742,
+          "chain": [
+            "H3.atlas-flow-steps-title",
+            "DIV.atlas-flow-steps",
+            "DIV.atlas-flow-overlay-split",
+            "DIV.atlas-flow-overlay",
+            "DIV.atlas-explain-body",
+            "SECTION.atlas-explain"
+          ]
+        },
+        {
+          "x": 462,
+          "y": 926,
+          "chain": [
+            "text.atlas-flow-arrow-label",
+            "g.atlas-flow-arrow",
+            "svg.atlas-flow-svg",
+            "DIV.atlas-flow-box",
+            "DIV.atlas-flow",
+            "DIV.atlas-flow-overlay-split"
+          ]
+        },
+        {
+          "x": 1038,
+          "y": 926,
+          "chain": [
+            "BUTTON.atlas-flow-step-line",
+            "LI.atlas-flow-step",
+            "OL.atlas-flow-step-list",
+            "DIV.atlas-flow-steps",
+            "DIV.atlas-flow-overlay-split",
+            "DIV.atlas-flow-overlay"
+          ]
+        }
+      ],
+      "rect": {
+        "x": 270,
+        "y": 681.203125,
+        "width": 960,
+        "height": 306.40625
+      }
+    },
+    "honestyProvenance": "The diagram and the list are two readings of one walk: one lifeline per file, one line per call the index reported. Neither shows a call the index did not resolve. Derived from the index and nothing else: every line is a call, a raised error or an environment read that the analysis reported, in the order it reported them. Anything the index did not resolve is absent from this block, not absent from the code. Nobody drew this picture. CodeAtlas laid it out from what the index recorded for this walk, so it can be incomplete about the code and exact about what was reported. The picture shows the calls this symbol makes itself: the walk went 1 hop and kept at most 15 symbols. What those calls reach in turn is one hop further than this box draws.",
+    "stepper": {
+      "beforeStep": {
+        "path": "src/services/userService.ts",
+        "line": 23
+      },
+      "afterFirst": {
+        "path": "src/services/userService.ts",
+        "line": 24
+      },
+      "afterSecond": {
+        "path": "src/services/userService.ts",
+        "line": 27
+      },
+      "first": {
+        "activeArrow": 5,
+        "marked": [
+          0
+        ],
+        "position": "1 of 11"
+      },
+      "second": {
+        "activeArrow": 4,
+        "marked": [
+          1
+        ],
+        "position": "2 of 11"
+      }
+    },
+    "afterEscape": {
+      "present": false
+    },
+    "panelWithLongTwin": {
+      "present": true,
+      "rect": {
+        "x": 1241,
+        "y": 578.890625,
+        "width": 439,
+        "height": 408.71875
+      },
+      "minHeight": 280,
+      "viewport": {
+        "width": 1680,
+        "height": 1050
+      },
+      "inViewport": true,
+      "mode": "galaxy",
+      "scene": {
+        "x": 1241,
+        "y": 659.46875,
+        "width": 439,
+        "height": 328.140625
+      },
+      "legend": null,
+      "legendToggle": "false",
+      "collapsePresent": true,
+      "twinBodyScrolls": true,
+      "sideOverflow": 0
+    },
+    "tour": {
+      "start": {
+        "present": true,
+        "rect": {
+          "x": 1241,
+          "y": 578.890625,
+          "width": 439,
+          "height": 408.71875
+        },
+        "minHeight": 280,
+        "viewport": {
+          "width": 1680,
+          "height": 1050
+        },
+        "inViewport": true,
+        "mode": "galaxy",
+        "scene": {
+          "x": 1241,
+          "y": 659.46875,
+          "width": 439,
+          "height": 328.140625
+        },
+        "legend": null,
+        "legendToggle": "false",
+        "collapsePresent": true,
+        "twinBodyScrolls": false,
+        "sideOverflow": 0
+      },
+      "step2": {
+        "present": true,
+        "rect": {
+          "x": 1241,
+          "y": 578.890625,
+          "width": 439,
+          "height": 408.71875
+        },
+        "minHeight": 280,
+        "viewport": {
+          "width": 1680,
+          "height": 1050
+        },
+        "inViewport": true,
+        "mode": "galaxy",
+        "scene": {
+          "x": 1241,
+          "y": 659.46875,
+          "width": 439,
+          "height": 328.140625
+        },
+        "legend": null,
+        "legendToggle": "false",
+        "collapsePresent": true,
+        "twinBodyScrolls": false,
+        "sideOverflow": 0
+      },
+      "step3": {
+        "present": true,
+        "rect": {
+          "x": 1241,
+          "y": 578.890625,
+          "width": 439,
+          "height": 408.71875
+        },
+        "minHeight": 280,
+        "viewport": {
+          "width": 1680,
+          "height": 1050
+        },
+        "inViewport": true,
+        "mode": "galaxy",
+        "scene": {
+          "x": 1241,
+          "y": 659.46875,
+          "width": 439,
+          "height": 328.140625
+        },
+        "legend": null,
+        "legendToggle": "false",
+        "collapsePresent": true,
+        "twinBodyScrolls": true,
+        "sideOverflow": 0
+      },
+      "targetChanges": [
+        2,
+        3,
+        4
+      ]
+    },
+    "largeWalk": {
+      "nodes": 8,
+      "depth": 3,
+      "labels": 8,
+      "bloom": 0,
+      "boxes": [
+        {
+          "name": "ValidationError",
+          "x": 120,
+          "y": 141.64499893188477,
+          "width": 90.9375,
+          "height": 20.25
+        },
+        {
+          "name": "createUser",
+          "x": 0,
+          "y": 31.405001068115233,
+          "width": 71.0625,
+          "height": 20.25
+        },
+        {
+          "name": "query",
+          "x": 240,
+          "y": 28.045000267028808,
+          "width": 43.125,
+          "height": 20.25
+        },
+        {
+          "name": "listUsers",
+          "x": 120,
+          "y": -8.794998931884766,
+          "width": 58.875,
+          "height": 20.25
+        },
+        {
+          "name": "UserEntity",
+          "x": 120,
+          "y": 206.925,
+          "width": 68.0625,
+          "height": 20.25
+        },
+        {
+          "name": "insert",
+          "x": 120,
+          "y": 57.325,
+          "width": 42.75,
+          "height": 20.25
+        },
+        {
+          "name": "toUser",
+          "x": 120,
+          "y": -86.675,
+          "width": 47.8125,
+          "height": 20.25
+        },
+        {
+          "name": "validateUser",
+          "x": 120,
+          "y": -158.675,
+          "width": 79.125,
+          "height": 20.25
+        }
+      ]
+    },
+    "panelWithLegend": {
+      "present": true,
+      "rect": {
+        "x": 1241,
+        "y": 578.890625,
+        "width": 439,
+        "height": 408.71875
+      },
+      "minHeight": 280,
+      "viewport": {
+        "width": 1680,
+        "height": 1050
+      },
+      "inViewport": true,
+      "mode": "hierarchy",
+      "scene": {
+        "x": 1241,
+        "y": 741,
+        "width": 439,
+        "height": 246.609375
+      },
+      "legend": {
+        "x": 1241,
+        "y": 659.46875,
+        "width": 439,
+        "height": 80.53125
+      },
+      "legendToggle": "true",
+      "collapsePresent": true,
+      "twinBodyScrolls": true,
+      "sideOverflow": 0
+    },
+    "smallWalk": {
+      "nodes": 4,
+      "depth": 3,
+      "labels": 4,
+      "bloom": 0,
+      "boxes": [
+        {
+          "name": "ValidationError",
+          "x": 240,
+          "y": 33.644998931884764,
+          "width": 90.9375,
+          "height": 20.25
+        },
+        {
+          "name": "query",
+          "x": 120,
+          "y": 64.04500026702881,
+          "width": 43.125,
+          "height": 20.25
+        },
+        {
+          "name": "getOrder",
+          "x": 0,
+          "y": 21.325,
+          "width": 60.375,
+          "height": 20.25
+        },
+        {
+          "name": "validateId",
+          "x": 120,
+          "y": -14.675,
+          "width": 64.125,
+          "height": 20.25
+        }
+      ]
+    },
+    "apiRoutes": {
+      "/api/layout": 1,
+      "/api/tree": 7
+    },
+    "rpcTools": {
+      "index_status": 2,
+      "query_graph": 233,
+      "check_index_coverage": 20,
+      "get_code_snippet": 30,
+      "search_graph": 10,
+      "get_architecture": 2
+    }
+  }
+}

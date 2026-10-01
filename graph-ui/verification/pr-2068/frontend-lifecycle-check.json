@@ -1,0 +1,392 @@
+{
+  "captured_at": "2026-09-09T20:06:33.817Z",
+  "scope": "Existing retained 200-row feedback sample plus fresh live browser lifecycle; local developer verification only.",
+  "stored_sample": {
+    "rows": 200,
+    "total_reported": 265,
+    "request_errors": [
+      {
+        "row_id": 1378,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:41:58.569Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/logs?lines=200&min_level=warn war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1379,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:41:59.856Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/rpc get_architecture: Failed to fetch"
+      },
+      {
+        "row_id": 1380,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:01.586Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/logs?lines=200&min_level=warn war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1381,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:42:03.354Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/rpc index_status: Failed to fetch"
+      },
+      {
+        "row_id": 1382,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:03.355Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/tree?project=cbm-pr2068 war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1383,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:42:03.368Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/rpc index_status: Failed to fetch"
+      },
+      {
+        "row_id": 1384,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:42:03.368Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/rpc get_architecture: Failed to fetch"
+      },
+      {
+        "row_id": 1385,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:04.600Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/logs?lines=200&min_level=warn war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1386,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:06.629Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/processes war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1387,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:07.604Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/logs?lines=200&min_level=warn war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1388,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:09.634Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/processes war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1389,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:10.611Z",
+        "received_at": "2026-09-09T19:42:13Z",
+        "session": "69cdae0f",
+        "message": "/api/logs?lines=200&min_level=warn war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1443,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:42:31.180Z",
+        "received_at": "2026-09-09T19:42:32Z",
+        "session": "fccca943",
+        "message": "/api/tree?project=cbm-pr2068&path=.github war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 1444,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:42:31.184Z",
+        "received_at": "2026-09-09T19:42:32Z",
+        "session": "fccca943",
+        "message": "/rpc query_graph: Failed to fetch"
+      },
+      {
+        "row_id": 1849,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:46:44.240Z",
+        "received_at": "2026-09-09T19:46:44Z",
+        "session": "6fba3bfd",
+        "message": "/rpc query_graph: Failed to fetch"
+      },
+      {
+        "row_id": 1850,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:46:44.240Z",
+        "received_at": "2026-09-09T19:46:44Z",
+        "session": "6fba3bfd",
+        "message": "/rpc check_index_coverage: Failed to fetch"
+      },
+      {
+        "row_id": 2036,
+        "source": "api",
+        "recorded_at": "2026-09-09T19:50:27.588Z",
+        "received_at": "2026-09-09T19:50:27Z",
+        "session": "feed9e56",
+        "message": "/api/tree?project=cbm-pr2068&path=.github war nicht erreichbar: Failed to fetch"
+      },
+      {
+        "row_id": 2037,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:50:27.593Z",
+        "received_at": "2026-09-09T19:50:27Z",
+        "session": "feed9e56",
+        "message": "/rpc query_graph: Failed to fetch"
+      },
+      {
+        "row_id": 2038,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:50:27.593Z",
+        "received_at": "2026-09-09T19:50:27Z",
+        "session": "feed9e56",
+        "message": "/rpc check_index_coverage: Failed to fetch"
+      },
+      {
+        "row_id": 2039,
+        "source": "rpc",
+        "recorded_at": "2026-09-09T19:50:27.593Z",
+        "received_at": "2026-09-09T19:50:27Z",
+        "session": "feed9e56",
+        "message": "/rpc query_graph: Failed to fetch"
+      }
+    ],
+    "fixture_errors": [
+      {
+        "id": 1538,
+        "message": "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+      },
+      {
+        "id": 1540,
+        "message": "level=error msg=ui.index.done path=/tmp/cbm-2068-error-fixture rc=err"
+      },
+      {
+        "id": 1608,
+        "message": "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+      },
+      {
+        "id": 1610,
+        "message": "level=error msg=ui.index.done path=/tmp/cbm-2068-error-fixture rc=err"
+      },
+      {
+        "id": 2263,
+        "message": "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+      },
+      {
+        "id": 2265,
+        "message": "level=error msg=ui.index.done path=/tmp/cbm-2068-error-fixture rc=err"
+      },
+      {
+        "id": 2283,
+        "message": "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+      },
+      {
+        "id": 2285,
+        "message": "level=error msg=ui.index.done path=/tmp/cbm-2068-error-fixture rc=err"
+      }
+    ]
+  },
+  "interpretation": [
+    "All sampled API/RPC error entries describe TypeError: Failed to fetch; they are real request failures. The persisted message does not prove whether daemon outage, intentional browser shutdown or another network interruption caused each failure.",
+    "The group recorded 19:41:58\u201319:42:10 and delivered together at 19:42:13 shows the UI buffer retained failures across a period without successful delivery. Root has separate restart/offline test history for correlation; this sample alone does not prove the cause.",
+    "Errors mentioning cbm-2068-error-fixture/unreadable.c belong to explicitly constructed integration-test indexing attempts, not the actual cbm-pr2068 source project.",
+    "Fresh live normal workspace navigation, two reloads and browser close reproduced zero page exceptions, failed requests, HTTP error statuses or outgoing ui-log error entries. Existing THREE.Clock deprecation and headless WebGL ReadPixels warnings remained visible.",
+    "No additional cancellation suppression was introduced: RPC AbortError filtering already exists and passes its test; true Failed to fetch errors remain logged.",
+    "Implemented project ownership at log-record time and request ownership in RPC error reports; tests cover buffered A-to-B change, retry, late A error and explicit daemon-wide entry. This fresh browser run predates embedding that patch."
+  ],
+  "browser": {
+    "at": "2026-09-09T20:06:33.817Z",
+    "url": "http://127.0.0.1:9749/?project=cbm-pr2068&audit=lifecycle",
+    "method": "Fresh real Chromium, initial map, Galaxy/System/Agents/Architect navigation, two real reloads. No mocked/offline requests or daemon stops.",
+    "actions": [
+      {
+        "at": "2026-09-09T20:06:11.145Z",
+        "phase": "tab-galaxy"
+      },
+      {
+        "at": "2026-09-09T20:06:13.260Z",
+        "phase": "tab-system"
+      },
+      {
+        "at": "2026-09-09T20:06:21.572Z",
+        "phase": "tab-agents"
+      },
+      {
+        "at": "2026-09-09T20:06:23.617Z",
+        "phase": "tab-architecture"
+      },
+      {
+        "at": "2026-09-09T20:06:25.650Z",
+        "phase": "reload-1"
+      },
+      {
+        "at": "2026-09-09T20:06:28.735Z",
+        "phase": "reload-2"
+      },
+      {
+        "at": "2026-09-09T20:06:33.782Z",
+        "phase": "browser-close"
+      }
+    ],
+    "events": [
+      {
+        "at": "2026-09-09T20:06:11.295Z",
+        "phase": "tab-galaxy",
+        "type": "console.warning",
+        "message": "THREE.THREE.Clock: This module has been deprecated. Please use THREE.Timer instead."
+      },
+      {
+        "at": "2026-09-09T20:06:11.339Z",
+        "phase": "tab-galaxy",
+        "type": "console.warning",
+        "message": "[.WebGL-0x13c00499c00]GL Driver Message (OpenGL, Performance, GL_CLOSE_PATH_NV, High): GPU stall due to ReadPixels"
+      },
+      {
+        "at": "2026-09-09T20:06:12.517Z",
+        "phase": "tab-galaxy",
+        "type": "console.warning",
+        "message": "[.WebGL-0x13c00499c00]GL Driver Message (OpenGL, Performance, GL_CLOSE_PATH_NV, High): GPU stall due to ReadPixels"
+      },
+      {
+        "at": "2026-09-09T20:06:13.267Z",
+        "phase": "tab-system",
+        "type": "console.warning",
+        "message": "[.WebGL-0x13c00499c00]GL Driver Message (OpenGL, Performance, GL_CLOSE_PATH_NV, High): GPU stall due to ReadPixels"
+      },
+      {
+        "at": "2026-09-09T20:06:13.993Z",
+        "phase": "tab-system",
+        "type": "console.warning",
+        "message": "[.WebGL-0x13c00499c00]GL Driver Message (OpenGL, Performance, GL_CLOSE_PATH_NV, High): GPU stall due to ReadPixels (this message will no longer repeat)"
+      }
+    ],
+    "uiPosts": [
+      {
+        "at": "2026-09-09T20:06:09.435Z",
+        "phase": "initial-load",
+        "payload": {
+          "page": "/?project=cbm-pr2068&audit=lifecycle",
+          "session": "787544df",
+          "entries": [
+            {
+              "ts": "2026-09-09T20:06:07.900Z",
+              "seq": 1,
+              "level": "info",
+              "source": "ui-log",
+              "message": "session 787544df started on /?project=cbm-pr2068&audit=lifecycle",
+              "detail": "build v0.0.1-dirty; Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36",
+              "url": "http://127.0.0.1:9749/?project=cbm-pr2068&audit=lifecycle"
+            }
+          ]
+        }
+      },
+      {
+        "at": "2026-09-09T20:06:11.168Z",
+        "phase": "tab-galaxy",
+        "payload": {
+          "page": "/?project=cbm-pr2068&audit=lifecycle",
+          "session": "787544df",
+          "entries": [
+            {
+              "ts": "2026-09-09T20:06:09.660Z",
+              "seq": 2,
+              "level": "warn",
+              "source": "reader",
+              "message": "The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here."
+            }
+          ]
+        }
+      },
+      {
+        "at": "2026-09-09T20:06:13.269Z",
+        "phase": "tab-system",
+        "payload": {
+          "page": "/?project=cbm-pr2068&audit=lifecycle",
+          "session": "787544df",
+          "entries": [
+            {
+              "ts": "2026-09-09T20:06:11.294Z",
+              "seq": 3,
+              "level": "warn",
+              "source": "console",
+              "message": "THREE.THREE.Clock: This module has been deprecated. Please use THREE.Timer instead."
+            }
+          ]
+        }
+      },
+      {
+        "at": "2026-09-09T20:06:27.235Z",
+        "phase": "reload-1",
+        "payload": {
+          "page": "/?project=cbm-pr2068&audit=lifecycle",
+          "session": "cbbedcaa",
+          "entries": [
+            {
+              "ts": "2026-09-09T20:06:25.733Z",
+              "seq": 1,
+              "level": "info",
+              "source": "ui-log",
+              "message": "session cbbedcaa started on /?project=cbm-pr2068&audit=lifecycle",
+              "detail": "build v0.0.1-dirty; Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36",
+              "url": "http://127.0.0.1:9749/?project=cbm-pr2068&audit=lifecycle"
+            },
+            {
+              "ts": "2026-09-09T20:06:27.120Z",
+              "seq": 2,
+              "level": "warn",
+              "source": "reader",
+              "message": "The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here."
+            }
+          ]
+        }
+      },
+      {
+        "at": "2026-09-09T20:06:30.260Z",
+        "phase": "reload-2",
+        "payload": {
+          "page": "/?project=cbm-pr2068&audit=lifecycle",
+          "session": "e7bc48f7",
+          "entries": [
+            {
+              "ts": "2026-09-09T20:06:28.759Z",
+              "seq": 1,
+              "level": "info",
+              "source": "ui-log",
+              "message": "session e7bc48f7 started on /?project=cbm-pr2068&audit=lifecycle",
+              "detail": "build v0.0.1-dirty; Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/151.0.7922.34 Safari/537.36",
+              "url": "http://127.0.0.1:9749/?project=cbm-pr2068&audit=lifecycle"
+            },
+            {
+              "ts": "2026-09-09T20:06:30.013Z",
+              "seq": 2,
+              "level": "warn",
+              "source": "reader",
+              "message": "The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here."
+            }
+          ]
+        }
+      }
+    ],
+    "bodyExcerpt": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n\u2318 / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n\u2304\n! 28 recorded errors \u00b7 172 recorded warnings\nUpdated 10:06:31 PM\nShow all 200 retained events\nRefresh events\nInspect index coverage\n\nIndex gaps in returned path records: 85 partial / 0 skipped / 196 excluded \u00b7 incomplete lists.\n\n! ERROR ui.index.done 2026-09-09T19:52:00.234Z Event #2285\nlevel=error msg=ui.index.done path=/tmp/cbm-2068-error-fixture rc=err\nFull recorded event\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nREPOSITORY MAP\n\nStart at an entry point, follow a component boundary, then inspect the symbols behind it.\n\nEvidence legend\n1,427 indexed files \u00b7 62,273 retained edges \u00b7 snapshot and limits\nRepository\nWhere to start\n\nEntry candidates identified by the index; these are declarations, not a verified execution order.\n\nRead project README\nApp\nFunction \u00b7 graph-ui/src/App.tsx:750\nmain\nFunction \u00b7 src/main.c:2546\nGalaxyPanel\nFunction \u00b7 graph-ui/src/galaxy/GalaxyPanel.tsx:729\nmain\nFunction \u00b7 graph-ui/tools/smoke-w10.mjs:1187\nConnected areas\n\nGrouped by source location, ranked by recorded links across areas. Open an area to see its responsibilities through entry symbols, interfaces and connections.\n\nSOURCE AREA \u00b7 INFERRED BOUNDARY\ntests\n174 files \u00b7 5 entry candidates \u00b7 9 exported symbols\nIncoming 54 \u2190 \u00b7 \u2192 Outgoing 11557\nmain \u00b7 main \u00b7 main\nSOURCE AREA \u00b7 INFERRED BOUNDARY\ninternal/cbm\n248 files \u00b7 0 entry candidates \u00b7 2268 exported symbols\nIncoming 4553 \u2190 \u00b7 \u2192 Outgoing 1435\ncbm_free_result \u00b7 cbm_node_text \u00b7 cbm_arena_alloc\nSOURCE AREA \u00b7 INFERRED BOUNDARY\nsrc/foundation\n65 files \u00b7 0 entry candidates \u00b7 574 exported symbols\nIncoming 4109 \u2190 \u00b7 \u2192 Outgoing 31\ncbm_mkdtemp \u00b7 cbm_mutex_unlock \u00b7 cbm_mutex_lock\nSOURCE AREA \u00b7 INFERRED BOUNDARY\nsrc/daemon\n24 files \u00b7 0 entry candidates \u00b7 773 exported symbols\nIncoming 1382 \u2190 \u00b7 \u2192 Outgoing 570\ncbm_daemon_ipc_endpoint_free \u00b7 cbm_daemon_ipc_endpoint_new \u00b7 cbm_daemon_ipc_endpoint_runtime_dir\nSOURCE AREA \u00b7 INFERRED BOUNDARY\nsrc/pipeline\n43 files \u00b7 0 entry candidates \u00b7 984 exported symbols\nIncoming 435 \u2190 \u00b7 \u2192 Outgoing 1442\ncbm_project_name_from_path \u00b7 cbm_pipeline_fqn_compute \u00b7 cbm_pipeline_fqn_module\nSOURCE AREA \u00b7 INFERRED BOUNDARY\nsrc/store\n2 files \u00b7 0 entry candidates \u00b7 321 exported symbols\nIncoming 1308 \u2190 \u00b7 \u2192 Outgoing 99\ncbm_sto"
+  },
+  "focused_tests": {
+    "command": "npx vitest run src/app/ui-log.test.ts src/app/ui-log-install.test.ts src/provider/error-observer.test.ts src/provider/rpc-transport.test.ts",
+    "files_passed": 4,
+    "tests_passed": 39
+  }
+}

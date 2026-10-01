@@ -97,6 +97,7 @@ struct cbm_watcher {
     cbm_watcher_project_pruned_fn project_pruned;
     void *mutation_context;
     atomic_int stopped;
+    atomic_bool running;
     /* Deferred-free list: freed after the next poll_once. */
     project_state_t **pending_free;
     int pending_free_count;
@@ -881,7 +882,7 @@ static root_status_t root_status(const char *root_path, int *out_errno) {
  * each call so tests/operators can adjust via setenv without a restart —
  * same convention as cbm_max_file_bytes in limits.c. */
 static long prune_grace_s(void) {
-    const char *raw = getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    const char *raw = cbm_runtime_getenv("CBM_WATCHER_PRUNE_GRACE_S");
     if (raw && raw[0]) {
         errno = 0;
         char *end = NULL;
@@ -982,6 +983,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     cbm_mutex_init(&w->projects_lock);
     cbm_mutex_init(&w->coordination_lock);
     atomic_init(&w->stopped, 0);
+    atomic_init(&w->running, false);
     return w;
 }
 
@@ -1128,6 +1130,21 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
         s->next_poll_ns = 0;
     }
     cbm_mutex_unlock(&w->projects_lock);
+}
+
+cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w,
+                                                       const char *project_name) {
+    cbm_watcher_project_status_t status = {0};
+    if (!w) {
+        return status;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *project = project_name ? cbm_ht_get(w->projects, project_name) : NULL;
+    status.registered = project && atomic_load_explicit(&project->registered, memory_order_acquire);
+    status.running = atomic_load_explicit(&w->running, memory_order_acquire) &&
+                     !atomic_load_explicit(&w->stopped, memory_order_acquire);
+    cbm_mutex_unlock(&w->projects_lock);
+    return status;
 }
 
 int cbm_watcher_watch_count(cbm_watcher_t *w) {
@@ -1545,6 +1562,7 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
         base_interval_ms = POLL_BASE_MS;
     }
 
+    atomic_store_explicit(&w->running, true, memory_order_release);
     cbm_log_info("watcher.start", "interval_ms", base_interval_ms > 999 ? "multi-sec" : "fast");
 
     while (!atomic_load(&w->stopped)) {
@@ -1562,6 +1580,7 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
         }
     }
 
+    atomic_store_explicit(&w->running, false, memory_order_release);
     cbm_log_info("watcher.stop");
     return 0;
 }

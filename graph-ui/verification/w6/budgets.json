@@ -1,0 +1,56 @@
+{
+  "twinWarmP95Ms": 427,
+  "twinWarmSamples": 10,
+  "twinColdMs": 464,
+  "searchOverlayMs": 346,
+  "galaxyLoadMs": 1999,
+  "warmSamples": [
+    {
+      "symbol": "listUsers",
+      "ms": 411
+    },
+    {
+      "symbol": "validateUser",
+      "ms": 331
+    },
+    {
+      "symbol": "getOrder",
+      "ms": 348
+    },
+    {
+      "symbol": "hotspotScan",
+      "ms": 342
+    },
+    {
+      "symbol": "insert",
+      "ms": 337
+    },
+    {
+      "symbol": "query",
+      "ms": 343
+    },
+    {
+      "symbol": "walk",
+      "ms": 328
+    },
+    {
+      "symbol": "registerUserRoutes",
+      "ms": 427
+    },
+    {
+      "symbol": "main",
+      "ms": 345
+    },
+    {
+      "symbol": "createUser",
+      "ms": 419
+    }
+  ],
+  "method": {
+    "warm": "Zehn verschiedene Symbole, nacheinander ueber die Bedeutungssuche geoeffnet. Gemessen vom Klick auf den Treffer bis der Twin das neue Subjekt fertig zeigt (Aufloesung und IR-Bau ueber /rpc, dann das Bild). Das Tippen und die Entprellung davor stehen als searchOverlayMs getrennt. Zehn VERSCHIEDENE Symbole, weil dasselbe zweimal den Cache in src/twin/ir-cache.ts messen wuerde und nicht den Server.",
+    "cold": "Der erste Symbolwechsel nach dem Laden der Seite, gleich gemessen.",
+    "searchOverlay": "Vom ersten Tastendruck bis die Trefferzeile mit diesem Namen im Fenster steht, einschliesslich der Entprellung von 200 ms.",
+    "galaxy": "Vom Aufruf der Adresse bis das Graph-Panel Knoten meldet (Szene im DOM UND __atlasGalaxy.nodes > 0). Enthaelt den Seitenaufbau, weil ein Leser ihn ebenfalls abwartet."
+  },
+  "generatedAt": "2026-08-30T18:50:56.033Z"
+}

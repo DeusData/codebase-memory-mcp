@@ -1,0 +1,2049 @@
+{
+  "fullSuitePass": true,
+  "unitPass": true,
+  "evalCheckPass": true,
+  "allSmokeArtifactsPresent": true,
+  "planReconciliation": [
+    {
+      "phase": "W0",
+      "item": "Projekt-Scaffold",
+      "commit": "8ae29e0",
+      "commitSubject": "W0: Projekt-Scaffold mit Plan, Regeln und Design-Referenz",
+      "evidence": "PLAN.md, design/",
+      "status": "committet"
+    },
+    {
+      "phase": "W0",
+      "item": "Inventar, Asks und Monaco-Spike",
+      "commit": "76d0e33",
+      "commitSubject": "W0: Inventar des PR-1860-Stacks, Upstream-Asks und Monaco-Spike",
+      "evidence": "INVENTAR.md, verification/w0/spike.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W1",
+      "item": "Vite, RPC, IR und Netz-Deny",
+      "commit": "c49cff6",
+      "commitSubject": "W1a: Vite-Geruest, RpcTransport mit Compact-Parser, Semantic-IR-Port, Netz-Deny-Gate",
+      "evidence": "verification/w1/scaffold.json, verification/w1/netdeny.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W1",
+      "item": "Provider live bewiesen",
+      "commit": "85bbb48",
+      "commitSubject": "W1b: Provider-Schicht portiert und live gegen den PR-1860-Server bewiesen",
+      "evidence": "verification/w1/provider.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W2",
+      "item": "Chrome, Explorer und Monaco-Reader",
+      "commit": "0170185",
+      "commitSubject": "W2a: CODEATLAS-Chrome, Explorer-Baum aus dem Graphen, Monaco-Reader ueber Modul-Snippets",
+      "evidence": "verification/w2/reader.json, verification/w2/app-chrome.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W2",
+      "item": "Semantic Twin und Schritt-Badges",
+      "commit": "41afa62",
+      "commitSubject": "W2b: Semantic Twin portiert, Cursor-Pipeline und Schritt-Badges synchron",
+      "evidence": "verification/w2/twin.json, verification/w2/twin.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W3",
+      "item": "Galaxy und Bedeutungssuche",
+      "commit": "d41a206",
+      "commitSubject": "W3: Galaxy-Panel mit Focus-Follow in beide Richtungen, Bedeutungssuche im Command",
+      "evidence": "verification/w3/galaxy.json, verification/w3/search.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W4",
+      "item": "Why, Tour und Entry-Walk",
+      "commit": "6210dbb",
+      "commitSubject": "W4a: Why-Panel, Topsort-Tour, Entry-Point-Vorwaertswalk, stille Checkliste",
+      "evidence": "verification/w4/tours.json, verification/w4/why.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W4",
+      "item": "BUG-Wizard und Blast-Radius",
+      "commit": "a188f44",
+      "commitSubject": "W4b: BUG-Wizard mit echten Traces, Blast-Radius mit portierten Risk-Regeln",
+      "evidence": "verification/w4/bugwizard.json, verification/w4/impact.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W4",
+      "item": "Flow und Pseudocode",
+      "commit": "7ec9c48",
+      "commitSubject": "W4c: Flow-Erklaerer im Twin, Pseudocode-Port, Imports-Gruppe beglichen",
+      "evidence": "verification/w4/flow.json, verification/w4/pseudocode.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W4",
+      "item": "Explorer-Coverage und Legende",
+      "commit": "c3478f3",
+      "commitSubject": "W4d: Explorer aus der Datei-Wahrheit mit Coverage-Join, Galaxy-Legende",
+      "evidence": "verification/w4/coverage.json, verification/w4/explorer-coverage.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W4",
+      "item": "Entry-Hierarchie",
+      "commit": "aa93261",
+      "commitSubject": "W4e: Hierarchie-Ansicht des Entry-Subgraphen im Graph-Panel",
+      "evidence": "verification/w4/hierarchy.json, verification/w4/hierarchy.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W5",
+      "item": "Modell-ADR, Sidecar und Opt-out",
+      "commit": "1e7998e",
+      "commitSubject": "W5a: Modell-ADR, Sidecar-Manager, Opt-out als echter Produktmodus",
+      "evidence": "verification/w5/sidecar.json, verification/w5/sidecar-off.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W5",
+      "item": "Compiler, Chat und Eval",
+      "commit": "ce6b9ce",
+      "commitSubject": "W5b: Context-Compiler, Atlas-Chat mit K-Zitaten, Sechs-Modelle-Eval",
+      "evidence": "verification/w5/chat.json, verification/w5/eval.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W5",
+      "item": "Flow- und Panel-Nacharbeit",
+      "commit": "3d9c270",
+      "commitSubject": "W5c: Nacharbeit aus vier Feedback-Wellen: Flow-Overlay, Status-Punkte, Panel-Permanenz, lesbare Hierarchie, scrollende Tabs",
+      "evidence": "verification/w5/flowfix.json, verification/w5/flow-overlay.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W6",
+      "item": "Air-gap, Budgets, i18n und Fresh Clone",
+      "commit": "2c3562f",
+      "commitSubject": "W6a: Haertung: Gesamtstrecke air-gapped, Budgets, i18n-Katalog, Fresh-Clone, v1.0.0",
+      "evidence": "verification/w6/airgap.json, verification/w6/budgets.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W6",
+      "item": "Demo und unabhaengiges Audit",
+      "commit": "ea52f17",
+      "commitSubject": "W6b: Demo, unabhaengiges Audit mit geschlossenem Finding-Loop, Release v1.0.0",
+      "evidence": "verification/w6/demo/demo.json, verification/w6/audit.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W7a",
+      "item": "Hilfeseite und ehrliche leere Zustaende",
+      "commit": "75c1d7e",
+      "commitSubject": "W7a: keine leeren Versprechen mehr, echte Hilfeseite, Version 0.0.1",
+      "evidence": "verification/w7/help.json, verification/w7/command.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W7b",
+      "item": "Einheitliche Menuezeile und sofortige Suche",
+      "commit": "9b5a2a9",
+      "commitSubject": "W7b: Menuezeile einheitlich, Kuerzel diagnostizierbar, Suche antwortet sofort",
+      "evidence": "verification/w7/menu-uniform.png, verification/w7/search-fast.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W7c",
+      "item": "Reader-nahe Symbolsuche und schliessbares Panel",
+      "commit": "83a8b79",
+      "commitSubject": "W7c: find the symbol the reader meant, and let them close the panel",
+      "evidence": "verification/w7/search.json, verification/w7/chat-answer.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W9",
+      "item": "Kantenarten und lesbare Saetze",
+      "commit": "5a148a6",
+      "commitSubject": "W9: show what kind of edge it is, and stop cutting sentences in half",
+      "evidence": "verification/w9/edges.json, verification/w9/galaxy-edges.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W8",
+      "item": "Draggable Layout-Zonen",
+      "commit": "9f0fb4c",
+      "commitSubject": "W8: zones with draggable borders instead of windows fighting for the same spot",
+      "evidence": "verification/w8/layout.json, verification/w8/layout-default.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W8b",
+      "item": "Lesbare, nicht ueberlagerte Erklaerungen",
+      "commit": "2af1220",
+      "commitSubject": "W8b: say it in words, and stop laying things over the reader",
+      "evidence": "verification/w8b/ux.json, verification/w8b/twin-full.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W8c",
+      "item": "Pseudocode erklaert Auslassungen",
+      "commit": "24ad225",
+      "commitSubject": "W8c: lead with what the code does not say",
+      "evidence": "verification/w8c/pseudocode.json, verification/w8c/pseudocode-long.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W10",
+      "item": "Modellsteuerung mit gemessenen Wirkungen",
+      "commit": "11d205a",
+      "commitSubject": "W10: the model belongs to the reader, and every switch names its measured effect",
+      "evidence": "verification/w10/models.json, verification/w10/settings-switch.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W11a",
+      "item": "Sichtbare Agenten und Messinstrument",
+      "commit": "b0519b9",
+      "commitSubject": "W11a: agents are bodies in the code, and the instrument says what one sees",
+      "evidence": "verification/w11/agents.json, verification/w11/live-agents.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W10b",
+      "item": "Reader- und Hierarchie-Fixes",
+      "commit": "bbe4917",
+      "commitSubject": "W10b: five things that stood in the reader's way",
+      "evidence": "verification/w10b/fixes.json, verification/w10b/handles.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W11b",
+      "item": "Agentenbewegung und Puls",
+      "commit": "f615f27",
+      "commitSubject": "W11b: an agent does not teleport, and its pulse says how hard it works",
+      "evidence": "verification/w11/motion.json, verification/w11/cinema.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W13",
+      "item": "Lesestufen im Reader und Twin",
+      "commit": "81eeff9",
+      "commitSubject": "W13: the slider asks who is reading, not how much",
+      "evidence": "verification/w13/reader.json, verification/w13/level-architect.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W14",
+      "item": "Ehrliche Symbolsaetze je Lesestufe",
+      "commit": "c7127ab",
+      "commitSubject": "W14: every symbol gets an honest sentence",
+      "evidence": "verification/w14/symbols.json, verification/w14/before-levels.json.gz.b64",
+      "status": "committet"
+    },
+    {
+      "phase": "W15",
+      "item": "Expliziter KI-Schalter in drei Bereichen",
+      "commit": "9b3afea",
+      "commitSubject": "W15: one AI switch in every explanation",
+      "evidence": "verification/w15/hybrid.json, verification/w15/twin-ai.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W12a",
+      "item": "Kommandohilfe ueberdeckt keine Controls",
+      "commit": "acd0a3a",
+      "commitSubject": "W12a: command help leaves visible controls alone",
+      "evidence": "verification/w12a/command-overlay.json",
+      "status": "committet"
+    },
+    {
+      "phase": "W12b",
+      "item": "Suchergebniszeilen antworten auf Tastatur",
+      "commit": "c04bcc3",
+      "commitSubject": "W12b: every result row answers the keyboard",
+      "evidence": "verification/w12/states/search.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W12c",
+      "item": "Tour begruendet fehlenden Rueckweg",
+      "commit": "b780c1e",
+      "commitSubject": "W12c: explain why the first step cannot go back",
+      "evidence": "verification/w12/states/walk-running.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W12d",
+      "item": "Settings meldet Kopierstatus synchron",
+      "commit": "8538f48",
+      "commitSubject": "W12d: Settings answers before the clipboard does",
+      "evidence": "verification/w12/states/settings.png",
+      "status": "committet"
+    },
+    {
+      "phase": "W12",
+      "item": "Vollstaendiger Interaktionsbeweis",
+      "commit": "13070a2",
+      "commitSubject": "Complete exhaustive W12 interaction proof",
+      "evidence": "verification/w12/buttons.json, verification/w12/buttons.md",
+      "status": "committet"
+    },
+    {
+      "phase": "Release",
+      "item": "Aktuelles Release-Gate bis W15 und W12",
+      "commit": "1be9292",
+      "commitSubject": "Release: current gate through W15 and W12",
+      "evidence": "tools/release-gate.mjs, package.json, tests/scaffold/release-current.test.mjs",
+      "status": "committet"
+    },
+    {
+      "phase": "Release",
+      "item": "Aktueller Release-Gate-Beweis",
+      "commit": "37686f7",
+      "commitSubject": "Release: record current gate proof",
+      "evidence": "verification/w6/evalcheck.json, verification/w6/release.json",
+      "status": "committet"
+    },
+    {
+      "phase": "Release",
+      "item": "W12, W14, W15 und Proof-Luecken geschlossen",
+      "commit": "b7801f1",
+      "commitSubject": "Release blockers: close W12 W14 W15 and proof gaps",
+      "evidence": "verification/w12/buttons.json, verification/w14/symbols.json, verification/w15/hybrid.json, tests/scaffold/release-proof-binding.test.mjs",
+      "status": "committet"
+    },
+    {
+      "phase": "Audit",
+      "item": "Korrigierten Release-Kandidaten geprueft",
+      "commit": "237f020",
+      "commitSubject": "Audit: verify corrected release candidate",
+      "evidence": "verification/w6/audit.json, verification/w6/audit.md",
+      "status": "committet"
+    }
+  ],
+  "testCountSync": {
+    "scaffoldTests": 213,
+    "scaffoldPass": 213,
+    "scaffoldFail": 0,
+    "unitTests": 2024,
+    "unitFiles": 117,
+    "documentedClaims": [],
+    "skippedProtocolClaims": [
+      {
+        "file": "verification/w6/audit.md",
+        "line": 161,
+        "claimed": 77,
+        "text": "Suite-Zahlen: `node --test tests/scaffold/` im Arbeitsbaum 77 Tests, 73 gruen, 4 rot (ausschliesslich der noch entstehende w6b-Block: demo.webm, audit.json, rel"
+      },
+      {
+        "file": "verification/w6/audit.md",
+        "line": 186,
+        "claimed": 10,
+        "text": "| 10 Scaffold-Tests als Aktenpruefer | accepted | Gegengewichte: gate:release faehrt beide Suiten + eval:check selbst; W6a/W6b fahren die Gesamtstrecke live; di"
+      },
+      {
+        "file": "verification/w6/audit.md",
+        "line": 274,
+        "claimed": 213,
+        "text": "`tests/scaffold/*.test.mjs` und fand 213 Tests; kein Verzeichnis-Aufruf."
+      }
+    ],
+    "protocolPrefix": "verification/",
+    "mismatches": [],
+    "synced": true,
+    "method": "Gemessen aus der TAP-Ausgabe von node --test tests/scaffold/ und aus der Zusammenfassung von vitest, beide in diesem Lauf gefahren. Verglichen wird gegen jede Zahl, die eine verfolgte Markdown-Datei ausserhalb von verification/ unmittelbar vor einem Testwort nennt. Die Zahlen in den datierten Protokollen darunter stehen als skippedProtocolClaims daneben und werden nicht verglichen: sie beschreiben den Stand ihres Tages und behaupten keinen von heute.",
+    "note": "Keine lebende verfolgte Markdown-Datei nennt eine Testzahl. Die gemessenen Zahlen stehen darum hier als einzige Quelle; es gibt keine Angabe, von der sie abweichen koennten. 3 Zahlen stehen in datierten Protokollen unter verification/ und beschreiben ihren eigenen Tag."
+  },
+  "attributionHits": 0,
+  "dashHitsOutsideDocumentedQuotes": 0,
+  "upstreamAsksHandover": true,
+  "cbmPushDisabled": true,
+  "cleanTree": true,
+  "version": "0.0.1",
+  "sourceHead": "237f0201ad0b28ba09f618de1579bd4cf0aaa01f",
+  "generatedProofFiles": [
+    "verification/w6/evalcheck.json",
+    "verification/w6/release.json"
+  ],
+  "evalcheck": {
+    "path": "verification/w6/evalcheck.json",
+    "sha256": "79d899cbe54e3bc21465e84946be979a49ee4dcd523bf059da328edb52115221",
+    "generatedAt": "2026-08-31T13:55:50.886Z"
+  },
+  "versionMatches": true,
+  "missingArtifacts": [],
+  "unlistedArtifacts": [],
+  "artifactsChecked": 226,
+  "planItemsWithoutCommit": [],
+  "commitsWithoutPlanItem": [],
+  "unexpectedDirtyPaths": [],
+  "dirtyPaths": [],
+  "upstream": {
+    "file": "UPSTREAM-ASKS.md",
+    "exists": true,
+    "tracked": true,
+    "stand": "2026-08-28",
+    "asks": 5,
+    "addenda": 3,
+    "lastCommitAt": 1787995494,
+    "inventarCommitAt": 1787972873,
+    "notOlderThanInventarCommitted": true,
+    "workingTreeOverlay": [],
+    "notOlderThanInventar": true,
+    "answeredFrom": "die Commit-Zeiten",
+    "remotes": [
+      "origin\thttps://github.com/BernhardJackiewicz/CodeAtlasWeb.git (fetch)",
+      "origin\thttps://github.com/BernhardJackiewicz/CodeAtlasWeb.git (push)"
+    ],
+    "upstreamRemotes": []
+  },
+  "cbmPush": {
+    "path": "cbm",
+    "expected": "DISABLED-push-tabu",
+    "present": true,
+    "pushUrl": "DISABLED-push-tabu"
+  },
+  "style": {
+    "attributionMatches": [],
+    "attributionPatternMatches": [],
+    "documentedAttributionExceptions": 14,
+    "dashMatches": [],
+    "documentedQuoteExceptions": 1,
+    "namesWatchedCount": 2,
+    "namesWatchedSource": "tools/lib/forbidden-names.mjs",
+    "reportsNotRead": [
+      "verification/w6/stylegate.json",
+      "verification/w6/evalcheck.json",
+      "verification/w6/release.json"
+    ],
+    "textFiles": 491,
+    "binaryFiles": 155
+  },
+  "artifacts": [
+    {
+      "phase": "w0",
+      "path": "verification/w0/spike.json",
+      "exists": true,
+      "bytes": 884
+    },
+    {
+      "phase": "w0",
+      "path": "verification/w0/spike.png",
+      "exists": true,
+      "bytes": 197383
+    },
+    {
+      "phase": "w1",
+      "path": "verification/w1/netdeny.json",
+      "exists": true,
+      "bytes": 349
+    },
+    {
+      "phase": "w1",
+      "path": "verification/w1/provider.json",
+      "exists": true,
+      "bytes": 4100
+    },
+    {
+      "phase": "w1",
+      "path": "verification/w1/scaffold.json",
+      "exists": true,
+      "bytes": 197
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/app-chrome.png",
+      "exists": true,
+      "bytes": 339963
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/netdeny-w2b.json",
+      "exists": true,
+      "bytes": 707
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/netdeny.json",
+      "exists": true,
+      "bytes": 568
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/reader-truncated.png",
+      "exists": true,
+      "bytes": 290220
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/reader.json",
+      "exists": true,
+      "bytes": 6638
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/reader.png",
+      "exists": true,
+      "bytes": 136897
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/twin-dense.png",
+      "exists": true,
+      "bytes": 285787
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/twin.json",
+      "exists": true,
+      "bytes": 4480
+    },
+    {
+      "phase": "w2",
+      "path": "verification/w2/twin.png",
+      "exists": true,
+      "bytes": 292527
+    },
+    {
+      "phase": "w3",
+      "path": "verification/w3/galaxy-focus.png",
+      "exists": true,
+      "bytes": 299899
+    },
+    {
+      "phase": "w3",
+      "path": "verification/w3/galaxy.json",
+      "exists": true,
+      "bytes": 4025
+    },
+    {
+      "phase": "w3",
+      "path": "verification/w3/galaxy.png",
+      "exists": true,
+      "bytes": 255247
+    },
+    {
+      "phase": "w3",
+      "path": "verification/w3/netdeny.json",
+      "exists": true,
+      "bytes": 637
+    },
+    {
+      "phase": "w3",
+      "path": "verification/w3/search.png",
+      "exists": true,
+      "bytes": 201121
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/bugwizard-divergence.png",
+      "exists": true,
+      "bytes": 244515
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/bugwizard-no-traces.png",
+      "exists": true,
+      "bytes": 274278
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/bugwizard.json",
+      "exists": true,
+      "bytes": 9586
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/coverage.json",
+      "exists": true,
+      "bytes": 24827
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/explorer-coverage.png",
+      "exists": true,
+      "bytes": 253268
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/flow.json",
+      "exists": true,
+      "bytes": 10267
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/flow.png",
+      "exists": true,
+      "bytes": 310812
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/hierarchy.json",
+      "exists": true,
+      "bytes": 27229
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/hierarchy.png",
+      "exists": true,
+      "bytes": 281898
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/impact.json",
+      "exists": true,
+      "bytes": 4021
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/impact.png",
+      "exists": true,
+      "bytes": 310902
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/netdeny-w4b.json",
+      "exists": true,
+      "bytes": 777
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/netdeny-w4c.json",
+      "exists": true,
+      "bytes": 847
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/netdeny-w4d.json",
+      "exists": true,
+      "bytes": 638
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/netdeny-w4e.json",
+      "exists": true,
+      "bytes": 568
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/netdeny.json",
+      "exists": true,
+      "bytes": 638
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/pseudocode.png",
+      "exists": true,
+      "bytes": 319197
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/tour.png",
+      "exists": true,
+      "bytes": 271829
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/tours.json",
+      "exists": true,
+      "bytes": 7986
+    },
+    {
+      "phase": "w4",
+      "path": "verification/w4/why.png",
+      "exists": true,
+      "bytes": 194662
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/chat.json",
+      "exists": true,
+      "bytes": 14579
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/chat.png",
+      "exists": true,
+      "bytes": 309538
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/eval.json",
+      "exists": true,
+      "bytes": 246276
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/flow-overlay-depth0.png",
+      "exists": true,
+      "bytes": 321108
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/flow-overlay.png",
+      "exists": true,
+      "bytes": 304809
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/flowfix.json",
+      "exists": true,
+      "bytes": 29225
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/modellrecherche.md",
+      "exists": true,
+      "bytes": 22902
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/models.json",
+      "exists": true,
+      "bytes": 3889
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/netdeny-w5a.json",
+      "exists": true,
+      "bytes": 987
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/netdeny-w5b.json",
+      "exists": true,
+      "bytes": 638
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/netdeny-w5c.json",
+      "exists": true,
+      "bytes": 498
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/sidecar-off.png",
+      "exists": true,
+      "bytes": 261551
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/sidecar-ready.png",
+      "exists": true,
+      "bytes": 239289
+    },
+    {
+      "phase": "w5",
+      "path": "verification/w5/sidecar.json",
+      "exists": true,
+      "bytes": 10787
+    },
+    {
+      "phase": "w6",
+      "path": "verification/w6/airgap.json",
+      "exists": true,
+      "bytes": 45974
+    },
+    {
+      "phase": "w6",
+      "path": "verification/w6/budgets.json",
+      "exists": true,
+      "bytes": 1613
+    },
+    {
+      "phase": "w6",
+      "path": "verification/w6/evalcheck.json",
+      "exists": true,
+      "bytes": 62967
+    },
+    {
+      "phase": "w6",
+      "path": "verification/w6/freshclone.json",
+      "exists": true,
+      "bytes": 8026
+    },
+    {
+      "phase": "w6",
+      "path": "verification/w6/netdeny.json",
+      "exists": true,
+      "bytes": 1554
+    },
+    {
+      "phase": "w6",
+      "path": "verification/w6/stylegate.json",
+      "exists": true,
+      "bytes": 7134
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/01-app-open.png",
+      "exists": true,
+      "bytes": 259309
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/02-explorer-expanded.png",
+      "exists": true,
+      "bytes": 259309
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/03-explorer-coverage-legend.png",
+      "exists": true,
+      "bytes": 259309
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/04-reader-open-file.png",
+      "exists": true,
+      "bytes": 345083
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/05-reader-capped-file.png",
+      "exists": true,
+      "bytes": 339318
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/06-search-overlay.png",
+      "exists": true,
+      "bytes": 200926
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/07-twin-depth-3.png",
+      "exists": true,
+      "bytes": 327519
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/08-twin-evidence.png",
+      "exists": true,
+      "bytes": 314957
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/09-flow-overlay.png",
+      "exists": true,
+      "bytes": 310725
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/10-flow-stepper.png",
+      "exists": true,
+      "bytes": 309650
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/11-pseudocode.png",
+      "exists": true,
+      "bytes": 315784
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/12-search-enter.png",
+      "exists": true,
+      "bytes": 228166
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/13-twin-warm.png",
+      "exists": true,
+      "bytes": 323349
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/14-galaxy-legend.png",
+      "exists": true,
+      "bytes": 331322
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/14b-atlas-row-shortcuts.png",
+      "exists": true,
+      "bytes": 244644
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/15-tour-step-1.png",
+      "exists": true,
+      "bytes": 248731
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/16-tour-step-3.png",
+      "exists": true,
+      "bytes": 274372
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/17-entry-dialog.png",
+      "exists": true,
+      "bytes": 291362
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/18-entry-walk-hierarchy.png",
+      "exists": true,
+      "bytes": 287398
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/18b-tour-diagram.png",
+      "exists": true,
+      "bytes": 304122
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/19-graph-mode-galaxy.png",
+      "exists": true,
+      "bytes": 290309
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/20-bugwizard-no-traces.png",
+      "exists": true,
+      "bytes": 297331
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/21-bugwizard-divergence.png",
+      "exists": true,
+      "bytes": 302324
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/22-impact.png",
+      "exists": true,
+      "bytes": 263017
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/23-sidecar-off.png",
+      "exists": true,
+      "bytes": 215566
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/24-sidecar-ready.png",
+      "exists": true,
+      "bytes": 210182
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/25-chat-answer.png",
+      "exists": true,
+      "bytes": 248205
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/26-chat-citation.png",
+      "exists": true,
+      "bytes": 313959
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/27-chat-cards.png",
+      "exists": true,
+      "bytes": 310179
+    },
+    {
+      "phase": "w6-walk",
+      "path": "verification/w6/walk/28-sidecar-off-again.png",
+      "exists": true,
+      "bytes": 310080
+    },
+    {
+      "phase": "w6-demo",
+      "path": "verification/w6/demo/demo.webm",
+      "exists": true,
+      "bytes": 16919603
+    },
+    {
+      "phase": "w6-demo",
+      "path": "verification/w6/demo/demo.json",
+      "exists": true,
+      "bytes": 6958
+    },
+    {
+      "phase": "w6-audit",
+      "path": "verification/w6/audit.md",
+      "exists": true,
+      "bytes": 37055
+    },
+    {
+      "phase": "w6-audit",
+      "path": "verification/w6/audit.json",
+      "exists": true,
+      "bytes": 12959
+    },
+    {
+      "phase": "w7",
+      "path": "verification/w7/command.png",
+      "exists": true,
+      "bytes": 179014
+    },
+    {
+      "phase": "w7",
+      "path": "verification/w7/help.json",
+      "exists": true,
+      "bytes": 17856
+    },
+    {
+      "phase": "w7",
+      "path": "verification/w7/help.png",
+      "exists": true,
+      "bytes": 366464
+    },
+    {
+      "phase": "w7",
+      "path": "verification/w7/menu.png",
+      "exists": true,
+      "bytes": 259311
+    },
+    {
+      "phase": "w7",
+      "path": "verification/w7/netdeny.json",
+      "exists": true,
+      "bytes": 638
+    },
+    {
+      "phase": "w7",
+      "path": "verification/w7/onechar.png",
+      "exists": true,
+      "bytes": 251118
+    },
+    {
+      "phase": "w7",
+      "path": "verification/w7/promises.json",
+      "exists": true,
+      "bytes": 2994
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/chat-answer.png",
+      "exists": true,
+      "bytes": 326341
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/chat-resized.png",
+      "exists": true,
+      "bytes": 343954
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/chat.json",
+      "exists": true,
+      "bytes": 17057
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/menu-uniform.png",
+      "exists": true,
+      "bytes": 258003
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/netdeny-w7b.json",
+      "exists": true,
+      "bytes": 988
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/netdeny-w7c.json",
+      "exists": true,
+      "bytes": 779
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/search-fast.png",
+      "exists": true,
+      "bytes": 191173
+    },
+    {
+      "phase": "w7-current",
+      "path": "verification/w7/search.json",
+      "exists": true,
+      "bytes": 23700
+    },
+    {
+      "phase": "w8",
+      "path": "verification/w8/layout-custom.png",
+      "exists": true,
+      "bytes": 255529
+    },
+    {
+      "phase": "w8",
+      "path": "verification/w8/layout-default.png",
+      "exists": true,
+      "bytes": 260438
+    },
+    {
+      "phase": "w8",
+      "path": "verification/w8/layout-explain-large.png",
+      "exists": true,
+      "bytes": 298112
+    },
+    {
+      "phase": "w8",
+      "path": "verification/w8/layout.json",
+      "exists": true,
+      "bytes": 36113
+    },
+    {
+      "phase": "w8",
+      "path": "verification/w8/netdeny.json",
+      "exists": true,
+      "bytes": 987
+    },
+    {
+      "phase": "w8b",
+      "path": "verification/w8b/collapse-words.png",
+      "exists": true,
+      "bytes": 216745
+    },
+    {
+      "phase": "w8b",
+      "path": "verification/w8b/flow-short.png",
+      "exists": true,
+      "bytes": 290054
+    },
+    {
+      "phase": "w8b",
+      "path": "verification/w8b/netdeny.json",
+      "exists": true,
+      "bytes": 499
+    },
+    {
+      "phase": "w8b",
+      "path": "verification/w8b/tooltip-open.png",
+      "exists": true,
+      "bytes": 291387
+    },
+    {
+      "phase": "w8b",
+      "path": "verification/w8b/twin-full.png",
+      "exists": true,
+      "bytes": 281717
+    },
+    {
+      "phase": "w8b",
+      "path": "verification/w8b/ux.json",
+      "exists": true,
+      "bytes": 153130
+    },
+    {
+      "phase": "w8c",
+      "path": "verification/w8c/netdeny.json",
+      "exists": true,
+      "bytes": 638
+    },
+    {
+      "phase": "w8c",
+      "path": "verification/w8c/pseudocode-long.png",
+      "exists": true,
+      "bytes": 340700
+    },
+    {
+      "phase": "w8c",
+      "path": "verification/w8c/pseudocode-short.png",
+      "exists": true,
+      "bytes": 305602
+    },
+    {
+      "phase": "w8c",
+      "path": "verification/w8c/pseudocode.json",
+      "exists": true,
+      "bytes": 22625
+    },
+    {
+      "phase": "w9",
+      "path": "verification/w9/edges.json",
+      "exists": true,
+      "bytes": 25718
+    },
+    {
+      "phase": "w9",
+      "path": "verification/w9/galaxy-edges.png",
+      "exists": true,
+      "bytes": 250763
+    },
+    {
+      "phase": "w9",
+      "path": "verification/w9/hierarchy-edges.png",
+      "exists": true,
+      "bytes": 293932
+    },
+    {
+      "phase": "w9",
+      "path": "verification/w9/legend-filter.png",
+      "exists": true,
+      "bytes": 247478
+    },
+    {
+      "phase": "w9",
+      "path": "verification/w9/netdeny-w9.json",
+      "exists": true,
+      "bytes": 497
+    },
+    {
+      "phase": "w10",
+      "path": "verification/w10/models.json",
+      "exists": true,
+      "bytes": 101349
+    },
+    {
+      "phase": "w10",
+      "path": "verification/w10/netdeny.json",
+      "exists": true,
+      "bytes": 1693
+    },
+    {
+      "phase": "w10",
+      "path": "verification/w10/settings-fetch.png",
+      "exists": true,
+      "bytes": 343411
+    },
+    {
+      "phase": "w10",
+      "path": "verification/w10/settings-performance.png",
+      "exists": true,
+      "bytes": 352668
+    },
+    {
+      "phase": "w10",
+      "path": "verification/w10/settings-switch.png",
+      "exists": true,
+      "bytes": 305685
+    },
+    {
+      "phase": "w10",
+      "path": "verification/w10/settings.png",
+      "exists": true,
+      "bytes": 353468
+    },
+    {
+      "phase": "w10b",
+      "path": "verification/w10b/fixes.json",
+      "exists": true,
+      "bytes": 53387
+    },
+    {
+      "phase": "w10b",
+      "path": "verification/w10b/graph-collapsed.png",
+      "exists": true,
+      "bytes": 316980
+    },
+    {
+      "phase": "w10b",
+      "path": "verification/w10b/handles.png",
+      "exists": true,
+      "bytes": 259780
+    },
+    {
+      "phase": "w10b",
+      "path": "verification/w10b/hierarchy-from-focus.png",
+      "exists": true,
+      "bytes": 309064
+    },
+    {
+      "phase": "w10b",
+      "path": "verification/w10b/netdeny.json",
+      "exists": true,
+      "bytes": 640
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/agents.json",
+      "exists": true,
+      "bytes": 77796
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/cinema.png",
+      "exists": true,
+      "bytes": 234314
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/contact-sheet.png",
+      "exists": true,
+      "bytes": 2210996
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/follow.png",
+      "exists": true,
+      "bytes": 249998
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-01.png",
+      "exists": true,
+      "bytes": 53920
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-02.png",
+      "exists": true,
+      "bytes": 54423
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-03.png",
+      "exists": true,
+      "bytes": 53765
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-04.png",
+      "exists": true,
+      "bytes": 54174
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-05.png",
+      "exists": true,
+      "bytes": 54155
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-06.png",
+      "exists": true,
+      "bytes": 54179
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-07.png",
+      "exists": true,
+      "bytes": 54150
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/orbit-08.png",
+      "exists": true,
+      "bytes": 54084
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-01.png",
+      "exists": true,
+      "bytes": 232795
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-02.png",
+      "exists": true,
+      "bytes": 230895
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-03.png",
+      "exists": true,
+      "bytes": 234082
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-04.png",
+      "exists": true,
+      "bytes": 247596
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-05.png",
+      "exists": true,
+      "bytes": 228693
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-06.png",
+      "exists": true,
+      "bytes": 241018
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-07.png",
+      "exists": true,
+      "bytes": 235516
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-08.png",
+      "exists": true,
+      "bytes": 238417
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-09.png",
+      "exists": true,
+      "bytes": 275050
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-10.png",
+      "exists": true,
+      "bytes": 245941
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-11.png",
+      "exists": true,
+      "bytes": 281883
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-12.png",
+      "exists": true,
+      "bytes": 251794
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-13.png",
+      "exists": true,
+      "bytes": 232172
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-14.png",
+      "exists": true,
+      "bytes": 248438
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-15.png",
+      "exists": true,
+      "bytes": 266089
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/frames/step-16.png",
+      "exists": true,
+      "bytes": 240690
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/live-agents-cinema.png",
+      "exists": true,
+      "bytes": 195894
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/live-agents-collapsed.png",
+      "exists": true,
+      "bytes": 329147
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/live-agents-nobridge.png",
+      "exists": true,
+      "bytes": 263043
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/live-agents.png",
+      "exists": true,
+      "bytes": 344992
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/live.webm",
+      "exists": true,
+      "bytes": 4529307
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/motion.json",
+      "exists": true,
+      "bytes": 140491
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/netdeny-w11b.json",
+      "exists": true,
+      "bytes": 2399
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/netdeny.json",
+      "exists": true,
+      "bytes": 992
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/orbit-contact-sheet.png",
+      "exists": true,
+      "bytes": 279809
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/timeline.png",
+      "exists": true,
+      "bytes": 372986
+    },
+    {
+      "phase": "w11",
+      "path": "verification/w11/trails.png",
+      "exists": true,
+      "bytes": 377564
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/buttons.json",
+      "exists": true,
+      "bytes": 2019065
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/buttons.md",
+      "exists": true,
+      "bytes": 51016
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/netdeny.json",
+      "exists": true,
+      "bytes": 2533
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/agents-fullscreen.png",
+      "exists": true,
+      "bytes": 217930
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/agents-live.png",
+      "exists": true,
+      "bytes": 388480
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/entry-dialog.png",
+      "exists": true,
+      "bytes": 282815
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/explain-bug.png",
+      "exists": true,
+      "bytes": 297491
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/explain-change.png",
+      "exists": true,
+      "bytes": 300383
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/explain-chat-idle.png",
+      "exists": true,
+      "bytes": 275257
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/explain-flow.png",
+      "exists": true,
+      "bytes": 296706
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/explain-walk-idle.png",
+      "exists": true,
+      "bytes": 271682
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/file-open.png",
+      "exists": true,
+      "bytes": 355863
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/galaxy-collapsed.png",
+      "exists": true,
+      "bytes": 326318
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/galaxy-legend.png",
+      "exists": true,
+      "bytes": 326578
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/help.png",
+      "exists": true,
+      "bytes": 341053
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/hierarchy.png",
+      "exists": true,
+      "bytes": 318772
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/llm-off.png",
+      "exists": true,
+      "bytes": 314892
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/llm-on.png",
+      "exists": true,
+      "bytes": 311495
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/search.png",
+      "exists": true,
+      "bytes": 259013
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/settings-flat.png",
+      "exists": true,
+      "bytes": 369277
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/settings.png",
+      "exists": true,
+      "bytes": 328258
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/start.png",
+      "exists": true,
+      "bytes": 266884
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/symbol-focus.png",
+      "exists": true,
+      "bytes": 314386
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/twin-pseudocode.png",
+      "exists": true,
+      "bytes": 321291
+    },
+    {
+      "phase": "w12",
+      "path": "verification/w12/states/walk-running.png",
+      "exists": true,
+      "bytes": 276014
+    },
+    {
+      "phase": "w12a",
+      "path": "verification/w12a/command-overlay.json",
+      "exists": true,
+      "bytes": 781
+    },
+    {
+      "phase": "w12a",
+      "path": "verification/w12a/command-overlay.png",
+      "exists": true,
+      "bytes": 216947
+    },
+    {
+      "phase": "w12a",
+      "path": "verification/w12a/netdeny.json",
+      "exists": true,
+      "bytes": 358
+    },
+    {
+      "phase": "w13",
+      "path": "verification/w13/level-architect.png",
+      "exists": true,
+      "bytes": 320955
+    },
+    {
+      "phase": "w13",
+      "path": "verification/w13/level-junior.png",
+      "exists": true,
+      "bytes": 339752
+    },
+    {
+      "phase": "w13",
+      "path": "verification/w13/level-medior.png",
+      "exists": true,
+      "bytes": 309491
+    },
+    {
+      "phase": "w13",
+      "path": "verification/w13/level-senior.png",
+      "exists": true,
+      "bytes": 335688
+    },
+    {
+      "phase": "w13",
+      "path": "verification/w13/level-vibe-coder.png",
+      "exists": true,
+      "bytes": 316148
+    },
+    {
+      "phase": "w13",
+      "path": "verification/w13/netdeny.json",
+      "exists": true,
+      "bytes": 988
+    },
+    {
+      "phase": "w13",
+      "path": "verification/w13/reader.json",
+      "exists": true,
+      "bytes": 60885
+    },
+    {
+      "phase": "w14",
+      "path": "verification/w14/before-levels.json.gz.b64",
+      "exists": true,
+      "bytes": 6885
+    },
+    {
+      "phase": "w14",
+      "path": "verification/w14/flow-empty.png",
+      "exists": true,
+      "bytes": 263061
+    },
+    {
+      "phase": "w14",
+      "path": "verification/w14/leaf-junior.png",
+      "exists": true,
+      "bytes": 301118
+    },
+    {
+      "phase": "w14",
+      "path": "verification/w14/leaf-vibe.png",
+      "exists": true,
+      "bytes": 302615
+    },
+    {
+      "phase": "w14",
+      "path": "verification/w14/menus.png",
+      "exists": true,
+      "bytes": 276691
+    },
+    {
+      "phase": "w14",
+      "path": "verification/w14/netdeny.json",
+      "exists": true,
+      "bytes": 1538
+    },
+    {
+      "phase": "w14",
+      "path": "verification/w14/symbols.json",
+      "exists": true,
+      "bytes": 170688
+    },
+    {
+      "phase": "w15",
+      "path": "verification/w15/chat-ai.png",
+      "exists": true,
+      "bytes": 331651
+    },
+    {
+      "phase": "w15",
+      "path": "verification/w15/chat-off.png",
+      "exists": true,
+      "bytes": 285260
+    },
+    {
+      "phase": "w15",
+      "path": "verification/w15/flow-ai.png",
+      "exists": true,
+      "bytes": 293275
+    },
+    {
+      "phase": "w15",
+      "path": "verification/w15/hybrid.json",
+      "exists": true,
+      "bytes": 15273
+    },
+    {
+      "phase": "w15",
+      "path": "verification/w15/netdeny.json",
+      "exists": true,
+      "bytes": 567
+    },
+    {
+      "phase": "w15",
+      "path": "verification/w15/twin-ai.png",
+      "exists": true,
+      "bytes": 305435
+    }
+  ],
+  "scaffold": {
+    "exit": 0,
+    "ms": 433,
+    "tests": 213,
+    "pass": 213,
+    "fail": 0,
+    "failedTests": [],
+    "out": [
+      "✔ AC4: the hierarchy shows more than calls, and says how much more (0.163209ms)",
+      "✔ AC5/AC6: proof run, readability and wiring (0.365833ms)",
+      "✔ AC6: the ported galaxy files still say where they come from (0.086209ms)",
+      "✔ AC7: one number carries one name (0.855583ms)",
+      "ℹ tests 213",
+      "ℹ suites 0",
+      "ℹ pass 213",
+      "ℹ fail 0",
+      "ℹ cancelled 0",
+      "ℹ skipped 0",
+      "ℹ todo 0",
+      "ℹ duration_ms 294.325625"
+    ]
+  },
+  "note": "Endfassung: jede Zahl in dieser Datei ist in diesem Lauf gemessen.",
+  "generatedAt": "2026-08-31T13:55:56.504Z",
+  "durationMs": 130782,
+  "extras": {
+    "evalCheck": {
+      "exit": 0,
+      "ms": 125153,
+      "out": [
+        "> codeatlasweb@0.0.1 eval:check",
+        "> node tools/eval-check.mjs",
+        "",
+        "[eval-check] Sieger aus eval.json: A=Qwen3.5-2B, B=gemma-4-E4B",
+        "[eval-check] 44 goldene Fragen",
+        "[eval-check] indiziert: codeatlasweb-w6b-evalcheck (76 Knoten, 179 Kanten)",
+        "[eval-check] C-Server auf 4360",
+        "[eval-check] 44 Fakten-Pakete gebaut",
+        "[eval-check] starte Qwen3.5-2B auf 4400 (Kontext 3072)",
+        "[eval-check] Qwen3.5-2B: passRate 0.682 (aufgezeichnet 0.682), Zitattreue 0.932 (aufgezeichnet 0.932), 54 s",
+        "[eval-check] starte gemma-4-E4B auf 4400 (Kontext 8192)",
+        "[eval-check] gemma-4-E4B: passRate 0.841 (aufgezeichnet 0.841), Zitattreue 1 (aufgezeichnet 1), 54 s",
+        "[eval-check] Hinweis: Port 4141 ist fremd belegt (2 Prozesse). Das ist kein Prozessrest dieses Laufs und faerbt ihn nicht.",
+        "[eval-check] geschrieben: /private/tmp/codeatlas-final-gate.pWKSg1/verification/w6/evalcheck.json",
+        "[eval-check] Eval-Regression durch: 2 Sieger, 125 s, keine Prozessreste auf den eigenen Ports (4360, 4400, 4400)."
+      ],
+      "comparisons": [
+        {
+          "modelClass": "A",
+          "name": "Qwen3.5-2B",
+          "recordedPassRate": 0.682,
+          "measuredPassRate": 0.682,
+          "passRateDelta": 0,
+          "improved": false,
+          "recordedCitation": 0.932,
+          "measuredCitation": 0.932,
+          "citationBound": 0.9,
+          "withinTolerance": true,
+          "reasons": []
+        },
+        {
+          "modelClass": "B",
+          "name": "gemma-4-E4B",
+          "recordedPassRate": 0.841,
+          "measuredPassRate": 0.841,
+          "passRateDelta": 0,
+          "improved": false,
+          "recordedCitation": 1,
+          "measuredCitation": 1,
+          "citationBound": 0.9,
+          "withinTolerance": true,
+          "reasons": []
+        }
+      ],
+      "reasons": []
+    },
+    "commitSeries": [
+      {
+        "commit": "8ae29e0",
+        "subject": "W0: Projekt-Scaffold mit Plan, Regeln und Design-Referenz"
+      },
+      {
+        "commit": "76d0e33",
+        "subject": "W0: Inventar des PR-1860-Stacks, Upstream-Asks und Monaco-Spike"
+      },
+      {
+        "commit": "c49cff6",
+        "subject": "W1a: Vite-Geruest, RpcTransport mit Compact-Parser, Semantic-IR-Port, Netz-Deny-Gate"
+      },
+      {
+        "commit": "85bbb48",
+        "subject": "W1b: Provider-Schicht portiert und live gegen den PR-1860-Server bewiesen"
+      },
+      {
+        "commit": "0170185",
+        "subject": "W2a: CODEATLAS-Chrome, Explorer-Baum aus dem Graphen, Monaco-Reader ueber Modul-Snippets"
+      },
+      {
+        "commit": "41afa62",
+        "subject": "W2b: Semantic Twin portiert, Cursor-Pipeline und Schritt-Badges synchron"
+      },
+      {
+        "commit": "d41a206",
+        "subject": "W3: Galaxy-Panel mit Focus-Follow in beide Richtungen, Bedeutungssuche im Command"
+      },
+      {
+        "commit": "6210dbb",
+        "subject": "W4a: Why-Panel, Topsort-Tour, Entry-Point-Vorwaertswalk, stille Checkliste"
+      },
+      {
+        "commit": "a188f44",
+        "subject": "W4b: BUG-Wizard mit echten Traces, Blast-Radius mit portierten Risk-Regeln"
+      },
+      {
+        "commit": "7ec9c48",
+        "subject": "W4c: Flow-Erklaerer im Twin, Pseudocode-Port, Imports-Gruppe beglichen"
+      },
+      {
+        "commit": "c3478f3",
+        "subject": "W4d: Explorer aus der Datei-Wahrheit mit Coverage-Join, Galaxy-Legende"
+      },
+      {
+        "commit": "aa93261",
+        "subject": "W4e: Hierarchie-Ansicht des Entry-Subgraphen im Graph-Panel"
+      },
+      {
+        "commit": "1e7998e",
+        "subject": "W5a: Modell-ADR, Sidecar-Manager, Opt-out als echter Produktmodus"
+      },
+      {
+        "commit": "ce6b9ce",
+        "subject": "W5b: Context-Compiler, Atlas-Chat mit K-Zitaten, Sechs-Modelle-Eval"
+      },
+      {
+        "commit": "3d9c270",
+        "subject": "W5c: Nacharbeit aus vier Feedback-Wellen: Flow-Overlay, Status-Punkte, Panel-Permanenz, lesbare Hierarchie, scrollende Tabs"
+      },
+      {
+        "commit": "2c3562f",
+        "subject": "W6a: Haertung: Gesamtstrecke air-gapped, Budgets, i18n-Katalog, Fresh-Clone, v1.0.0"
+      },
+      {
+        "commit": "ea52f17",
+        "subject": "W6b: Demo, unabhaengiges Audit mit geschlossenem Finding-Loop, Release v1.0.0"
+      },
+      {
+        "commit": "75c1d7e",
+        "subject": "W7a: keine leeren Versprechen mehr, echte Hilfeseite, Version 0.0.1"
+      },
+      {
+        "commit": "9b5a2a9",
+        "subject": "W7b: Menuezeile einheitlich, Kuerzel diagnostizierbar, Suche antwortet sofort"
+      },
+      {
+        "commit": "83a8b79",
+        "subject": "W7c: find the symbol the reader meant, and let them close the panel"
+      },
+      {
+        "commit": "5a148a6",
+        "subject": "W9: show what kind of edge it is, and stop cutting sentences in half"
+      },
+      {
+        "commit": "9f0fb4c",
+        "subject": "W8: zones with draggable borders instead of windows fighting for the same spot"
+      },
+      {
+        "commit": "2af1220",
+        "subject": "W8b: say it in words, and stop laying things over the reader"
+      },
+      {
+        "commit": "24ad225",
+        "subject": "W8c: lead with what the code does not say"
+      },
+      {
+        "commit": "11d205a",
+        "subject": "W10: the model belongs to the reader, and every switch names its measured effect"
+      },
+      {
+        "commit": "b0519b9",
+        "subject": "W11a: agents are bodies in the code, and the instrument says what one sees"
+      },
+      {
+        "commit": "bbe4917",
+        "subject": "W10b: five things that stood in the reader's way"
+      },
+      {
+        "commit": "f615f27",
+        "subject": "W11b: an agent does not teleport, and its pulse says how hard it works"
+      },
+      {
+        "commit": "81eeff9",
+        "subject": "W13: the slider asks who is reading, not how much"
+      },
+      {
+        "commit": "c7127ab",
+        "subject": "W14: every symbol gets an honest sentence"
+      },
+      {
+        "commit": "9b3afea",
+        "subject": "W15: one AI switch in every explanation"
+      },
+      {
+        "commit": "acd0a3a",
+        "subject": "W12a: command help leaves visible controls alone"
+      },
+      {
+        "commit": "c04bcc3",
+        "subject": "W12b: every result row answers the keyboard"
+      },
+      {
+        "commit": "b780c1e",
+        "subject": "W12c: explain why the first step cannot go back"
+      },
+      {
+        "commit": "8538f48",
+        "subject": "W12d: Settings answers before the clipboard does"
+      },
+      {
+        "commit": "13070a2",
+        "subject": "Complete exhaustive W12 interaction proof"
+      },
+      {
+        "commit": "1be9292",
+        "subject": "Release: current gate through W15 and W12"
+      },
+      {
+        "commit": "37686f7",
+        "subject": "Release: record current gate proof"
+      },
+      {
+        "commit": "b7801f1",
+        "subject": "Release blockers: close W12 W14 W15 and proof gaps"
+      },
+      {
+        "commit": "237f020",
+        "subject": "Audit: verify corrected release candidate"
+      }
+    ],
+    "version": {
+      "packageVersion": "0.0.1",
+      "expectedChip": "v0.0.1",
+      "shownChip": "v0.0.1",
+      "measuredIn": "verification/w6/airgap.json",
+      "readError": ""
+    },
+    "unit": {
+      "exit": 0,
+      "ms": 4645,
+      "tests": 2024,
+      "files": 117,
+      "out": [
+        "> codeatlasweb@0.0.1 test:unit",
+        "> vitest run",
+        "",
+        "",
+        " RUN  v4.1.11 /private/tmp/codeatlas-final-gate.pWKSg1",
+        "",
+        "",
+        " Test Files  117 passed (117)",
+        "      Tests  2024 passed (2024)",
+        "   Start at  15:55:51",
+        "   Duration  4.21s (transform 5.10s, setup 0ms, import 9.90s, tests 6.26s, environment 8.15s)"
+      ]
+    }
+  }
+}

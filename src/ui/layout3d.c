@@ -14,6 +14,7 @@
 #include "ui/layout3d.h"
 #include "ui/layout_internal.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 
 #include <yyjson/yyjson.h>
 
@@ -178,7 +179,7 @@ float cbm_layout_rand_float(uint32_t *seed) {
  * (or raises, up to HARD_MAX_NODES) the ceiling for constrained deployments;
  * without it the full hard ceiling is available to explicit requests. */
 static int render_node_limit(void) {
-    const char *raw = getenv("CBM_UI_MAX_RENDER_NODES");
+    const char *raw = cbm_runtime_getenv("CBM_UI_MAX_RENDER_NODES");
     if (!raw || !raw[0]) {
         return HARD_MAX_NODES;
     }

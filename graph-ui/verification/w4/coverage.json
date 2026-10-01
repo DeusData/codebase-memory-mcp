@@ -1,0 +1,782 @@
+{
+  "treeShowsAllDiscovered": true,
+  "states": [
+    "indexed",
+    "not-indexed",
+    "partial"
+  ],
+  "partialOrSkippedVisible": true,
+  "dimmedNotIndexed": true,
+  "legendShown": true,
+  "brokenFileHonest": true,
+  "freshnessNoteWorks": true,
+  "undiscoveredGap": "gitignored file \"ignored-note.ts\" is listed by the server: index_status.not_indexed.files, check_index_coverage.scope(kind=not_indexed_file). check_index_coverage(paths) answers status \"excluded\", freshness \"not_tracked\", recommended_action \"read_source_and_reindex\"; metadata says ignored_files_stored=2, ignored_files_total=2, recording_status \"complete\". The explorer shows it as \"not-indexed\", so a file excluded by .gitignore is NOT an undiscovered gap on this server; the remaining gap is a file the discovery never walked at all, which no source names.",
+  "galaxyLegendToggles": true,
+  "galaxyLegendEntries": 5,
+  "galaxyLegendStatePersists": true,
+  "port": 4321,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w4d",
+  "fixture": "fixtures/atlas-sample (nur gelesen; praepariert wurde eine Scratch-Kopie)",
+  "timings": {
+    "buildMs": 8962,
+    "serverStartMs": 7122,
+    "totalMs": 34308
+  },
+  "generatedAt": "2026-08-28T21:43:16.416Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "measured": {
+      "parsePartial": {
+        "files": [
+          {
+            "path": "src/broken.ts",
+            "error_ranges": "2-12"
+          }
+        ],
+        "count": 1,
+        "truncated": false
+      },
+      "skipped": {
+        "files": [],
+        "count": 0,
+        "truncated": false
+      },
+      "notIndexed": {
+        "dirs": [],
+        "dirs_count": 0,
+        "files": [
+          {
+            "path": "assets/beleg.png",
+            "reason": "ignored-suffix"
+          },
+          {
+            "path": "ignored-note.ts",
+            "reason": "gitignore"
+          }
+        ],
+        "files_count": 2,
+        "truncated": false,
+        "note": "Purposely not indexed — excluded BY DESIGN via gitignore/.cbmignore/skip-lists (see each file's reason). Not an error: change the ignore rules and re-index to include them."
+      },
+      "scopeEntries": [
+        {
+          "path": "assets/beleg.png",
+          "kind": "not_indexed_file",
+          "detail": "ignored-suffix"
+        },
+        {
+          "path": "ignored-note.ts",
+          "kind": "not_indexed_file",
+          "detail": "gitignore"
+        },
+        {
+          "path": "src/broken.ts",
+          "kind": "parse_partial",
+          "detail": "2-12",
+          "ranges": [
+            {
+              "start": 2,
+              "end": 12
+            }
+          ]
+        }
+      ],
+      "scopeMetadata": {
+        "generation": "2026-08-28T21:42:59Z",
+        "index_mode": "full",
+        "recorded_at": "2026-08-28T21:42:59Z",
+        "recording_status": "complete",
+        "ignored_files_stored": 2,
+        "ignored_files_total": 2,
+        "hash_records_complete": true,
+        "coverage_version": 3,
+        "generation_matches": true
+      },
+      "scopePages": 1,
+      "graphFiles": [
+        "HERKUNFT.md",
+        "src/broken.ts",
+        "src/config.ts",
+        "src/repo/db.ts",
+        "src/routes/orders.ts",
+        "src/routes/users.ts",
+        "src/server.ts",
+        "src/services/orderService.ts",
+        "src/services/userService.ts",
+        "src/types.ts",
+        "src/util/validate.ts",
+        "test/userService.test.ts"
+      ],
+      "graphDirs": [
+        "src",
+        "src/repo",
+        "src/routes",
+        "src/services",
+        "src/util",
+        "test"
+      ]
+    },
+    "fixtureCopy": "/private/tmp/codeatlasweb-w4d-fix-U3cwsa/atlas-sample-w4d",
+    "prepared": {
+      "clean": "src/services/userService.ts",
+      "broken": "src/broken.ts",
+      "binary": "assets/beleg.png",
+      "gitignored": "ignored-note.ts",
+      "gitignoreLine": "ignored-note.ts"
+    },
+    "indexed": {
+      "nodes": 79,
+      "edges": 181,
+      "skipped": 0
+    },
+    "serverPort": 4320,
+    "whereIs": {
+      "src/services/userService.ts": [
+        "graph"
+      ],
+      "src/broken.ts": [
+        "graph",
+        "index_status.parse_partial",
+        "check_index_coverage.scope(kind=parse_partial)"
+      ],
+      "assets/beleg.png": [
+        "index_status.not_indexed.files",
+        "check_index_coverage.scope(kind=not_indexed_file)"
+      ],
+      "ignored-note.ts": [
+        "index_status.not_indexed.files",
+        "check_index_coverage.scope(kind=not_indexed_file)"
+      ]
+    },
+    "ignoredPathAnswer": {
+      "requested_path": "ignored-note.ts",
+      "path": "ignored-note.ts",
+      "status": "excluded",
+      "freshness": "not_tracked",
+      "recommended_action": "read_source_and_reindex",
+      "coverage": [
+        {
+          "path": "ignored-note.ts",
+          "kind": "not_indexed_file",
+          "detail": "gitignore",
+          "match": "exact"
+        }
+      ]
+    },
+    "ignoredMetadata": {
+      "ignored_files_stored": 2,
+      "ignored_files_total": 2,
+      "recording_status": "complete",
+      "generation_matches": true
+    },
+    "expandRounds": 2,
+    "tree": {
+      "rows": [
+        {
+          "path": "assets",
+          "kind": "dir",
+          "coverage": "not-indexed",
+          "expanded": "true",
+          "title": "worst stage below this folder: not indexed (excluded by design (gitignore/.cbmignore), with the rule as the reason)",
+          "mark": "●",
+          "markColor": "rgb(255, 95, 143)",
+          "opacity": 1,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "assets/beleg.png",
+          "kind": "file",
+          "coverage": "not-indexed",
+          "expanded": null,
+          "title": "not indexed by design: ignored-suffix. Change the ignore rules and re-index to include it.",
+          "mark": "-",
+          "markColor": "rgb(125, 154, 142)",
+          "opacity": 0.55,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "src",
+          "kind": "dir",
+          "coverage": "partial",
+          "expanded": "true",
+          "title": "worst stage below this folder: partially parsed (indexed, but constructs in the listed line ranges may be missing)",
+          "mark": "●",
+          "markColor": "rgb(255, 95, 143)",
+          "opacity": 1,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "src/repo",
+          "kind": "dir",
+          "coverage": "indexed",
+          "expanded": "true",
+          "title": "every file below it is in the graph without a recorded issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "src/repo/db.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/routes",
+          "kind": "dir",
+          "coverage": "indexed",
+          "expanded": "true",
+          "title": "every file below it is in the graph without a recorded issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "src/routes/orders.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/routes/users.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/services",
+          "kind": "dir",
+          "coverage": "indexed",
+          "expanded": "true",
+          "title": "every file below it is in the graph without a recorded issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "src/services/orderService.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/services/userService.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/util",
+          "kind": "dir",
+          "coverage": "indexed",
+          "expanded": "true",
+          "title": "every file below it is in the graph without a recorded issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "src/util/validate.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/broken.ts",
+          "kind": "file",
+          "coverage": "partial",
+          "expanded": null,
+          "title": "partially parsed: constructs inside lines 2-12 may be missing from the graph",
+          "mark": "!",
+          "markColor": "rgb(255, 95, 143)",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/config.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/server.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "src/types.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "test",
+          "kind": "dir",
+          "coverage": "indexed",
+          "expanded": "true",
+          "title": "every file below it is in the graph without a recorded issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(125, 154, 142)"
+        },
+        {
+          "path": "test/userService.test.ts",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "HERKUNFT.md",
+          "kind": "file",
+          "coverage": "indexed",
+          "expanded": null,
+          "title": "indexed: the graph carries this file and no source recorded an issue",
+          "mark": "",
+          "markColor": "",
+          "opacity": 1,
+          "color": "rgb(195, 212, 205)"
+        },
+        {
+          "path": "ignored-note.ts",
+          "kind": "file",
+          "coverage": "not-indexed",
+          "expanded": null,
+          "title": "not indexed by design: gitignore. Change the ignore rules and re-index to include it.",
+          "mark": "-",
+          "markColor": "rgb(125, 154, 142)",
+          "opacity": 0.55,
+          "color": "rgb(125, 154, 142)"
+        }
+      ],
+      "legend": {
+        "present": true,
+        "entries": [
+          "indexed in the graph, no recorded issue",
+          "!partially parsed indexed, but constructs in the listed line ranges may be missing",
+          "-not indexed excluded by design (gitignore/.cbmignore), with the rule as the reason",
+          "●folder the worst stage of anything below it"
+        ],
+        "source": "files as the index discovery saw them; files it never met are invisible until the server lists directories"
+      },
+      "truncationLines": [],
+      "note": "19 files, 74 symbols from /api/tree; 1 index entry names no path and is not shown; 1 partial, 0 skipped, 2 files and 0 folders not indexed, 3 coverage entries joined in"
+    },
+    "seam": {
+      "rows": 21,
+      "records": [
+        {
+          "path": "src/broken.ts",
+          "kind": "file",
+          "state": "partial",
+          "reason": "2-12",
+          "sources": [
+            "index_status.parse_partial",
+            "check_index_coverage.scope:."
+          ]
+        },
+        {
+          "path": "assets/beleg.png",
+          "kind": "file",
+          "state": "not-indexed",
+          "reason": "ignored-suffix",
+          "sources": [
+            "index_status.not_indexed.files",
+            "check_index_coverage.scope:."
+          ]
+        },
+        {
+          "path": "ignored-note.ts",
+          "kind": "file",
+          "state": "not-indexed",
+          "reason": "gitignore",
+          "sources": [
+            "index_status.not_indexed.files",
+            "check_index_coverage.scope:."
+          ]
+        }
+      ],
+      "truncations": [],
+      "counts": {
+        "partial": 1,
+        "skipped": 0,
+        "notIndexedDirs": 0,
+        "notIndexedFiles": 2,
+        "scopeEntries": 3
+      },
+      "metadata": {
+        "generation": "2026-08-28T21:42:59Z",
+        "indexMode": "full",
+        "recordedAt": "2026-08-28T21:42:59Z",
+        "recordingStatus": "complete",
+        "ignoredFilesStored": 2,
+        "ignoredFilesTotal": 2,
+        "hashRecordsComplete": true,
+        "coverageVersion": 3,
+        "generationMatches": true
+      },
+      "error": ""
+    },
+    "seamRecords": [
+      {
+        "path": "src/broken.ts",
+        "kind": "file",
+        "state": "partial",
+        "reason": "2-12",
+        "sources": [
+          "index_status.parse_partial",
+          "check_index_coverage.scope:."
+        ]
+      },
+      {
+        "path": "assets/beleg.png",
+        "kind": "file",
+        "state": "not-indexed",
+        "reason": "ignored-suffix",
+        "sources": [
+          "index_status.not_indexed.files",
+          "check_index_coverage.scope:."
+        ]
+      },
+      {
+        "path": "ignored-note.ts",
+        "kind": "file",
+        "state": "not-indexed",
+        "reason": "gitignore",
+        "sources": [
+          "index_status.not_indexed.files",
+          "check_index_coverage.scope:."
+        ]
+      }
+    ],
+    "missingFromTree": [],
+    "rows": {
+      "broken": {
+        "path": "src/broken.ts",
+        "kind": "file",
+        "coverage": "partial",
+        "expanded": null,
+        "title": "partially parsed: constructs inside lines 2-12 may be missing from the graph",
+        "mark": "!",
+        "markColor": "rgb(255, 95, 143)",
+        "opacity": 1,
+        "color": "rgb(195, 212, 205)"
+      },
+      "binary": {
+        "path": "assets/beleg.png",
+        "kind": "file",
+        "coverage": "not-indexed",
+        "expanded": null,
+        "title": "not indexed by design: ignored-suffix. Change the ignore rules and re-index to include it.",
+        "mark": "-",
+        "markColor": "rgb(125, 154, 142)",
+        "opacity": 0.55,
+        "color": "rgb(125, 154, 142)"
+      },
+      "ignored": {
+        "path": "ignored-note.ts",
+        "kind": "file",
+        "coverage": "not-indexed",
+        "expanded": null,
+        "title": "not indexed by design: gitignore. Change the ignore rules and re-index to include it.",
+        "mark": "-",
+        "markColor": "rgb(125, 154, 142)",
+        "opacity": 0.55,
+        "color": "rgb(125, 154, 142)"
+      }
+    },
+    "dimmed": [
+      {
+        "path": "assets/beleg.png",
+        "coverage": "not-indexed",
+        "opacity": 0.55
+      },
+      {
+        "path": "ignored-note.ts",
+        "coverage": "not-indexed",
+        "opacity": 0.55
+      }
+    ],
+    "markedFolders": [
+      {
+        "path": "assets",
+        "coverage": "not-indexed",
+        "mark": "●",
+        "opacity": 1
+      },
+      {
+        "path": "src",
+        "coverage": "partial",
+        "mark": "●",
+        "opacity": 1
+      }
+    ],
+    "galaxyLegend": {
+      "open": {
+        "togglePresent": true,
+        "expanded": "true",
+        "arrow": "▾legend",
+        "present": true,
+        "entries": [
+          {
+            "key": "node-color",
+            "text": "node colourthe server maps a symbol degree to a stellar spectral colour (layout3d.c, stellar_color): few connections give a red dwarf, many give a blue giant. This panel paints what the layout sent."
+          },
+          {
+            "key": "node-size",
+            "text": "node sizea base size per node label plus a boost from the same degree, both computed by the server. A bigger dot means more edges, not more importance."
+          },
+          {
+            "key": "edge-color",
+            "text": "edge colourDEFINESUSAGEIMPORTSCALLSCONTAINS_FILECONFIGURESCONTAINS_FOLDERDEFINES_METHODone colour per edge type, from the same table that draws the lines. Shown are the types in this layout."
+          },
+          {
+            "key": "focus",
+            "text": "focusthe focused symbol and its direct neighbours stay bright, everything else dims. The focus follows the twin subject, and a click in the sky sends it back."
+          },
+          {
+            "key": "positions",
+            "text": "positionsa deterministic layout computed by the server, not by this browser. The same index gives the same sky, so a position is comparable between two runs."
+          }
+        ],
+        "swatches": [
+          {
+            "type": "DEFINES",
+            "color": "#a855f7",
+            "painted": "rgb(168, 85, 247)"
+          },
+          {
+            "type": "USAGE",
+            "color": "#1C8585",
+            "painted": "rgb(28, 133, 133)"
+          },
+          {
+            "type": "IMPORTS",
+            "color": "#3b82f6",
+            "painted": "rgb(59, 130, 246)"
+          },
+          {
+            "type": "CALLS",
+            "color": "#1DA27E",
+            "painted": "rgb(29, 162, 126)"
+          },
+          {
+            "type": "CONTAINS_FILE",
+            "color": "#22c55e",
+            "painted": "rgb(34, 197, 94)"
+          },
+          {
+            "type": "CONFIGURES",
+            "color": "#1C8585",
+            "painted": "rgb(28, 133, 133)"
+          },
+          {
+            "type": "CONTAINS_FOLDER",
+            "color": "#22c55e",
+            "painted": "rgb(34, 197, 94)"
+          },
+          {
+            "type": "DEFINES_METHOD",
+            "color": "#a855f7",
+            "painted": "rgb(168, 85, 247)"
+          }
+        ]
+      },
+      "closed": {
+        "togglePresent": true,
+        "expanded": "false",
+        "arrow": "▸legend",
+        "present": false,
+        "entries": [],
+        "swatches": []
+      },
+      "afterReload": {
+        "togglePresent": true,
+        "expanded": "false",
+        "arrow": "▸legend",
+        "present": false,
+        "entries": [],
+        "swatches": []
+      },
+      "afterSecondReload": {
+        "togglePresent": true,
+        "expanded": "true",
+        "arrow": "▾legend",
+        "present": true,
+        "entries": [
+          {
+            "key": "node-color",
+            "text": "node colourthe server maps a symbol degree to a stellar spectral colour (layout3d.c, stellar_color): few connections give a red dwarf, many give a blue giant. This panel paints what the layout sent."
+          },
+          {
+            "key": "node-size",
+            "text": "node sizea base size per node label plus a boost from the same degree, both computed by the server. A bigger dot means more edges, not more importance."
+          },
+          {
+            "key": "edge-color",
+            "text": "edge colourDEFINESUSAGEIMPORTSCALLSCONTAINS_FILECONFIGURESCONTAINS_FOLDERDEFINES_METHODone colour per edge type, from the same table that draws the lines. Shown are the types in this layout."
+          },
+          {
+            "key": "focus",
+            "text": "focusthe focused symbol and its direct neighbours stay bright, everything else dims. The focus follows the twin subject, and a click in the sky sends it back."
+          },
+          {
+            "key": "positions",
+            "text": "positionsa deterministic layout computed by the server, not by this browser. The same index gives the same sky, so a position is comparable between two runs."
+          }
+        ],
+        "swatches": [
+          {
+            "type": "DEFINES",
+            "color": "#a855f7",
+            "painted": "rgb(168, 85, 247)"
+          },
+          {
+            "type": "USAGE",
+            "color": "#1C8585",
+            "painted": "rgb(28, 133, 133)"
+          },
+          {
+            "type": "IMPORTS",
+            "color": "#3b82f6",
+            "painted": "rgb(59, 130, 246)"
+          },
+          {
+            "type": "CALLS",
+            "color": "#1DA27E",
+            "painted": "rgb(29, 162, 126)"
+          },
+          {
+            "type": "CONTAINS_FILE",
+            "color": "#22c55e",
+            "painted": "rgb(34, 197, 94)"
+          },
+          {
+            "type": "CONFIGURES",
+            "color": "#1C8585",
+            "painted": "rgb(28, 133, 133)"
+          },
+          {
+            "type": "CONTAINS_FOLDER",
+            "color": "#22c55e",
+            "painted": "rgb(34, 197, 94)"
+          },
+          {
+            "type": "DEFINES_METHOD",
+            "color": "#a855f7",
+            "painted": "rgb(168, 85, 247)"
+          }
+        ]
+      }
+    },
+    "reader": {
+      "broken": {
+        "status": "ready",
+        "path": "src/broken.ts",
+        "lines": 13,
+        "hasContent": true,
+        "placeholderState": "",
+        "placeholder": "",
+        "coverageNote": "partially parsed: src/broken.ts is only partially parsed: constructs inside lines 2-12 may be missing from the graph. The text below is the file; the graph around it is incomplete.",
+        "coverageNoteState": "partially parsed",
+        "statusCoverage": "coverage metadata_match / partial / read_ranges_and_verify_scope"
+      },
+      "empty": {
+        "path": "",
+        "status": "unavailable",
+        "lines": 1,
+        "hasContent": false,
+        "placeholderState": "unavailable",
+        "placeholder": "ignored-note.ts has no content here: it is excluded by design (gitignore), so the index holds no module node for it. This server delivers file content only through get_code_snippet on an indexed symbol, so there is nothing to read until a file endpoint exists (Upstream-Ask 1). The file itself is on disk; this surface simply cannot show it.",
+        "coverageNote": "",
+        "coverageNoteState": "",
+        "statusCoverage": "coverage not_tracked / excluded / read_source_and_reindex"
+      }
+    },
+    "freshness": {
+      "file": "src/config.ts",
+      "before": {
+        "chip": ""
+      },
+      "after": {
+        "chip": "coverage metadata_changed / no_recorded_issue / read_source_and_reindex",
+        "open": {
+          "path": "src/config.ts",
+          "status": "no_recorded_issue",
+          "freshness": "metadata_changed",
+          "action": "read_source_and_reindex",
+          "note": "metadata_changed / no_recorded_issue / read_source_and_reindex"
+        }
+      }
+    },
+    "apiRoutes": {
+      "/api/layout": 3,
+      "/api/tree": 26
+    },
+    "rpcTools": {
+      "index_status": 6,
+      "check_index_coverage": 9,
+      "query_graph": 5,
+      "get_code_snippet": 5
+    }
+  }
+}

@@ -7056,7 +7056,7 @@ typedef struct {
 // Realistic files never approach this; it only bounds a pathological/adversarial
 // file so extraction degrades to a warned skip rather than unbounded memory.
 static int wd_stack_max(void) {
-    const char *e = getenv("CBM_WALK_DEFS_MAX");
+    const char *e = cbm_runtime_getenv("CBM_WALK_DEFS_MAX");
     if (e) {
         int v = atoi(e);
         if (v > 0) {

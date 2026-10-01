@@ -1,0 +1,22 @@
+.container-projects { display:flex; flex-wrap:wrap; gap:10px 20px; padding:12px 20px; border-top:1px solid var(--spatial-line); }
+.container-projects label { display:flex; flex-wrap:wrap; align-items:center; gap:8px; font-size:12px; min-width:0; }
+.container-projects select { max-width:260px; }
+.container-edge-key { display:flex; flex-wrap:wrap; gap:14px; font-size:11px; align-items:center; color:var(--spatial-muted); }
+.container-edge-key label, .container-edge-key span { display:flex; align-items:center; gap:6px; }
+.container-edge-key input { accent-color:#a9b8b1; }
+.container-call-key { width:18px; height:2px; background:#7da4ba; }
+.container-map .spatial-map { height:clamp(540px,64vh,820px); }
+.container-map .spatial-inspector { max-height:clamp(540px,64vh,820px); }
+.container-map .architecture-node-label:not(.is-selected) { max-width:145px; background:#101b23db; border-color:#63889380; border-radius:6px; padding:7px 12px; }
+.container-map .architecture-node-label:not(.is-selected) strong { font-size:12px; }
+.container-facts { display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px; font-size:11px; line-height:1.6; }
+.container-facts dt { color:var(--spatial-muted); }
+.container-facts dd { margin:0; overflow-wrap:anywhere; }
+.container-service-list { display:flex; flex-wrap:wrap; gap:8px; padding:8px 20px 16px; }
+.container-service-list button { text-align:left; flex:1 1 120px; max-width:240px; }
+.container-source pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:11px; padding:12px; border:1px solid var(--spatial-line); }
+.container-mode { display:flex; gap:6px; margin:16px 0; }
+.container-mode button { color:#aebeb7; border:1px solid #314c43; border-radius:6px; padding:8px 14px; background:#101b19; font:inherit; font-size:12px; cursor:pointer; }
+.container-mode button[aria-pressed=true] { color:#d9ece5; background:#243d35; border-color:#638d7b; }
+.container-mode button:focus-visible { outline:2px solid #8ce9f7; outline-offset:3px; }
+@media(max-width:760px) { .container-projects { padding:12px; } .container-map .spatial-map { height:540px; } }

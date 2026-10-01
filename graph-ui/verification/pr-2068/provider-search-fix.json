@@ -1,0 +1,211 @@
+{
+  "at": "2026-09-09T20:55:26.603Z",
+  "project": "cbm-pr2068",
+  "origin": "http://127.0.0.1:9749",
+  "method": "Bundled unchanged production provider/search/inspector modules against actual local RPC; read-only",
+  "symbols": {
+    "count": 152,
+    "message": "",
+    "byKind": {
+      "class": 8,
+      "function": 144
+    },
+    "constructor": {
+      "name": "cbm_daemon_application_new",
+      "qualifiedName": "cbm-pr2068.src.daemon.application.cbm_daemon_application_new",
+      "kind": "function",
+      "uri": "file:///workspace/src/daemon/application.c",
+      "range": {
+        "start": {
+          "line": 2908,
+          "character": 0
+        },
+        "end": {
+          "line": 2909,
+          "character": 0
+        }
+      },
+      "selectionRange": {
+        "start": {
+          "line": 2908,
+          "character": 0
+        },
+        "end": {
+          "line": 2909,
+          "character": 0
+        }
+      },
+      "projectName": "cbm-pr2068"
+    }
+  },
+  "search": {
+    "query": "src/daemon/application.c",
+    "first": {
+      "hit": {
+        "name": "application.c",
+        "kind": "unknown",
+        "filePath": "src/daemon/application.c"
+      },
+      "score": 35,
+      "matched": [
+        "exact file path"
+      ],
+      "fanIn": 0,
+      "pathMatch": "file"
+    },
+    "count": 1
+  },
+  "requests": [
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      },
+      "status": 200,
+      "head": [
+        "rows_refs: 2  (cols: id prefix)",
+        "  0 cbm-pr2068.src.daemon.application.",
+        "  1 src/daemon/application.c",
+        "rows_ref_rule: @N+suffix=prefix+suffix",
+        "rows: 127  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)"
+      ],
+      "footer": [
+        "returned: 127",
+        "total: 144",
+        "has_more: true",
+        "truncated: true",
+        "truncation_reason: output_budget",
+        "next_offset: 127"
+      ]
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      },
+      "status": 200,
+      "head": [
+        "rows: 0  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)",
+        "returned: 0",
+        "total: 0",
+        "total_relation: eq",
+        "has_more: false"
+      ],
+      "footer": [
+        "returned: 0",
+        "total: 0",
+        "has_more: false",
+        "truncated: false"
+      ]
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      },
+      "status": 200,
+      "head": [
+        "rows_refs: 2  (cols: id prefix)",
+        "  0 cbm-pr2068.src.daemon.application.",
+        "  1 src/daemon/application.c",
+        "rows_ref_rule: @N+suffix=prefix+suffix",
+        "rows: 8  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)"
+      ],
+      "footer": [
+        "returned: 8",
+        "total: 8",
+        "has_more: false",
+        "truncated: false"
+      ]
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Interface) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      },
+      "status": 200,
+      "head": [
+        "rows: 0  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)",
+        "returned: 0",
+        "total: 0",
+        "total_relation: eq",
+        "has_more: false"
+      ],
+      "footer": [
+        "returned: 0",
+        "total: 0",
+        "has_more: false",
+        "truncated: false"
+      ]
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Type) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      },
+      "status": 200,
+      "head": [
+        "rows: 0  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)",
+        "returned: 0",
+        "total: 0",
+        "total_relation: eq",
+        "has_more: false"
+      ],
+      "footer": [
+        "returned: 0",
+        "total: 0",
+        "has_more: false",
+        "truncated: false"
+      ]
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200",
+        "cursor": "q1.u0911bd5153455afeg2.6b1590743e407166.631dcb67d00cdf81484e3ece670ffbf4.127.64768524b792413a"
+      },
+      "status": 200,
+      "head": [
+        "rows_refs: 2  (cols: id prefix)",
+        "  0 cbm-pr2068.src.daemon.application.",
+        "  1 src/daemon/application.c",
+        "rows_ref_rule: @N+suffix=prefix+suffix",
+        "rows: 17  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)"
+      ],
+      "footer": [
+        "returned: 17",
+        "total: 144",
+        "offset: 127",
+        "has_more: false",
+        "truncated: false"
+      ]
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.file_path LIMIT 1"
+      },
+      "status": 200,
+      "head": [
+        "rows: 1  (cols: n.name n.file_path)",
+        "  application.c src/daemon/application.c",
+        "returned: 1",
+        "total: 1",
+        "total_relation: eq"
+      ],
+      "footer": [
+        "returned: 1",
+        "total: 1",
+        "has_more: false",
+        "truncated: false"
+      ]
+    }
+  ]
+}

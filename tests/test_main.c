@@ -23,7 +23,7 @@ int tf_skip_count = 0;
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
-#include "ui/http_server.h"       /* deleted-self executable probe */
+#include "ui/http_server.h"        /* deleted-self executable probe */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -822,6 +822,7 @@ extern void suite_java_lsp_coverage(void);
 extern void suite_kotlin_lsp(void);
 extern void suite_rust_lsp(void);
 extern void suite_store_arch(void);
+extern void suite_architecture_projection(void);
 extern void suite_store_bulk(void);
 extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
@@ -829,6 +830,7 @@ extern void suite_traces(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
+extern void suite_runtime_settings(void);
 extern void suite_agent_clients(void);
 extern void suite_agent_profiles(void);
 extern void suite_config_json_like(void);
@@ -1121,6 +1123,7 @@ int main(int argc, char **argv) {
 
     /* Architecture + ADR + Louvain */
     RUN_SELECTED_SUITE(store_arch);
+    RUN_SELECTED_SUITE(architecture_projection);
 
     /* HTTP link */
 
@@ -1135,6 +1138,7 @@ int main(int argc, char **argv) {
 
     /* CLI (install, update, config) */
     RUN_SELECTED_SUITE(cli);
+    RUN_SELECTED_SUITE(runtime_settings);
     RUN_SELECTED_SUITE(agent_clients);
     RUN_SELECTED_SUITE(agent_profiles);
     RUN_SELECTED_SUITE(config_json_like);

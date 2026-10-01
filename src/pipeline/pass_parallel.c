@@ -134,7 +134,7 @@ void cbm_pp_lsp_linear_fallback_rows_reset(void) {
  * Follows the limits.c strtol convention: unset / unparseable / non-positive
  * → return 0 so the caller keeps its derived default. */
 static size_t cbm_retain_env_bytes(const char *name) {
-    const char *raw = getenv(name);
+    const char *raw = cbm_runtime_getenv(name);
     if (!raw || !raw[0]) {
         return 0;
     }

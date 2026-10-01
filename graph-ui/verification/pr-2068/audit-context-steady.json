@@ -1,0 +1,15 @@
+{
+  "method": "Supplementary stable source capture from a fresh context, Welcome → Explore → known Explorer src/daemon/application.c. No storage seeding. Wait for reader data-status=ready before screenshot.",
+  "before": {
+    "at": "2026-09-09T20:37:42.168Z",
+    "readerStatus": "ready",
+    "inspector": "Selected code\nPin\nsrc/daemon/application.c\nAsk about this\nShow in graph\nSymbols in this file\n\nNo symbols found in the current index.\n\nPartial results: queries failed for Function, Class.\n\nFile imports\nNone found",
+    "screenshot": "audit-before-context.png"
+  },
+  "after": {
+    "at": "2026-09-09T20:37:54.634Z",
+    "readerStatus": "ready",
+    "inspector": "Selected code\nPin\nsrc/daemon/application.c\nAsk about this\nShow in graph\nSelection context\n\nsrc/daemon/application.c\n\nGRAPH EVIDENCE\n\n246 indexed caller edges from 5 files reach this selection. Check these callers when changing its contract.\n\nIncoming relationships · 246\nOutgoing relationships · 191\nOBSERVED AGENT ACTIVITY\n\nNo retained agent event names this file. Enable live activity to read the daemon's local event store.\n\nRead source evidence\nAssess change impact\nSymbols in this file\n\nNo symbols found in the current index.\n\nPartial results: queries failed for Function, Class.\n\nFile imports\nNone found",
+    "screenshot": "audit-after-context.png"
+  }
+}

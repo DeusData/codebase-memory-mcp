@@ -34,6 +34,8 @@
 #include "mcp/mcp.h"
 #include "mcp/index_supervisor.h"
 #include "cli/cli.h"
+#include "cli/runtime_settings.h"
+#include "foundation/platform.h"
 #include "cli/progress_sink.h"
 #include "foundation/constants.h"
 
@@ -70,7 +72,7 @@ enum {
  * cold daemon on a starved host loses through no fault of its own.
  * CBM_STARTUP_TIMEOUT_MS, clamped to [1s, 10min]; malformed -> default. */
 static uint32_t main_startup_timeout_ms(void) {
-    const char *raw = getenv("CBM_STARTUP_TIMEOUT_MS");
+    const char *raw = cbm_runtime_getenv("CBM_STARTUP_TIMEOUT_MS");
     if (!raw || !raw[0])
         return MAIN_MCP_STARTUP_TIMEOUT_MS;
     char *end = NULL;
@@ -2578,6 +2580,16 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    bool configure_stateless = role == CBM_DAEMON_PROCESS_STATELESS && argc > 1 &&
+                               strcmp(argv[1], "config") == 0;
+    if ((role != CBM_DAEMON_PROCESS_STATELESS && role != CBM_DAEMON_PROCESS_HOOK_CLIENT) ||
+        configure_stateless) {
+        const char *settings_cache = cbm_resolve_cache_dir();
+        if (settings_cache && !cbm_runtime_settings_init(settings_cache)) {
+            (void)fprintf(stderr, "codebase-memory-mcp: could not load saved runtime settings\n");
+            return EXIT_FAILURE;
+        }
+    }
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init();
     /* The library default stays INFO (embedders and the test runner observe
@@ -2636,6 +2648,15 @@ int main(int argc, char **argv) {
             }
             cbm_hook_augment_prefetch_stdin(hook_input);
         }
+        const char *hook_settings_cache = cbm_resolve_cache_dir();
+        if (hook_settings_cache && !cbm_runtime_settings_init(hook_settings_cache)) {
+            return EXIT_SUCCESS;
+        }
+#ifndef _WIN32
+        /* The first deadline bounded input and settings loading; subsequent
+         * processing uses the now-resolved saved deadline. */
+        cbm_hook_augment_arm_deadline();
+#endif
     }
 
     if (role == CBM_DAEMON_PROCESS_STATELESS) {

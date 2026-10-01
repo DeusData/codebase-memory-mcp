@@ -1,0 +1,489 @@
+{
+  "origin": "http://127.0.0.1:9749",
+  "project": "cbm-pr2068",
+  "startedAt": "2026-09-09T21:10:21.103Z",
+  "method": "Fresh normal UI navigation; no localStorage seeding, graph mocks or repository writes.",
+  "actions": [
+    {
+      "description": "Standard welcome: Start exploring",
+      "before": {
+        "x": 983.9375,
+        "y": 729.984375,
+        "width": 119.0625,
+        "height": 42.796875
+      }
+    },
+    {
+      "description": "Explore workspace",
+      "before": {
+        "x": 237.5,
+        "y": 12,
+        "width": 71.125,
+        "height": 36.796875
+      }
+    },
+    {
+      "description": "Change scope entry",
+      "before": {
+        "x": 526.640625,
+        "y": 945.40625,
+        "width": 105.953125,
+        "height": 23.59375
+      }
+    },
+    {
+      "description": "Actual modified daemon/application.c",
+      "before": {
+        "x": 39,
+        "y": 523.5,
+        "width": 433.1875,
+        "height": 33.5
+      }
+    },
+    {
+      "description": "Tests to review: inspect actual indexed test paths",
+      "before": {
+        "x": 644.03125,
+        "y": 572.703125,
+        "width": 129.109375,
+        "height": 32.84375
+      }
+    },
+    {
+      "description": "Open test source evidence while preserving analysis",
+      "before": {
+        "x": 527.1875,
+        "y": 684.6875,
+        "width": 503.734375,
+        "height": 32.84375
+      }
+    },
+    {
+      "description": "Close source evidence, keep test selection",
+      "before": {
+        "x": 1506.875,
+        "y": 99.5,
+        "width": 56.125,
+        "height": 33.5
+      }
+    },
+    {
+      "description": "Git history tab",
+      "before": {
+        "x": 779.140625,
+        "y": 572.703125,
+        "width": 101.15625,
+        "height": 32.84375
+      }
+    },
+    {
+      "description": "Expand a recorded local commit",
+      "before": {
+        "x": 527.1875,
+        "y": 784.0625,
+        "width": 1023.8125,
+        "height": 28.84375
+      }
+    },
+    {
+      "description": "Copy exact local Git evidence command",
+      "before": {
+        "x": 527.1875,
+        "y": 860.6875,
+        "width": 225.921875,
+        "height": 32.84375
+      }
+    },
+    {
+      "description": "Review snapshot, dirty status and uncertainty",
+      "before": {
+        "x": 886.296875,
+        "y": 572.703125,
+        "width": 111.125,
+        "height": 32.84375
+      }
+    },
+    {
+      "description": "Dependencies at 1024 × 800",
+      "before": {
+        "x": 334.390625,
+        "y": 611.703125,
+        "width": 130.84375,
+        "height": 32.84375
+      }
+    }
+  ],
+  "screenshots": [
+    {
+      "name": "change-analysis-after-dependencies.png",
+      "at": "2026-09-09T21:10:36.080Z"
+    },
+    {
+      "name": "change-analysis-after-test-source.png",
+      "at": "2026-09-09T21:10:45.104Z"
+    },
+    {
+      "name": "change-analysis-after-git-evidence.png",
+      "at": "2026-09-09T21:10:53.843Z"
+    },
+    {
+      "name": "change-analysis-e2e-failure.png",
+      "at": "2026-09-09T21:11:02.483Z"
+    }
+  ],
+  "rpc": [
+    {
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Module) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1"
+      }
+    },
+    {
+      "tool": "get_architecture",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "aspects": [
+          "all"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "tool": "check_index_coverage",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "scopes": [
+          "."
+        ],
+        "scope_limit": 1000,
+        "scope_offset": 0,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name LIMIT 1"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.u0911bd5153455afeg2.6212d9a8bcbbe31e.827a0c47df0cf8b6229034c74af1ac14.200.4a608cf6fbb2613a"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.u0911bd5153455afeg2.6212d9a8bcbbe31e.827a0c47df0cf8b6229034c74af1ac14.400.8f3d29a0b55a593f"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.u0911bd5153455afeg2.6212d9a8bcbbe31e.827a0c47df0cf8b6229034c74af1ac14.600.b5f35e3cb0154029"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.u0911bd5153455afeg2.6212d9a8bcbbe31e.827a0c47df0cf8b6229034c74af1ac14.800.ce0f3b18727e4657"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.u0911bd5153455afeg2.6212d9a8bcbbe31e.827a0c47df0cf8b6229034c74af1ac14.1000.4421444bd707e850"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.u0911bd5153455afeg2.6212d9a8bcbbe31e.827a0c47df0cf8b6229034c74af1ac14.1200.3f3b187b99b98055"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000",
+        "cursor": "q1.u0911bd5153455afeg2.6212d9a8bcbbe31e.827a0c47df0cf8b6229034c74af1ac14.1400.d12d1e1585af9382"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "tool": "detect_changes",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "since": "HEAD",
+        "scope": "files",
+        "direction": "inbound",
+        "changed_limit": 500,
+        "limit": 1,
+        "module_limit": 0,
+        "max_output_tokens": 12000,
+        "format": "json"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.121.128d5cfdefd0f93a"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.241.4d413b2d014eb5aa"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.365.0198ec4b83b168eb"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.494.fdc40e9453864c6c"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.611.c96c3d5998ceef2f"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.737.82dd52a0359d6da3"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line LIMIT 200"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.866.f61fdc7b2d67ca98"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.1005.9602b2c988a2ae9c"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.1139.68e7ccd05f4322bf"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.1279.a02d51d57e0d1596"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.94f3b2766ad6647c.8202d9d35b5e2b42f080027234f7fbad.1413.e7a91561c0a52d3f"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500",
+        "cursor": "q1.u0911bd5153455afeg2.a412b05a6d0e32c2.196ccf7440d993e892565d5c6e43ee7c.123.2aa3fbb3b7ec6207"
+      }
+    }
+  ],
+  "pageErrors": [],
+  "externalRequests": [],
+  "checks": {
+    "changeSet": "Uncommitted changes\n\nCompared explicitly with HEAD; staged, unstaged and untracked paths are included.\n\n260 of 260 changed paths loaded\n\nChange-set revision and limits\nFilter changed paths\n\nAreas are grouped by path and ordered by changed-file count, with the current selection first. These counts measure scope, not risk.\n\ngraph-ui/verification · 136 changed paths\ngraph-ui/src · 90 changed paths\ndocs/development · 9 changed paths\ngraph-ui/tools · 9 changed paths\nsrc/ui · 7 changed paths\ntests · 3 changed paths\ngraph-ui/agents · 2 changed paths\n(root) · 1 changed paths\ngraph-ui · 1 changed paths\nsrc/daemon · 1 changed paths\nsrc/pipeline · 1 changed paths",
+    "selectedSymbol": {
+      "value": "cbm-pr2068.src.daemon.application.application_project_lock_release_fully",
+      "label": "application_project_lock_release_fully · line 288"
+    },
+    "scope": "src/daemon/application.c\nAnalysis scope\nEntire indexed file\ncbm_daemon_application_fail_next_job_thread_start_for_test · line 218\ncbm_daemon_application_background_initializes_for_test · line 232\ncbm_daemon_application_busy_queue_waits_for_test · line 243\ncbm_daemon_application_hold_job_before_start_for_test · line 247\napplication_job_thread_create · line 252\napplication_request_cancelled_locked · line 260\napplication_deadline_after · line 268\napplication_cleanup_force_terminate · line 273\napplication_project_lock_release_fully · line 288\napplication_worker_diagnostic · line 304\napplication_worker_start_default · line 318\napplication_worker_poll_default · line 331\napplication_worker_cancel_default · line 338\napplication_worker_log_path_default · line 344\napplication_worker_destroy_default · line 350\napplication_get_u32 · line 356\napplication_put_u32 · line 361\napplication_text_copy · line 368\napplication_regular_db_exists · line 380\napplication_canonical_directory_exists · line 394\napplication_find_watch_locked · line 399\napplication_remove_watch_entry_locked · line 409\napplication_remove_watch_locked · line 435\napplication_release_session_watch_locked · line 440\napplication_session_workspace_allowed · line 455\napplication_refresh_watch_locked · line 472\napplication_refresh_watch · line 555\napplication_job_free · line 564\napplication_jobs_reap_completed · line 578\napplication_tmp_lock · line 618\napplication_tmp_unlock · line 624\napplication_cache_dir · line 628\napplication_unique_recovery_file · line 653\napplication_recovery_files_create · line 684\napplication_recovery_files_remove · line 697\napplication_truncate_file · line 707\napplication_read_suspects · line 714\napplication_free_suspects · line 806\napplication_suspect_contains · line 816\napplication_append_quarantine · line 825\napplication_max_restarts · line 838\napplication_attempt_init · line 850\napplication_attempt_free · line 856\napplication_job_cancel_requested · line 861\napplication_project_keys_conflict · line 869\napplication_mutation_conflicts_locked · line 874\napplication_job_reserves_project_locked · line 885\napplication_mutation_begin_internal · line 895\ncbm_daemon_application_project_mutation_try_begin · line 988\ncbm_daemon_application_project_mutation_end · line 993\napplication_watcher_mutation_begin · line 1031\napplication_watcher_mutation_end · line 1035\napplication_watcher_project_pruned · line 1039\napplication_session_mutation_begin · line 1054\napplication_session_mutation_try_begin · line 1060\napplication_session_mutation_end · line 1066\napplication_job_wait_for_mutations · line 1073\napplication_cancelled_result · line 1090\napplication_job_run_attempt · line 1098\napplication_job_failure_response · line 1176\napplication_attempt_disposition · line 1197\napplication_record_attempt · line 1210\napplication_record_cancelled · line 1223\napplication_result_is_attributable_failure · line 1231\napplication_job_execution_init · line 1253\napplication_job_execution_cancel · line 1258\napplication_index_response_succeeded · line 1269\napplication_consume_attempt · line 1279\napplication_recovery_record_suspects · line 1310\napplication_job_try_partial · line 1357\napplication_job_recover · line 1384\napplication_auto_index_retry_pending_locked · line 1439\napplication_job_publish · line 1487\napplication_job_thread · line 1520\napplication_find_job_locked · line 1559\napplication_find_active_job_locked · line 1572\napplication_index_project_key · line 1582\napplication_active_job_count_locked · line 1589\napplication_index_args_normalize_defaults · line 1604\napplication_index_args_equal · line 1623\napplication_job_subscribe_locked · line 1645\napplication_job_subscribe · line 1708\napplication_job_unsubscribe_locked · line 1719\napplication_auto_index_release_locked · line 1732\napplication_auto_index_cancel_join · line 1748\napplication_update_cancel_locked · line 1772\napplication_update_owner_release_locked · line 1783\napplication_update_version_valid · line 1799\napplication_update_publish_terminal_locked · line 1812\napplication_update_thread · line 1840\napplication_update_subscribe_locked · line 1891\napplication_update_reap · line 1931\napplication_auto_index_args · line 1966\napplication_background_initialize_impl · line 1981\napplication_background_initialize · line 2064\napplication_jsonrpc_success · line 2070\napplication_update_notice_inject · line 2079\napplication_watch_job_subscription_exists_locked · line 2092\napplication_watch_job_subscribe_late_session_locked · line 2109\napplication_watch_job_subscribe_sessions_locked · line 2137\napplication_watch_job_unsubscribe_session_locked · line 2183\napplication_watch_job_unsubscribe_job_locked · line 2202\napplication_job_wait_for_session · line 2218\napplication_index_execute · line 2242\napplication_session_open · line 2305\napplication_set_context · line 2347\napplication_oversized_response_error · line 2422\napplication_framable_response · line 2463\ncbm_daemon_application_framable_response_for_test · line 2472\napplication_mcp_request · line 2477\napplication_tool_request · line 2537\napplication_set_ui_config · line 2573\napplication_ui_readiness_proof · line 2611\napplication_request_dispatch · line 2629\napplication_request · line 2674\napplication_cancel_jobs_locked · line 2762\napplication_request_cancel · line 2770\napplication_session_cancel · line 2800\napplication_session_close · line 2858\ncbm_daemon_application_set_permanent · line 2900\ncbm_daemon_application_new · line 2909\ncbm_daemon_application_shutdown · line 2999\ncbm_daemon_application_free_with_timeout · line 3057\ncbm_daemon_application_free · line 3128\ncbm_daemon_application_runtime_callbacks · line 3132\napplication_client_exchange_tagged · line 3148\napplication_client_exchange · line 3192\ncbm_daemon_application_client_set_context · line 3200\ncbm_daemon_application_client_set_ui_config · line 3256\ncbm_daemon_application_client_ui_readiness_proof · line 3290\napplication_client_text_request_tagged · line 3322\napplication_client_text_request · line 3344\ncbm_daemon_application_client_mcp · line 3352\ncbm_daemon_application_client_mcp_tagged · line 3359\ncbm_daemon_application_client_tool · line 3368\ncbm_daemon_application_client_hook_augment · line 3392\napplication_background_index · line 3400\ncbm_daemon_application_index · line 3508\ncbm_daemon_application_watcher_index · line 3513\ncbm_daemon_application_active_jobs · line 3518\ncbm_daemon_application_job_subscribers · line 3533\ncbm_daemon_application_physical_job_limit · line 3545\ncbm_daemon_application_worker_memory_budget_bytes · line 3555\ncbm_daemon_application_session_retains_store_for_test · line 3565\nOpen source evidence\nThis file is in the detected change set.\nThis symbol was selected manually; edited lines are not automatically mapped to declarations.\nInspect this file’s local diff",
+    "risk": "Review needed · elevated change risk\nHeuristic, no defect probability\n17 indexed dependents could be affected; inspect direct paths first.\n5 data limitations · inspect before relying on absence of findings",
+    "dependencies": "Structural impact · indexed dependencies\n\n2 direct · 17 total dependents within 4 hops. CALLS means a static call relation; IMPORTS means an import dependency. Neither proves runtime execution or data flow.\n\nShowing 8 of 17 returned evidence paths.\n\napplication_mutation_begin_internaldirect dependency\nsrc/daemon/application.c:895\nShow indexed path (1 edge)\ncbm_daemon_application_project_mutation_enddirect dependency\nsrc/daemon/application.c:993\nShow indexed path (1 edge)\ncbm_daemon_application_project_mutation_try_begin2 hops\nsrc/daemon/application.c:988\nShow indexed path (2 edges)\napplication_session_mutation_begin2 hops\nsrc/daemon/application.c:1054\nShow indexed path (2 edges)\napplication_session_mutation_try_begin2 hops\nsrc/daemon/application.c:1060\nShow indexed path (2 edges)\nhost_ui_mutation_end2 hops\nsrc/daemon/host.c:316\nShow indexed path (2 edges)\ndaemon_application_reserved_mutation_delays_worker_start2 hops · test candidate (path heuristic)\ntests/test_daemon_application.c:4185\nShow indexed path (2 edges)\ndaemon_application_mutation_does_not_block_other_project2 hops · test candidate (path heuristic)\ntests/test_daemon_application.c:4242\nShow indexed path (2 edges)\nShow more affected symbols (8 of 17)",
+    "tests": "Tests to review\n\n7 test candidates reach the selection in the bounded graph walk. File-path classification is heuristic; a test relationship does not prove assertion coverage.\n\nOpen test source: daemon_application_reserved_mutation_delays_worker_start\ntests/test_daemon_application.c:4185 · 2 indexed hops\nInspect test dependency path\nOpen test source: daemon_application_mutation_does_not_block_other_project\ntests/test_daemon_application.c:4242 · 2 indexed hops\nInspect test dependency path\nOpen test source: daemon_application_mutation_still_owns_os_project_lock\ntests/test_daemon_application.c:4290 · 2 indexed hops\nInspect test dependency path\nOpen test source: daemon_application_free_reports_retained_live_ownership\ntests/test_daemon_application.c:5260 · 2 indexed hops\nInspect test dependency path\nOpen test source: test_daemon_application.c\ntests/test_daemon_application.c:0 · 2 indexed hops\nInspect test dependency path\nOpen test source: watcher_prune_waits_for_daemon_project_mutation\ntests/test_watcher.c:391 · 2 indexed hops\nInspect test dependency path\nOpen test source: test_watcher.c\ntests/test_watcher.c:0 · 2 indexed hops\nInspect test dependency path\nNext checks\nInspect the nearest dependent paths and check the interfaces used by their callers or importers.\nReview and run the 7 indexed test candidates that reach the selection. Test-file classification is heuristic.\nCompare the local change with the indexed source and reindex before relying on absence of downstream findings.\nInspect the linked local commit evidence for repeated co-changes; shared commits alone do not establish a dependency.",
+    "testSourceReadable": false,
+    "testSource": "Source evidence\ndaemon_application_reserved_mutation_delays_worker_start\nClose\n\ntests/test_daemon_application.c:4185\n\nRequested source location. Current local source may have changed since indexing. The map stays open.\n\nCopy location\nRefresh source\nOpen in Explore\n\nNo indexed file declaration is available in this snapshot. Open the file in Explore to use the repository reader.",
+    "history": "Historical evidence · files changed together\n\n1 ordinary commits touched this file in a sample of 200 commits, up to 548 days. Excluded: 98 merges and 4 changes touching more than 30 files. Rename history is not followed.\n\nCo-changes are historical association, not functional dependency or evidence of a later defect.\n\nShowing 2 of 2 returned files.\n\ntests/test_daemon_application.c · 1 shared commit\nInspect local Git evidence\n\n9d4ac2b98b9c19633ce2cbf8d9c6bf9edc57bba6 · 9/2/2026, 12:00:31 AM\nfix(daemon): accept Unicode session roots on Windows · 3 changed files\n\nCopy local Git evidence command\ngit show 9d4ac2b98b9c19633ce2cbf8d9c6bf9edc57bba6 -- 'src/daemon/application.c' 'tests/test_daemon_application.c'\ntests/windows/test_non_ascii_path.py · 1 shared commit\nInspect local Git evidence",
+    "copiedCommand": "git show 9d4ac2b98b9c19633ce2cbf8d9c6bf9edc57bba6 -- 'src/daemon/application.c' 'tests/test_daemon_application.c'",
+    "quality": "Data quality and revision · 5 limitations\n\nComputed 9/9/2026, 11:10:28 PM · cached for up to 30s.\nIndex: 2026-09-09T19:51:51Z · generation u0911bd5153455afeg2\nGit HEAD: 80f4f41f9bcb9daf60afc5f607bcbcba24a4b196\nScope: selected symbol; Git evidence is file-level.\nGraph scope: 1 starting nodes · at most 600 visited nodes · 60 returned findings.\n\n281 persisted index coverage records identify excluded, unsupported, or partially indexed paths; inspect Diagnostics.\nThe index does not record a Git revision; equivalence to HEAD or the worktree is unverified.\nThe history scan reached a count, time, or file bound.\nFewer than 3 sampled ordinary commits touch this file; historical evidence is sparse.\nThe selected file has uncommitted changes; Git history describes committed versions, and graph freshness is unverified.\nInspect local indexing diagnostics",
+    "narrowLayout": {
+      "width": 1024,
+      "documentWidth": 1024,
+      "panel": {
+        "x": 334.390625,
+        "y": 661.546875,
+        "width": 648.609375,
+        "height": 89.453125
+      },
+      "root": {
+        "x": 23,
+        "y": 69,
+        "width": 978,
+        "height": 694
+      },
+      "toolbarButtons": [
+        {
+          "text": "Close change impact",
+          "x": 833.84375,
+          "y": 85,
+          "width": 147.15625,
+          "height": 33.5
+        },
+        {
+          "text": "Current selection",
+          "x": 43,
+          "y": 174.5,
+          "width": 124.375,
+          "height": 33.5
+        },
+        {
+          "text": "Working tree",
+          "x": 173.375,
+          "y": 174.5,
+          "width": 97.4375,
+          "height": 33.5
+        },
+        {
+          "text": "Since ref",
+          "x": 276.8125,
+          "y": 174.5,
+          "width": 73.65625,
+          "height": 33.5
+        },
+        {
+          "text": "Refresh changes",
+          "x": 362.46875,
+          "y": 174.5,
+          "width": 121.4375,
+          "height": 33.5
+        },
+        {
+          "text": "Dependencies · 17",
+          "x": 334.390625,
+          "y": 611.703125,
+          "width": 130.84375,
+          "height": 32.84375
+        },
+        {
+          "text": "Tests to review · 7",
+          "x": 471.234375,
+          "y": 611.703125,
+          "width": 129.109375,
+          "height": 32.84375
+        },
+        {
+          "text": "Git history · 2",
+          "x": 606.34375,
+          "y": 611.703125,
+          "width": 101.15625,
+          "height": 32.84375
+        },
+        {
+          "text": "Data quality · 5",
+          "x": 713.5,
+          "y": 611.703125,
+          "width": 111.125,
+          "height": 32.84375
+        }
+      ]
+    }
+  },
+  "success": false,
+  "error": "AssertionError [ERR_ASSERTION]: Evidence retains a usable independent scroll area",
+  "finishedAt": "2026-09-09T21:11:02.490Z"
+}

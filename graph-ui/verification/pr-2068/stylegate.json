@@ -1,0 +1,11 @@
+{
+  "dashHitsOutsideDocumentedQuotes": 0,
+  "attributionHits": 0,
+  "attributionPatternHits": 0,
+  "hardcodedChromeStrings": 0,
+  "filesConsidered": 835,
+  "textFiles": 640,
+  "binaryFiles": 195,
+  "fullReport": "stylegate-full.json.gz",
+  "note": "Full generated report stored compressed to avoid recursive findings from its quoted scan rules."
+}

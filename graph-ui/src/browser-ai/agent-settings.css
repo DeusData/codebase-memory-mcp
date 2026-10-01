@@ -1,0 +1,28 @@
+.cbm-agent-settings {
+    --chat-border: #34483f; --chat-muted: #9badA4; --chat-accent: #91cbb0;
+    box-sizing: border-box; width: min(540px, calc(100vw - 32px)); max-height: min(720px, calc(100dvh - 48px));
+    margin: auto; padding: 0; overflow: auto; color: #dfE8e3; background: #111b17;
+    border: 1px solid #425a4e; border-radius: 16px; box-shadow: 0 24px 100px #0009;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.cbm-agent-settings::backdrop { background: #03090799; backdrop-filter: blur(5px); }
+.cbm-agent-settings * { box-sizing: border-box; }
+.cbm-agent-settings > header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 22px 24px 18px; border-bottom: 1px solid var(--chat-border); }
+.cbm-agent-settings h2 { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: -.4px; }
+.cbm-agent-settings p { margin: 0; color: var(--chat-muted); font-size: 12px; }
+.cbm-agent-settings button, .cbm-agent-settings select { font: inherit; color: inherit; border: 1px solid var(--chat-border); background: #1b2a22; border-radius: 7px; padding: 8px 12px; }
+.cbm-agent-settings button { cursor: pointer; }
+.cbm-agent-settings button:disabled, .cbm-agent-settings select:disabled { opacity: .5; cursor: not-allowed; }
+.cbm-agent-settings > header button { background: transparent; border: 0; font-size: 24px; padding: 0 8px; }
+.cbm-agent-settings :is(button, select, input, a):focus-visible { outline: 2px solid var(--chat-accent); outline-offset: 3px; }
+.cbm-agent-settings-body { padding: 22px 24px; display: grid; gap: 16px; }
+.cbm-agent-settings .cbm-chat-settings { display: grid; gap: 12px; }
+.cbm-agent-settings .cbm-chat-settings select { width: 100%; min-width: 0; }
+.cbm-agent-settings label { font-weight: 500; }
+.cbm-agent-settings input { accent-color: #77b695; }
+.cbm-agent-settings a { color: #abc8be; text-underline-offset: 3px; }
+.cbm-agent-settings .cbm-chat-model-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
+.cbm-agent-settings .cbm-chat-primary { border-color: #638a74; background: #263f31; }
+.cbm-agent-settings .cbm-chat-status { color: var(--chat-muted); font-size: 12px; }
+.cbm-agent-settings .cbm-chat-loading { padding: 0; }
+.cbm-agent-settings .cbm-chat-error, .cbm-agent-settings .cbm-chat-notice { margin: 0 !important; }

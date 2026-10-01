@@ -27,6 +27,7 @@
  */
 
 #include "ts_lsp.h"
+#include "../../../src/foundation/platform.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,7 +61,7 @@ static _Thread_local long g_ts_type_budget = -1;
 static _Thread_local bool g_ts_type_budget_warned;
 
 static void ts_type_budget_reset(size_t source_len) {
-    const char *e = getenv("CBM_TS_TYPE_BUDGET");
+    const char *e = cbm_runtime_getenv("CBM_TS_TYPE_BUDGET");
     if (e && e[0]) {
         long v = atol(e);
         g_ts_type_budget = (v > 0) ? v : -1;
