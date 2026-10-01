@@ -9578,6 +9578,83 @@ TEST(pipeline_docstring_go_class) {
     PASS();
 }
 
+/* Index one file; true when the node with this label and name stores `want` in
+ * its properties JSON. */
+static bool doc_props_contain(const char *file, const char *content, const char *label,
+                              const char *name, const char *want) {
+    const char *files[] = {file};
+    const char *contents[] = {content};
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        return false;
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    bool found = false;
+    if (p && cbm_pipeline_run(p) == 0) {
+        cbm_store_t *s = cbm_store_open_path(db);
+        cbm_node_t *nodes = NULL;
+        int nc = 0;
+        if (s && cbm_store_find_nodes_by_label(s, cbm_pipeline_project_name(p), label, &nodes,
+                                               &nc) == 0) {
+            for (int i = 0; i < nc; i++) {
+                if (nodes[i].name && strcmp(nodes[i].name, name) == 0 && nodes[i].properties_json &&
+                    strstr(nodes[i].properties_json, want)) {
+                    found = true;
+                }
+            }
+            cbm_store_free_nodes(nodes, nc);
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    teardown_lang_repo();
+    return found;
+}
+
+TEST(pipeline_doc_go_package_comment_on_file_node) {
+    /* go/doc: the comment group touching `package` documents the package; it is
+     * stored on the File node. */
+    ASSERT_TRUE(doc_props_contain("knob.go",
+                                  "// Package knob turns knobs.\n"
+                                  "package knob\n\n"
+                                  "func Turn() {}\n",
+                                  "File", "knob.go",
+                                  "\"docstring\":\"// Package knob turns knobs.\""));
+    PASS();
+}
+
+TEST(pipeline_doc_rust_inner_doc_on_file_node) {
+    ASSERT_TRUE(doc_props_contain("lib.rs",
+                                  "//! Knob crate.\n"
+                                  "//! Turns knobs.\n"
+                                  "\n"
+                                  "pub fn turn() {}\n",
+                                  "File", "lib.rs",
+                                  "\"docstring\":\"//! Knob crate.\\n//! Turns knobs.\""));
+    PASS();
+}
+
+TEST(pipeline_doc_long_docstring_stored_whole) {
+    /* A 30-line doc (longer than the old fixed 2 KB properties buffer on its
+     * own) is stored whole, and the fields after it are not dropped. */
+    char src[4096];
+    int s = snprintf(src, sizeof(src), "package knob\n\n");
+    for (int i = 0; i < 30; i++) {
+        s += snprintf(src + s, sizeof(src) - (size_t)s,
+                      "// Line %02d of a long doc comment that keeps on going.\n", i);
+    }
+    snprintf(src + s, sizeof(src) - (size_t)s, "func Long(steps int) int { return steps }\n");
+    ASSERT_TRUE(doc_props_contain("knob.go", src, "Function", "Long",
+                                  "that keeps on going.\\n// Line 29 of a long doc"));
+    ASSERT_TRUE(doc_props_contain("knob.go", src, "Function", "Long", "\"signature\":"));
+    PASS();
+}
+
 TEST(project_name_from_path) {
     /* Port of TestProjectNameFromPath — more cases than integ_pipeline_project_name */
     struct {
@@ -16405,6 +16482,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_docstring_java_method);
     RUN_TEST(pipeline_docstring_kotlin_function);
     RUN_TEST(pipeline_docstring_go_class);
+    RUN_TEST(pipeline_doc_go_package_comment_on_file_node);
+    RUN_TEST(pipeline_doc_rust_inner_doc_on_file_node);
+    RUN_TEST(pipeline_doc_long_docstring_stored_whole);
     /* Project name */
     RUN_TEST(project_name_from_path);
     RUN_TEST(project_name_drive_letter_case_insensitive_issue394);

@@ -385,6 +385,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_list(c, &r->macros);
     cr_str(c, &r->error_msg);
     cr_str(c, &r->error_ranges);
+    cr_str(c, &r->module_doc);
     cr_blob(c, (const void **)&r->source, r->source ? (size_t)r->source_len + SKIP_ONE : 0);
 }
 

@@ -606,6 +606,11 @@ typedef struct CBMFileResult {
     // by cbm_free_result(); ordinary single-file results leave these zeroed.
     struct CBMFileResult **owned_results;
     int owned_result_count;
+
+    /* The file's own doc, set on its File node: the Go package comment or
+     * the Rust inner docs (//!). NULL for other languages and undocumented
+     * files. */
+    const char *module_doc;
 } CBMFileResult;
 
 // --- Enclosing function cache ---
@@ -692,6 +697,11 @@ typedef struct {
     /* How many nodes the unified walk actually visited (whether or not it ran
      * out of budget) — the measurement the budget has to be expressed in. */
     uint32_t walk_nodes_visited;
+    /* Doc-comment lookup state (extract_defs.c), NULL until first used and
+     * allocated in `scratch`: the memo of parents' child arrays and the Perl
+     * POD section index. */
+    void *doc_memo;
+    void *doc_pod_index;
 } CBMExtractCtx;
 
 // --- Public API ---

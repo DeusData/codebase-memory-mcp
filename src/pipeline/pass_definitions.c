@@ -22,6 +22,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h" /* cbm_alloc/cbm_free: the grown properties buffer */
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
@@ -321,16 +322,74 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
 }
 
-/* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges. */
-static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel) {
+/* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
+ * serialized docstring field, which has no length cap (a field that does not
+ * fit is dropped whole). Returns `stack` for a def without a docstring, or
+ * when the larger buffer cannot be allocated. Twin of pass_parallel.c -- keep
+ * both in sync. */
+static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
+    if (!def->docstring || !def->docstring[0]) {
+        return stack;
+    }
+    size_t need =
+        *size + strlen("docstring") + def_json_escaped_len(def->docstring) + PD_JSON_FIELD_OVERHEAD;
+    char *buf = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, need);
+    if (!buf) {
+        return stack;
+    }
+    *size = need;
+    return buf;
+}
+
+/* Add a file's own doc (Go package comment, Rust inner docs) to its File
+ * node as "docstring". Twin of pass_parallel.c -- keep both in sync. */
+static void pd_add_file_doc(const cbm_gbuf_node_t *file_node, const char *doc) {
+    if (!file_node || !doc || !doc[0]) {
+        return;
+    }
+    const char *old = file_node->properties_json ? file_node->properties_json : "{}";
+    size_t olen = strlen(old);
+    if (olen < PAIR_LEN || old[olen - SKIP_ONE] != '}') {
+        return; /* not a JSON object -- leave it untouched */
+    }
+    size_t cap = olen + strlen("docstring") + def_json_escaped_len(doc) + PD_JSON_FIELD_OVERHEAD +
+                 PD_ESC_SPACE + SKIP_ONE;
+    char *neu = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, cap);
+    if (!neu) {
+        return;
+    }
+    size_t pos = olen - SKIP_ONE; /* without the closing brace */
+    memcpy(neu, old, pos);
+    neu[pos] = '\0';
+    append_json_string(neu, cap, &pos, "docstring", doc);
+    if (olen == PAIR_LEN && pos > PAIR_LEN) { /* "{}": drop the leading comma */
+        memmove(neu + SKIP_ONE, neu + PAIR_LEN, pos - SKIP_ONE);
+        pos--;
+    }
+    neu[pos++] = '}';
+    neu[pos] = '\0';
+    (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file_node, neu);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, neu);
+}
+
+/* Process one definition: create node, register, DEFINES + DEFINES_METHOD edges.
+ * `file_doc`, the file's own doc (passed with its first def only), goes on the
+ * File node. */
+static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
+                        const char *file_doc) {
     if (!def->qualified_name || !def->name) {
         return;
     }
-    char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    char stack[CBM_SZ_2K];
+    size_t props_size = sizeof(stack);
+    char *props = pd_props_buf(def, stack, &props_size);
+    build_def_props(props, props_size, def);
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    if (props != stack) {
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
+    }
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
      * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
@@ -341,6 +400,7 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    pd_add_file_doc(file_node, file_doc);
     if (file_node && node_id > 0) {
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
     }
@@ -860,8 +920,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         /* Create nodes for each definition */
+        const char *file_doc = result->module_doc; /* goes with the first def */
         for (int d = 0; d < result->defs.count; d++) {
-            process_def(ctx, &result->defs.items[d], rel);
+            process_def(ctx, &result->defs.items[d], rel, file_doc);
+            file_doc = NULL;
             total_defs++;
         }
 

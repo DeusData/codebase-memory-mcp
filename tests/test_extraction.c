@@ -7064,12 +7064,12 @@ TEST(extract_python_method_test_dir_marks_is_test_issue1294) {
     PASS();
 }
 
-/* #1017: docstring truncation at MAX_COMMENT_LEN (500 bytes) can split a
+/* #1017: docstring truncation at MAX_COMMENT_LEN (500 bytes) could split a
  * multi-byte UTF-8 character, leaving an incomplete byte sequence.
  * Craft a Go comment whose 498th-500th bytes are a 3-byte CJK character
- * (U+6210 = 成 = e6 88 90).  The raw byte truncation at offset 500 lands
- * one byte past the character start, splitting it.  After the fix the
- * truncated string must end on a complete codepoint boundary. */
+ * (U+6210 = 成 = e6 88 90), where a raw byte cut at offset 500 lands one
+ * byte past the character start. Docstrings are no longer cut at all, so
+ * the whole comment is kept and still ends on a complete codepoint. */
 TEST(docstring_utf8_truncation_boundary_issue1017) {
     /* Build a comment: "// " (3 bytes) + 495 ASCII 'A' + "成成成" (9 bytes)
      * Total comment text = 3 + 495 + 9 = 507 bytes.
@@ -7110,10 +7110,10 @@ TEST(docstring_utf8_truncation_boundary_issue1017) {
     }
     ASSERT_NOT_NULL(doc);
 
-    /* Verify every byte in the truncated docstring is valid UTF-8:
-     * no trailing incomplete multi-byte sequence. */
+    /* The whole comment, and every byte of it valid UTF-8: no trailing
+     * incomplete multi-byte sequence. */
+    ASSERT_STR_EQ(doc, comment);
     size_t len = strlen(doc);
-    ASSERT_TRUE(len <= 500);
     const unsigned char *u = (const unsigned char *)doc;
     size_t i = 0;
     while (i < len) {
@@ -7135,6 +7135,298 @@ TEST(docstring_utf8_truncation_boundary_issue1017) {
         i += (size_t)seq_len;
     }
 
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Doc comments: the whole comment run above a definition, above its
+ * attributes / export / declaration wrapper, never a detached or
+ * banner-only run, and never cut at 500 bytes.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* The def with this label and name, or NULL. */
+static const CBMDefinition *doc_def(CBMFileResult *r, const char *label, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, label) == 0 && strcmp(d->name, name) == 0) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+TEST(doc_go_comment_group_without_directives) {
+    CBMFileResult *r = extract("package knob\n\n"
+                               "// Turn rotates the knob by one step.\n"
+                               "// It is safe for concurrent use.\n"
+                               "//go:noinline\n"
+                               "func Turn() {}\n",
+                               CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "Turn");
+    ASSERT_NOT_NULL(d);
+    /* go/ast CommentGroup.Text: the whole group, the //go: directive dropped. */
+    ASSERT_STR_EQ(d->docstring, "// Turn rotates the knob by one step.\n"
+                                "// It is safe for concurrent use.");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_go_struct_field) {
+    CBMFileResult *r = extract("package knob\n\n"
+                               "// Knob is a rotary control.\n"
+                               "type Knob struct {\n"
+                               "\t// Steps counts the turns so far.\n"
+                               "\tSteps int\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *knob = doc_def(r, "Struct", "Knob");
+    ASSERT_NOT_NULL(knob);
+    ASSERT_STR_EQ(knob->docstring, "// Knob is a rotary control.");
+    const CBMDefinition *steps = doc_def(r, "Field", "Steps");
+    ASSERT_NOT_NULL(steps);
+    ASSERT_STR_EQ(steps->docstring, "// Steps counts the turns so far.");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_go_detached_comment_is_not_doc) {
+    /* go/doc: a comment group separated by a blank line documents nothing. */
+    CBMFileResult *r = extract("package knob\n\n"
+                               "// Section: helpers.\n"
+                               "\n"
+                               "func Reset() {}\n",
+                               CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "Reset");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NULL(d->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_python_comment_run_and_detached) {
+    CBMFileResult *r = extract("# Turns the knob.\n"
+                               "# One step per call.\n"
+                               "def turn():\n"
+                               "    pass\n"
+                               "\n"
+                               "# Section: helpers.\n"
+                               "\n"
+                               "def reset():\n"
+                               "    pass\n",
+                               CBM_LANG_PYTHON, "t", "knob.py");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *turn = doc_def(r, "Function", "turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "# Turns the knob.\n# One step per call.");
+    const CBMDefinition *reset = doc_def(r, "Function", "reset");
+    ASSERT_NOT_NULL(reset);
+    ASSERT_NULL(reset->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_rust_attribute_impl_method_and_inner_doc) {
+    CBMFileResult *r = extract("//! The knob crate.\n"
+                               "\n"
+                               "/// Adds two steps.\n"
+                               "/// Wraps on overflow.\n"
+                               "#[inline]\n"
+                               "pub fn add(a: u8, b: u8) -> u8 { a.wrapping_add(b) }\n"
+                               "\n"
+                               "pub struct Knob;\n"
+                               "\n"
+                               "impl Knob {\n"
+                               "    /// Turns the knob once.\n"
+                               "    pub fn turn(&self) {}\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    /* The doc sits above the attribute; a run is joined line by line. */
+    const CBMDefinition *add = doc_def(r, "Function", "add");
+    ASSERT_NOT_NULL(add);
+    ASSERT_STR_EQ(add->docstring, "/// Adds two steps.\n/// Wraps on overflow.");
+    /* impl methods get their doc too; a single comment keeps its bytes. */
+    const CBMDefinition *turn = doc_def(r, "Method", "turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "/// Turns the knob once.\n");
+    /* The //! inner doc documents the crate (the File node), not the struct. */
+    const CBMDefinition *knob = doc_def(r, "Struct", "Knob");
+    ASSERT_NOT_NULL(knob);
+    ASSERT_NULL(knob->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_ts_export_and_arrow_wrapper) {
+    CBMFileResult *r = extract("/** Exported helper. */\n"
+                               "export function helper(): number {\n"
+                               "    return 1;\n"
+                               "}\n"
+                               "\n"
+                               "/** Arrow helper. */\n"
+                               "export const arrow = (): number => 2;\n",
+                               CBM_LANG_TYPESCRIPT, "t", "knob.ts");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *helper = doc_def(r, "Function", "helper");
+    ASSERT_NOT_NULL(helper);
+    ASSERT_STR_EQ(helper->docstring, "/** Exported helper. */");
+    const CBMDefinition *arrow = doc_def(r, "Function", "arrow");
+    ASSERT_NOT_NULL(arrow);
+    ASSERT_STR_EQ(arrow->docstring, "/** Arrow helper. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_csharp_xml_doc_run_and_top_level_function) {
+    CBMFileResult *r = extract("/// Adds one.\n"
+                               "static int AddOne(int x) => x + 1;\n"
+                               "\n"
+                               "namespace Knobs {\n"
+                               "    public class Knob {\n"
+                               "        /// <summary>\n"
+                               "        /// Turns the knob.\n"
+                               "        /// </summary>\n"
+                               "        public void Turn() {}\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Knob.cs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *turn = doc_def(r, "Method", "Turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "/// <summary>\n/// Turns the knob.\n/// </summary>");
+    const CBMDefinition *add = doc_def(r, "Function", "AddOne");
+    ASSERT_NOT_NULL(add);
+    ASSERT_STR_EQ(add->docstring, "/// Adds one.");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_java_javadoc_over_line_comment_and_field) {
+    CBMFileResult *r = extract("class Knob {\n"
+                               "    /** Turns taken so far. */\n"
+                               "    private int steps;\n"
+                               "\n"
+                               "    /** Turns the knob. */\n"
+                               "    // NOSONAR\n"
+                               "    void turn() {}\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "Knob.java");
+    ASSERT_NOT_NULL(r);
+    /* A plain comment between the Javadoc and the method does not replace it. */
+    const CBMDefinition *turn = doc_def(r, "Method", "turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "/** Turns the knob. */");
+    const CBMDefinition *steps = doc_def(r, "Field", "steps");
+    ASSERT_NOT_NULL(steps);
+    ASSERT_STR_EQ(steps->docstring, "/** Turns taken so far. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_kotlin_kdoc_folded_after_imports) {
+    /* tree-sitter-kotlin folds this KDoc into the node before the class, so it
+     * is no sibling of it. */
+    CBMFileResult *r = extract("package knobs\n"
+                               "\n"
+                               "import knobs.core.Step\n"
+                               "import knobs.core.Turn\n"
+                               "\n"
+                               "/** Base class of every knob. */\n"
+                               "abstract class BaseKnob(step: Step) : Turn(step)\n",
+                               CBM_LANG_KOTLIN, "t", "BaseKnob.kt");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Class", "BaseKnob");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "/** Base class of every knob. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_c_typedef_struct) {
+    CBMFileResult *r = extract("/* A file event. */\n"
+                               "typedef struct aeFileEvent {\n"
+                               "    int mask;\n"
+                               "} aeFileEvent;\n",
+                               CBM_LANG_C, "t", "ae.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Class", "aeFileEvent");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "/* A file event. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_perl_pod_section_by_sub_name) {
+    CBMFileResult *r = extract("package Knob;\n"
+                               "\n"
+                               "sub turn { return 1; }\n"
+                               "\n"
+                               "1;\n"
+                               "__END__\n"
+                               "\n"
+                               "=head1 METHODS\n"
+                               "\n"
+                               "=head2 turn\n"
+                               "\n"
+                               "Turns the knob once.\n"
+                               "\n"
+                               "=cut\n",
+                               CBM_LANG_PERL, "t", "Knob.pm");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "turn");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "=head2 turn\n\nTurns the knob once.");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_long_comment_kept_whole) {
+    /* One 12-line block comment well past the old 500-byte cut, kept byte for
+     * byte. */
+    char src[4096];
+    char want[2048];
+    int w = snprintf(want, sizeof(want), "/*");
+    for (int i = 0; i < 12; i++) {
+        w += snprintf(want + w, sizeof(want) - (size_t)w,
+                      "\n * Line %02d of a long doc that keeps going past the cut.", i);
+    }
+    snprintf(want + w, sizeof(want) - (size_t)w, "\n */");
+    snprintf(src, sizeof(src), "package knob\n\n%s\nfunc Long() {}\n", want);
+    ASSERT_GT((int)strlen(want), 500);
+
+    CBMFileResult *r = extract(src, CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "Long");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, want);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_divider_only_run_is_not_doc) {
+    CBMFileResult *r = extract("/*****************************/\n"
+                               "void knob(void) {}\n"
+                               "\n"
+                               "// \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n"
+                               "void dial(void) {}\n"
+                               "\n"
+                               "/* Resets the dial. */\n"
+                               "void reset(void) {}\n",
+                               CBM_LANG_C, "t", "knob.c");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *knob = doc_def(r, "Function", "knob");
+    ASSERT_NOT_NULL(knob);
+    ASSERT_NULL(knob->docstring);
+    const CBMDefinition *dial = doc_def(r, "Function", "dial"); /* a box-drawing banner */
+    ASSERT_NOT_NULL(dial);
+    ASSERT_NULL(dial->docstring);
+    const CBMDefinition *reset = doc_def(r, "Function", "reset");
+    ASSERT_NOT_NULL(reset);
+    ASSERT_STR_EQ(reset->docstring, "/* Resets the dial. */");
     cbm_free_result(r);
     PASS();
 }
@@ -9291,6 +9583,19 @@ SUITE(extraction) {
     RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
+    RUN_TEST(doc_go_comment_group_without_directives);
+    RUN_TEST(doc_go_struct_field);
+    RUN_TEST(doc_go_detached_comment_is_not_doc);
+    RUN_TEST(doc_python_comment_run_and_detached);
+    RUN_TEST(doc_rust_attribute_impl_method_and_inner_doc);
+    RUN_TEST(doc_ts_export_and_arrow_wrapper);
+    RUN_TEST(doc_csharp_xml_doc_run_and_top_level_function);
+    RUN_TEST(doc_java_javadoc_over_line_comment_and_field);
+    RUN_TEST(doc_kotlin_kdoc_folded_after_imports);
+    RUN_TEST(doc_c_typedef_struct);
+    RUN_TEST(doc_perl_pod_section_by_sub_name);
+    RUN_TEST(doc_long_comment_kept_whole);
+    RUN_TEST(doc_divider_only_run_is_not_doc);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
 
     /* #518/#519 — prose carried into docstring so nodes_fts can index it */
