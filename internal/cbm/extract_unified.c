@@ -2558,6 +2558,29 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     }
 }
 
+/* ST: the body of a FUNCTION_BLOCK or PROGRAM is the code that runs when the
+ * block is called, so its calls and reads source to the block, not to the
+ * Module. Runs after push_boundary_scopes: the block's class frame at this
+ * depth becomes the enclosing routine until that frame pops (and restores
+ * the Module). Its METHODs push their own function scope. */
+static void st_enter_block_body(const CBMExtractCtx *ctx, TSNode node, WalkState *state,
+                                uint32_t depth) {
+    if (ctx->language != CBM_LANG_ST) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "function_block_declaration") != 0 &&
+        strcmp(kind, "program_declaration") != 0) {
+        return;
+    }
+    for (int i = state->scope_top - SKIP_ONE; i >= 0 && state->scopes[i].depth == depth; i--) {
+        if (state->scopes[i].kind == SCOPE_CLASS && state->scopes[i].qn) {
+            state->enclosing_func_qn = state->scopes[i].qn;
+            return;
+        }
+    }
+}
+
 void cbm_extract_unified(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -2650,6 +2673,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             scan_infra_bindings(ctx, node);
 
             push_boundary_scopes(ctx, node, spec, &state, depth, &invocation);
+            st_enter_block_body(ctx, node, &state, depth);
         }
 
         /* Lexer-terminal trivia has no semantic work and no descendants. Avoid

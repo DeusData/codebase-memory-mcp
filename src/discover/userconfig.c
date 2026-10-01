@@ -143,6 +143,7 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"mojo", CBM_LANG_MOJO},
     {"plsql", CBM_LANG_PLSQL},
     {"chialisp", CBM_LANG_CHIALISP},
+    {"st", CBM_LANG_ST},
     {"lean", CBM_LANG_LEAN},
     {"form", CBM_LANG_FORM},
     {"magma", CBM_LANG_MAGMA},

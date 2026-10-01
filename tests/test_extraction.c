@@ -4903,10 +4903,11 @@ TEST(swift_non_url_constructor_untouched_issue1892) {
  * the per-file constant map and resolved at the call site, for both return
  * statements and arrow expression bodies. */
 TEST(extract_ts_await_generic_call_issue2210) {
-    CBMFileResult *r = extract("function parseJsonBody<T>() { return {} as T; }\n"
-                               "async function plain() { return await parseJsonBody(); }\n"
-                               "async function generic() { return await parseJsonBody<string>(); }\n",
-                               CBM_LANG_TYPESCRIPT, "t", "await.ts");
+    CBMFileResult *r =
+        extract("function parseJsonBody<T>() { return {} as T; }\n"
+                "async function plain() { return await parseJsonBody(); }\n"
+                "async function generic() { return await parseJsonBody<string>(); }\n",
+                CBM_LANG_TYPESCRIPT, "t", "await.ts");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_EQ(count_calls_named(r, "parseJsonBody"), 2);
@@ -8410,6 +8411,238 @@ TEST(non_config_language_module_has_no_promoted_description_issue519) {
     PASS();
 }
 
+/* ── IEC 61131-3 Structured Text ─────────────────────────────────────────── */
+
+/* A FUNCTION_BLOCK is class-like: it owns its METHOD and PROPERTY members. */
+TEST(st_function_block_is_class_with_members) {
+    CBMFileResult *r = extract("FUNCTION_BLOCK FB_Motor\n"
+                               "VAR\n"
+                               "  _running : BOOL;\n"
+                               "END_VAR\n"
+                               "METHOD PUBLIC Start : BOOL\n"
+                               "Start := TRUE;\n"
+                               "END_METHOD\n"
+                               "PROPERTY PUBLIC Running : BOOL\n"
+                               "GET\n"
+                               "Running := _running;\n"
+                               "END_GET\n"
+                               "END_PROPERTY\n"
+                               "END_FUNCTION_BLOCK\n",
+                               CBM_LANG_ST, "t", "Motor.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "FB_Motor"));
+    ASSERT(has_def(r, "Method", "Start"));
+    ASSERT(has_def(r, "Field", "Running"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Regression: the ST grammar tags a TRAILING body statement with the field name
+ * "body". find_class_body() probes that field name before any language case, so
+ * it used to return the lone statement as the member container and every member
+ * of such a block was silently dropped. Members must survive the statement. */
+TEST(st_members_survive_trailing_body_statement) {
+    CBMFileResult *r = extract("FUNCTION_BLOCK FB_Motor\n"
+                               "VAR\n"
+                               "  _running : BOOL;\n"
+                               "END_VAR\n"
+                               "METHOD PUBLIC Start : BOOL\n"
+                               "Start := TRUE;\n"
+                               "END_METHOD\n"
+                               "PROPERTY PUBLIC Running : BOOL\n"
+                               "GET\n"
+                               "Running := _running;\n"
+                               "END_GET\n"
+                               "END_PROPERTY\n"
+                               "_running := TRUE;\n"
+                               "END_FUNCTION_BLOCK\n",
+                               CBM_LANG_ST, "t", "Motor.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "FB_Motor"));
+    ASSERT(has_def(r, "Method", "Start"));
+    ASSERT(has_def(r, "Field", "Running"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* An INTERFACE holds method_signature nodes, not method_declaration ones. */
+TEST(st_interface_members_extracted) {
+    CBMFileResult *r = extract("INTERFACE I_Motor\n"
+                               "METHOD Start : BOOL\n"
+                               "END_METHOD\n"
+                               "METHOD Stop : BOOL\n"
+                               "END_METHOD\n"
+                               "END_INTERFACE\n",
+                               CBM_LANG_ST, "t", "I_Motor.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "I_Motor"));
+    ASSERT(has_def(r, "Method", "Start"));
+    ASSERT(has_def(r, "Method", "Stop"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* "TYPE T_X : ... END_TYPE" parses as a NAMELESS type_declaration wrapping a
+ * type_definition that carries the name, which is why type_definition and not
+ * type_declaration is registered. */
+TEST(st_struct_type_keeps_its_name) {
+    CBMFileResult *r =
+        extract("TYPE T_MotorConfig :\nSTRUCT\n  MaxSpeed : INT;\nEND_STRUCT;\nEND_TYPE\n",
+                CBM_LANG_ST, "t", "Types.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def_any(r, "T_MotorConfig"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(st_type_alias_keeps_its_name) {
+    CBMFileResult *r = extract("TYPE T_Speed : INT; END_TYPE\n", CBM_LANG_ST, "t", "Speed.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def_any(r, "T_Speed"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The body of a FUNCTION_BLOCK or PROGRAM is the code that runs when the
+ * block is called, so a call made there, like a type its VAR section reads,
+ * belongs to the block itself, not to the file's Module node. A call inside a
+ * METHOD stays with the method. */
+TEST(st_body_call_sources_to_its_block) {
+    CBMFileResult *r = extract("FUNCTION_BLOCK FB_Motor\n"
+                               "VAR\n"
+                               "  cfg : T_Config;\n"
+                               "END_VAR\n"
+                               "METHOD Start : BOOL\n"
+                               "StartDrive();\n"
+                               "END_METHOD\n"
+                               "RunCycle();\n"
+                               "END_FUNCTION_BLOCK\n"
+                               "PROGRAM Main\n"
+                               "Supervise();\n"
+                               "END_PROGRAM\n",
+                               CBM_LANG_ST, "t", "Motor.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *fb = find_def_by_name(r, "FB_Motor");
+    const CBMDefinition *prog = find_def_by_name(r, "Main");
+    const CBMDefinition *start = find_def_by_name(r, "Start");
+    const CBMCall *run_cycle = find_call_by_callee(r, "RunCycle");
+    const CBMCall *supervise = find_call_by_callee(r, "Supervise");
+    const CBMCall *start_drive = find_call_by_callee(r, "StartDrive");
+    ASSERT_NOT_NULL(fb);
+    ASSERT_NOT_NULL(prog);
+    ASSERT_NOT_NULL(start);
+    ASSERT_NOT_NULL(run_cycle);
+    ASSERT_NOT_NULL(supervise);
+    ASSERT_NOT_NULL(start_drive);
+    ASSERT_STR_EQ(run_cycle->enclosing_func_qn, fb->qualified_name);
+    ASSERT_STR_EQ(supervise->enclosing_func_qn, prog->qualified_name);
+    ASSERT_STR_EQ(start_drive->enclosing_func_qn, start->qualified_name);
+    const CBMUsage *cfg_type = NULL;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "T_Config") == 0) {
+            cfg_type = &r->usages.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(cfg_type);
+    ASSERT_STR_EQ(cfg_type->enclosing_func_qn, fb->qualified_name);
+    cbm_free_result(r);
+    PASS();
+}
+
+static int st_usage_count(const CBMFileResult *r, const char *name) {
+    int count = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, name) == 0)
+            count++;
+    }
+    return count;
+}
+
+/* ST keeps declared names in the plural `names` field, which the generic
+ * binding rules did not list, so every declaration used to be emitted as a
+ * usage too — inflating in-degree. Declared names bind; a declaration's type
+ * and its initializer are still reads. */
+TEST(st_declared_names_bind_while_types_and_initializers_stay_usages) {
+    CBMFileResult *r = extract("FUNCTION run : INT\n"
+                               "VAR_INPUT\n"
+                               "  watched : INT;\n"
+                               "END_VAR\n"
+                               "VAR\n"
+                               "  cfg : T_Config;\n"
+                               "  f : INT := seed;\n"
+                               "END_VAR\n"
+                               "run := watched + f;\n"
+                               "END_FUNCTION\n",
+                               CBM_LANG_ST, "t", "Run.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(st_usage_count(r, "watched"), 1);
+    ASSERT_EQ(st_usage_count(r, "f"), 1);
+    ASSERT_EQ(st_usage_count(r, "cfg"), 0);
+    ASSERT_EQ(st_usage_count(r, "T_Config"), 1);
+    ASSERT_EQ(st_usage_count(r, "seed"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+static const CBMDefinition *st_def(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+static int st_has_base(const CBMDefinition *d, const char *base) {
+    for (int i = 0; d && d->base_classes && d->base_classes[i]; i++) {
+        if (strcmp(d->base_classes[i], base) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int st_base_count(const CBMDefinition *d) {
+    int n = 0;
+    while (d && d->base_classes && d->base_classes[n])
+        n++;
+    return n;
+}
+
+/* ST tags every base with a REPEATED `extends`/`implements` field, so a
+ * first-match field probe kept at most one base and the graph had no
+ * INHERITS/IMPLEMENTS edge at all. Every base must be collected. */
+TEST(st_extends_and_implements_collect_every_base) {
+    CBMFileResult *r = extract("FUNCTION_BLOCK FB_A EXTENDS FB_Base IMPLEMENTS I_One, I_Two\n"
+                               "END_FUNCTION_BLOCK\n"
+                               "FUNCTION_BLOCK FB_B IMPLEMENTS Lib.I_Three\n"
+                               "END_FUNCTION_BLOCK\n"
+                               "INTERFACE I_X EXTENDS I_One, I_Two\n"
+                               "END_INTERFACE\n",
+                               CBM_LANG_ST, "t", "Bases.st");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    const CBMDefinition *a = st_def(r, "FB_A");
+    const CBMDefinition *b = st_def(r, "FB_B");
+    const CBMDefinition *x = st_def(r, "I_X");
+    ASSERT_EQ(st_base_count(a), 3);
+    ASSERT(st_has_base(a, "FB_Base"));
+    ASSERT(st_has_base(a, "I_One"));
+    ASSERT(st_has_base(a, "I_Two"));
+    ASSERT_EQ(st_base_count(b), 1);
+    ASSERT(st_has_base(b, "Lib.I_Three"));
+    ASSERT_EQ(st_base_count(x), 2);
+    ASSERT(st_has_base(x, "I_One"));
+    ASSERT(st_has_base(x, "I_Two"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Result compaction (cbm_result_compact) ────────────────────────────── */
 
 static const char *COMPACT_PY_SRC = "import os\n"
@@ -9252,6 +9485,14 @@ SUITE(extraction) {
     RUN_TEST(json_toplevel_description_promoted_to_module_issue519);
     RUN_TEST(config_description_only_at_top_level_issue519);
     RUN_TEST(non_config_language_module_has_no_promoted_description_issue519);
+    RUN_TEST(st_function_block_is_class_with_members);
+    RUN_TEST(st_members_survive_trailing_body_statement);
+    RUN_TEST(st_interface_members_extracted);
+    RUN_TEST(st_struct_type_keeps_its_name);
+    RUN_TEST(st_type_alias_keeps_its_name);
+    RUN_TEST(st_body_call_sources_to_its_block);
+    RUN_TEST(st_declared_names_bind_while_types_and_initializers_stay_usages);
+    RUN_TEST(st_extends_and_implements_collect_every_base);
 
     cbm_shutdown();
 }

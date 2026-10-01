@@ -174,6 +174,39 @@ extern const TSLanguage *tree_sitter_plsql(void);
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
 
+// ==================== STRUCTURED TEXT (IEC 61131-3) ====================
+// Every node name below was taken from the grammar's node-types.json at the
+// pinned commit, not guessed.
+extern const TSLanguage *tree_sitter_iec61131_3_st(void);
+// An INTERFACE member is a *_signature, not a *_declaration - verified by
+// parsing: an INTERFACE contains method_signature/property_signature and no
+// method_declaration/property_declaration at all.
+// FUNCTION_BLOCK and PROGRAM are class-like: they OWN methods and properties.
+// They must not be in function_node_types: the def-walker would match the
+// block, emit one node spanning all of it and stop descending (it descends
+// into a matched function only for an allowlist of languages that does not
+// include ST), so the block's own methods and properties would be lost, while
+// an INTERFACE's members still arrive via the class-body path.
+// Do NOT list them in both arrays: the function branch runs first and wins.
+static const char *st_func_types[] = {"method_declaration", "method_signature",
+                                      "function_declaration", NULL};
+// "TYPE T_X : INT; END_TYPE" parses as a NAMELESS type_declaration wrapping a
+// type_definition that carries name='T_X'. Selecting the wrapper loses the name.
+static const char *st_class_types[] = {"function_block_declaration", "program_declaration",
+                                       "interface_declaration", "type_definition", NULL};
+static const char *st_field_types[] = {"property_declaration", "property_signature", NULL};
+static const char *st_module_types[] = {"source_file", NULL};
+static const char *st_call_types[] = {"call_expression", "invocation_statement", NULL};
+// The dependency is "USING N;" (using_directive). A namespace_declaration is the
+// file DECLARING a namespace, which is the opposite of an import - registering it
+// produced an import edge pointing at the file's own namespace.
+static const char *st_import_types[] = {"using_directive", NULL};
+static const char *st_branch_types[] = {"if_statement",    "case_statement",   "for_statement",
+                                        "while_statement", "repeat_statement", NULL};
+static const char *st_var_types[] = {"variable_declaration", NULL};
+static const char *st_assign_types[] = {"assignment_statement", "reference_assignment_statement",
+                                        NULL};
+
 // ==================== GO ====================
 static const char *go_func_types[] = {"function_declaration", "method_declaration", "method_elem",
                                       "func_literal", NULL};
@@ -2188,6 +2221,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                            chialisp_module_types, chialisp_call_types, empty_types, empty_types,
                            empty_types, chialisp_var_types, empty_types, empty_types, NULL,
                            empty_types, NULL, NULL, tree_sitter_chialisp, NULL},
+
+    // CBM_LANG_ST
+    [CBM_LANG_ST] = {CBM_LANG_ST, st_func_types, st_class_types, st_field_types, st_module_types,
+                     st_call_types, st_import_types, empty_types, st_branch_types, st_var_types,
+                     st_assign_types, empty_types, NULL, empty_types, NULL, NULL,
+                     tree_sitter_iec61131_3_st, NULL},
 
     // CBM_LANG_FENNEL
     [CBM_LANG_FENNEL] = {CBM_LANG_FENNEL, fennel_func_types, empty_types, empty_types,

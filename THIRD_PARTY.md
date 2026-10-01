@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-160 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+163 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -84,6 +84,17 @@ License summary:
   other vendored grammar, as documented in
   `internal/cbm/vendored/grammars/MANIFEST.md`. PL/SQL support was originally
   contributed in PR #1033 by Oğuz (@ouzsrcm).
+
+### tree-sitter-iec61131-3-st
+
+- **Project:** [HeytalePazguato/tree-sitter-iec61131-3-st](https://github.com/HeytalePazguato/tree-sitter-iec61131-3-st)
+- **License:** MIT
+- **Copyright:** (c) 2026 Jorge Centeno
+- **Vendored at:** `internal/cbm/vendored/grammars/st/`
+- **Pinned commit:** `00e24f50f8de`
+- **Notes:** Community-maintained grammar for IEC 61131-3 Structured Text; not in
+  the nvim-treesitter or Helix registries (`community-niche` in the manifest).
+  Ships `parser.c` plus an external `scanner.c`. No local patches.
 
 ### tree-sitter-objectscript (UDL + routine)
 

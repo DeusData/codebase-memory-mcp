@@ -458,6 +458,7 @@ static const char *const meson_write_nodes[] = {"operatorunit", NULL};
 static const char *const gn_write_nodes[] = {"assignment_statement", NULL};
 static const char *const objectscript_binding_nodes[] = {"argument", "tag_parameter", NULL};
 static const char *const objectscript_write_nodes[] = {"set_argument", NULL};
+static const char *const st_binding_nodes[] = {"variable_declaration", NULL};
 
 /* Parallel to lang_specs: occurrence semantics evolve without adding fields to
  * the positional CBMLangSpec initializer used by every language. */
@@ -506,6 +507,13 @@ static const CBMOccurrenceSpec occurrence_specs[CBM_LANG_COUNT] = {
                                    CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = {objectscript_binding_nodes, objectscript_write_nodes,
                                        CBM_OCCURRENCE_STANDARD, true},
+    /* IEC 61131-3 ST: every VAR/VAR_INPUT/VAR_OUTPUT/VAR_IN_OUT/VAR_TEMP entry is a
+     * variable_declaration whose names sit in the plural `names` field, which
+     * binding_fields does not list — so without this row a declared name was
+     * emitted as a usage. All VAR sections precede the body and are visible for
+     * the whole POU, so parameter-like whole-scope binding is the ST semantics.
+     * The `type` field and (see is_binding_occurrence) `initial_value` stay reads. */
+    [CBM_LANG_ST] = {st_binding_nodes, NULL, CBM_OCCURRENCE_STANDARD, false},
 };
 
 static bool text_equals(CBMExtractCtx *ctx, TSNode node, const char *expected) {
@@ -1137,6 +1145,26 @@ static bool elixir_binary_operator_binds(CBMExtractCtx *ctx, TSNode node) {
            text_equals(ctx, operator_node, "->") || text_equals(ctx, operator_node, "\\\\");
 }
 
+/* A declaration field whose symbols are reads, not the declared name.
+ * A declaration container binds its name/pattern, not the symbols used by its
+ * type annotation. Both TypeScript (`cfg: Config`) and Go (`cfg Config`)
+ * expose that annotation through the exact `type` field; stop before the
+ * whole-parameter binding rule can swallow `Config`. The emitted occurrence
+ * remains an ordinary USAGE, never a callable reference merely because the
+ * target happens to be a type. ST names a declaration's initializer
+ * `initial_value` ("f : INT := g;"): a read like any value field, but
+ * is_value_field stays generic, since Pine exposes a field of the same name
+ * with its own occurrence policy. */
+static bool is_non_binding_decl_field(const CBMExtractCtx *ctx, const char *field) {
+    if (!field) {
+        return false;
+    }
+    if (strcmp(field, "type") == 0) {
+        return true;
+    }
+    return ctx->language == CBM_LANG_ST && strcmp(field, "initial_value") == 0;
+}
+
 static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                   WalkState *state) {
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
@@ -1158,13 +1186,7 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
         if (is_value_field(field)) {
             return false;
         }
-        /* A declaration container binds its name/pattern, not the symbols used
-         * by its type annotation.  Both TypeScript (`cfg: Config`) and Go
-         * (`cfg Config`) expose that annotation through the exact `type` field;
-         * stop before the whole-parameter binding rule can swallow `Config`.
-         * The emitted occurrence remains an ordinary USAGE, never a callable
-         * reference merely because the target happens to be a type. */
-        if (field && strcmp(field, "type") == 0) {
+        if (is_non_binding_decl_field(ctx, field)) {
             return false;
         }
 
