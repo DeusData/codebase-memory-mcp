@@ -41,6 +41,11 @@ static const lib_pattern_t http_libraries[] = {
 
     /* JavaScript / TypeScript */
     {"axios", CBM_SVC_HTTP, NULL},
+    /* `import Axios from "axios"`: the capitalized default-import binding
+     * (also axios's own Axios / AxiosInstance types). Matching is
+     * case-sensitive, so without this entry `Axios.get(url)` fell through to
+     * the `.get` route-suffix fallback and became a route registration. */
+    {"Axios", CBM_SVC_HTTP, NULL},
     {"superagent", CBM_SVC_HTTP, NULL},
     {"needle", CBM_SVC_HTTP, NULL},
     {"node-fetch", CBM_SVC_HTTP, NULL},

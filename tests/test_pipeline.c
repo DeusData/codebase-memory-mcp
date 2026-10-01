@@ -1592,6 +1592,35 @@ static int named_edge_count(cbm_store_t *s, const char *project, const char *edg
     return matches;
 }
 
+/* HTTP_CALLS edges out of the function `source_name` whose Route target's
+ * qualified name contains `route_qn_part` (e.g. "__route__GET__"). */
+static int http_calls_to_route(cbm_store_t *s, const char *project, const char *source_name,
+                               const char *route_qn_part) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HTTP_CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            strcmp(source.name, source_name) == 0 && strstr(target.qualified_name, route_qn_part)) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
 /* Like named_edge_count, but distinguish same-named targets by their source
  * file. Semantic-control fixtures intentionally keep the exported short name
  * identical in two modules so a project-wide unique-name fallback cannot make
@@ -6982,6 +7011,120 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     }
     th_rmtree(tmp);
     PASS();
+}
+
+/* Route-registration CALLS edges (via=route_registration) out of the function
+ * `source_name`. */
+static int route_registrations_from(cbm_store_t *s, const char *project, const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        if (source_ok && source.name && strcmp(source.name, source_name) == 0 &&
+            edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"via\":\"route_registration\"")) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* `import Axios from "axios"` -- the default-import binding capitalized, a
+ * common convention -- must classify `Axios.get/post/delete(url)` as HTTP
+ * client calls exactly like `axios.*`. The library table matched only the
+ * lowercase id, so the calls fell through to the `.get`/`.post` route-suffix
+ * fallback and became route REGISTRATIONS: on
+ * microsoft/Game-Control-Puzzle-Event-Administration-Tools all 69 client
+ * calls masqueraded as server Routes. A real Express registration in the same
+ * project stays a registration. `fillers` > 0 forces the parallel resolver,
+ * 0 keeps the sequential one; both classify through the same table. */
+static int capitalized_axios_case(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_axios_cap_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/service.ts",
+                    "import Axios from \"axios\";\n"
+                    "export function getSettings(eventId: string) {\n"
+                    "  return Axios.get(`/api/admin/events/${eventId}/settings`);\n"
+                    "}\n"
+                    "export function addUser(eventId: string, participant: unknown) {\n"
+                    "  return Axios.post(`/api/admin/users/${eventId}`, participant);\n"
+                    "}\n"
+                    "export function removeUser(id: string) {\n"
+                    "  return Axios.delete(`/api/admin/users/${id}`);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/server.ts",
+                    "function listUsers(req: unknown, res: unknown) {}\n"
+                    "export function mount(router: any) {\n"
+                    "  router.get('/api/admin/users', listUsers);\n"
+                    "}\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/axios_cap.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *typed_route;
+    } client[] = {{"getSettings", "__route__GET__"},
+                  {"addUser", "__route__POST__"},
+                  {"removeUser", "__route__DELETE__"}};
+    for (size_t i = 0; i < sizeof(client) / sizeof(client[0]); i++) {
+        ASSERT_EQ(route_registrations_from(s, project, client[i].caller), 0);
+        ASSERT_EQ(http_calls_to_route(s, project, client[i].caller, client[i].typed_route), 1);
+    }
+    /* Control: the server-side registration is untouched. */
+    ASSERT_EQ(route_registrations_from(s, project, "mount"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "mount", "__route__"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_capitalized_axios_import_is_http_client) {
+    return capitalized_axios_case(52);
+}
+
+TEST(pipeline_capitalized_axios_import_is_http_client_sequential) {
+    return capitalized_axios_case(0);
 }
 
 /* Python bare-call local-binding suppression, sequential path. The bare-call
@@ -16353,6 +16496,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_capitalized_axios_import_is_http_client);
+    RUN_TEST(pipeline_capitalized_axios_import_is_http_client_sequential);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);

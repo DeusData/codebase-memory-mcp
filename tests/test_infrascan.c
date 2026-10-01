@@ -113,6 +113,8 @@ TEST(infrascan_service_pattern_match_rejects_ids_inside_words) {
         {"gqlalchemy.Memgraph.execute", CBM_SVC_NONE},
         {"celeryconfig.broker_url", CBM_SVC_NONE},
         {"kafkaesque.story.tell", CBM_SVC_NONE},
+        /* "Axios" glued to a lowercase continuation */
+        {"geo.Axiosphere.map", CBM_SVC_NONE},
         {NULL, CBM_SVC_NONE},
     };
     ASSERT_EQ(svc_case_mismatches(cases), 0);
@@ -136,6 +138,11 @@ TEST(infrascan_service_pattern_match_keeps_real_library_qns) {
         {"package:dio/dio.dart", CBM_SVC_HTTP},
         {"dio.Dio.get", CBM_SVC_HTTP},
         {"pkg.net.curl.get", CBM_SVC_HTTP},
+        /* axios under a capitalized default-import binding
+         * (`import Axios from "axios"`) and axios's own instance type */
+        {"Axios.get", CBM_SVC_HTTP},
+        {"Axios.post", CBM_SVC_HTTP},
+        {"AxiosInstance.get", CBM_SVC_HTTP},
         {"curl_exec", CBM_SVC_HTTP},
         {"surf.get", CBM_SVC_HTTP},
         {"hyper.Client.request", CBM_SVC_HTTP},
