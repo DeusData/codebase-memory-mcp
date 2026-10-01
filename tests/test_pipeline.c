@@ -16270,6 +16270,402 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 }
 #endif
 
+/* #1153: a C++ method called on the object a static factory returns
+ * (`SecdManager::getInstance()->m()`, `Registry::instance().m()`,
+ * `auto w = Widget::create(); w->m()`) got no CALLS edge when the class lives
+ * in another file. The class is declared in a header, its methods are defined
+ * out of line in a .cpp, and the call is in a third file -- the reporter's
+ * layout. The cross-file C++ LSP resolved `Class::member` only under the
+ * caller's own module QN or as a bare QN, so the static call missed, its return
+ * type stayed unknown, and every receiver built from it dropped the method
+ * call. In one file the same code already resolved.
+ *
+ * `Other` declares the same method names in the same header: a correct
+ * resolution must never bind them. `Twin` is declared by two libraries, so
+ * `Twin::get()` names no single class and must stay unresolved. `Mystery` is
+ * never defined, so `m->paint()` has no receiver type to dispatch on. 52
+ * fillers + CBM_WORKERS=4 force the parallel path; each test runs both. */
+/* write_temp_file creates one directory level; this layout nests two. */
+static void cpp_recv_write(const char *tmp, const char *name, const char *content) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/%s", tmp, name);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        cbm_mkdir_p(dir, 0755);
+    }
+    write_temp_file(tmp, name, content);
+}
+
+static void cpp_recv_write_fixture(const char *tmp, bool parallel) {
+    cpp_recv_write(tmp, "app/src/SecdManager.h",
+                   "#pragma once\n"
+                   "#include <memory>\n\n"
+                   "class SecdManager {\n"
+                   "public:\n"
+                   "    static SecdManager *getInstance();\n"
+                   "    bool secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, int &pic_id);\n"
+                   "};\n\n"
+                   "class Registry {\n"
+                   "public:\n"
+                   "    static Registry &instance();\n"
+                   "    void registerItem(int id);\n"
+                   "};\n\n"
+                   "class Widget {\n"
+                   "public:\n"
+                   "    static std::unique_ptr<Widget> create();\n"
+                   "    void paint();\n"
+                   "};\n\n"
+                   "class Session {\n"
+                   "public:\n"
+                   "    static std::shared_ptr<Session> open();\n"
+                   "    void close();\n"
+                   "};\n\n"
+                   "class Other {\n"
+                   "public:\n"
+                   "    bool secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, int &pic_id);\n"
+                   "    void registerItem(int id);\n"
+                   "    void paint();\n"
+                   "    void close();\n"
+                   "};\n");
+    cpp_recv_write(
+        tmp, "app/src/SecdManager.cpp",
+        "#include \"SecdManager.h\"\n\n"
+        "SecdManager *SecdManager::getInstance() {\n"
+        "    static SecdManager inst;\n"
+        "    return &inst;\n"
+        "}\n\n"
+        "bool SecdManager::secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, "
+        "int &pic_id) {\n"
+        "    fpc_id = ifdh;\n"
+        "    pic_id = ifdh;\n"
+        "    return true;\n"
+        "}\n\n"
+        "Registry &Registry::instance() {\n"
+        "    static Registry r;\n"
+        "    return r;\n"
+        "}\n\n"
+        "void Registry::registerItem(int id) { (void)id; }\n\n"
+        "std::unique_ptr<Widget> Widget::create() { return std::make_unique<Widget>(); }\n\n"
+        "void Widget::paint() {}\n\n"
+        "std::shared_ptr<Session> Session::open() { return std::make_shared<Session>(); }\n\n"
+        "void Session::close() {}\n\n"
+        "bool Other::secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, int &pic_id) {\n"
+        "    fpc_id = pic_id = ifdh;\n"
+        "    return false;\n"
+        "}\n"
+        "void Other::registerItem(int id) { (void)id; }\n"
+        "void Other::paint() {}\n"
+        "void Other::close() {}\n");
+    for (int lib = 0; lib < 2; lib++) {
+        char path[64];
+        snprintf(path, sizeof(path), "lib_%c/Twin.h", 'a' + lib);
+        cpp_recv_write(tmp, path,
+                       "#pragma once\n"
+                       "class Twin {\n"
+                       "public:\n"
+                       "    static Twin *get();\n"
+                       "    void run();\n"
+                       "};\n");
+        snprintf(path, sizeof(path), "lib_%c/Twin.cpp", 'a' + lib);
+        cpp_recv_write(tmp, path,
+                       "#include \"Twin.h\"\n\n"
+                       "Twin *Twin::get() {\n"
+                       "    static Twin t;\n"
+                       "    return &t;\n"
+                       "}\n\n"
+                       "void Twin::run() {}\n");
+    }
+    cpp_recv_write(
+        tmp, "pil/src/SecdCfgHandlerThread.cpp",
+        "#include \"SecdManager.h\"\n"
+        "#include \"Twin.h\"\n\n"
+        "int GetExternalPhyPresent(int ifdh) {\n"
+        "    int fpc_id = 0, pic_id = 0;\n"
+        "    if (!SecdManager::getInstance()->secd_retrieve_pic_fpc_i2c_id(ifdh, fpc_id, "
+        "pic_id)) {\n"
+        "        return -1;\n"
+        "    }\n"
+        "    return fpc_id + pic_id;\n"
+        "}\n\n"
+        "void UseRegistry() {\n"
+        "    Registry::instance().registerItem(7);\n"
+        "}\n\n"
+        "void UseWidget() {\n"
+        "    auto w = Widget::create();\n"
+        "    w->paint();\n"
+        "}\n\n"
+        "void UseSession() {\n"
+        "    auto s = Session::open();\n"
+        "    s->close();\n"
+        "}\n\n"
+        "void UseUnknown(struct Mystery *m) {\n"
+        "    m->paint();\n"
+        "}\n\n"
+        "void UseTwin() {\n"
+        "    Twin::get()->run();\n"
+        "}\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char pad[128];
+        snprintf(name, sizeof(name), "pad/cpp_pad_%02d.cpp", i);
+        snprintf(pad, sizeof(pad), "int cpp_pad_%02d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, pad);
+    }
+}
+
+typedef struct {
+    char tmp[256];
+    char db[512];
+    char *saved_workers;
+    cbm_pipeline_t *p;
+    cbm_store_t *s;
+    const char *project;
+} CppRecvRun;
+
+static void cpp_recv_close(CppRecvRun *r) {
+    if (r->s) {
+        cbm_store_close(r->s);
+    }
+    if (r->p) {
+        cbm_pipeline_free(r->p);
+    }
+    if (r->saved_workers) {
+        cbm_setenv("CBM_WORKERS", r->saved_workers, 1);
+        free(r->saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (r->tmp[0]) {
+        th_rmtree(r->tmp);
+    }
+    memset(r, 0, sizeof(*r));
+}
+
+/* Every node an assertion names must exist, or "no CALLS edge" would also
+ * pass for a fixture that never got indexed. */
+static bool cpp_recv_fixture_indexed(const CppRecvRun *r) {
+    static const char *const required[] = {
+        "pil.src.SecdCfgHandlerThread.GetExternalPhyPresent",
+        "pil.src.SecdCfgHandlerThread.UseRegistry",
+        "pil.src.SecdCfgHandlerThread.UseWidget",
+        "pil.src.SecdCfgHandlerThread.UseSession",
+        "pil.src.SecdCfgHandlerThread.UseUnknown",
+        "pil.src.SecdCfgHandlerThread.UseTwin",
+        "app.src.SecdManager.SecdManager.getInstance",
+        "app.src.SecdManager.SecdManager.secd_retrieve_pic_fpc_i2c_id",
+        "app.src.SecdManager.Registry.registerItem",
+        "app.src.SecdManager.Widget.paint",
+        "app.src.SecdManager.Session.close",
+        "app.src.SecdManager.Other.secd_retrieve_pic_fpc_i2c_id",
+        "app.src.SecdManager.Other.registerItem",
+        "app.src.SecdManager.Other.paint",
+        "app.src.SecdManager.Other.close",
+        "lib_a.Twin.Twin.get",
+        "lib_a.Twin.Twin.run",
+        "lib_b.Twin.Twin.get",
+        "lib_b.Twin.Twin.run",
+    };
+    bool all = true;
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        char qn[512];
+        snprintf(qn, sizeof(qn), "%s.%s", r->project, required[i]);
+        cbm_node_t n;
+        memset(&n, 0, sizeof(n));
+        if (cbm_store_find_node_by_qn(r->s, r->project, qn, &n) != CBM_STORE_OK) {
+            printf("  fixture node missing: %s\n", qn);
+            all = false;
+        }
+        cbm_node_free_fields(&n);
+    }
+    return all;
+}
+
+/* Index the fixture; false (after cleanup) when the run itself fails. */
+static bool cpp_recv_open(CppRecvRun *r, bool parallel) {
+    memset(r, 0, sizeof(*r));
+    snprintf(r->tmp, sizeof(r->tmp), "/tmp/cbm_cpp_recv_XXXXXX");
+    if (!cbm_mkdtemp(r->tmp)) {
+        r->tmp[0] = '\0';
+        return false;
+    }
+    cpp_recv_write_fixture(r->tmp, parallel);
+    const char *old_workers = getenv("CBM_WORKERS");
+    r->saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+    snprintf(r->db, sizeof(r->db), "%s/cpp_recv.db", r->tmp);
+    r->p = cbm_pipeline_new(r->tmp, r->db, CBM_MODE_FULL);
+    if (!r->p || cbm_pipeline_run(r->p) != 0) {
+        cpp_recv_close(r);
+        return false;
+    }
+    r->s = cbm_store_open_path(r->db);
+    r->project = cbm_pipeline_project_name(r->p);
+    if (!r->s || !r->project || !cpp_recv_fixture_indexed(r)) {
+        cpp_recv_close(r);
+        return false;
+    }
+    return true;
+}
+
+/* Properties of the CALLS edge caller -> target (QNs below the project), or
+ * NULL when there is no such edge. The caller frees the result. */
+static char *cpp_recv_calls(const CppRecvRun *r, const char *caller, const char *target) {
+    char src_qn[512];
+    char tgt_qn[512];
+    snprintf(src_qn, sizeof(src_qn), "%s.%s", r->project, caller);
+    snprintf(tgt_qn, sizeof(tgt_qn), "%s.%s", r->project, target);
+    cbm_node_t src;
+    cbm_node_t tgt;
+    memset(&src, 0, sizeof(src));
+    memset(&tgt, 0, sizeof(tgt));
+    char *props = NULL;
+    if (cbm_store_find_node_by_qn(r->s, r->project, src_qn, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(r->s, r->project, tgt_qn, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(r->s, src.id, "CALLS", &edges, &ec);
+        for (int i = 0; i < ec && !props; i++) {
+            if (edges[i].target_id == tgt.id) {
+                props = strdup(edges[i].properties_json ? edges[i].properties_json : "{}");
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    return props;
+}
+
+#define CPP_RECV_CALLER "pil.src.SecdCfgHandlerThread."
+#define CPP_RECV_CLASS "app.src.SecdManager."
+
+/* 1 = an lsp_* CALLS edge, 0 = no edge, -1 = an edge from a name heuristic. */
+static int cpp_recv_edge_kind(const CppRecvRun *r, bool parallel, const char *caller,
+                              const char *target) {
+    char *props = cpp_recv_calls(r, caller, target);
+    int kind = props ? (strstr(props, "\"strategy\":\"lsp_") ? 1 : -1) : 0;
+    if (kind != 1) {
+        printf("  [%s] %s -> %s: %s\n", parallel ? "parallel" : "sequential", caller, target,
+               props ? props : "(no CALLS edge)");
+    }
+    free(props);
+    return kind;
+}
+
+/* Reported shape: a raw pointer from a singleton accessor. */
+TEST(pipeline_cpp_static_factory_pointer_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int factory = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "GetExternalPhyPresent",
+                                         CPP_RECV_CLASS "SecdManager.getInstance");
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "GetExternalPhyPresent",
+                                        CPP_RECV_CLASS "SecdManager.secd_retrieve_pic_fpc_i2c_id");
+        char *wrong = cpp_recv_calls(&r, CPP_RECV_CALLER "GetExternalPhyPresent",
+                                     CPP_RECV_CLASS "Other.secd_retrieve_pic_fpc_i2c_id");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(factory, 1); /* RED: only a unique_name guess */
+        ASSERT_EQ(method, 1);  /* RED: the call through the returned pointer dropped */
+        ASSERT_TRUE(no_wrong); /* control: never the same-named Other method */
+    }
+    PASS();
+}
+
+/* `Foo::instance().bar()`: a reference-returning accessor. */
+TEST(pipeline_cpp_static_factory_reference_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "UseRegistry",
+                                        CPP_RECV_CLASS "Registry.registerItem");
+        char *wrong =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseRegistry", CPP_RECV_CLASS "Other.registerItem");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(method, 1);  /* RED: dropped */
+        ASSERT_TRUE(no_wrong); /* control: never the same-named Other method */
+    }
+    PASS();
+}
+
+/* `auto w = Widget::create(); w->paint();` with std::unique_ptr<Widget>. */
+TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "UseWidget",
+                                        CPP_RECV_CLASS "Widget.paint");
+        char *wrong = cpp_recv_calls(&r, CPP_RECV_CALLER "UseWidget", CPP_RECV_CLASS "Other.paint");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(method, 1);
+        ASSERT_TRUE(no_wrong);
+    }
+    PASS();
+}
+
+/* `auto s = Session::open(); s->close();` with std::shared_ptr<Session>. */
+TEST(pipeline_cpp_static_factory_shared_ptr_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "UseSession",
+                                        CPP_RECV_CLASS "Session.close");
+        char *wrong =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseSession", CPP_RECV_CLASS "Other.close");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(method, 1);
+        ASSERT_TRUE(no_wrong);
+    }
+    PASS();
+}
+
+/* Controls: no receiver type, or a class name two libraries declare, gives
+ * the LSP nothing to dispatch on -- neither may gain an edge. */
+TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153) {
+    static const char *const twin_targets[] = {"lib_a.Twin.Twin.get", "lib_a.Twin.Twin.run",
+                                               "lib_b.Twin.Twin.get", "lib_b.Twin.Twin.run"};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        char *widget =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseUnknown", CPP_RECV_CLASS "Widget.paint");
+        char *other =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseUnknown", CPP_RECV_CLASS "Other.paint");
+        int twin_lsp = 0;
+        for (int t = 0; t < 4; t++) {
+            char *props = cpp_recv_calls(&r, CPP_RECV_CALLER "UseTwin", twin_targets[t]);
+            if (props && strstr(props, "\"strategy\":\"lsp_")) {
+                printf("  [%s] UseTwin -> %s: %s\n", parallel ? "parallel" : "sequential",
+                       twin_targets[t], props);
+                twin_lsp++;
+            }
+            free(props);
+        }
+        cpp_recv_close(&r);
+        bool unknown_unbound = widget == NULL && other == NULL;
+        free(widget);
+        free(other);
+        ASSERT_TRUE(unknown_unbound);
+        ASSERT_EQ(twin_lsp, 0);
+    }
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_nested_fixture_files_are_written);
     RUN_TEST(pipeline_fixture_file_parent_is_preserved);
@@ -16636,6 +17032,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
     RUN_TEST(pipeline_semantic_edges_no_functions);
     RUN_TEST(pipeline_semantic_batched_matches_unbatched);
+    RUN_TEST(pipeline_cpp_static_factory_pointer_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_static_factory_reference_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_static_factory_shared_ptr_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
