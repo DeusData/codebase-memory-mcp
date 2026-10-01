@@ -877,6 +877,19 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * Store.commit() call to a JS function named commit (or a Bash main
      * to a Python main). Drop that weak cross-language edge. */
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+        /* Refusing the binding leaves the callee unresolved, and an
+         * unresolved route-registration callee is still a registration:
+         * `Route::get('/x', ...)` beside a JS `get`, `app.get('/x', h)`
+         * beside a Python `get`. Give it the same Route the #952
+         * unresolved-callee fallback above mints, and nothing else. Dropping
+         * the whole call lost every GET registration in a mixed-language repo
+         * while POST (no `post` to collide with) survived. */
+        if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
+            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                      imp_count);
+            return SKIP_ONE;
+        }
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,

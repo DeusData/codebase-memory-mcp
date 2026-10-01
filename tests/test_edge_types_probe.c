@@ -1685,6 +1685,157 @@ TEST(override_go_interface) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  ROUTE REGISTRATION vs the #725 cross-language guard.
+ *
+ *  The route classifier recognises a registration by its callee
+ *  (`Route::get`, `$router->get`, `app.get`) plus a path-shaped first
+ *  argument. The registry still resolves the callee's bare name first, and in
+ *  a mixed-language repo with imports it binds `get` by suffix_match to a
+ *  same-named definition in ANOTHER language (a JS `get`, a Python `get`).
+ *  The #725 guard rightly refuses that binding — but it dropped the whole
+ *  call, before either resolver reached the route classification, so every
+ *  GET registration vanished while POST (no `post` definition to collide
+ *  with) survived: krayin/laravel-crm minted 1 of its 127 GET routes.
+ *  The guard must keep dropping the false CALLS edge; the registration must
+ *  survive. Each fixture also carries calls the guard must still drop.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Index `files` (padded onto the parallel path when `parallel`), then require
+ * the exact Route-name set `routes` AND zero CALLS edges into any definition
+ * named `get`: every `get` in these fixtures lives in a different language
+ * than its would-be callers, so any such edge is the binding #725 refuses. */
+static int et_xlang_routes(const EtFile *files, int nfiles, bool parallel, const char **routes) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int wanted = 0;
+    int ok = store != NULL;
+    while (routes[wanted]) {
+        wanted++;
+    }
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    } else if (node_count != wanted) {
+        ok = 0;
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        int hit = 0;
+        for (int ni = 0; ni < node_count; ni++) {
+            if (nodes[ni].name && strcmp(nodes[ni].name, routes[wi]) == 0) {
+                hit = 1;
+            }
+        }
+        if (!hit) {
+            fprintf(stderr, "  [ET-XLANG] missing Route %s\n", routes[wi]);
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-XLANG] expected=%d actual=%d available:", wanted, node_count);
+        for (int ni = 0; ni < node_count; ni++) {
+            fprintf(stderr, " %s", nodes[ni].name ? nodes[ni].name : "<null>");
+        }
+        fprintf(stderr, "\n");
+    }
+    int false_calls = 0;
+    cbm_node_t *gets = NULL;
+    int get_count = 0;
+    if (store &&
+        cbm_store_find_nodes_by_name(store, lp.project, "get", &gets, &get_count) == CBM_STORE_OK) {
+        for (int gi = 0; gi < get_count; gi++) {
+            cbm_edge_t *in = NULL;
+            int in_count = 0;
+            if (cbm_store_find_edges_by_target_type(store, gets[gi].id, "CALLS", &in, &in_count) ==
+                CBM_STORE_OK) {
+                false_calls += in_count;
+                cbm_store_free_edges(in, in_count);
+            }
+        }
+        cbm_store_free_nodes(gets, get_count);
+    }
+    if (false_calls != 0) {
+        fprintf(stderr, "  [ET-XLANG] %d cross-language CALLS into `get`\n", false_calls);
+        ok = 0;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* Laravel: facade `Route::get` and `$router->get` beside two JS `get`
+ * definitions. Controls: POST is unchanged, and a bare PHP `get('/x')` (no
+ * route-registration callee) stays dropped — no Route, no CALLS into JS. */
+static const EtFile et_xlang_laravel[] = {
+    {"app/Http/Controllers/LeadController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class LeadController\n{\n"
+     "    public function index() { return []; }\n"
+     "    public function store() { return []; }\n}\n"},
+    {"routes/web.php",
+     "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+     "use App\\Http\\Controllers\\LeadController;\n\n"
+     "Route::get('/leads', [LeadController::class, 'index']);\n"
+     "Route::post('/leads/store', [LeadController::class, 'store']);\n"
+     "$router->get('/reports', [LeadController::class, 'index']);\n\n"
+     "function report_file() { return get('/files/report'); }\n"},
+    {"resources/js/http.js", "export function get(url) {\n  return url;\n}\n"},
+    {"resources/js/store.js", "export class Store {\n  get(key) {\n    return key;\n  }\n}\n"},
+};
+static const char *et_xlang_laravel_routes[] = {"/leads", "/leads/store", "/reports", NULL};
+
+TEST(routes_laravel_get_survives_xlang_guard) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
+                                false, et_xlang_laravel_routes));
+    PASS();
+}
+
+TEST(routes_laravel_get_survives_xlang_guard_parallel) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
+                                true, et_xlang_laravel_routes));
+    PASS();
+}
+
+/* Express: `app.get` beside two Python `get` definitions. Controls: POST is
+ * unchanged; a member `memo.get(key)` (route suffix, no path) and a bare
+ * `get('/cache/key')` stay dropped — no Route, no CALLS into Python. */
+static const EtFile et_xlang_express[] = {
+    {"web/server.js",
+     "const express = require('express');\n"
+     "const { health } = require('./handlers');\n\n"
+     "const app = express();\n\n"
+     "app.get('/health', health);\n"
+     "app.post('/items', health);\n\n"
+     "function readCache(memo, key) {\n"
+     "  return memo.get(key) || get('/cache/key');\n"
+     "}\n"
+     "module.exports = { readCache };\n"},
+    {"web/handlers.js",
+     "function health(req, res) {\n  return res;\n}\nmodule.exports = { health };\n"},
+    {"tools/cache.py", "def get(key):\n    return key\n"},
+    {"tools/store.py", "class Store:\n    def get(self, key):\n        return key\n"},
+};
+static const char *et_xlang_express_routes[] = {"/health", "/items", NULL};
+
+TEST(routes_express_get_survives_xlang_guard) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_express,
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
+                                false, et_xlang_express_routes));
+    PASS();
+}
+
+TEST(routes_express_get_survives_xlang_guard_parallel) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_express,
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
+                                true, et_xlang_express_routes));
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -1766,4 +1917,10 @@ SUITE(edge_types_probe) {
 
     /* OVERRIDE — Go interface method override (parallel path) */
     RUN_TEST(override_go_interface);
+
+    /* Route registration vs the #725 cross-language guard (both resolvers) */
+    RUN_TEST(routes_laravel_get_survives_xlang_guard);
+    RUN_TEST(routes_laravel_get_survives_xlang_guard_parallel);
+    RUN_TEST(routes_express_get_survives_xlang_guard);
+    RUN_TEST(routes_express_get_survives_xlang_guard_parallel);
 }

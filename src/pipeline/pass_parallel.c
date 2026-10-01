@@ -2579,6 +2579,35 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     detect_url_in_args(gbuf, source, call);
 }
 
+/* The #725 guard refuses a suffix_match binding across a language boundary,
+ * which leaves the callee unresolved. An unresolved callee the route
+ * classifier recognises is still a registration: `Route::get('/x', ...)`
+ * beside a JS `get`, `app.get('/x', h)` beside a Python `get`. Emit exactly
+ * the Route + CALLS + HANDLES that the unresolved-callee (callee_suffix)
+ * fallback in resolve_file_calls emits for it, classified by callee name the
+ * same way emit_service_edge classifies that fallback, and nothing else: no
+ * CALLS edge to the refused target and no URL-argument scan. Dropping the
+ * whole call lost every GET registration in a mixed-language repo while POST
+ * (no `post` to collide with) survived. Mirrors pass_calls.c. */
+static void emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                     const CBMCall *call, const char *module_qn,
+                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
+                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+    if (cbm_service_pattern_route_method(call->callee_name) == NULL) {
+        return;
+    }
+    cbm_svc_kind_t svc = cbm_service_pattern_match(call->callee_name);
+    if (svc != CBM_SVC_NONE && svc != CBM_SVC_ROUTE_REG) {
+        return;
+    }
+    const char *handler_ref = NULL;
+    const char *route_path = find_route_path_in_args(call, &handler_ref);
+    if (route_path) {
+        emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn, registry,
+                                main_gbuf, imp_keys, imp_vals, imp_count);
+    }
+}
+
 /* Find the source node for an edge: enclosing function or file node. */
 /* This worker's last file-node answer. The graph buffer is read-only for the
  * whole of phase 4 and a file's rel_path pointer is stable within it, so the
@@ -3140,7 +3169,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (target_node && source_node->id != target_node->id &&
             cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
             /* #725: same guard as pass_calls.c — do not emit a suffix_match
-             * CALLS edge across a language boundary. */
+             * CALLS edge across a language boundary. A route registration
+             * behind the refused binding still gets its Route. */
+            emit_xlang_refused_route(ws->local_edge_buf, source_node, call, module_qn, rc->registry,
+                                     rc->main_gbuf, imp_keys, imp_vals, imp_count);
             continue;
         }
         if (!target_node || source_node->id == target_node->id) {
