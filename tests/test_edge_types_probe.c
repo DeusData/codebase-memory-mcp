@@ -651,6 +651,169 @@ TEST(handles_laravel_facade_no_junk_routes_issue952) {
     PASS();
 }
 
+/* Assert the exact HANDLES edge set as "<handler-QN tail> -> <route name>"
+ * pairs. The tail is matched at a segment boundary against the handler's
+ * qualified name ("UserController.show" matches
+ * "<project>.app.Http.Controllers.UserController.UserController.show"), so a
+ * same-named method on another class never satisfies it; the total count must
+ * match too, so a fabricated extra edge fails the assertion. */
+typedef struct {
+    const char *handler_tail;
+    const char *route;
+} EtHandles;
+
+static int et_qn_has_tail(const char *qn, const char *tail) {
+    size_t ql = qn ? strlen(qn) : 0;
+    size_t tl = strlen(tail);
+    return ql >= tl && strcmp(qn + ql - tl, tail) == 0 && (ql == tl || qn[ql - tl - 1] == '.');
+}
+
+static int et_handles_exact(const EtFile *files, int nfiles, const EtHandles *want, int parallel) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    int wanted = 0;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+    while (want[wanted].handler_tail && wanted < ET_ROUTE_ASSERT_MAX) {
+        wanted++;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    int ok = store != NULL &&
+             cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n) ==
+                 CBM_STORE_OK &&
+             n == wanted;
+    for (int i = 0; store && i < n; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        int have_src = cbm_store_find_node_by_id(store, edges[i].source_id, &src) == CBM_STORE_OK;
+        int have_tgt = cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) == CBM_STORE_OK;
+        int matched = 0;
+        for (int wi = 0; have_src && have_tgt && wi < wanted; wi++) {
+            if (!found[wi] && tgt.name && strcmp(tgt.name, want[wi].route) == 0 &&
+                et_qn_has_tail(src.qualified_name, want[wi].handler_tail)) {
+                found[wi] = matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            ok = 0;
+            fprintf(stderr, "  [ET-HANDLES] unexpected %s -> %s\n",
+                    have_src && src.qualified_name ? src.qualified_name : "<?>",
+                    have_tgt && tgt.name ? tgt.name : "<?>");
+        }
+        if (have_src) cbm_node_free_fields(&src);
+        if (have_tgt) cbm_node_free_fields(&tgt);
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        if (!found[wi]) {
+            ok = 0;
+            fprintf(stderr, "  [ET-HANDLES] missing %s -> %s\n", want[wi].handler_tail,
+                    want[wi].route);
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-HANDLES] FAIL (%s path) expected=%d actual=%d\n",
+                parallel ? "parallel" : "sequential", wanted, n);
+    }
+    if (edges) cbm_store_free_edges(edges, n);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* #1146: Laravel's two class-based handler forms —
+ *   Route::get('/x', [UserController::class, 'show'])   (controller method)
+ *   Route::get('/x', GetCurrentUserController::class)   (invokable: __invoke)
+ * got no HANDLES edge, because the handler scan only took identifiers and
+ * strings. The cross-repo matcher needs HANDLES on the Route, so apps written
+ * this way (the #1146 reporter's included) produced 0 CROSS_HTTP_CALLS.
+ * Controls: an Admin\UserController::show with the same short name (the `use`
+ * statement picks the class), an alias import, a fully-qualified class that is
+ * not imported, a package class under a PSR-4 root whose folder does not
+ * mirror its namespace (Acme\Blog\ -> packages/blog/src/), a decoy __invoke on
+ * another class, and two vendor classes that are not in the repo — those must
+ * get no HANDLES edge at all rather than bind to some other class's
+ * same-named method. composer.json comes first so the no-composer variant
+ * below can index the same fixture without it. */
+static const EtFile et_laravel_class_handlers[] = {
+    {"composer.json", "{\"autoload\": {\"psr-4\": {\"App\\\\\": \"app/\", "
+                      "\"Acme\\\\Blog\\\\\": \"packages/blog/src/\"}}}\n"},
+    {"packages/blog/src/Http/PostsController.php",
+     "<?php\nnamespace Acme\\Blog\\Http;\n\n"
+     "class PostsController {\n"
+     "    public function index() { return ['posts' => []]; }\n}\n"},
+    {"app/Http/Controllers/UserController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class UserController {\n"
+     "    public function show($id) { return ['id' => $id]; }\n"
+     "    public function index() { return []; }\n}\n"},
+    {"app/Http/Controllers/Admin/UserController.php",
+     "<?php\nnamespace App\\Http\\Controllers\\Admin;\n\n"
+     "class UserController {\n"
+     "    public function show($id) { return ['admin' => $id]; }\n}\n"},
+    {"app/Http/Controllers/PostController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class PostController {\n"
+     "    public function show($id) { return ['post' => $id]; }\n}\n"},
+    {"app/Http/Controllers/GetCurrentUserController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class GetCurrentUserController {\n"
+     "    public function __invoke() { return ['me' => true]; }\n}\n"},
+    {"app/Http/Controllers/HealthController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class HealthController {\n"
+     "    public function __invoke() { return ['ok' => true]; }\n}\n"},
+    {"routes/api.php",
+     "<?php\n"
+     "use App\\Http\\Controllers\\UserController;\n"
+     "use App\\Http\\Controllers\\GetCurrentUserController as CurrentUser;\n"
+     "use Acme\\Blog\\Http\\PostsController;\n"
+     "use Illuminate\\Support\\Facades\\Route;\n\n"
+     "Route::get('/users/{id}', [UserController::class, 'show']);\n"
+     "Route::get('/me', CurrentUser::class);\n"
+     "Route::get('/posts/{id}', [\\App\\Http\\Controllers\\PostController::class, 'show']);\n"
+     "Route::get('/blog', [PostsController::class, 'index']);\n"
+     "Route::get('/vendor/{id}', [VendorController::class, 'show']);\n"
+     "Route::get('/vendor-ping', VendorInvokable::class);\n"}};
+
+enum { ET_LARAVEL_CLASS_FILES = 8 };
+
+static const EtHandles et_laravel_class_handles[] = {
+    {"Controllers.UserController.UserController.show", "/users/{id}"},
+    {"GetCurrentUserController.__invoke", "/me"},
+    {"PostController.show", "/posts/{id}"},
+    {"PostsController.index", "/blog"},
+    {NULL, NULL}};
+
+TEST(handles_laravel_class_handlers_issue1146) {
+    ASSERT_TRUE(et_handles_exact(et_laravel_class_handlers, ET_LARAVEL_CLASS_FILES,
+                                 et_laravel_class_handles, 0));
+    PASS();
+}
+
+/* Same fixture through the parallel pipeline (> MIN_FILES_FOR_PARALLEL),
+ * whose route emitter (pass_parallel.c) is a separate code path. */
+TEST(handles_laravel_class_handlers_parallel_issue1146) {
+    ASSERT_TRUE(et_handles_exact(et_laravel_class_handlers, ET_LARAVEL_CLASS_FILES,
+                                 et_laravel_class_handles, 1));
+    PASS();
+}
+
+/* Without composer.json there is no PSR-4 map: a class is placed only where
+ * its namespace mirrors the folders (App\Http\Controllers -> app/Http/
+ * Controllers). The package class, whose folder does not mirror its
+ * namespace, then gets no handler rather than a guessed one. */
+TEST(handles_laravel_class_handlers_no_composer_issue1146) {
+    static const EtHandles want[] = {
+        {"Controllers.UserController.UserController.show", "/users/{id}"},
+        {"GetCurrentUserController.__invoke", "/me"},
+        {"PostController.show", "/posts/{id}"},
+        {NULL, NULL}};
+    ASSERT_TRUE(
+        et_handles_exact(et_laravel_class_handlers + 1, ET_LARAVEL_CLASS_FILES - 1, want, 0));
+    PASS();
+}
+
 /* Rails (Ruby) — ActionDispatch router.  The handler MUST be passed as a bare
  * identifier (not the idiomatic `to: 'list_items'` string, which extract_handler_arg
  * cannot capture).  mapper.get resolves by name to the Mapper#get method whose QN
@@ -1708,6 +1871,9 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
     RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
+    RUN_TEST(handles_laravel_class_handlers_issue1146);
+    RUN_TEST(handles_laravel_class_handlers_parallel_issue1146);
+    RUN_TEST(handles_laravel_class_handlers_no_composer_issue1146);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 

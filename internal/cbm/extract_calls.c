@@ -2553,6 +2553,123 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
     return unq;
 }
 
+/* True for a PHP class/namespace name: identifier segments joined by '\'. */
+static bool php_is_class_path(const char *s) {
+    if (!s || !s[0]) {
+        return false;
+    }
+    for (; *s; s++) {
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') ||
+              *s == '_' || *s == '\\')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Qualify a class name the way PHP resolves it: a leading '\' is already
+ * absolute; a first segment that a `use` clause imports (by alias or by last
+ * segment) is replaced by the imported name; anything else is relative to the
+ * file's namespace. Imports and the namespace are extracted before the call
+ * walk, so both are complete here. */
+static const char *php_qualify_class(CBMExtractCtx *ctx, const char *written) {
+    if (written[0] == '\\') {
+        return written + SKIP_ONE;
+    }
+    const char *sep = strchr(written, '\\');
+    size_t first_len = sep ? (size_t)(sep - written) : strlen(written);
+    const CBMImportArray *imps = &ctx->result->imports;
+    for (int i = 0; i < imps->count; i++) {
+        const CBMImport *imp = &imps->items[i];
+        const char *path = imp->module_path;
+        if (!imp->local_name || !path || strlen(imp->local_name) != first_len ||
+            strncmp(imp->local_name, written, first_len) != 0) {
+            continue;
+        }
+        path += path[0] == '\\' ? SKIP_ONE : 0;
+        if (php_is_class_path(path)) {
+            return cbm_arena_sprintf(ctx->arena, "%s%s", path, sep ? sep : "");
+        }
+    }
+    const char *ns = ctx->result->namespace_name;
+    return ns && ns[0] ? cbm_arena_sprintf(ctx->arena, "%s\\%s", ns, written) : written;
+}
+
+/* The fully-qualified class a PHP `X::class` expression names (`use` imports
+ * and the file namespace applied). NULL for any other expression, including
+ * `static::class` and `self::class`. */
+static const char *php_class_literal_fqn(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "class_constant_access_expression") != 0 ||
+        ts_node_named_child_count(node) != PAIR_LEN) {
+        return NULL;
+    }
+    TSNode cls = ts_node_named_child(node, 0);
+    const char *ck = ts_node_type(cls);
+    const char *member =
+        cbm_node_text(ctx->arena, ts_node_named_child(node, SKIP_ONE), ctx->source);
+    if ((strcmp(ck, "name") != 0 && strcmp(ck, "qualified_name") != 0) || !member ||
+        strcmp(member, "class") != 0) {
+        return NULL;
+    }
+    const char *text = cbm_node_text(ctx->arena, cls, ctx->source);
+    return php_is_class_path(text) ? php_qualify_class(ctx, text) : NULL;
+}
+
+/* The value of a PHP array element written without a key; a null node for a
+ * keyed element (`'uses' => ...`) or anything else. */
+static TSNode php_unkeyed_element_value(TSNode elem) {
+    TSNode none = {0};
+    if (strcmp(ts_node_type(elem), "array_element_initializer") != 0 ||
+        ts_node_named_child_count(elem) != SKIP_ONE) {
+        return none;
+    }
+    return ts_node_named_child(elem, 0);
+}
+
+static bool php_is_identifier(const char *s) {
+    if (!s || !((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) {
+        return false;
+    }
+    for (; *s; s++) {
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') ||
+              *s == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Laravel's class-based route handlers (#1146), as "Ns\Class::method":
+ *   [UserController::class, 'show']  -> App\Http\Controllers\UserController::show
+ *   GetCurrentUserController::class   -> App\...\GetCurrentUserController::__invoke
+ * with the class qualified through the file's `use` imports; the route passes
+ * place it on a method QN (cbm_registry_resolve_handler). NULL for any other
+ * expression. */
+static const char *php_class_route_handler(CBMExtractCtx *ctx, TSNode arg) {
+    const char *kind = ts_node_type(arg);
+    if (strcmp(kind, "class_constant_access_expression") == 0) {
+        const char *cls = php_class_literal_fqn(ctx, arg);
+        return cls ? cbm_arena_sprintf(ctx->arena, "%s::__invoke", cls) : NULL;
+    }
+    if (strcmp(kind, "array_creation_expression") != 0 ||
+        ts_node_named_child_count(arg) != PAIR_LEN) {
+        return NULL;
+    }
+    TSNode cls_node = php_unkeyed_element_value(ts_node_named_child(arg, 0));
+    TSNode method_node = php_unkeyed_element_value(ts_node_named_child(arg, SKIP_ONE));
+    if (ts_node_is_null(cls_node) || ts_node_is_null(method_node)) {
+        return NULL;
+    }
+    const char *cls = php_class_literal_fqn(ctx, cls_node);
+    const char *mk = ts_node_type(method_node);
+    if (!cls || (strcmp(mk, "string") != 0 && strcmp(mk, "encapsed_string") != 0)) {
+        return NULL;
+    }
+    const char *method =
+        strip_quotes(ctx->arena, cbm_node_text(ctx->arena, method_node, ctx->source));
+    return php_is_identifier(method) ? cbm_arena_sprintf(ctx->arena, "%s::%s", cls, method) : NULL;
+}
+
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     /* The LAST eligible argument wins, and every argument is examined.
      * Express, Fastify, gin and Laravel all put middleware between the route
@@ -2569,6 +2686,13 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
         if (strcmp(ts_node_type(arg2), "argument") == 0 && ts_node_named_child_count(arg2) > 0) {
             arg2 = ts_node_named_child(arg2, 0);
+        }
+        if (ctx->language == CBM_LANG_PHP) {
+            const char *class_handler = php_class_route_handler(ctx, arg2);
+            if (class_handler) {
+                handler = class_handler;
+                continue;
+            }
         }
         const char *ak2 = ts_node_type(arg2);
         /* `name` = PHP bare identifier handler; string = Laravel string handler

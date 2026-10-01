@@ -25,6 +25,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 
 #define DEFAULT_CONFIDENCE 0.5
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
@@ -1434,6 +1435,173 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         }
     }
     return res;
+}
+
+/* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
+
+/* Method QNs are path-based: <project>.<dirs>.<file stem>.<Class>.<method>.
+ * A PHP class is named by its namespace instead, so a "Ns\\Class::method"
+ * handler is placed on a QN by what places the class file itself. */
+#define CONF_PSR4_MEMBER 0.95
+#define CONF_NAMESPACE_PATH_MEMBER 0.90
+
+static bool seg_eq_nocase(const char *a, size_t alen, const char *b, size_t blen) {
+    if (alen != blen) {
+        return false;
+    }
+    for (size_t i = 0; i < alen; i++) {
+        char ca = (char)((a[i] >= 'A' && a[i] <= 'Z') ? a[i] - 'A' + 'a' : a[i]);
+        char cb = (char)((b[i] >= 'A' && b[i] <= 'Z') ? b[i] - 'A' + 'a' : b[i]);
+        if (ca != cb) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Does qn end with ".<cls>.<member>"? Returns the offset of that tail or -1. */
+static int qn_class_member_tail(const char *qn, const char *cls, size_t cls_len,
+                                const char *member) {
+    size_t qlen = strlen(qn);
+    size_t mlen = strlen(member);
+    if (qlen < cls_len + mlen + PAIR_LEN) {
+        return CBM_NOT_FOUND;
+    }
+    const char *m = qn + qlen - mlen;
+    const char *c = m - SKIP_ONE - cls_len;
+    if (strcmp(m, member) != 0 || m[-SKIP_ONE] != '.' || strncmp(c, cls, cls_len) != 0 ||
+        c[-SKIP_ONE] != '.') {
+        return CBM_NOT_FOUND;
+    }
+    return (int)(c - SKIP_ONE - qn);
+}
+
+/* PSR-4: the longest composer.json autoload root "Prefix\\" that prefixes the
+ * FQN maps the remaining namespace onto directories below the root's folder
+ * and the class onto <Class>.php — the file Composer's autoloader loads.
+ * Returns the registered method QN, or NULL (no root prefixes the FQN, or the
+ * autoloaded file holds no such method). */
+static const char *psr4_member_qn(const cbm_registry_t *r, const CBMHashTable *psr4_roots,
+                                  const char *fqn, size_t fqn_len, const char *cls, size_t cls_len,
+                                  const char *member) {
+    if (!psr4_roots || fqn_len >= CBM_SZ_512) {
+        return NULL;
+    }
+    char key[CBM_SZ_512];
+    for (size_t cut = fqn_len; cut > 0; cut--) {
+        if (fqn[cut - SKIP_ONE] != '\\') {
+            continue;
+        }
+        memcpy(key, fqn, cut); /* "App\\" / "App\\Http\\" — keeps the trailing '\\' */
+        key[cut] = '\0';
+        const char *root_qn = (const char *)cbm_ht_get(psr4_roots, key);
+        if (!root_qn) {
+            continue;
+        }
+        char qn[CBM_SZ_1K];
+        int n = snprintf(qn, sizeof(qn), "%s.%.*s.%.*s.%s", root_qn, (int)(fqn_len - cut),
+                         fqn + cut, (int)cls_len, cls, member);
+        if (n <= 0 || (size_t)n >= sizeof(qn)) {
+            return NULL;
+        }
+        for (char *p = qn + strlen(root_qn); *p; p++) {
+            if (*p == '\\') {
+                *p = '.';
+            }
+        }
+        return cbm_ht_get_key(r->exact, qn);
+    }
+    return NULL;
+}
+
+/* Do the directory segments of qn (between the project root segment and the
+ * file stem, i.e. before offset tail = ".<Class>.<member>") end with every
+ * segment of the namespace fqn[0, ns_len)? Case-insensitive: App\\Http is
+ * conventionally app/Http. An empty namespace is trivially aligned. */
+static bool namespace_matches_dirs(const char *qn, int tail, const char *fqn, size_t ns_len) {
+    const char *root_dot = strchr(qn, '.');
+    const char *stem_end = qn + tail;
+    if (!root_dot || stem_end <= root_dot) {
+        return false;
+    }
+    const char *dir_end = stem_end - SKIP_ONE; /* back over the file stem */
+    while (*dir_end != '.') {
+        dir_end--;
+    }
+    size_t ns_end = ns_len;
+    while (ns_end > 0) {
+        size_t ns_start = ns_end;
+        while (ns_start > 0 && fqn[ns_start - SKIP_ONE] != '\\') {
+            ns_start--;
+        }
+        if (dir_end <= root_dot) {
+            return false; /* more namespace segments than directories */
+        }
+        const char *dir_start = dir_end;
+        while (dir_start[-SKIP_ONE] != '.') {
+            dir_start--;
+        }
+        if (!seg_eq_nocase(fqn + ns_start, ns_end - ns_start, dir_start,
+                           (size_t)(dir_end - dir_start))) {
+            return false;
+        }
+        dir_end = dir_start - SKIP_ONE;
+        ns_end = ns_start > 0 ? ns_start - SKIP_ONE : 0;
+    }
+    return true;
+}
+
+/* Namespace/path alignment: the one "<Class>.<member>" candidate that sits
+ * where its namespace says. NULL when none or several do. */
+static const char *aligned_member_qn(const cbm_registry_t *r, const char *fqn, size_t ns_len,
+                                     const char *cls, size_t cls_len, const char *member) {
+    const qn_array_t *arr = cbm_ht_get(r->by_name, member);
+    const char *match = NULL;
+    for (int i = 0; arr && i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        int tail = qn_class_member_tail(qn, cls, cls_len, member);
+        if (tail == CBM_NOT_FOUND || !namespace_matches_dirs(qn, tail, fqn, ns_len)) {
+            continue;
+        }
+        if (match) {
+            return NULL; /* ambiguous */
+        }
+        match = qn;
+    }
+    return match;
+}
+
+cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const char *handler_ref,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count,
+                                              const CBMHashTable *psr4_roots) {
+    const char *sep = handler_ref ? strstr(handler_ref, "::") : NULL;
+    if (!r || !sep) {
+        return cbm_registry_resolve(r, handler_ref, module_qn, import_map_keys, import_map_vals,
+                                    import_map_count);
+    }
+    const char *member = sep + PAIR_LEN;
+    size_t fqn_len = (size_t)(sep - handler_ref);
+    size_t ns_len = fqn_len;
+    while (ns_len > 0 && handler_ref[ns_len - SKIP_ONE] != '\\') {
+        ns_len--;
+    }
+    const char *cls = handler_ref + ns_len;
+    size_t cls_len = fqn_len - ns_len;
+    ns_len = ns_len > 0 ? ns_len - SKIP_ONE : 0; /* drop the separator before the class */
+    if (cls_len == 0 || !member[0]) {
+        return empty_result();
+    }
+    const char *qn = psr4_member_qn(r, psr4_roots, handler_ref, fqn_len, cls, cls_len, member);
+    if (qn) {
+        return (cbm_resolution_t){qn, "php_psr4", CONF_PSR4_MEMBER, REG_RESOLVED};
+    }
+    qn = aligned_member_qn(r, handler_ref, ns_len, cls, cls_len, member);
+    if (qn) {
+        return (cbm_resolution_t){qn, "php_namespace_path", CONF_NAMESPACE_PATH_MEMBER,
+                                  REG_RESOLVED};
+    }
+    return empty_result();
 }
 
 cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
