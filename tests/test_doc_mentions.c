@@ -5,11 +5,12 @@
  * MSBuild global usings, publication into doc_link_unresolved, the
  * index_status block, delete_project, and incremental == full across edits.
  * Every pipeline test indexes a real fixture through cbm_pipeline_run and
- * reads the published database.
+ * reads the published database (helpers: test_doc_mentions_helpers.h).
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "test_doc_mentions_helpers.h"
 
 #include "cbm.h"
 #include "doclink.h"
@@ -20,189 +21,10 @@
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "sqlite3.h"
-#include <yyjson/yyjson.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* ── helpers ─────────────────────────────────────────────────────── */
-
-static const CBMDocLink *dm_find_token(const CBMFileResult *r, const char *raw) {
-    for (int i = 0; i < r->doc_links.count; i++) {
-        if (strcmp(r->doc_links.items[i].raw, raw) == 0) {
-            return &r->doc_links.items[i];
-        }
-    }
-    return NULL;
-}
-
-static int dm_count_tokens(const CBMFileResult *r, const char *raw) {
-    int n = 0;
-    for (int i = 0; i < r->doc_links.count; i++) {
-        n += strcmp(r->doc_links.items[i].raw, raw) == 0;
-    }
-    return n;
-}
-
-static int dm_index(const char *repo, const char *db, char **project_out) {
-    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
-    if (!p) {
-        return -1;
-    }
-    int rc = cbm_pipeline_run(p);
-    if (project_out) {
-        *project_out = strdup(cbm_pipeline_project_name(p));
-    }
-    cbm_pipeline_free(p);
-    return rc;
-}
-
-/* Properties of the MENTIONS edge whose endpoints' qualified names END with
- * the given local paths ("Widget", "Helper.Once"); "" when absent; count via
- * *n. */
-static void dm_edge(const char *db, const char *src_suffix, const char *tgt_suffix, char *props,
-                    size_t cap, int *n) {
-    props[0] = '\0';
-    *n = 0;
-    sqlite3 *h = NULL;
-    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        sqlite3_close(h);
-        *n = -1;
-        return;
-    }
-    sqlite3_stmt *st = NULL;
-    const char *sql =
-        "SELECT e.properties FROM edges e JOIN nodes s ON s.id = e.source_id "
-        "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
-        "AND (s.qualified_name LIKE '%.' || ?1) AND (t.qualified_name LIKE '%.' || ?2)";
-    if (sqlite3_prepare_v2(h, sql, -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, src_suffix, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, tgt_suffix, -1, SQLITE_TRANSIENT);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            (*n)++;
-            snprintf(props, cap, "%s", (const char *)sqlite3_column_text(st, 0));
-        }
-    }
-    sqlite3_finalize(st);
-    sqlite3_close(h);
-}
-
-static int dm_mentions_from(const char *db, const char *src_suffix) {
-    sqlite3 *h = NULL;
-    int n = -1;
-    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(h,
-                               "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
-                               "WHERE e.type = 'MENTIONS' AND s.qualified_name LIKE '%.' || ?1",
-                               -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, src_suffix, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(st) == SQLITE_ROW) {
-                n = sqlite3_column_int(st, 0);
-            }
-        }
-        sqlite3_finalize(st);
-    }
-    sqlite3_close(h);
-    return n;
-}
-
-/* The single integer a query returns; -1 when it cannot be read. */
-static int dm_count(const char *db, const char *sql) {
-    sqlite3 *h = NULL;
-    int n = -1;
-    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(h, sql, -1, &st, NULL) == SQLITE_OK &&
-            sqlite3_step(st) == SQLITE_ROW) {
-            n = sqlite3_column_int(st, 0);
-        }
-        sqlite3_finalize(st);
-    }
-    sqlite3_close(h);
-    return n;
-}
-
-/* Reason of the unresolved row with this raw text in this file ("" when
- * none). */
-static void dm_row(const char *db, const char *rel, const char *raw, char *reason, size_t cap,
-                   char *syntax, size_t scap) {
-    reason[0] = '\0';
-    if (syntax) {
-        syntax[0] = '\0';
-    }
-    sqlite3 *h = NULL;
-    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(h,
-                               "SELECT reason, syntax FROM doc_link_unresolved WHERE rel_path = ?1 "
-                               "AND raw = ?2",
-                               -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, rel, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, raw, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(st) == SQLITE_ROW) {
-                snprintf(reason, cap, "%s", (const char *)sqlite3_column_text(st, 0));
-                if (syntax) {
-                    snprintf(syntax, scap, "%s", (const char *)sqlite3_column_text(st, 1));
-                }
-            }
-        }
-        sqlite3_finalize(st);
-    }
-    sqlite3_close(h);
-}
-
-/* Canonical text of every MENTIONS edge and unresolved row: what a full and
- * an incremental index of the same tree must agree on byte for byte. */
-static char *dm_doclink_state(const char *db) {
-    sqlite3 *h = NULL;
-    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        sqlite3_close(h);
-        return NULL;
-    }
-    size_t cap = 4096;
-    size_t len = 0;
-    char *buf = malloc(cap);
-    buf[0] = '\0';
-    const char *queries[] = {
-        "SELECT 'E ' || s.qualified_name || ' -> ' || t.qualified_name || ' ' || e.properties "
-        "FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
-        "WHERE e.type = 'MENTIONS' ORDER BY 1",
-        "SELECT 'R ' || rel_path || ':' || line || ' ' || syntax || ' [' || raw || '] ' || reason "
-        "FROM doc_link_unresolved ORDER BY 1",
-    };
-    for (size_t q = 0; q < sizeof(queries) / sizeof(queries[0]); q++) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(h, queries[q], -1, &st, NULL) != SQLITE_OK) {
-            continue;
-        }
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const char *line = (const char *)sqlite3_column_text(st, 0);
-            size_t l = strlen(line);
-            if (len + l + 2 > cap) {
-                cap = (len + l + 2) * 2;
-                buf = realloc(buf, cap);
-            }
-            memcpy(buf + len, line, l);
-            len += l;
-            buf[len++] = '\n';
-            buf[len] = '\0';
-        }
-        sqlite3_finalize(st);
-    }
-    sqlite3_close(h);
-    return buf;
-}
-
-static void dm_unlink_db(const char *db) {
-    char side[600];
-    unlink(db);
-    snprintf(side, sizeof(side), "%s-wal", db);
-    unlink(side);
-    snprintf(side, sizeof(side), "%s-shm", db);
-    unlink(side);
-}
 
 /* ── extraction ──────────────────────────────────────────────────── */
 
@@ -315,7 +137,7 @@ TEST(doc_mentions_cs_scope_blob) {
 
 /* The scope blob of one C# source; the result owns it. */
 static CBMFileResult *dm_scope(const char *src) {
-    return cbm_extract_file(src, (int)strlen(src), CBM_LANG_CSHARP, "p", "S.cs", 0, NULL, NULL);
+    return dm_extract(src, CBM_LANG_CSHARP, "S.cs");
 }
 
 /* A file whose tree has parse errors takes its nesting from the braces: error
@@ -1134,65 +956,6 @@ TEST(doc_mentions_ship_gate) {
 
 /* ── publication: index_status, delete_project, older databases ──── */
 
-/* The text content of an MCP tool result (the report itself); the caller
- * frees it. */
-static char *dm_tool_text(const char *mcp_result) {
-    yyjson_doc *doc = mcp_result ? yyjson_read(mcp_result, strlen(mcp_result), 0) : NULL;
-    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
-    yyjson_val *content = root ? yyjson_obj_get(root, "content") : NULL;
-    yyjson_val *item = content ? yyjson_arr_get(content, 0) : NULL;
-    const char *text = item ? yyjson_get_str(yyjson_obj_get(item, "text")) : NULL;
-    char *out = text ? strdup(text) : NULL;
-    yyjson_doc_free(doc);
-    return out;
-}
-
-/* index_status of the project as text, from a server of its own (nothing
- * cached from an earlier call). */
-static char *dm_index_status(const char *project, bool full) {
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    if (!srv) {
-        return NULL;
-    }
-    char args[1200];
-    snprintf(args, sizeof(args), "{\"project\":\"%s\"%s}", project,
-             full ? ",\"diagnostics\":\"full\"" : "");
-    char *resp = cbm_mcp_handle_tool(srv, "index_status", args);
-    char *text = dm_tool_text(resp);
-    free(resp);
-    cbm_mcp_server_free(srv);
-    return text;
-}
-
-/* Every reason the table holds is listed under doc_links.unresolved with its
- * row count. The number of reasons checked; -1 when a line is missing. */
-static int dm_reason_lines(const char *db, const char *block) {
-    sqlite3 *h = NULL;
-    int n = -1;
-    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(h,
-                               "SELECT reason, COUNT(*) FROM doc_link_unresolved GROUP BY reason",
-                               -1, &st, NULL) == SQLITE_OK) {
-            n = 0;
-            while (n >= 0 && sqlite3_step(st) == SQLITE_ROW) {
-                char line[128];
-                snprintf(line, sizeof(line), "\n    %s: %d\n",
-                         (const char *)sqlite3_column_text(st, 0), sqlite3_column_int(st, 1));
-                if (strstr(block, line)) {
-                    n++;
-                } else {
-                    printf("  no line%s  in\n%s\n", line, block);
-                    n = -1;
-                }
-            }
-        }
-        sqlite3_finalize(st);
-    }
-    sqlite3_close(h);
-    return n;
-}
-
 /* The checks of doc_mentions_index_status_and_delete; the caller owns the
  * environment and the directories. */
 static int dm_index_status_checks(const char *tmp, const char *repo, const char *cache_dir) {
@@ -1532,37 +1295,6 @@ static const char DM_CSPROJ[] = "<Project Sdk=\"Microsoft.NET.Sdk\">\n"
 static const char DM_CSPROJ_NO_USING[] = "<Project Sdk=\"Microsoft.NET.Sdk\">\n"
                                          "</Project>\n";
 
-/* Index `repo` incrementally into `inc_db`, then fully into a fresh database,
- * and require identical MENTIONS edges and unresolved rows. */
-static int dm_step(const char *repo, const char *inc_db, const char *full_db, const char *what,
-                   cbm_incremental_route_t want_route) {
-    cbm_pipeline_incremental_test_reset_faults();
-    if (dm_index(repo, inc_db, NULL) != 0) {
-        printf("  %s: incremental index failed\n", what);
-        return -1;
-    }
-    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
-    dm_unlink_db(full_db);
-    if (dm_index(repo, full_db, NULL) != 0) {
-        printf("  %s: full index failed\n", what);
-        return -1;
-    }
-    char *inc = dm_doclink_state(inc_db);
-    char *full = dm_doclink_state(full_db);
-    int rc = 0;
-    if (!inc || !full || strcmp(inc, full) != 0) {
-        printf("  %s: incremental != full\n--- incremental (route %d)\n%s--- full\n%s", what,
-               (int)route, inc ? inc : "(null)", full ? full : "(null)");
-        rc = -1;
-    } else if (route != want_route) {
-        printf("  %s: route %d, expected %d\n", what, (int)route, (int)want_route);
-        rc = -1;
-    }
-    free(inc);
-    free(full);
-    return rc;
-}
-
 TEST(doc_mentions_incremental_equals_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_dm_inc_XXXXXX");
@@ -1713,49 +1445,10 @@ TEST(doc_mentions_incremental_equals_full) {
 
 /* ── which scope changes are repairable file by file ─────────────── */
 
-typedef struct {
-    char names[256];
-} dm_names_t;
-
-static bool dm_name_put(void *ud, const char *name, size_t len) {
-    dm_names_t *n = (dm_names_t *)ud;
-    size_t used = strlen(n->names);
-    if (used + len + 2 > sizeof(n->names)) {
-        return false;
-    }
-    if (used > 0) {
-        n->names[used++] = ',';
-    }
-    memcpy(n->names + used, name, len);
-    n->names[used + len] = '\0';
-    return true;
-}
-
-enum { DM_DELTA_SCAN_FAILED = -2 };
-
 /* The scope delta between two versions of one C# file (NULL: the file does
- * not exist), through the real scanner and the persisted form; the removed
- * names joined by ','. */
+ * not exist); the removed names joined by ','. */
 static int dm_delta(const char *before, const char *after, char *names, size_t cap) {
-    names[0] = '\0';
-    CBMFileResult *a = before ? dm_scope(before) : NULL;
-    CBMFileResult *b = after ? dm_scope(after) : NULL;
-    char *pa = (a && a->doc_scope) ? cbm_doclink_portable_scope(a->doc_scope) : NULL;
-    char *pb = (b && b->doc_scope) ? cbm_doclink_portable_scope(b->doc_scope) : NULL;
-    dm_names_t n = {{0}};
-    int rc = ((before && !pa) || (after && !pb))
-                 ? DM_DELTA_SCAN_FAILED
-                 : cbm_doclinks_scope_delta(pa, pb, dm_name_put, &n);
-    snprintf(names, cap, "%s", n.names);
-    cbm_free(CBM_MEM_CLASS_OTHER, pa);
-    cbm_free(CBM_MEM_CLASS_OTHER, pb);
-    if (a) {
-        cbm_free_result(a);
-    }
-    if (b) {
-        cbm_free_result(b);
-    }
-    return rc;
+    return dm_scope_delta(CBM_LANG_CSHARP, "S.cs", before, after, names, cap);
 }
 
 #define DM_DELTA_HEAD "using Acme.Local;\n"
@@ -1922,30 +1615,7 @@ TEST(doc_mentions_parallel_equals_sequential) {
     char seq_db[512];
     snprintf(par_db, sizeof(par_db), "%s/par.db", tmp);
     snprintf(seq_db, sizeof(seq_db), "%s/seq.db", tmp);
-    const char *saved_workers = getenv("CBM_WORKERS");
-    char *saved_workers_copy = saved_workers ? strdup(saved_workers) : NULL;
-    cbm_setenv("CBM_WORKERS", "4", 1);
-    int par_rc = dm_index(repo, par_db, NULL);
-    cbm_setenv("CBM_WORKERS", "1", 1); /* one worker: the sequential passes */
-    int seq_rc = dm_index(repo, seq_db, NULL);
-    if (saved_workers_copy) {
-        cbm_setenv("CBM_WORKERS", saved_workers_copy, 1);
-        free(saved_workers_copy);
-    } else {
-        cbm_unsetenv("CBM_WORKERS");
-    }
-    ASSERT_EQ(par_rc, 0);
-    ASSERT_EQ(seq_rc, 0);
-    char *par = dm_doclink_state(par_db);
-    char *seq = dm_doclink_state(seq_db);
-    bool same = par && seq && strcmp(par, seq) == 0;
-    if (!same) {
-        printf("  parallel != sequential\n--- parallel\n%s--- sequential\n%s", par ? par : "(null)",
-               seq ? seq : "(null)");
-    }
-    free(par);
-    free(seq);
-    ASSERT_TRUE(same);
+    ASSERT_EQ(dm_workers_agree(repo, par_db, seq_db), 0);
     /* per class: successor (see), Hub (seealso), Hub.Run(int) (exception) */
     ASSERT_EQ(dm_count(par_db, "SELECT COUNT(*) FROM edges WHERE type = 'MENTIONS'"), DM_RING * 3);
     /* per class: the overload group (ambiguous) and the undeclared name */
