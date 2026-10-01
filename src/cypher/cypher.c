@@ -2594,6 +2594,12 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
     return n->name ? n->name : "";
 }
 
+/* Set when an `=~` or inline-property pattern was refused by the regex
+ * wrapper's compile-size guard during the CURRENT execution; cbm_cypher_execute
+ * turns it into result->warning so an empty result can be told from "no such
+ * name". Reset at the start of every execution. */
+static _Thread_local bool g_cypher_regex_refused = false;
+
 /* Evaluate a comparison operator between actual and expected strings. */
 static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
     if (strcmp(op, "=") == 0) {
@@ -2604,7 +2610,11 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
     }
     if (strcmp(op, "=~") == 0) {
         cbm_regex_t re;
-        if (cbm_regcomp(&re, expected, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+        int comp_rc = cbm_regcomp(&re, expected, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+        if (comp_rc != 0) {
+            if (comp_rc == CBM_REG_ETOOBIG) {
+                g_cypher_regex_refused = true;
+            }
             return false;
         }
         int rc = cbm_regexec(&re, actual, 0, NULL, 0);
@@ -2784,13 +2794,17 @@ static bool check_inline_props(const cbm_node_t *n, const cbm_prop_filter_t *pro
         const char *actual = node_prop(n, props[i].key, store);
         if (looks_like_regex(props[i].value)) {
             cbm_regex_t re;
-            if (cbm_regcomp(&re, props[i].value, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
+            int comp_rc = cbm_regcomp(&re, props[i].value, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+            if (comp_rc == 0) {
                 bool matched = cbm_regexec(&re, actual, 0, NULL, 0) == 0;
                 cbm_regfree(&re);
                 if (!matched) {
                     return false;
                 }
             } else if (strcmp(actual, props[i].value) != 0) {
+                if (comp_rc == CBM_REG_ETOOBIG) {
+                    g_cypher_regex_refused = true;
+                }
                 return false;
             }
         } else if (strcmp(actual, props[i].value) != 0) {
@@ -5447,6 +5461,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     g_cypher_depth_clamped = 0;
     g_cypher_trail_truncated = 0;
     g_cypher_truncated = false;
+    g_cypher_regex_refused = false;
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
@@ -5534,8 +5549,8 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     /* Any internal ceiling that prevented exhaustive evaluation: a candidate or
      * traversal budget, or a variable-length range clamped to the engine cap. */
     out->truncated = g_cypher_truncated || g_cypher_trail_truncated != 0;
+    char wbuf[CBM_SZ_512] = "";
     if (g_cypher_depth_clamped > 0 || g_cypher_trail_truncated) {
-        char wbuf[CBM_SZ_256];
         if (g_cypher_depth_clamped > 0 && g_cypher_trail_truncated) {
             snprintf(wbuf, sizeof(wbuf),
                      "variable-length hop range clamped to the engine ceiling (%d) and "
@@ -5550,6 +5565,16 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             snprintf(wbuf, sizeof(wbuf),
                      "variable-length traversal budget was exhausted — results may be partial");
         }
+    }
+    /* A refused `=~` or property pattern matched nothing: say so, once per
+     * query, next to any traversal warning. */
+    if (g_cypher_regex_refused) {
+        size_t used = strlen(wbuf);
+        snprintf(wbuf + used, sizeof(wbuf) - used,
+                 "%sa =~ or property " CBM_REG_ETOOBIG_REASON " — the comparison matched nothing",
+                 used ? "; " : "");
+    }
+    if (wbuf[0]) {
         out->warning = heap_strdup(wbuf);
     }
 

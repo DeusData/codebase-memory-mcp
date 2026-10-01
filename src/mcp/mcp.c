@@ -5336,8 +5336,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                        max_degree != CBM_NOT_FOUND;
     bool semantic_only = sq_present && !has_filters;
     cbm_search_output_t out = {0};
-    if (!semantic_only) {
-        (void)cbm_store_search(store, &params, &out);
+    char search_error[CBM_SZ_512] = "";
+    if (!semantic_only && cbm_store_search(store, &params, &out) != CBM_STORE_OK) {
+        /* A refused or invalid regex aborts the row scan inside SQLite; the
+         * store's reason is the caller's only hint about the pattern. */
+        snprintf(search_error, sizeof(search_error), "search_graph: %s", cbm_store_error(store));
     }
 
     const char *diagnostic_hint = NULL;
@@ -5420,7 +5423,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(file_pattern);
     free(relationship);
 
-    char *result = cbm_mcp_text_result(payload ? payload : "out of memory", payload == NULL);
+    char *result = search_error[0]
+                       ? cbm_mcp_text_result(search_error, true)
+                       : cbm_mcp_text_result(payload ? payload : "out of memory", payload == NULL);
     free(payload);
     return result;
 }
@@ -14821,12 +14826,16 @@ static bool search_scratch_open(search_scratch_t *scratch, const char *pattern) 
     return true;
 }
 
-/* Compile a path filter regex. Returns true if compiled successfully. */
-static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
+/* Compile a path filter regex. Returns true when *re holds the compiled filter.
+ * An absent or empty filter compiles nothing and reports CBM_REG_OK in *rc; a
+ * filter the regex wrapper refuses or cannot compile reports its error there. */
+static bool compile_path_filter(const char *filter, cbm_regex_t *re, int *rc) {
+    *rc = CBM_REG_OK;
     if (!filter || !filter[0]) {
         return false;
     }
-    return cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK;
+    *rc = cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+    return *rc == CBM_REG_OK;
 }
 
 static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
@@ -14979,7 +14988,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     size_t byte_budget = (size_t)max_output_tokens * (size_t)MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE;
 
     cbm_regex_t path_regex;
-    bool has_path_filter = compile_path_filter(path_filter, &path_regex);
+    int path_filter_rc = CBM_REG_OK; /* reported with the regex probe below */
+    bool has_path_filter = compile_path_filter(path_filter, &path_regex, &path_filter_rc);
     free(path_filter);
     path_filter = NULL;
 
@@ -15025,21 +15035,35 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * unclosed group) makes the underlying grep fail, which the handler would
      * otherwise report as an empty result set — indistinguishable from a
      * legitimate no-match. Validate the user's regex up front and return an
-     * explicit error so callers can tell "broken pattern" from "no matches". */
-    if (use_regex) {
+     * explicit error so callers can tell "broken pattern" from "no matches".
+     * A path_filter the regex wrapper refused or could not compile is reported
+     * the same way instead of silently searching unfiltered. */
+    const char *regex_error = NULL;
+    if (path_filter_rc != CBM_REG_OK) {
+        regex_error = path_filter_rc == CBM_REG_ETOOBIG
+                          ? "path_filter: " CBM_REG_ETOOBIG_REASON
+                          : "invalid path_filter regex: check for unbalanced (), [], or {}";
+    } else if (use_regex) {
         cbm_regex_t probe;
-        if (cbm_regcomp(&probe, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != CBM_REG_OK) {
-            if (has_path_filter) {
-                cbm_regfree(&path_regex);
-            }
-            free(root_path);
-            free(pattern);
-            free(project);
-            free(file_pattern);
-            return cbm_mcp_text_result(
-                "invalid regex pattern (regex=true): check for unbalanced (), [], or {}", true);
+        int probe_rc = cbm_regcomp(&probe, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+        if (probe_rc != CBM_REG_OK) {
+            regex_error =
+                probe_rc == CBM_REG_ETOOBIG
+                    ? CBM_REG_ETOOBIG_REASON " (regex=true)"
+                    : "invalid regex pattern (regex=true): check for unbalanced (), [], or {}";
+        } else {
+            cbm_regfree(&probe);
         }
-        cbm_regfree(&probe);
+    }
+    if (regex_error) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return cbm_mcp_text_result(regex_error, true);
     }
 
     /* ── Phase 0.5: Multi-word → regex conversion ───────────── */

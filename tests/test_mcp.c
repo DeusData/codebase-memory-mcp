@@ -10992,6 +10992,87 @@ TEST(search_code_path_filter_matches_nothing) {
     PASS();
 }
 
+/* An over-budget regex is refused by the wrapper before the platform compiler
+ * expands it. search_code reports that as a tool error naming the argument and
+ * the reason, for path_filter and for a regex=true pattern alike, and keeps
+ * answering afterwards. The pattern is 14^4 = 38,416 expanded atoms: over the
+ * 32,768-unit budget, and tens of MB to hold even when unguarded. */
+TEST(search_code_oversized_path_filter_is_tool_error) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"((((a){14}){14}){14}){14}\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "path_filter"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"((((a){14}){14}){14}){14}\",\"regex\":true,"
+             "\"project\":\"prefilter-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    ASSERT_NOT_NULL(strstr(resp, "regex=true"));
+    free(resp);
+
+    /* The server still answers an ordinary filtered call. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"^src/\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "src/handler.go"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* search_graph compiles name_pattern inside SQLite's REGEXP function. An
+ * over-budget pattern is refused there, the row scan aborts, and the tool
+ * reports the reason as a tool error instead of an empty result. The next call
+ * answers normally. */
+TEST(search_graph_oversized_name_pattern_is_tool_error) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"prefilter-search\",\"name_pattern\":\"((((a){14}){14}){14}){14}\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"prefilter-search\",\"name_pattern\":\"^HandleRequest$\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
 TEST(search_code_file_pattern_prefilter_boundaries) {
     ASSERT_TRUE(cbm_search_code_file_pattern_can_prefilter("*.pas"));
     ASSERT_TRUE(cbm_search_code_file_pattern_can_prefilter("*.PAS"));
@@ -21230,6 +21311,8 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_long_line_does_not_invent_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
+    RUN_TEST(search_code_oversized_path_filter_is_tool_error);
+    RUN_TEST(search_graph_oversized_name_pattern_is_tool_error);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
