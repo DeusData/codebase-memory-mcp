@@ -5350,6 +5350,24 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             diagnostic_hint = "No nodes match; check spelling or broaden the regex.";
         } else if (label) {
             diagnostic_hint = "No nodes have this label; inspect get_graph_schema.";
+            /* Another filter can empty a label that does match. Blaming the
+             * label then reads as "this project has no such nodes". */
+            bool narrowed = qn_pattern || file_pattern || relationship || exclude_entry_points ||
+                            min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
+            if (narrowed) {
+                cbm_search_params_t label_only = {.project = project,
+                                                  .label = label,
+                                                  .limit = 1,
+                                                  .min_degree = CBM_NOT_FOUND,
+                                                  .max_degree = CBM_NOT_FOUND};
+                cbm_search_output_t probe = {0};
+                if (cbm_store_search(store, &label_only, &probe) == CBM_STORE_OK &&
+                    probe.total > 0) {
+                    diagnostic_hint =
+                        "No results; the label matches nodes, so relax the other filters.";
+                }
+                cbm_store_search_free(&probe);
+            }
         }
     } else if (core_fields_requested) {
         diagnostic_hint = "Core qn/name/label/file/lines fields are already present.";
