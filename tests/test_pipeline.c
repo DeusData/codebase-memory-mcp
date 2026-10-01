@@ -6312,6 +6312,93 @@ TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
     PASS();
 }
 
+/* Issue #1354: a method call on an instance built with `new ImportedClass()`
+ * produced no CALLS edge (only the constructor edge), while the identical
+ * shape in the class's own file resolved via lsp_ts_method. End to end:
+ * both cross-file shapes must now carry the type-aware lsp_ts_method edge,
+ * and the same-file control must keep it. */
+TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ts_1354_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* write_temp_file creates one directory level only. */
+    write_temp_file(tmp, "lib/toast.service.ts",
+                    "export class ToastService {\n"
+                    "  openSuccessUniqueXyz(msg: string): void {\n"
+                    "    console.log(msg);\n"
+                    "  }\n"
+                    "}\n"
+                    "\n"
+                    "export function sameFileControl(): void {\n"
+                    "  const t = new ToastService();\n"
+                    "  t.openSuccessUniqueXyz('same-file control');\n"
+                    "}\n");
+    write_temp_file(tmp, "app/variants.ts",
+                    "import { ToastService } from '../lib/toast.service';\n"
+                    "\n"
+                    "export function crossNewLocal(): void {\n"
+                    "  const t = new ToastService();\n"
+                    "  t.openSuccessUniqueXyz('cross-file');\n"
+                    "}\n"
+                    "\n"
+                    "export function crossNewChain(): void {\n"
+                    "  new ToastService().openSuccessUniqueXyz('chained');\n"
+                    "}\n");
+    /* File named after its class (`NotifierService.ts` exports
+     * `NotifierService`): the imported module QN already ends in the class
+     * name, which must not be mistaken for the class QN. */
+    write_temp_file(tmp, "lib/NotifierService.ts",
+                    "export class NotifierService {\n"
+                    "  notifyUniqueAbc(): void {}\n"
+                    "}\n");
+    write_temp_file(tmp, "app/notify.ts",
+                    "import { NotifierService } from '../lib/NotifierService';\n"
+                    "\n"
+                    "export function crossSameNameNew(): void {\n"
+                    "  const n = new NotifierService();\n"
+                    "  n.notifyUniqueAbc();\n"
+                    "}\n"
+                    "\n"
+                    "export function crossSameNameTyped(n: NotifierService): void {\n"
+                    "  n.notifyUniqueAbc();\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ts_1354.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    bool same_file = cross_file_call_has_strategy(s, project, "sameFileControl",
+                                                  "openSuccessUniqueXyz", "lsp_ts_method");
+    bool cross_local = cross_file_call_has_strategy(s, project, "crossNewLocal",
+                                                    "openSuccessUniqueXyz", "lsp_ts_method");
+    bool cross_chain = cross_file_call_has_strategy(s, project, "crossNewChain",
+                                                    "openSuccessUniqueXyz", "lsp_ts_method");
+    bool same_name_new = cross_file_call_has_strategy(s, project, "crossSameNameNew",
+                                                      "notifyUniqueAbc", "lsp_ts_method");
+    bool same_name_typed = cross_file_call_has_strategy(s, project, "crossSameNameTyped",
+                                                        "notifyUniqueAbc", "lsp_ts_method");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(same_file);
+    ASSERT_TRUE(cross_local);
+    ASSERT_TRUE(cross_chain);
+    ASSERT_TRUE(same_name_new);
+    ASSERT_TRUE(same_name_typed);
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_recv_XXXXXX");
@@ -16453,6 +16540,7 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916);
+    RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
