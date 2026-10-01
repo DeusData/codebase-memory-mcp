@@ -1259,6 +1259,82 @@ TEST(discover_cbmignore_negates_always_skip_dir) {
     PASS();
 }
 
+/* ── Laravel compiled Blade view cache (issue #1735) ─────────────── */
+
+/* storage/framework/views/ holds Laravel's compiled Blade templates: generated
+ * PHP with no source value that the php_only grammar flags as parse damage.
+ * It is skipped by default even when Laravel's stock .gitignore in that folder
+ * is missing. The match is on the path suffix, component-aligned, so ordinary
+ * views/ dirs (resources/views, app/views, app/framework/views) and look-alike
+ * prefixes (mystorage/...) stay indexed. */
+TEST(discover_skips_laravel_compiled_views_issue1735) {
+    char *base = th_mktempdir("cbm_disc_laravel_views");
+    ASSERT(base != NULL);
+
+    /* No .gitignore anywhere: the skip must come from the built-in rule. */
+    th_write_file(TH_PATH(base, "storage/framework/views/abc123.php"),
+                  "<?php $__env->startSection('title'); ?>\n"
+                  "<?php echo e($title); ?>\n"
+                  "<?php $__env->stopSection(); ?>\n");
+    th_write_file(TH_PATH(base, "backend/storage/framework/views/def456.php"),
+                  "<?php echo e($x); ?>\n");
+    th_write_file(TH_PATH(base, "resources/views/welcome.blade.php"), "<h1>{{ $title }}</h1>\n");
+    th_write_file(TH_PATH(base, "app/views/x.php"), "<?php function x() { return 1; }\n");
+    th_write_file(TH_PATH(base, "app/framework/views/y.php"), "<?php function y() {}\n");
+    th_write_file(TH_PATH(base, "mystorage/framework/views/z.php"), "<?php function z() {}\n");
+    th_write_file(TH_PATH(base, "storage/framework/views_old/w.php"), "<?php function w() {}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/framework/views/abc123.php"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "backend/storage/framework/views/def456.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "resources/views/welcome.blade.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/views/x.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/framework/views/y.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "mystorage/framework/views/z.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/framework/views_old/w.php"));
+    ASSERT_EQ(count, 5);
+    /* Reported as an excluded subtree (#411), like every built-in skip dir. */
+    ASSERT_TRUE(discover_excluded_contains(excluded, excluded_count, "storage/framework/views"));
+    ASSERT_TRUE(
+        discover_excluded_contains(excluded, excluded_count, "backend/storage/framework/views"));
+    ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "app/views"));
+    ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "resources/views"));
+
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Like the other ordinary built-in skip dirs (#500), a .cbmignore negation
+ * un-skips the compiled-view cache for a user who really wants it indexed. */
+TEST(discover_cbmignore_negates_laravel_compiled_views_issue1735) {
+    char *base = th_mktempdir("cbm_disc_laravel_views_neg");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "!storage/framework/views/\n");
+    th_write_file(TH_PATH(base, "storage/framework/views/abc123.php"), "<?php echo 1; ?>\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/framework/views/abc123.php"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* An anchored negation ("!src/target/") un-skips only that nested dir; other
  * dirs with the same basename stay built-in-skipped. */
 TEST(discover_cbmignore_negates_only_nested_skip_dir) {
@@ -1507,6 +1583,212 @@ TEST(discover_worktree_committed_gitignore) {
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(count, 1);
     ASSERT_TRUE(strstr(files[0].rel_path, "main.go") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* ── Enclosing-repo .gitignore tests (issue #510, second half) ──── */
+
+/* repo_path itself has no .git (indexing a git-less subfolder of a larger
+ * repo). The enclosing repo's root .gitignore must still be honored, exactly
+ * as `git status`/`git check-ignore` run from that subfolder would. Before
+ * this fix, resolve_git_common_dir() only ever stat'd repo_path/.git
+ * directly and gave up, so the enclosing repo's rules were silently never
+ * consulted. */
+TEST(discover_enclosing_repo_gitignore_issue510) {
+    char *base = th_mktempdir("cbm_disc_enc_gi");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "secret.py\n");
+    th_write_file(TH_PATH(base, "pkg/secret.py"), "TOKEN = 1\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "keep.py") != NULL);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "secret.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* The enclosing repo's <common>/info/exclude (per-clone, uncommitted) must
+ * be honored the same way once the enclosing root is found, exactly as it
+ * already is for a repo_path that carries its own .git (issue #489). */
+TEST(discover_enclosing_repo_info_exclude) {
+    char *base = th_mktempdir("cbm_disc_enc_exc");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git/info"));
+    th_write_file(TH_PATH(base, ".git/info/exclude"), "scratch/\n");
+    th_write_file(TH_PATH(base, "pkg/main.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/scratch/tmp.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "main.py") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Precedence: the indexed directory's own .gitignore is more specific than
+ * the enclosing repo's root .gitignore and must still win on conflict,
+ * matching git's shallow-to-deep rule (a later, deeper pattern overrides an
+ * earlier, shallower one). Without this, folding the enclosing root in
+ * ahead of repo_path's own .gitignore in the wrong order would let a root
+ * pattern silently re-ignore a file the subfolder's own .gitignore
+ * un-ignores. */
+TEST(discover_enclosing_repo_gitignore_local_overrides) {
+    char *base = th_mktempdir("cbm_disc_enc_gi_ovr");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.py\n");
+    th_write_file(TH_PATH(base, "pkg/.gitignore"), "!keep.py\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/drop.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "keep.py") != NULL);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* An enclosing repo's patterns are ANCHORED to the enclosing repo's own root,
+ * never to the indexed subfolder. Folding them into the subfolder's matcher
+ * re-anchors every rooted pattern one or more levels too deep, in both
+ * directions. The four tests below pin the four cases; each expectation was
+ * taken from `git check-ignore` run inside the subfolder on an identical
+ * fixture, so they encode git's behaviour, not ours.
+ *
+ * Direction 1 — silent index loss, the worst failure mode for discovery:
+ * `/secret.py` at the enclosing root means "secret.py in the ROOT", so git
+ * indexes pkg/secret.py. Re-anchored onto pkg it becomes "secret.py in pkg"
+ * and the file vanishes from the index with no diagnostic. */
+TEST(discover_enclosing_rooted_pattern_not_reanchored) {
+    char *base = th_mktempdir("cbm_disc_enc_anchor");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "/secret.py\n");
+    th_write_file(TH_PATH(base, "pkg/secret.py"), "TOKEN = 1\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside pkg: both files INDEXED. */
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "secret.py"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "keep.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Direction 2 — the mirror: a pattern the enclosing repo anchors THROUGH the
+ * indexed subfolder ("pkg/scratch/") no longer matches once rel_path is
+ * relative to pkg, so a directory git excludes gets walked and indexed. */
+TEST(discover_enclosing_info_exclude_rooted_subpath) {
+    char *base = th_mktempdir("cbm_disc_enc_exc_sub");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git/info"));
+    th_write_file(TH_PATH(base, ".git/info/exclude"), "pkg/scratch/\n");
+    th_write_file(TH_PATH(base, "pkg/main.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/scratch/tmp.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside pkg: scratch/tmp.py IGNORED, main.py indexed. */
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.py"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "scratch/tmp.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* git consults the .gitignore of EVERY directory between the enclosing root
+ * and the indexed one, not just the root's. Here only <root>/a/.gitignore has
+ * an opinion, and it is rooted at a/ — so it needs both the intermediate file
+ * to be loaded at all and its patterns to be matched relative to a/. */
+TEST(discover_enclosing_intermediate_gitignore) {
+    char *base = th_mktempdir("cbm_disc_enc_mid");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, "a/.gitignore"), "/b/drop.py\n");
+    th_write_file(TH_PATH(base, "a/b/drop.py"), "pass\n");
+    th_write_file(TH_PATH(base, "a/b/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "a/b"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside a/b: drop.py IGNORED, keep.py indexed. */
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "keep.py"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Precedence among ancestors: the deeper .gitignore wins over the shallower
+ * one, negations included. <root>/.gitignore ignores every *.py;
+ * <root>/a/.gitignore re-includes b/keep.py. Merging both into one matcher
+ * would decide this by file order instead of by depth. */
+TEST(discover_enclosing_deeper_ancestor_negation_wins) {
+    char *base = th_mktempdir("cbm_disc_enc_neg");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.py\n");
+    th_write_file(TH_PATH(base, "a/.gitignore"), "!/b/keep.py\n");
+    th_write_file(TH_PATH(base, "a/b/drop.py"), "pass\n");
+    th_write_file(TH_PATH(base, "a/b/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "a/b"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside a/b: drop.py IGNORED, keep.py indexed. */
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "keep.py"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
 
     cbm_discover_free(files, count);
     th_cleanup(base);
@@ -2172,6 +2454,10 @@ SUITE(discover) {
     RUN_TEST(discover_cbmignore_negation_last_match_wins);
     RUN_TEST(discover_cbmignore_negation_cannot_unskip_safety_core);
 
+    /* Laravel compiled Blade view cache (issue #1735) */
+    RUN_TEST(discover_skips_laravel_compiled_views_issue1735);
+    RUN_TEST(discover_cbmignore_negates_laravel_compiled_views_issue1735);
+
     /* .git/info/exclude support (issue #489) */
     RUN_TEST(discover_git_info_exclude);
     RUN_TEST(discover_git_info_exclude_stacks_with_gitignore);
@@ -2179,6 +2465,15 @@ SUITE(discover) {
     /* Linked-worktree ignore resolution (gitlink + commondir) */
     RUN_TEST(discover_worktree_info_exclude);
     RUN_TEST(discover_worktree_committed_gitignore);
+
+    /* Enclosing-repo .gitignore resolution (issue #510, second half) */
+    RUN_TEST(discover_enclosing_repo_gitignore_issue510);
+    RUN_TEST(discover_enclosing_repo_info_exclude);
+    RUN_TEST(discover_enclosing_repo_gitignore_local_overrides);
+    RUN_TEST(discover_enclosing_rooted_pattern_not_reanchored);
+    RUN_TEST(discover_enclosing_info_exclude_rooted_subpath);
+    RUN_TEST(discover_enclosing_intermediate_gitignore);
+    RUN_TEST(discover_enclosing_deeper_ancestor_negation_wins);
 
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);

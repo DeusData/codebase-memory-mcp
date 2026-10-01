@@ -23,6 +23,7 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/sha256.h"
+#include "foundation/str_util.h"
 #include "cli/client_adapter.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 #include "mcp/index_supervisor.h"
@@ -62,7 +63,6 @@ enum {
     SQL_PARAM_1 = 1,   /* sqlite3_bind parameter index 1 */
     SQL_PARAM_2 = 2,
     SEMVER_PARTS = 3, /* major.minor.patch */
-    DB_EXT_LEN = 3,   /* strlen(".db") */
     MIN_ARGC_CMD = 3,
     /* minimum argc for subcommand with arg */ /* sqlite3_bind parameter index 2 */ /* 10 MB cap
                                                                                        factor */
@@ -226,6 +226,7 @@ typedef struct {
 static cbm_cli_activation_ops_t g_cli_activation_test_ops;
 static bool g_cli_activation_test_ops_set = false;
 static const char *g_cli_activation_runtime_parent_for_test = NULL;
+static bool g_cli_activation_scope_cache_unreadable_for_test = false;
 
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
     const char *diagnostic = message ? message : CLI_ACTIVATION_REFUSED_MESSAGE;
@@ -333,6 +334,10 @@ void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent) 
 
 const char *cbm_cli_activation_runtime_parent_for_test(void) {
     return g_cli_activation_runtime_parent_for_test;
+}
+
+void cbm_cli_set_activation_scope_cache_unreadable_for_test(bool unreadable) {
+    g_cli_activation_scope_cache_unreadable_for_test = unreadable;
 }
 
 static const char *cli_activation_action_text(cbm_daemon_runtime_activation_action_t action) {
@@ -541,6 +546,7 @@ typedef enum {
     CLI_ACTIVATION_SCOPE_ACTIVE = 0,
     CLI_ACTIVATION_SCOPE_NOTHING_TO_REPLACE,
     CLI_ACTIVATION_SCOPE_FOREIGN_COHORT,
+    CLI_ACTIVATION_SCOPE_UNCONFIRMED,
     CLI_ACTIVATION_SCOPE_ERROR,
 } cli_activation_scope_t;
 
@@ -566,9 +572,43 @@ static void cli_activation_log_guard_decision(const cli_activation_production_co
  * anything at all (a --skip-binary install without an index reset publishes
  * nothing), and whose cohort is active. Admission with an immediate deadline
  * is the cheapest authoritative read of the active lifetime record: OK means
- * the cohort is ours or empty, CONFLICT names the active identity (its cache
- * fingerprint is filled for every conflict kind), BUSY means another
- * activation holds maintenance and the barrier waits for it as before. */
+ * the cohort shares this exact identity (cache included) or is empty,
+ * CONFLICT names the active identity (its cache fingerprint is filled for
+ * every conflict kind), BUSY means another activation or a session start held
+ * the group, so the active identity was never read.
+ *
+ * Only a POSITIVE match may drain (user decision 2026-09-28, "unknown =
+ * foreign, keep it"): the daemon's activation-shutdown handler verifies the
+ * requester's build, never its cache, so this decision is the only thing
+ * that keeps another HOME's install/update from stopping the account's live
+ * daemon. A busy group or an unreadable active cache used to fall through to
+ * "ours" and stop every session behind that daemon. */
+static cli_activation_scope_t cli_activation_scope_unconfirmed(
+    cli_activation_production_context_t *context, const char *scope, const char *reason) {
+    const char *action = cli_activation_action_text(context->action);
+    (void)snprintf(context->scope_detail, sizeof(context->scope_detail),
+                   "active cohort ownership unconfirmed (%s); scope=%s; nothing stopped", reason,
+                   scope);
+    cli_activation_log_guard_decision(context, "unconfirmed_cohort", NULL);
+    /* Name the daemon being left: a read-only status probe (no cohort, no
+     * HELLO, no admission) that works across build skew. */
+    cbm_daemon_runtime_status_t daemon;
+    if (cbm_daemon_runtime_request_status(context->endpoint, &context->identity,
+                                          CLI_ACTIVATION_CONTROL_TIMEOUT_MS, &daemon)) {
+        printf("Leaving the running CBM daemon untouched (pid %lu, version %s): this %s could "
+               "not confirm that it serves the cache this %s targets (%s).\n",
+               (unsigned long)daemon.daemon_pid, daemon.semantic_version, action, action, reason);
+    } else {
+        printf("Leaving active CBM sessions untouched: this %s could not confirm that they "
+               "serve the cache it targets (%s).\n",
+               action, reason);
+    }
+    printf("If it is yours, close its CBM sessions and run `codebase-memory-mcp daemon stop` "
+           "to stop it yourself.\n");
+    (void)fflush(stdout);
+    return CLI_ACTIVATION_SCOPE_UNCONFIRMED;
+}
+
 static cli_activation_scope_t cli_activation_resolve_scope(
     cli_activation_production_context_t *context) {
     const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(context->endpoint);
@@ -594,20 +634,27 @@ static cli_activation_scope_t cli_activation_resolve_scope(
     if (lease) {
         return CLI_ACTIVATION_SCOPE_ERROR;
     }
+    if (g_cli_activation_scope_cache_unreadable_for_test) {
+        conflict.active_cache_fingerprint[0] = '\0';
+    }
     switch (status) {
     case CBM_VERSION_COHORT_OK:
-    case CBM_VERSION_COHORT_BUSY:
         return CLI_ACTIVATION_SCOPE_ACTIVE;
+    case CBM_VERSION_COHORT_BUSY:
+        return cli_activation_scope_unconfirmed(
+            context, scope, "the session group was busy, so its cache identity could not be read");
     case CBM_VERSION_COHORT_CONFLICT:
         break;
     default:
         return CLI_ACTIVATION_SCOPE_ERROR;
     }
-    if (!conflict.active_cache_fingerprint[0] ||
-        strcmp(conflict.active_cache_fingerprint, context->cache_fingerprint) == 0) {
-        /* Same cache namespace, another build or version: that IS the daemon
-         * this activation replaces. An unreadable active cache stays in scope
-         * rather than silently exempting a same-namespace daemon. */
+    if (!conflict.active_cache_fingerprint[0]) {
+        return cli_activation_scope_unconfirmed(context, scope,
+                                                "its cache identity could not be read");
+    }
+    if (strcmp(conflict.active_cache_fingerprint, context->cache_fingerprint) == 0) {
+        /* Positively confirmed: same cache namespace, another build or
+         * version. That IS the daemon this activation replaces. */
         return CLI_ACTIVATION_SCOPE_ACTIVE;
     }
     (void)snprintf(context->scope_detail, sizeof(context->scope_detail),
@@ -636,9 +683,10 @@ static int cli_activation_production_reserve(void *opaque, cbm_cli_activation_lo
     }
     if (scope != CLI_ACTIVATION_SCOPE_ACTIVE) {
         /* Nothing in the target namespace is being replaced, or the only
-         * active cohort serves another namespace: hold no maintenance,
-         * admission, lifetime or startup lock (each wakes or blocks the other
-         * namespace's sessions) and send no drain request. */
+         * active cohort serves another namespace, or its ownership could not
+         * be confirmed: hold no maintenance, admission, lifetime or startup
+         * lock (each wakes or blocks the other namespace's sessions) and
+         * send no drain request. */
         if (!cli_activation_log_event(context, "quiesce_skipped", context->scope_detail)) {
             return CLI_ERR;
         }
@@ -7207,8 +7255,7 @@ int cbm_list_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
         }
@@ -7231,8 +7278,7 @@ int cbm_remove_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             char path[CLI_BUF_1K];
             snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
             /* Also remove .db.tmp if present */
@@ -7268,7 +7314,7 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
     }
 
     char dbpath[CLI_BUF_1K];
-    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", cache_dir);
+    snprintf(dbpath, sizeof(dbpath), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
 
     /* Ensure directory exists */
     mkdirp(cache_dir, DIR_PERMS);
@@ -10437,7 +10483,7 @@ static int cbm_install_agent_configs_with_previous(const char *home, const char 
     return result;
 }
 
-/* Count .db files in the cache directory. */
+/* Count project index .db files in the cache directory (internal stores excluded). */
 static int count_db_indexes(const char *home) {
     const char *cache_dir = get_cache_dir(home);
     if (!cache_dir) {
@@ -10450,8 +10496,7 @@ static int count_db_indexes(const char *home) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             count++;
         }
     }
