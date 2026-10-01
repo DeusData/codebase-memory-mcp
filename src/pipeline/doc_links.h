@@ -143,6 +143,11 @@ typedef struct {
     int run_file;      /* index into the run's files[], or -1 for a base file */
 } cbm_doclink_file_t;
 
+/* What `build` is handed. LIFETIMES: the struct and its `files` array are
+ * valid only during the `build` call (the array is freed right after it): a
+ * resolver must not keep either pointer. The `rel_path` and `scope` strings
+ * the array points to stay valid until `destroy`, so an index may keep those
+ * without copying them. */
 typedef struct {
     const cbm_pipeline_ctx_t *ctx;
     const cbm_gbuf_t *graph;

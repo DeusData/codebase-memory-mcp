@@ -10,6 +10,7 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
+#include "result_spill.h" /* a parked result's header: is there a scope to read back? */
 #include "yyjson/yyjson.h"
 
 #include <stdatomic.h>
@@ -146,12 +147,46 @@ static int file_cmp(const void *a, const void *b) {
                   ((const cbm_doclink_file_t *)b)->rel_path);
 }
 
+/* True when file `i`'s result is parked on disk with a scope: an acquire that
+ * handed nothing out then means a failed read, not "no scope". A header that
+ * cannot be peeked counts as one. */
+static bool parked_scope_unread(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache, int i) {
+    if ((cache && cache[i]) || !ctx || !ctx->spill || !cbm_result_spill_has(ctx->spill, i)) {
+        return false;
+    }
+    CBMFileResult header;
+    return !cbm_result_spill_peek_header(ctx->spill, i, &header) || want_doc_scope(&header);
+}
+
+/* The scope of run file `i`, copied into the run's arena; NULL when the file
+ * has none. *why is set when it has one that cannot be had (the copy fails,
+ * or its parked result does not load): a scope dropped silently would take
+ * the file's declarations out of the index, and references to them would
+ * read as missing. */
+static const char *run_file_scope(cbm_doclinks_t *dl, const cbm_pipeline_ctx_t *ctx,
+                                  CBMFileResult **cache, int i, const char **why) {
+    bool loaded = false;
+    CBMFileResult *r = cbm_pipeline_result_acquire(ctx, cache, i, want_doc_scope, &loaded);
+    const char *scope = NULL;
+    if (r && r->doc_scope) {
+        scope = cbm_arena_strdup(&dl->arena, r->doc_scope);
+        if (!scope) {
+            *why = "alloc";
+        }
+    } else if (!r && parked_scope_unread(ctx, cache, i)) {
+        *why = "scope_unreadable";
+    }
+    cbm_pipeline_result_release(r, loaded);
+    return scope;
+}
+
 /* Build one language's index over this run's files of that language plus the
- * base scopes tagged for it. Returns false on allocation failure. */
+ * base scopes tagged for it. Returns false, with *why, when a scope cannot be
+ * read or copied or the index cannot be built: the caller fails the layer. */
 static bool build_language(cbm_doclinks_t *dl, int slot, const cbm_pipeline_ctx_t *ctx,
                            const cbm_file_info_t *files, int file_count, CBMFileResult **cache,
-                           const cbm_doclink_scope_t *base, int base_count,
-                           const cbm_gbuf_t *graph) {
+                           const cbm_doclink_scope_t *base, int base_count, const cbm_gbuf_t *graph,
+                           const char **why) {
     const cbm_doclink_resolver_t *R = DOCLINK_RESOLVERS[slot];
     int cap = 0;
     for (int i = 0; i < file_count; i++) {
@@ -166,17 +201,16 @@ static bool build_language(cbm_doclinks_t *dl, int slot, const cbm_pipeline_ctx_
     cbm_doclink_file_t *lf =
         (cbm_doclink_file_t *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)cap * sizeof(*lf));
     if (!lf) {
+        *why = "alloc";
         return false;
     }
+    const char *failed = NULL;
     int n = 0;
     for (int i = 0; i < file_count; i++) {
         if (!resolver_has_lang(R, files[i].language)) {
             continue;
         }
-        bool loaded = false;
-        CBMFileResult *r = cbm_pipeline_result_acquire(ctx, cache, i, want_doc_scope, &loaded);
-        const char *scope = (r && r->doc_scope) ? cbm_arena_strdup(&dl->arena, r->doc_scope) : NULL;
-        cbm_pipeline_result_release(r, loaded);
+        const char *scope = run_file_scope(dl, ctx, cache, i, &failed);
         lf[n++] =
             (cbm_doclink_file_t){.rel_path = files[i].rel_path, .scope = scope, .run_file = i};
     }
@@ -184,15 +218,27 @@ static bool build_language(cbm_doclinks_t *dl, int slot, const cbm_pipeline_ctx_
         if (!scope_has_tag(base[i].scope, R->scope_tag)) {
             continue;
         }
-        lf[n++] = (cbm_doclink_file_t){.rel_path = cbm_arena_strdup(&dl->arena, base[i].rel_path),
-                                       .scope = cbm_arena_strdup(&dl->arena, base[i].scope),
-                                       .run_file = CBM_NOT_FOUND};
+        const char *rel_path = cbm_arena_strdup(&dl->arena, base[i].rel_path);
+        const char *scope = cbm_arena_strdup(&dl->arena, base[i].scope);
+        if (!rel_path || !scope) {
+            failed = "alloc";
+        }
+        lf[n++] =
+            (cbm_doclink_file_t){.rel_path = rel_path, .scope = scope, .run_file = CBM_NOT_FOUND};
+    }
+    if (failed) {
+        cbm_free(CBM_MEM_CLASS_OTHER, lf);
+        *why = failed;
+        return false;
     }
     qsort(lf, (size_t)n, sizeof(*lf), file_cmp);
     cbm_doclink_build_in_t in = {
         .ctx = ctx, .graph = graph, .files = lf, .file_count = n, .run_file_count = file_count};
     dl->index[slot] = R->build(&in);
     cbm_free(CBM_MEM_CLASS_OTHER, lf);
+    if (!dl->index[slot]) {
+        *why = "index";
+    }
     return dl->index[slot] != NULL;
 }
 
@@ -232,8 +278,9 @@ cbm_doclinks_t *cbm_doclinks_build(const cbm_pipeline_ctx_t *ctx, const cbm_file
         return NULL;
     }
     for (int s = 0; s < DOCLINK_RESOLVER_COUNT; s++) {
-        if (!build_language(dl, s, ctx, files, file_count, cache, base, base_count, graph)) {
-            cbm_log_error("doc_links.error", "phase", "index_build", "reason", "alloc");
+        const char *why = "alloc";
+        if (!build_language(dl, s, ctx, files, file_count, cache, base, base_count, graph, &why)) {
+            cbm_log_error("doc_links.error", "phase", "index_build", "reason", why);
             cbm_doclinks_free(dl);
             return NULL;
         }
