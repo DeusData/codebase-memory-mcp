@@ -7264,6 +7264,67 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+/* Leak regression: trace_path by a qualified name resolves only through the
+ * qualified_name fallback. The bare-name lookup that precedes it returns a
+ * heap array even for zero rows (find_nodes_generic allocates its initial
+ * capacity up front), and the fallback used to overwrite that pointer —
+ * leaking ~1 KB per call for the daemon's lifetime. The sanitizer lanes
+ * (LSan: default-on under Linux ASan, `make -f Makefile.cbm test-lsan` on
+ * macOS) report the leak at exit; the assertions pin that this test really
+ * takes the fallback path. */
+TEST(tool_trace_call_path_qn_fallback_frees_name_miss) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "qnfb-proj";
+    const char *qn = "qnfb-proj.src.qnfb_entry";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/qnfb");
+    cbm_node_t entry = {.project = proj,
+                        .label = "Function",
+                        .name = "qnfb_entry",
+                        .qualified_name = qn,
+                        .file_path = "src/qnfb.c",
+                        .start_line = 1,
+                        .end_line = 10};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "qnfb_callee",
+                         .qualified_name = "qnfb-proj.src.qnfb_callee",
+                         .file_path = "src/qnfb.c",
+                         .start_line = 20,
+                         .end_line = 30};
+    int64_t id_entry = cbm_store_upsert_node(st, &entry);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_entry, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t e = {
+        .project = proj, .source_id = id_entry, .target_id = id_callee, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    /* Precondition: the qualified name is NOT a bare name, so the handler's
+     * first lookup misses and the fallback is the only way to resolve it. */
+    cbm_node_t *by_name = NULL;
+    int by_name_count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(st, proj, qn, &by_name, &by_name_count), CBM_STORE_OK);
+    ASSERT_EQ(by_name_count, 0);
+    cbm_store_free_nodes(by_name, by_name_count);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
+             "\"qnfb-proj.src.qnfb_entry\",\"project\":\"qnfb-proj\",\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "function not found"));
+    /* resolved through the fallback -> its outbound CALLS edge shows */
+    ASSERT_NOT_NULL(strstr(inner, "qnfb_callee"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* CONTRACT PIN for the closed strategy vocabulary published by
  * trace_path(include_evidence:true).
  *
@@ -8597,6 +8658,112 @@ TEST(tool_project_arg_resolves_non_ascii_folder_issue1827) {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
     th_rmtree(parent);
+    th_rmtree(cache);
+    PASS();
+}
+
+/* #2134: re-indexing a root WITHOUT `name` must update the project that
+ * already owns that root_path, not fork a second index under the
+ * path-derived name (both then list the same root_path and the stale one
+ * keeps being read as fresh). Several owners of one root are ambiguous: the
+ * call must fail loudly and name them instead of guessing or forking. */
+static int i2134_count_occurrences(const char *haystack, const char *needle) {
+    int count = 0;
+    for (const char *p = haystack ? strstr(haystack, needle) : NULL; p; p = strstr(p + 1, needle)) {
+        count++;
+    }
+    return count;
+}
+
+TEST(tool_index_repository_reuses_existing_project_for_root_issue2134) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-i2134r-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i2134c-XXXXXX");
+    if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    char canonical_repo[CBM_SZ_4K]; /* cbm_canonical_path needs >= 4096 bytes */
+    if (!cbm_canonical_path(repo, canonical_repo, sizeof(canonical_repo))) {
+        FAIL("cbm_canonical_path failed");
+    }
+    /* Stored root_path values use forward slashes on every platform. */
+    cbm_normalize_path_sep(canonical_repo);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    const char *saved_sup = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sup_copy = saved_sup ? cbm_strdup(saved_sup) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+    i1025_write_repo(repo, "root_owner_2134");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* 1. Index once under an explicit name. */
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"named-2134\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    free(r);
+
+    /* 2. Re-index the same root without a name: must update named-2134. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    if (!strstr(r, "named-2134")) {
+        fprintf(stderr, "  [2134] reindex without name forked: %.300s\n", r);
+    }
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    free(r);
+
+    /* Every listed project carries its root_path once in structuredContent,
+     * so the canonical root occurring once there means exactly one owner. */
+    r = cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"structuredContent\""));
+    int owners = i2134_count_occurrences(strstr(r, "\"structuredContent\""), canonical_repo);
+    if (owners != 1) {
+        fprintf(stderr, "  [2134] %d projects share root %s: %.400s\n", owners, canonical_repo, r);
+    }
+    ASSERT_EQ(owners, 1);
+    free(r);
+
+    /* 3. An explicit second name is the caller's choice; afterwards the root
+     * has two owners, so an unnamed re-index must refuse and list both. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"other-2134\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "other-2134"));
+    free(r);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    ASSERT_NOT_NULL(strstr(r, "other-2134"));
+    ASSERT_NOT_NULL(strstr(r, "\"isError\":true"));
+    free(r);
+    r = cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"structuredContent\""));
+    ASSERT_EQ(i2134_count_occurrences(strstr(r, "\"structuredContent\""), canonical_repo), 2);
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_sup_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sup_copy, 1);
+        free(saved_sup_copy);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    th_rmtree(repo);
     th_rmtree(cache);
     PASS();
 }
@@ -21004,6 +21171,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_reports_engine_saturation_as_lower_bound);
     RUN_TEST(store_bfs_edge_data_is_skippable_and_bounded);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
@@ -21022,6 +21190,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
     RUN_TEST(tool_project_arg_resolves_non_ascii_folder_issue1827);
+    RUN_TEST(tool_index_repository_reuses_existing_project_for_root_issue2134);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

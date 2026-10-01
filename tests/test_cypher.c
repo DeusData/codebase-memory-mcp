@@ -715,6 +715,45 @@ TEST(cypher_exec_optional_empty_label_no_overflow) {
     PASS();
 }
 
+/* Regression: the relationship variant of the test above. An OPTIONAL MATCH
+ * with a relationship whose start AND terminal are both unbound, and whose
+ * start matches zero nodes, drove cross_join_with_rels with extra_count == 0.
+ * That sized its output for a single binding, and the OPTIONAL fallback then
+ * wrote one row per existing binding without growing the buffer: a heap
+ * buffer overflow once the first MATCH bound more than one node (ASan:
+ * heap-buffer-overflow). The query text reaches this from the MCP query tool. */
+TEST(cypher_exec_optional_empty_label_rel_no_overflow) {
+    cbm_store_t *s = setup_cypher_store(); /* 4 Function nodes */
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function) OPTIONAL MATCH (x:NoSuchLabel)-[:CALLS]->(y) "
+                                "RETURN a.name, x.name, y.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 3);
+    /* One row per Function, each with x and y left unbound (""). */
+    ASSERT_EQ(r.row_count, 4);
+    const char *want[] = {"HandleOrder", "ValidateOrder", "SubmitOrder", "LogError"};
+    for (int w = 0; w < 4; w++) {
+        int seen = 0;
+        for (int i = 0; i < r.row_count; i++) {
+            if (strcmp(r.rows[i][0], want[w]) == 0) {
+                seen++;
+            }
+        }
+        ASSERT_EQ(seen, 1);
+    }
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_STR_EQ(r.rows[i][1], "");
+        ASSERT_STR_EQ(r.rows[i][2], "");
+    }
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* Regression: expand_pattern_rels sized its OPTIONAL-expansion output buffer as
  * bind_cap*10 + 1 — room for the bounded expansion (max_new = bind_cap*10) plus
  * a SINGLE OPTIONAL fallback row. When one source saturated the expansion to
@@ -4869,6 +4908,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_deep_nesting_rejected_not_crash);
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_exec_optional_empty_label_no_overflow);
+    RUN_TEST(cypher_exec_optional_empty_label_rel_no_overflow);
     RUN_TEST(cypher_cross_join_alloc_rejects_overflow);
     RUN_TEST(cypher_exec_optional_rel_saturated_no_overflow);
     RUN_TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match);

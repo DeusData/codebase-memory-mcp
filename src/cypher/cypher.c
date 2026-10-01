@@ -4822,9 +4822,12 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
             free(tmp);
         }
         if (opt && extra_count == 0) {
+            /* OPTIONAL with no start node: keep the row, pattern vars unbound.
+             * The buffer was sized for a single row when extra_count == 0, so
+             * this write must grow it like every other writer here. */
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
-            new_bindings[new_count++] = nb;
+            (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
         }
     }
     for (int bi = 0; bi < *bind_count; bi++) {

@@ -435,36 +435,58 @@ static double cx_ratio(double num, double den) {
     return den > 0.0 ? num / den : 0.0;
 }
 
+typedef int (*CxCorpusBuilder)(const char *root, int k);
+
+static void cx_remove_corpus(const char *root) {
+    if (th_rmtree(root) != 0) {
+        fprintf(stderr, "  [complexity] WARN: could not remove temp corpus %s\n", root);
+    }
+}
+
+/* Build one corpus shape at k and 2k in two fresh temp dirs, run the pipeline
+ * on both, and remove both dirs before returning — on success and on every
+ * failure path. Only the metrics outlive the call; the corpora used to stay
+ * behind in the temp root, four per suite run. Only dirs this call created
+ * are removed (the temp root is shared with concurrent runs). */
+static int cx_measure(CxCorpusBuilder build, const char *prefix_a, const char *prefix_b,
+                      CxMetrics *out_a, CxMetrics *out_b) {
+    const char *tmp = cbm_tmpdir();
+    char root_a[512];
+    char root_b[512];
+    snprintf(root_a, sizeof(root_a), "%s/%s_XXXXXX", tmp, prefix_a);
+    snprintf(root_b, sizeof(root_b), "%s/%s_XXXXXX", tmp, prefix_b);
+    bool made_a = cbm_mkdtemp(root_a) != NULL;
+    bool made_b = made_a && cbm_mkdtemp(root_b) != NULL;
+    int rc = -1;
+    if (made_b && build(root_a, CX_K_BASE) == 0 && build(root_b, CX_K_BASE * 2) == 0) {
+        char db_a[600];
+        char db_b[600];
+        snprintf(db_a, sizeof(db_a), "%s/cx.db", root_a);
+        snprintf(db_b, sizeof(db_b), "%s/cx.db", root_b);
+        if (cx_run(root_a, db_a, out_a) == 0 && cx_run(root_b, db_b, out_b) == 0) {
+            rc = 0;
+        }
+    }
+    if (made_b) {
+        cx_remove_corpus(root_b);
+    }
+    if (made_a) {
+        cx_remove_corpus(root_a);
+    }
+    return rc;
+}
+
 /* Shared across the suite so the report test reuses the measured pair instead
  * of paying two more pipeline runs. */
 static CxMetrics g_cx_base;
 static CxMetrics g_cx_doubled;
 static bool g_cx_measured = false;
-static char g_cx_root_base[512];
-static char g_cx_root_doubled[512];
 
 static int cx_measure_pair(void) {
     if (g_cx_measured) {
         return 0;
     }
-    const char *tmp = cbm_tmpdir();
-    snprintf(g_cx_root_base, sizeof(g_cx_root_base), "%s/cbm_cx_base_XXXXXX", tmp);
-    snprintf(g_cx_root_doubled, sizeof(g_cx_root_doubled), "%s/cbm_cx_dbl_XXXXXX", tmp);
-    if (!cbm_mkdtemp(g_cx_root_base) || !cbm_mkdtemp(g_cx_root_doubled)) {
-        return -1;
-    }
-    if (cx_build_corpus(g_cx_root_base, CX_K_BASE) != 0 ||
-        cx_build_corpus(g_cx_root_doubled, CX_K_BASE * 2) != 0) {
-        return -1;
-    }
-    char db1[600];
-    char db2[600];
-    snprintf(db1, sizeof(db1), "%s/cx.db", g_cx_root_base);
-    snprintf(db2, sizeof(db2), "%s/cx.db", g_cx_root_doubled);
-    if (cx_run(g_cx_root_base, db1, &g_cx_base) != 0) {
-        return -1;
-    }
-    if (cx_run(g_cx_root_doubled, db2, &g_cx_doubled) != 0) {
+    if (cx_measure(cx_build_corpus, "cbm_cx_base", "cbm_cx_dbl", &g_cx_base, &g_cx_doubled) != 0) {
         return -1;
     }
     g_cx_measured = true;
@@ -555,25 +577,8 @@ static int cx_measure_bigpkg_pair(void) {
     if (g_cx_big_measured) {
         return 0;
     }
-    const char *tmp = cbm_tmpdir();
-    char ra[512];
-    char rb[512];
-    snprintf(ra, sizeof(ra), "%s/cbm_cxbig_a_XXXXXX", tmp);
-    snprintf(rb, sizeof(rb), "%s/cbm_cxbig_b_XXXXXX", tmp);
-    if (!cbm_mkdtemp(ra) || !cbm_mkdtemp(rb)) {
-        return -1;
-    }
-    if (cx_build_bigpkg(ra, CX_K_BASE) != 0 || cx_build_bigpkg(rb, CX_K_BASE * 2) != 0) {
-        return -1;
-    }
-    char db1[600];
-    char db2[600];
-    snprintf(db1, sizeof(db1), "%s/cx.db", ra);
-    snprintf(db2, sizeof(db2), "%s/cx.db", rb);
-    if (cx_run(ra, db1, &g_cx_big_base) != 0) {
-        return -1;
-    }
-    if (cx_run(rb, db2, &g_cx_big_doubled) != 0) {
+    if (cx_measure(cx_build_bigpkg, "cbm_cxbig_a", "cbm_cxbig_b", &g_cx_big_base,
+                   &g_cx_big_doubled) != 0) {
         return -1;
     }
     g_cx_big_measured = true;
