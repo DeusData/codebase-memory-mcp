@@ -191,7 +191,7 @@ TEST(registry_free_null) {
 
 TEST(registry_add_and_exists) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function");
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false);
     ASSERT_EQ(cbm_registry_size(r), 1);
     ASSERT_TRUE(cbm_registry_exists(r, "proj.cmd.main"));
     ASSERT_FALSE(cbm_registry_exists(r, "proj.cmd.other"));
@@ -199,10 +199,52 @@ TEST(registry_add_and_exists) {
     PASS();
 }
 
+/* REG_TEST_PENALTY had no direct coverage. Of the registry call sites in this
+ * suite, none registered a symbol the scorer would treat as a test, so the
+ * layer that keeps production code ahead of test code was never exercised.
+ * These three pin it, and pin where the verdict comes from. */
+TEST(registry_prefers_non_test_over_test_candidate) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "helper", "proj.app.helper", "Function", false);
+    cbm_registry_add(r, "helper", "proj.harness.helper", "Function", true);
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "helper", "proj.other", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.app.helper");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The verdict is the caller's, not the QN's spelling. "latest" contains "test",
+ * so the scan this replaces read ordinary production code as a test and pushed
+ * it below a real one; "harness" spells nothing, so the same scan read a test
+ * as production. Both verdicts here are the extractor's, and both are right. */
+TEST(registry_test_verdict_comes_from_the_caller_not_the_qn) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "parse", "proj.latest.parse", "Function", false);
+    cbm_registry_add(r, "parse", "proj.harness.parse", "Function", true);
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "parse", "proj.other", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.latest.parse");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* A bucket of one is returned whatever its verdict: the penalty orders
+ * candidates, it does not veto them. */
+TEST(registry_sole_test_candidate_still_resolves) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "only", "proj.harness.only", "Function", true);
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "only", "proj.other", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.harness.only");
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(registry_label_of) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Foo", "proj.pkg.Foo", "Class");
-    cbm_registry_add(r, "bar", "proj.pkg.bar", "Function");
+    cbm_registry_add(r, "Foo", "proj.pkg.Foo", "Class", false);
+    cbm_registry_add(r, "bar", "proj.pkg.bar", "Function", false);
 
     ASSERT_STR_EQ(cbm_registry_label_of(r, "proj.pkg.Foo"), "Class");
     ASSERT_STR_EQ(cbm_registry_label_of(r, "proj.pkg.bar"), "Function");
@@ -214,9 +256,9 @@ TEST(registry_label_of) {
 
 TEST(registry_find_by_name) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function");
-    cbm_registry_add(r, "main", "proj.srv.main", "Function");
-    cbm_registry_add(r, "helper", "proj.util.helper", "Function");
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false);
+    cbm_registry_add(r, "main", "proj.srv.main", "Function", false);
+    cbm_registry_add(r, "helper", "proj.util.helper", "Function", false);
 
     const char **out = NULL;
     int count = 0;
@@ -235,8 +277,8 @@ TEST(registry_find_by_name) {
 
 TEST(registry_no_duplicates) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function");
-    cbm_registry_add(r, "main", "proj.cmd.main", "Function"); /* duplicate */
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false);
+    cbm_registry_add(r, "main", "proj.cmd.main", "Function", false); /* duplicate */
     ASSERT_EQ(cbm_registry_size(r), 1);
 
     const char **out = NULL;
@@ -252,7 +294,7 @@ TEST(registry_no_duplicates) {
 
 TEST(resolve_same_module) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "helper", "proj.pkg.service.helper", "Function");
+    cbm_registry_add(r, "helper", "proj.pkg.service.helper", "Function", false);
 
     /* Call "helper" from the same module → should resolve */
     cbm_resolution_t res = cbm_registry_resolve(r, "helper", "proj.pkg.service", NULL, NULL, 0);
@@ -270,9 +312,9 @@ TEST(resolve_same_module) {
  * Foo::Bar::sub()) where the same sub name exists in multiple packages. */
 TEST(resolve_qualified_disambiguates_same_name) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "save", "proj.lib.App.Alpha.save", "Function");
-    cbm_registry_add(r, "save", "proj.lib.App.Beta.save", "Function");
-    cbm_registry_add(r, "save", "proj.lib.App.Gamma.save", "Function");
+    cbm_registry_add(r, "save", "proj.lib.App.Alpha.save", "Function", false);
+    cbm_registry_add(r, "save", "proj.lib.App.Beta.save", "Function", false);
+    cbm_registry_add(r, "save", "proj.lib.App.Gamma.save", "Function", false);
 
     /* Each fully-qualified call routes to its own package. */
     cbm_resolution_t a =
@@ -313,8 +355,8 @@ TEST(resolve_qualified_disambiguates_same_name) {
  * pick arbitrarily under the high-confidence qualified_suffix strategy. */
 TEST(resolve_qualified_ambiguous_tail_falls_through) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "run", "proj.svcA.Foo.Bar.run", "Function");
-    cbm_registry_add(r, "run", "proj.svcB.Foo.Bar.run", "Function");
+    cbm_registry_add(r, "run", "proj.svcA.Foo.Bar.run", "Function", false);
+    cbm_registry_add(r, "run", "proj.svcB.Foo.Bar.run", "Function", false);
 
     /* "Foo::Bar::run" tail matches BOTH candidates → not unique → fall through. */
     cbm_resolution_t res =
@@ -332,7 +374,7 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
  * `add` callee could ever reach it. */
 TEST(registry_indexes_by_passed_name_not_qn_tail) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function");
+    cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function", false);
 
     cbm_resolution_t res = cbm_registry_resolve(r, "add", "proj.lib.caller", NULL, NULL, 0);
     ASSERT_STR_EQ(res.qualified_name, "proj.lib.add#cfg(test)");
@@ -357,9 +399,9 @@ TEST(registry_indexes_by_passed_name_not_qn_tail) {
  * lookup a bare module reference needs. */
 TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "resource.aws_instance.web", "proj.main.resource.aws_instance.web",
-                     "Class");
-    cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module");
+    cbm_registry_add(r, "resource.aws_instance.web", "proj.main.resource.aws_instance.web", "Class",
+                     false);
+    cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module", false);
 
     cbm_resolution_t tail = cbm_registry_resolve(r, "web", "proj.main", NULL, NULL, 0);
     ASSERT_STR_EQ(tail.qualified_name, "proj.main.resource.aws_instance.web");
@@ -377,7 +419,7 @@ TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
 
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function", false);
 
     /* Import map: "worker" → "proj.pkg.worker" */
     const char *keys[] = {"worker"};
@@ -400,9 +442,9 @@ TEST(resolve_import_map) {
  * file. Regression for the @/lib/auth-style import case. */
 TEST(resolve_import_map_bare_function) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "requireAdmin", "proj.lib.authorization.requireAdmin", "Function");
+    cbm_registry_add(r, "requireAdmin", "proj.lib.authorization.requireAdmin", "Function", false);
     /* Same name in another module — without the fix this is what gets picked. */
-    cbm_registry_add(r, "requireAdmin", "proj.lib.users.requireAdmin", "Function");
+    cbm_registry_add(r, "requireAdmin", "proj.lib.users.requireAdmin", "Function", false);
 
     const char *keys[] = {"requireAdmin"};
     const char *vals[] = {"proj.lib.authorization"};
@@ -423,7 +465,7 @@ TEST(resolve_import_map_bare_function) {
  * Regression for #875. */
 TEST(resolve_import_map_bare_alias) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function");
+    cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function", false);
     /* Import map: alias "_scan_bash" → FULL SYMBOL QN (not the module). */
     const char *keys[] = {"_scan_bash"};
     const char *vals[] = {"proj.security_scan.scan_bash"};
@@ -440,10 +482,10 @@ TEST(resolve_import_map_bare_alias) {
  * already on main via #875/#979; this locks the Yui G1 shape. */
 TEST(resolve_import_map_aliased_from_import) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "execute", "proj.services.satori_bridge.gate.execute", "Function");
+    cbm_registry_add(r, "execute", "proj.services.satori_bridge.gate.execute", "Function", false);
     /* Alias ghost must not win if somehow registered. */
     cbm_registry_add(r, "bridge_execute", "proj.services.satori_bridge.gate.bridge_execute",
-                     "Function");
+                     "Function", false);
 
     const char *keys[] = {"bridge_execute"};
     const char *vals[] = {"proj.services.satori_bridge.gate.execute"};
@@ -459,7 +501,7 @@ TEST(resolve_import_map_aliased_from_import) {
 
 TEST(resolve_unique_name) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
+    cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function", false);
 
     /* Call "UniqueFunc" — only one candidate project-wide */
     cbm_resolution_t res =
@@ -473,7 +515,7 @@ TEST(resolve_unique_name) {
 
 TEST(resolve_unresolved) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "foo", "proj.pkg.foo", "Function");
+    cbm_registry_add(r, "foo", "proj.pkg.foo", "Function", false);
 
     /* Call "nonexistent" — not in registry */
     cbm_resolution_t res = cbm_registry_resolve(r, "nonexistent", "proj.other", NULL, NULL, 0);
@@ -490,7 +532,7 @@ TEST(resolve_many_nodes) {
         char name[32], qn[64];
         snprintf(name, sizeof(name), "func_%d", i);
         snprintf(qn, sizeof(qn), "proj.pkg.func_%d", i);
-        cbm_registry_add(r, name, qn, "Function");
+        cbm_registry_add(r, name, qn, "Function", false);
     }
     ASSERT_EQ(cbm_registry_size(r), 500);
 
@@ -528,8 +570,8 @@ TEST(confidence_band_speculative) {
 
 TEST(resolve_suffix_match) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function", false);
 
     /* Caller in svcA — should prefer svcA via import distance */
     cbm_resolution_t res = cbm_registry_resolve(r, "Process", "proj.svcA.caller", NULL, NULL, 0);
@@ -552,7 +594,7 @@ TEST(resolve_caps_unresolvably_ambiguous_names) {
     for (int i = 0; i < 300; i++) {
         char qn[64];
         snprintf(qn, sizeof(qn), "proj.mod%d.flags", i);
-        cbm_registry_add(r, "flags", qn, "Variable");
+        cbm_registry_add(r, "flags", qn, "Variable", false);
     }
     cbm_resolution_t res = cbm_registry_resolve(r, "flags", "proj.other.caller", NULL, NULL, 0);
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
@@ -570,7 +612,7 @@ TEST(resolve_caps_unresolvably_ambiguous_names) {
 
 TEST(resolve_import_map_suffix) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Foo", "proj.other.sub.Foo", "Function");
+    cbm_registry_add(r, "Foo", "proj.other.sub.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -592,7 +634,7 @@ TEST(resolve_is_import_reachable) {
     /* Test import reachability through unique_name confidence penalty.
      * is_import_reachable is static, so we test it indirectly. */
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Helper", "proj.shared.utils.Helper", "Function");
+    cbm_registry_add(r, "Helper", "proj.shared.utils.Helper", "Function", false);
 
     /* With import covering the module → full confidence */
     const char *keys1[] = {"utils"};
@@ -615,7 +657,7 @@ TEST(resolve_is_import_reachable) {
 TEST(resolve_import_reachable_prefix) {
     /* "proj.handler.sub.Process" should be reachable via import "proj.handler" */
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.handler.sub.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.handler.sub.Process", "Function", false);
 
     const char *keys[] = {"handler"};
     const char *vals[] = {"proj.handler"};
@@ -669,8 +711,8 @@ TEST(reach_cache_memo_matches_uncached_across_files) {
 
 TEST(negative_import_rejects_unimported) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.billing.Process", "Function");
-    cbm_registry_add(r, "Process", "proj.handler.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.billing.Process", "Function", false);
+    cbm_registry_add(r, "Process", "proj.handler.Process", "Function", false);
 
     /* Import only handler's module — suffix_match should prefer handler */
     const char *keys[] = {"handler"};
@@ -686,8 +728,8 @@ TEST(negative_import_rejects_unimported) {
 
 TEST(fuzzy_resolve_single_candidate) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
-    cbm_registry_add(r, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
+    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
+    cbm_registry_add(r, "ValidateOrder", "svcB.validators.ValidateOrder", "Function", false);
 
     /* FuzzyResolve should find by simple name even with unknown prefix */
     cbm_fuzzy_result_t fr =
@@ -701,7 +743,7 @@ TEST(fuzzy_resolve_single_candidate) {
 
 TEST(fuzzy_resolve_nonexistent) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+    cbm_registry_add(r, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(r, "NonExistent", "svcC.caller", NULL, NULL, 0);
@@ -713,8 +755,8 @@ TEST(fuzzy_resolve_nonexistent) {
 
 TEST(fuzzy_resolve_multiple_best_by_distance) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "svcA.handlers.Process", "Function");
-    cbm_registry_add(r, "Process", "svcB.handlers.Process", "Function");
+    cbm_registry_add(r, "Process", "svcA.handlers.Process", "Function", false);
+    cbm_registry_add(r, "Process", "svcB.handlers.Process", "Function", false);
 
     /* Caller in svcA — should prefer svcA */
     cbm_fuzzy_result_t fr =
@@ -733,7 +775,7 @@ TEST(fuzzy_resolve_multiple_best_by_distance) {
 
 TEST(fuzzy_resolve_deep_name_extraction) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "DoWork", "myproject.utils.DoWork", "Function");
+    cbm_registry_add(r, "DoWork", "myproject.utils.DoWork", "Function", false);
 
     /* Deeply qualified callee — should extract "DoWork" */
     cbm_fuzzy_result_t fr =
@@ -758,7 +800,7 @@ TEST(fuzzy_resolve_empty_registry) {
 
 TEST(fuzzy_resolve_confidence_single) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Handler", "proj.svc.Handler", "Function");
+    cbm_registry_add(r, "Handler", "proj.svc.Handler", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(r, "unknownPkg.Handler", "proj.caller", NULL, NULL, 0);
@@ -772,8 +814,8 @@ TEST(fuzzy_resolve_confidence_single) {
 
 TEST(fuzzy_resolve_confidence_distance) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(r, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(r, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(r, "unknownPkg.Process", "proj.svcA.other", NULL, NULL, 0);
@@ -787,7 +829,7 @@ TEST(fuzzy_resolve_confidence_distance) {
 
 TEST(fuzzy_penalty_unreachable_import) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function", false);
 
     /* Import for different module → confidence halved */
     const char *keys[] = {"other"};
@@ -804,7 +846,7 @@ TEST(fuzzy_penalty_unreachable_import) {
 
 TEST(fuzzy_no_import_map_passthrough) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(r, "Handler", "proj.billing.Handler", "Function", false);
 
     /* nil import map → full confidence */
     cbm_fuzzy_result_t fr =
@@ -913,8 +955,8 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     cbm_registry_t *forward = cbm_registry_new();
     cbm_registry_t *backward = cbm_registry_new();
     for (int i = 0; i < n; i++) {
-        cbm_registry_add(forward, "dev_name", cands[i], labels[i]);
-        cbm_registry_add(backward, "dev_name", cands[n - 1 - i], labels[n - 1 - i]);
+        cbm_registry_add(forward, "dev_name", cands[i], labels[i], false);
+        cbm_registry_add(backward, "dev_name", cands[n - 1 - i], labels[n - 1 - i], false);
     }
 
     /* A far-away caller with no imports: every candidate scores the same. */
@@ -932,10 +974,10 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     /* Equal depth: the smaller QN, from either order. */
     cbm_registry_t *lex_a = cbm_registry_new();
     cbm_registry_t *lex_b = cbm_registry_new();
-    cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
-    cbm_registry_add(lex_a, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
-    cbm_registry_add(lex_b, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
-    cbm_registry_add(lex_b, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function", false);
+    cbm_registry_add(lex_a, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function", false);
+    cbm_registry_add(lex_b, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function", false);
+    cbm_registry_add(lex_b, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function", false);
     cbm_resolution_t la =
         cbm_registry_resolve(lex_a, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
     cbm_resolution_t lb =
@@ -945,9 +987,9 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
 
     /* Proximity still outranks depth: the sibling wins over a shallower stranger. */
     cbm_registry_t *near = cbm_registry_new();
-    cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
+    cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function", false);
     cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
-                     "Function");
+                     "Function", false);
     cbm_resolution_t nr = cbm_registry_resolve(near, "vnic_rq_free",
                                                "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
     ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
@@ -1209,8 +1251,8 @@ TEST(weak_call_guards_share_one_drop_list) {
  * Signal.send). Regression guard for #1000. */
 TEST(resolve_import_map_alias_with_suffix_hits_method) {
     cbm_registry_t *r = cbm_registry_new();
-    cbm_registry_add(r, "user_logged_in", "proj.auth.signals.user_logged_in", "Variable");
-    cbm_registry_add(r, "send", "proj.auth.signals.user_logged_in.send", "Method");
+    cbm_registry_add(r, "user_logged_in", "proj.auth.signals.user_logged_in", "Variable", false);
+    cbm_registry_add(r, "send", "proj.auth.signals.user_logged_in.send", "Method", false);
     const char *keys[] = {"user_logged_in"};
     const char *vals[] = {"proj.auth.signals.user_logged_in"};
     cbm_resolution_t res =
@@ -1244,6 +1286,9 @@ SUITE(registry) {
     RUN_TEST(registry_create_free);
     RUN_TEST(registry_free_null);
     RUN_TEST(registry_add_and_exists);
+    RUN_TEST(registry_prefers_non_test_over_test_candidate);
+    RUN_TEST(registry_test_verdict_comes_from_the_caller_not_the_qn);
+    RUN_TEST(registry_sole_test_candidate_still_resolves);
     RUN_TEST(registry_label_of);
     RUN_TEST(registry_find_by_name);
     RUN_TEST(registry_no_duplicates);

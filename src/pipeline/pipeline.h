@@ -236,8 +236,11 @@ cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
 /* Register a function/method/class. All strings are copied. */
+/* `is_test` is the extractor's verdict for this symbol (CBMDefinition.is_test:
+ * the file's test-ness OR the definition's own test attributes). The registry
+ * stores it and scores with it; it does not derive test-ness from the QN. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label);
+                      const char *label, bool is_test);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.

@@ -28,6 +28,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
+#include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
 
@@ -72,16 +73,16 @@ const char *cbm_confidence_band(double score) {
 
 /* ── Internal types ──────────────────────────────────────────────── */
 
-/* Array of QN strings for byName index, with the test/mock verdict of each
- * name cached beside it: the scorer asked is_test_qn for every candidate of
- * every unresolved call, and the answer depends only on the name, which never
- * changes once registered (waste sanitizer scaling lane, 2026-09-17). Field
- * order and names match CBM_DYN_ARRAY(char *) so cbm_da_push works on it. */
+/* Array of QN strings for byName index, with each entry's test verdict beside
+ * it. The verdict is the extractor's, handed to cbm_registry_add by the caller
+ * that already computed it from the file path and the definition's attributes;
+ * it is stored rather than derived, so every entry always has one. Field order
+ * and names match CBM_DYN_ARRAY(char *) so cbm_da_push works on it. */
 typedef struct {
     char **items;
     int count;
     int cap;
-    uint8_t *is_test; /* is_test_qn(items[i]), one byte per entry */
+    uint8_t *is_test; /* the caller's verdict for items[i], one byte per entry */
     int is_test_cap;
 } qn_array_t;
 
@@ -151,78 +152,19 @@ static int common_prefix_len(const char *a, const char *b) {
 
 enum { REG_TEST_PENALTY = 1000 };
 
-/* Check if a qualified name looks like a test/mock path: does it contain any of
- * Test, test, Mock, mock, Stub, stub, Fake, fake, Fixture, spec? One pass that
- * dispatches on the first character instead of ten strstr scans of the whole
- * name (this ran for every candidate of every unresolved call: the scaling
- * lane's x4.0, waste sanitizer 2026-09-17). */
-static bool is_test_qn(const char *qn) {
-    if (!qn) {
-        return false;
-    }
-    for (const char *p = qn; *p; p++) {
-        switch (*p) {
-        case 'T':
-            if (strncmp(p, "Test", 4) == 0) {
-                return true;
-            }
-            break;
-        case 't':
-            if (strncmp(p, "test", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'M':
-            if (strncmp(p, "Mock", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'm':
-            if (strncmp(p, "mock", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'S':
-            if (strncmp(p, "Stub", 4) == 0) {
-                return true;
-            }
-            break;
-        case 's':
-            if (strncmp(p, "stub", 4) == 0 || strncmp(p, "spec", 4) == 0) {
-                return true;
-            }
-            break;
-        case 'F':
-            if (strncmp(p, "Fake", 4) == 0 || strncmp(p, "Fixture", 7) == 0) {
-                return true;
-            }
-            break;
-        case 'f':
-            if (strncmp(p, "fake", 4) == 0) {
-                return true;
-            }
-            break;
-        default:
-            break;
-        }
-    }
-    return false;
-}
-
-/* The cached test verdicts, only when they cover every entry: a failed growth
- * leaves the cache short, and then the scorer asks per candidate as before. */
+/* The stored test verdicts. index_under_name drops an entry it cannot record a
+ * verdict for, so this covers every entry of a non-empty bucket. */
 static const uint8_t *qn_test_flags(const qn_array_t *arr) {
-    return arr->is_test && arr->is_test_cap >= arr->count ? arr->is_test : NULL;
+    return arr->is_test;
 }
 
 /* Score a candidate for tiebreaking. Higher = better.
  * Layer 1: Non-test code preferred over test code (+1000)
  * Layer 2: Namespace proximity via common prefix length (+plen)
- * `is_test` is the cached verdict when the caller has one (-1: ask). */
-static int candidate_score(const char *candidate_qn, const char *module_qn, int is_test) {
+ * `is_test` is the verdict stored for this candidate at registration. */
+static int candidate_score(const char *candidate_qn, const char *module_qn, bool is_test) {
     int score = 0;
-    bool test = is_test >= 0 ? is_test != 0 : is_test_qn(candidate_qn);
-    if (!test) {
+    if (!is_test) {
         score += REG_TEST_PENALTY;
     }
     score += common_prefix_len(candidate_qn, module_qn);
@@ -268,8 +210,7 @@ static const char *best_by_import_distance(const char **candidates, const uint8_
     const char *best = NULL;
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
-        int score =
-            candidate_score(candidates[i], module_qn, is_test_flags ? (int)is_test_flags[i] : -1);
+        int score = candidate_score(candidates[i], module_qn, is_test_flags[i] != 0);
         if (score > best_score ||
             (score == best_score && best && candidate_outranks_on_tie(candidates[i], best))) {
             best_score = score;
@@ -863,7 +804,8 @@ void cbm_registry_free(cbm_registry_t *r) {
  *
  * No array dedup needed: cbm_registry_add's exact-map check guarantees the QN
  * is new, and it calls this at most once per distinct key. */
-static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn) {
+static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn,
+                             bool is_test) {
     qn_array_t *arr = cbm_ht_get(r->by_name, key);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
@@ -872,7 +814,7 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
     int before = arr->count;
     cbm_da_push(arr, (char *)owned_qn);
     if (arr->count == before) {
-        return; /* the name could not be recorded: no verdict to cache */
+        return; /* the name could not be recorded: no verdict to store */
     }
     if (arr->count > arr->is_test_cap) {
         int want = arr->cap > 0 ? arr->cap : arr->count;
@@ -883,13 +825,19 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
             arr->is_test_cap = want;
         }
     }
-    if (arr->count <= arr->is_test_cap) {
-        arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
+    if (arr->count > arr->is_test_cap) {
+        /* The verdict can no longer be recomputed from the QN, so an entry
+         * without one would be scored as non-test and outrank real code. Drop
+         * it instead: one missing candidate beats a wrong winner. */
+        arr->count = before;
+        cbm_log_warn("registry.verdict_alloc_failed", "key", key);
+        return;
     }
+    arr->is_test[arr->count - SKIP_ONE] = is_test ? 1 : 0;
 }
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
-                      const char *label) {
+                      const char *label, bool is_test) {
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -945,14 +893,14 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
      * `name` is NULL or empty only for callers that have no symbol name to
      * give; those have the derived key and nothing else. */
     const char *derived = simple_name(qualified_name);
-    index_under_name(r, derived, owned_qn);
+    index_under_name(r, derived, owned_qn, is_test);
     /* '#' is a QN fence, and extract_defs.c's rust_cfg_qualified_name is the
      * only thing in the tree that mints one today. A grammar that starts
      * minting a '#' opts into this second key by doing so, whatever it means by
      * the fence: its symbols become reachable under the passed name as well,
      * and they share that name's bucket with everything else filed under it. */
     if (name && name[0] && strchr(derived, '#') && strcmp(name, derived) != 0) {
-        index_under_name(r, name, owned_qn);
+        index_under_name(r, name, owned_qn, is_test);
     }
 }
 
@@ -1111,9 +1059,7 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
         if (is_import_reachable(arr->items[i], import_vals, import_count)) {
-            if (flags) {
-                filtered_test[fcount] = flags[i];
-            }
+            filtered_test[fcount] = flags[i];
             filtered[fcount] = arr->items[i];
             fcount++;
         }
@@ -1123,8 +1069,7 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
     }
     if (fcount > SKIP_ONE) {
-        const char *best =
-            best_by_import_distance(filtered, flags ? filtered_test : NULL, fcount, module_qn);
+        const char *best = best_by_import_distance(filtered, filtered_test, fcount, module_qn);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
@@ -1454,11 +1399,15 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
 
 /* Filter candidates by import reachability. Returns count of reachable. */
-static int filter_import_reachable(const char **candidates, int count, const char **import_vals,
-                                   int import_count, const char **out, int max_out) {
+/* Keeps `out_flags` in step with `out`: the verdicts are stored per entry and
+ * cannot be recomputed from the QN, so a filtered view has to carry its own. */
+static int filter_import_reachable(const char **candidates, const uint8_t *flags, int count,
+                                   const char **import_vals, int import_count, const char **out,
+                                   uint8_t *out_flags, int max_out) {
     int n = 0;
     for (int i = 0; i < count && n < max_out; i++) {
         if (is_import_reachable(candidates[i], import_vals, import_count)) {
+            out_flags[n] = flags[i];
             out[n++] = candidates[i];
         }
     }
@@ -1498,13 +1447,17 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
 
     /* Multiple candidates: filter by import reachability */
     const char *filtered[CBM_SZ_256];
+    uint8_t filtered_flags[CBM_SZ_256];
     int fcount = arr->count;
     const char **fptr = (const char **)arr->items;
+    const uint8_t *fflags = qn_test_flags(arr);
 
     if (have_imports) {
-        fcount = filter_import_reachable((const char **)arr->items, arr->count, import_map_vals,
-                                         import_map_count, filtered, CBM_SZ_256);
+        fcount = filter_import_reachable((const char **)arr->items, qn_test_flags(arr), arr->count,
+                                         import_map_vals, import_map_count, filtered,
+                                         filtered_flags, CBM_SZ_256);
         fptr = filtered;
+        fflags = filtered_flags;
     }
 
     if (fcount == 0) {
@@ -1524,8 +1477,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
             true};
     }
-    const char *best = best_by_import_distance(
-        fptr, fptr == (const char **)arr->items ? qn_test_flags(arr) : NULL, fcount, module_qn);
+    const char *best = best_by_import_distance(fptr, fflags, fcount, module_qn);
     if (!best) {
         return no_match;
     }

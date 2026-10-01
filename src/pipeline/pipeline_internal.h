@@ -169,6 +169,12 @@ typedef struct {
 typedef bool (*cbm_result_want_fn)(const CBMFileResult *header);
 CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
                                            int i, cbm_result_want_fn want, bool *loaded);
+/* True when a graph-buffer node carries is_test:true in its properties JSON.
+ * The incremental registry seed has only the persisted node, not the
+ * CBMDefinition the definition passes hand to cbm_registry_add, and both must
+ * give the registry the same verdict for the same symbol. */
+bool cbm_node_is_test(const cbm_gbuf_node_t *n);
+
 void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
 
 /* Log the store counters, close and delete the store, drop the latch. */

@@ -11305,8 +11305,8 @@ TEST(helm_parse_chart_no_deps_issue338) {
 
 TEST(registry_resolve_single_candidate) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
-    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
+    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function", false);
 
     /* Normal resolve unique name */
     cbm_resolution_t r = cbm_registry_resolve(reg, "CreateOrder", "svcC.caller", NULL, NULL, 0);
@@ -11324,7 +11324,7 @@ TEST(registry_resolve_single_candidate) {
 
 TEST(registry_fuzzy_nonexistent) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "NonExistent", "svcC.caller", NULL, NULL, 0);
@@ -11336,8 +11336,8 @@ TEST(registry_fuzzy_nonexistent) {
 
 TEST(registry_fuzzy_multiple_best_by_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function");
-    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function");
+    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function", false);
 
     /* Caller in svcA → prefer svcA */
     cbm_fuzzy_result_t fr =
@@ -11356,7 +11356,7 @@ TEST(registry_fuzzy_multiple_best_by_distance) {
 
 TEST(registry_fuzzy_simple_name_extraction) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function");
+    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function", false);
 
     /* Deeply qualified name → extract "DoWork" */
     cbm_fuzzy_result_t fr = cbm_registry_fuzzy_resolve(reg, "some.deep.module.DoWork",
@@ -11381,8 +11381,8 @@ TEST(registry_fuzzy_empty) {
 
 TEST(registry_exists) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method");
+    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method", false);
 
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Foo"));
     ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Bar"));
@@ -11395,7 +11395,7 @@ TEST(registry_exists) {
 
 TEST(registry_confidence_import_map) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -11410,7 +11410,7 @@ TEST(registry_confidence_import_map) {
 
 TEST(registry_confidence_import_map_suffix) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function", false);
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
@@ -11425,7 +11425,7 @@ TEST(registry_confidence_import_map_suffix) {
 
 TEST(registry_confidence_same_module) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Foo", "proj.pkg", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Foo");
@@ -11438,7 +11438,7 @@ TEST(registry_confidence_same_module) {
 
 TEST(registry_confidence_unique_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
@@ -11451,8 +11451,8 @@ TEST(registry_confidence_unique_name) {
 
 TEST(registry_confidence_suffix_match) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.svcA.caller", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.svcA.Process");
@@ -11468,7 +11468,7 @@ TEST(registry_confidence_suffix_match) {
  * wrong target — and with one candidate it won the top name-only confidence. */
 TEST(registry_receiver_chain_refuses_library_unique_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable", false);
 
     cbm_resolution_t r =
         cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
@@ -11482,8 +11482,8 @@ TEST(registry_receiver_chain_refuses_library_unique_name_issue1893) {
  * the final name and import distance picks the winner. */
 TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
-    cbm_registry_add(reg, "data", "HomeboxUI.Payload.data", "Variable");
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable", false);
+    cbm_registry_add(reg, "data", "HomeboxUI.Payload.data", "Variable", false);
 
     cbm_resolution_t r =
         cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
@@ -11497,7 +11497,7 @@ TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
  * so Calendar really is in the receiver chain. */
 TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method");
+    cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Calendar.utcGregorian.startOfDayUTC",
                                               "HomeboxUI.Stats", NULL, NULL, 0);
@@ -11517,7 +11517,7 @@ TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
 TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "putList", "org.elasticsearch.common.settings.Settings.Builder.putList",
-                     "Method");
+                     "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(
         reg, "Settings.builder().putList", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
@@ -11528,7 +11528,7 @@ TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
      * .toBuilder().setWarningsHandler -> RequestOptions.Builder.setWarningsHandler. */
     cbm_registry_add(reg, "setWarningsHandler",
                      "org.elasticsearch.client.RequestOptions.Builder.setWarningsHandler",
-                     "Method");
+                     "Method", false);
     r = cbm_registry_resolve(reg, "RequestOptions.DEFAULT.toBuilder().setWarningsHandler",
                              "org.elasticsearch.client.Rest", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name,
@@ -11544,7 +11544,7 @@ TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
 TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "getEncoder", "org.elasticsearch.index.codec.DocOffsetsCodec.getEncoder",
-                     "Method");
+                     "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(
         reg, "Base64.getEncoder", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
@@ -11554,7 +11554,7 @@ TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
      * org.elasticsearch.common.Math.toIntExact through "Math" appearing as an
      * ancestry segment ONLY IF that segment really is the type — here it is, and
      * that is the correct outcome (the project's own Math.toIntExact). */
-    cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method");
+    cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method", false);
     r = cbm_registry_resolve(reg, "Math.toIntExact", "org.elasticsearch.index.IndexSettings", NULL,
                              NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "org.elasticsearch.common.Math.toIntExact");
@@ -11567,7 +11567,7 @@ TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
  * must not look at it, or every ordinary vm.load style call would be refused. */
 TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method");
+    cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "vm.load", "HomeboxUI.Views", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "HomeboxUI.EntityListViewModel.load");
@@ -11580,7 +11580,7 @@ TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
 /* An unqualified callee has no chain at all and must pass through unchanged. */
 TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function");
+    cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function", false);
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "helper", "proj.other", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "proj.pkg.helper");
@@ -11592,7 +11592,7 @@ TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
 
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Handler", "proj.caller", NULL, NULL, 0);
@@ -11606,8 +11606,8 @@ TEST(registry_fuzzy_confidence_single) {
 
 TEST(registry_fuzzy_confidence_distance) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function", false);
 
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.Process", "proj.svcA.other", NULL, NULL, 0);
@@ -11621,8 +11621,8 @@ TEST(registry_fuzzy_confidence_distance) {
 
 TEST(registry_negative_import_rejects) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function");
-    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function", false);
+    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function", false);
 
     /* Import only handler's module → should prefer handler */
     const char *keys[] = {"handler"};
@@ -11636,7 +11636,7 @@ TEST(registry_negative_import_rejects) {
 
 TEST(registry_fuzzy_import_penalty) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", false);
 
     /* Has imports but billing not imported → confidence halved */
     const char *keys[] = {"other"};
@@ -11653,7 +11653,7 @@ TEST(registry_fuzzy_import_penalty) {
 
 TEST(registry_fuzzy_no_import_map_passthrough) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function", false);
 
     /* NULL import map → no penalty, full fuzzy confidence */
     cbm_fuzzy_result_t fr =
@@ -11667,10 +11667,10 @@ TEST(registry_fuzzy_no_import_map_passthrough) {
 
 TEST(registry_find_by_name) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", false);
 
     /* FindByName returns all entries for "Foo" */
     const char **foos = NULL;
@@ -13003,10 +13003,10 @@ TEST(registry_is_import_reachable) {
 /* Port of FindEndingWith portion from Go TestFunctionRegistry in pipeline_test.go */
 TEST(registry_find_ending_with) {
     cbm_registry_t *reg = cbm_registry_new();
-    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
-    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
-    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
-    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function", false);
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function", false);
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function", false);
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method", false);
 
     /* FindEndingWith "DataProcessor.transform" → 1 match */
     const char **matches = NULL;

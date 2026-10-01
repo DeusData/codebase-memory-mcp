@@ -1041,7 +1041,7 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
-    cbm_registry_add(r, node->name, node->qualified_name, node->label);
+    cbm_registry_add(r, node->name, node->qualified_name, node->label, cbm_node_is_test(node));
 }
 
 static void free_incremental_result_cache(CBMFileResult **cache, int count) {
