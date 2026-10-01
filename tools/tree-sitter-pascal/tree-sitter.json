@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "pascal",
+      "camelcase": "Pascal",
+      "scope": "source.pascal",
+      "path": ".",
+      "file-types": ["pp", "lpr", "dpr", "pas"]
+    }
+  ],
+  "metadata": {
+    "version": "0.10.2-cbm.1",
+    "license": "MIT",
+    "description": "cbm fork of tree-sitter-pascal @ 042119e (Unicode identifiers)"
+  }
+}

@@ -60,10 +60,10 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Nine further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `javascript`, `pine`, `qml`, `tsx`) are self-maintained
-  forks that retain their original upstream authors' licenses — see the manifest
-  for per-grammar provenance. `arkts` is a first-party derivative of
+- Ten further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`) are
+  self-maintained forks that retain their original upstream authors' licenses —
+  see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
   (MIT, (c) 2017 Max Brunsfeld; on the
   [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
@@ -75,7 +75,11 @@ License summary:
   `tsx` dialect, MIT, (c) 2017 Max Brunsfeld, on the same javascript base) are
   the upstream grammars with one (c) 2026 DeusData patch that lets a lone `&`
   appear in JSX strings and text; their grammar sources live in
-  `tools/tree-sitter-javascript/` and `tools/tree-sitter-tsx/`.
+  `tools/tree-sitter-javascript/` and `tools/tree-sitter-tsx/`. `pascal`
+  ([Isopod/tree-sitter-pascal](https://github.com/Isopod/tree-sitter-pascal),
+  MIT, (c) 2018 Benjamin Gray) is the upstream grammar with one (c) 2026
+  DeusData patch that accepts non-ASCII letters in identifiers; its grammar
+  source lives in `tools/tree-sitter-pascal/`.
 
 ### tree-sitter-plsql
 
