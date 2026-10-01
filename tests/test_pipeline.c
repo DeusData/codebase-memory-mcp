@@ -8806,7 +8806,7 @@ TEST(pipeline_python_cross_module_call) {
 /* #725: two same-named symbols across languages must not share CALLS edges.
  * Python Store.commit is the real callee of save(); the JS Editor.commit
  * function is a distinct binding and must have no inbound CALLS from Python.
- * unique_name (candidates==1) is #1572 and is not this claim. */
+ * unique_name (candidates==1) is the #1572 pipeline test. */
 TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
     const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
     const char *contents[] = {"class Store:\n"

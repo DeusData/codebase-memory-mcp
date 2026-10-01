@@ -697,14 +697,21 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
 
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
-           lang == CBM_LANG_ARKTS;
+           lang == CBM_LANG_ARKTS || lang == CBM_LANG_VUE || lang == CBM_LANG_SVELTE ||
+           lang == CBM_LANG_ASTRO || lang == CBM_LANG_HTML;
 }
 
 /* C and C++ are one family for cross-language checks: .h maps to CBM_LANG_CPP
  * in the extension table, so a .c file referencing a symbol declared in its
- * own header would otherwise read as a language boundary. */
+ * own header would otherwise read as a language boundary. CUDA and Objective-C
+ * use the same front end for header calls (#1702 census addendum). */
 static bool c_cpp_family(CBMLanguage lang) {
-    return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_OBJC;
+}
+
+static bool jvm_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN || lang == CBM_LANG_GROOVY;
 }
 
 static const char *path_basename(const char *path) {
@@ -721,14 +728,17 @@ static const char *path_basename(const char *path) {
     return slash ? slash + 1 : path;
 }
 
-/* Build and configuration languages have no cross-language call semantics: a
- * Makefile's `$(eval ...)` or a CMake `function(...)` names nothing in a C
- * file, so a bare-name bind into another language is always a collision
- * (2026-09-16 probe: kernel Makefile targets bound to `sk_psock.eval`). */
-static bool build_config_language(CBMLanguage lang) {
-    return lang == CBM_LANG_MAKEFILE || lang == CBM_LANG_CMAKE || lang == CBM_LANG_YAML ||
-           lang == CBM_LANG_TOML || lang == CBM_LANG_JSON || lang == CBM_LANG_INI ||
-           lang == CBM_LANG_DOCKERFILE;
+/* Target language from basename alone is wrong for extensions whose real
+ * language is decided by file content during discovery (.m → MATLAB in the
+ * table but often Objective-C, etc.). Never suppress on filename guess alone. */
+static bool target_lang_from_filename_ambiguous(const char *target_file_path) {
+    const char *base = path_basename(target_file_path);
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot == base) {
+        return false;
+    }
+    return strcmp(dot, ".m") == 0 || strcmp(dot, ".cls") == 0 || strcmp(dot, ".inc") == 0 ||
+           strcmp(dot, ".cfc") == 0 || strcmp(dot, ".frm") == 0;
 }
 
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
@@ -736,15 +746,12 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
     /* Two same-named symbols in different languages: suffix_match picks one
      * winner by import-distance and attaches every bare-name call to it
      * (#725, Bash/Python main, JS/Python commit). unique_name is the
-     * candidates==1 case (#1572) and is not this guard — except for a build
-     * or configuration caller, where even a unique match into another
-     * language is a collision by construction. */
-    if (!strategy) {
-        return false;
-    }
-    bool config_caller = build_config_language(caller_lang);
-    if (strcmp(strategy, "suffix_match") != 0 &&
-        !(config_caller && strcmp(strategy, "unique_name") == 0)) {
+     * candidates==1 case of the same class (#1572, Python
+     * `from unittest.mock import patch` binding to a unique TSX `patch`).
+     * Build/config callers have no cross-language call semantics, so their
+     * unique_name collisions are covered by the same guard. */
+    if (!strategy ||
+        (strcmp(strategy, "suffix_match") != 0 && strcmp(strategy, "unique_name") != 0)) {
         return false;
     }
     if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
@@ -757,7 +764,16 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
     if (caller_lang == target_lang) {
         return false;
     }
+    if (target_lang_from_filename_ambiguous(target_file_path)) {
+        return false;
+    }
     if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
+        return false;
+    }
+    if (c_cpp_family(caller_lang) && c_cpp_family(target_lang)) {
+        return false;
+    }
+    if (jvm_family(caller_lang) && jvm_family(target_lang)) {
         return false;
     }
     return true;
@@ -783,6 +799,9 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
         return false;
     }
     if (caller_lang == target_lang) {
+        return false;
+    }
+    if (target_lang_from_filename_ambiguous(target_file_path)) {
         return false;
     }
     if (js_ts_family(caller_lang) && js_ts_family(target_lang)) {
