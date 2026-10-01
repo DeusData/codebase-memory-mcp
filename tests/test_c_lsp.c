@@ -2086,6 +2086,28 @@ TEST(clsp_structured_binding_struct) {
     PASS();
 }
 
+/* #1743: a structured binding with more names than the struct has fields
+ * (ill-formed C++, but common in compiler test suites such as LLVM's
+ * dcl.decomp tests) indexed field_types[] past its NULL terminator. The read
+ * landed in the next arena object and bound a garbage pointer (0x9) as the
+ * type, which decltype() then dereferenced: a deterministic SIGSEGV at
+ * address 9 in c_resolve_name_to_type. Extra names must bind as unknown. */
+TEST(clsp_structured_binding_more_names_than_fields) {
+    CBMFileResult *r = extract_cpp("struct A { int x, y; };\n"
+                                   "const auto &[acr0, acr1, acr2] = A();\n"
+                                   "using ConstFloatRef = decltype(acr2);\n"
+                                   "void test() {\n"
+                                   "    auto [b0, b1, b2, b3] = A();\n"
+                                   "    using T = decltype(b3);\n"
+                                   "    for (auto [c0, c1, c2, c3] : (A *)0) {\n"
+                                   "        using U = decltype(c3);\n"
+                                   "    }\n"
+                                   "}\n");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_ternary_type) {
     CBMFileResult *r = extract_cpp("\n"
                                    "class Widget {\n"
@@ -16486,6 +16508,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_tad_make_pair_like);
     RUN_TEST(clsp_structured_binding_pair);
     RUN_TEST(clsp_structured_binding_struct);
+    RUN_TEST(clsp_structured_binding_more_names_than_fields);
     RUN_TEST(clsp_ternary_type);
     RUN_TEST(clsp_chained_method_calls);
     RUN_TEST(clsp_std_vector_push_back);

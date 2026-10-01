@@ -429,6 +429,60 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     return out;
 }
 
+/* Rebuild the payload text with the notice attached; NULL when the payload
+ * cannot be rewritten. The result is a memory-core block (class other) on
+ * both branches, so the caller has one release path. */
+static char *tool_result_payload_with_notice(const char *payload, const char *notice) {
+    yyjson_doc *payload_doc = yyjson_read(payload, strlen(payload), 0);
+    yyjson_val *payload_root = payload_doc ? yyjson_doc_get_root(payload_doc) : NULL;
+    char *rewritten = NULL;
+    if (payload_root && yyjson_is_obj(payload_root)) {
+        yyjson_mut_doc *copy = yyjson_doc_mut_copy(payload_doc, NULL);
+        yyjson_mut_val *copy_root = copy ? yyjson_mut_doc_get_root(copy) : NULL;
+        char *written = copy_root && yyjson_mut_obj_add_strcpy(copy, copy_root, "notice", notice)
+                            ? yy_doc_to_str(copy)
+                            : NULL;
+        rewritten = written ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, written) : NULL;
+        safe_free(written); /* yyjson's writer block, not a core block */
+        yyjson_mut_doc_free(copy);
+    } else {
+        size_t payload_len = strlen(payload);
+        size_t notice_len = strlen(notice);
+        rewritten = cbm_alloc(CBM_MEM_CLASS_OTHER, payload_len + notice_len + 3U);
+        if (rewritten) {
+            memcpy(rewritten, payload, payload_len);
+            memcpy(rewritten + payload_len, "\n\n", 2U);
+            memcpy(rewritten + payload_len + 2U, notice, notice_len + 1U);
+        }
+    }
+    yyjson_doc_free(payload_doc);
+    return rewritten;
+}
+
+char *cbm_mcp_tool_result_add_notice(char *result, const char *notice) {
+    if (!result || !notice || !notice[0]) {
+        return result;
+    }
+    yyjson_doc *doc = yyjson_read(result, strlen(result), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *content = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "content") : NULL;
+    yyjson_val *first = content && yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    yyjson_val *text = first && yyjson_is_obj(first) ? yyjson_obj_get(first, "text") : NULL;
+    yyjson_val *is_error = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "isError") : NULL;
+    char *payload = text && yyjson_is_str(text)
+                        ? tool_result_payload_with_notice(yyjson_get_str(text), notice)
+                        : NULL;
+    char *rebuilt =
+        payload ? cbm_mcp_text_result(payload, is_error && yyjson_get_bool(is_error)) : NULL;
+    cbm_free(CBM_MEM_CLASS_OTHER, payload);
+    yyjson_doc_free(doc);
+    if (!rebuilt) {
+        return result;
+    }
+    safe_free(result); /* the caller's tool result, not a core block */
+    return rebuilt;
+}
+
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
                                     const char *active_id_str) {
     if (!params_json) {
@@ -467,7 +521,11 @@ typedef struct {
 static const tool_def_t TOOLS[] = {
     {"index_repository",
      "Index a repository. full/moderate add semantics; fast omits them; cross-repo-intelligence "
-     "links services. Reports coverage gaps.",
+     "links services. Reports coverage gaps. Waits for the whole index by default; a large repo "
+     "can exceed a client's per-call deadline. async:true starts (or joins) the index in the "
+     "daemon and returns at once; poll with status:true (same repo_path) until state is "
+     "succeeded, failed or cancelled. async needs a daemon that outlives the call: an MCP session "
+     "or `daemon start`.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Repository path\"},"
      "\"mode\":{\"type\":\"string\","
@@ -479,7 +537,14 @@ static const tool_def_t TOOLS[] = {
      "\"name\":{\"type\":\"string\",\"description\":"
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
-     "\"Write .codebase-memory/graph.db.zst.\"}"
+     "\"Write .codebase-memory/graph.db.zst.\"},"
+     "\"async\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Start the index in the background and return immediately; it keeps running if this "
+     "call is cancelled or times out. Not with status or cross-repo-intelligence. Refused for a "
+     "one-shot cli call that is the only client of a temporary daemon (run daemon start).\"},"
+     "\"status\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Report the running or last index job (queued/running/succeeded/failed/cancelled) "
+     "instead of indexing. Pass the same repo_path (and name, if any) as the index call.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph",
@@ -770,14 +835,19 @@ typedef struct {
  * left in place, never quarantined or rebuilt — quarantine/rebuild is reserved
  * for write-side opens (index_repository, manage_adr writes). That is what
  * makes readOnlyHint=true honest for them and lets plan-mode clients expose
- * them (the "read-only analysis tools" surface described in #1100). */
+ * them (the "read-only analysis tools" surface described in #1100).
+ * get_file_outline reads through the same resolve_store() path, and
+ * ingest_traces only validates and counts its input (edge creation is not
+ * implemented), so both are read-only too (#2118). Only handlers that write
+ * user-visible state -- index_repository, manage_adr, delete_project -- may
+ * clear readOnlyHint. */
 static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"index_repository", false, false, true, false},
     {"search_graph", true, false, true, false},
     {"query_graph", true, false, true, false},
     {"trace_path", true, false, true, false},
     {"get_code_snippet", true, false, true, false},
-    {"get_file_outline", false, true, true, false},
+    {"get_file_outline", true, false, true, false},
     {"get_graph_schema", true, false, true, false},
     {"compare_graphs", true, false, true, false},
     {"get_architecture", true, false, true, false},
@@ -788,7 +858,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"check_index_coverage", true, false, true, false},
     {"detect_changes", true, false, true, false},
     {"manage_adr", false, true, false, false},
-    {"ingest_traces", false, false, false, false},
+    {"ingest_traces", true, false, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
@@ -1482,24 +1552,50 @@ static bool repo_path_is_absolute(const char *path) {
 #endif
 }
 
+bool cbm_validate_project_name(const char *project);
+
+static bool has_non_ascii_byte(const char *s) {
+    for (; *s; s++) {
+        if ((unsigned char)*s >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* #1827: a bare non-ASCII selector, typically the real folder name of a repo
+ * under a CJK path, is encoded exactly like the path segment it came from
+ * (non-ASCII bytes -> hex, #571), so the exact/tail lookup matches the stored
+ * identity. Stored names never change; ASCII selectors keep their existing
+ * validation; a selector that collapses to the "root" fallback is left alone
+ * so it never selects the root project. */
+static bool bare_project_encoding_usable(const char *encoded) {
+    return strcmp(encoded, "root") != 0 && cbm_validate_project_name(encoded);
+}
+
 static char *normalize_project_arg(char *project) {
-    if (!project || (!strchr(project, '/') && !strchr(project, '\\'))) {
+    if (!project) {
         return project;
     }
-
-    project = canonicalize_repo_path_if_exists(project);
-    char *normalized = cbm_project_name_from_path(project);
-    if (normalized) {
-        free(project);
-        return normalized;
+    char *normalized = NULL;
+    bool bare = !strchr(project, '/') && !strchr(project, '\\');
+    if (bare) {
+        if (has_non_ascii_byte(project)) {
+            normalized = cbm_project_name_sanitize(project);
+        }
+    } else {
+        project = canonicalize_repo_path_if_exists(project);
+        normalized = cbm_project_name_from_path(project);
     }
-    return project;
+    /* Keep exactly one of the two strings and release the other. */
+    bool use_normalized = normalized && (!bare || bare_project_encoding_usable(normalized));
+    free(use_normalized ? project : normalized);
+    return use_normalized ? normalized : project;
 }
 
 /* Forward decls — defined below alongside store resolution. */
 static const char *cache_dir(char *buf, size_t bufsz);
 static bool is_project_db_file(const char *name, size_t len);
-bool cbm_validate_project_name(const char *project);
 
 /* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp"),
  * but indexed project names derive from the full path
@@ -1661,6 +1757,8 @@ struct cbm_mcp_server {
     struct cbm_config *config;        /* external config ref (not owned) */
     cbm_mcp_index_executor_fn index_executor;
     void *index_executor_context;
+    cbm_mcp_index_status_fn index_status_provider; /* #2144; NULL outside the daemon */
+    void *index_status_context;
     cbm_proc_log_cb index_log_callback;
     void *index_log_context;
     cbm_mcp_project_mutation_begin_fn mutation_begin;
@@ -1813,6 +1911,14 @@ void cbm_mcp_server_set_index_executor(cbm_mcp_server_t *srv, cbm_mcp_index_exec
     if (srv) {
         srv->index_executor = executor;
         srv->index_executor_context = context;
+    }
+}
+
+void cbm_mcp_server_set_index_status_provider(cbm_mcp_server_t *srv,
+                                              cbm_mcp_index_status_fn provider, void *context) {
+    if (srv) {
+        srv->index_status_provider = provider;
+        srv->index_status_context = context;
     }
 }
 
@@ -10153,10 +10259,16 @@ static char *handle_cross_repo_mode(cbm_mcp_server_t *srv, const char *repo_path
     free(lease_keys);
     yyjson_doc_free(jdoc);
 
-    if (result.failed) {
+    if (result.no_targets || result.failed) {
         free(project);
         return cbm_mcp_text_result(
-            "cross-repo source or target project is missing, invalid, or not indexed", true);
+            result.no_targets
+                ? "cross-repo-intelligence resolved zero target projects: no indexed project "
+                  "other than the source matched target_projects. Index the other service first "
+                  "(run list_projects to see what is indexed); existing cross-repo edges were "
+                  "left unchanged."
+                : "cross-repo source or target project is missing, invalid, or not indexed",
+            true);
     }
 
     int total = result.http_edges + result.async_edges + result.channel_edges + result.grpc_edges +
@@ -10704,7 +10816,8 @@ static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_ou
     yyjson_mut_obj_add_str(
         doc, root, "hint",
         cancellation_requested
-            ? "Indexing worker was cancelled. No in-process retry was started."
+            ? "Indexing worker was cancelled. No in-process retry was "
+              "started. " CBM_MCP_INDEX_ASYNC_HINT
             : "Indexing worker process-tree containment failed. No in-process retry was "
               "started; inspect daemon logs.");
     if (repo_path) {
@@ -11280,6 +11393,16 @@ static char *index_args_with_repo_path(const char *args, const char *canonical_r
     while (yyjson_mut_obj_get(copy_root, "_cbm_index_policy")) {
         (void)yyjson_mut_obj_remove_key(copy_root, "_cbm_index_policy");
     }
+    /* #2144: async/status choose how the caller waits, not what is indexed.
+     * They never reach the worker, and an async request coalesces with an
+     * identical synchronous one instead of being refused as an options
+     * conflict. */
+    static const char *const call_mode_keys[] = {"async", "status"};
+    for (size_t i = 0; i < sizeof(call_mode_keys) / sizeof(call_mode_keys[0]); i++) {
+        while (yyjson_mut_obj_get(copy_root, call_mode_keys[i])) {
+            (void)yyjson_mut_obj_remove_key(copy_root, call_mode_keys[i]);
+        }
+    }
     if (!yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path) ||
         !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy)) {
         yyjson_mut_doc_free(copy);
@@ -11343,7 +11466,107 @@ static void index_args_free(char *repo_path, char *mode_str, char *name_override
     free(name_override);
 }
 
+/* #2144: async and status are strict booleans. A present non-boolean value is
+ * refused rather than read as false, so "async":"true" never silently blocks
+ * for the whole index. */
+static bool index_call_mode_arg(const char *args, const char *key, bool *value_out) {
+    *value_out = false;
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, key) : NULL;
+    bool valid = !value || yyjson_is_bool(value);
+    *value_out = valid && value && yyjson_get_bool(value);
+    yyjson_doc_free(doc);
+    return valid;
+}
+
+/* The project key a status query names: an explicit name override wins (the
+ * key the index call used), then repo_path resolved exactly as for indexing
+ * (session root, canonical form, workspace boundary), then a known project
+ * alias. NULL with *error_out set when none identifies a project. */
+static char *index_status_project_key(cbm_mcp_server_t *srv, const char *args, char *error_out,
+                                      size_t error_size) {
+    char *name = cbm_mcp_get_string_arg(args, "name");
+    if (name && name[0]) {
+        char *key = cbm_project_name_from_path(name);
+        safe_free(name);
+        return key;
+    }
+    safe_free(name);
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    if (!repo_path) {
+        char *project = get_project_arg(args);
+        if (!project) {
+            (void)snprintf(error_out, error_size,
+                           "status needs the repo_path (or name) the index call used");
+        }
+        return project;
+    }
+    cbm_normalize_path_sep(repo_path);
+    if (!resolve_session_repo_path(srv, &repo_path)) {
+        safe_free(repo_path);
+        (void)snprintf(error_out, error_size, "failed to resolve repo_path");
+        return NULL;
+    }
+    repo_path = canonicalize_repo_path_if_exists(repo_path);
+    const char *allowed_root =
+        srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
+    if (repo_path && repo_path[0] &&
+        !cbm_workspace_root_allowed(repo_path, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
+                                    allowed_root, error_out, error_size)) {
+        safe_free(repo_path);
+        return NULL;
+    }
+    char *key = repo_path ? cbm_project_name_from_path(repo_path) : NULL;
+    safe_free(repo_path);
+    if (!key) {
+        (void)snprintf(error_out, error_size, "could not resolve index project name");
+    }
+    return key;
+}
+
+/* index_repository(status: true): report the project's running or most recent
+ * index job without starting one. Job state lives in the daemon's job
+ * registry; a server without one (CLI index worker, embedder) has no job that
+ * could outlive a call, so it refuses instead of guessing. */
+static char *handle_index_repository_status(cbm_mcp_server_t *srv, const char *args) {
+    if (!srv->index_status_provider) {
+        return cbm_mcp_text_result("index_repository status needs the daemon-backed MCP server; "
+                                   "this in-process server tracks no index jobs",
+                                   true);
+    }
+    char error[CBM_SZ_1K] = {0};
+    char *project = index_status_project_key(srv, args, error, sizeof(error));
+    if (!project) {
+        return cbm_mcp_text_result(error[0] ? error : "could not resolve index project name", true);
+    }
+    char *result = srv->index_status_provider(srv->index_status_context, project);
+    safe_free(project);
+    return result ? result : cbm_mcp_text_result("index job status is unavailable", true);
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    bool async_mode = false;
+    bool status_mode = false;
+    if (!index_call_mode_arg(args, "async", &async_mode) ||
+        !index_call_mode_arg(args, "status", &status_mode)) {
+        return cbm_mcp_text_result("async and status must be booleans", true);
+    }
+    if (async_mode && status_mode) {
+        return cbm_mcp_text_result(
+            "async and status are exclusive: start with async: true, then poll with status: true",
+            true);
+    }
+    if (status_mode) {
+        return handle_index_repository_status(srv, args);
+    }
+    if (async_mode && !srv->index_executor) {
+        return cbm_mcp_text_result("index_repository async needs the daemon-backed MCP server: "
+                                   "this in-process server has no process that outlives the call; "
+                                   "call without async",
+                                   true);
+    }
+
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
@@ -11385,6 +11608,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
+        if (async_mode) {
+            index_args_free(repo_path, mode_str, name_override);
+            return cbm_mcp_text_result(
+                "async is not supported for mode cross-repo-intelligence (it runs no index job)",
+                true);
+        }
         char *result = handle_cross_repo_mode(srv, repo_path, name_override, args);
         index_args_free(repo_path, mode_str, name_override);
         return result;
@@ -11401,9 +11630,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * registry only after path canonicalization and workspace authorization. */
     if (srv->index_executor) {
         char *worker_args = index_args_with_repo_path(args, repo_path, &resource_policy);
-        char *coordinated =
-            worker_args ? srv->index_executor(srv->index_executor_context, repo_path, worker_args)
-                        : NULL;
+        char *coordinated = worker_args ? srv->index_executor(srv->index_executor_context,
+                                                              repo_path, worker_args, async_mode)
+                                        : NULL;
         free(worker_args);
         index_args_free(repo_path, mode_str, name_override);
         return coordinated ? coordinated
@@ -11459,7 +11688,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         mcp_project_mutation_end(srv, mutation_project);
         free(mutation_project);
         index_args_free(repo_path, mode_str, name_override);
-        return cbm_mcp_text_result("index operation cancelled for this request", true);
+        return cbm_mcp_text_result(
+            "index operation cancelled for this request. " CBM_MCP_INDEX_ASYNC_HINT, true);
     }
 
     cbm_index_mode_t mode = CBM_MODE_FULL;
@@ -14652,7 +14882,7 @@ static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
 static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
     cbm_mcp_server_t *srv, const char *command, char output_path[CBM_SZ_2K], size_t output_limit,
     uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
-    cbm_proc_result_t *result_out);
+    bool git_child, cbm_proc_result_t *result_out);
 
 static char *search_code_timeout_result(void) {
     static const char message[] = "search_code scan exceeded its execution deadline";
@@ -14993,7 +15223,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             srv->search_scan_command_override ? srv->search_scan_command_override : cmd;
         mcp_scan_cause_t scan_cause = mcp_run_shell_command_cancellable_bounded(
             srv, scan_command, output_path, scan_output_limit, scan_deadline_ms, true,
-            scan_deadline_latched, /*exit_one_is_no_match=*/false, &scan_result);
+            scan_deadline_latched, /*exit_one_is_no_match=*/false, /*git_child=*/false,
+            &scan_result);
         /* Both POSIX commands wrap grep and map its no-match status to 0, so any
          * non-zero exit (a failed find/sort, an unreadable operand, a broken
          * grep) is an incomplete scan and fails closed. */
@@ -15353,7 +15584,7 @@ static mcp_scan_cause_t mcp_scan_pre_spawn_cause(cbm_mcp_server_t *srv, const ch
 static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
     cbm_mcp_server_t *srv, const char *command, char output_path[CBM_SZ_2K], size_t output_limit,
     uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
-    cbm_proc_result_t *result_out) {
+    bool git_child, cbm_proc_result_t *result_out) {
     if (!srv || !command || !output_path || !result_out) {
         return MCP_SCAN_COMMAND_FAILURE;
     }
@@ -15411,6 +15642,7 @@ static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
         .quiet_timeout_ms = 0,
         .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
         .delete_log_on_exit = false,
+        .strip_git_repo_env = git_child,
     };
     pre_spawn_cause =
         mcp_scan_pre_spawn_cause(srv, output_path, output_limit, deadline_ms, deadline_enabled,
@@ -15488,11 +15720,14 @@ static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
                                                  : MCP_SCAN_CONTAINED_COMMAND_FAILURE;
 }
 
+/* Every caller is a detect_changes git command: the child environment drops
+ * git's repository-local variables so an inherited GIT_DIR cannot redirect
+ * `git -C <root>` (#2003). */
 static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *command,
                                              char output_path[CBM_SZ_2K],
                                              cbm_proc_result_t *result_out) {
     mcp_scan_cause_t cause = mcp_run_shell_command_cancellable_bounded(
-        srv, command, output_path, 0, 0, false, false, false, result_out);
+        srv, command, output_path, 0, 0, false, false, false, /*git_child=*/true, result_out);
     /* Legacy callers inspect result_out for cancellation/exit status. Preserve
      * their original contract: any contained terminal tree is transport
      * success; only spawn/rejection or failed supervision is a wrapper error. */
@@ -15773,6 +16008,48 @@ static bool detect_add_changed_path(char ***files, int *file_count, int *file_ca
     }
     (*files)[(*file_count)++] = copy;
     return true;
+}
+
+/* Git status porcelain always reports paths relative to the Git ROOT, while
+ * graph file_paths are relative to the indexed project root, which may be a
+ * subdirectory of the repository (#1951). `prefix` is that subdirectory as
+ * `git rev-parse --show-prefix` prints it ("" at the root, else "dir/").
+ * Returns the project-relative tail, or NULL for a path outside the project. */
+static const char *detect_project_relative_path(const char *git_path, const char *prefix) {
+    size_t prefix_length = strlen(prefix);
+    if (strncmp(git_path, prefix, prefix_length) != 0) {
+        return NULL;
+    }
+    return git_path + prefix_length;
+}
+
+/* A `--show-prefix` answer: empty at the repository root, otherwise a
+ * '/'-terminated relative directory. */
+static bool detect_valid_git_prefix(const char *value) {
+    size_t length = strlen(value);
+    return length == 0 || value[length - 1] == '/';
+}
+
+/* Read one '\n'-terminated `git rev-parse` record (a trailing '\r' dropped)
+ * into out when it is terminated, fits, and passes `valid`. Anything else is
+ * a malformed answer and fails the request closed. */
+static bool detect_read_rev_parse_line(FILE *stream, bool *oom, char *out, size_t out_size,
+                                       bool (*valid)(const char *)) {
+    bool terminated = false;
+    char *record = detect_read_record(stream, '\n', oom, &terminated);
+    if (!record) {
+        return false;
+    }
+    size_t length = strlen(record);
+    if (length > 0 && record[length - 1] == '\r') {
+        record[--length] = '\0';
+    }
+    bool ok = terminated && length < out_size && valid(record);
+    if (ok) {
+        memcpy(out, record, length + 1U);
+    }
+    free(record);
+    return ok;
 }
 
 static int detect_changed_path_compare(const void *left, const void *right) {
@@ -16125,15 +16402,20 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * HEAD advance cannot mix revisions within one answer. */
     char head_oid[65] = "";
     char base_oid[65] = "";
+    /* The project root may be a subdirectory of the Git worktree (#1951);
+     * --show-prefix names it so every changed path can be translated from the
+     * Git-root coordinate system into the graph's project-relative one. */
+    char git_prefix[CBM_SZ_4K] = "";
+    bool git_prefix_valid = false;
     char resolve_cmd[CBM_SZ_2K];
 #ifdef _WIN32
     snprintf(resolve_cmd, sizeof(resolve_cmd),
-             "git -C \"%s\" rev-parse \"HEAD^{commit}\" \"%s^{commit}\" 2>NUL", root_path,
-             base_branch);
+             "git -C \"%s\" rev-parse \"HEAD^{commit}\" \"%s^{commit}\" --show-prefix 2>NUL",
+             root_path, base_branch);
 #else
     snprintf(resolve_cmd, sizeof(resolve_cmd),
-             "git -C '%s' rev-parse 'HEAD^{commit}' '%s^{commit}' 2>/dev/null", root_path,
-             base_branch);
+             "git -C '%s' rev-parse 'HEAD^{commit}' '%s^{commit}' --show-prefix 2>/dev/null",
+             root_path, base_branch);
 #endif
     char resolve_output_path[CBM_SZ_2K] = {0};
     cbm_proc_result_t resolve_result = {0};
@@ -16141,43 +16423,24 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         mcp_run_shell_command_cancellable(srv, resolve_cmd, resolve_output_path, &resolve_result);
     bool resolve_cancelled = resolve_result.cancellation_requested || mcp_request_cancelled(srv);
     bool resolve_oom = false;
-    char *resolved_head = NULL;
-    char *resolved_base = NULL;
     FILE *resolve_fp = resolve_run == 0 && resolve_result.exit_code == 0 && !resolve_cancelled
                            ? cbm_fopen(resolve_output_path, "rb")
                            : NULL;
     if (resolve_fp) {
-        bool head_terminated = false;
-        bool base_terminated = false;
-        resolved_head = detect_read_record(resolve_fp, '\n', &resolve_oom, &head_terminated);
-        resolved_base = detect_read_record(resolve_fp, '\n', &resolve_oom, &base_terminated);
-        if (resolved_head) {
-            size_t length = strlen(resolved_head);
-            if (length > 0 && resolved_head[length - 1] == '\r') {
-                resolved_head[--length] = '\0';
-            }
-            if (head_terminated && detect_valid_object_id(resolved_head)) {
-                memcpy(head_oid, resolved_head, length + 1U);
-            }
-        }
-        if (resolved_base) {
-            size_t length = strlen(resolved_base);
-            if (length > 0 && resolved_base[length - 1] == '\r') {
-                resolved_base[--length] = '\0';
-            }
-            if (base_terminated && detect_valid_object_id(resolved_base)) {
-                memcpy(base_oid, resolved_base, length + 1U);
-            }
-        }
+        /* Records in argument order: HEAD, base, then the --show-prefix line. */
+        (void)detect_read_rev_parse_line(resolve_fp, &resolve_oom, head_oid, sizeof(head_oid),
+                                         detect_valid_object_id);
+        (void)detect_read_rev_parse_line(resolve_fp, &resolve_oom, base_oid, sizeof(base_oid),
+                                         detect_valid_object_id);
+        git_prefix_valid = detect_read_rev_parse_line(resolve_fp, &resolve_oom, git_prefix,
+                                                      sizeof(git_prefix), detect_valid_git_prefix);
         (void)fclose(resolve_fp);
     }
-    free(resolved_head);
-    free(resolved_base);
     if (resolve_output_path[0]) {
         (void)cbm_unlink(resolve_output_path);
     }
     if (resolve_cancelled || resolve_run != 0 || resolve_result.exit_code != 0 || resolve_oom ||
-        !head_oid[0] || !base_oid[0]) {
+        !head_oid[0] || !base_oid[0] || !git_prefix_valid) {
         free(direction);
         free(root_path);
         free(project);
@@ -16189,6 +16452,12 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (resolve_run != 0) {
             return cbm_mcp_text_result(
                 "git revision resolution failed: the contained command could not complete", true);
+        }
+        if (head_oid[0] && base_oid[0] && !resolve_oom) {
+            return cbm_mcp_text_result(
+                "git revision resolution failed: the project root's path inside the Git "
+                "worktree could not be determined",
+                true);
         }
         return cbm_mcp_text_result(
             "git revision resolution failed: base_branch or HEAD is not a commit", true);
@@ -16289,7 +16558,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 free(record);
                 break;
             }
-            if (!detect_add_changed_path(&files, &file_count, &file_cap, record)) {
+            const char *project_path = detect_project_relative_path(record, git_prefix);
+            if (project_path &&
+                !detect_add_changed_path(&files, &file_count, &file_cap, project_path)) {
                 changed_path_oom = true;
                 free(record);
                 break;
@@ -16364,7 +16635,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 free(record);
                 break;
             }
-            if (!detect_add_changed_path(&files, &file_count, &file_cap, record + PAIR_LEN + 1U)) {
+            const char *project_path =
+                detect_project_relative_path(record + PAIR_LEN + 1U, git_prefix);
+            if (project_path &&
+                !detect_add_changed_path(&files, &file_count, &file_cap, project_path)) {
                 changed_path_oom = true;
                 free(record);
                 break;
@@ -16481,20 +16755,22 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * index combined with insertions earlier in the file shifts the node lines
      * relative to the hunks and can mis-scope. The failure is bounded by
      * detect_collect_seeds' zero-overlap fallback: a file whose definitions all
-     * miss reverts to whole-file seeding rather than dropping out. */
+     * miss reverts to whole-file seeding rather than dropping out.
+     * --relative keeps hunk paths in the same project-relative coordinates as
+     * `files` when the project root is a repository subdirectory (#1951). */
     cbm_changed_hunk_t *hunks = NULL;
     int hunk_count = 0;
     if (want_symbols) {
         char hunk_cmd[CBM_SZ_2K];
 #ifdef _WIN32
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" diff --unified=0 \"%s\" \"%s\" -- 2>NUL && "
-                 "git -C \"%s\" diff --unified=0 -- 2>NUL",
+                 "git -C \"%s\" diff --relative --unified=0 \"%s\" \"%s\" -- 2>NUL && "
+                 "git -C \"%s\" diff --relative --unified=0 -- 2>NUL",
                  root_path, merge_base, head_oid, root_path);
 #else
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C '%s' diff --unified=0 '%s' '%s' -- 2>/dev/null && "
-                 "git -C '%s' diff --unified=0 -- 2>/dev/null",
+                 "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
+                 "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
                  root_path, merge_base, head_oid, root_path);
 #endif
         char hunk_output_path[CBM_SZ_2K] = {0};
