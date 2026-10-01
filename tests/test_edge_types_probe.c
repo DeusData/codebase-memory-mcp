@@ -651,6 +651,161 @@ TEST(handles_laravel_facade_no_junk_routes_issue952) {
     PASS();
 }
 
+/* Assert the exact Route set as "METHOD /path" strings: the method comes from
+ * the Route QN ("__route__PUT__/articles/{}"), the path from the node name
+ * (the raw composed path). The count must match too, so a junk Route fails. */
+static int et_route_set_exact(const EtFile *files, int nfiles, const char **want, int parallel) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int wanted = 0;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+    while (want[wanted] && wanted < ET_ROUTE_ASSERT_MAX) {
+        wanted++;
+    }
+    int ok = store != NULL &&
+             cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) ==
+                 CBM_STORE_OK &&
+             node_count == wanted;
+    for (int ni = 0; store && ni < node_count; ni++) {
+        char got[512];
+        const char *qn = nodes[ni].qualified_name ? nodes[ni].qualified_name : "";
+        const char *m = strncmp(qn, "__route__", 9) == 0 ? qn + 9 : qn;
+        const char *end = strstr(m, "__");
+        snprintf(got, sizeof(got), "%.*s %s", end ? (int)(end - m) : 0, m,
+                 nodes[ni].name ? nodes[ni].name : "");
+        int matched = 0;
+        for (int wi = 0; wi < wanted; wi++) {
+            if (!found[wi] && strcmp(got, want[wi]) == 0) {
+                found[wi] = matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            ok = 0;
+            fprintf(stderr, "  [ET-ROUTESET] unexpected %s\n", got);
+        }
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        if (!found[wi]) {
+            ok = 0;
+            fprintf(stderr, "  [ET-ROUTESET] missing %s\n", want[wi]);
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-ROUTESET] FAIL (%s path) expected=%d actual=%d\n",
+                parallel ? "parallel" : "sequential", wanted, node_count);
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* #1146: Laravel writes most route URIs without the leading slash —
+ * Route::get('users', ...) serves /users, Route::put('{article}', ...) inside
+ * prefix('articles') serves /articles/{article}, and '' is the group root.
+ * Both route passes only minted a Route for a first argument starting with
+ * '/', so Firefly III's API (258 registrations) and laravel.io's PUT/DELETE
+ * API routes had no Route at all. Covers the facade, a facade chain
+ * (Route::middleware()->get), the $router instance, the chain-form and the
+ * array-form prefix group (Route::group(['prefix' => ...], fn)), and a
+ * trailing slash. */
+static const EtFile et_laravel_slashless[] = {
+    {"routes/api.php",
+     "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+     "Route::get('users', 'UserController@index');\n"
+     "Route::post('users/', 'UserController@store');\n"
+     "Route::prefix('articles')->group(function () {\n"
+     "    Route::get('', 'ArticlesController@index');\n"
+     "    Route::put('{article}', 'ArticlesController@update');\n"
+     "    Route::delete('{article}', 'ArticlesController@delete');\n"
+     "});\n"
+     "Route::group(['prefix' => 'v1/autocomplete', 'as' => 'api.v1.'], static function (): void {\n"
+     "    Route::get('accounts', ['uses' => 'AccountController@accounts', 'as' => 'accounts']);\n"
+     "});\n"
+     "Route::middleware('auth')->get('dashboard', 'DashboardController@show');\n"
+     "$router->get('lumen/users', 'UserController@index');\n"}};
+
+static const char *et_laravel_slashless_routes[] = {"GET /users",
+                                                    "POST /users",
+                                                    "GET /articles",
+                                                    "PUT /articles/{article}",
+                                                    "DELETE /articles/{article}",
+                                                    "GET /v1/autocomplete/accounts",
+                                                    "GET /dashboard",
+                                                    "GET /lumen/users",
+                                                    NULL};
+
+TEST(routes_laravel_slashless_issue1146) {
+    ASSERT_TRUE(et_route_set_exact(et_laravel_slashless, 1, et_laravel_slashless_routes, 0));
+    PASS();
+}
+
+TEST(routes_laravel_slashless_parallel_issue1146) {
+    ASSERT_TRUE(et_route_set_exact(et_laravel_slashless, 1, et_laravel_slashless_routes, 1));
+    PASS();
+}
+
+/* The string action of a slashless registration — 'index' inside a
+ * Route::controller() group, 'UserController@store' — does not say which
+ * class owns the method, so resolving it could only guess a same-named
+ * function anywhere in the repo (on krayin/laravel-crm 'update' and 'destroy'
+ * bound a chart.js function). Such routes are minted without a guessed
+ * HANDLES edge. Decoys: a JS function and a PHP method per action name. */
+TEST(routes_laravel_slashless_no_guessed_handlers_issue1146) {
+    static const char *want[] = {"GET /leads", "PUT /leads/edit/{id}", "POST /users", NULL};
+    static const EtFile f[] = {
+        {"routes/web.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+         "Route::controller(LeadController::class)->prefix('leads')->group(function () {\n"
+         "    Route::get('', 'index');\n"
+         "    Route::put('edit/{id}', 'update');\n"
+         "});\n"
+         "Route::post('users', 'UserController@store');\n"},
+        {"resources/js/chart.js",
+         "function index() { return 1; }\nfunction update() { return 2; }\n"},
+        {"app/Http/Controllers/ActivityController.php",
+         "<?php\nnamespace App\\Http\\Controllers;\n\n"
+         "class ActivityController {\n    public function store() { return 1; }\n}\n"}};
+    ASSERT_TRUE(et_route_set_exact(f, 3, want, 0));
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, f, 3);
+    int handles = store ? cbm_store_count_edges_by_type(store, lp.project, "HANDLES") : -1;
+    et_cleanup(&lp, store);
+    ASSERT_EQ(handles, 0);
+    PASS();
+}
+
+/* Precision guard for the slashless form: only a Laravel route registration
+ * (the Route facade, or $router) has its URI normalised. A string first
+ * argument of any other get/post call — a request input, a cache key, config,
+ * a collection or session lookup, a property that merely holds a router, a
+ * test client call — stays what it is and mints no Route. */
+TEST(routes_laravel_slashless_no_junk_issue1146) {
+    static const char *want[] = {"GET /real", NULL};
+    static const EtFile f[] = {
+        {"routes/web.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+         "use Illuminate\\Support\\Facades\\Cache;\n\n"
+         "Route::get('real', 'RealController@show');\n\n"
+         "class UsersController {\n"
+         "    public function index($request) {\n"
+         "        $name = $request->get('name');\n"
+         "        $q = $request->query->get('q');\n"
+         "        $v = Cache::get('users.count');\n"
+         "        $c = config('app.name');\n"
+         "        $k = collect(['a' => 1])->get('a');\n"
+         "        $s = session()->get('key');\n"
+         "        $r = $this->router->get('status');\n"
+         "        $p = $this->post('login', []);\n"
+         "        return $this->get('users');\n"
+         "    }\n}\n"}};
+    ASSERT_TRUE(et_route_set_exact(f, 1, want, 0));
+    PASS();
+}
+
 /* Rails (Ruby) — ActionDispatch router.  The handler MUST be passed as a bare
  * identifier (not the idiomatic `to: 'list_items'` string, which extract_handler_arg
  * cannot capture).  mapper.get resolves by name to the Mapper#get method whose QN
@@ -1708,6 +1863,10 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
     RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
+    RUN_TEST(routes_laravel_slashless_issue1146);
+    RUN_TEST(routes_laravel_slashless_parallel_issue1146);
+    RUN_TEST(routes_laravel_slashless_no_guessed_handlers_issue1146);
+    RUN_TEST(routes_laravel_slashless_no_junk_issue1146);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 
