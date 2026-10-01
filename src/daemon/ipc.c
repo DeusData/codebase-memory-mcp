@@ -408,6 +408,9 @@ int cbm_daemon_ipc_wait_pending(const cbm_ipc_pending_ops_t *ops, uint32_t timeo
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -1680,6 +1683,55 @@ static bool posix_ancestor_stat_ok(uid_t owner, mode_t mode, uid_t euid, uid_t o
     return true;
 }
 
+/* #1687: WSL2 mounts Windows drives (/mnt/c, /mnt/e, ...) as DrvFs over 9p.
+ * Without the `metadata` mount option such a mount reports 0777 for every
+ * directory and ignores chmod, so both the ancestor rule (not world-writable)
+ * and the leaf 0700 rule refuse it -- correctly: the 0777 is real. The gate
+ * stays exactly as it is; this only lets the refusal name the remedy instead
+ * of leaving a WSL user to guess. Detection is a statfs magic (9p) confirmed by
+ * a WSL kernel release string, so plain 9p mounts elsewhere (QEMU virtfs) keep
+ * the generic message. Diagnostic only: it never changes accept/refuse. */
+#define POSIX_WSL_DRVFS_REMEDY                                                                   \
+    "WSL DrvFs mount: set /etc/wsl.conf [automount] options = "                                  \
+    "\"metadata,umask=22,fmask=11\", then run `wsl --shutdown`; or keep the cache on the Linux " \
+    "filesystem (e.g. ~/.cache)"
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_posix_force_wsl_drvfs;
+void cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(bool force) {
+    g_posix_force_wsl_drvfs = force;
+}
+#endif
+
+#if defined(__linux__)
+#define POSIX_V9FS_MAGIC 0x01021997UL
+
+static bool posix_kernel_is_wsl(void) {
+    char release[128];
+    if (!posix_read_small_proc_file("/proc/sys/kernel/osrelease", release, sizeof(release))) {
+        return false;
+    }
+    return strstr(release, "microsoft") != NULL || strstr(release, "Microsoft") != NULL ||
+           strstr(release, "WSL") != NULL;
+}
+#endif
+
+static bool posix_fd_on_wsl_drvfs(int directory_fd) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_posix_force_wsl_drvfs) {
+        return true;
+    }
+#endif
+#if defined(__linux__)
+    struct statfs filesystem;
+    return directory_fd >= 0 && fstatfs(directory_fd, &filesystem) == 0 &&
+           (unsigned long)filesystem.f_type == POSIX_V9FS_MAGIC && posix_kernel_is_wsl();
+#else
+    (void)directory_fd;
+    return false;
+#endif
+}
+
 static bool posix_directory_ancestor_owner_trusted(uid_t owner) {
     return posix_ancestor_owner_ok(owner, geteuid(), posix_ancestor_overflow_uid());
 }
@@ -1796,11 +1848,18 @@ static int private_directory_tree_open(const char *directory_path) {
                  * refusing, found it clean, and said so — correctly. Naming the
                  * containing directory is the difference between a report we
                  * can act on and weeks of talking past each other. */
-                ipc_validation_detail_set(
-                    "%s: the directory CONTAINING '%s' is not a usable private-directory parent "
-                    "(it must be owned by you, not world-writable, and carry no allow-ACL). Check "
-                    "that containing directory, not '%s' itself",
-                    directory_path, component, component);
+                if (posix_fd_on_wsl_drvfs(current_fd)) {
+                    /* #1687: shorter rule text so the remedy fits the buffer. */
+                    ipc_validation_detail_set("%s: the directory CONTAINING '%s' is not private "
+                                              "(DrvFs reports 0777). " POSIX_WSL_DRVFS_REMEDY,
+                                              directory_path, component);
+                } else {
+                    ipc_validation_detail_set(
+                        "%s: the directory CONTAINING '%s' is not a usable private-directory "
+                        "parent (it must be owned by you, not world-writable, and carry no "
+                        "allow-ACL). Check that containing directory, not '%s' itself",
+                        directory_path, component, component);
+                }
             }
             bool created = ok && mkdirat(current_fd, component, 0700) == 0;
             if (!created && errno != EEXIST) {
@@ -1854,8 +1913,11 @@ static int private_directory_tree_open(const char *directory_path) {
         ok = false;
     }
     if (ok && (fstat(current_fd, &final_status) != 0 || (final_status.st_mode & 07777) != 0700)) {
-        ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700", directory_path,
-                                  (unsigned)(final_status.st_mode & 07777));
+        /* #1687: DrvFs without `metadata` ignores chmod; name the remedy. */
+        bool drvfs = posix_fd_on_wsl_drvfs(current_fd);
+        ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700%s%s", directory_path,
+                                  (unsigned)(final_status.st_mode & 07777), drvfs ? ". " : "",
+                                  drvfs ? POSIX_WSL_DRVFS_REMEDY : "");
         ok = false;
     }
     if (ok && !cbm_macos_extended_acl_fd_is_empty(current_fd)) {

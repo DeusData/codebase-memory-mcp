@@ -18,12 +18,14 @@ int tf_skip_count = 0;
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
 #include "foundation/log.h"        /* worker liveness heartbeat probe */
 #include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
+#include "daemon/bootstrap.h"      /* runner rendezvous isolation */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
 #include "ui/http_server.h"        /* deleted-self executable probe */
+#include "result_spill.h"          /* pinned free disk: spill verdicts ignore the host disk */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -186,10 +188,14 @@ static int tf_maybe_run_blocking_git_probe(int argc, char **argv) {
  * this sentinel and restore it; atexit removes anything left behind by an
  * assertion that returns before fixture cleanup. */
 static char tf_home_sentinel[512];
+static char tf_runtime_sentinel[512];
 
 static void tf_cleanup_cache_sentinel(void) {
     if (tf_home_sentinel[0]) {
         th_rmtree(tf_home_sentinel);
+    }
+    if (tf_runtime_sentinel[0]) {
+        th_rmtree(tf_runtime_sentinel);
     }
 }
 
@@ -242,7 +248,106 @@ static bool tf_setup_cache_sentinel(void) {
         cbm_unsetenv(tf_client_home_overrides[i]);
     }
     atexit(tf_cleanup_cache_sentinel);
+    /* HOME and CBM_CACHE_DIR do not move the daemon rendezvous: its key is a
+     * constant product hash under the system temp root. Without this, an
+     * install/uninstall/update test or any endpoint resolved with no explicit
+     * parent reaches the developer's live daemon. The run always gets a fresh
+     * private directory; an inherited value is replaced, never reused (the
+     * rule scripts/test-runtime.sh applies to the shell harness).
+     * th_secure_runtime_parent_new anchors it where the IPC ancestry check
+     * accepts it (LocalAppData on Windows). */
+    if (!th_secure_runtime_parent_new(tf_runtime_sentinel, sizeof(tf_runtime_sentinel), "run")) {
+        tf_runtime_sentinel[0] = '\0';
+        return false;
+    }
+    if (cbm_setenv("CBM_RUNTIME_DIR", tf_runtime_sentinel, 1) != 0) {
+        return false;
+    }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* Belt and braces: a fixture that later drops the variable gets a loud
+     * refusal instead of the default rendezvous. */
+    cbm_daemon_bootstrap_forbid_default_runtime_for_test(true);
+#endif
     return true;
+}
+
+static bool tf_path_has_parent(const char *path, const char *parent) {
+    size_t length = parent ? strlen(parent) : 0;
+    return path && length > 0 && strncmp(path, parent, length) == 0 &&
+           (path[length] == '/' || path[length] == '\\');
+}
+
+/* The daemon rendezvous is not derived from HOME or the cache: its key is a
+ * constant product hash and its default parent is the system temp root. With
+ * CBM_RUNTIME_DIR unset, every endpoint a test resolves is therefore the
+ * developer's live daemon socket (<tmp>/cbm-daemon-<uid>/cbm-<key>.sock).
+ * Every check runs before anything is resolved, so a run without isolation
+ * fails here and this test never reaches that socket itself. */
+TEST(runner_isolation_daemon_runtime_dir_is_private) {
+    char runtime_env[sizeof(tf_runtime_sentinel)] = {0};
+    const char *value = cbm_safe_getenv("CBM_RUNTIME_DIR", runtime_env, sizeof(runtime_env), NULL);
+    ASSERT_NOT_NULL(value);
+    ASSERT_TRUE(value[0] != '\0');
+    /* The fresh per-run directory, never a value inherited from the caller. */
+    ASSERT_STR_EQ(value, tf_runtime_sentinel);
+
+    const char *root = th_secure_runtime_base();
+    ASSERT_NOT_NULL(root);
+    char canonical_root[CBM_SZ_4K] = {0};
+    char canonical_run[CBM_SZ_4K] = {0};
+    ASSERT_TRUE(cbm_canonical_path(root, canonical_root, sizeof(canonical_root)) != 0);
+    ASSERT_TRUE(cbm_canonical_path(value, canonical_run, sizeof(canonical_run)) != 0);
+    /* Strictly below the temp root: the root itself is the default rendezvous
+     * parent (/tmp on POSIX, LocalAppData on Windows). */
+    ASSERT_TRUE(tf_path_has_parent(canonical_run, canonical_root));
+
+    /* Only now resolve through the product resolver. A NULL parent is what
+     * every product call site passes: daemon, MCP client, CLI, activation. */
+    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+    const char *resolved = endpoint ? cbm_daemon_ipc_endpoint_runtime_dir(endpoint) : NULL;
+    char canonical_resolved[CBM_SZ_4K] = {0};
+    bool resolved_ok = resolved && cbm_canonical_path(resolved, canonical_resolved,
+                                                      sizeof(canonical_resolved)) != 0;
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ASSERT_TRUE(resolved_ok);
+    ASSERT_TRUE(tf_path_has_parent(canonical_resolved, canonical_run));
+#ifndef _WIN32
+    char live_default[CBM_SZ_4K];
+    (void)snprintf(live_default, sizeof(live_default), "%s/cbm-daemon-%lu", canonical_root,
+                   (unsigned long)geteuid());
+    ASSERT_TRUE(strcmp(canonical_resolved, live_default) != 0);
+#endif
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* The runner arms the bootstrap guard, so a fixture that drops the variable
+ * gets a refusal instead of the default rendezvous. Only the decision is
+ * exercised: no endpoint is ever built while the variable is absent. */
+TEST(runner_isolation_refuses_default_daemon_runtime) {
+    ASSERT_TRUE(tf_runtime_sentinel[0] != '\0');
+    bool allowed_with_run_dir = !cbm_daemon_bootstrap_default_runtime_refused_for_test(NULL);
+
+    (void)cbm_unsetenv("CBM_RUNTIME_DIR");
+    bool refused_without = cbm_daemon_bootstrap_default_runtime_refused_for_test(NULL);
+    bool explicit_allowed =
+        !cbm_daemon_bootstrap_default_runtime_refused_for_test(tf_runtime_sentinel);
+    /* Restore before asserting: a failed assertion returns immediately. */
+    bool restored = cbm_setenv("CBM_RUNTIME_DIR", tf_runtime_sentinel, 1) == 0;
+
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(allowed_with_run_dir);
+    ASSERT_TRUE(refused_without);
+    ASSERT_TRUE(explicit_allowed);
+    PASS();
+}
+#endif
+
+SUITE(runner_isolation) {
+    RUN_TEST(runner_isolation_daemon_runtime_dir_is_private);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(runner_isolation_refuses_default_daemon_runtime);
+#endif
 }
 
 /* Fast real-process probes for the async index-supervisor contract. They run
@@ -957,6 +1062,14 @@ int main(int argc, char **argv) {
         (void)printf("sanitized=%d test_seams=%d\n", sanitized, test_seams);
         return 0;
     }
+    /* A test's verdict is a pure function of code, test, platform and seed --
+     * never of how full this machine's disk is. The spill store refuses to open
+     * below 10 GB free, so without this pin every spill test failed, and every
+     * budget-driven pipeline test silently took the no-store path, on a host
+     * with less free space. Pin ample space for this process and every worker
+     * it re-execs; the refusal itself is pinned on purpose by
+     * extraction::extract_spill_refuses_below_the_free_disk_floor. */
+    (void)cbm_result_spill_pin_free_bytes_for_tests((size_t)64 * 1024 * 1024 * 1024);
     /* Skip the multi-hundred-MB executable-image hash that computes the exact
      * build fingerprint: it is tens of seconds per spawned worker/daemon under
      * ASan on constrained CI runners and the sole cause of the daemon-family
@@ -1047,7 +1160,7 @@ int main(int argc, char **argv) {
      * A test that exercises the supervisor must explicitly re-enable it. */
     cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
     if (!tf_setup_cache_sentinel()) {
-        fprintf(stderr, "failed to create isolated test cache\n");
+        fprintf(stderr, "failed to create isolated test cache and daemon runtime\n");
         return 2;
     }
 
@@ -1070,6 +1183,9 @@ int main(int argc, char **argv) {
     if (!g_list_only) {
         printf("\n  codebase-memory-mcp  C test suite\n");
     }
+
+    /* Runner isolation first: nothing below may reach the developer's daemon. */
+    RUN_SELECTED_SUITE(runner_isolation);
 
     /* Foundation */
     RUN_SELECTED_SUITE(arena);

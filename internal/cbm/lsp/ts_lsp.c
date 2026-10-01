@@ -1785,9 +1785,28 @@ static const CBMType *eval_indexed_access(TSLSPContext *ctx, const CBMType *obj,
     return cbm_type_unknown();
 }
 
-// Look up a method on a receiver type — returns the registered func.
+static const CBMRegisteredFunc *lookup_method_inner(TSLSPContext *ctx, const CBMType *recv,
+                                                    const char *method_name);
+
+/* Depth-guarded entry, same contract as lookup_member_type: the method walk
+ * recurses through wrapper classes, union members and the extends/implements
+ * chain. A cyclic chain (#1743: the Effect idiom `class Service extends
+ * Context.Service<Service, I>()(...)` whose base resolved to the class itself)
+ * recursed without bound and overflowed the resolver thread's stack. Past the
+ * cap the method is simply not found. */
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name) {
+    if (!ctx || ctx->method_depth >= TS_LSP_MAX_MEMBER_DEPTH)
+        return NULL;
+    ctx->method_depth++;
+    const CBMRegisteredFunc *f = lookup_method_inner(ctx, recv, method_name);
+    ctx->method_depth--;
+    return f;
+}
+
+// Look up a method on a receiver type — returns the registered func.
+static const CBMRegisteredFunc *lookup_method_inner(TSLSPContext *ctx, const CBMType *recv,
+                                                    const char *method_name) {
     if (!ctx || !recv || !method_name)
         return NULL;
     const CBMType *base = simplify_type(ctx, recv);

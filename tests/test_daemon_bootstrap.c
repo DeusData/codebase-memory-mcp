@@ -400,6 +400,11 @@ TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
     char relocated_runtime[BOOTSTRAP_TEST_PATH_CAP] = {0};
     char explicit_runtime[BOOTSTRAP_TEST_PATH_CAP] = {0};
     char unusable[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    /* The runner isolates the rendezvous for the whole run through this same
+     * variable, so the test must hand back exactly what it found. */
+    char previous_value[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    const char *previous =
+        cbm_safe_getenv("CBM_RUNTIME_DIR", previous_value, sizeof(previous_value), NULL);
     int written = snprintf(override_parent, sizeof(override_parent),
                            "%s/cbm-bootstrap-runtime-env-XXXXXX", cbm_tmpdir());
     if (written <= 0 || written >= (int)sizeof(override_parent) || !cbm_mkdtemp(override_parent)) {
@@ -436,8 +441,10 @@ TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
         unusable_set ? cbm_daemon_bootstrap_endpoint_new(NULL) : NULL;
 
     /* Restore before asserting: a failed assertion returns immediately, and a
-     * leaked CBM_RUNTIME_DIR would follow every later suite in this process. */
-    (void)cbm_unsetenv("CBM_RUNTIME_DIR");
+     * leaked override, or a dropped run value, would follow every later suite
+     * in this process. */
+    bool restored = previous ? cbm_setenv("CBM_RUNTIME_DIR", previous_value, 1) == 0
+                             : cbm_unsetenv("CBM_RUNTIME_DIR") == 0;
     cbm_daemon_ipc_endpoint_free(refused);
     cbm_daemon_ipc_endpoint_free(relocated);
     if (relocated_runtime[0] != '\0') {
@@ -448,6 +455,7 @@ TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
     }
     (void)cbm_rmdir(override_parent);
 
+    ASSERT_TRUE(restored);
     ASSERT_TRUE(prepared);
     ASSERT_TRUE(explicit_started);
     ASSERT_TRUE(explicit_canonical);

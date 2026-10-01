@@ -394,7 +394,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
         const char *sk = ts_node_type(sub);
         if (strcmp(sk, "identifier") == 0) {
             char *name = cbm_node_text(a, sub, ctx->source);
-            CBMImport imp = {.local_name = name, .module_path = path};
+            CBMImport imp = {.local_name = name, .module_path = path, .is_default = true};
             cbm_imports_push(&ctx->result->imports, a, imp);
             found = true;
         } else if (strcmp(sk, "namespace_import") == 0) {
