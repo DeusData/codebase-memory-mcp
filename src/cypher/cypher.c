@@ -1862,6 +1862,8 @@ static int parse_return(parser_t *p, cbm_return_clause_t **out) {
     return parse_return_or_with(p, out, false);
 }
 
+static void free_pattern(cbm_pattern_t *pat);
+
 /* Parse a single MATCH pattern into pat */
 static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     memset(pat, 0, sizeof(*pat));
@@ -1870,31 +1872,38 @@ static int parse_match_pattern(parser_t *p, cbm_pattern_t *pat) {
     pat->nodes = malloc(node_cap * sizeof(cbm_node_pattern_t));
     pat->rels = calloc(rel_cap, sizeof(cbm_rel_pattern_t));
 
-    if (parse_node(p, &pat->nodes[0]) < 0) {
-        return CBM_NOT_FOUND;
-    }
+    /* Count the slot before parsing so even partially filled nodes and
+     * relationships are released when a malformed pattern is rejected. */
     pat->node_count = SKIP_ONE;
+    if (parse_node(p, &pat->nodes[0]) < 0) {
+        goto fail;
+    }
 
     while (check(p, TOK_DASH) || check(p, TOK_LT)) {
         if (pat->rel_count >= rel_cap) {
             rel_cap *= PAIR_LEN;
             pat->rels = safe_realloc(pat->rels, rel_cap * sizeof(cbm_rel_pattern_t));
         }
-        if (parse_rel(p, &pat->rels[pat->rel_count]) < 0) {
-            return CBM_NOT_FOUND;
-        }
         pat->rel_count++;
+        if (parse_rel(p, &pat->rels[pat->rel_count - SKIP_ONE]) < 0) {
+            goto fail;
+        }
 
         if (pat->node_count >= node_cap) {
             node_cap *= PAIR_LEN;
             pat->nodes = safe_realloc(pat->nodes, node_cap * sizeof(cbm_node_pattern_t));
         }
-        if (parse_node(p, &pat->nodes[pat->node_count]) < 0) {
-            return CBM_NOT_FOUND;
-        }
         pat->node_count++;
+        if (parse_node(p, &pat->nodes[pat->node_count - SKIP_ONE]) < 0) {
+            goto fail;
+        }
     }
     return 0;
+
+fail:
+    free_pattern(pat);
+    memset(pat, 0, sizeof(*pat));
+    return CBM_NOT_FOUND;
 }
 
 /* Parse UNWIND [...] AS var clause into query */
