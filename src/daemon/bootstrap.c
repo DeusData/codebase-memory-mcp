@@ -241,21 +241,49 @@ static const char *bootstrap_runtime_parent_override(char *buffer, size_t capaci
     return value && value[0] != '\0' ? value : NULL;
 }
 
+/* An explicit parent keeps precedence: it carries the compile-time test seam
+ * and the lifecycle guards' isolated namespace. NULL means the account-wide
+ * default rendezvous. */
+static const char *bootstrap_runtime_parent_resolve(const char *runtime_parent, char *buffer,
+                                                    size_t capacity) {
+    return runtime_parent ? runtime_parent : bootstrap_runtime_parent_override(buffer, capacity);
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Armed once by a test runner before any suite starts its threads. */
+static bool g_bootstrap_default_runtime_forbidden = false;
+
+void cbm_daemon_bootstrap_forbid_default_runtime_for_test(bool forbid) {
+    g_bootstrap_default_runtime_forbidden = forbid;
+}
+
+bool cbm_daemon_bootstrap_default_runtime_refused_for_test(const char *runtime_parent) {
+    char override_parent[BOOTSTRAP_PATH_CAP];
+    return g_bootstrap_default_runtime_forbidden &&
+           !bootstrap_runtime_parent_resolve(runtime_parent, override_parent,
+                                             sizeof(override_parent));
+}
+#endif
+
 cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime_parent) {
     char key[CBM_DAEMON_KEY_SIZE];
     if (!cbm_daemon_rendezvous_key(key)) {
         return NULL;
     }
-    /* An explicit parent keeps precedence: it carries the compile-time test
-     * seam and the lifecycle guards' isolated namespace. The override is
-     * resolved HERE, the one function every product endpoint goes through
-     * (daemon, MCP client, local CLI, index worker, activation), so no call
-     * site can silently keep the default. */
+    /* The override is resolved HERE, the one function every product endpoint
+     * goes through (daemon, MCP client, local CLI, index worker, activation),
+     * so no call site can silently keep the default. */
     char override_parent[BOOTSTRAP_PATH_CAP];
     const char *parent =
-        runtime_parent
-            ? runtime_parent
-            : bootstrap_runtime_parent_override(override_parent, sizeof(override_parent));
+        bootstrap_runtime_parent_resolve(runtime_parent, override_parent, sizeof(override_parent));
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (!parent && g_bootstrap_default_runtime_forbidden) {
+        (void)fprintf(stderr, "codebase-memory-mcp: test run refused the default daemon runtime "
+                              "directory (no explicit parent and CBM_RUNTIME_DIR unset): the "
+                              "developer's live daemon listens there\n");
+        return NULL;
+    }
+#endif
     return cbm_daemon_ipc_endpoint_new(key, parent);
 }
 

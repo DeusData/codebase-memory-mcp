@@ -255,7 +255,7 @@ static bool git_head_hash(const char *repo_path, char *buf, size_t bufsz) {
                           git_context.c) */
         return false;
     }
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         buf[0] = '\0';
         return false;
@@ -397,7 +397,7 @@ static bool git_run_ok(const char *repo_path, const char *args) {
     if (!build_git_cmd(cmd, sizeof(cmd), repo_path, args)) {
         return false;
     }
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return false;
     }
@@ -416,7 +416,7 @@ static int git_capture_full(const char *repo_path, const char *args, char **out,
     if (!build_git_cmd(cmd, sizeof(cmd), repo_path, args)) {
         return CBM_NOT_FOUND;
     }
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
@@ -813,7 +813,7 @@ static void ensure_gitattributes(const char *repo_path) {
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
         return; /* truncated command → skip (parity with git_context.c) */
     }
-    FILE *p = cbm_popen(cmd, "r");
+    FILE *p = cbm_popen_git(cmd);
     if (p) {
         (void)cbm_pclose(p);
     }

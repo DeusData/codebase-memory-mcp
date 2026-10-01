@@ -371,6 +371,11 @@ const char *cbm_store_db_path(const cbm_store_t *s);
  * (projects table has correct types, no corruption indicators).
  * Returns false if corruption is detected — caller should delete and re-index. */
 bool cbm_store_check_integrity(cbm_store_t *s);
+/* True when the edges table carries the #768 local_name_gen discriminator —
+ * the schema a read-write open (cbm_store_open_path_existing) requires. A
+ * pre-#768 store still serves read-only queries but refuses every write open
+ * until it is reindexed. Read-only: safe on a store opened for query. */
+bool cbm_store_edges_schema_current(cbm_store_t *s);
 /* Shallow check + PRAGMA quick_check — catches page-level corruption.
  * O(db size); use on rare paths (artifact import), not hot opens. */
 bool cbm_store_check_integrity_deep(cbm_store_t *s);

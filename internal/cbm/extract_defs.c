@@ -87,10 +87,18 @@ static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *
 }
 
 /* Walk AST body, collect unique identifier text as space-separated string.
- * Returns arena-allocated string or NULL. */
+ * Contract: the first BT_MAX_IDENTS unique identifiers in pre-order (source
+ * order), bounded by BT_BUF bytes. The ident/byte caps ARE the sampling
+ * contract; the pending stack is not — BT_STACK is only the on-stack first
+ * chunk and spills to the heap, because a full fixed stack dropped a wide
+ * body's FIRST children and sampled a mid-body window instead.
+ * Returns arena-allocated string, or NULL when there are no identifiers or the
+ * stack could not be grown (logged; no truncated sample is ever returned). */
 static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
     enum { BT_STACK = 512, BT_BUF = 2048, BT_MAX_IDENTS = 128, BT_SEEN = 256, BT_SEEN_MASK = 255 };
-    TSNode bt_stack[BT_STACK];
+    TSNode bt_inline[BT_STACK];
+    TSNode *bt_stack = bt_inline;
+    int bt_cap = BT_STACK;
     int bt_top = 0;
     bt_stack[bt_top++] = body;
     char bt_buf[BT_BUF];
@@ -120,11 +128,17 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
                 }
             }
         } else {
-            for (int i = (int)nc - SKIP_ONE; i >= 0 && bt_top < BT_STACK; i--) {
+            if (!cbm_walk_stack_reserve((void **)&bt_stack, &bt_cap, bt_top + (int)nc,
+                                        sizeof(TSNode), bt_inline, "body_ident_tokens")) {
+                bt_pos = 0; /* sentinel: no sample rather than a truncated one */
+                break;
+            }
+            for (int i = (int)nc - SKIP_ONE; i >= 0; i--) {
                 bt_stack[bt_top++] = ts_node_child(nd, (uint32_t)i);
             }
         }
     }
+    cbm_walk_stack_release(bt_stack, bt_inline);
     if (bt_pos > 0) {
         bt_buf[bt_pos] = '\0';
         return cbm_arena_strdup(ctx->arena, bt_buf);
@@ -5759,6 +5773,123 @@ static bool is_require_import_call(TSNode value, const char *source, CBMArena *a
     return false;
 }
 
+/* True when text of `node` equals `want` exactly (no arena allocation). */
+static bool js_node_text_is(TSNode node, const char *source, const char *want) {
+    if (ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = strlen(want);
+    return end >= start && (size_t)(end - start) == len && memcmp(source + start, want, len) == 0;
+}
+
+/* #1916: `axios.create(...)` — the factory of a configured axios instance
+ * (the vue-element-admin / RuoYi `request.js` wrapper). Only the literal
+ * `axios` receiver is recognised: a look-alike `factory.create(...)` is not
+ * an HTTP client and must not turn its binding into one. */
+static bool js_is_axios_create_call(TSNode value, const char *source) {
+    if (ts_node_is_null(value) || strcmp(ts_node_type(value), "call_expression") != 0) {
+        return false;
+    }
+    TSNode fn = ts_node_child_by_field_name(value, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "member_expression") != 0) {
+        return false;
+    }
+    TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+    TSNode prop = ts_node_child_by_field_name(fn, TS_FIELD("property"));
+    return !ts_node_is_null(obj) && strcmp(ts_node_type(obj), "identifier") == 0 &&
+           js_node_text_is(obj, source, "axios") && js_node_text_is(prop, source, "create");
+}
+
+/* The literal `baseURL` of `axios.create({ baseURL: '<lit>' })`, or NULL when
+ * the config is absent, not an object literal, or the value is not a plain
+ * string literal (process.env.X, a template with substitutions, an escape):
+ * an unknown base is never guessed. */
+static const char *js_axios_create_base_url(CBMArena *a, TSNode call, const char *source) {
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return NULL;
+    }
+    TSNode cfg = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(cfg), "object") != 0) {
+        return NULL;
+    }
+    uint32_t n = ts_node_named_child_count(cfg);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(cfg, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        if (!js_node_text_is(key, source, "baseURL") &&
+            !js_node_text_is(key, source, "'baseURL'") &&
+            !js_node_text_is(key, source, "\"baseURL\"")) {
+            continue;
+        }
+        TSNode val = ts_node_child_by_field_name(pair, TS_FIELD("value"));
+        if (ts_node_is_null(val) || strcmp(ts_node_type(val), "string") != 0) {
+            return NULL;
+        }
+        char *text = cbm_node_text(a, val, source);
+        size_t len = text ? strlen(text) : 0;
+        if (len < PAIR_LEN || strchr(text, '\\') != NULL) {
+            return NULL;
+        }
+        text[len - SKIP_ONE] = '\0';
+        return text + SKIP_ONE;
+    }
+    return NULL;
+}
+
+/* Mark `def` as an axios client instance created by `call` (#1916). */
+static void js_mark_axios_client(CBMArena *a, CBMDefinition *def, TSNode call, const char *source) {
+    def->http_client = "axios";
+    def->http_base_url = js_axios_create_base_url(a, call, source);
+}
+
+/* #1916: `export default api;` (api an axios instance declared above) or
+ * `export default axios.create({...})` makes the MODULE's default export the
+ * client — record it on the Module def so a default import can find it. */
+static void js_mark_default_export_client(CBMExtractCtx *ctx, int mod_idx) {
+    if (mod_idx < 0 || mod_idx >= ctx->result->defs.count) {
+        return;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode stmt = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(stmt), "export_statement") != 0) {
+            continue;
+        }
+        TSNode val = ts_node_child_by_field_name(stmt, TS_FIELD("value"));
+        if (ts_node_is_null(val)) {
+            continue;
+        }
+        CBMDefinition *mod = &ctx->result->defs.items[mod_idx];
+        if (js_is_axios_create_call(val, ctx->source)) {
+            js_mark_axios_client(ctx->arena, mod, val, ctx->source);
+            continue;
+        }
+        if (strcmp(ts_node_type(val), "identifier") != 0) {
+            continue;
+        }
+        for (int d = 0; d < ctx->result->defs.count; d++) {
+            const CBMDefinition *v = &ctx->result->defs.items[d];
+            if (v->http_client && v->label && strcmp(v->label, "Variable") == 0 && v->name &&
+                !v->parent_class && js_node_text_is(val, ctx->source, v->name)) {
+                mod->http_client = v->http_client;
+                mod->http_base_url = v->http_base_url;
+                break;
+            }
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 // JS/TS variable extraction: skip function-assigned declarators.
 static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -5794,7 +5925,12 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 if (is_require) {
                     continue;
                 }
+                int before = ctx->result->defs.count;
                 push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+                if (ctx->result->defs.count > before &&
+                    js_is_axios_create_call(value, ctx->source)) {
+                    js_mark_axios_client(a, &ctx->result->defs.items[before], value, ctx->source);
+                }
             }
         }
     }
@@ -7470,6 +7606,38 @@ static void extract_typescript_namespace_def(CBMExtractCtx *ctx, TSNode node,
     cbm_defs_push(&ctx->result->defs, ctx->arena, def);
 }
 
+/* Dart `extension on T { ... }` has no name: there is no container def to hang
+ * its members on, and extract_class_def would bail before extract_class_methods,
+ * dropping every member (#1457). */
+static bool is_dart_unnamed_extension(const CBMExtractCtx *ctx, TSNode node) {
+    return ctx->language == CBM_LANG_DART &&
+           strcmp(ts_node_type(node), "extension_declaration") == 0 &&
+           ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("name")));
+}
+
+/* Walk an unnamed Dart extension's members as file-level functions. A member is
+ * `method_signature > function_signature`; the wrapper carries no name of its
+ * own, so push the inner function_signature (which does) for the generic walk. */
+static void push_dart_unnamed_extension_members(TSNode node, wd_stack_t *s,
+                                                const char *enclosing_qn) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(body);
+    for (int i = (int)nc - 1; i >= 0; i--) {
+        TSNode child = ts_node_named_child(body, (uint32_t)i);
+        if (strcmp(ts_node_type(child), "method_signature") == 0) {
+            TSNode sig = cbm_find_child_by_kind(child, "function_signature");
+            if (!ts_node_is_null(sig)) {
+                wd_push(s, sig, enclosing_qn);
+            }
+            continue;
+        }
+        wd_push(s, child, enclosing_qn);
+    }
+}
+
 // Push nested class children from a class body container onto the walk stack.
 static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
                                      const char *new_enclosing, const CBMExtractCtx *ctx) {
@@ -8072,6 +8240,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             continue;
         }
 
+        if (is_dart_unnamed_extension(ctx, node)) {
+            push_dart_unnamed_extension_members(node, &s, frame.enclosing_class_qn);
+            continue;
+        }
+
         if (cbm_kind_in_set(node, spec->class_node_types)) {
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
@@ -8232,7 +8405,14 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
             mod.route_method = "GET"; /* a routable page is reached by navigation */
         }
     }
+    int mod_idx = ctx->result->defs.count;
     cbm_defs_push(&ctx->result->defs, a, mod);
 
     cbm_extract_definitions_without_module(ctx);
+
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
+        /* Same language set as extract_js_vars, which marks the bindings. */
+        js_mark_default_export_client(ctx, mod_idx);
+    }
 }
