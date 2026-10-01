@@ -2561,9 +2561,13 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     bool has_url = (arg && arg[0] != '\0' && (arg[0] == '/' || strstr(arg, "://") != NULL));
     bool has_topic = (arg && arg[0] != '\0' && svc == CBM_SVC_ASYNC && strlen(arg) > PP_ESC_SPACE);
+    /* Set when this call already has its HTTP_CALLS edge from the service
+     * patterns (typed with the verb its callee names). */
+    bool http_edge_emitted = false;
 
     if ((svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) && (has_url || has_topic)) {
         emit_http_async_service_edge(gbuf, source, call, res, svc, arg);
+        http_edge_emitted = svc == CBM_SVC_HTTP;
     } else if (svc == CBM_SVC_GRPC) {
         emit_grpc_edge(gbuf, source, call, res);
     } else if (svc == CBM_SVC_GRAPHQL) {
@@ -2576,7 +2580,13 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call);
+    /* The arg-URL heuristic is for calls no service pattern knows (a local
+     * fetch wrapper). On a classified HTTP call it only minted a method-less
+     * __route__ANY__ twin of the typed edge, which cross-repo matching then
+     * bound to server handlers of any method. */
+    if (!http_edge_emitted) {
+        detect_url_in_args(gbuf, source, call);
+    }
 }
 
 /* Find the source node for an edge: enclosing function or file node. */
@@ -3025,7 +3035,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         /* Dynamic-language weak-member suppression (#592/#606/#1276). The
          * receiver-aware guard must NOT drop this call here: doing so would also
          * skip the #523 callee-name service bypass below, emit_service_edge's
-         * route/gRPC/config branches, and its unconditional detect_url_in_args
+         * route/gRPC/config branches, and its detect_url_in_args
          * (which classifies verb-suffix HTTP clients like api.patch('/x')).
          * Instead, defer to the emit path and suppress ONLY the plain-CALLS
          * fall-through (emit_normal_calls_edge), so every service edge stays

@@ -1592,6 +1592,35 @@ static int named_edge_count(cbm_store_t *s, const char *project, const char *edg
     return matches;
 }
 
+/* HTTP_CALLS edges out of the function `source_name` whose Route target's
+ * qualified name contains `route_qn_part` (e.g. "__route__GET__"). */
+static int http_calls_to_route(cbm_store_t *s, const char *project, const char *source_name,
+                               const char *route_qn_part) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HTTP_CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            strcmp(source.name, source_name) == 0 && strstr(target.qualified_name, route_qn_part)) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
 /* Like named_edge_count, but distinguish same-named targets by their source
  * file. Semantic-control fixtures intentionally keep the exported short name
  * identical in two modules so a project-wide unique-name fallback cannot make
@@ -6945,16 +6974,19 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
 
-    /* (1) Genuine HTTP_CALLS survive under the guard (>= 3):
-     *   - axios.get('/api/orders') -> 2 edges (recognized lib #523 callee bypass
-     *     + detect_url_in_args), and
+    /* (1) Genuine HTTP_CALLS survive under the guard:
+     *   - axios.get('/api/orders') -> 1 edge, typed GET (recognized lib #523
+     *     callee bypass; no method-less arg-URL twin), and
      *   - dev.load('/api/data')    -> 1 edge via detect_url_in_args, which runs
-     *     unconditionally after emit_service_edge's branch even when the plain
-     *     fall-through is suppressed.
+     *     after emit_service_edge's branch even when the plain fall-through is
+     *     suppressed.
      * dev.load is the class the predicate-duplicating guard lost: `.load` is not
      * a route suffix and `dev` is not an HTTP lib, so it was dropped before
-     * emit_service_edge ran (RED on that guard: only axios's 2). */
-    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 3);
+     * emit_service_edge ran (RED on that guard: only axios's edge). */
+    ASSERT_EQ(http_calls_to_route(s, project, "callApi", "__route__GET__"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "callApi", "__route__"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "callLoad", "__route__ANY__"), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 2);
     /* (2) The verb-suffix + route-path member calls keep their route
      * registrations (edge type CALLS -> a Route node named by the path). These
      * classify as route_registration on main, NOT HTTP_CALLS — Option A preserves
@@ -7759,6 +7791,103 @@ TEST(pipeline_local_fetch_shadow_not_classified_as_http) {
     cbm_pipeline_free(p);
     th_rmtree(tmp);
     PASS();
+}
+
+/* A call the HTTP service patterns classify (axios, an axios.create instance)
+ * gets exactly ONE HTTP_CALLS edge, typed with the verb its callee names. The
+ * arg-URL heuristic (detect_url_in_args, via=arg_url) exists for calls the
+ * patterns do not know -- a local fetch wrapper such as callApi('/api/orders')
+ * -- and must not add a second, method-less __route__ANY__ edge for the same
+ * call site. On microsoft/healthcare-ai-model-evaluator 59 of 129 HTTP_CALLS
+ * were such twins, and the cross-repo matcher bound them to server handlers of
+ * any method. `fillers` > 0 forces the parallel resolver (the RED case); 0
+ * keeps the sequential one, which must agree. */
+static int typed_http_no_url_twin_case(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_http_twin_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/api.ts",
+                    "import axios from 'axios';\n"
+                    "const axiosInstance = axios.create({ baseURL: 'http://localhost:5000' });\n"
+                    "export function getModel(id: string) {\n"
+                    "  return axiosInstance.get(`/api/models/${id}`);\n"
+                    "}\n"
+                    "export function addModel(body: unknown) {\n"
+                    "  return axiosInstance.post('/api/models', body);\n"
+                    "}\n"
+                    "export function removeModel(id: string) {\n"
+                    "  return axios.delete(`/api/models/${id}`);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/wrapper.ts",
+                    "function callApi(path: string): Promise<Response> {\n"
+                    "  return fetch(path);\n"
+                    "}\n"
+                    "export function listOrders() {\n"
+                    "  return callApi('/api/orders');\n"
+                    "}\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/http_twin.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *typed_route;
+    } typed[] = {{"getModel", "__route__GET__"},
+                 {"addModel", "__route__POST__"},
+                 {"removeModel", "__route__DELETE__"}};
+    for (size_t i = 0; i < sizeof(typed) / sizeof(typed[0]); i++) {
+        /* The typed edge stays ... */
+        ASSERT_EQ(http_calls_to_route(s, project, typed[i].caller, typed[i].typed_route), 1);
+        /* ... and it is the only HTTP_CALLS edge of that call site. */
+        ASSERT_EQ(http_calls_to_route(s, project, typed[i].caller, "__route__ANY__"), 0);
+        ASSERT_EQ(http_calls_to_route(s, project, typed[i].caller, "__route__"), 1);
+    }
+    if (fillers > 0) {
+        /* Control: the heuristic still covers the call no pattern knows. The
+         * sequential resolver has no arg-URL heuristic yet (#2235). */
+        ASSERT_EQ(http_calls_to_route(s, project, "listOrders", "__route__ANY__"), 1);
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_typed_http_call_has_no_arg_url_twin) {
+    return typed_http_no_url_twin_case(52);
+}
+
+TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential) {
+    return typed_http_no_url_twin_case(0);
 }
 
 /* ── Git history pass tests ─────────────────────────────────────── */
@@ -16365,6 +16494,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
+    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
+    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
