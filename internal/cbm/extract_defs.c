@@ -1,5 +1,6 @@
 #include "cbm.h"
-#include "arena.h" // CBMArena, cbm_arena_alloc/strdup/sprintf
+#include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
+#include "doclink.h" // cbm_doclink_note_doc_line
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
@@ -2018,10 +2019,14 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
     int kept = 0;
     bool words = false;
     size_t total = 0;
+    uint32_t first_row = 0;
     for (int k = first; k <= last; k++) {
         const doc_span_t *sp = &t->items[k];
         if (!doc_span_kept(src, sp, go_directives)) {
             continue;
+        }
+        if (kept == 0) {
+            first_row = sp->srow;
         }
         total += (size_t)(sp->eb - sp->sb) + SKIP_ONE;
         words = words || doc_has_words(src + sp->sb, sp->eb - sp->sb);
@@ -2052,6 +2057,10 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
         w += eb - sp->sb;
     }
     buf[w] = '\0';
+    /* Doc-link references need their source lines: the text's line k is the
+     * source line first_row + k (one comment per line, or a block keeping
+     * its own newlines). */
+    cbm_doclink_note_doc_line(ctx, buf, first_row + SKIP_ONE);
     return buf;
 }
 

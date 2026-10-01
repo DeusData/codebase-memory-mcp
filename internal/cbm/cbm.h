@@ -518,6 +518,24 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
+/* One reference found in a definition's complete doc comment (doclink.h has
+ * the syntax table and the per-language parsers). Resolution happens later,
+ * per file, in the pipeline (src/pipeline/doc_links.c). */
+typedef struct {
+    const char *source_qn; // QN of the documented definition (the edge source)
+    const char *raw;       // the reference as written, markup entities decoded
+    uint32_t line;         // 1-based source line of the reference
+    uint32_t def_line;     // 1-based start line of the documented definition
+    uint16_t syntax;       // CBMDocLinkSyntax (doclink.h)
+    uint16_t flags;        // reserved, 0
+} CBMDocLink;
+
+typedef struct {
+    CBMDocLink *items;
+    int count;
+    int cap;
+} CBMDocLinkArray;
+
 // Full extraction result for one file.
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
@@ -611,6 +629,14 @@ typedef struct CBMFileResult {
      * the Rust inner docs (//!). NULL for other languages and undocumented
      * files. */
     const char *module_doc;
+
+    /* Doc-comment references of this file's definitions (doclink.h), and the
+     * file's doc-link scope: a language-tagged text blob with what OTHER
+     * files' doc-link resolution needs from this file (C#: namespaces,
+     * usings, type and member declarations). A pure function of the file's
+     * bytes; NULL for languages without a scope scanner. */
+    CBMDocLinkArray doc_links;
+    const char *doc_scope;
 } CBMFileResult;
 
 // --- Enclosing function cache ---
@@ -702,6 +728,10 @@ typedef struct {
      * POD section index. */
     void *doc_memo;
     void *doc_pod_index;
+    /* Start line of every doc text doc_run_text built, keyed by the returned
+     * pointer (doclink.c), so a definition's doc references get exact source
+     * lines. NULL until the first doc; allocated in `scratch`. */
+    void *doc_lines;
 } CBMExtractCtx;
 
 // --- Public API ---

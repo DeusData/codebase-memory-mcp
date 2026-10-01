@@ -6181,6 +6181,71 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     return res;
 }
 
+/* Doc-comment references (index_status.doc_links): MENTIONS edges, the
+ * unresolved rows per reason, and the layer's status. "error" when the
+ * generation recorded a failed doc-link layer, when the doc_link_unresolved
+ * table is missing (an index from before the layer: reindex), or when it
+ * cannot be read. Samples (diagnostics=full) are rows ordered by reason,
+ * path and line. */
+enum { DOC_LINK_SAMPLE_CAP = 50 };
+
+static void add_doc_links_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                 const char *project, bool with_samples) {
+    yyjson_mut_val *dl = yyjson_mut_obj(doc);
+    int mentions = cbm_store_count_edges_by_type(store, project, "MENTIONS");
+    cbm_doc_link_reason_count_t *reasons = NULL;
+    int nreasons = 0;
+    cbm_doc_link_row_t *samples = NULL;
+    int nsamples = 0;
+    bool present = false;
+    int rc = cbm_store_doc_links_summary(store, project, &reasons, &nreasons, &samples, &nsamples,
+                                         with_samples ? DOC_LINK_SAMPLE_CAP : 0, &present);
+    bool error = rc != CBM_STORE_OK || mentions < 0 || !present;
+    yyjson_mut_obj_add_int(doc, dl, "mentions", mentions < 0 ? 0 : mentions);
+    yyjson_mut_val *unresolved = yyjson_mut_obj(doc);
+    for (int i = 0; i < nreasons; i++) {
+        if (strcmp(reasons[i].reason, "error") == 0) {
+            error = true; /* the generation's own failure marker, not a reference */
+            continue;
+        }
+        /* the key is copied: the document outlives `reasons` */
+        yyjson_mut_val *key = yyjson_mut_strcpy(doc, reasons[i].reason);
+        yyjson_mut_obj_add(unresolved, key, yyjson_mut_int(doc, reasons[i].count));
+    }
+    yyjson_mut_obj_add_val(doc, dl, "unresolved", unresolved);
+    yyjson_mut_obj_add_str(doc, dl, "status", error ? "error" : "ok");
+    if (error) {
+        yyjson_mut_obj_add_str(
+            doc, dl, "hint",
+            !present && rc == CBM_STORE_OK
+                ? "This index predates doc-comment links; re-run index_repository(repo_path=...)."
+                : "The doc-link layer failed or its table could not be read; re-run "
+                  "index_repository(repo_path=...).");
+    }
+    if (with_samples) {
+        yyjson_mut_val *arr = yyjson_mut_arr(doc);
+        for (int i = 0; i < nsamples; i++) {
+            if (!samples[i].rel_path || !samples[i].rel_path[0]) {
+                continue;
+            }
+            yyjson_mut_val *o = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, o, "rel_path", samples[i].rel_path);
+            yyjson_mut_obj_add_int(doc, o, "line", samples[i].line);
+            yyjson_mut_obj_add_strcpy(doc, o, "syntax", samples[i].syntax);
+            yyjson_mut_obj_add_strcpy(doc, o, "raw", samples[i].raw);
+            yyjson_mut_obj_add_strcpy(doc, o, "reason", samples[i].reason);
+            yyjson_mut_arr_append(arr, o);
+        }
+        yyjson_mut_obj_add_val(doc, dl, "samples", arr);
+    }
+    if (error && rc != CBM_STORE_OK) {
+        cbm_log_warn("index_status.doc_links", "project", project, "reason", "read_failed");
+    }
+    cbm_store_free_doc_link_reasons(reasons, nreasons);
+    cbm_store_free_doc_links(samples, nsamples);
+    yyjson_mut_obj_add_val(doc, root, "doc_links", dl);
+}
+
 /* Indexing-coverage report (#963), attached to index_status: the best-effort
  * signal from the separate index_coverage table (coverage is metadata ABOUT
  * the graph, stored outside it). Full per-project list, capped generously. */
@@ -6906,6 +6971,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         }
         add_coverage_report(doc, root, store, project, have_proj_info ? proj_info.indexed_at : NULL,
                             coverage_samples);
+        add_doc_links_report(doc, root, store, project, coverage_samples == COVERAGE_FILE_CAP);
         safe_str_free(&proj_info.name);
         safe_str_free(&proj_info.indexed_at);
         safe_str_free(&proj_info.root_path);

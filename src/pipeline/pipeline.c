@@ -14,11 +14,12 @@
 
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
+enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/doc_links.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pass_ensemble_routing.h"
@@ -260,6 +261,13 @@ struct cbm_pipeline {
     cbm_lsp_surface_row_t *surface_rows;
     int surface_row_count;
 
+    /* This run's doc_link_unresolved rows (doc_links.h), handed over by the
+     * resolve phase; doc_links_ran stays false until a doc-link phase did. */
+    cbm_doc_link_row_t *doc_link_rows;
+    int doc_link_row_count;
+    bool doc_links_failed;
+    bool doc_links_ran;
+
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
@@ -431,6 +439,42 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
     p->surface_row_count = count;
 }
 
+void cbm_pipeline_set_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t *rows, int count,
+                                    bool failed) {
+    if (!p) {
+        cbm_doclinks_free_rows(rows, count);
+        return;
+    }
+    cbm_doclinks_free_rows(p->doc_link_rows, p->doc_link_row_count);
+    p->doc_link_rows = rows;
+    p->doc_link_row_count = count;
+    p->doc_links_failed = failed;
+    p->doc_links_ran = true;
+}
+
+void cbm_pipeline_take_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t **rows, int *count,
+                                     bool *failed, bool *ran) {
+    *rows = p ? p->doc_link_rows : NULL;
+    *count = p ? p->doc_link_row_count : 0;
+    *failed = p ? p->doc_links_failed : true;
+    *ran = p ? p->doc_links_ran : false;
+    if (p) {
+        p->doc_link_rows = NULL;
+        p->doc_link_row_count = 0;
+        p->doc_links_failed = false;
+        p->doc_links_ran = false;
+    }
+}
+
+/* Forget a previous run's doc-link rows (a pipeline object can run twice). */
+static void pipeline_reset_doc_links(cbm_pipeline_t *p) {
+    cbm_doclinks_free_rows(p->doc_link_rows, p->doc_link_row_count);
+    p->doc_link_rows = NULL;
+    p->doc_link_row_count = 0;
+    p->doc_links_failed = false;
+    p->doc_links_ran = false;
+}
+
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -461,6 +505,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     cbm_store_free_lsp_surfaces(p->surface_rows, p->surface_row_count);
     p->surface_rows = NULL;
     p->surface_row_count = 0;
+    pipeline_reset_doc_links(p);
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -1443,6 +1488,9 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         {cbm_pipeline_pass_calls, "calls", false},
         {cbm_pipeline_pass_usages, "usages", false},
         {cbm_pipeline_pass_semantic, "semantic", false},
+        /* doc-comment references: a failure is recorded for publication
+         * (doc_links.status), never a failed index */
+        {cbm_pipeline_pass_doc_links, "doc_links", true},
     };
     int rc = 0;
     for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
@@ -1691,9 +1739,16 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     pipeline_phase_mark("lsp_cross_prepare");
+    /* Doc-comment references resolve beside CALLS in the resolve workers;
+     * their indexes need every file's scope and the complete node set. */
+    cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    cbm_doclinks_begin(ctx, files, file_count, cache);
+    cbm_log_info("pass.timing", "pass", "doc_links_prepare", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(*t)));
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                               def_count, def_modules, module_def_index, &cross_registries);
+    cbm_doclinks_end(ctx);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     pipeline_phase_mark("parallel_resolve");
@@ -2251,6 +2306,31 @@ int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation)
     return cbm_pipeline_publish_staged(stage_path, generation, true, false);
 }
 
+/* Write the generation's doc_link_unresolved rows (plus the error marker when
+ * the doc-link layer failed). */
+static int publish_doc_links(cbm_store_t *store, const cbm_pipeline_generation_t *generation) {
+    if (!generation->doc_links_failed) {
+        return cbm_store_doc_links_replace(store, generation->project, generation->doc_link_rows,
+                                           generation->doc_link_row_count);
+    }
+    cbm_log_error("doc_links.error", "phase", "publish", "reason", "layer_failed", "project",
+                  generation->project);
+    int n = generation->doc_link_row_count;
+    cbm_doc_link_row_t *rows = (cbm_doc_link_row_t *)cbm_alloc(
+        CBM_MEM_CLASS_STORE, (size_t)(n + SKIP_ONE) * sizeof(*rows));
+    if (!rows) {
+        return CBM_STORE_ERR;
+    }
+    if (n > 0) {
+        memcpy(rows, generation->doc_link_rows, (size_t)n * sizeof(*rows));
+    }
+    rows[n] = (cbm_doc_link_row_t){
+        .rel_path = "", .line = 0, .syntax = "", .raw = "doc-link layer failed", .reason = "error"};
+    int rc = cbm_store_doc_links_replace(store, generation->project, rows, n + SKIP_ONE);
+    cbm_free(CBM_MEM_CLASS_STORE, rows); /* the array only: the strings are borrowed */
+    return rc;
+}
+
 /* Complete and publish an already-materialized staging database: metadata
  * writes, FTS policy, integrity, seal, then the shared finalize leg. Takes
  * ownership of stage_path (frees it on every path). fts_wholesale selects
@@ -2316,6 +2396,15 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
         cbm_project_free_fields(&project_info);
     }
     cbm_log_info("publish.timing", "block", "coverage_replace", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t_pub)));
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
+    /* Unresolved doc-comment references belong to the generation, like its
+     * coverage rows. A failed doc-link layer is recorded as an error marker
+     * row (rel_path "", reason "error") so index_status can say so. */
+    if (ok && publish_doc_links(store, generation) != CBM_STORE_OK) {
+        ok = false;
+    }
+    cbm_log_info("publish.timing", "block", "doc_links", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
     /* The column list lives in cbm_store_fts_rebuild() alone — see the delta
@@ -2546,6 +2635,10 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
             },
         .surface_rows = p->surface_rows,
         .surface_row_count = p->surface_row_count,
+        .doc_link_rows = p->doc_link_rows,
+        .doc_link_row_count = p->doc_link_row_count,
+        /* every full route runs a doc-link phase; none having run is a fault */
+        .doc_links_failed = p->doc_links_failed || !p->doc_links_ran,
     };
 
     free(db_dir);
@@ -2721,6 +2814,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     bool restore_requested_discovery = false;
 
     p->mode = p->requested_mode;
+    pipeline_reset_doc_links(p);
     bool mode_promoted = promote_mode_to_existing_coverage(p);
 
     /* cbm_pipeline_new() may precede the actual run by an arbitrary interval.

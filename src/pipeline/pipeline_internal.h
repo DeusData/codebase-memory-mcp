@@ -156,6 +156,16 @@ typedef struct {
      * the incremental and probe routes still hand the cache array to passes
      * that index it directly, so they keep results in memory (follow-up). */
     bool spill_allowed;
+
+    /* Doc-comment references -> MENTIONS (doc_links.h). doc_links is the
+     * run's resolver state while the resolve phase runs (NULL otherwise);
+     * doc_link_base holds the stored scopes of the files an incremental run
+     * does not re-extract (borrowed from the route that loaded them);
+     * doc_links_failed records a failed build so publication can mark it. */
+    struct cbm_doclinks *doc_links;
+    const struct cbm_doclink_scope *doc_link_base;
+    int doc_link_base_count;
+    bool doc_links_failed;
 } cbm_pipeline_ctx_t;
 
 /* ── Result-cache access contract (spill mode) ────────────────────────
@@ -806,8 +816,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
                                                cbm_file_hash_t **out, int *out_count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
- * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+ * graph/manifest semantic change makes prior exact-input indexes unsafe.
+ * 4: doc-comment references became MENTIONS edges and doc_link_unresolved
+ *    rows, and C# LSP surfaces carry the doc-link scope ("dl"); an index
+ *    built before has neither, so it rebuilds once on upgrade. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 4 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -830,6 +843,13 @@ typedef struct {
      * into the staging store (delta patch); publish then skips the
      * wholesale delete+rewrite. */
     bool surfaces_in_place;
+    /* The generation's doc_link_unresolved rows (complete: an incremental
+     * route passes the merge of carried-forward and fresh rows), and whether
+     * the doc-link layer failed for it (publish then adds the error marker
+     * row that index_status reports as doc_links.status = "error"). */
+    const cbm_doc_link_row_t *doc_link_rows;
+    int doc_link_row_count;
+    bool doc_links_failed;
 } cbm_pipeline_generation_t;
 
 /* Serialize and fully populate a sibling staging database, then atomically
@@ -892,6 +912,15 @@ void cbm_pipeline_discard_stage(const char *stage_path);
  * Takes ownership; dump_and_persist_hashes writes them into the staging
  * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
+/* The run's doc_link_unresolved rows and failure flag (doc_links.h), taken
+ * over by the pipeline (set replaces and frees earlier rows; NULL p frees).
+ * A full run publishes them from dump_and_persist_hashes; an incremental
+ * route takes them back for its carry-forward merge. `ran` stays false until
+ * a doc-link phase hands rows over, so a route that never resolved can tell. */
+void cbm_pipeline_set_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t *rows, int count,
+                                    bool failed);
+void cbm_pipeline_take_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t **rows, int *count,
+                                     bool *failed, bool *ran);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

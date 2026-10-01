@@ -6,7 +6,8 @@
 #include "foundation/mem_events.h" // waste sanitizer: the bound allocators bypass every observer
 #include "foundation/log.h"        // cbm_log_warn -- extract.lsp.skipped
 #include "cbm.h"
-#include "arena.h" // CBMArena, cbm_arena_init/alloc/strdup/destroy
+#include "arena.h"   // CBMArena, cbm_arena_init/alloc/strdup/destroy
+#include "doclink.h" // cbm_doclinks_extract: doc-comment references + doc-link scope
 #include "helpers.h"
 #include "lang_specs.h"
 #include "extract_unified.h"
@@ -2951,6 +2952,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
 
     result->imports_count = result->imports.count;
+
+    /* Doc-comment references of the documented definitions, and the file's
+     * doc-link scope: both read the complete docstrings and the tree. */
+    cbm_doclinks_extract(&ctx);
 
     // Accumulate profiling counters
     atomic_fetch_add(&total_parse_ns, t1 - t0);
