@@ -886,6 +886,16 @@ TEST(lang_d_source_stays_dlang) {
     ASSERT_EQ(disambiguate_d_content("public/**/:\nvoid f() {}\n"), CBM_LANG_DLANG);
     ASSERT_EQ(disambiguate_d_content("public/+ +/:\nvoid f() {}\n"), CBM_LANG_DLANG);
     ASSERT_EQ(disambiguate_d_content("public//note: x\nvoid f() {}\n"), CBM_LANG_DLANG);
+    /* Every D whitespace splits tokens, not only space, tab and CR: form feed,
+     * vertical tab, U+2028 and U+2029. */
+    ASSERT_EQ(disambiguate_d_content("import\fstd.stdio : writeln;\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("import\vstd.stdio : writeln;\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("import\xE2\x80\xA8"
+                                     "std.stdio : writeln;\n"),
+              CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("import\xE2\x80\xA9"
+                                     "std.stdio : writeln;\n"),
+              CBM_LANG_DLANG);
     /* Default on doubt: empty or unreadable. */
     ASSERT_EQ(disambiguate_d_content(""), CBM_LANG_DLANG);
     ASSERT_EQ(cbm_disambiguate_d("/tmp/nonexistent_file_12345.d"), CBM_LANG_DLANG);

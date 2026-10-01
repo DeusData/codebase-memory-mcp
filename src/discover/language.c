@@ -1338,6 +1338,20 @@ static bool is_rule_colon(const char *p, bool whole_file) {
                          (next == '\0' && whole_file));
 }
 
+/* Bytes of D whitespace at p, or 0: space, tab, vertical tab, form feed, CR
+ * and the UTF-8 line and paragraph separators U+2028/U+2029, all of which split
+ * D tokens. '\n' ends the line and is the caller's. */
+static size_t d_space_len(const char *p) {
+    if (*p == ' ' || *p == '\t' || *p == '\v' || *p == '\f' || *p == '\r') {
+        return SKIP_ONE;
+    }
+    if (strncmp(p, "\xE2\x80\xA8", SLEN("\xE2\x80\xA8")) == 0 ||
+        strncmp(p, "\xE2\x80\xA9", SLEN("\xE2\x80\xA9")) == 0) {
+        return SLEN("\xE2\x80\xA8");
+    }
+    return 0;
+}
+
 /* True if the line at p is a make rule "target...: prereq..." whose targets all
  * look like paths (contain '/', '\' or '.'); a backslash-escaped space stays
  * inside its target. D source fails this: "public:", "@safe:", "extern(C):"
@@ -1353,12 +1367,14 @@ static bool is_dep_rule_line(const char *p, bool whole_file) {
         if (is_rule_colon(p, whole_file)) {
             return in_target ? path_like : any_target;
         }
-        if (*p == ' ' || *p == '\t' || *p == '\r') {
+        size_t space = d_space_len(p);
+        if (space) {
             if (in_target && !path_like) {
                 return false;
             }
             in_target = false;
             path_like = false;
+            p += space - SKIP_ONE;
             continue;
         }
         if (strchr("(){};=\"',@", *p)) {
