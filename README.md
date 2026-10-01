@@ -221,6 +221,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
 - `HTTP_CALLS`, `ASYNC_CALLS` (cross-service)
 - `EMITS`, `LISTENS_ON` (channels)
+- `BINDS` (Go google/wire `wire.Bind(new(I), new(T))`: provider set or injector → concrete type, exact matches only)
 - `DATA_FLOWS` with arg-to-param mapping + field access chains
 - `SIMILAR_TO` (MinHash + LSH near-clone detection, Jaccard scored)
 - `SEMANTICALLY_RELATED` (vocabulary-mismatch, same-language, score ≥ 0.80)
@@ -731,7 +732,7 @@ mode. `index_status` keeps describing the published graph and its freshness.
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `BINDS`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
 
 ### Qualified Names
 

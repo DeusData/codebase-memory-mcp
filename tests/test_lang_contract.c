@@ -1050,7 +1050,8 @@ TEST(contract_calls_breadth) {
 /* Every graph edge type the pipeline can emit — used to print a histogram
  * when an edge contract fails, so a regression shows exactly what WAS
  * produced instead of the missing type. */
-static const char *ALL_EDGE_TYPES[] = {"CALLS",
+static const char *ALL_EDGE_TYPES[] = {"BINDS",
+                                       "CALLS",
                                        "CALL_REFERENCE",
                                        "CONFIGURES",
                                        "CONTAINS_FILE",

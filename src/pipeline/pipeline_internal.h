@@ -186,6 +186,11 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
 int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
                                                 const CBMFileResult *result, const char *rel);
 
+/* Materialize BINDS edges for google/wire `wire.Bind(new(I), new(T))` calls in one Go
+ * file. Called alongside the env-CONFIGURES helper at every site. */
+int cbm_pipeline_create_wire_binds_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                            const char *rel);
+
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
                                                    int excluded_count) {
     if (!rel_path || rel_path[0] == '\0' || !excluded_dirs || excluded_count <= 0) {
