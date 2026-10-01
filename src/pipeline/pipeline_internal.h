@@ -184,6 +184,12 @@ void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
 /* Log the store counters, close and delete the store, drop the latch. */
 void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
 
+/* The File node of `rel` in `gbuf` (NULL when it has none): the one lookup
+ * for "this file as an edge source", by the name cbm_pipeline_fqn_compute
+ * gives every File node. */
+const cbm_gbuf_node_t *cbm_pipeline_file_node(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel);
+
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
  * extraction arenas and is released with the ordinary cbm_free_result(). */

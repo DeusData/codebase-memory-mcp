@@ -316,6 +316,29 @@ void cbm_doclinks_extract(CBMExtractCtx *ctx) {
         uint32_t doc_line = doc_line_of(ctx, d->docstring);
         L->parse_doc(ctx, d, d->docstring, doc_line ? doc_line : d->start_line);
     }
+    /* The file's own doc: its references belong to the file. The parser gets
+     * a definition-shaped stand-in for the file; what it pushes is marked, and
+     * the resolving half takes the File node as the source. No qualified name
+     * for that node is computed on this side. */
+    const char *file_doc = ctx->result->module_doc;
+    if (file_doc && file_doc[0]) {
+        CBMDocLinkArray *arr = &ctx->result->doc_links;
+        int first = arr->count;
+        CBMDefinition file_def = {
+            .name = ctx->rel_path,
+            .qualified_name = ctx->module_qn ? ctx->module_qn : "",
+            .label = "File",
+            .file_path = ctx->rel_path,
+            .start_line = SKIP_ONE,
+            .end_line = SKIP_ONE,
+            .docstring = file_doc,
+        };
+        uint32_t doc_line = doc_line_of(ctx, file_doc);
+        L->parse_doc(ctx, &file_def, file_doc, doc_line ? doc_line : file_def.start_line);
+        for (int i = first; i < arr->count; i++) {
+            arr->items[i].flags |= CBM_DOCLINK_FLAG_FILE;
+        }
+    }
     if (L->scan_scope) {
         ctx->result->doc_scope = L->scan_scope(ctx);
     }

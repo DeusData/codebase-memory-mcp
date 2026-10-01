@@ -2653,14 +2653,20 @@ static void file_node_cache_clear(void) {
     tl_file_node = NULL;
 }
 
+const cbm_gbuf_node_t *cbm_pipeline_file_node(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel) {
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    free(file_qn);
+    return node;
+}
+
 static const cbm_gbuf_node_t *file_node_for(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel) {
     if (tl_file_node_gbuf == gbuf && tl_file_node_rel == rel) {
         return tl_file_node;
     }
-    char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
-    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, file_qn);
-    free(file_qn);
+    const cbm_gbuf_node_t *node = cbm_pipeline_file_node(gbuf, project, rel);
     tl_file_node_gbuf = gbuf;
     tl_file_node_rel = rel;
     tl_file_node = node;

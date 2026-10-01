@@ -70,6 +70,17 @@ typedef enum {
         CBM_DOCLINK_SYNTAX_COUNT
 } CBMDocLinkSyntax;
 
+/* CBMDocLink.flags. */
+enum {
+    /* The reference is written in the FILE's own doc (CBMFileResult.module_doc:
+     * a Go package comment, Rust `//!` inner docs), not in a definition's. Its
+     * edge source is the file's File node, which the resolving half looks up
+     * from the file it is resolving; `source_qn` is not the source then. Set
+     * by the driver (cbm_doclinks_extract) on what a parser pushes for the
+     * file-level doc -- a parser never sets it. */
+    CBM_DOCLINK_FLAG_FILE = 1,
+};
+
 /* One link family: a line of CBM_DOCLINK_FAMILY_LIST. */
 typedef struct {
     CBMLanguage lang; /* the language whose doc comments write it; CBM_LANG_COUNT: any */
@@ -108,7 +119,14 @@ void cbm_doclink_note_doc_line(CBMExtractCtx *ctx, const char *doc, uint32_t lin
 
 /* Harvest the references of every documented definition into
  * ctx->result->doc_links and the file's scope into ctx->result->doc_scope.
- * Called once per file at the end of extraction, with the tree still alive. */
+ * Called once per file at the end of extraction, with the tree still alive.
+ *
+ * A file-level doc (ctx->result->module_doc) goes through the same parse_doc
+ * hook once more: `def` is then a stand-in for the FILE (label "File", name
+ * and file_path the relative path, qualified_name the file's module QN,
+ * start_line 1) and `doc_line` the doc's first line. The parser fills its
+ * tokens exactly as for a definition; the driver marks them
+ * CBM_DOCLINK_FLAG_FILE afterwards. */
 void cbm_doclinks_extract(CBMExtractCtx *ctx);
 
 /* Append one token (copies nothing: `raw` must live in the result arena). */

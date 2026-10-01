@@ -121,6 +121,7 @@ typedef struct {
 struct cbm_doclinks {
     const cbm_file_info_t *files; /* borrowed: the run's file list */
     int file_count;
+    const char *project; /* borrowed: names the File node of a file-level source */
     void *index[DOCLINK_RESOLVER_COUNT];
     doclink_file_rows_t *rows; /* per run file */
     CBMArena arena;            /* scope copies handed to the resolvers */
@@ -267,6 +268,7 @@ cbm_doclinks_t *cbm_doclinks_build(const cbm_pipeline_ctx_t *ctx, const cbm_file
     }
     dl->files = files;
     dl->file_count = file_count;
+    dl->project = ctx ? ctx->project_name : NULL;
     dl->rows = file_count > 0
                    ? (doclink_file_rows_t *)cbm_calloc(
                          CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(doclink_file_rows_t))
@@ -372,6 +374,10 @@ void cbm_doclinks_resolve_file(cbm_doclinks_t *dl, int file_idx, const CBMFileRe
     }
     int nm = 0;
     int nr = 0;
+    /* the file's own node: looked up once, and only when a reference of the
+     * file-level doc resolves */
+    const cbm_gbuf_node_t *file_node = NULL;
+    bool file_node_looked_up = false;
     for (int i = 0; i < n; i++) {
         const CBMDocLink *link = &result->doc_links.items[i];
         cbm_doclink_outcome_t out = {.kind = CBM_DOCLINK_UNRESOLVED,
@@ -388,7 +394,17 @@ void cbm_doclinks_resolve_file(cbm_doclinks_t *dl, int file_idx, const CBMFileRe
             continue;
         }
         if (out.kind == CBM_DOCLINK_EDGE && out.target) {
-            const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(graph, link->source_qn);
+            const cbm_gbuf_node_t *src = NULL;
+            if (link->flags & CBM_DOCLINK_FLAG_FILE) {
+                /* written in the file's own doc: the source is the File node */
+                if (!file_node_looked_up) {
+                    file_node = cbm_pipeline_file_node(graph, dl->project, fi->rel_path);
+                    file_node_looked_up = true;
+                }
+                src = file_node;
+            } else {
+                src = cbm_gbuf_find_by_qn(graph, link->source_qn);
+            }
             if (!src) {
                 atomic_fetch_add_explicit(&dl->no_source, 1, memory_order_relaxed);
                 continue;

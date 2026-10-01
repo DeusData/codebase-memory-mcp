@@ -954,6 +954,39 @@ TEST(doc_mentions_ship_gate) {
     PASS();
 }
 
+/* A reference written in a file's own doc has the file's File node as its
+ * source. The resolver finds that node with the pipeline's one lookup; this
+ * holds it against the graph the pipeline published: the lookup must name the
+ * File node of exactly that file. (No language of this suite has file-level
+ * docs; the language legs test the references themselves.) */
+TEST(doc_mentions_file_node_lookup) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dm_fn_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    dm_write_resolver_fixture(tmp);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/res.db", tmp);
+    char *project = NULL;
+    ASSERT_EQ(dm_index(tmp, db, &project), 0);
+    ASSERT_NOT_NULL(project);
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, tmp);
+    ASSERT_NOT_NULL(gb);
+    ASSERT_EQ(cbm_gbuf_load_from_db(gb, db, project), 0);
+    const char *paths[] = {"src/Lib/Widgets.cs", "src/Other/tests/Half.cs", "src/Lib/Lib.csproj"};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        const cbm_gbuf_node_t *n = cbm_pipeline_file_node(gb, project, paths[i]);
+        ASSERT_NOT_NULL(n);
+        ASSERT_STR_EQ(n->label, "File");
+        ASSERT_STR_EQ(n->file_path, paths[i]);
+    }
+    ASSERT_NULL(cbm_pipeline_file_node(gb, project, "src/Lib/NoSuchFile.cs"));
+    cbm_gbuf_free(gb);
+    free(project);
+    dm_unlink_db(db);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* ── publication: index_status, delete_project, older databases ──── */
 
 /* The checks of doc_mentions_index_status_and_delete; the caller owns the
@@ -1642,6 +1675,7 @@ SUITE(doc_mentions) {
     RUN_TEST(doc_mentions_resolver_arity_and_members);
     RUN_TEST(doc_mentions_resolver_parse_errors);
     RUN_TEST(doc_mentions_ship_gate);
+    RUN_TEST(doc_mentions_file_node_lookup);
     RUN_TEST(doc_mentions_index_status_and_delete);
     RUN_TEST(doc_mentions_scope_delta_rules);
     RUN_TEST(doc_mentions_incremental_equals_full);

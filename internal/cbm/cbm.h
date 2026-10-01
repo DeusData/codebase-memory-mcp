@@ -518,16 +518,18 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
-/* One reference found in a definition's complete doc comment (doclink.h has
- * the syntax table and the per-language parsers). Resolution happens later,
- * per file, in the pipeline (src/pipeline/doc_links.c). */
+/* One reference found in a definition's complete doc comment, or in the file's
+ * own doc (doclink.h has the syntax table and the per-language parsers).
+ * Resolution happens later, per file, in the pipeline
+ * (src/pipeline/doc_links.c). */
 typedef struct {
-    const char *source_qn; // QN of the documented definition (the edge source)
+    const char *source_qn; // QN of the documented definition (the edge source);
+                           // for a file-level reference the file's module QN
     const char *raw;       // the reference as written, markup entities decoded
     uint32_t line;         // 1-based source line of the reference
     uint32_t def_line;     // 1-based start line of the documented definition
     uint16_t syntax;       // CBMDocLinkSyntax (doclink.h)
-    uint16_t flags;        // reserved, 0
+    uint16_t flags;        // CBM_DOCLINK_FLAG_* (doclink.h); set by the driver
 } CBMDocLink;
 
 typedef struct {
