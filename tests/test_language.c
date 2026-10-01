@@ -878,6 +878,14 @@ TEST(lang_d_source_stays_dlang) {
     ASSERT_EQ(disambiguate_d_content("/+ dub.sdl:\n    name \"hello\"\n+/\nvoid main() {}\n"),
               CBM_LANG_DLANG);
     ASSERT_EQ(disambiguate_d_content("enum E : ubyte {\n    a,\n}\n"), CBM_LANG_DLANG);
+    /* A float UDA ("@ FloatLiteral") has a '.' before its colon, alone or glued
+     * to a keyword. */
+    ASSERT_EQ(disambiguate_d_content("@1.0:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("nothrow@1.0:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    /* A comment between tokens puts a '/' before the colon. */
+    ASSERT_EQ(disambiguate_d_content("public/**/:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("public/+ +/:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("public//note: x\nvoid f() {}\n"), CBM_LANG_DLANG);
     /* Default on doubt: empty or unreadable. */
     ASSERT_EQ(disambiguate_d_content(""), CBM_LANG_DLANG);
     ASSERT_EQ(cbm_disambiguate_d("/tmp/nonexistent_file_12345.d"), CBM_LANG_DLANG);

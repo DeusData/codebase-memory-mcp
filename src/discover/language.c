@@ -1342,7 +1342,9 @@ static bool is_rule_colon(const char *p, bool whole_file) {
  * look like paths (contain '/', '\' or '.'); a backslash-escaped space stays
  * inside its target. D source fails this: "public:", "@safe:", "extern(C):"
  * and "import a.b : c" all have a non-path word or D punctuation before the
- * colon. */
+ * colon. An attribute ('@', as in "@1.0:") or a comment between tokens
+ * ("public/+ +/:") is D even with a '.' or '/' before the colon, so a target
+ * holding either is never dep-info. */
 static bool is_dep_rule_line(const char *p, bool whole_file) {
     bool in_target = false;
     bool path_like = false;
@@ -1359,7 +1361,10 @@ static bool is_dep_rule_line(const char *p, bool whole_file) {
             path_like = false;
             continue;
         }
-        if (strchr("(){};=\"',", *p)) {
+        if (strchr("(){};=\"',@", *p)) {
+            return false;
+        }
+        if (*p == '/' && (p[SKIP_ONE] == '*' || p[SKIP_ONE] == '+' || p[SKIP_ONE] == '/')) {
             return false;
         }
         in_target = true;
