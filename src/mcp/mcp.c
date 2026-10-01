@@ -42,6 +42,10 @@ enum {
     MCP_COMPARE_MAX_SCAN_LIMIT = 10000000,
     MCP_COMPARE_SET_BYTE_BUDGET = 512 * 1024,
     MCP_QUERY_MAX_VISIBLE_ROWS = 99998,
+    /* search_code `context`: lines of surrounding source per hit, the same
+     * ceiling as `source_max_lines`. Clamped at the handler and again where
+     * the window is computed, so the arithmetic never overflows. */
+    MCP_SEARCH_CONTEXT_MAX_LINES = 200,
     /* max_output_tokens is model-neutral sizing guidance, not a tokenizer
      * promise. The actual cross-platform contract is this deterministic UTF-8
      * byte ceiling, applied only at whole semantic-unit boundaries. */
@@ -701,7 +705,7 @@ static const tool_def_t TOOLS[] = {
      "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"path_filter\":{\"type\":\"string\"},"
      "\"mode\":{\"type\":\"string\","
      "\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\"},"
-     "\"context\":{\"type\":\"integer\"},"
+     "\"context\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,\"maximum\":200},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false},"
      "\"debug\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Add scope_ms/scan_ms/enrich_ms phase timings.\"},"
@@ -13328,11 +13332,15 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
             }
         }
     } else if (context_lines > 0 && r->match_count > 0) {
-        int ctx_start = r->match_lines[0] - context_lines;
-        int ctx_end = r->match_lines[r->match_count - SKIP_ONE] + context_lines;
-        if (ctx_start < SKIP_ONE) {
-            ctx_start = SKIP_ONE;
-        }
+        /* Bounded here as well as at the handler: the window must stay
+         * match ± MCP_SEARCH_CONTEXT_MAX_LINES for any caller, and the
+         * arithmetic must not overflow for any value. */
+        int ctx_lines = context_lines > MCP_SEARCH_CONTEXT_MAX_LINES ? MCP_SEARCH_CONTEXT_MAX_LINES
+                                                                     : context_lines;
+        int first_match = r->match_lines[0];
+        int last_match = r->match_lines[r->match_count - SKIP_ONE];
+        int ctx_start = first_match > ctx_lines ? first_match - ctx_lines : SKIP_ONE;
+        int ctx_end = last_match > INT_MAX - ctx_lines ? INT_MAX : last_match + ctx_lines;
         char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
         if (ctx) {
             char *safe_context = sanitize_utf8_lossy(ctx);
@@ -14902,6 +14910,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int result_limit = cbm_mcp_get_int_arg(args, "result_limit", legacy_limit);
     int result_offset = cbm_mcp_get_int_arg(args, "result_offset", 0);
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
+    if (context_lines < 0) {
+        context_lines = 0;
+    } else if (context_lines > MCP_SEARCH_CONTEXT_MAX_LINES) {
+        context_lines = MCP_SEARCH_CONTEXT_MAX_LINES;
+    }
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
     search_metrics_t metrics = {0};

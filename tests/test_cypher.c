@@ -9,6 +9,7 @@
 #include "../src/foundation/compat_thread.h"
 #include <cypher/cypher.h>
 #include <store/store.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -4862,6 +4863,28 @@ TEST(cypher_exec_deadline_allows_normal_query_issue601) {
     PASS();
 }
 
+/* The caller-supplied output-row limit sizes the initial binding array; a
+ * value above the engine ceiling is clamped to it before that happens, and a
+ * value inside the ceiling still bounds the row count. */
+TEST(cypher_exec_max_rows_above_ceiling_is_clamped) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function)", "test", INT_MAX, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function)", "test", 2, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -5089,4 +5112,5 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);
     RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
     RUN_TEST(cypher_single_hop_seeds_from_selective_far_node);
+    RUN_TEST(cypher_exec_max_rows_above_ceiling_is_clamped);
 }

@@ -5138,7 +5138,11 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 
     /* Build initial bindings with early WHERE */
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
-    binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
+    binding_t *bindings = malloc(((size_t)bind_cap + SKIP_ONE) * sizeof(binding_t));
+    if (!bindings) {
+        cbm_store_free_nodes(scanned, scan_count);
+        return CBM_NOT_FOUND; /* initial binding array refused */
+    }
     int bind_count = 0;
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : CYP_ANON_HEAD_VAR;
 
@@ -5448,7 +5452,9 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     g_cypher_trail_truncated = 0;
     g_cypher_truncated = false;
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
-    if (max_rows <= 0) {
+    /* max_rows sizes the initial binding array: non-positive means the
+     * ceiling, and nothing above the ceiling is ever materialized anyway. */
+    if (max_rows <= 0 || max_rows > CYPHER_RESULT_CEILING) {
         max_rows = CYPHER_RESULT_CEILING;
     }
 
