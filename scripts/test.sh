@@ -10,7 +10,7 @@ cd "$ROOT"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
+Usage: scripts/test.sh [--suites LIST | --tsan | --contracts-only] [--arch ARCH] [VAR=VAL ...]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
@@ -29,6 +29,10 @@ Modes:
   --tsan         ThreadSanitizer leg (data-race gate): builds and runs the
                  widened TSan runner via make test-tsan — the same leg CI's
                  tsan jobs and the compose test-tsan service run.
+  --contracts-only
+                 Only the static contract steps (Step 0*) of the default leg:
+                 no compiler, no build, no suites. PR CI runs this for
+                 docs-only and non-product changes (tiers T0a, T0b).
 
 Options:
   --arch ARCH    Force target arch (arm64 | x86_64), e.g. under Rosetta.
@@ -64,11 +68,13 @@ EOF
 # silently swallowed — agents must know exactly what a run will do.
 SUITES=""
 TSAN=0
+CONTRACTS_ONLY=0
 prev_arg=""
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
         --tsan) :;;
+        --contracts-only) :;;
         --suites) :;; # next arg is the value, handled below
         --suites=*) SUITES="${arg#--suites=}" ;;
         --arch) :;; # next arg is the value, handled below
@@ -96,6 +102,7 @@ done
 for arg in "$@"; do
     case "$arg" in
         --tsan) TSAN=1 ;;
+        --contracts-only) CONTRACTS_ONLY=1 ;;
         arm64|x86_64)
             if [[ "${prev_arg2:-}" == "--arch" ]]; then
                 export CBM_ARCH="$arg"
@@ -119,6 +126,10 @@ case "${prev_arg:-}" in
 esac
 if [ "$TSAN" -eq 1 ] && [ -n "$SUITES" ]; then
     echo "test.sh: --tsan and --suites are separate modes (the TSan leg has its own suite set). Please consult --help." >&2
+    exit 2
+fi
+if [ "$CONTRACTS_ONLY" -eq 1 ] && { [ "$TSAN" -eq 1 ] || [ -n "$SUITES" ]; }; then
+    echo "test.sh: --contracts-only is its own mode (no build, no suites). Please consult --help." >&2
     exit 2
 fi
 prev_arg=""
@@ -152,7 +163,7 @@ for arg in "$@"; do
         CC=*|CXX=*) export "${arg}" ;;
         --arch|--arch=*) ;; # already handled
         arm64|x86_64) ;; # already handled
-        --tsan) ;; # already handled
+        --tsan|--contracts-only) ;; # already handled
         --suites|--suites=*) ;; # already handled (value skipped via prev_arg below)
         BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS+=("$arg") ;;
         SANITIZE=*)
@@ -337,6 +348,25 @@ bash "$ROOT/tests/test_version_metadata_contract.sh"
 # is what every Windows verdict rests on.
 echo "=== Step 0y: VM leg verdict contract ==="
 bash "$ROOT/tests/test_vm_verdict_contract.sh"
+
+# Step 0z: PR CI runs only the lanes scripts/ci/select-lanes.sh selects, so a
+# wrong selection is a silent gate loss. The decision table, and the replay of
+# every September 2026 PR push and real failure against it.
+echo "=== Step 0z: PR lane selector contract ==="
+bash "$ROOT/tests/test_select_lanes.sh"
+echo "=== Step 0z2: lane selector history replay ==="
+bash "$ROOT/scripts/test-impact/replay-selector.sh"
+echo "=== Step 0z3: lane-aware aggregate gates (ci-ok, shard union) ==="
+bash "$ROOT/tests/test_lane_gate_contract.sh"
+echo "=== Step 0z4: lane wiring (PRs select, dry run and release run all) ==="
+bash "$ROOT/tests/test_lane_wiring_contract.sh"
+echo "=== Step 0z5: test-impact shadow prediction contract ==="
+bash "$ROOT/tests/test_test_impact_predict.sh"
+
+if [ "$CONTRACTS_ONLY" -eq 1 ]; then
+    echo "=== test.sh: contracts-only — every contract step passed ==="
+    exit 0
+fi
 
 # Verify compiler supports target arch
 verify_compiler "$CC"

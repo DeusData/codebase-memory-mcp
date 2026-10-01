@@ -1,0 +1,48 @@
+# Lane-selector contract table: changed files -> tier, full, lanes.
+# Driven by tests/test_select_lanes.sh against scripts/ci/select-lanes.sh.
+# Columns (TAB-separated): name, files (space-separated; "-" = empty list),
+# tier, full, lanes (space-separated, any order; "FULL" = every PR lane,
+# "FULL -a -b" = every PR lane except a and b).
+docs-only	README.md docs/BENCHMARK.md	T0a-docs	false	contracts security-static
+issue-template-is-docs	.github/ISSUE_TEMPLATE/bug.yml	T0a-docs	false	contracts security-static
+local-infra	test-infrastructure/run.sh	T0b-nonproduct	false	contracts lint lint-mem security-static
+lint-config	scripts/memory-core-baseline.txt	T0b-nonproduct	false	contracts lint lint-mem security-static
+graph-ui-adds-guards	graph-ui/src/App.tsx	T0b-nonproduct	false	contracts lint lint-mem security-static smoke-ubuntu windows-guards
+memwaste-tools-add-memwaste	scripts/memwaste.sh	T0b-nonproduct	false	contracts lint lint-mem memwaste security-static
+non-gating-script-runs-contracts-leg	scripts/benchmark-index.sh	T0b-nonproduct	false	contracts lint lint-mem security-static shard-completeness unix-x86
+test-impact-tooling	scripts/test-impact/replay-selector.sh	T0b-nonproduct	false	contracts lint lint-mem security-static shard-completeness unix-x86
+tests-only	tests/test_store.c	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+test-fixture	tests/fixtures/cpp_include/a.h	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+contract-test	tests/test_version_metadata_contract.sh	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+fuzz-harness	tests/fuzz/fuzz_cypher.c	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+docs-plus-tests	README.md tests/test_store.c	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+lsp-language	internal/cbm/lsp/go_lsp.c	T2-extract	false	codeql-gate lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows
+lsp-core	internal/cbm/lsp/type_registry.c	T2-extract	false	codeql-gate lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows
+grammar-is-extract-not-full	internal/cbm/vendored/grammars/go/parser.c	T2-extract	false	codeql-gate lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows
+extraction	internal/cbm/extract_calls.c	T2-extract	false	codeql-gate lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows
+pipeline	src/pipeline/pass_calls.c	T3-mid	false	codeql-gate lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows
+mcp-plus-tests	src/mcp/mcp.c tests/test_mcp.c	T3-mid	false	codeql-gate lint lint-mem security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows
+mid-plus-memwaste-tools	src/store/store.c scripts/memwaste-report.py	T3-mid	false	codeql-gate lint lint-mem memwaste security-static shard-completeness smoke-ubuntu tsan-x86 unix-macos14 unix-x86 windows
+daemon	src/daemon/application.c	T4-platform	false	FULL -msan -diag -memwaste
+main-c-is-cli	src/main.c	T4-platform	false	FULL -msan -diag -memwaste
+foundation-non-memory	src/foundation/log.c	T4-platform	false	FULL -msan -diag -memwaste
+windows-guard-tests	tests/windows/guard.ps1	T4-platform	false	FULL -msan -diag -memwaste
+smoke-harness	scripts/smoke-local.sh	T4-platform	false	FULL -msan -diag -memwaste
+package-wrappers	pkg/npm/package.json	T4-platform	false	FULL -msan -diag -memwaste
+memory-core	src/foundation/mem_core.c	T5-core	true	FULL
+gate-script	scripts/ci/require-all-green.sh	T5-core	true	FULL
+the-selector-itself	scripts/ci/select-lanes.sh	T5-core	true	FULL
+build-script	scripts/build.sh	T5-core	true	FULL
+makefile-always-full	Makefile.cbm	T5-core	true	FULL
+vendored-code	vendored/sqlite3/sqlite3.c	T5-core	true	FULL
+gate-workflow	.github/workflows/codeql.yml	T5-core	true	FULL
+unmatched-top-level-path	weird/new.file	T5-core	true	FULL
+unmatched-src-directory	src/newthing/x.c	T5-core	true	FULL
+unmatched-script	scripts/README.md	T5-core	true	FULL
+non-gate-workflow-forces-full	.github/workflows/stale.yml	T0b-nonproduct	true	FULL
+harness-main-forces-full	tests/test_main.c	T1-tests	true	FULL
+harness-framework-forces-full	tests/test_framework.h	T1-tests	true	FULL
+harness-driver-forces-full	scripts/test.sh	T5-core	true	FULL
+harness-scheduler-forces-full	scripts/run-test-wave.py	T5-core	true	FULL
+lower-tier-plus-trigger-is-full	docs/x.md src/pipeline/a.c tests/test_main.c	T3-mid	true	FULL
+empty-list-fails-safe	-	T0a-docs	true	FULL

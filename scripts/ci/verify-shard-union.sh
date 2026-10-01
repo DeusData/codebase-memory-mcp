@@ -10,22 +10,52 @@
 # shard slices equals that list — a rename/re-shard can never silently drop a
 # suite (gate-quality loss) without failing here.
 #
-# Usage: scripts/ci/verify-shard-union.sh <manifests-dir>
+# No manifests at all is a failure — unless the PR's lane selection (--lanes,
+# the JSON list from scripts/ci/select-lanes.sh) holds no test leg, in which
+# case no leg ran by design. Without --lanes (or with "all": dry run,
+# release) every leg is expected, exactly as before lane selection.
+#
+# Usage: scripts/ci/verify-shard-union.sh <manifests-dir> [--lanes <json-list>|all]
 set -eu
 
 case "${1:-}" in
 -h | --help)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac
 
 MANIFEST_DIR="${1:?usage: verify-shard-union.sh <manifests-dir> (see --help)}"
+LANES=all
+if [ "${2:-}" = "--lanes" ]; then
+    LANES="${3:-}"
+elif [ -n "${2:-}" ]; then
+    echo "verify-shard-union.sh: unknown argument '$2'. Please consult --help." >&2
+    exit 2
+fi
+case "$LANES" in
+all | \[*\]) ;;
+*)
+    echo "verify-shard-union.sh: --lanes must be 'all' or a JSON list. Please consult --help." >&2
+    exit 2
+    ;;
+esac
 
-files=$(find "$MANIFEST_DIR" -name shard-manifest.txt | sort)
+files=""
+if [ -d "$MANIFEST_DIR" ]; then
+    files=$(find "$MANIFEST_DIR" -name shard-manifest.txt | sort)
+fi
 if [ -z "$files" ]; then
-    echo "FAIL: no shard manifests were uploaded" >&2
-    exit 1
+    # The test legs are the sharded ones: unix-* and windows (matched with its
+    # quotes, so the windows-guards lane never reads as the windows leg).
+    case "$LANES" in
+    all | *\"unix-* | *\"windows\"*)
+        echo "FAIL: no shard manifests were uploaded" >&2
+        exit 1
+        ;;
+    esac
+    echo "OK: no test leg was selected ($LANES) — no manifests expected"
+    exit 0
 fi
 rc=0
 for leg in $(grep -h '^leg=' $files | sort -u | sed 's/^leg=//'); do

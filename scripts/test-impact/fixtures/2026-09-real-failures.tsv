@@ -1,0 +1,26 @@
+# The 22 real (non-flake, non-infra) job failures of the September 2026 PR
+# pushes, from the lane analysis ground truth: which lane caught each. The
+# replay asserts the selector selects that lane for that push.
+# Columns (TAB): run_id, attempt, pr, head_sha, lane, classification.
+34263688699	1	2115	013e1f7ec7d4b981a1cd28bf35d5767c195f8447	unix-arm64	real: cli suite hang on slow runners (arm64, then intel)
+34288397854	1	2115	92cb3b9a4bebbc79bd283e447104669ca068ea64	unix-arm64	real: cli suite hang on slow runners (arm64, then intel)
+34649406520	1	2115	78a6d19f1eaaa73054639ab0f14c372c53cd1bb3	unix-arm64	real: cli suite hang on slow runners (arm64, then intel)
+34649406520	2	2115	78a6d19f1eaaa73054639ab0f14c372c53cd1bb3	unix-arm64	real: cli suite hang on slow runners (arm64, then intel)
+34676336284	1	2185	eb5e34cfc141454e849daf413f648e73f74c455a	codeql-gate	real: codeql-action bump broke CodeQL (still caught by requiring CodeQL/analyze)
+34676429093	1	2187	cea35fcc0520a0ba95139bd0210052f09b9cfa20	codeql-gate	real: codeql-action bump broke CodeQL (still caught by requiring CodeQL/analyze)
+34696991657	1	2115	9a460b389ce3002ac164605c3627bb86aa3b9be3	unix-macos-intel	real: cli suite hang on slow runners (arm64, then intel)
+34805101784	1	2202	7b77fd4834afe355cc4c7326ac3a55f0502f7264	lsan-macos	real: macOS-only LSan leaks (memory-core)
+34805101784	1	2202	7b77fd4834afe355cc4c7326ac3a55f0502f7264	msan	real?: MSan stack overflow (memory-core, branch-specific)
+34805101784	1	2202	7b77fd4834afe355cc4c7326ac3a55f0502f7264	tsan-arm	real?: backpressure nap-cycle bound (memory-core)
+34805101784	1	2202	7b77fd4834afe355cc4c7326ac3a55f0502f7264	tsan-mac	real?: backpressure nap-cycle bound (memory-core)
+34876200704	1	2202	9724d903046626df0640ced218259cb58070e4e8	lsan-macos	real: macOS-only LSan leaks (memory-core)
+34876200704	1	2202	9724d903046626df0640ced218259cb58070e4e8	msan	real?: MSan stack overflow (memory-core, branch-specific)
+34876200704	1	2202	9724d903046626df0640ced218259cb58070e4e8	tsan-arm	real?: backpressure nap-cycle bound (memory-core)
+35448941856	1	2233	9db5217bdbb779212c5d066ed1a84f7ca6fc0282	tsan-arm	real: TSan data race system_info.c:274
+35448941856	1	2233	9db5217bdbb779212c5d066ed1a84f7ca6fc0282	tsan-mac	real: TSan data race system_info.c:274
+35448941856	1	2233	9db5217bdbb779212c5d066ed1a84f7ca6fc0282	tsan-x86	real: TSan data race system_info.c:274
+35483768695	1	2236	d2dd3b347bbdcc695f911e80b1b7f7a32d790e5a	pkg-wrappers	real?: wrapper publication crash-gate (cache-management)
+35483768695	1	2236	d2dd3b347bbdcc695f911e80b1b7f7a32d790e5a	smoke-mac	real: cache CLI broken on macOS/Windows
+35483768695	1	2236	d2dd3b347bbdcc695f911e80b1b7f7a32d790e5a	smoke-win	real: cache CLI broken on macOS/Windows
+35493947102	1	2236	2caafc0c41bd083092afeb692824e718a8e1e007	smoke-mac	real: cache CLI broken on macOS/Windows
+36242675954	1	2363	363575af920b05f911fc76ca964dcfa7ef1c62bb	codeql-gate	real: codeql-action bump broke CodeQL (still caught by requiring CodeQL/analyze)
