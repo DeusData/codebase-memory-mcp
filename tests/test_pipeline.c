@@ -1372,6 +1372,57 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
     PASS();
 }
 
+/* #2000, end to end: functions declared after an inline-HTML block reach the
+ * store with their CALLS edges, in the same file and across files. */
+TEST(pipeline_php_inline_html_calls_resolve_issue2000) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    static const struct {
+        const char *name;
+        const char *body;
+    } files[] = {
+        {"inline_html.php", "<?php\n"
+                            "function gamma() { return 2; }\n"
+                            "?>\n"
+                            "<div class=\"box\">\n"
+                            "  <p>plain markup after the closing tag</p>\n"
+                            "</div>\n"
+                            "<?php\n"
+                            "function delta() { return gamma(); }\n"},
+        {"price_helpers.php",
+         "<!-- shared helpers -->\n"
+         "<?php\n"
+         "function formatPrice($cents) { return number_format($cents / 100, 2); }\n"},
+        {"card_view.php", "<?php $title = 'Cards'; ?>\n"
+                          "<h1><?= $title ?></h1>\n"
+                          "<?php\n"
+                          "function renderCard($item) { return formatPrice($item['cents']); }\n"},
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        write_temp_file(g_tmpdir, files[i].name, files[i].body);
+    }
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test_php_inline_html.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT(cross_file_call_exists(s, project, "delta", "gamma"));
+    ASSERT(cross_file_call_exists(s, project, "renderCard", "formatPrice"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Terraform reference resolution, end to end.
  *
  * An HCL block names itself with its labels appended -- find_hcl_block_name
@@ -16323,6 +16374,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
+    RUN_TEST(pipeline_php_inline_html_calls_resolve_issue2000);
     RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
