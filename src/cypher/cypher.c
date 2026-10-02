@@ -2766,6 +2766,82 @@ static bool eval_where(const cbm_where_clause_t *w, binding_t *b) {
     return is_and;
 }
 
+/* Early WHERE runs while only the scanned node is bound. A condition on a
+ * variable that is not bound yet is unknown, not true: treating it as true
+ * made `b.name = 'x' AND NOT a.y = 'z'` (seeded from b) evaluate NOT(true)
+ * and discard every row, and an unbound label test pruned as false.
+ * Three-valued evaluation prunes only rows the bound variables already
+ * prove false; the late WHERE decides with every variable bound. */
+enum { CYP_TRI_FALSE = 0, CYP_TRI_TRUE = 1, CYP_TRI_UNKNOWN = 2 };
+
+static bool cypher_var_bound(binding_t *b, const char *var) {
+    return !var || binding_get_edge(b, var) || binding_get(b, var);
+}
+
+static bool cypher_condition_bound(const cbm_condition_t *c, binding_t *b) {
+    if (c->func) {
+        for (int i = 0; i < c->arg_count; i++) {
+            if (!cypher_var_bound(b, c->args[i].variable)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return cypher_var_bound(b, c->variable);
+}
+
+static int eval_expr_tri(const cbm_expr_t *e, binding_t *b) { // NOLINT(misc-no-recursion)
+    if (!e) {
+        return CYP_TRI_TRUE;
+    }
+    switch (e->type) {
+    case EXPR_CONDITION:
+        if (!cypher_condition_bound(&e->cond, b)) {
+            return CYP_TRI_UNKNOWN;
+        }
+        return eval_condition(&e->cond, b) ? CYP_TRI_TRUE : CYP_TRI_FALSE;
+    case EXPR_AND: {
+        int l = eval_expr_tri(e->left, b);
+        int r = eval_expr_tri(e->right, b);
+        if (l == CYP_TRI_FALSE || r == CYP_TRI_FALSE) {
+            return CYP_TRI_FALSE;
+        }
+        return l == CYP_TRI_TRUE && r == CYP_TRI_TRUE ? CYP_TRI_TRUE : CYP_TRI_UNKNOWN;
+    }
+    case EXPR_OR: {
+        int l = eval_expr_tri(e->left, b);
+        int r = eval_expr_tri(e->right, b);
+        if (l == CYP_TRI_TRUE || r == CYP_TRI_TRUE) {
+            return CYP_TRI_TRUE;
+        }
+        return l == CYP_TRI_FALSE && r == CYP_TRI_FALSE ? CYP_TRI_FALSE : CYP_TRI_UNKNOWN;
+    }
+    case EXPR_NOT: {
+        int c = eval_expr_tri(e->left, b);
+        if (c == CYP_TRI_UNKNOWN) {
+            return CYP_TRI_UNKNOWN;
+        }
+        return c == CYP_TRI_TRUE ? CYP_TRI_FALSE : CYP_TRI_TRUE;
+    }
+    case EXPR_XOR: {
+        int l = eval_expr_tri(e->left, b);
+        int r = eval_expr_tri(e->right, b);
+        if (l == CYP_TRI_UNKNOWN || r == CYP_TRI_UNKNOWN) {
+            return CYP_TRI_UNKNOWN;
+        }
+        return l != r ? CYP_TRI_TRUE : CYP_TRI_FALSE;
+    }
+    }
+    return CYP_TRI_TRUE;
+}
+
+static bool eval_where_early(const cbm_where_clause_t *w, binding_t *b) {
+    if (w && w->root) {
+        return eval_expr_tri(w->root, b) != CYP_TRI_FALSE;
+    }
+    return eval_where(w, b);
+}
+
 /* Check if a string value looks like a regex pattern. */
 static bool looks_like_regex(const char *s) {
     if (!s) {
@@ -5149,7 +5225,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         binding_t b = {0};
         b.store = store;
         binding_set(&b, var_name, &scanned[i]);
-        bool pass = !q->where || eval_where(q->where, &b);
+        bool pass = !q->where || eval_where_early(q->where, &b);
         if (pass) {
             bindings[bind_count++] = b;
         } else {

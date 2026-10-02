@@ -3544,6 +3544,47 @@ TEST(cypher_exec_where_not_prefix) {
     PASS();
 }
 
+/* An equality on the far node seeds the scan from that node, so the early
+ * WHERE runs with the near node still unbound. A condition on an unbound
+ * variable is unknown, not true or false: NOT(unknown) and an unbound label
+ * test used to discard every row before the pattern was expanded. */
+static int cypher_row_count(cbm_store_t *s, const char *query) {
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    int rows = rc == 0 ? r.row_count : -1;
+    cbm_cypher_result_free(&r);
+    return rows;
+}
+
+TEST(cypher_exec_where_and_not_on_unbound_seed_side) {
+    cbm_store_t *s = setup_cypher_store();
+    ASSERT_EQ(cypher_row_count(s, "MATCH (a)-[r:CALLS]->(b) WHERE b.name = \"LogError\" AND NOT "
+                                  "(a.file_path CONTAINS \"validate\") RETURN a.name"),
+              1);
+    ASSERT_EQ(cypher_row_count(s, "MATCH (a)-[r:CALLS]->(b) WHERE b.name = \"LogError\" AND NOT "
+                                  "a.name = \"x\" RETURN a.name"),
+              1);
+    ASSERT_EQ(cypher_row_count(s, "MATCH (a)-[r:CALLS]->(b) WHERE NOT (a.name = \"x\") AND "
+                                  "b.name = \"LogError\" RETURN a.name"),
+              1);
+    ASSERT_EQ(cypher_row_count(s, "MATCH (a)-[r:CALLS]->(b) WHERE b.name = \"SubmitOrder\" AND "
+                                  "NOT (a.name = \"HandleOrder\" AND a.file_path CONTAINS "
+                                  "\"handler\") RETURN a.name"),
+              1);
+    ASSERT_EQ(cypher_row_count(s, "MATCH (a)-[r:CALLS]->(b) WHERE (b.name = \"LogError\" AND NOT "
+                                  "a.name = \"x\") OR b.name = \"SubmitOrder\" RETURN a.name"),
+              2);
+    ASSERT_EQ(cypher_row_count(s, "MATCH (a)-[r:CALLS]->(b) WHERE b.name = \"LogError\" AND "
+                                  "a:Function RETURN a.name"),
+              1);
+    /* Excluding the only caller still yields nothing. */
+    ASSERT_EQ(cypher_row_count(s, "MATCH (a)-[r:CALLS]->(b) WHERE b.name = \"LogError\" AND NOT "
+                                  "a.name = \"HandleOrder\" RETURN a.name"),
+              0);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_parse_expr_tree_and_or) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -5025,6 +5066,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_complex_bool);
     RUN_TEST(cypher_exec_where_xor);
     RUN_TEST(cypher_exec_where_not_prefix);
+    RUN_TEST(cypher_exec_where_and_not_on_unbound_seed_side);
     RUN_TEST(cypher_parse_expr_tree_and_or);
     RUN_TEST(cypher_parse_expr_tree_nested);
     /* Phase 3: Unsupported keyword errors */
