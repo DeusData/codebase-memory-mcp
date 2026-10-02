@@ -187,6 +187,23 @@ jobs:
           # shard-completeness job still gates the cross-shard union.
           if-no-files-found: warn
 
+      # The job log carries a red suite's SUMMARY; these are the complete logs
+      # behind it, so a failure can be read instead of re-run. The harness
+      # copies the log of every suite that did not end green, plus results.txt,
+      # into test-logs/failed/ (scripts/suite-failure-report.sh) — typically a
+      # few kilobytes for a red suite, not the ~25 MB of a whole run's logs.
+      # Runs only on a failed job. warn, not error: a job that failed OUTSIDE
+      # the suite wave (contract step, build, prod-binary guards) has no such
+      # directory, and a second error would only bury the first.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-${{ matrix.os }}-${{ matrix.cc }}-${{ strategy.job-index }}
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Compiler cache (save)
         if: always() && (matrix.shard == null || startsWith(matrix.shard, '1/'))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -282,6 +299,17 @@ jobs:
           scripts/test.sh CC=clang-21 CXX=clang++-21 \
             SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"
 
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-diag
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Compiler cache (save)
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -363,6 +391,17 @@ jobs:
         run: |
           LLVM_PREFIX="$(brew --prefix llvm@22)"
           scripts/test.sh CC="$LLVM_PREFIX/bin/clang" CXX="$LLVM_PREFIX/bin/clang++"
+
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-lsan-macos
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Compiler cache (save)
         if: always()
@@ -529,6 +568,17 @@ jobs:
           # (contract step / build) — that failure is already the job's red;
           # warn instead of stacking a second error on top of it. The
           # shard-completeness job still gates the cross-shard union.
+          if-no-files-found: warn
+
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-${{ matrix.os }}-${{ matrix.msystem }}-${{ strategy.job-index }}
+          path: build/c/test-logs/failed/
+          retention-days: 7
           if-no-files-found: warn
 
       # Shard 1 (or the unsharded job) saves the compiler cache; every shard
