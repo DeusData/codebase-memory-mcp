@@ -1374,6 +1374,126 @@ TEST(lrp_ts_barrel_reexport_member_calls) {
     PASS();
 }
 
+/* CQRS handlers name their event/command class only as a decorator argument,
+ * a method parameter type and an `ofType(X)` argument. Each is an imported
+ * class reference. The usage fallback vetoed every import-bound reference to
+ * a Class (treated as callable), so "who handles this event" had no edge. */
+TEST(lrp_ts_usage_imported_class_in_decorator_param_and_call_arg) {
+    static const LRP_File f[] = {
+        {"apps/api/tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{"
+                                   "\"@acme/shipping/*\":[\"libs/shipping/src/*\"],"
+                                   "\"@acme/shared/*\":[\"libs/shared/src/*\"]}}}\n"},
+        {"apps/api/libs/shipping/src/domain/event/shipment-dispatched.event.ts",
+         "export class ShipmentDispatchedEvent {\n"
+         "  constructor(public readonly shipmentId: string) {}\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/domain/event/shipment-returned.event.ts",
+         "export class ShipmentReturnedEvent {\n"
+         "  constructor(public readonly shipmentId: string) {}\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/application/command/dispatch-shipment.command.ts",
+         "export class DispatchShipmentCommand {\n"
+         "  constructor(public readonly shipmentId: string) {}\n"
+         "}\n"},
+        {"apps/api/libs/shared/src/traced-events-handler.decorator.ts",
+         "export const TracedEventsHandler = (...events: unknown[]): ClassDecorator => {\n"
+         "  return (target) => {\n"
+         "    void events;\n"
+         "    void target;\n"
+         "  };\n"
+         "};\n"},
+        {"apps/api/libs/invoice/src/application/event/handler/"
+         "bill-on-shipment-dispatched.handler.ts",
+         "import { IEventHandler } from \"@nestjs/cqrs\";\n"
+         "import { ShipmentDispatchedEvent } from "
+         "\"@acme/shipping/domain/event/shipment-dispatched.event\";\n"
+         "import { TracedEventsHandler } from \"@acme/shared/traced-events-handler.decorator\";\n"
+         "@TracedEventsHandler(ShipmentDispatchedEvent)\n"
+         "export class BillOnShipmentDispatchedHandler implements "
+         "IEventHandler<ShipmentDispatchedEvent> {\n"
+         "  async handle(event: ShipmentDispatchedEvent): Promise<void> {\n"
+         "    void event.shipmentId;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/invoice/src/application/event/handler/"
+         "notify-on-shipment-dispatched.handler.ts",
+         "import { EventsHandler, IEventHandler } from \"@nestjs/cqrs\";\n"
+         "import { ShipmentDispatchedEvent } from "
+         "\"@acme/shipping/domain/event/shipment-dispatched.event\";\n"
+         "import { ShipmentReturnedEvent } from "
+         "\"@acme/shipping/domain/event/shipment-returned.event\";\n"
+         "@EventsHandler(ShipmentDispatchedEvent, ShipmentReturnedEvent)\n"
+         "export class NotifyOnShipmentDispatchedHandler\n"
+         "  implements IEventHandler<ShipmentDispatchedEvent | ShipmentReturnedEvent>\n"
+         "{\n"
+         "  handle(event: ShipmentDispatchedEvent | ShipmentReturnedEvent): void {\n"
+         "    void event;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/application/command/handler/dispatch-shipment.handler.ts",
+         "import { CommandHandler, ICommandHandler } from \"@nestjs/cqrs\";\n"
+         "import { DispatchShipmentCommand } from "
+         "\"@acme/shipping/application/command/dispatch-shipment.command\";\n"
+         "@CommandHandler(DispatchShipmentCommand)\n"
+         "export class DispatchShipmentHandler implements "
+         "ICommandHandler<DispatchShipmentCommand> {\n"
+         "  async execute(command: DispatchShipmentCommand): Promise<void> {\n"
+         "    void command.shipmentId;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/application/saga/shipment.saga.ts",
+         "import { ICommand, ofType, Saga } from \"@nestjs/cqrs\";\n"
+         "import { Observable, map } from \"rxjs\";\n"
+         "import { ShipmentReturnedEvent } from "
+         "\"@acme/shipping/domain/event/shipment-returned.event\";\n"
+         "import { DispatchShipmentCommand } from "
+         "\"@acme/shipping/application/command/dispatch-shipment.command\";\n"
+         "export class ShipmentSaga {\n"
+         "  @Saga()\n"
+         "  redispatch = (events$: Observable<unknown>): Observable<ICommand> =>\n"
+         "    events$.pipe(\n"
+         "      ofType(ShipmentReturnedEvent),\n"
+         "      map((event) => new DispatchShipmentCommand(event.shipmentId)),\n"
+         "    );\n"
+         "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int deco = lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE",
+                                           "bill-on-shipment-dispatched.handler",
+                                           "ShipmentDispatchedEvent");
+    int g1a = lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE",
+                                          "BillOnShipmentDispatchedHandler.handle",
+                                          "ShipmentDispatchedEvent");
+    int g1b_dispatched = lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE",
+                                                     "NotifyOnShipmentDispatchedHandler.handle",
+                                                     "ShipmentDispatchedEvent");
+    int g1b_returned = lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE",
+                                                   "NotifyOnShipmentDispatchedHandler.handle",
+                                                   "ShipmentReturnedEvent");
+    int g1c = lrp_exact_edge_by_qn_suffix(
+        store, lp.project, "USAGE", "DispatchShipmentHandler.execute", "DispatchShipmentCommand");
+    int g1d = lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE", "ShipmentSaga.redispatch",
+                                          "ShipmentReturnedEvent");
+    int negative = lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE",
+                                               "BillOnShipmentDispatchedHandler.handle",
+                                               "ShipmentReturnedEvent");
+    printf("  [ts/usage-class] deco=%d g1a=%d g1b=%d/%d g1c=%d g1d=%d negative=%d\n", deco, g1a,
+           g1b_dispatched, g1b_returned, g1c, g1d, negative);
+    lrp_cleanup(&lp, store);
+
+    ASSERT_GTE(deco, 1);
+    ASSERT_GTE(g1a, 1);
+    ASSERT_GTE(g1b_dispatched, 1);
+    ASSERT_GTE(g1b_returned, 1);
+    ASSERT_GTE(g1c, 1);
+    ASSERT_GTE(g1d, 1);
+    ASSERT_EQ(negative, 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -2022,6 +2142,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_s7_generic);
     RUN_TEST(lrp_ts_s8_field_type_hint);
     RUN_TEST(lrp_ts_barrel_reexport_member_calls);
+    RUN_TEST(lrp_ts_usage_imported_class_in_decorator_param_and_call_arg);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);
