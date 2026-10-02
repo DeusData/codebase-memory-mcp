@@ -154,6 +154,22 @@ TEST(path_alias_strips_ext) {
     PASS();
 }
 
+/* Same extension set as the relative resolver (#1682); dotted basenames
+ * without a module extension stay intact. */
+TEST(path_alias_strips_module_ext_keeps_dotted_basename) {
+    cbm_path_alias_map_t *m = make_map(NULL, 1, "@/*", "src/*");
+    char *r = cbm_path_alias_resolve(m, "@/lib/util.mjs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/lib/util");
+    free(r);
+    r = cbm_path_alias_resolve(m, "@/cats/cat.service");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r, "src/cats/cat.service");
+    free(r);
+    free_map(m);
+    PASS();
+}
+
 /* ── baseUrl fallback for non-relative, non-package imports ────── */
 
 TEST(path_alias_baseurl_fallback) {
@@ -414,6 +430,7 @@ void suite_path_alias(void) {
     RUN_TEST(path_alias_specificity_longest_first);
     RUN_TEST(path_alias_exact_match);
     RUN_TEST(path_alias_strips_ext);
+    RUN_TEST(path_alias_strips_module_ext_keeps_dotted_basename);
     RUN_TEST(path_alias_baseurl_fallback);
     RUN_TEST(path_alias_null_safety);
     RUN_TEST(path_alias_find_for_file_nearest_ancestor);
