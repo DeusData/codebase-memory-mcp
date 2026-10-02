@@ -274,6 +274,24 @@ TEST(cypher_parse_accepts_single_with_clause) {
     PASS();
 }
 
+TEST(cypher_parse_rejects_partial_patterns) {
+    const char *queries[] = {
+        "MATCH p = (a:Class)-[:INHERITS*1..3]->(b:Class) RETURN a.name, length(p)",
+        "MATCH (a)-[:CALLS]->(b) MATCH (c)-[:CALLS*]-> RETURN a.name",
+        "MATCH (a)-[:CALLS|]->(b)",
+    };
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        cbm_query_t *q = NULL;
+        char *err = NULL;
+        int rc = cbm_cypher_parse(queries[i], &q, &err);
+        ASSERT_NEQ(rc, 0);
+        ASSERT_NULL(q);
+        ASSERT_NOT_NULL(err);
+        free(err);
+    }
+    PASS();
+}
+
 TEST(cypher_parse_relationship_outbound) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -4881,6 +4899,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_rejects_trailing_tokens);
     RUN_TEST(cypher_parse_rejects_second_with_clause);
     RUN_TEST(cypher_parse_accepts_single_with_clause);
+    RUN_TEST(cypher_parse_rejects_partial_patterns);
     RUN_TEST(cypher_parse_relationship_outbound);
     RUN_TEST(cypher_parse_relationship_inbound);
     RUN_TEST(cypher_parse_relationship_any);

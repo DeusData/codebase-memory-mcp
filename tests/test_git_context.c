@@ -346,6 +346,95 @@ TEST(canonical_root_linked_worktree) {
 #endif /* _WIN32 */
 }
 
+/* ── cbm_git_is_linked_worktree ─────────────────────────────────── */
+/* Detection backing the `ignore_worktrees` config gate. The predicate must be
+ * TRUE only for a linked worktree (`git worktree add`) — never for the main
+ * checkout, a plain directory, or a submodule. The submodule case is the one a
+ * naive "is .git a regular file?" check gets wrong: a submodule's .git is also a
+ * gitlink file, and it is separated here by the absence of a `commondir` entry
+ * in the pointed-at gitdir. */
+
+TEST(is_linked_worktree_true_for_linked_worktree) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree test not implemented for Windows");
+#else
+    /* th_mktempdir() returns a static buffer — copy before the second call. */
+    char main_tmp[256];
+    char *raw = th_mktempdir("cbm_wt_main");
+    if (!raw) FAIL("th_mktempdir returned NULL");
+    strncpy(main_tmp, raw, sizeof(main_tmp) - 1);
+    main_tmp[sizeof(main_tmp) - 1] = '\0';
+
+    char wt_tmp[256];
+    raw = th_mktempdir("cbm_wt_linked");
+    if (!raw) FAIL("th_mktempdir returned NULL");
+    strncpy(wt_tmp, raw, sizeof(wt_tmp) - 1);
+    wt_tmp[sizeof(wt_tmp) - 1] = '\0';
+    th_rmtree(wt_tmp); /* git worktree add creates it */
+
+    if (make_git_repo(main_tmp) != 0) {
+        th_rmtree(main_tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (git_run(main_tmp, "branch wt-branch") != 0) {
+        th_rmtree(main_tmp);
+        FAIL("failed to create branch for worktree");
+    }
+    char wt_cmd[1024];
+    snprintf(wt_cmd, sizeof(wt_cmd), "worktree add \"%s\" wt-branch", wt_tmp);
+    if (git_run(main_tmp, wt_cmd) != 0) {
+        th_rmtree(wt_tmp);
+        th_rmtree(main_tmp);
+        SKIP_PLATFORM("git worktree add unavailable (git 2.5+ required)");
+    }
+
+    bool worktree_detected = cbm_git_is_linked_worktree(wt_tmp);
+    /* A subdirectory has no .git of its own. The predicate must still see the
+     * linked worktree above it, or ignore_worktrees misses nested sessions. */
+    char nested[1024];
+    snprintf(nested, sizeof(nested), "%s/nested/deeper", wt_tmp);
+    bool nested_ok = th_mkdir_p(nested) == 0;
+    bool nested_detected = nested_ok && cbm_git_is_linked_worktree(nested);
+    /* The MAIN checkout of the very same repo must NOT be flagged — otherwise
+     * enabling ignore_worktrees would stop indexing ordinary repositories. */
+    bool main_detected = cbm_git_is_linked_worktree(main_tmp);
+    char main_nested[1024];
+    snprintf(main_nested, sizeof(main_nested), "%s/src", main_tmp);
+    bool main_nested_ok = th_mkdir_p(main_nested) == 0;
+    bool main_nested_detected = main_nested_ok && cbm_git_is_linked_worktree(main_nested);
+    /* A worktree nested inside another must not share the parent's anchor. */
+    char inner[1024];
+    snprintf(inner, sizeof(inner), "%s/inner-wt", wt_tmp);
+    char inner_cmd[1200];
+    snprintf(inner_cmd, sizeof(inner_cmd), "worktree add -b inner-branch \"%s\"", inner);
+    bool inner_added = git_run(main_tmp, inner_cmd) == 0;
+    char inner_sub[1200];
+    snprintf(inner_sub, sizeof(inner_sub), "%s/sub", inner);
+    bool inner_sub_ok = inner_added && th_mkdir_p(inner_sub) == 0;
+    bool same_outer = cbm_git_same_linked_worktree(nested, wt_tmp);
+    bool same_inner = inner_sub_ok && cbm_git_same_linked_worktree(inner_sub, inner);
+    bool not_parent = inner_sub_ok && !cbm_git_same_linked_worktree(inner_sub, wt_tmp);
+    bool not_main = !cbm_git_same_linked_worktree(nested, main_tmp);
+
+    git_run(main_tmp, "worktree prune");
+    th_rmtree(main_tmp);
+    th_rmtree(wt_tmp);
+
+    ASSERT(worktree_detected);
+    ASSERT(nested_ok);
+    ASSERT(nested_detected);
+    ASSERT(!main_detected);
+    ASSERT(main_nested_ok);
+    ASSERT(!main_nested_detected);
+    ASSERT(inner_added);
+    ASSERT(same_outer);
+    ASSERT(same_inner);
+    ASSERT(not_parent);
+    ASSERT(not_main);
+    PASS();
+#endif /* _WIN32 */
+}
+
 TEST(git_context_ignores_inherited_repo_env) {
 #ifdef _WIN32
     SKIP_PLATFORM("git-based env-isolation test not supported on Windows CI");
@@ -403,6 +492,68 @@ TEST(git_context_ignores_inherited_repo_env) {
 #endif /* _WIN32 */
 }
 
+TEST(is_linked_worktree_false_for_submodule_and_nongit) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git worktree test not implemented for Windows");
+#else
+    char super_tmp[256];
+    char *raw = th_mktempdir("cbm_wt_super");
+    if (!raw) FAIL("th_mktempdir returned NULL");
+    strncpy(super_tmp, raw, sizeof(super_tmp) - 1);
+    super_tmp[sizeof(super_tmp) - 1] = '\0';
+
+    char child_tmp[256];
+    raw = th_mktempdir("cbm_wt_child");
+    if (!raw) FAIL("th_mktempdir returned NULL");
+    strncpy(child_tmp, raw, sizeof(child_tmp) - 1);
+    child_tmp[sizeof(child_tmp) - 1] = '\0';
+
+    if (make_git_repo(super_tmp) != 0 || make_git_repo(child_tmp) != 0) {
+        th_rmtree(super_tmp);
+        th_rmtree(child_tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    /* A plain directory that is not a git repo at all. */
+    char plain[1024];
+    snprintf(plain, sizeof(plain), "%s/plain", super_tmp);
+    if (th_mkdir_p(plain) != 0) {
+        th_rmtree(super_tmp);
+        th_rmtree(child_tmp);
+        FAIL("failed to create plain dir");
+    }
+    bool plain_detected = cbm_git_is_linked_worktree(plain);
+
+    /* file:// submodules are refused by default since the CVE-2022-39253 fix. */
+    char sub_cmd[1024];
+    snprintf(sub_cmd, sizeof(sub_cmd),
+             "-c protocol.file.allow=always submodule add -q \"%s\" subm", child_tmp);
+    int sub_rc = git_run(super_tmp, sub_cmd);
+
+    char subm[1024];
+    snprintf(subm, sizeof(subm), "%s/subm", super_tmp);
+    bool submodule_detected = sub_rc == 0 && cbm_git_is_linked_worktree(subm);
+    char sub_nested[1024];
+    snprintf(sub_nested, sizeof(sub_nested), "%s/nested", subm);
+    bool sub_nested_made = sub_rc == 0 && th_mkdir_p(sub_nested) == 0;
+    bool sub_nested_detected = sub_nested_made && cbm_git_is_linked_worktree(sub_nested);
+
+    th_rmtree(super_tmp);
+    th_rmtree(child_tmp);
+
+    ASSERT(!plain_detected);
+    if (sub_rc != 0) {
+        SKIP_PLATFORM("git submodule add unavailable in this environment");
+    }
+    /* A submodule gitlink has no commondir, including a subdirectory which
+     * must not walk into the superproject. */
+    ASSERT(!submodule_detected);
+    ASSERT(sub_nested_made);
+    ASSERT(!sub_nested_detected);
+    PASS();
+#endif /* _WIN32 */
+}
+
 TEST(githistory_ignores_inherited_repo_env) {
 #ifdef _WIN32
     SKIP_PLATFORM("git-based env-isolation test not supported on Windows CI");
@@ -447,6 +598,8 @@ SUITE(git_context) {
     RUN_TEST(canonical_root_repo_root);
     RUN_TEST(canonical_root_subdir);
     RUN_TEST(canonical_root_linked_worktree);
+    RUN_TEST(is_linked_worktree_true_for_linked_worktree);
+    RUN_TEST(is_linked_worktree_false_for_submodule_and_nongit);
     RUN_TEST(git_context_ignores_inherited_repo_env);
     RUN_TEST(githistory_ignores_inherited_repo_env);
 }

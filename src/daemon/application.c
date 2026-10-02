@@ -16,6 +16,7 @@
 #include "foundation/sha256.h"
 #include "foundation/subprocess.h"
 #include "foundation/workspace.h"
+#include "git/git_context.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -1613,6 +1614,18 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             application_refresh_watch_locked(session);
             continue;
         }
+        /* ignore_worktrees can be turned on after this session was queued for
+         * a capacity slot. Initial admission already skips linked worktrees;
+         * retry must apply the same gate or the pending checkout is indexed
+         * once a slot opens. */
+        if (cbm_mcp_ignore_worktrees_enabled(session->mcp) &&
+            cbm_git_is_linked_worktree(root_path)) {
+            session->auto_index_retry_pending = false;
+            cbm_log_info("daemon.autoindex.skipped", "project", project, "reason",
+                         "linked_worktree");
+            application_refresh_watch_locked(session);
+            continue;
+        }
         char *args = application_auto_index_args(application, root_path);
         if (!args) {
             continue;
@@ -2234,6 +2247,11 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
     bool auto_index_candidate = auto_index && !db_exists;
     if (auto_index_candidate &&
         !application_session_workspace_allowed(session, "auto_index_discovery")) {
+        auto_index_candidate = false;
+    }
+    if (auto_index_candidate && cbm_mcp_ignore_worktrees_enabled(session->mcp) &&
+        cbm_git_is_linked_worktree(root_path)) {
+        cbm_log_info("daemon.autoindex.skipped", "project", project, "reason", "linked_worktree");
         auto_index_candidate = false;
     }
     bool within_auto_index_limit =
