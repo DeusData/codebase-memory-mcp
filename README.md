@@ -213,6 +213,8 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - **`CROSS_*` edges** link nodes across multiple repos indexed under the same store
 - **Multi-galaxy 3D UI layout** for cross-repo architecture visualization
 - **Cross-repo architecture summary** combining services, routes, and dependencies across the indexed fleet
+- **Run status**: `index_status` (and the UI layout next to `linked_projects`) carries a `cross_repo` object, `{"status":"never_run"}` until `index_repository(mode="cross-repo-intelligence")` has run with that project as the source, then `"ran"` with `last_run_at`, `outcome`, `targets`, `projects_scanned`, `total_cross_edges` and `skipped_projects`. That is how you tell "never linked" apart from "linked, nothing matched". The status is stored in the project's own index next to its `CROSS_*` edges, so a reindex that rebuilds the index drops both at once and the status goes back to `never_run`.
+- **Skipped stores**: `target_projects: ["*"]` skips an index built before the #768 schema change rather than failing the whole run. The response lists each one as `skipped_projects: [{"name", "reason": "pre_768_schema", "hint": "reindex this project"}]`.
 
 ### Edge types (selected)
 - `CALLS` — a callable is invoked at the source site
