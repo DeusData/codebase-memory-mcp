@@ -5010,7 +5010,407 @@ TEST(cypher_exec_max_rows_above_ceiling_is_clamped) {
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 2);
     cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
 
+/* ══════════════════════════════════════════════════════════════════
+ *  LONG OPERATOR CHAINS AND MANY UNION BRANCHES
+ *
+ * A WHERE chain `a OR b OR c ...` and a UNION chain are bounded only by the
+ * message size, and an agent that lists a few thousand names in one query is
+ * ordinary input. The parser used to fold a chain into a tree as deep as the
+ * chain is long and to parse every UNION branch through a nested call, so each
+ * walker (evaluation, seed selectivity, parsing) recursed once per operand or
+ * branch. The daemon runs a query on a worker thread with a 256 KiB stack
+ * (daemon/runtime.c RUNTIME_WORKER_STACK_SIZE), where a few thousand frames
+ * already overflow. These tests run their query on a thread of that size,
+ * inside a forked child on POSIX, so an overflow is reported as the signal
+ * that killed the child instead of ending the test runner.
+ * ══════════════════════════════════════════════════════════════════ */
+
+enum { CYPHER_WORKER_STACK_BYTES = 256 * 1024 }; /* = RUNTIME_WORKER_STACK_SIZE */
+
+typedef struct {
+    int (*check)(void *);
+    void *arg;
+    int result;
+} worker_stack_run_t;
+
+static void *worker_stack_thread(void *opaque) {
+    worker_stack_run_t *run = opaque;
+    run->result = run->check(run->arg);
+    return NULL;
+}
+
+/* Runs check(arg) on a thread with the worker stack size; returns its result. */
+static int run_on_worker_stack_thread(worker_stack_run_t *run) {
+    cbm_thread_t t;
+    if (cbm_thread_create(&t, CYPHER_WORKER_STACK_BYTES, worker_stack_thread, run) != 0) {
+        FAIL("could not create the worker-stack thread");
+    }
+    (void)cbm_thread_join(&t);
+    return run->result;
+}
+
+/* Runs check(arg) the way the daemon runs a query. POSIX: on the worker-sized
+ * thread of a forked child, whose exit status is the check's result; a killing
+ * signal is reported as such. Windows has no fork, and CreateThread's size
+ * argument sets the committed stack while the reserve stays the image default,
+ * so the thread runs in-process there. */
+static int run_on_worker_stack(int (*check)(void *), void *arg) {
+    worker_stack_run_t run = {.check = check, .arg = arg, .result = 1};
+#ifdef _WIN32
+    return run_on_worker_stack_thread(&run);
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int code = run_on_worker_stack_thread(&run);
+        fflush(NULL);
+        _exit(code == 0 ? 0 : 1);
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "query thread killed by signal %d on a %d KiB stack",
+                 WTERMSIG(status), CYPHER_WORKER_STACK_BYTES / 1024);
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    return 0;
+#endif
+}
+
+/* The fixture graph of setup_cypher_store, restated here so the expected rows
+ * are computed by the test and not read back from the engine. */
+static const char *const cypher_fixture_functions[] = {"HandleOrder", "ValidateOrder",
+                                                       "SubmitOrder", "LogError"};
+enum { CYPHER_FIXTURE_FUNCTION_COUNT = 4 };
+static const char *const cypher_fixture_calls[][2] = {{"HandleOrder", "ValidateOrder"},
+                                                      {"ValidateOrder", "SubmitOrder"},
+                                                      {"HandleOrder", "LogError"}};
+enum { CYPHER_FIXTURE_CALL_COUNT = 3 };
+static const char *const cypher_fixture_nodes[] = {"HandleOrder", "ValidateOrder", "SubmitOrder",
+                                                   "main", "LogError"};
+enum { CYPHER_FIXTURE_NODE_COUNT = 5 };
+
+enum { CYPHER_CHAIN_OPERANDS = 50000 };
+
+/* Operand i of a generated chain compares f.name with this value. Two fixture
+ * names sit deep in the chain (the middle and the very last operand); every
+ * other operand names a function that does not exist. */
+static const char *chain_operand_value(int i, char *buf, size_t n) {
+    if (i == CYPHER_CHAIN_OPERANDS / 2) {
+        return "ValidateOrder";
+    }
+    if (i == CYPHER_CHAIN_OPERANDS - 1) {
+        return "LogError";
+    }
+    snprintf(buf, n, "no_such_function_%d", i);
+    return buf;
+}
+
+/* The test's own reading of the chain: does any operand name `name`? */
+static bool chain_names(const char *name) {
+    for (int i = 0; i < CYPHER_CHAIN_OPERANDS; i++) {
+        char buf[48];
+        if (strcmp(chain_operand_value(i, buf, sizeof(buf)), name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* head + "f.name <op> \"v0\"" + join + "f.name <op> \"v1\"" + ... + tail */
+static char *chain_query(const char *head, const char *op, const char *join, const char *tail) {
+    size_t cap = 256 + (size_t)CYPHER_CHAIN_OPERANDS * 64;
+    char *q = malloc(cap);
+    if (!q) {
+        return NULL;
+    }
+    size_t len = (size_t)snprintf(q, cap, "%s", head);
+    for (int i = 0; i < CYPHER_CHAIN_OPERANDS && len < cap; i++) {
+        char buf[48];
+        const char *v = chain_operand_value(i, buf, sizeof(buf));
+        len += (size_t)snprintf(q + len, cap - len, "%sf.name %s \"%s\"", i ? join : "", op, v);
+    }
+    if (len >= cap) {
+        free(q);
+        return NULL;
+    }
+    snprintf(q + len, cap - len, "%s", tail);
+    return q;
+}
+
+typedef struct {
+    const char *head;
+    const char *op;
+    const char *join;
+    const char *tail;
+    bool admits_named; /* true: a row passes when the chain names f; false: when it does not */
+    int expected_rows;
+} chain_case_t;
+
+/* Runs the chain query and checks every row against the test's own reading of
+ * the chain, then checks that the engine still answers afterwards. */
+static int chain_check(void *arg) {
+    const chain_case_t *c = arg;
+    char *query = chain_query(c->head, c->op, c->join, c->tail);
+    ASSERT_NOT_NULL(query);
+
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    free(query);
+    if (rc != 0) {
+        printf("  query error: %s\n", r.error ? r.error : "(none)");
+    }
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, c->expected_rows);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_EQ(chain_names(r.rows[i][0]), c->admits_named);
+    }
+    cbm_cypher_result_free(&r);
+
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, CYPHER_FIXTURE_FUNCTION_COUNT);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    return 0;
+}
+
+/* 50,000 operands joined by OR over a single node pattern: the rows are the
+ * Functions the chain names. The expected count comes from the fixture list
+ * and chain_names, not from the engine. */
+TEST(cypher_long_or_chain_evaluates) {
+    chain_case_t c = {.head = "MATCH (f:Function) WHERE ",
+                      .op = "=",
+                      .join = " OR ",
+                      .tail = " RETURN f.name",
+                      .admits_named = true,
+                      .expected_rows = 0};
+    for (int i = 0; i < CYPHER_FIXTURE_FUNCTION_COUNT; i++) {
+        c.expected_rows += chain_names(cypher_fixture_functions[i]) ? 1 : 0;
+    }
+    ASSERT_EQ(c.expected_rows, 2); /* the generator plants ValidateOrder and LogError */
+    int rc = run_on_worker_stack(chain_check, &c);
+    if (rc != 0) {
+        return rc;
+    }
+    PASS();
+}
+
+/* 50,000 operands joined by AND over a single-hop pattern, so the planner's
+ * seed-selectivity walk sees the chain as well as the evaluator: the rows are
+ * the CALLS edges whose caller the chain does not name. */
+TEST(cypher_long_and_chain_evaluates) {
+    chain_case_t c = {.head = "MATCH (f:Function)-[:CALLS]->(g:Function) WHERE ",
+                      .op = "<>",
+                      .join = " AND ",
+                      .tail = " RETURN f.name, g.name",
+                      .admits_named = false,
+                      .expected_rows = 0};
+    for (int i = 0; i < CYPHER_FIXTURE_CALL_COUNT; i++) {
+        c.expected_rows += chain_names(cypher_fixture_calls[i][0]) ? 0 : 1;
+    }
+    ASSERT_EQ(c.expected_rows, 2); /* HandleOrder's two calls; ValidateOrder's is named */
+    int rc = run_on_worker_stack(chain_check, &c);
+    if (rc != 0) {
+        return rc;
+    }
+    PASS();
+}
+
+static int cmp_cstr(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Runs `query` and checks that its first column holds exactly the names in
+ * `expected`, given in strcmp order; the rows are sorted the same way so the
+ * engine's row order does not matter. */
+static int assert_name_set(cbm_store_t *s, const char *query, const char *const *expected, int n) {
+    enum { NAME_SET_MAX = 8 };
+    ASSERT_TRUE(n <= NAME_SET_MAX);
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    if (rc != 0) {
+        printf("  query error: %s\n", r.error ? r.error : "(none)");
+    }
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, n);
+    const char *names[NAME_SET_MAX];
+    for (int i = 0; i < n; i++) {
+        names[i] = r.rows[i][0];
+    }
+    qsort(names, (size_t)n, sizeof(names[0]), cmp_cstr);
+    for (int i = 0; i < n; i++) {
+        ASSERT_STR_EQ(names[i], expected[i]);
+    }
+    cbm_cypher_result_free(&r);
+    return 0;
+}
+
+/* Every spelling in `forms` is one WHERE expression; all must yield `expected`. */
+static int where_forms_agree(cbm_store_t *s, const char *const *forms, int form_count,
+                             const char *const *expected, int n) {
+    for (int f = 0; f < form_count; f++) {
+        char query[512];
+        snprintf(query, sizeof(query), "MATCH (n) WHERE %s RETURN n.name", forms[f]);
+        int rc = assert_name_set(s, query, expected, n);
+        if (rc != 0) {
+            printf("  form: %s\n", forms[f]);
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/* A chain and the same expression written out with parentheses, in both
+ * associations, must agree row for row. The operands include a property the
+ * `main` node does not have: file_path reads as the empty string there, so
+ * `IS NULL` holds and `<>` holds, and a missing value takes part in AND, OR and
+ * XOR like any other operand instead of voiding the chain. */
+TEST(cypher_mixed_chain_matches_nested_form) {
+    cbm_store_t *s = setup_cypher_store();
+
+    static const char *const or_forms[] = {
+        "n.file_path = \"handler.go\" OR n.file_path IS NULL OR n.name = \"LogError\"",
+        "(n.file_path = \"handler.go\" OR n.file_path IS NULL) OR n.name = \"LogError\"",
+        "n.file_path = \"handler.go\" OR (n.file_path IS NULL OR n.name = \"LogError\")"};
+    static const char *const or_rows[] = {"HandleOrder", "LogError", "main"};
+    ASSERT_EQ(where_forms_agree(s, or_forms, 3, or_rows, 3), 0);
+
+    static const char *const and_forms[] = {
+        "n.file_path <> \"handler.go\" AND n.file_path <> \"log.go\" AND n.name <> \"SubmitOrder\"",
+        "(n.file_path <> \"handler.go\" AND n.file_path <> \"log.go\") AND n.name <> "
+        "\"SubmitOrder\"",
+        "n.file_path <> \"handler.go\" AND (n.file_path <> \"log.go\" AND n.name <> "
+        "\"SubmitOrder\")"};
+    static const char *const and_rows[] = {"ValidateOrder", "main"};
+    ASSERT_EQ(where_forms_agree(s, and_forms, 3, and_rows, 2), 0);
+
+    /* Parity: main is T^T^F^F, LogError F^F^T^F, HandleOrder F^F^F^T. */
+    static const char *const xor_forms[] = {
+        "n.name = \"main\" XOR n.file_path IS NULL XOR n.name = \"LogError\" XOR "
+        "n.file_path = \"handler.go\"",
+        "((n.name = \"main\" XOR n.file_path IS NULL) XOR n.name = \"LogError\") XOR "
+        "n.file_path = \"handler.go\"",
+        "n.name = \"main\" XOR (n.file_path IS NULL XOR (n.name = \"LogError\" XOR "
+        "n.file_path = \"handler.go\"))"};
+    static const char *const xor_rows[] = {"HandleOrder", "LogError"};
+    ASSERT_EQ(where_forms_agree(s, xor_forms, 3, xor_rows, 2), 0);
+
+    /* Mixed precedence (NOT > AND > XOR > OR) with a NOT over a missing value:
+     * main by name, LogError by (F AND T) XOR T, SubmitOrder by NOT (F). */
+    static const char *const mixed_forms[] = {
+        "n.name = \"main\" OR n.file_path IS NULL AND n.name = \"LogError\" XOR "
+        "n.file_path = \"log.go\" OR NOT n.file_path <> \"submit.go\"",
+        "n.name = \"main\" OR ((n.file_path IS NULL AND n.name = \"LogError\") XOR "
+        "n.file_path = \"log.go\") OR (NOT (n.file_path <> \"submit.go\"))",
+        "(n.name = \"main\" OR ((n.file_path IS NULL AND n.name = \"LogError\") XOR "
+        "n.file_path = \"log.go\")) OR (NOT (n.file_path <> \"submit.go\"))"};
+    static const char *const mixed_rows[] = {"LogError", "SubmitOrder", "main"};
+    ASSERT_EQ(where_forms_agree(s, mixed_forms, 3, mixed_rows, 3), 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Branch i selects fixture node i % 5 by name; `join` is " UNION " or
+ * " UNION ALL ". */
+static char *union_query(int branches, const char *join) {
+    size_t cap = 64 + (size_t)branches * 80;
+    char *q = malloc(cap);
+    if (!q) {
+        return NULL;
+    }
+    size_t len = 0;
+    for (int i = 0; i < branches && len < cap; i++) {
+        len +=
+            (size_t)snprintf(q + len, cap - len, "%sMATCH (n) WHERE n.name = \"%s\" RETURN n.name",
+                             i ? join : "", cypher_fixture_nodes[i % CYPHER_FIXTURE_NODE_COUNT]);
+    }
+    if (len >= cap) {
+        free(q);
+        return NULL;
+    }
+    return q;
+}
+
+enum { CYPHER_UNION_MANY_BRANCHES = 20000 };
+
+/* UNION ALL keeps every branch's row in branch order. */
+static int union_many_check(void *arg) {
+    (void)arg;
+    char *query = union_query(CYPHER_UNION_MANY_BRANCHES, " UNION ALL ");
+    ASSERT_NOT_NULL(query);
+
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    free(query);
+    if (rc != 0) {
+        printf("  query error: %s\n", r.error ? r.error : "(none)");
+    }
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, CYPHER_UNION_MANY_BRANCHES);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_STR_EQ(r.rows[i][0], cypher_fixture_nodes[i % CYPHER_FIXTURE_NODE_COUNT]);
+    }
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    return 0;
+}
+
+/* 20,000 UNION ALL branches parse, run and free on the worker stack, and
+ * every branch contributes its row. */
+TEST(cypher_many_union_branches) {
+    int rc = run_on_worker_stack(union_many_check, NULL);
+    if (rc != 0) {
+        return rc;
+    }
+    PASS();
+}
+
+/* 50 branches: UNION ALL yields one row per branch in branch order, UNION
+ * keeps the first row of each name, and a UNION with nothing after it is still
+ * a clean parse error. */
+TEST(cypher_fifty_union_branches) {
+    enum { BRANCHES = 50 };
+    cbm_store_t *s = setup_cypher_store();
+    char *all = union_query(BRANCHES, " UNION ALL ");
+    char *distinct = union_query(BRANCHES, " UNION ");
+    ASSERT_NOT_NULL(all);
+    ASSERT_NOT_NULL(distinct);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, all, "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, BRANCHES);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_STR_EQ(r.rows[i][0], cypher_fixture_nodes[i % CYPHER_FIXTURE_NODE_COUNT]);
+    }
+    cbm_cypher_result_free(&r);
+
+    rc = cbm_cypher_execute(s, distinct, "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, CYPHER_FIXTURE_NODE_COUNT);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_STR_EQ(r.rows[i][0], cypher_fixture_nodes[i]);
+    }
+    cbm_cypher_result_free(&r);
+    free(all);
+    free(distinct);
+
+    rc = cbm_cypher_execute(s, "MATCH (n) RETURN n.name UNION", "test", 0, &r);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NOT_NULL(r.error);
+    cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
 }
@@ -5245,4 +5645,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
     RUN_TEST(cypher_single_hop_seeds_from_selective_far_node);
     RUN_TEST(cypher_exec_max_rows_above_ceiling_is_clamped);
+    /* Long operator chains and many UNION branches */
+    RUN_TEST(cypher_long_or_chain_evaluates);
+    RUN_TEST(cypher_long_and_chain_evaluates);
+    RUN_TEST(cypher_mixed_chain_matches_nested_form);
+    RUN_TEST(cypher_many_union_branches);
+    RUN_TEST(cypher_fifty_union_branches);
 }
