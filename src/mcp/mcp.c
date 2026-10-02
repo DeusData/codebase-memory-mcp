@@ -3876,6 +3876,7 @@ enum {
     BM25_BIND_FILE = 6,
     BM25_BIND_LABEL = 7,
     BM25_BIND_EXACT = 8,
+    BM25_BIND_LABEL_WEIGHT = 9,
     BM25_SQL_AUTO_LEN = -1,
     /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
      * (no JOIN/WHERE on outer table) of the form:
@@ -3884,6 +3885,11 @@ enum {
      * and then joining/filtering/re-ranking those, we bound all work to O(N) where
      * N = BM25_INNER_LIMIT rather than the full match set size. */
     BM25_INNER_LIMIT = 2000,
+    /* Longest label spliced into the MATCH pre-filter; real labels are short
+     * identifiers, so anything longer simply skips the pre-filter. */
+    BM25_LABEL_MAX = 64,
+    /* Room for "(<tokens>) AND label : \"<label>\"" around the token list. */
+    BM25_MATCH_BUF = BM25_QUERY_BUF + BM25_LABEL_MAX + 32,
 };
 
 /* Column weights for nodes_fts (name, qualified_name, label, file_path, body).
@@ -3902,8 +3908,15 @@ enum {
  * Safe against a legacy four-column nodes_fts: FTS5's bm25() reads a weight
  * only when an instance actually lands in that column (`nVal > ic`), so the
  * fifth weight is simply never consulted on a table that has no fifth
- * column. */
-#define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, 1.0, 1.0, 0.3)"
+ * column.
+ *
+ * The label weight is bound (?9): 1.0 normally, 0.0 when the MATCH is scoped
+ * to a label (#2386). Every candidate then carries that label, so a label hit
+ * cannot tell them apart, and a zero weight keeps the added `label : "..."`
+ * phrase from shifting BM25 order by row length. */
+#define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, ?9, 1.0, 0.3)"
+static const double BM25_LABEL_WEIGHT = 1.0;
+static const double BM25_LABEL_WEIGHT_SCOPED = 0.0;
 
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
@@ -3952,6 +3965,39 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
     }
     out[pos] = '\0';
     return tokens;
+}
+
+/* Scope an FTS5 MATCH expression to one node label (#2386). The label filter
+ * must choose the BM25_INNER_LIMIT candidate window, not trim it afterwards:
+ * otherwise a label that is rare among a common token's matches falls outside
+ * the window and the search returns 0 rows although matching nodes exist.
+ * FTS5 matching is case-insensitive, so this is a superset pre-filter; the
+ * caller keeps the exact `n.label = ?` check. Only a plain identifier is
+ * spliced in, as a quoted FTS5 string; any other label leaves `tokens`
+ * unscoped, which is the pre-#2386 behaviour. Returns the label-column weight
+ * to bind for the resulting MATCH. */
+static double bm25_scope_match_to_label(const char *tokens, const char *label, char *out,
+                                        size_t out_size) {
+    snprintf(out, out_size, "%s", tokens);
+    if (!label || !label[0]) {
+        return BM25_LABEL_WEIGHT;
+    }
+    size_t len = 0;
+    for (; label[len]; len++) {
+        char ch = label[len];
+        bool ident = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                     (ch >= '0' && ch <= '9') || ch == '_';
+        if (!ident || len >= BM25_LABEL_MAX) {
+            return BM25_LABEL_WEIGHT;
+        }
+    }
+    char scoped[BM25_MATCH_BUF];
+    int n = snprintf(scoped, sizeof(scoped), "(%s) AND label : \"%s\"", tokens, label);
+    if (n <= 0 || (size_t)n >= sizeof(scoped) || (size_t)n >= out_size) {
+        return BM25_LABEL_WEIGHT;
+    }
+    memcpy(out, scoped, (size_t)n + 1);
+    return BM25_LABEL_WEIGHT_SCOPED;
 }
 
 static char *bm25_file_pattern_like(const char *file_pattern) {
@@ -4139,11 +4185,16 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (!db) {
         return NULL;
     }
-    char fts_query[BM25_QUERY_BUF];
-    int tok_count = bm25_build_match(query, fts_query, sizeof(fts_query));
+    char fts_tokens[BM25_QUERY_BUF];
+    int tok_count = bm25_build_match(query, fts_tokens, sizeof(fts_tokens));
     if (tok_count == 0) {
         return NULL;
     }
+    /* One MATCH string for the ranked query, the count and the saturation
+     * probe, so all three describe the same label-scoped window. */
+    char fts_query[BM25_MATCH_BUF];
+    double label_weight =
+        bm25_scope_match_to_label(fts_tokens, label, fts_query, sizeof(fts_query));
     char *file_like = bm25_file_pattern_like(file_pattern);
 
     /* BM25 ranked query using a two-step approach to enable FTS5 early termination.
@@ -4223,6 +4274,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         sqlite3_bind_null(stmt, BM25_BIND_LABEL);
     }
     sqlite3_bind_text(stmt, BM25_BIND_EXACT, query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, BM25_BIND_LABEL_WEIGHT, label_weight);
 
     /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
      * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
@@ -4249,6 +4301,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
             sqlite3_bind_int(cs, BM25_BIND_LIMIT, BM25_INNER_LIMIT);
+            sqlite3_bind_double(cs, BM25_BIND_LABEL_WEIGHT, label_weight);
             if (file_like) {
                 sqlite3_bind_text(cs, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
                                   MCP_SQLITE_TRANSIENT);
@@ -4270,9 +4323,10 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
 
     /* The top-candidate window is a performance ceiling, not an exact-total
      * boundary. Probe one candidate beyond it so a broad query never presents
-     * a window-local count as the complete match count. This is global to the
-     * FTS table; saturation is therefore conservatively reported even when
-     * later project/path filters might discard the hidden candidates. */
+     * a window-local count as the complete match count. The probe shares the
+     * label-scoped MATCH but is otherwise global to the FTS table; saturation
+     * is therefore conservatively reported even when later project/path
+     * filters might discard the hidden candidates. */
     bool candidate_window_saturated = true;
     {
         const char *probe_sql = "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1 "
