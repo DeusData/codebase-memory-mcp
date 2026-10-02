@@ -20983,6 +20983,296 @@ TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
     PASS();
 }
 
+/* ── search_code: every match resolves inside the project root ─────────
+ * search_code returns the lines its scan opened. The scoped file list is
+ * built from the index, and an indexed path that now passes through a
+ * directory link still looks like a regular file to lstat, so grep opens
+ * and reports the link target. Reading a result's source already goes
+ * through cbm_path_within_root (attach_result_source); the match itself
+ * must pass the same check in every output mode.
+ *
+ * POSIX only: the fixture needs symbolic links. Windows: creating a link
+ * or junction from a test needs CreateSymbolicLinkW (a privilege unless
+ * developer mode is on) or a junction helper the test tree does not have,
+ * and a Windows run of these cases was not attempted in this change, so
+ * they skip with that reason rather than sit as an unexplained red. */
+#ifndef _WIN32
+typedef struct {
+    char root[CBM_SZ_512];
+    char outside[CBM_SZ_512];
+} search_root_fixture_t;
+
+/* Layout (every line that matters carries ROOTCHECK_NEEDLE):
+ *   <root>/main.c                      ordinary file, Variable INSIDE_SYMBOL
+ *   <root>/inner/same.c                ordinary file, reached via the links
+ *   <root>/alias -> inner              directory link that stays inside
+ *   <root>/mirror.c -> inner/same.c    file link that stays inside
+ *   <root>/link.c -> <outside>/far.c   file link that leaves the root
+ *   <root>/lib -> <outside>/dir        directory link that leaves the root
+ *   <outside>/dir/deep.c               raw hit through the directory link
+ *   <outside>/dir/sym.c                graph hit (Variable FAR_DIR_SYMBOL) */
+static bool search_root_fixture_create(search_root_fixture_t *fx) {
+    snprintf(fx->root, sizeof(fx->root), "%s/cbm_srch_root_XXXXXX", cbm_tmpdir());
+    snprintf(fx->outside, sizeof(fx->outside), "%s/cbm_srch_outside_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(fx->root) || !cbm_mkdtemp(fx->outside)) {
+        return false;
+    }
+    char path[CBM_SZ_1K];
+    char target[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/main.c", fx->root);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_INSIDE = 1;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/inner/same.c", fx->root);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_INNER = 4;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/alias", fx->root);
+    if (symlink("inner", path) != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/mirror.c", fx->root);
+    if (symlink("inner/same.c", path) != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/far.c", fx->outside);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_FILE = 2;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/dir/deep.c", fx->outside);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_DIR = 3;\n") != 0) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "%s/dir/sym.c", fx->outside);
+    if (th_write_file(path, "int ROOTCHECK_NEEDLE_FAR_SYM = 5;\n") != 0) {
+        return false;
+    }
+    snprintf(target, sizeof(target), "%s/far.c", fx->outside);
+    snprintf(path, sizeof(path), "%s/link.c", fx->root);
+    if (symlink(target, path) != 0) {
+        return false;
+    }
+    snprintf(target, sizeof(target), "%s/dir", fx->outside);
+    snprintf(path, sizeof(path), "%s/lib", fx->root);
+    return symlink(target, path) == 0;
+}
+
+static void search_root_fixture_destroy(search_root_fixture_t *fx) {
+    /* Unlink the links first so the tree removal never descends through one. */
+    static const char *const links[] = {"alias", "mirror.c", "link.c", "lib"};
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), "%s/%s", fx->root, links[i]);
+        (void)unlink(path);
+    }
+    (void)th_rmtree(fx->root);
+    (void)th_rmtree(fx->outside);
+}
+
+/* File nodes as a stale index holds them: the link targets were ordinary
+ * directories and files when they were indexed (discovery itself never
+ * follows a link). inner/same.c is deliberately absent so its line can only
+ * be reached through alias/ or mirror.c. */
+static bool search_root_fixture_index(cbm_store_t *store, const char *project) {
+    static const char *const files[] = {"main.c", "alias/same.c", "mirror.c",
+                                        "link.c", "lib/deep.c",   "lib/sym.c"};
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        const char *base = strrchr(files[i], '/');
+        base = base ? base + 1 : files[i];
+        char qualified_name[CBM_SZ_256];
+        snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, files[i]);
+        cbm_node_t file = {.project = project,
+                           .label = "File",
+                           .name = base,
+                           .qualified_name = qualified_name,
+                           .file_path = files[i]};
+        if (cbm_store_upsert_node(store, &file) <= 0) {
+            return false;
+        }
+    }
+    cbm_node_t inside = {.project = project,
+                         .label = "Variable",
+                         .name = "INSIDE_SYMBOL",
+                         .qualified_name = "search-root.INSIDE_SYMBOL",
+                         .file_path = "main.c",
+                         .start_line = 1,
+                         .end_line = 1};
+    cbm_node_t far_symbol = {.project = project,
+                             .label = "Variable",
+                             .name = "FAR_DIR_SYMBOL",
+                             .qualified_name = "search-root.lib.FAR_DIR_SYMBOL",
+                             .file_path = "lib/sym.c",
+                             .start_line = 1,
+                             .end_line = 1};
+    return cbm_store_upsert_node(store, &inside) > 0 &&
+           cbm_store_upsert_node(store, &far_symbol) > 0;
+}
+
+typedef struct {
+    bool ok;               /* a non-error response with text content */
+    bool inside_file;      /* main.c reported */
+    bool inside_dir_link;  /* alias/same.c reported (directory link inside) */
+    bool inside_file_link; /* mirror.c reported (file link inside) */
+    bool outside;          /* any line or path from beyond the root */
+} search_root_probe_t;
+
+static search_root_probe_t search_root_probe(cbm_mcp_server_t *srv, const char *args) {
+    search_root_probe_t probe = {0};
+    char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+    char *inner = response ? extract_text_content(response) : NULL;
+    probe.ok = response && !strstr(response, "\"isError\":true") && inner;
+    if (probe.ok) {
+        probe.inside_file = strstr(inner, "main.c") != NULL;
+        probe.inside_dir_link = strstr(inner, "alias/same.c") != NULL;
+        probe.inside_file_link = strstr(inner, "mirror.c") != NULL;
+        static const char *const outside_markers[] = {"ROOTCHECK_NEEDLE_FAR", "FAR_DIR_SYMBOL",
+                                                      "deep.c", "sym.c", "link.c"};
+        for (size_t i = 0; i < sizeof(outside_markers) / sizeof(outside_markers[0]); i++) {
+            if (strstr(inner, outside_markers[i])) {
+                probe.outside = true;
+            }
+        }
+    }
+    free(inner);
+    free(response);
+    return probe;
+}
+
+#define SEARCH_ROOT_ARGS(extra) \
+    "{\"pattern\":\"ROOTCHECK_NEEDLE\",\"project\":\"search-root\"" extra "}"
+#endif
+
+/* Scoped route, real scan command: the index lists lib/deep.c and lib/sym.c,
+ * lstat follows the lib -> <outside>/dir link and calls both regular, grep
+ * reads the targets. Every output mode must leave those lines out while
+ * main.c and alias/same.c (a directory link that stays inside) stay in.
+ * mirror.c and link.c are links as their last path component; the scoped
+ * list writer already leaves those out (lstat reports the link itself) —
+ * pinned here as the existing behaviour, not changed. */
+TEST(search_code_matches_stay_inside_project_root) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
+#else
+    search_root_fixture_t fx;
+    bool fixture_ok = search_root_fixture_create(&fx);
+    if (!fixture_ok) {
+        search_root_fixture_destroy(&fx);
+    }
+    ASSERT_TRUE(fixture_ok);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-root";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
+    ASSERT_TRUE(search_root_fixture_index(store, project));
+
+    static const char *const args[] = {
+        SEARCH_ROOT_ARGS(""),
+        SEARCH_ROOT_ARGS(",\"format\":\"json\""),
+        SEARCH_ROOT_ARGS(",\"mode\":\"full\""),
+        SEARCH_ROOT_ARGS(",\"mode\":\"full\",\"format\":\"json\""),
+        SEARCH_ROOT_ARGS(",\"mode\":\"files\""),
+        SEARCH_ROOT_ARGS(",\"context\":2"),
+        "{\"pattern\":\"ROOTCHECK_NEEDLE_[A-Z]+\",\"project\":\"search-root\",\"regex\":true}",
+    };
+    enum { PROBES = sizeof(args) / sizeof(args[0]) };
+    search_root_probe_t probes[PROBES];
+    for (size_t i = 0; i < PROBES; i++) {
+        probes[i] = search_root_probe(srv, args[i]);
+    }
+    /* Dropped files are not counted either: the exact total is the two
+     * lines inside the root, as it would be after a fresh index. */
+    char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
+    char *json_inner = json_response ? extract_text_content(json_response) : NULL;
+    bool total_counts_inside_only = json_inner && strstr(json_inner, "\"total_grep_matches\":2");
+    free(json_inner);
+    free(json_response);
+
+    cbm_mcp_server_free(srv);
+    search_root_fixture_destroy(&fx);
+
+    for (size_t i = 0; i < PROBES; i++) {
+        ASSERT_TRUE(probes[i].ok);
+        ASSERT_FALSE(probes[i].outside);
+        ASSERT_TRUE(probes[i].inside_file);
+        ASSERT_TRUE(probes[i].inside_dir_link);
+        ASSERT_FALSE(probes[i].inside_file_link);
+    }
+    ASSERT_TRUE(total_counts_inside_only);
+    PASS();
+#endif
+}
+
+/* Recursive route: with no indexed files the scan walks the tree. On POSIX
+ * that walker is `find -type f`, which never hands grep a link, so the scan
+ * command is replaced by one that does — the hits a walker that follows
+ * links (Get-ChildItem on Windows is one) would deliver. Lines from
+ * link.c and lib/ resolve outside the root and must be dropped; mirror.c
+ * and alias/same.c resolve inside and must be kept. */
+TEST(search_code_drops_walker_hits_that_resolve_outside_root) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symbolic-link fixture; see search_root_fixture_create");
+#else
+    search_root_fixture_t fx;
+    bool fixture_ok = search_root_fixture_create(&fx);
+    if (!fixture_ok) {
+        search_root_fixture_destroy(&fx);
+    }
+    ASSERT_TRUE(fixture_ok);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-root";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, fx.root), CBM_STORE_OK);
+
+    char scan_command[CBM_SZ_4K];
+    int command_length =
+        snprintf(scan_command, sizeof(scan_command),
+                 "grep -Hn -F ROOTCHECK_NEEDLE -- '%s/main.c' '%s/mirror.c' '%s/link.c' "
+                 "'%s/lib/deep.c' '%s/lib/sym.c' '%s/alias/same.c'",
+                 fx.root, fx.root, fx.root, fx.root, fx.root, fx.root);
+    ASSERT_TRUE(command_length > 0 && (size_t)command_length < sizeof(scan_command));
+    cbm_mcp_server_set_search_scan_command_for_test(srv, scan_command);
+
+    static const char *const args[] = {
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10"),
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"format\":\"json\""),
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"full\""),
+        SEARCH_ROOT_ARGS(",\"raw_limit\":10,\"mode\":\"files\""),
+    };
+    enum { PROBES = sizeof(args) / sizeof(args[0]) };
+    search_root_probe_t probes[PROBES];
+    for (size_t i = 0; i < PROBES; i++) {
+        probes[i] = search_root_probe(srv, args[i]);
+    }
+    char *json_response = cbm_mcp_handle_tool(srv, "search_code", args[1]);
+    cbm_mcp_server_set_search_scan_command_for_test(srv, NULL);
+    char *json_inner = json_response ? extract_text_content(json_response) : NULL;
+    bool total_counts_inside_only = json_inner && strstr(json_inner, "\"total_grep_matches\":3");
+    free(json_inner);
+    free(json_response);
+
+    cbm_mcp_server_free(srv);
+    search_root_fixture_destroy(&fx);
+
+    for (size_t i = 0; i < PROBES; i++) {
+        ASSERT_TRUE(probes[i].ok);
+        ASSERT_FALSE(probes[i].outside);
+        ASSERT_TRUE(probes[i].inside_file);
+        ASSERT_TRUE(probes[i].inside_dir_link);
+        ASSERT_TRUE(probes[i].inside_file_link);
+    }
+    ASSERT_TRUE(total_counts_inside_only);
+    PASS();
+#endif
+}
+
 SUITE(mcp) {
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
@@ -21361,6 +21651,10 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+
+    /* search_code: every match resolves inside the project root */
+    RUN_TEST(search_code_matches_stay_inside_project_root);
+    RUN_TEST(search_code_drops_walker_hits_that_resolve_outside_root);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without

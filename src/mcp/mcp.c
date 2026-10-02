@@ -14387,6 +14387,23 @@ static void free_file_nodes(cbm_node_t *nodes, int count) {
     free(nodes);
 }
 
+/* True when "<root_path>/<file>" resolves inside root_path. The scan stream
+ * carries whatever its walker opened: the scoped list is the index's paths,
+ * and an indexed path that passes through a directory link is a regular file
+ * to lstat, so grep reads the link's target; the recursive walker is the
+ * platform's own. This is the containment check attach_result_source already
+ * applies before it reads a result's source, applied to the match itself,
+ * once per distinct file (grep groups a file's hits). A path too long for
+ * the canonical-path buffers is one that check cannot resolve either. */
+static bool search_hit_file_within_root(const char *root_path, const char *file) {
+    char abs_path[CBM_SZ_4K];
+    int length = snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, file);
+    if (length < 0 || (size_t)length >= sizeof(abs_path)) {
+        return false;
+    }
+    return cbm_path_within_root(root_path, abs_path);
+}
+
 /* Parse and classify the complete grep stream without retaining one object per
  * hit. Graph results retain one identity per distinct node plus at most 500
  * line numbers each; raw matches retain only the caller's requested page.
@@ -14400,6 +14417,7 @@ static bool scan_and_classify_grep_matches(
     char *line = NULL;
     size_t line_capacity = 0;
     char *current_file = NULL;
+    bool current_file_inside = false;
     cbm_node_t *file_nodes = NULL;
     int file_node_count = 0;
     cbm_regex_t content_regex;
@@ -14445,12 +14463,6 @@ static bool scan_and_classify_grep_matches(
         if (has_path_filter && cbm_regexec(path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
             continue;
         }
-        if (*grep_count == INT_MAX) {
-            ok = false;
-            break;
-        }
-        (*grep_count)++;
-
         if (!current_file || strcmp(current_file, file) != 0) {
             free_file_nodes(file_nodes, file_node_count);
             file_nodes = NULL;
@@ -14461,11 +14473,22 @@ static bool scan_and_classify_grep_matches(
                 ok = false;
                 break;
             }
-            if (store) {
+            current_file_inside = search_hit_file_within_root(root_path, file);
+            if (store && current_file_inside) {
                 (void)cbm_store_find_nodes_by_file(store, project, file, &file_nodes,
                                                    &file_node_count);
             }
         }
+        if (!current_file_inside) {
+            /* Every hit of a file that resolves outside the root is dropped
+             * and, like a path_filter miss, not counted. */
+            continue;
+        }
+        if (*grep_count == INT_MAX) {
+            ok = false;
+            break;
+        }
+        (*grep_count)++;
 
         grep_match_t hit = {0};
         hit.file = heap_strdup(file);
