@@ -889,6 +889,48 @@ static bool activation_posix_acl_empty(int descriptor) {
     return cbm_macos_extended_acl_fd_is_empty(descriptor);
 }
 
+#ifdef __linux__
+/* Root of the per-user home tree and the account trusted to own it. Root and
+ * "/home" in production; the test seam substitutes a fixture tree and the test
+ * account, because the real layout needs root-owned entries to reproduce. */
+static const char *g_activation_home_root = "/home";
+static uid_t g_activation_home_owner = 0;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_activation_transaction_set_home_root_for_testing(const char *home_root,
+                                                          unsigned long owner_uid) {
+    g_activation_home_root = home_root ? home_root : "/home";
+    g_activation_home_owner = home_root ? (uid_t)owner_uid : 0;
+}
+#endif
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+/* Map a trusted symlink `link` (already lstat'd) onto its resolved target and
+ * append `rest`. The link and the target must both belong to `owner`; with
+ * accept_own_target the target may instead belong to the current account.
+ * Returns NULL when either check fails or the mapped path does not fit. */
+static char *activation_alias_map(const char *link, const struct stat *link_status, uid_t owner,
+                                  bool accept_own_target, const char *rest) {
+    char resolved[4096];
+    struct stat resolved_status;
+    if (link_status->st_uid != owner || !realpath(link, resolved) ||
+        lstat(resolved, &resolved_status) != 0 || !S_ISDIR(resolved_status.st_mode)) {
+        return NULL;
+    }
+    if (resolved_status.st_uid != owner &&
+        !(accept_own_target && resolved_status.st_uid == geteuid())) {
+        return NULL;
+    }
+    char mapped[4096];
+    int written = snprintf(mapped, sizeof(mapped), "%s%s", resolved, rest);
+    if (written <= 0 || (size_t)written >= sizeof(mapped)) {
+        return NULL;
+    }
+    return activation_string_copy(mapped);
+}
+#endif
+
 static char *activation_posix_walk_path(const char *directory) {
 #if defined(__APPLE__) || defined(__linux__)
     /* macOS and immutable Linux layouts can expose writable trees through
@@ -896,7 +938,7 @@ static char *activation_posix_walk_path(const char *directory) {
      * Resolve only these trusted system aliases; arbitrary user symlinks must
      * still fail the O_NOFOLLOW walk below. */
 #ifdef __linux__
-    static const char *const aliases[] = {"/tmp", "/var", "/home"};
+    const char *const aliases[] = {"/tmp", "/var", g_activation_home_root};
 #else
     static const char *const aliases[] = {"/tmp", "/var"};
 #endif
@@ -907,33 +949,48 @@ static char *activation_posix_walk_path(const char *directory) {
             (directory[alias_length] != '\0' && directory[alias_length] != '/')) {
             continue;
         }
+        uid_t owner = 0;
+#ifdef __linux__
+        bool is_home = alias == g_activation_home_root;
+        if (is_home) {
+            owner = g_activation_home_owner;
+        }
+#endif
         struct stat alias_status;
-        char resolved[4096];
         if (lstat(alias, &alias_status) != 0) {
             continue;
         }
-        if (!S_ISLNK(alias_status.st_mode)) {
+        if (S_ISLNK(alias_status.st_mode)) {
+            return activation_alias_map(alias, &alias_status, owner, false,
+                                        directory + alias_length);
+        }
+#ifdef __linux__
+        /* Managed Linux hosts often keep /home a real directory and point the
+         * per-user entry elsewhere (/home/alice -> /local/home/alice, #2306).
+         * Trust that entry only inside a root-owned /home nobody else can
+         * write, and only when root owns the entry itself. Unlike the whole-
+         * alias case above, the target may belong to the current account:
+         * that is the normal shape of a relocated home, and an account can
+         * already write its own home, so it gains nothing it did not have. */
+        const char *name = directory + alias_length;
+        size_t name_length = *name == '/' ? strcspn(name + 1, "/") : 0;
+        if (!is_home || !S_ISDIR(alias_status.st_mode) || alias_status.st_uid != owner ||
+            (alias_status.st_mode & 0022) != 0 || name_length == 0) {
             continue;
         }
-        if (alias_status.st_uid != 0 || !realpath(alias, resolved)) {
+        char entry[4096];
+        size_t entry_length = alias_length + 1U + name_length;
+        if (entry_length >= sizeof(entry)) {
             return NULL;
         }
-        struct stat resolved_status;
-        if (lstat(resolved, &resolved_status) != 0 || !S_ISDIR(resolved_status.st_mode) ||
-            resolved_status.st_uid != 0) {
-            return NULL;
+        memcpy(entry, directory, entry_length);
+        entry[entry_length] = '\0';
+        struct stat entry_status;
+        if (lstat(entry, &entry_status) == 0 && S_ISLNK(entry_status.st_mode)) {
+            return activation_alias_map(entry, &entry_status, owner, true,
+                                        directory + entry_length);
         }
-        size_t needed = strlen(resolved) + strlen(directory + alias_length) + 1U;
-        char *mapped = malloc(needed);
-        if (!mapped) {
-            return NULL;
-        }
-        int written = snprintf(mapped, needed, "%s%s", resolved, directory + alias_length);
-        if (written <= 0 || (size_t)written >= needed) {
-            free(mapped);
-            return NULL;
-        }
-        return mapped;
+#endif
     }
 #endif
     return activation_string_copy(directory);
