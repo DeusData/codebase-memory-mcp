@@ -147,9 +147,13 @@ enum { ET_ROUTE_ASSERT_MAX = 16 };
 /* Assert the exact Route node set. Edge-count smoke tests cannot catch partial
  * Spring paths such as "/orders" when the real route is "/api/orders", and a
  * presence-only assertion would still allow stale partial Route nodes to leak. */
-static int et_routes_exact(const EtFile *files, int nfiles, const char **routes) {
+static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int n_mean);
+
+static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes,
+                                int force_parallel) {
     EtProj lp;
-    cbm_store_t *store = et_index_files(&lp, files, nfiles);
+    cbm_store_t *store =
+        force_parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
     cbm_node_t *nodes = NULL;
     int node_count = 0;
     int wanted = 0;
@@ -200,6 +204,10 @@ static int et_routes_exact(const EtFile *files, int nfiles, const char **routes)
     cbm_store_free_nodes(nodes, node_count);
     et_cleanup(&lp, store);
     return ok;
+}
+
+static int et_routes_exact(const EtFile *files, int nfiles, const char **routes) {
+    return et_routes_exact_mode(files, nfiles, routes, 0);
 }
 
 /* Index meaningful[] plus PARALLEL_PAD_FILES trivial pad files to force the
@@ -390,6 +398,82 @@ TEST(handles_gin_go) {
          "    r.POST(\"/orders\", createOrder)\n"
          "}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
+    PASS();
+}
+
+/* #686: Go router groups. Fiber (and Gin/Echo, same syntax) build the external
+ * path from `grp := app.Group("/admin")` plus `grp.Post("/x")`, so the full
+ * path is never one literal at the registration site. The Route must carry
+ * the composed path, including nested groups (`v1 := api.Group("/v1")`) and
+ * groups built inline (`app.Group("/x").Get(...)`). Controls: a route on the
+ * root app keeps its own path, a variable later re-bound to a different group
+ * uses the binding in effect at the call, and a non-literal group prefix
+ * leaves the route unprefixed (never guessed). Exact Route set on BOTH the
+ * sequential and the parallel pipeline. */
+static const EtFile et_fiber_groups_issue686[] = {
+    {"main.go",
+     "package main\n\n"
+     "import \"github.com/gofiber/fiber/v2\"\n\n"
+     "func health(c *fiber.Ctx) error { return nil }\n"
+     "func getUser(c *fiber.Ctx) error { return nil }\n"
+     "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
+     "func listOrders(c *fiber.Ctx) error { return nil }\n"
+     "func ping(c *fiber.Ctx) error { return nil }\n"
+     "func report(c *fiber.Ctx) error { return nil }\n"
+     "func dyn(c *fiber.Ctx) error { return nil }\n\n"
+     "func main() {\n"
+     "    app := fiber.New()\n"
+     "    app.Get(\"/health\", health)\n"
+     "    api := app.Group(\"/api\")\n"
+     "    v1 := api.Group(\"/v1\", authMiddleware)\n"
+     "    v1.Get(\"/users/:id\", getUser)\n"
+     "    admin := app.Group(\"/admin\")\n"
+     "    admin.Post(\"/customers/:id\", updateCustomer)\n"
+     "    grp := api.Group(\"/shop\")\n"
+     "    grp.Get(\"/orders\", listOrders)\n"
+     "    grp = app.Group(\"/internal\")\n"
+     "    grp.Get(\"/ping\", ping)\n"
+     "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
+     "    prefix := \"/p\"\n"
+     "    dg := app.Group(prefix)\n"
+     "    dg.Get(\"/dyn\", dyn)\n"
+     "    app.Listen(\":3000\")\n"
+     "}\n\n"
+     "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
+
+static const char *et_fiber_groups_issue686_routes[] = {
+    "/health",      "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
+    "/internal/ping", "/reports/daily",  "/dyn",                 NULL};
+
+TEST(handles_fiber_group_prefix_sequential_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes, 0));
+    PASS();
+}
+
+TEST(handles_fiber_group_prefix_parallel_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes, 1));
+    PASS();
+}
+
+/* #686 control for the same mechanism on Gin: `v1 := r.Group("/v1")` with the
+ * idiomatic brace block. */
+TEST(handles_gin_group_prefix_issue686) {
+    static const EtFile f[] = {
+        {"main.go",
+         "package main\n\n"
+         "import \"github.com/gin-gonic/gin\"\n\n"
+         "func listOrders(c *gin.Context) {}\n"
+         "func createOrder(c *gin.Context) {}\n\n"
+         "func main() {\n"
+         "    r := gin.Default()\n"
+         "    v1 := r.Group(\"/v1\")\n"
+         "    {\n"
+         "        v1.GET(\"/orders\", listOrders)\n"
+         "        v1.POST(\"/orders\", createOrder)\n"
+         "    }\n"
+         "}\n"}};
+    static const char *routes[] = {"/v1/orders", "/v1/orders", NULL}; /* GET + POST */
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
 
@@ -1697,6 +1781,9 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_express_ts);
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
+    RUN_TEST(handles_fiber_group_prefix_sequential_issue686);
+    RUN_TEST(handles_fiber_group_prefix_parallel_issue686);
+    RUN_TEST(handles_gin_group_prefix_issue686);
     RUN_TEST(handles_spring_java);
     RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);

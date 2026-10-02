@@ -1763,8 +1763,50 @@ static const char *php_chain_prefix_arg(CBMArena *a, TSNode call_node, const cha
     return NULL;
 }
 
+/* Compose route-group prefix segments into one path. parts[] is inner-first;
+ * the result is outer-first with exactly one '/' between segments and a
+ * leading '/'. Returns NULL when no segment contributes or the result would
+ * be oversized (the route then stays un-prefixed). Shared by the Laravel
+ * (#952) and Go router-group (#686) prefix walks. */
+static const char *route_prefix_compose(CBMArena *a, const char *const *parts, int part_count) {
+    char buf[CBM_SZ_256];
+    size_t pos = 0;
+    for (int i = part_count - 1; i >= 0; i--) {
+        const char *seg = parts[i];
+        while (*seg == '/') {
+            seg++;
+        }
+        size_t sl = strlen(seg);
+        if (sl == 0) {
+            continue;
+        }
+        if (pos + sl + 2 >= sizeof(buf)) {
+            return NULL; /* oversized — leave path un-prefixed */
+        }
+        buf[pos++] = '/';
+        memcpy(buf + pos, seg, sl);
+        pos += sl;
+        while (pos > 1 && buf[pos - 1] == '/') {
+            pos--; /* strip trailing slash per segment */
+        }
+    }
+    buf[pos] = '\0';
+    return pos ? cbm_arena_strndup(a, buf, pos) : NULL;
+}
+
+/* Prepend a composed group prefix to a route path ("/x" + "/users" ->
+ * "/x/users"; a bare "/" route becomes the prefix itself). */
+static const char *route_path_with_prefix(CBMArena *a, const char *prefix, const char *path) {
+    const char *rel = path;
+    while (*rel == '/') {
+        rel++;
+    }
+    return rel[0] ? cbm_arena_sprintf(a, "%s/%s", prefix, rel)
+                  : cbm_arena_strndup(a, prefix, strlen(prefix));
+}
+
 static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const char *source) {
-    const char *parts[PHP_PREFIX_PARTS_MAX];
+    const char *parts[PHP_PREFIX_PARTS_MAX] = {NULL};
     int part_count = 0;
     TSNode cur = ts_node_parent(node);
     for (int depth = 0; depth < PHP_GROUP_WALK_MAX && !ts_node_is_null(cur); depth++) {
@@ -1813,34 +1855,200 @@ static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const cha
         }
         cur = ts_node_parent(cur);
     }
-    if (part_count == 0) {
+    return route_prefix_compose(a, parts, part_count);
+}
+
+/* #686: compose Go router-group prefixes (Fiber, Gin, Echo: `g := app.Group("/admin")`
+ * then `g.Post("/x")`). Starting at the route call's receiver, follow:
+ *   - an identifier to the latest binding before the use (`:=`, `=`, `var`)
+ *     among the preceding statements of the enclosing blocks of the same
+ *     function (a re-bound variable uses the binding in effect at the call),
+ *   - a `recv.Group("<literal>", ...)` call to its literal prefix and receiver,
+ * until the root router (`fiber.New()`, `gin.Default()`, a parameter ...).
+ * A non-literal group prefix returns NULL: the route stays un-prefixed rather
+ * than carrying a guessed path. Groups passed across functions are not
+ * followed (parameters are roots). */
+enum { GO_GROUP_HOPS_MAX = 32 };
+
+static const char *go_string_literal_value(CBMArena *a, TSNode n, const char *source) {
+    const char *k = ts_node_type(n);
+    if (strcmp(k, "interpreted_string_literal") != 0 && strcmp(k, "raw_string_literal") != 0) {
         return NULL;
     }
-    /* parts[] is inner-first; compose outer-first. Ensure exactly one '/'
-     * between segments and a leading '/'. */
-    char buf[CBM_SZ_256];
-    size_t pos = 0;
-    for (int i = part_count - 1; i >= 0; i--) {
-        const char *seg = parts[i];
-        while (*seg == '/') {
-            seg++;
-        }
-        size_t sl = strlen(seg);
-        if (sl == 0) {
+    char *t = cbm_node_text(a, n, source);
+    size_t len = t ? strlen(t) : 0;
+    if (len < 2) {
+        return NULL;
+    }
+    t[len - 1] = '\0';
+    return t + 1;
+}
+
+/* 1 = `recv.Group("<lit>")` (receiver + literal written out), 0 = not a Group
+ * call, -1 = a Group call whose prefix is not a string literal. */
+static int go_group_call(CBMArena *a, TSNode expr, const char *source, TSNode *recv_out,
+                         const char **prefix_out) {
+    if (strcmp(ts_node_type(expr), "call_expression") != 0) {
+        return 0;
+    }
+    TSNode fn = ts_node_child_by_field_name(expr, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "selector_expression") != 0) {
+        return 0;
+    }
+    TSNode field = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+    const char *ft = ts_node_is_null(field) ? NULL : cbm_node_text(a, field, source);
+    if (!ft || strcmp(ft, "Group") != 0) {
+        return 0;
+    }
+    *recv_out = ts_node_child_by_field_name(fn, TS_FIELD("operand"));
+    TSNode args = ts_node_child_by_field_name(expr, TS_FIELD("arguments"));
+    *prefix_out = NULL;
+    if (!ts_node_is_null(args) && ts_node_named_child_count(args) > 0) {
+        *prefix_out = go_string_literal_value(a, ts_node_named_child(args, 0), source);
+    }
+    return *prefix_out ? 1 : -1;
+}
+
+/* Value bound to `name` by one var_spec (`var a, b = x, y`), or a null node. */
+static TSNode go_var_spec_binding(CBMArena *a, TSNode spec, const char *name, const char *source) {
+    TSNode none = {0};
+    TSNode value = ts_node_child_by_field_name(spec, TS_FIELD("value"));
+    if (ts_node_is_null(value)) {
+        return none;
+    }
+    uint32_t idx = 0;
+    uint32_t nc = ts_node_named_child_count(spec);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(spec, i);
+        if (strcmp(ts_node_type(c), "identifier") != 0) {
             continue;
         }
-        if (pos + sl + 2 >= sizeof(buf)) {
-            return NULL; /* oversized — leave path un-prefixed */
+        const char *t = cbm_node_text(a, c, source);
+        if (t && strcmp(t, name) == 0) {
+            return idx < ts_node_named_child_count(value) ? ts_node_named_child(value, idx) : none;
         }
-        buf[pos++] = '/';
-        memcpy(buf + pos, seg, sl);
-        pos += sl;
-        while (pos > 1 && buf[pos - 1] == '/') {
-            pos--; /* strip trailing slash per segment */
+        idx++;
+    }
+    return none;
+}
+
+/* Value bound to `name` by statement `stmt`, or a null node. */
+static TSNode go_stmt_binding(CBMArena *a, TSNode stmt, const char *name, const char *source) {
+    TSNode none = {0};
+    const char *k = ts_node_type(stmt);
+    if (strcmp(k, "var_declaration") == 0 || strcmp(k, "var_spec_list") == 0) {
+        for (uint32_t i = ts_node_named_child_count(stmt); i > 0; i--) {
+            TSNode c = ts_node_named_child(stmt, i - 1);
+            TSNode v = strcmp(ts_node_type(c), "var_spec") == 0
+                           ? go_var_spec_binding(a, c, name, source)
+                           : go_stmt_binding(a, c, name, source);
+            if (!ts_node_is_null(v)) {
+                return v;
+            }
+        }
+        return none;
+    }
+    if (strcmp(k, "short_var_declaration") != 0 && strcmp(k, "assignment_statement") != 0) {
+        return none;
+    }
+    TSNode left = ts_node_child_by_field_name(stmt, TS_FIELD("left"));
+    TSNode right = ts_node_child_by_field_name(stmt, TS_FIELD("right"));
+    if (ts_node_is_null(left) || ts_node_is_null(right)) {
+        return none;
+    }
+    uint32_t nl = ts_node_named_child_count(left);
+    for (uint32_t i = 0; i < nl; i++) {
+        const char *t = cbm_node_text(a, ts_node_named_child(left, i), source);
+        if (t && strcmp(t, name) == 0) {
+            return i < ts_node_named_child_count(right) ? ts_node_named_child(right, i) : none;
         }
     }
-    buf[pos] = '\0';
-    return pos ? cbm_arena_strndup(a, buf, pos) : NULL;
+    return none;
+}
+
+static bool go_is_function_boundary(const char *k) {
+    return strcmp(k, "function_declaration") == 0 || strcmp(k, "method_declaration") == 0 ||
+           strcmp(k, "func_literal") == 0 || strcmp(k, "source_file") == 0;
+}
+
+/* Latest binding of `name` among the statements preceding `use` in its
+ * enclosing blocks, innermost block first; a null node when none. */
+static TSNode go_find_binding(CBMArena *a, TSNode use, const char *name, const char *source) {
+    TSNode child = use;
+    TSNode cur = ts_node_parent(use);
+    while (!ts_node_is_null(cur) && !go_is_function_boundary(ts_node_type(cur))) {
+        const char *k = ts_node_type(cur);
+        if (strcmp(k, "block") == 0 || strcmp(k, "statement_list") == 0) {
+            for (TSNode s = ts_node_prev_named_sibling(child); !ts_node_is_null(s);
+                 s = ts_node_prev_named_sibling(s)) {
+                TSNode v = go_stmt_binding(a, s, name, source);
+                if (!ts_node_is_null(v)) {
+                    return v;
+                }
+            }
+        }
+        child = cur;
+        cur = ts_node_parent(cur);
+    }
+    TSNode none = {0};
+    return none;
+}
+
+static const char *go_group_prefix_for_call(CBMArena *a, TSNode call, const char *source) {
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "selector_expression") != 0) {
+        return NULL;
+    }
+    const char *parts[GO_GROUP_HOPS_MAX] = {NULL};
+    int part_count = 0;
+    TSNode recv = ts_node_child_by_field_name(fn, TS_FIELD("operand"));
+    for (int hop = 0; !ts_node_is_null(recv); hop++) {
+        if (hop >= GO_GROUP_HOPS_MAX) {
+            return NULL; /* chain too deep to trust: never a partial prefix */
+        }
+        const char *k = ts_node_type(recv);
+        if (strcmp(k, "parenthesized_expression") == 0 && ts_node_named_child_count(recv) > 0) {
+            recv = ts_node_named_child(recv, 0);
+            continue;
+        }
+        if (strcmp(k, "identifier") == 0) {
+            const char *name = cbm_node_text(a, recv, source);
+            recv = name ? go_find_binding(a, recv, name, source) : (TSNode){0};
+            continue; /* unbound (parameter, package var): root reached */
+        }
+        TSNode inner = {0};
+        const char *prefix = NULL;
+        int g = go_group_call(a, recv, source, &inner, &prefix);
+        if (g < 0) {
+            return NULL; /* dynamic prefix: do not guess */
+        }
+        if (g == 0) {
+            break; /* root router constructor or other expression */
+        }
+        parts[part_count++] = prefix; /* inner-first */
+        recv = inner;
+    }
+    return route_prefix_compose(a, parts, part_count);
+}
+
+/* Routes registered inside router groups must carry the composed path — the
+ * resolve passes only see the flat CBMCall, so the enclosing group chain can
+ * only be read here where the AST still exists. Laravel `prefix()->group()`
+ * closures (#952) and Go `x.Group("/p")` receivers (#686). Returns the route
+ * path to store (unchanged when no group prefix applies). */
+static const char *route_path_with_group_prefix(CBMExtractCtx *ctx, TSNode node,
+                                                const char *callee_name, const char *path) {
+    if (!path || path[0] != '/' || !callee_name ||
+        cbm_service_pattern_route_method(callee_name) == NULL) {
+        return path;
+    }
+    const char *gp = NULL;
+    if (ctx->language == CBM_LANG_PHP) {
+        gp = php_group_prefix_for_call(ctx->arena, node, ctx->source);
+    } else if (ctx->language == CBM_LANG_GO) {
+        gp = go_group_prefix_for_call(ctx->arena, node, ctx->source);
+    }
+    return (gp && gp[0]) ? route_path_with_prefix(ctx->arena, gp, path) : path;
 }
 
 static bool is_nested_verilog_call_wrapper(CBMLanguage lang, TSNode node) {
@@ -3940,25 +4148,9 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 args = swift_call_args(node);
             }
             if (!ts_node_is_null(args)) {
-                call.first_string_arg = extract_url_or_topic_arg(ctx, args, call.callee_name);
-                /* #952: routes registered inside Laravel `prefix()->group()`
-                 * closures must carry the composed path — the resolve passes
-                 * only see the flat CBMCall, so the enclosing chain can only
-                 * be read here where the AST still exists. */
-                if (ctx->language == CBM_LANG_PHP && call.first_string_arg &&
-                    call.first_string_arg[0] == '/' && call.callee_name &&
-                    cbm_service_pattern_route_method(call.callee_name) != NULL) {
-                    const char *gp = php_group_prefix_for_call(ctx->arena, node, ctx->source);
-                    if (gp && gp[0]) {
-                        const char *rel = call.first_string_arg;
-                        while (*rel == '/') {
-                            rel++;
-                        }
-                        call.first_string_arg =
-                            rel[0] ? cbm_arena_sprintf(ctx->arena, "%s/%s", gp, rel)
-                                   : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
-                    }
-                }
+                call.first_string_arg = route_path_with_group_prefix(
+                    ctx, node, call.callee_name,
+                    extract_url_or_topic_arg(ctx, args, call.callee_name));
                 if (call.first_string_arg && call.first_string_arg[0] == '/') {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }
