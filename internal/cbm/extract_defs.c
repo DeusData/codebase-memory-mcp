@@ -5264,8 +5264,11 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
-    if (ctx->language == CBM_LANG_RUST &&
-        strcmp(ts_node_type(child), "function_signature_item") == 0) {
+    if ((ctx->language == CBM_LANG_RUST &&
+         strcmp(ts_node_type(child), "function_signature_item") == 0) ||
+        ((ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) &&
+         (strcmp(ts_node_type(child), "method_signature") == 0 ||
+          strcmp(ts_node_type(child), "abstract_method_signature") == 0))) {
         def.is_abstract = true;
     }
 
@@ -5416,6 +5419,22 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
                 continue;
             }
             push_method_def(ctx, value, class_node, class_qn, spec, fname);
+            continue;
+        }
+
+        // TS interface members and abstract class members are signatures, not
+        // method_definition, so function_node_types skips them. Emit them as
+        // Methods so a call through an interface-typed field (NestJS token
+        // injection, #514) has a target. Class-body method_signature nodes are
+        // overloads of a real method_definition and stay skipped.
+        if ((ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) &&
+            ((strcmp(ts_node_type(child), "method_signature") == 0 &&
+              strcmp(ts_node_type(class_node), "interface_declaration") == 0) ||
+             strcmp(ts_node_type(child), "abstract_method_signature") == 0)) {
+            TSNode sname = ts_node_child_by_field_name(child, TS_FIELD("name"));
+            if (!ts_node_is_null(sname)) {
+                push_method_def(ctx, child, class_node, class_qn, spec, sname);
+            }
             continue;
         }
 

@@ -4559,6 +4559,16 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
             }
             cbm_registry_add_type(reg, rt);
         } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
+            /* Interface members are registered by ast_sweep_shapes from the
+             * AST, whose signature resolves names against this module first;
+             * the def text would type `status(): Response` as the global
+             * lib.dom Response and break chained calls. */
+            if (strcmp(d->label, "Method") == 0 && d->parent_class) {
+                const CBMRegisteredType *owner = cbm_registry_lookup_type(reg, d->parent_class);
+                if (owner && owner->is_interface) {
+                    continue;
+                }
+            }
             CBMRegisteredFunc rf;
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name;
