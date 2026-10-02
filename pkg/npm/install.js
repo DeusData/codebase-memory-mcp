@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const { pipeline } = require('stream');
 
 const REPO = 'DeusData/codebase-memory-mcp';
@@ -18,6 +18,20 @@ const MAX_REDIRECTS = 5;
 const DOWNLOAD_HOP_TIMEOUT_MS = 120_000;
 const CANDIDATE_TIMEOUT_MS = 15_000;
 const MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
+// Release archive resource limits. Keep in sync with the Go wrapper
+// (pkg/go/cmd/codebase-memory-mcp/main.go) and the PyPI wrapper (_cli.py).
+const MAX_RELEASE_ARCHIVE_BYTES = 256 * 1024 * 1024;
+const MAX_ARCHIVE_MEMBERS = 64;
+const MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024;
+const MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024;
+const DEFAULT_ARCHIVE_LIMITS = Object.freeze({
+  compressedBytes: MAX_RELEASE_ARCHIVE_BYTES,
+  members: MAX_ARCHIVE_MEMBERS,
+  memberBytes: MAX_ARCHIVE_MEMBER_BYTES,
+  expandedBytes: MAX_ARCHIVE_EXPANDED_BYTES,
+});
+// Bytes of tar's own diagnostics kept for the failure message.
+const MAX_TAR_STDERR_CHARS = 4096;
 const WINDOWS_BINARY_NAME = 'codebase-memory-mcp.exe';
 const UNIX_ARCHIVE_NAMES = [
   'codebase-memory-mcp',
@@ -90,21 +104,131 @@ function validateExactTarMemberListing(listing, expectedNames) {
   }
 }
 
-function extractExactTarArchive(
-  archivePath, destPath, expectedNames, targetName, runFile = execFileSync,
+function validateArchiveLimits(limits) {
+  if (!limits || !(limits.compressedBytes > 0) || !(limits.members > 0) ||
+      !(limits.memberBytes > 0) || !(limits.expandedBytes > 0)) {
+    throw new Error('invalid archive resource safety limits');
+  }
+}
+
+function requireCompressedArchiveWithinLimit(archivePath, limits) {
+  const status = fs.statSync(archivePath);
+  if (!status.isFile()) {
+    throw new Error('release archive is not a regular file');
+  }
+  if (status.size > limits.compressedBytes) {
+    throw new Error(
+      `release archive exceeds the ${limits.compressedBytes}-byte compressed safety limit`,
+    );
+  }
+}
+
+// Streams one member through `tar -xzOf` into a file this call creates,
+// counting every byte against the per-member limit. The file is removed only
+// when this call created it: a pre-existing target fails untouched.
+function extractTarMemberWithLimit(
+  archivePath, target, memberName, limits, spawnFile = spawn,
 ) {
+  return new Promise((resolve, reject) => {
+    let fd;
+    try {
+      fd = fs.openSync(target, 'wx', 0o600);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let written = 0;
+    let failure = null;
+    let settled = false;
+    let stderr = '';
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      try { fs.closeSync(fd); } catch (closeError) { err = err || closeError; }
+      if (err) {
+        try { fs.unlinkSync(target); } catch (_) { /* already gone */ }
+        reject(err);
+        return;
+      }
+      resolve(written);
+    };
+    const child = spawnFile('tar', ['-xzOf', archivePath, memberName], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const fail = (err) => {
+      if (failure) return;
+      failure = err;
+      child.kill();
+    };
+    child.stdout.on('data', (chunk) => {
+      if (failure) return;
+      written += chunk.length;
+      if (written > limits.memberBytes) {
+        fail(new Error(
+          `archive member ${JSON.stringify(memberName)} exceeds the ${limits.memberBytes}-byte expanded safety limit`,
+        ));
+        return;
+      }
+      try {
+        let offset = 0;
+        while (offset < chunk.length) {
+          offset += fs.writeSync(fd, chunk, offset, chunk.length - offset);
+        }
+      } catch (err) {
+        fail(err);
+      }
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (text) => {
+      if (stderr.length < MAX_TAR_STDERR_CHARS) stderr += text;
+    });
+    child.on('error', (err) => {
+      failure = failure || err;
+      // A process that never started (no tar on PATH) has no exit to wait for.
+      if (child.pid === undefined) finish(failure);
+    });
+    child.on('close', (code, signal) => {
+      const detail = stderr.trim();
+      let err = failure;
+      if (!err && signal) {
+        err = new Error(
+          `tar was terminated by ${signal} while extracting ${memberName}: ${detail}`,
+        );
+      } else if (!err && code !== 0) {
+        err = new Error(
+          `tar exited with status ${code} while extracting ${memberName}: ${detail}`,
+        );
+      } else if (!err && written === 0) {
+        err = new Error(`archive member ${memberName} is empty`);
+      }
+      finish(err);
+    });
+  });
+}
+
+async function extractExactTarArchive(
+  archivePath, destPath, expectedNames, targetName,
+  runFile = execFileSync, limits = DEFAULT_ARCHIVE_LIMITS, spawnFile = spawn,
+) {
+  validateArchiveLimits(limits);
+  requireCompressedArchiveWithinLimit(archivePath, limits);
+  // The exact root namespace is the member bound: its four names lie well
+  // within MAX_ARCHIVE_MEMBERS, which the zip path enforces by count.
+  if (expectedNames.length > limits.members) {
+    throw new Error(`archive namespace exceeds the ${limits.members}-member safety limit`);
+  }
   const listing = runFile('tar', ['-tzf', archivePath], {
     encoding: 'utf8',
     maxBuffer: MAX_CHECKSUM_MANIFEST_BYTES,
     windowsHide: true,
   });
   validateExactTarMemberListing(listing, expectedNames);
-  // Extract only the fixed root executable. Even a malformed tar implementation
-  // cannot write an unvalidated companion member outside the private temp tree.
-  runFile('tar', ['-xzf', archivePath, '-C', destPath, targetName], {
-    stdio: 'inherit',
-    windowsHide: true,
-  });
+  // Only the fixed root executable is ever written, through the counted
+  // writer; the companions are listed but never extracted.
+  const target = path.join(destPath, targetName);
+  await extractTarMemberWithLimit(archivePath, target, targetName, limits, spawnFile);
+  fs.chmodSync(target, 0o755);
 }
 
 function downloadHop(url, dest, maxBytes) {
@@ -123,7 +247,11 @@ function downloadHop(url, dest, maxBytes) {
 
     const req = https.get(url, (res) => {
       response = res;
-      res.on('error', (err) => finish(err));
+      let piped = false;
+      // Before the body is piped, a response error ends the hop directly;
+      // afterwards the pipeline reports it, so the partial file is discarded
+      // before the hop settles.
+      res.on('error', (err) => { if (!piped) finish(err); });
       const redirectCodes = new Set([301, 302, 303, 307, 308]);
       if (redirectCodes.has(res.statusCode)) {
         const location = res.headers.location;
@@ -149,6 +277,12 @@ function downloadHop(url, dest, maxBytes) {
         finish(new Error(`HTTP ${res.statusCode} for ${url}`));
         return;
       }
+      const declared = Number(res.headers['content-length']);
+      if (maxBytes && Number.isFinite(declared) && declared > maxBytes) {
+        res.destroy();
+        finish(new Error(`Download exceeds the ${maxBytes}-byte safety limit`));
+        return;
+      }
 
       let received = 0;
       res.on('data', (chunk) => {
@@ -158,8 +292,20 @@ function downloadHop(url, dest, maxBytes) {
         }
       });
       const file = fs.createWriteStream(dest, { flags: 'w' });
+      piped = true;
       pipeline(res, file, (err) => {
-        finish(err, { redirect: null });
+        if (!err) {
+          finish(null, { redirect: null });
+          return;
+        }
+        // Discard the partial file once its handle is closed (Windows refuses
+        // to unlink an open file), then report the failure.
+        const discard = () => {
+          try { fs.unlinkSync(dest); } catch (_) { /* nothing was written */ }
+          finish(err);
+        };
+        if (file.closed) discard();
+        else file.once('close', discard);
       });
     });
     req.on('error', (err) => finish(err));
@@ -457,19 +603,37 @@ function installWindowsBinaryAtomically(sourceDir, destDir, verifier = verifyCan
   }
 }
 
-function extractZipOnWindows(archivePath, destPath, requiredNames, extractNames) {
+function extractZipOnWindows(
+  archivePath, destPath, requiredNames, extractNames,
+  limits = DEFAULT_ARCHIVE_LIMITS, shell = 'powershell',
+) {
+  validateArchiveLimits(limits);
+  requireCompressedArchiveWithinLimit(archivePath, limits);
   // -EncodedCommand is a constant program. Paths travel only through the child
   // environment and are consumed with -LiteralPath, so PowerShell never parses
   // user/TEMP path bytes as source code or wildcard syntax.
   const script = [
     "$ErrorActionPreference = 'Stop'",
     'Add-Type -AssemblyName System.IO.Compression.FileSystem',
+    '$maxMembers = [int]$env:CBM_NPM_MAX_MEMBERS',
+    '$maxMemberBytes = [long]$env:CBM_NPM_MAX_MEMBER_BYTES',
+    '$maxExpandedBytes = [long]$env:CBM_NPM_MAX_EXPANDED_BYTES',
+    '$memberCount = 0',
+    '$declaredExpanded = [long]0',
     '$zip = [System.IO.Compression.ZipFile]::OpenRead($env:CBM_NPM_ARCHIVE_PATH)',
     "$seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)",
     "$requiredNames = @($env:CBM_NPM_REQUIRED_NAMES.Split('|'))",
     '$targetCounts = @{}',
     'foreach ($requiredName in $requiredNames) { $targetCounts[$requiredName] = 0 }',
     'try { foreach ($entry in $zip.Entries) { ' +
+      '$memberCount = $memberCount + 1; ' +
+      'if ($memberCount -gt $maxMembers) { ' +
+      'throw "archive exceeds the $maxMembers-member safety limit" }; ' +
+      'if ($entry.Length -gt $maxMemberBytes) { ' +
+      'throw "archive member $($entry.FullName) exceeds the $maxMemberBytes-byte expanded safety limit" }; ' +
+      'if ($declaredExpanded -gt ($maxExpandedBytes - $entry.Length)) { ' +
+      'throw "archive exceeds the $maxExpandedBytes-byte aggregate expanded safety limit" }; ' +
+      '$declaredExpanded = $declaredExpanded + $entry.Length; ' +
       "$name = $entry.FullName.Replace('\\', '/'); " +
       "$directory = $name.EndsWith('/'); " +
       "$segmentsPath = if ($directory) { $name.TrimEnd('/') } else { $name }; " +
@@ -491,27 +655,61 @@ function extractZipOnWindows(archivePath, destPath, requiredNames, extractNames)
     'if ($seen.Count -ne $requiredNames.Count) { ' +
       'throw "archive does not match the exact release root-file allowlist" }',
     "$extractNames = @($env:CBM_NPM_EXTRACT_NAMES.Split('|'))",
+    '$actualExpanded = [long]0',
+    '$buffer = New-Object byte[] 65536',
     '$extractZip = [System.IO.Compression.ZipFile]::OpenRead($env:CBM_NPM_ARCHIVE_PATH)',
+    // Copy by hand with a byte counter: ExtractToFile would write whatever the
+    // compressed stream yields, regardless of the declared size.
     'try { foreach ($extractName in $extractNames) { ' +
       '$entry = @($extractZip.Entries | Where-Object { $_.FullName -ceq $extractName })[0]; ' +
-      '[System.IO.Compression.ZipFileExtensions]::ExtractToFile(' +
-      '$entry, (Join-Path $env:CBM_NPM_DEST_PATH $extractName), $false) ' +
+      '$targetPath = Join-Path $env:CBM_NPM_DEST_PATH $extractName; ' +
+      '$remaining = $maxExpandedBytes - $actualExpanded; ' +
+      '$copied = [long]0; ' +
+      '$source = $entry.Open(); ' +
+      '$target = [System.IO.File]::Open($targetPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write); ' +
+      'try { while ($true) { ' +
+      '$count = $source.Read($buffer, 0, $buffer.Length); ' +
+      'if ($count -le 0) { break }; ' +
+      '$copied = $copied + $count; ' +
+      'if ($copied -gt $maxMemberBytes) { ' +
+      'throw "archive member $extractName exceeds the $maxMemberBytes-byte actual expanded safety limit" }; ' +
+      'if ($copied -gt $remaining) { ' +
+      'throw "archive exceeds the $maxExpandedBytes-byte aggregate actual expanded safety limit" }; ' +
+      '$target.Write($buffer, 0, $count) } ' +
+      '} catch { $target.Dispose(); ' +
+      'Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue; throw ' +
+      '} finally { $target.Dispose(); $source.Dispose() }; ' +
+      'if ($copied -ne $entry.Length) { ' +
+      'Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue; ' +
+      'throw "archive member $extractName actual size $copied does not match declared size $($entry.Length)" }; ' +
+      '$actualExpanded = $actualExpanded + $copied ' +
       '} } finally { $extractZip.Dispose() }',
   ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
-  execFileSync('powershell', [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded,
-  ], {
-    env: {
-      ...process.env,
-      CBM_NPM_ARCHIVE_PATH: archivePath,
-      CBM_NPM_DEST_PATH: destPath,
-      CBM_NPM_REQUIRED_NAMES: requiredNames.join('|'),
-      CBM_NPM_EXTRACT_NAMES: extractNames.join('|'),
-    },
-    stdio: 'inherit',
-    windowsHide: true,
-  });
+  try {
+    execFileSync(shell, [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded,
+    ], {
+      env: {
+        ...process.env,
+        CBM_NPM_ARCHIVE_PATH: archivePath,
+        CBM_NPM_DEST_PATH: destPath,
+        CBM_NPM_REQUIRED_NAMES: requiredNames.join('|'),
+        CBM_NPM_EXTRACT_NAMES: extractNames.join('|'),
+        CBM_NPM_MAX_MEMBERS: String(limits.members),
+        CBM_NPM_MAX_MEMBER_BYTES: String(limits.memberBytes),
+        CBM_NPM_MAX_EXPANDED_BYTES: String(limits.expandedBytes),
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'inherit', 'pipe'],
+      windowsHide: true,
+    });
+  } catch (err) {
+    // Surface the script's own reason (for example which limit was hit)
+    // instead of a bare "Command failed".
+    const detail = err && err.stderr ? String(err.stderr).trim() : '';
+    throw new Error(detail ? `zip extraction failed: ${detail}` : err.message);
+  }
 }
 
 // Fetch checksums.txt and verify the archive hash.
@@ -592,12 +790,12 @@ async function main() {
   const tmpArchive = path.join(tmpDir, `cbm.${ext}`);
 
   try {
-    await download(url, tmpArchive);
+    await download(url, tmpArchive, MAX_RELEASE_ARCHIVE_BYTES);
     await verifyChecksum(tmpArchive, archive);
 
     // Validate the complete archive namespace, then extract only executables.
     if (ext === 'tar.gz') {
-      extractExactTarArchive(
+      await extractExactTarArchive(
         tmpArchive, tmpDir, archiveNames, binName,
       );
     } else {
@@ -674,9 +872,13 @@ if (require.main === module || module.parent == null) {
 }
 
 module.exports = {
+  DEFAULT_ARCHIVE_LIMITS,
   UNIX_ARCHIVE_NAMES,
+  WINDOWS_ARCHIVE_NAMES,
   WINDOWS_BINARY_NAME,
+  download,
   extractExactTarArchive,
+  extractZipOnWindows,
   installWindowsBinaryAtomically,
   validateExactTarMemberListing,
   windowsBinaryReady,

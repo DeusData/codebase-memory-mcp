@@ -13,6 +13,7 @@ const {
   installWindowsBinaryAtomically,
   validateExactTarMemberListing,
 } = require('../install.js');
+const { TAR_PATH_SKIP, writeTarGz } = require('./archive-fixtures.js');
 
 function exactUnixListing(extra = []) {
   return [...UNIX_ARCHIVE_NAMES, ...extra].join('\n') + '\n';
@@ -33,23 +34,37 @@ test('Unix archive validation rejects traversal and unexpected members', () => {
   );
 });
 
-test('Unix extraction requests only the validated root executable', () => {
-  const calls = [];
-  const runner = (command, args) => {
-    calls.push({ command, args: [...args] });
-    return calls.length === 1 ? exactUnixListing() : Buffer.alloc(0);
-  };
+test('Unix extraction lists through the system tar and writes only the root executable', { skip: TAR_PATH_SKIP }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-npm-extract-test-'));
+  try {
+    const archive = writeTarGz(
+      root, 'release.tar.gz',
+      UNIX_ARCHIVE_NAMES.map((name) => ({ name, data: `member:${name}` })),
+    );
+    const destination = path.join(root, 'extract');
+    fs.mkdirSync(destination);
+    const calls = [];
+    const runner = (command, args) => {
+      calls.push({ command, args: [...args] });
+      return exactUnixListing();
+    };
 
-  extractExactTarArchive(
-    '/tmp/release.tar.gz', '/tmp/extract', UNIX_ARCHIVE_NAMES,
-    'codebase-memory-mcp', runner,
-  );
+    await extractExactTarArchive(
+      archive, destination, UNIX_ARCHIVE_NAMES, 'codebase-memory-mcp', runner,
+    );
 
-  assert.deepEqual(calls[0].args, ['-tzf', '/tmp/release.tar.gz']);
-  assert.deepEqual(
-    calls[1].args,
-    ['-xzf', '/tmp/release.tar.gz', '-C', '/tmp/extract', 'codebase-memory-mcp'],
-  );
+    // The listing runner sees the namespace query only; the executable is
+    // written by the counted `tar -xzOf` writer, never by `tar -x` into the
+    // tree, so the companions never touch the disk.
+    assert.deepEqual(calls.map((call) => call.args), [['-tzf', archive]]);
+    assert.equal(
+      fs.readFileSync(path.join(destination, 'codebase-memory-mcp'), 'utf8'),
+      'member:codebase-memory-mcp',
+    );
+    assert.deepEqual(fs.readdirSync(destination), ['codebase-memory-mcp']);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function writeBinary(directory, tag) {
