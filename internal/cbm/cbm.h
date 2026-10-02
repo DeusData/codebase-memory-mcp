@@ -734,6 +734,14 @@ typedef struct {
      * pointer (doclink.c), so a definition's doc references get exact source
      * lines. NULL until the first doc; allocated in `scratch`. */
     void *doc_lines;
+    /* A per-file slot for the language's doc-link hooks (parse_doc and
+     * scan_scope, internal/cbm/doclink_<lang>.c): state that has to survive
+     * between the hook calls of ONE file, e.g. an index of the file's doc
+     * sections. NULL at the start of every file. What a hook stores here must
+     * be allocated in `scratch` (or `arena`), so that it ends with the file.
+     * The core never reads, interprets or frees it. It is the only place for
+     * such state: a static or thread-local cache is not. */
+    void *doclink_state;
 } CBMExtractCtx;
 
 // --- Public API ---

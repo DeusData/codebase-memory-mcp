@@ -54,7 +54,12 @@ const char *cbm_doclink_reason_name(int reason);
 typedef enum {
     CBM_DOCLINK_EDGE = 0,   /* target set: one MENTIONS edge */
     CBM_DOCLINK_UNRESOLVED, /* reason set: one doc_link_unresolved row */
-    CBM_DOCLINK_LOCAL,      /* names the definition's own parameter: neither */
+    /* Neither an edge nor a row: what the parser took for a reference is no
+     * reference to code elsewhere. It names the definition's own parameter or
+     * type parameter, or it is text the language's doc tool renders as plain
+     * text, which only the resolver can tell (it needs the index). Counted as
+     * `local` in the doc_links.done log line, and nowhere in index_status. */
+    CBM_DOCLINK_LOCAL,
 } cbm_doclink_kind_t;
 
 typedef struct {

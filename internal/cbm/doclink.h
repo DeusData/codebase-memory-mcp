@@ -22,6 +22,8 @@
  *                       identical on full and incremental runs. Optional.
  *       scope_tag,      the blob's tag line and its persisted form (line
  *       portable_scope  numbers dropped). Optional.
+ *     State a language's hooks need between their calls for one file lives in
+ *     ctx->doclink_state (cbm.h), never in a static or thread-local.
  * A language without a row produces no tokens and no scope. The resolving
  * half's hooks are a cbm_doclink_resolver_t (src/pipeline/doc_links.h).
  */
