@@ -145,12 +145,19 @@ bool cbm_workspace_manifest_read(const char *project_root, cbm_ws_manifest_t *ou
 bool cbm_workspace_manifest_is_approved(const char *cache_dir, const char *project_root,
                                         const cbm_ws_manifest_t *manifest);
 
-/* Record approval for the manifest currently on disk. Refuses when a requested
- * entry would not be allowable as a root on its own — approving a manifest must
- * not become a way around the breadth policy. */
+/* Record approval for the manifest currently on disk. Each entry is judged in
+ * its resolved form (links followed, `..` collapsed), since that is the
+ * directory that would be indexed; an entry that is relative, does not exist
+ * or is not a directory is refused, as is one that would not be allowable as a
+ * root on its own — approving a manifest must not become a way around the
+ * breadth policy. err names the entry as written and, when it differs, the
+ * directory it resolves to. */
 bool cbm_workspace_manifest_approve(const char *cache_dir, const char *home_dir,
                                     const char *project_root, char *err, size_t err_sz);
 
-/* True when candidate is at or below an APPROVED manifest entry of project_root. */
+/* True when candidate is at or below an APPROVED manifest entry of project_root.
+ * Entries are resolved and classified again here: approval binds to the
+ * manifest text, and where an entry leads is read at the time it is used. An
+ * entry that no longer resolves matches nothing. */
 bool cbm_workspace_manifest_allows(const char *cache_dir, const char *home_dir,
                                    const char *project_root, const char *candidate);
