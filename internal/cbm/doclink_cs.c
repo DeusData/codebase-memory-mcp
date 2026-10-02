@@ -49,6 +49,7 @@
 #include "tree_sitter/api.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -378,40 +379,38 @@ static void cs_drop_attributes(cs_str_t *t) {
 static void cs_unwrap_nullable(cs_str_t *t) {
     static const char *const prefixes[] = {"global::System.Nullable", "System.Nullable",
                                            "Nullable"};
-    for (;;) {
-        bool changed = false;
-        for (size_t pi = 0; pi < sizeof(prefixes) / sizeof(prefixes[0]) && !changed; pi++) {
+    /* one pass: what an unwrapped group leaves at its place is looked at
+     * again (Nullable<Nullable<X>>), the text before it never is */
+    for (size_t i = 0; i < t->len;) {
+        bool unwrapped = false;
+        bool boundary = i == 0 || !(cs_ident_char(t->s[i - SKIP_ONE]) ||
+                                    t->s[i - SKIP_ONE] == '.' || t->s[i - SKIP_ONE] == ':');
+        for (size_t pi = 0; boundary && !unwrapped && pi < sizeof(prefixes) / sizeof(prefixes[0]);
+             pi++) {
             size_t pl = strlen(prefixes[pi]);
-            for (size_t i = 0; i + pl <= t->len; i++) {
-                if (memcmp(t->s + i, prefixes[pi], pl) != 0) {
-                    continue;
-                }
-                if (i > 0 && (cs_ident_char(t->s[i - SKIP_ONE]) || t->s[i - SKIP_ONE] == '.' ||
-                              t->s[i - SKIP_ONE] == ':')) {
-                    continue;
-                }
-                size_t j = i + pl;
-                while (j < t->len && t->s[j] == ' ') {
-                    j++;
-                }
-                if (j >= t->len || (t->s[j] != '<' && t->s[j] != '{')) {
-                    continue;
-                }
-                size_t e = cs_group_end(t, j);
-                if (e > t->len || e <= j + SKIP_ONE) {
-                    continue;
-                }
-                /* keep the inner text */
-                size_t inner_len = e - j - PAIR_LEN;
-                memmove(t->s + i, t->s + j + SKIP_ONE, inner_len);
-                memmove(t->s + i + inner_len, t->s + e, t->len - e + SKIP_ONE);
-                t->len = i + inner_len + (t->len - e);
-                changed = true;
-                break;
+            if (i + pl > t->len || memcmp(t->s + i, prefixes[pi], pl) != 0) {
+                continue;
             }
+            size_t j = i + pl;
+            while (j < t->len && t->s[j] == ' ') {
+                j++;
+            }
+            if (j >= t->len || (t->s[j] != '<' && t->s[j] != '{')) {
+                continue;
+            }
+            size_t e = cs_group_end(t, j);
+            if (e > t->len || e <= j + SKIP_ONE) {
+                continue;
+            }
+            /* keep the inner text */
+            size_t inner_len = e - j - PAIR_LEN;
+            memmove(t->s + i, t->s + j + SKIP_ONE, inner_len);
+            memmove(t->s + i + inner_len, t->s + e, t->len - e + SKIP_ONE);
+            t->len = i + inner_len + (t->len - e);
+            unwrapped = true;
         }
-        if (!changed) {
-            return;
+        if (!unwrapped) {
+            i++;
         }
     }
 }
@@ -472,30 +471,39 @@ static void cs_drop_backtick_arity(cs_str_t *t) {
     }
 }
 
-/* Remove every <...> and {...} group, innermost first. */
+enum { CS_NORM_WORK = 512 };
+
+/* Remove every <...> and {...} group. An opener pairs with the next closer of
+ * its own kind that no unpaired opener stands before (`<` with `>`, `{` with
+ * `}`), so groups nest; what does not pair stays. Two passes over the text:
+ * pair, then copy what is outside. */
 static void cs_drop_type_args(cs_str_t *t) {
-    for (;;) {
-        bool changed = false;
-        for (size_t i = 0; i < t->len; i++) {
-            char c = t->s[i];
-            if (c != '<' && c != '{') {
-                continue;
-            }
-            char close = c == '<' ? '>' : '}';
-            size_t k = i + SKIP_ONE;
-            while (k < t->len && t->s[k] != '<' && t->s[k] != '{' && t->s[k] != close) {
-                k++;
-            }
-            if (k < t->len && t->s[k] == close) {
-                cs_cut(t, i, k + SKIP_ONE);
-                changed = true;
-                break;
-            }
-        }
-        if (!changed) {
-            return;
+    uint16_t past[CS_NORM_WORK]; /* for a paired opener: index just past its closer */
+    uint16_t open[CS_NORM_WORK];
+    size_t depth = 0;
+    if (t->len >= CS_NORM_WORK) {
+        return;
+    }
+    for (size_t i = 0; i < t->len; i++) {
+        char c = t->s[i];
+        past[i] = 0;
+        if (c == '<' || c == '{') {
+            open[depth++] = (uint16_t)i;
+        } else if (depth > 0 && ((c == '>' && t->s[open[depth - SKIP_ONE]] == '<') ||
+                                 (c == '}' && t->s[open[depth - SKIP_ONE]] == '{'))) {
+            past[open[--depth]] = (uint16_t)(i + SKIP_ONE);
         }
     }
+    size_t w = 0;
+    for (size_t i = 0; i < t->len;) {
+        if (past[i]) {
+            i = past[i];
+        } else {
+            t->s[w++] = t->s[i++];
+        }
+    }
+    t->s[w] = '\0';
+    t->len = w;
 }
 
 static const char *cs_bcl_alias(const char *base, size_t len) {
@@ -516,8 +524,6 @@ static const char *cs_bcl_alias(const char *base, size_t len) {
     }
     return NULL;
 }
-
-enum { CS_NORM_WORK = 512 };
 
 size_t cbm_doclink_cs_norm_type(const char *in, size_t len, char *out, size_t cap) {
     if (!out || cap == 0) {
@@ -646,13 +652,23 @@ typedef struct {
     char kind;    /* N namespace; c s i e r as for types */
 } cs_head_t;
 
+/* An open brace while the braces are paired. The open braces form a stack
+ * that is never copied: every open brace is one entry that names the one
+ * below it, so "the stack as it stood at the #if" is a single index, however
+ * deep the nesting, and going back to it costs nothing. */
+typedef struct {
+    int brace; /* its entry in the brace list */
+    int below; /* the open brace under it, or CBM_NOT_FOUND */
+} cs_open_t;
+
 /* An open #if while the braces are paired. */
 typedef struct {
-    int *at_if; /* the open braces where the #if stands */
+    int at_if; /* the top open brace where the #if stands (CBM_NOT_FOUND: none) */
     int n_if;
-    int *end1; /* ... and where its first branch ended; NULL until an #else */
+    int end1; /* ... and where its first branch ended; valid once has_end1 */
     int n_end1;
-    int mark; /* its entry in the brace list */
+    bool has_end1; /* an #else was seen */
+    int mark;      /* its entry in the brace list */
 } cs_pp_t;
 
 enum {
@@ -665,6 +681,7 @@ enum {
     CS_PP_MAX = 32,           /* nested #if */
     CS_CHAR_LITERAL_MAX = 12, /* '\U0010FFFF' */
     CS_RAW_QUOTES = 3,        /* """ */
+    CS_LEX_MAX_NEST = 64,     /* interpolated strings inside interpolation holes */
 };
 
 /* One declaration of the file. `node` is the declaration (a field's
@@ -703,13 +720,17 @@ typedef struct {
     cs_head_t *heads;
     int nheads;
     int cap_heads;
-    int *stack; /* brace pairing: the open braces */
-    int sp;
-    int cap_stack;
+    cs_open_t *open; /* brace pairing: every brace that was ever open */
+    int nopen;
+    int cap_open;
+    int top; /* the innermost open brace (index into open), or CBM_NOT_FOUND */
+    int sp;  /* how many are open */
     cs_pp_t pp[CS_PP_MAX];
     int npp;
     uint32_t row_pos; /* row cursor: the row of byte row_pos is `row` */
     uint32_t row;
+    uint64_t cost_steps;    /* source positions the text readers looked at */
+    uint64_t cost_bytes;    /* bytes taken from the scratch arena */
     bool failed;            /* out of memory */
     bool lexical;           /* the tree has parse errors: nesting is read from the braces */
     uint32_t untrusted;     /* byte offset from which the braces do not pair up */
@@ -727,12 +748,96 @@ enum {
     CS_TPARAMS_SCAN_MAX = 1024,
 };
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic uint64_t cs_cost_text_steps;
+static _Atomic uint64_t cs_cost_scratch_bytes;
+
+void cbm_doclink_cs_test_cost_reset(void) {
+    atomic_store(&cs_cost_text_steps, 0);
+    atomic_store(&cs_cost_scratch_bytes, 0);
+}
+
+void cbm_doclink_cs_test_cost(uint64_t *text_steps, uint64_t *scratch_bytes) {
+    *text_steps = atomic_load(&cs_cost_text_steps);
+    *scratch_bytes = atomic_load(&cs_cost_scratch_bytes);
+}
+#endif
+
+/* Hand a finished scan's cost to the test seam (nothing in a product build). */
+static void cs_cost_publish(const cs_scan_t *s) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add(&cs_cost_text_steps, s->cost_steps);
+    atomic_fetch_add(&cs_cost_scratch_bytes, s->cost_bytes);
+#else
+    (void)s;
+#endif
+}
+
 static bool cs_kind_is(TSNode n, const char *kind) {
     return strcmp(ts_node_type(n), kind) == 0;
 }
 
 static TSNode cs_field(TSNode n, const char *field) {
     return ts_node_child_by_field_name(n, field, (uint32_t)strlen(field));
+}
+
+/* The children of a node, in order. ts_node_child(n, i) walks from the first
+ * child on every call, so a loop over i costs the square of the child count
+ * (a parameter list, a base list and a class body are as long as the file
+ * makes them); a cursor steps from one child to the next. */
+typedef struct {
+    TSTreeCursor cur;
+    bool started;
+    bool done;
+} cs_kids_t;
+
+static cs_kids_t cs_kids(TSNode parent) {
+    return (cs_kids_t){.cur = ts_tree_cursor_new(parent)};
+}
+
+/* The next child, named or not; false after the last one. */
+static bool cs_kids_next(cs_kids_t *k, TSNode *out) {
+    if (k->done) {
+        return false;
+    }
+    bool moved = k->started ? ts_tree_cursor_goto_next_sibling(&k->cur)
+                            : ts_tree_cursor_goto_first_child(&k->cur);
+    k->started = true;
+    if (!moved) {
+        k->done = true;
+        return false;
+    }
+    *out = ts_tree_cursor_current_node(&k->cur);
+    return true;
+}
+
+/* The next NAMED child; false after the last one. */
+static bool cs_kids_next_named(cs_kids_t *k, TSNode *out) {
+    while (cs_kids_next(k, out)) {
+        if (ts_node_is_named(*out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cs_kids_end(cs_kids_t *k) {
+    ts_tree_cursor_delete(&k->cur);
+}
+
+/* The first named child of `n` of kind `kind`; a null node when it has none. */
+static TSNode cs_child_of_kind(TSNode n, const char *kind) {
+    TSNode found = {0};
+    cs_kids_t k = cs_kids(n);
+    TSNode c;
+    while (cs_kids_next_named(&k, &c)) {
+        if (strcmp(ts_node_type(c), kind) == 0) {
+            found = c;
+            break;
+        }
+    }
+    cs_kids_end(&k);
+    return found;
 }
 
 /* A declaration's type_parameter_list: a named field in some grammar
@@ -742,14 +847,7 @@ static TSNode cs_type_params(TSNode decl) {
     if (!ts_node_is_null(tp)) {
         return tp;
     }
-    uint32_t nc = ts_node_named_child_count(decl);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_named_child(decl, i);
-        if (strcmp(ts_node_type(c), "type_parameter_list") == 0) {
-            return c;
-        }
-    }
-    return (TSNode){0};
+    return cs_child_of_kind(decl, "type_parameter_list");
 }
 
 /* Node text without whitespace and without verbatim '@' markers, appended to
@@ -781,6 +879,7 @@ static void cs_put_text_nows(cs_scan_t *s, TSNode n) {
 }
 
 static void *cs_tmp_alloc(cs_scan_t *s, size_t n) {
+    s->cost_bytes += n;
     void *p = cbm_arena_alloc(s->tmp, n ? n : SKIP_ONE);
     if (!p) {
         s->failed = true;
@@ -852,9 +951,9 @@ static void cs_put_tparams(cs_scan_t *s, TSNode list) {
         return;
     }
     bool first = true;
-    uint32_t nc = ts_node_named_child_count(list);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode tp = ts_node_named_child(list, i);
+    cs_kids_t k = cs_kids(list);
+    TSNode tp;
+    while (cs_kids_next_named(&k, &tp)) {
         if (!cs_kind_is(tp, "type_parameter")) {
             continue;
         }
@@ -868,6 +967,7 @@ static void cs_put_tparams(cs_scan_t *s, TSNode list) {
         cs_put_text_nows(s, nm);
         first = false;
     }
+    cs_kids_end(&k);
 }
 
 static void cs_put_sig(cs_scan_t *s, TSNode params) {
@@ -876,9 +976,9 @@ static void cs_put_sig(cs_scan_t *s, TSNode params) {
     }
     const char *src = s->ctx->source;
     bool first = true;
-    uint32_t nc = ts_node_child_count(params);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode p = ts_node_child(params, i);
+    cs_kids_t k = cs_kids(params);
+    TSNode p;
+    while (cs_kids_next(&k, &p)) {
         /* A parameter is a `parameter` node -- except the `params` one, which
          * the grammar leaves inline in the list: its type is the list's own
          * "type" field. */
@@ -886,7 +986,7 @@ static void cs_put_sig(cs_scan_t *s, TSNode params) {
         if (cs_kind_is(p, "parameter")) {
             ty = cs_field(p, "type");
         } else {
-            const char *field = ts_node_field_name_for_child(params, i);
+            const char *field = ts_tree_cursor_current_field_name(&k.cur);
             if (!field || strcmp(field, "type") != 0) {
                 continue;
             }
@@ -906,16 +1006,11 @@ static void cs_put_sig(cs_scan_t *s, TSNode params) {
         sb_puts(&s->sb, norm);
         first = false;
     }
+    cs_kids_end(&k);
 }
 
 static bool cs_has_child_kind(TSNode n, const char *kind) {
-    uint32_t nc = ts_node_named_child_count(n);
-    for (uint32_t i = 0; i < nc; i++) {
-        if (cs_kind_is(ts_node_named_child(n, i), kind)) {
-            return true;
-        }
-    }
-    return false;
+    return !ts_node_is_null(cs_child_of_kind(n, kind));
 }
 
 static char cs_type_kind(const char *k) {
@@ -997,32 +1092,35 @@ static int cs_brace_push(cs_scan_t *s, uint32_t pos, char kind) {
     return s->nbraces++;
 }
 
-static bool cs_stack_reserve(cs_scan_t *s, int n) {
-    if (n <= s->cap_stack) {
-        return true;
+/* Brace `b` is open now: it goes on top of the open braces. */
+static bool cs_open_push(cs_scan_t *s, int b) {
+    if (s->nopen >= s->cap_open) {
+        int ncap = s->cap_open ? s->cap_open * PAIR_LEN : CS_HEADS_INIT;
+        cs_open_t *grown = (cs_open_t *)cs_tmp_alloc(s, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        if (s->nopen > 0) {
+            memcpy(grown, s->open, (size_t)s->nopen * sizeof(*grown));
+        }
+        s->open = grown;
+        s->cap_open = ncap;
     }
-    int ncap = s->cap_stack ? s->cap_stack : CS_HEADS_INIT;
-    while (ncap < n) {
-        ncap *= PAIR_LEN;
-    }
-    int *grown = (int *)cs_tmp_alloc(s, (size_t)ncap * sizeof(int));
-    if (!grown) {
-        return false;
-    }
-    if (s->sp > 0) {
-        memcpy(grown, s->stack, (size_t)s->sp * sizeof(int));
-    }
-    s->stack = grown;
-    s->cap_stack = ncap;
+    s->open[s->nopen] = (cs_open_t){.brace = b, .below = s->top};
+    s->top = s->nopen++;
+    s->sp++;
     return true;
 }
 
-static void cs_mark_untrusted(cs_scan_t *s, int brace) {
-    const cs_brace_t *b = &s->braces[brace];
-    if (b->pos < s->untrusted) {
-        s->untrusted = b->pos;
-        s->untrusted_row = b->row;
+static void cs_mark_untrusted_at(cs_scan_t *s, uint32_t pos, uint32_t row) {
+    if (pos < s->untrusted) {
+        s->untrusted = pos;
+        s->untrusted_row = row;
     }
+}
+
+static void cs_mark_untrusted(cs_scan_t *s, int brace) {
+    cs_mark_untrusted_at(s, s->braces[brace].pos, s->braces[brace].row);
 }
 
 /* The scanner reports a brace: pair it. */
@@ -1033,13 +1131,13 @@ static void cs_lex_brace(void *ud, uint32_t pos, bool open) {
         return;
     }
     if (open) {
-        if (cs_stack_reserve(s, s->sp + SKIP_ONE)) {
-            s->stack[s->sp++] = b;
-        }
-    } else if (s->sp == 0) {
+        (void)cs_open_push(s, b);
+    } else if (s->top < 0) {
         cs_mark_untrusted(s, b); /* closes nothing */
     } else {
-        int o = s->stack[--s->sp];
+        int o = s->open[s->top].brace;
+        s->top = s->open[s->top].below;
+        s->sp--;
         if (s->braces[o].match < 0) {
             s->braces[o].match = b; /* the first branch's close stands */
         }
@@ -1048,28 +1146,25 @@ static void cs_lex_brace(void *ud, uint32_t pos, bool open) {
     s->braces[b].depth = s->sp;
 }
 
-static int *cs_stack_copy(cs_scan_t *s) {
-    int *copy = (int *)cs_tmp_alloc(s, (size_t)(s->sp + SKIP_ONE) * sizeof(int));
-    if (copy && s->sp > 0) {
-        memcpy(copy, s->stack, (size_t)s->sp * sizeof(int));
-    }
-    return copy;
-}
-
 /* A later branch of a conditional ended. Where it leaves the same blocks
  * open as the first one did, its open braces stand in for the first
  * branch's (`class X : A {` / `#else` / `class X : B {` share one closing
  * brace). Where the branches disagree the first one stands alone: a file
  * can balance per configuration only (`#if A {` ... `#if A }`), and the
- * braces left over at the end say whether this one does. */
+ * braces left over at the end say whether this one does.
+ *
+ * The two stacks share everything below the first entry they have in common,
+ * so only the braces the branches opened themselves are walked. */
 static void cs_branch_merge(cs_scan_t *s, const cs_pp_t *f) {
     if (s->sp != f->n_end1) {
         return;
     }
-    for (int j = 0; j < s->sp; j++) {
-        if (s->stack[j] != f->end1[j]) {
-            s->braces[s->stack[j]].alias = f->end1[j];
-        }
+    int a = s->top;
+    int b = f->end1;
+    while (a != b && a >= 0 && b >= 0) {
+        s->braces[s->open[a].brace].alias = s->open[b].brace;
+        a = s->open[a].below;
+        b = s->open[b].below;
     }
 }
 
@@ -1086,26 +1181,23 @@ static void cs_lex_branch(void *ud, uint32_t pos, int what) {
         if (s->npp >= CS_PP_MAX) {
             cs_mark_untrusted(s, mark);
         } else {
-            cs_pp_t *f = &s->pp[s->npp];
-            *f = (cs_pp_t){.at_if = cs_stack_copy(s), .n_if = s->sp, .mark = mark};
-            s->npp += f->at_if != NULL;
+            s->pp[s->npp++] = (cs_pp_t){.at_if = s->top, .n_if = s->sp, .mark = mark};
         }
     } else if (s->npp > 0) {
         cs_pp_t *f = &s->pp[s->npp - SKIP_ONE];
-        if (!f->end1) {
-            if (what == CS_PP_ELSE) {
-                f->end1 = cs_stack_copy(s);
-                f->n_end1 = s->sp;
-            }
-        } else {
+        if (f->has_end1) {
             cs_branch_merge(s, f);
+        } else if (what == CS_PP_ELSE) {
+            f->end1 = s->top;
+            f->n_end1 = s->sp;
+            f->has_end1 = true;
         }
-        if (what == CS_PP_ELSE && f->end1 && cs_stack_reserve(s, f->n_if)) {
-            memcpy(s->stack, f->at_if, (size_t)f->n_if * sizeof(int));
+        if (what == CS_PP_ELSE) {
+            s->top = f->at_if;
             s->sp = f->n_if;
         } else if (what == CS_PP_ENDIF) {
-            if (f->end1 && cs_stack_reserve(s, f->n_end1)) {
-                memcpy(s->stack, f->end1, (size_t)f->n_end1 * sizeof(int));
+            if (f->has_end1) {
+                s->top = f->end1;
                 s->sp = f->n_end1;
             }
             s->npp--;
@@ -1141,7 +1233,11 @@ typedef struct {
     const char *src;
     uint32_t n;
     void *ud;
-    bool prev_sep; /* the previous token was ':' or ',' */
+    uint64_t steps;    /* positions looked at */
+    int nest;          /* interpolation holes the scan is inside of */
+    uint32_t stop_pos; /* where the scan gave up (`stopped`) */
+    bool stopped;      /* holes nested deeper than CS_LEX_MAX_NEST: the rest is not read */
+    bool prev_sep;     /* the previous token was ':' or ',' */
 } cs_lex_t;
 
 static bool cs_lex_word(unsigned char c) {
@@ -1165,12 +1261,31 @@ static char cs_keyword_kind(const char *text, uint32_t len) {
 
 static uint32_t cs_lex_code(cs_lex_t *lx, uint32_t i, bool hole);
 
+/* The code of an interpolation hole from src[i]: just past the brace that
+ * closes it. A hole can hold the next interpolated string, and each such
+ * level costs stack: past CS_LEX_MAX_NEST -- deeper than any program -- the
+ * scan stops for good, and what follows in the file is not placed. */
+static uint32_t cs_lex_hole(cs_lex_t *lx, uint32_t i) {
+    if (lx->nest >= CS_LEX_MAX_NEST) {
+        if (!lx->stopped) {
+            lx->stopped = true;
+            lx->stop_pos = i;
+        }
+        return lx->n;
+    }
+    lx->nest++;
+    uint32_t end = cs_lex_code(lx, i, true);
+    lx->nest--;
+    return end;
+}
+
 /* Length of the run of `c` at src[i]. */
-static uint32_t cs_lex_run(const cs_lex_t *lx, uint32_t i, char c) {
+static uint32_t cs_lex_run(cs_lex_t *lx, uint32_t i, char c) {
     uint32_t j = i;
     while (j < lx->n && lx->src[j] == c) {
         j++;
     }
+    lx->steps += (uint64_t)(j - i) + SKIP_ONE;
     return j - i;
 }
 
@@ -1236,7 +1351,7 @@ static uint32_t cs_lex_raw(cs_lex_t *lx, uint32_t i, uint32_t quotes, uint32_t d
             uint32_t run = cs_lex_run(lx, j, '{');
             j += run;
             if (run >= dollars) {
-                j = cs_lex_code(lx, j, true);
+                j = cs_lex_hole(lx, j);
                 j += cs_lex_run(lx, j, '}'); /* the rest of the closing run */
             }
         } else {
@@ -1265,7 +1380,7 @@ static uint32_t cs_lex_interpolated(cs_lex_t *lx, uint32_t i, bool verbatim) {
             if (j + SKIP_ONE < lx->n && lx->src[j + SKIP_ONE] == c) {
                 j += PAIR_LEN;
             } else if (c == '{') {
-                j = cs_lex_code(lx, j + SKIP_ONE, true);
+                j = cs_lex_hole(lx, j + SKIP_ONE);
             } else {
                 j++;
             }
@@ -1279,7 +1394,9 @@ static uint32_t cs_lex_interpolated(cs_lex_t *lx, uint32_t i, bool verbatim) {
 }
 
 /* A literal that starts with a quote, `@`, or `$` at src[i]; returns i itself
- * when there is none there. */
+ * when there is none there. A run of `$` is measured once: where it starts
+ * no literal the scan goes on behind it (or at its last `$`, when that one
+ * starts an ordinary interpolated string), never at its second character. */
 static uint32_t cs_lex_literal(cs_lex_t *lx, uint32_t i) {
     const char *src = lx->src;
     uint32_t n = lx->n;
@@ -1305,11 +1422,12 @@ static uint32_t cs_lex_literal(cs_lex_t *lx, uint32_t i) {
             if (q >= CS_RAW_QUOTES) {
                 return cs_lex_raw(lx, j, q, d);
             }
-            return (d == SKIP_ONE) ? cs_lex_interpolated(lx, j, false) : i;
+            return (d == SKIP_ONE) ? cs_lex_interpolated(lx, j, false) : j - SKIP_ONE;
         }
-        if (d == SKIP_ONE && j + SKIP_ONE < n && src[j] == '@' && src[j + SKIP_ONE] == '"') {
-            return cs_lex_interpolated(lx, j + SKIP_ONE, true);
+        if (j + SKIP_ONE < n && src[j] == '@' && src[j + SKIP_ONE] == '"') {
+            return (d == SKIP_ONE) ? cs_lex_interpolated(lx, j + SKIP_ONE, true) : j - SKIP_ONE;
         }
+        return j;
     }
     return i;
 }
@@ -1398,6 +1516,7 @@ static uint32_t cs_lex_code(cs_lex_t *lx, uint32_t i, bool hole) {
     bool line_start = !hole;
     while (i < n) {
         unsigned char c = (unsigned char)src[i];
+        lx->steps++;
         if (isspace(c)) {
             line_start = line_start || c == '\n';
             i++;
@@ -1447,11 +1566,20 @@ static uint32_t cs_lex_code(cs_lex_t *lx, uint32_t i, bool hole) {
 static void cs_scan_tokens(cs_scan_t *s) {
     cs_lex_t lx = {.src = s->ctx->source, .n = s->root_end_byte, .ud = s};
     (void)cs_lex_code(&lx, 0, false);
+    s->cost_steps += lx.steps;
     if (s->failed) {
         return;
     }
-    if (s->sp > 0) {
-        cs_mark_untrusted(s, s->stack[0]);
+    if (lx.stopped) {
+        cs_mark_untrusted_at(s, lx.stop_pos, cs_row_of(s, lx.stop_pos));
+    }
+    /* the outermost brace that is still open */
+    int unpaired = CBM_NOT_FOUND;
+    for (int o = s->top; o >= 0; o = s->open[o].below) {
+        unpaired = s->open[o].brace;
+    }
+    if (unpaired >= 0) {
+        cs_mark_untrusted(s, unpaired);
     }
     /* a later branch's brace closes where the first branch's does */
     for (int i = 0; i < s->nbraces; i++) {
@@ -1570,15 +1698,18 @@ static bool cs_not_a_name(const char *name) {
 
 /* The type parameters written at src[*pos] (`<in T, U>`): their names
  * ','-joined, "" when there are none. *pos moves past the list. NULL when the
- * list cannot be read. */
-static const char *cs_text_tparams(cs_scan_t *s, uint32_t *pos) {
+ * list cannot be read. Nothing at or past `stop` is read. */
+static const char *cs_text_tparams(cs_scan_t *s, uint32_t *pos, uint32_t stop) {
     const char *src = s->ctx->source;
     uint32_t n = s->root_end_byte;
     uint32_t i = cs_skip_space(src, *pos, n);
     if (i >= n || src[i] != '<') {
         return "";
     }
-    uint32_t limit = i + CS_TPARAMS_SCAN_MAX < n ? i + CS_TPARAMS_SCAN_MAX : n;
+    uint32_t limit = i + CS_TPARAMS_SCAN_MAX < stop ? i + CS_TPARAMS_SCAN_MAX : stop;
+    if (limit <= i) {
+        return NULL;
+    }
     char *out = (char *)cs_tmp_alloc(s, (size_t)(limit - i) + SKIP_ONE);
     if (!out) {
         return NULL;
@@ -1589,6 +1720,7 @@ static const char *cs_text_tparams(cs_scan_t *s, uint32_t *pos) {
     uint32_t word_e = 0; /* the last identifier of the current parameter */
     for (uint32_t k = i + SKIP_ONE; k < limit; k++) {
         char c = src[k];
+        s->cost_steps++;
         if (c == '[') {
             square++;
         } else if (c == ']') {
@@ -1628,15 +1760,15 @@ static const char *cs_text_tparams(cs_scan_t *s, uint32_t *pos) {
 /* From the end of a type's name and type parameters to the `{` that opens
  * its body (returned as a brace index) or the `;` that ends a body-less
  * declaration (*bodyless). CBM_NOT_FOUND with *bodyless false when neither is
- * found: then this was no declaration. */
-static int cs_text_body(const cs_scan_t *s, uint32_t from, bool *bodyless) {
+ * found: then this was no declaration. Nothing at or past `stop` is read. */
+static int cs_text_body(cs_scan_t *s, uint32_t from, uint32_t stop, bool *bodyless) {
     const char *src = s->ctx->source;
-    uint32_t n = s->root_end_byte;
-    uint32_t limit = from + CS_HEADER_SCAN_MAX < n ? from + CS_HEADER_SCAN_MAX : n;
+    uint32_t limit = from + CS_HEADER_SCAN_MAX < stop ? from + CS_HEADER_SCAN_MAX : stop;
     int round = 0;
     *bodyless = false;
     for (uint32_t i = from; i < limit; i++) {
         char c = src[i];
+        s->cost_steps++;
         if (c == '/' && i + SKIP_ONE < limit &&
             (src[i + SKIP_ONE] == '/' || src[i + SKIP_ONE] == '*')) {
             uint32_t past = cs_skip_space(src, i, limit);
@@ -1723,21 +1855,23 @@ static void cs_member_new(cs_scan_t *s, TSNode decl, char kind, bool explicit_im
 /* Every variable_declarator name under a field / event field declaration. */
 static void cs_collect_declarators(cs_scan_t *s, TSNode decl, char kind, int owner) {
     TSNode null_node = {0};
-    uint32_t nc = ts_node_named_child_count(decl);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode vd = ts_node_named_child(decl, i);
+    cs_kids_t outer = cs_kids(decl);
+    TSNode vd;
+    while (cs_kids_next_named(&outer, &vd)) {
         if (!cs_kind_is(vd, "variable_declaration")) {
             continue;
         }
-        uint32_t vc = ts_node_named_child_count(vd);
-        for (uint32_t j = 0; j < vc; j++) {
-            TSNode d = ts_node_named_child(vd, j);
+        cs_kids_t inner = cs_kids(vd);
+        TSNode d;
+        while (cs_kids_next_named(&inner, &d)) {
             if (cs_kind_is(d, "variable_declarator")) {
                 cs_member_new(s, decl, kind, false, owner, cs_field(d, "name"), null_node,
                               null_node);
             }
         }
+        cs_kids_end(&inner);
     }
+    cs_kids_end(&outer);
 }
 
 /* A member whose header did not parse: an error node among its own parts, or
@@ -1746,18 +1880,18 @@ static void cs_collect_declarators(cs_scan_t *s, TSNode decl, char kind, int own
  * method named `extern`. */
 static bool cs_header_broken(TSNode decl, bool callable) {
     TSNode body = callable ? cs_field(decl, "body") : (TSNode){0};
-    uint32_t cc = ts_node_child_count(decl);
-    for (uint32_t i = 0; i < cc; i++) {
-        TSNode ch = ts_node_child(decl, i);
+    bool broken = false;
+    cs_kids_t k = cs_kids(decl);
+    TSNode ch;
+    while (!broken && cs_kids_next(&k, &ch)) {
         if (!ts_node_is_null(body) && ts_node_eq(ch, body)) {
             continue;
         }
-        if (cs_kind_is(ch, "ERROR") || ts_node_is_missing(ch) ||
-            (callable && ts_node_has_error(ch))) {
-            return true;
-        }
+        broken = cs_kind_is(ch, "ERROR") || ts_node_is_missing(ch) ||
+                 (callable && ts_node_has_error(ch));
     }
-    return false;
+    cs_kids_end(&k);
+    return broken;
 }
 
 static void cs_collect_member(cs_scan_t *s, TSNode c, const char *k, int owner) {
@@ -1795,70 +1929,109 @@ static void cs_collect_member(cs_scan_t *s, TSNode c, const char *k, int owner) 
     }
 }
 
-/* Collect the declarations under `node` in document order. `owner` is the
- * item of the type whose members `node` holds (CS_OWNER_NONE outside a type).
+/* A node whose children are being collected. */
+typedef struct {
+    cs_kids_t kids;
+    int owner; /* the item of the type whose members the node holds, or CS_OWNER_* */
+} cs_walk_t;
+
+typedef struct {
+    cs_walk_t *frames;
+    int count;
+    int cap;
+} cs_walk_stack_t;
+
+/* Go into `node`: its children are collected next. false when memory ran out. */
+static bool cs_walk_push(cs_scan_t *s, cs_walk_stack_t *w, TSNode node, int owner) {
+    if (ts_node_is_null(node)) {
+        return true;
+    }
+    if (w->count >= w->cap) {
+        int ncap = w->cap ? w->cap * PAIR_LEN : CS_HEADS_INIT;
+        cs_walk_t *grown = (cs_walk_t *)cs_tmp_alloc(s, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        if (w->count > 0) {
+            memcpy(grown, w->frames, (size_t)w->count * sizeof(*grown));
+        }
+        w->frames = grown;
+        w->cap = ncap;
+    }
+    w->frames[w->count++] = (cs_walk_t){.kids = cs_kids(node), .owner = owner};
+    return true;
+}
+
+/* One child `c` of a collected node: record what it declares and go into it
+ * where declarations can sit. false when memory ran out. */
+static bool cs_collect_child(cs_scan_t *s, cs_walk_stack_t *w, TSNode c, int owner) {
+    const char *k = ts_node_type(c);
+    if (strcmp(k, "ERROR") == 0) {
+        if (owner >= 0) {
+            s->items[owner].broken = true;
+        }
+        return cs_walk_push(s, w, c, CS_OWNER_LEXICAL);
+    }
+    if (strncmp(k, "preproc_", 8) == 0 || strcmp(k, "declaration_list") == 0 ||
+        strcmp(k, "enum_member_declaration_list") == 0) {
+        return cs_walk_push(s, w, c, owner);
+    }
+    if (strcmp(k, "using_directive") == 0) {
+        (void)cs_item_of_node(s, 'U', c);
+        return true;
+    }
+    bool file_scoped = strcmp(k, "file_scoped_namespace_declaration") == 0;
+    if (file_scoped || strcmp(k, "namespace_declaration") == 0) {
+        int ni = cs_item_of_node(s, file_scoped ? 'F' : 'N', c);
+        if (ni < 0) {
+            return false;
+        }
+        s->items[ni].name = cs_field(c, "name");
+        /* a file-scoped namespace holds nothing itself -- unless it is a
+         * block namespace recovery could not parse, whose declarations
+         * then sit in an error node under it */
+        TSNode body = file_scoped ? (TSNode){0} : cs_field(c, "body");
+        return cs_walk_push(s, w, ts_node_is_null(body) ? c : body, CS_OWNER_NONE);
+    }
+    char tk = cs_type_kind(k);
+    if (tk) {
+        int ti = cs_item_of_node(s, 'T', c);
+        if (ti < 0) {
+            return false;
+        }
+        s->items[ti].kind = tk;
+        s->items[ti].name = cs_field(c, "name");
+        s->items[ti].tparams = cs_type_params(c);
+        return tk == 'd' || cs_walk_push(s, w, cs_field(c, "body"), ti);
+    }
+    if (owner != CS_OWNER_NONE) {
+        cs_collect_member(s, c, k, owner);
+    }
+    return true;
+}
+
+/* Collect the declarations under `root` in document order. `owner` is the
+ * item of the type whose members a node holds (CS_OWNER_NONE outside a type).
  * Preprocessor blocks and error nodes are looked into: a declaration that
  * parsed is a declaration wherever recovery left it, and its placement is
  * checked against the braces afterwards. What sits in an error node belongs
- * to whichever block's braces hold it. */
-static void cs_collect(cs_scan_t *s, TSNode node, int owner, int depth) {
-    if (depth > CS_SCAN_MAX_DEPTH || ts_node_is_null(node) || s->failed) {
-        return;
-    }
-    uint32_t nc = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_named_child(node, i);
-        const char *k = ts_node_type(c);
-        if (strcmp(k, "ERROR") == 0) {
-            if (owner >= 0) {
-                s->items[owner].broken = true;
-            }
-            cs_collect(s, c, CS_OWNER_LEXICAL, depth + SKIP_ONE);
+ * to whichever block's braces hold it.
+ *
+ * The walk keeps its own stack: how deep declarations nest is the file's
+ * choice, and must not be this thread's stack depth. */
+static void cs_collect(cs_scan_t *s, TSNode root, int owner) {
+    cs_walk_stack_t w = {0};
+    bool ok = !s->failed && cs_walk_push(s, &w, root, owner);
+    while (w.count > 0) {
+        /* a child may push a frame, which moves the array: no pointer into it
+         * is kept across cs_collect_child */
+        TSNode c;
+        if (!ok || s->failed || !cs_kids_next_named(&w.frames[w.count - SKIP_ONE].kids, &c)) {
+            cs_kids_end(&w.frames[w.count - SKIP_ONE].kids);
+            w.count--;
             continue;
         }
-        if (strncmp(k, "preproc_", 8) == 0 || strcmp(k, "declaration_list") == 0 ||
-            strcmp(k, "enum_member_declaration_list") == 0) {
-            cs_collect(s, c, owner, depth + SKIP_ONE);
-            continue;
-        }
-        if (strcmp(k, "using_directive") == 0) {
-            (void)cs_item_of_node(s, 'U', c);
-            continue;
-        }
-        bool file_scoped = strcmp(k, "file_scoped_namespace_declaration") == 0;
-        if (file_scoped || strcmp(k, "namespace_declaration") == 0) {
-            int ni = cs_item_of_node(s, file_scoped ? 'F' : 'N', c);
-            if (ni < 0) {
-                return;
-            }
-            s->items[ni].name = cs_field(c, "name");
-            /* a file-scoped namespace holds nothing itself -- unless it is a
-             * block namespace recovery could not parse, whose declarations
-             * then sit in an error node under it */
-            TSNode body = file_scoped ? (TSNode){0} : cs_field(c, "body");
-            cs_collect(s, ts_node_is_null(body) ? c : body, CS_OWNER_NONE, depth + SKIP_ONE);
-            continue;
-        }
-        char tk = cs_type_kind(k);
-        if (tk) {
-            int ti = cs_item_of_node(s, 'T', c);
-            if (ti < 0) {
-                return;
-            }
-            s->items[ti].kind = tk;
-            s->items[ti].name = cs_field(c, "name");
-            s->items[ti].tparams = cs_type_params(c);
-            if (tk != 'd') {
-                TSNode body = cs_field(c, "body");
-                if (!ts_node_is_null(body)) {
-                    cs_collect(s, body, ti, depth + SKIP_ONE);
-                }
-            }
-            continue;
-        }
-        if (owner != CS_OWNER_NONE) {
-            cs_collect_member(s, c, k, owner);
-        }
+        ok = cs_collect_child(s, &w, c, w.frames[w.count - SKIP_ONE].owner);
     }
 }
 
@@ -1882,8 +2055,11 @@ static int cs_item_start_cmp(const void *a, const void *b) {
 
 /* Read the declaration a keyword starts from the text and add it as an item,
  * unless the tree already has a node for it (`parsed`: the name positions of
- * the tree's namespaces and types). */
-static void cs_text_item(cs_scan_t *s, const cs_head_t *h, const uint32_t *parsed, int nparsed) {
+ * the tree's namespaces and types). A header ends where the next declaration
+ * keyword stands (`stop`): reading past it would read the file once per
+ * keyword. */
+static void cs_text_item(cs_scan_t *s, const cs_head_t *h, uint32_t stop, const uint32_t *parsed,
+                         int nparsed) {
     const char *src = s->ctx->source;
     uint32_t n = s->root_end_byte;
     uint32_t a = cs_skip_space(src, h->end, n);
@@ -1917,9 +2093,9 @@ static void cs_text_item(cs_scan_t *s, const cs_head_t *h, const uint32_t *parse
         }
     } else {
         uint32_t pos = b;
-        tparams = cs_text_tparams(s, &pos);
+        tparams = cs_text_tparams(s, &pos, stop);
         bool bodyless = false;
-        brace = tparams ? cs_text_body(s, pos, &bodyless) : CBM_NOT_FOUND;
+        brace = tparams ? cs_text_body(s, pos, stop, &bodyless) : CBM_NOT_FOUND;
         if (!tparams || (brace < 0 && !bodyless)) {
             return;
         }
@@ -1961,7 +2137,8 @@ static void cs_add_text_items(cs_scan_t *s) {
     }
     qsort(parsed, (size_t)nparsed, sizeof(uint32_t), cs_u32_cmp);
     for (int h = 0; h < s->nheads && !s->failed; h++) {
-        cs_text_item(s, &s->heads[h], parsed, nparsed);
+        uint32_t stop = h + SKIP_ONE < s->nheads ? s->heads[h + SKIP_ONE].end : s->root_end_byte;
+        cs_text_item(s, &s->heads[h], stop, parsed, nparsed);
     }
     if (s->nitems > tree_items) {
         qsort(s->items, (size_t)s->nitems, sizeof(cs_item_t), cs_item_start_cmp);
@@ -1974,22 +2151,14 @@ static void cs_put_bases(cs_scan_t *s, TSNode type_decl, char kind) {
     if (kind == 'e' || kind == 'd') {
         return; /* an enum's base is its underlying integral type */
     }
-    TSNode bl = {0};
-    uint32_t nc = ts_node_named_child_count(type_decl);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_named_child(type_decl, i);
-        if (cs_kind_is(c, "base_list")) {
-            bl = c;
-            break;
-        }
-    }
+    TSNode bl = cs_child_of_kind(type_decl, "base_list");
     if (ts_node_is_null(bl)) {
         return;
     }
     bool first = true;
-    uint32_t bc = ts_node_named_child_count(bl);
-    for (uint32_t i = 0; i < bc; i++) {
-        TSNode b = ts_node_named_child(bl, i);
+    cs_kids_t k = cs_kids(bl);
+    TSNode b;
+    while (cs_kids_next_named(&k, &b)) {
         if (cs_kind_is(b, "primary_constructor_base_type")) {
             TSNode ty = cs_field(b, "type");
             if (ts_node_is_null(ty) && ts_node_named_child_count(b) > 0) {
@@ -2008,6 +2177,7 @@ static void cs_put_bases(cs_scan_t *s, TSNode type_decl, char kind) {
         cs_put_text_nows(s, b);
         first = false;
     }
+    cs_kids_end(&k);
 }
 
 static void cs_emit_member(cs_scan_t *s, TSNode decl, char kind, bool explicit_impl,
@@ -2041,9 +2211,9 @@ static void cs_emit_using(cs_scan_t *s, TSNode u, int region) {
     bool is_global = false;
     bool is_static = false;
     bool is_alias = false;
-    uint32_t cc = ts_node_child_count(u);
-    for (uint32_t i = 0; i < cc; i++) {
-        TSNode ch = ts_node_child(u, i);
+    cs_kids_t k = cs_kids(u);
+    TSNode ch;
+    while (cs_kids_next(&k, &ch)) {
         if (ts_node_is_named(ch)) {
             continue;
         }
@@ -2056,11 +2226,11 @@ static void cs_emit_using(cs_scan_t *s, TSNode u, int region) {
             is_alias = true;
         }
     }
+    cs_kids_end(&k);
     TSNode alias = is_alias ? cs_field(u, "name") : (TSNode){0};
     TSNode target = {0};
-    uint32_t nc = ts_node_named_child_count(u);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode ch = ts_node_named_child(u, i);
+    k = cs_kids(u);
+    while (cs_kids_next_named(&k, &ch)) {
         if (is_alias && ts_node_eq(ch, alias)) {
             continue;
         }
@@ -2069,6 +2239,7 @@ static void cs_emit_using(cs_scan_t *s, TSNode u, int region) {
         }
         target = ch;
     }
+    cs_kids_end(&k);
     if (ts_node_is_null(target)) {
         return;
     }
@@ -2150,20 +2321,22 @@ static void cs_emit_type(cs_scan_t *s, const cs_item_t *it, int region, uint32_t
         return;
     }
     TSNode null_node = {0};
-    uint32_t nc = ts_node_named_child_count(it->node);
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode pl = ts_node_named_child(it->node, i);
+    cs_kids_t lists = cs_kids(it->node);
+    TSNode pl;
+    while (cs_kids_next_named(&lists, &pl)) {
         if (!cs_kind_is(pl, "parameter_list")) {
             continue;
         }
-        uint32_t pc = ts_node_named_child_count(pl);
-        for (uint32_t j = 0; j < pc; j++) {
-            TSNode p = ts_node_named_child(pl, j);
+        cs_kids_t params = cs_kids(pl);
+        TSNode p;
+        while (cs_kids_next_named(&params, &p)) {
             if (cs_kind_is(p, "parameter")) {
                 cs_emit_member(s, p, 'v', false, path, cs_field(p, "name"), null_node, null_node);
             }
         }
+        cs_kids_end(&params);
     }
+    cs_kids_end(&lists);
 }
 
 /* An open block while the items are placed. */
@@ -2426,6 +2599,7 @@ const char *cbm_doclink_cs_scan_scope(CBMExtractCtx *ctx) {
     cs_scan_t s = {.ctx = ctx,
                    .tmp = ctx->scratch ? ctx->scratch : ctx->arena,
                    .sb = {.a = ctx->arena},
+                   .top = CBM_NOT_FOUND,
                    .untrusted = UINT32_MAX,
                    .next_region = SKIP_ONE};
     s.root_end_byte = ctx->source_len > 0 ? (uint32_t)ctx->source_len : 0;
@@ -2435,13 +2609,14 @@ const char *cbm_doclink_cs_scan_scope(CBMExtractCtx *ctx) {
         cs_scan_tokens(&s);
     }
     /* the root itself is an error node when nothing of the file parsed */
-    cs_collect(&s, ctx->root, cs_kind_is(ctx->root, "ERROR") ? CS_OWNER_LEXICAL : CS_OWNER_NONE, 0);
+    cs_collect(&s, ctx->root, cs_kind_is(ctx->root, "ERROR") ? CS_OWNER_LEXICAL : CS_OWNER_NONE);
     cs_add_text_items(&s);
     sb_puts(&s.sb, CBM_DOCLINK_CS_SCOPE_TAG "\n");
     cs_emit_items(&s);
     if (s.untrusted != UINT32_MAX) {
         cs_emit_unplaced(&s, s.untrusted_row + TS_LINE_OFFSET, s.root_end_line);
     }
+    cs_cost_publish(&s);
     if (s.failed || s.sb.failed || !s.sb.buf) {
         return NULL;
     }

@@ -149,6 +149,16 @@ void cbm_doclink_cs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, cons
 const char *cbm_doclink_cs_scan_scope(CBMExtractCtx *ctx);
 char *cbm_doclink_cs_portable_scope(const char *scope);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: what the C# scope scans since the last reset cost -- the source
+ * positions their text readers looked at, and the bytes they took from the
+ * scratch arena. A test holds these against the size of its input, so that a
+ * scan whose cost grows faster than its input fails without a clock. Test
+ * builds only. */
+void cbm_doclink_cs_test_cost_reset(void);
+void cbm_doclink_cs_test_cost(uint64_t *text_steps, uint64_t *scratch_bytes);
+#endif
+
 /* Normalize one C# parameter type as written in a declaration or a cref
  * parameter list: attributes, ref/out/in/params/this/scoped modifiers, type
  * arguments, namespaces, nullable markers and a trailing parameter name are

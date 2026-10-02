@@ -14,6 +14,7 @@
 
 #include "cbm.h"
 #include "doclink.h"
+#include "foundation/compat_thread.h"
 #include "foundation/mem_core.h"
 #include "mcp/mcp.h"
 #include "pipeline/doc_links.h"
@@ -1665,6 +1666,199 @@ TEST(doc_mentions_parallel_equals_sequential) {
     PASS();
 }
 
+/* ── the scope scanner's limits and cost ─────────────────────────── */
+
+/* `prefix`, then `unit` n times, then `suffix`; the caller frees it. */
+static char *dm_repeated(const char *prefix, const char *unit, int n, const char *suffix) {
+    size_t pl = strlen(prefix);
+    size_t ul = strlen(unit);
+    size_t sl = strlen(suffix);
+    char *out = malloc(pl + (ul * (size_t)n) + sl + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, prefix, pl);
+    for (int i = 0; i < n; i++) {
+        memcpy(out + pl + (ul * (size_t)i), unit, ul);
+    }
+    memcpy(out + pl + (ul * (size_t)n), suffix, sl + 1);
+    return out;
+}
+
+typedef struct {
+    char *src;
+    const char *rel_path;
+    CBMFileResult *result;
+} dm_extract_job_t;
+
+/* cbm_thread_create body: extract job->src as C#. */
+static void *dm_extract_thread(void *arg) {
+    dm_extract_job_t *job = (dm_extract_job_t *)arg;
+    job->result = dm_extract(job->src, CBM_LANG_CSHARP, job->rel_path);
+    return NULL;
+}
+
+/* Interpolated strings nest: a hole of code can hold the next string. The
+ * brace scan follows them to a fixed depth; a file that goes deeper is not
+ * placed, and scanning it costs no stack. */
+TEST(doc_mentions_cs_scan_nested_holes) {
+    /* three levels, in a file whose tree has a parse error (the unsafe
+     * dereference): the braces are read from the text, through the holes */
+    const char *nested = "namespace N\n" /* 1 */
+                         "{\n"
+                         "    public class Deep\n" /* 3 */
+                         "    {\n"
+                         "        unsafe void E(void* p) { _r = ref *(int*)p; }\n"
+                         "        void M() { s = $\"a{$\"b{$\"c{1}\"}\"}\"; }\n"
+                         "        public int Q;\n" /* 7 */
+                         "    }\n"                 /* 8 */
+                         "    public class After { }\n"
+                         "}\n";
+    CBMFileResult *r = dm_extract(nested, CBM_LANG_CSHARP, "Nested.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->doc_scope);
+    ASSERT_NOT_NULL(strstr(r->doc_scope, "T\t1\t3\t8\tc!\tDeep\t"));
+    ASSERT_NOT_NULL(strstr(r->doc_scope, "\tAfter\t"));
+    ASSERT_NULL(strstr(r->doc_scope, "\nX\t"));
+    cbm_free_result(r);
+
+    /* a hundred levels, every one closed again: deeper than the scan follows.
+     * The file is not placed, and its scope says so */
+    enum { DM_DEEP = 100 };
+    char *closers = dm_repeated("1", "}\"", DM_DEEP, "; }\n    }\n}\n");
+    ASSERT_NOT_NULL(closers);
+    char *deep = dm_repeated("namespace N\n"
+                             "{\n"
+                             "    public class Deep\n"
+                             "    {\n"
+                             "        unsafe void E(void* p) { _r = ref *(int*)p; }\n"
+                             "        void M() { s = ",
+                             "$\"{", DM_DEEP, closers);
+    free(closers);
+    ASSERT_NOT_NULL(deep);
+    r = dm_extract(deep, CBM_LANG_CSHARP, "Hundred.cs");
+    free(deep);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->doc_scope);
+    ASSERT_NOT_NULL(strstr(r->doc_scope, "\nX\t"));
+    ASSERT_NOT_NULL(strstr(r->doc_scope, "Q\tDeep\n"));
+    ASSERT_NULL(strstr(r->doc_scope, "\nT\t"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ... and following them costs no stack: 8,000 levels left open, extracted on
+ * a thread with an eighth of an index worker's stack. A scan that follows
+ * them all needs one recursion level per three bytes of source. */
+TEST(doc_mentions_cs_scan_holes_stack) {
+    enum { DM_HOLES = 8000, DM_SMALL_STACK = 1024 * 1024 };
+    dm_extract_job_t job = {.src = dm_repeated("namespace N\n"
+                                               "{\n"
+                                               "    public class Ok { }\n"
+                                               "    public class C\n"
+                                               "    {\n"
+                                               "        string s = ",
+                                               "$\"{", DM_HOLES, "\n"),
+                            .rel_path = "Holes.cs"};
+    ASSERT_NOT_NULL(job.src);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, DM_SMALL_STACK, dm_extract_thread, &job), 0);
+    ASSERT_EQ(cbm_thread_join(&thread), 0);
+    free(job.src);
+    CBMFileResult *r = job.result;
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->doc_scope);
+    /* nothing is placed: the namespace's brace never closes */
+    ASSERT_NOT_NULL(strstr(r->doc_scope, "\nX\t"));
+    ASSERT_NULL(strstr(r->doc_scope, "\nT\t"));
+    ASSERT_NULL(strstr(r->doc_scope, "\nR\t"));
+    ASSERT_NOT_NULL(strstr(r->doc_scope, "Q\tOk\n"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The cost of scanning `src` as C#: source positions the text readers looked
+ * at, bytes taken from the scratch arena. false when the file has no scope. */
+static bool dm_scan_cost(const char *src, uint64_t *steps, uint64_t *bytes) {
+    cbm_doclink_cs_test_cost_reset();
+    CBMFileResult *r = src ? dm_extract(src, CBM_LANG_CSHARP, "Cost.cs") : NULL;
+    bool ok = r && r->doc_scope;
+    cbm_doclink_cs_test_cost(steps, bytes);
+    if (r) {
+        cbm_free_result(r);
+    }
+    return ok;
+}
+
+/* The scan's cost of an input twice as large, as a multiple of the smaller
+ * one's: about 2 for a scan that is linear, 4 for a quadratic one. -1 when a
+ * scan fails. `prefix` + `unit` x n + `mid` + `unit2` x n + `suffix`. */
+static double dm_cost_growth(const char *prefix, const char *unit, const char *mid,
+                             const char *unit2, int n, bool bytes) {
+    uint64_t cost[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        int reps = n * (k + 1);
+        char *tail = dm_repeated(mid, unit2, reps, "\n");
+        char *src = tail ? dm_repeated(prefix, unit, reps, tail) : NULL;
+        uint64_t steps = 0;
+        uint64_t scratch = 0;
+        bool ok = dm_scan_cost(src, &steps, &scratch);
+        free(tail);
+        free(src);
+        if (!ok) {
+            return -1.0;
+        }
+        cost[k] = bytes ? scratch : steps;
+    }
+    return cost[0] ? (double)cost[1] / (double)cost[0] : -1.0;
+}
+
+/* The scan's work grows with its input, not faster: no clock decides these,
+ * the scanner's own counters do. */
+
+/* A run of `$` that starts no string is passed once, not once per `$`. */
+TEST(doc_mentions_cs_scan_dollar_run) {
+    double growth = dm_cost_growth("class C { int x = ", "$", "; }", "", 20000, false);
+    if (!(growth > 0 && growth < 3.0)) {
+        printf("  `$` run: twice the input costs %.2f times the steps\n", growth);
+        FAIL("the scan of a `$` run is not linear");
+    }
+    PASS();
+}
+
+/* A conditional remembers where the open braces stood, not a copy of them. */
+TEST(doc_mentions_cs_scan_branch_memory) {
+    double growth =
+        dm_cost_growth("class C { void M() {\n", "{", "\n", "#if X\n#endif\n", 3000, true);
+    if (!(growth > 0 && growth < 3.0)) {
+        printf("  #if under open braces: twice the input takes %.2f times the memory\n", growth);
+        FAIL("the memory of the brace scan is not linear");
+    }
+    PASS();
+}
+
+/* A declaration keyword's header is read up to the next keyword, so every
+ * byte of the file is read a bounded number of times. */
+TEST(doc_mentions_cs_scan_header_reads) {
+    const char *heads[] = {"class a ", "class a<[ "};
+    for (size_t i = 0; i < sizeof(heads) / sizeof(heads[0]); i++) {
+        char *src = dm_repeated("namespace N {\n", heads[i], 20000, "\n");
+        ASSERT_NOT_NULL(src);
+        uint64_t steps = 0;
+        uint64_t scratch = 0;
+        bool ok = dm_scan_cost(src, &steps, &scratch);
+        size_t len = strlen(src);
+        free(src);
+        ASSERT_TRUE(ok);
+        if (steps > (uint64_t)len * 16) {
+            printf("  `%s` x 20000: %llu steps for %zu bytes\n", heads[i],
+                   (unsigned long long)steps, len);
+            FAIL("declaration headers are read over and over");
+        }
+    }
+    PASS();
+}
+
 SUITE(doc_mentions) {
     RUN_TEST(doc_mentions_extract_cs_tokens);
     RUN_TEST(doc_mentions_cs_scope_blob);
@@ -1680,4 +1874,9 @@ SUITE(doc_mentions) {
     RUN_TEST(doc_mentions_scope_delta_rules);
     RUN_TEST(doc_mentions_incremental_equals_full);
     RUN_TEST(doc_mentions_parallel_equals_sequential);
+    RUN_TEST(doc_mentions_cs_scan_dollar_run);
+    RUN_TEST(doc_mentions_cs_scan_branch_memory);
+    RUN_TEST(doc_mentions_cs_scan_header_reads);
+    RUN_TEST(doc_mentions_cs_scan_nested_holes);
+    RUN_TEST(doc_mentions_cs_scan_holes_stack);
 }
