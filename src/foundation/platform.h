@@ -138,6 +138,19 @@ int cbm_default_worker_count(bool initial);
  * Returns NULL when the variable is unset and fallback is NULL. */
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
 
+/* Allocating sibling of cbm_safe_getenv, for a value that must not be capped at
+ * a caller-chosen size. A Windows PATH routinely runs past the 4096-byte buffer
+ * cbm_safe_getenv's callers pass, and the copy helper REPORTS that as failure
+ * rather than truncating -- so the whole PATH was skipped and every directory
+ * past the cut became invisible (#221).
+ *
+ * Returns a UTF-8 copy owned by the memory core: release it with
+ * cbm_free(CBM_MEM_CLASS_OTHER, ptr), never free(). NULL when the variable is
+ * unset or cannot be read; a variable that exists but is empty yields "".
+ * On Windows the value is read with the wide API and converted, the same route
+ * cbm_safe_getenv takes, so a non-ASCII value survives intact. */
+char *cbm_env_dup(const char *name);
+
 /* Read an environment variable as a whole number.
  *
  * Answers true only when the variable is set, is not empty, and reads cleanly
