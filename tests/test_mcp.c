@@ -2548,6 +2548,100 @@ TEST(tool_search_graph_basic) {
     PASS();
 }
 
+/* An empty search_graph page that carries a label used to blame the label
+ * ("No nodes have this label") even when the label matched and another filter
+ * removed every row. A dead-code search (label + max_degree 0) that finds
+ * nothing then reads as "this project has no functions". */
+static const char *empty_search_hint(cbm_mcp_server_t *srv, const char *args, char **inner_out,
+                                     yyjson_doc **doc_out) {
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    if (!resp) {
+        return NULL;
+    }
+    char *inner = extract_text_content(resp);
+    free(resp);
+    if (!inner) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    *inner_out = inner;
+    *doc_out = doc;
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (yyjson_get_int(yyjson_obj_get(root, "total")) != 0) {
+        return NULL;
+    }
+    return yyjson_get_str(yyjson_obj_get(root, "hint"));
+}
+
+TEST(tool_search_graph_empty_hint_blames_label_only_when_absent) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "hintproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/hintproj");
+
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "callee",
+                         .qualified_name = "hintproj.a.callee",
+                         .file_path = "a.c",
+                         .start_line = 1,
+                         .end_line = 3};
+    int64_t callee_id = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(callee_id, 0);
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "hintproj.a.caller",
+                         .file_path = "a.c",
+                         .start_line = 5,
+                         .end_line = 8};
+    int64_t caller_id = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t call = {
+        .project = proj, .source_id = caller_id, .target_id = callee_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &call), 0);
+
+    /* Both functions carry a CALLS edge, so each of these filters empties the
+     * page while the label itself matches two nodes. */
+    const char *narrowed[] = {
+        "{\"project\":\"hintproj\",\"label\":\"Function\",\"max_degree\":0,"
+        "\"format\":\"json\"}",
+        "{\"project\":\"hintproj\",\"label\":\"Function\",\"file_pattern\":\"no/such/*\","
+        "\"format\":\"json\"}",
+        "{\"project\":\"hintproj\",\"label\":\"Function\",\"relationship\":\"IMPORTS\","
+        "\"format\":\"json\"}",
+    };
+    for (size_t i = 0; i < sizeof(narrowed) / sizeof(narrowed[0]); i++) {
+        char *inner = NULL;
+        yyjson_doc *doc = NULL;
+        const char *hint = empty_search_hint(srv, narrowed[i], &inner, &doc);
+        ASSERT_NOT_NULL(hint);
+        ASSERT_NULL(strstr(hint, "No nodes have this label"));
+        ASSERT_NOT_NULL(strstr(hint, "relax the other filters"));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+
+    /* A label with no nodes at all keeps the label hint. */
+    char *inner = NULL;
+    yyjson_doc *doc = NULL;
+    const char *hint = empty_search_hint(
+        srv, "{\"project\":\"hintproj\",\"label\":\"Route\",\"max_degree\":0,\"format\":\"json\"}",
+        &inner, &doc);
+    ASSERT_NOT_NULL(hint);
+    ASSERT_NOT_NULL(strstr(hint, "No nodes have this label"));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Forward declarations for helpers defined later in this file */
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
@@ -21110,6 +21204,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469);
     RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_search_graph_empty_hint_blames_label_only_when_absent);
     RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
     RUN_TEST(tool_trace_totals_respect_test_filter);
