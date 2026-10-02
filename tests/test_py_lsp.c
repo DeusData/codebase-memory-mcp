@@ -1931,6 +1931,56 @@ TEST(pylsp_lambda_rewalk_dedupes_dunder_occurrence) {
     PASS();
 }
 
+/* A lambda body is also re-walked for calls made inside another lambda's
+ * re-walk, so a lambda that reaches itself again (directly or through another
+ * lambda) was re-walked once per nesting level until the walk-depth cap. With
+ * two such calls in one body the work doubled per level, and a two-line
+ * `fib = lambda n: fib(n - 1) + fib(n - 2)` drove extraction to many GB. A
+ * lambda already being re-walked must not be re-entered, so each helper()
+ * site below resolves once. The recursion here is linear, so without the
+ * guard this stays small and fails the count instead of exhausting memory. */
+TEST(pylsp_recursive_lambda_rewalk_is_bounded) {
+    CBMFileResult *r = extract_py("def helper():\n"
+                                  "    return 0\n"
+                                  "count = lambda n: helper() if n == 0 else count(n - 1)\n"
+                                  "even = lambda n: helper() if n == 0 else odd(n - 1)\n"
+                                  "odd = lambda n: even(n - 1)\n"
+                                  "count(3)\n"
+                                  "even(4)\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error || r->parse_incomplete);
+
+    int helper_resolutions = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->callee_qn && strstr(rc->callee_qn, ".helper"))
+            helper_resolutions++;
+    }
+    ASSERT_EQ(helper_resolutions, 2);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The re-walk guard is released after each walk, so a later call to the same
+ * lambda still binds its own argument type: both A.m and B.m resolve. */
+TEST(pylsp_lambda_rewalk_guard_released_between_calls) {
+    CBMFileResult *r = extract_py("class A:\n"
+                                  "    def m(self):\n"
+                                  "        return 1\n"
+                                  "class B:\n"
+                                  "    def m(self):\n"
+                                  "        return 2\n"
+                                  "call_m = lambda x: x.m()\n"
+                                  "call_m(A())\n"
+                                  "call_m(B())\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "<lambda>", ".A.m"), 0);
+    ASSERT_GTE(require_resolved(r, "<lambda>", ".B.m"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Parser-backed Python calls have the same occurrence-identity requirement as
  * synthetic dunders. Distinct typed receivers can expose the same method leaf
  * in one caller; each CBMCall must join the semantic record for its own site. */
@@ -2243,6 +2293,8 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_round5_super_init);
     RUN_TEST(pylsp_dunder_same_leaf_occurrences_join_by_exact_site);
     RUN_TEST(pylsp_lambda_rewalk_dedupes_dunder_occurrence);
+    RUN_TEST(pylsp_recursive_lambda_rewalk_is_bounded);
+    RUN_TEST(pylsp_lambda_rewalk_guard_released_between_calls);
     RUN_TEST(pylsp_ordinary_same_leaf_calls_join_by_exact_site);
     /* Round 6 — generators, dataclasses, properties */
     RUN_TEST(pylsp_round6_generator_yields_iterable);
