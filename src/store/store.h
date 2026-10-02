@@ -906,6 +906,17 @@ typedef struct {
 
 int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content);
 int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out);
+/* Move any legacy ADR row from the graph DB's project_summaries into the
+ * per-project sidecar, once (guarded by a marker in the sidecar). Call before a
+ * rebuild deletes the old generation, and on artifact import. Returns
+ * CBM_STORE_ERR on failure so callers can preserve the old generation. */
+int cbm_store_adr_migrate_once(cbm_store_t *s);
+/* Restore ADRs from the graph DB's project_summaries into the per-project sidecar
+ * for any project the sidecar has no row for, without overwriting a local one and
+ * regardless of the migrated marker. Used on artifact import so a teammate who
+ * already indexed the project (marked sidecar, no ADR) still receives the shared
+ * ADR the artifact carries. Returns CBM_STORE_ERR on failure. */
+int cbm_store_adr_restore_from_graph_if_absent(cbm_store_t *s);
 int cbm_store_adr_delete(cbm_store_t *s, const char *project);
 int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const char **keys,
                                   const char **values, int count, cbm_adr_t *out);

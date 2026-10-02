@@ -579,6 +579,22 @@ TEST(adr_store_and_retrieve) {
     PASS();
 }
 
+TEST(adr_restore_from_graph_if_absent_memory_is_noop) {
+    /* A :memory: store keeps ADRs in the graph DB, so restore-if-absent is a
+     * well-formed no-op (returns OK) and leaves an existing ADR untouched. */
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_store(s, "test", "v1"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_restore_from_graph_if_absent(s), CBM_STORE_OK);
+    cbm_adr_t adr;
+    ASSERT_EQ(cbm_store_adr_get(s, "test", &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, "v1");
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(adr_upsert) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -1693,6 +1709,7 @@ SUITE(store_arch) {
     /* ADR */
     RUN_TEST(adr_store_and_retrieve);
     RUN_TEST(adr_upsert);
+    RUN_TEST(adr_restore_from_graph_if_absent_memory_is_noop);
     RUN_TEST(adr_delete);
     RUN_TEST(adr_delete_not_found);
     RUN_TEST(adr_parse_sections_basic);

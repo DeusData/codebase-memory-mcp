@@ -833,7 +833,6 @@ typedef struct {
     atomic_int *cancelled;
     const cbm_file_hash_t *manifest;
     int manifest_count;
-    const char *adr_content;
     const cbm_coverage_row_t *coverage;
     int coverage_count;
     cbm_coverage_meta_t coverage_meta;
@@ -984,7 +983,6 @@ void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_predump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void);
-void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);

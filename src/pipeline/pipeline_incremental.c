@@ -1498,8 +1498,7 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
  * generation boundary as full indexing. */
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             atomic_int *cancelled, const cbm_file_hash_t *manifest,
-                            int manifest_count, const char *adr_content,
-                            const cbm_coverage_row_t *cov, int cov_count,
+                            int manifest_count, const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template,
                             const cbm_lsp_surface_row_t *surface_rows, int surface_row_count) {
     struct timespec t;
@@ -1511,7 +1510,6 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         .cancelled = cancelled,
         .manifest = manifest,
         .manifest_count = manifest_count,
-        .adr_content = adr_content,
         .coverage = cov,
         .coverage_count = cov_count,
         .coverage_meta = meta_template ? *meta_template : (cbm_coverage_meta_t){0},
@@ -2328,7 +2326,6 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             .cancelled = cbm_pipeline_cancelled_ptr(p),
             .manifest = manifest,
             .manifest_count = manifest_count,
-            .adr_content = NULL, /* the clone already carries the ADR rows */
             .coverage = cov,
             .coverage_count = cov_n,
             .coverage_meta =
@@ -2628,43 +2625,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
 
-    char *saved_adr = NULL;
-    cbm_adr_t existing_adr = {0};
-    int adr_rc = cbm_store_adr_get(store, project, &existing_adr);
-    if (adr_rc == CBM_STORE_OK) {
-        bool had_adr_content = existing_adr.content != NULL;
-        if (had_adr_content) {
-            saved_adr = strdup(existing_adr.content);
-        }
-        cbm_store_adr_free(&existing_adr);
-        if (had_adr_content && !saved_adr) {
-            cbm_gbuf_free(existing);
-            free(changed_files);
-            for (int i = 0; i < deleted_count; i++) {
-                free(deleted[i]);
-            }
-            free(deleted);
-            free_mode_skipped(mode_skipped, mode_skipped_count);
-            cbm_store_free_coverage(old_cov, old_cov_count);
-            cbm_store_close(store);
-            closure_plan_free(&closure_plan);
-            return CBM_PIPELINE_ABORT_PRESERVE_DB;
-        }
-    } else if (adr_rc != CBM_STORE_NOT_FOUND) {
-        cbm_store_adr_free(&existing_adr);
-        cbm_gbuf_free(existing);
-        free(changed_files);
-        for (int i = 0; i < deleted_count; i++) {
-            free(deleted[i]);
-        }
-        free(deleted);
-        free_mode_skipped(mode_skipped, mode_skipped_count);
-        cbm_store_free_coverage(old_cov, old_cov_count);
-        cbm_store_close(store);
-        closure_plan_free(&closure_plan);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
-    }
-
+    /* ADRs live in the "<db>.adr.db" sidecar, which the delta clone/patch/rename
+     * never touches, so there is nothing to capture or re-apply here. */
     cbm_store_close(store);
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
@@ -2784,7 +2746,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         incr_free_edge_capture(&edge_cap);
         cbm_store_free_coverage(old_cov, old_cov_count);
         free_mode_skipped(mode_skipped, mode_skipped_count);
-        free(saved_adr);
         cbm_gbuf_free(existing);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
@@ -2876,7 +2837,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free(cov);
         cbm_store_free_coverage(old_cov, old_cov_count);
         free_mode_skipped(mode_skipped, mode_skipped_count);
-        free(saved_adr);
         cbm_gbuf_free(existing);
         return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
                                                           : CBM_PIPELINE_ABORT_PRESERVE_DB;
@@ -2907,9 +2867,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * empty table just routes the next incremental to a full rebuild. */
     int persist_rc =
         dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p), manifest,
-                         manifest_count, saved_adr, cov, cov_n, &coverage_meta, NULL, 0);
+                         manifest_count, cov, cov_n, &coverage_meta, NULL, 0);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
-    free(saved_adr);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
