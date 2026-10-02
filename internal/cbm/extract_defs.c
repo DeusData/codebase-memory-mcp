@@ -1650,6 +1650,141 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
     return true;
 }
 
+/* NestJS (and routing-controllers) method decorators: the verb is the bare,
+ * capitalized decorator name — @Get, @Post, ... @All. Returns NULL otherwise. */
+static const char *nest_decorator_method(const char *name) {
+    static const struct {
+        const char *decorator;
+        const char *method;
+    } verbs[] = {{"Get", "GET"},     {"Post", "POST"}, {"Put", "PUT"},         {"Delete", "DELETE"},
+                 {"Patch", "PATCH"}, {"Head", "HEAD"}, {"Options", "OPTIONS"}, {"All", "ANY"}};
+    for (size_t i = 0; name && i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        if (strcmp(name, verbs[i].decorator) == 0) {
+            return verbs[i].method;
+        }
+    }
+    return NULL;
+}
+
+/* Unquote a TS `string` literal node and root it at "/": Nest writes route
+ * segments without a leading slash (@Get(':id'), @Controller('users')). */
+static const char *nest_path_from_string(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "string") != 0) {
+        return NULL;
+    }
+    char *text = cbm_node_text(a, node, source);
+    size_t len = text ? strlen(text) : 0;
+    if (len < PAIR_CHARS) {
+        return NULL;
+    }
+    const char *inner = cbm_arena_strndup(a, text + SKIP_CHAR, len - PAIR_CHARS);
+    if (!inner) {
+        return NULL;
+    }
+    return inner[0] == '/' ? inner : cbm_arena_sprintf(a, "/%s", inner);
+}
+
+/* The route path a Nest decorator's argument list carries. Accepted shapes:
+ *   ()                         -> "/"
+ *   ('users') / (['a', 'b'])   -> the (first) string literal
+ *   ({ path: 'users', ... })   -> the `path` property (Nest's options form)
+ * Any other first argument (a constant, a template) has no statically known
+ * path: NULL, so no Route is invented for it. */
+static const char *nest_path_from_args(CBMArena *a, TSNode args, const char *source) {
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return "/";
+    }
+    TSNode arg = ts_node_named_child(args, 0);
+    const char *kind = ts_node_type(arg);
+    if (strcmp(kind, "array") == 0 && ts_node_named_child_count(arg) > 0) {
+        return nest_path_from_string(a, ts_node_named_child(arg, 0), source);
+    }
+    if (strcmp(kind, "object") != 0) {
+        return nest_path_from_string(a, arg, source);
+    }
+    uint32_t nc = ts_node_named_child_count(arg);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode pair = ts_node_named_child(arg, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        char *key_text = ts_node_is_null(key) ? NULL : cbm_node_text(a, key, source);
+        if (key_text && strcmp(key_text, "path") == 0) {
+            return nest_path_from_string(a, ts_node_child_by_field_name(pair, TS_FIELD("value")),
+                                         source);
+        }
+    }
+    return "/"; /* options object without `path` (e.g. only `host`) */
+}
+
+/* A TS decorator's call_expression as (bare name, argument list). Returns the
+ * name, or NULL when the callee is not a plain identifier. */
+static const char *ts_decorator_call_name(CBMArena *a, TSNode call, const char *source,
+                                          TSNode *out_args) {
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return NULL;
+    }
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0) {
+        return NULL;
+    }
+    *out_args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    return cbm_node_text(a, fn, source);
+}
+
+/* NestJS method route: @Get(':id') on a TS class method. The class-level
+ * @Controller prefix is composed by the caller (nest_class_route_prefix). */
+static bool try_route_from_ts_decorator_call(CBMArena *a, TSNode dchild, const char *source,
+                                             const char **out_path, const char **out_method) {
+    TSNode args = {0};
+    const char *method = nest_decorator_method(ts_decorator_call_name(a, dchild, source, &args));
+    if (!method) {
+        return false;
+    }
+    const char *path = nest_path_from_args(a, args, source);
+    if (!path) {
+        return false;
+    }
+    *out_path = path;
+    *out_method = method;
+    return true;
+}
+
+/* The @Controller('users') prefix of a NestJS controller, from `decorator`
+ * nodes that are children of the class node (`@X class C`) or its preceding
+ * siblings (`@X export class C`: the decorator belongs to export_statement).
+ * NULL when the class is not a controller. */
+static const char *nest_prefix_from_decorator(CBMArena *a, TSNode dec, const char *source) {
+    if (strcmp(ts_node_type(dec), "decorator") != 0) {
+        return NULL;
+    }
+    TSNode args = {0};
+    const char *name = ts_decorator_call_name(a, ts_node_named_child(dec, 0), source, &args);
+    if (!name || (strcmp(name, "Controller") != 0 && strcmp(name, "JsonController") != 0)) {
+        return NULL;
+    }
+    return nest_path_from_args(a, args, source);
+}
+
+static const char *nest_class_route_prefix(CBMArena *a, TSNode class_node, const char *source) {
+    uint32_t cc = ts_node_named_child_count(class_node);
+    for (uint32_t i = 0; i < cc; i++) {
+        const char *p = nest_prefix_from_decorator(a, ts_node_named_child(class_node, i), source);
+        if (p) {
+            return p;
+        }
+    }
+    for (TSNode prev = ts_node_prev_named_sibling(class_node); !ts_node_is_null(prev);
+         prev = ts_node_prev_named_sibling(prev)) {
+        const char *p = nest_prefix_from_decorator(a, prev, source);
+        if (p) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
 /* Resolve an annotation's name node across grammars. Java exposes a `name`
  * field; tree-sitter-kotlin does not — its annotation name lives in a nested
  * type_identifier:
@@ -1822,6 +1957,9 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
         uint32_t dc = ts_node_named_child_count(prev);
         for (uint32_t di = 0; di < dc; di++) {
             TSNode dchild = ts_node_named_child(prev, di);
+            if (try_route_from_ts_decorator_call(a, dchild, source, out_path, out_method)) {
+                return;
+            }
             if (strcmp(ts_node_type(dchild), "call") != 0) {
                 continue;
             }
@@ -5180,6 +5318,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
     }
+    if (def.route_path && (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX)) {
+        /* NestJS: a verb decorator only routes inside a @Controller class. */
+        const char *prefix = nest_class_route_prefix(a, class_node, ctx->source);
+        def.route_path = prefix ? join_route_paths(a, prefix, def.route_path) : NULL;
+        def.route_method = prefix ? def.route_method : NULL;
+    }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -5773,6 +5917,123 @@ static bool is_require_import_call(TSNode value, const char *source, CBMArena *a
     return false;
 }
 
+/* True when text of `node` equals `want` exactly (no arena allocation). */
+static bool js_node_text_is(TSNode node, const char *source, const char *want) {
+    if (ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = strlen(want);
+    return end >= start && (size_t)(end - start) == len && memcmp(source + start, want, len) == 0;
+}
+
+/* #1916: `axios.create(...)` — the factory of a configured axios instance
+ * (the vue-element-admin / RuoYi `request.js` wrapper). Only the literal
+ * `axios` receiver is recognised: a look-alike `factory.create(...)` is not
+ * an HTTP client and must not turn its binding into one. */
+static bool js_is_axios_create_call(TSNode value, const char *source) {
+    if (ts_node_is_null(value) || strcmp(ts_node_type(value), "call_expression") != 0) {
+        return false;
+    }
+    TSNode fn = ts_node_child_by_field_name(value, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "member_expression") != 0) {
+        return false;
+    }
+    TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+    TSNode prop = ts_node_child_by_field_name(fn, TS_FIELD("property"));
+    return !ts_node_is_null(obj) && strcmp(ts_node_type(obj), "identifier") == 0 &&
+           js_node_text_is(obj, source, "axios") && js_node_text_is(prop, source, "create");
+}
+
+/* The literal `baseURL` of `axios.create({ baseURL: '<lit>' })`, or NULL when
+ * the config is absent, not an object literal, or the value is not a plain
+ * string literal (process.env.X, a template with substitutions, an escape):
+ * an unknown base is never guessed. */
+static const char *js_axios_create_base_url(CBMArena *a, TSNode call, const char *source) {
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return NULL;
+    }
+    TSNode cfg = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(cfg), "object") != 0) {
+        return NULL;
+    }
+    uint32_t n = ts_node_named_child_count(cfg);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(cfg, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        if (!js_node_text_is(key, source, "baseURL") &&
+            !js_node_text_is(key, source, "'baseURL'") &&
+            !js_node_text_is(key, source, "\"baseURL\"")) {
+            continue;
+        }
+        TSNode val = ts_node_child_by_field_name(pair, TS_FIELD("value"));
+        if (ts_node_is_null(val) || strcmp(ts_node_type(val), "string") != 0) {
+            return NULL;
+        }
+        char *text = cbm_node_text(a, val, source);
+        size_t len = text ? strlen(text) : 0;
+        if (len < PAIR_LEN || strchr(text, '\\') != NULL) {
+            return NULL;
+        }
+        text[len - SKIP_ONE] = '\0';
+        return text + SKIP_ONE;
+    }
+    return NULL;
+}
+
+/* Mark `def` as an axios client instance created by `call` (#1916). */
+static void js_mark_axios_client(CBMArena *a, CBMDefinition *def, TSNode call, const char *source) {
+    def->http_client = "axios";
+    def->http_base_url = js_axios_create_base_url(a, call, source);
+}
+
+/* #1916: `export default api;` (api an axios instance declared above) or
+ * `export default axios.create({...})` makes the MODULE's default export the
+ * client — record it on the Module def so a default import can find it. */
+static void js_mark_default_export_client(CBMExtractCtx *ctx, int mod_idx) {
+    if (mod_idx < 0 || mod_idx >= ctx->result->defs.count) {
+        return;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode stmt = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(stmt), "export_statement") != 0) {
+            continue;
+        }
+        TSNode val = ts_node_child_by_field_name(stmt, TS_FIELD("value"));
+        if (ts_node_is_null(val)) {
+            continue;
+        }
+        CBMDefinition *mod = &ctx->result->defs.items[mod_idx];
+        if (js_is_axios_create_call(val, ctx->source)) {
+            js_mark_axios_client(ctx->arena, mod, val, ctx->source);
+            continue;
+        }
+        if (strcmp(ts_node_type(val), "identifier") != 0) {
+            continue;
+        }
+        for (int d = 0; d < ctx->result->defs.count; d++) {
+            const CBMDefinition *v = &ctx->result->defs.items[d];
+            if (v->http_client && v->label && strcmp(v->label, "Variable") == 0 && v->name &&
+                !v->parent_class && js_node_text_is(val, ctx->source, v->name)) {
+                mod->http_client = v->http_client;
+                mod->http_base_url = v->http_base_url;
+                break;
+            }
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 // JS/TS variable extraction: skip function-assigned declarators.
 static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -5808,7 +6069,12 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 if (is_require) {
                     continue;
                 }
+                int before = ctx->result->defs.count;
                 push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
+                if (ctx->result->defs.count > before &&
+                    js_is_axios_create_call(value, ctx->source)) {
+                    js_mark_axios_client(a, &ctx->result->defs.items[before], value, ctx->source);
+                }
             }
         }
     }
@@ -7484,6 +7750,38 @@ static void extract_typescript_namespace_def(CBMExtractCtx *ctx, TSNode node,
     cbm_defs_push(&ctx->result->defs, ctx->arena, def);
 }
 
+/* Dart `extension on T { ... }` has no name: there is no container def to hang
+ * its members on, and extract_class_def would bail before extract_class_methods,
+ * dropping every member (#1457). */
+static bool is_dart_unnamed_extension(const CBMExtractCtx *ctx, TSNode node) {
+    return ctx->language == CBM_LANG_DART &&
+           strcmp(ts_node_type(node), "extension_declaration") == 0 &&
+           ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("name")));
+}
+
+/* Walk an unnamed Dart extension's members as file-level functions. A member is
+ * `method_signature > function_signature`; the wrapper carries no name of its
+ * own, so push the inner function_signature (which does) for the generic walk. */
+static void push_dart_unnamed_extension_members(TSNode node, wd_stack_t *s,
+                                                const char *enclosing_qn) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(body);
+    for (int i = (int)nc - 1; i >= 0; i--) {
+        TSNode child = ts_node_named_child(body, (uint32_t)i);
+        if (strcmp(ts_node_type(child), "method_signature") == 0) {
+            TSNode sig = cbm_find_child_by_kind(child, "function_signature");
+            if (!ts_node_is_null(sig)) {
+                wd_push(s, sig, enclosing_qn);
+            }
+            continue;
+        }
+        wd_push(s, child, enclosing_qn);
+    }
+}
+
 // Push nested class children from a class body container onto the walk stack.
 static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
                                      const char *new_enclosing, const CBMExtractCtx *ctx) {
@@ -8086,6 +8384,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             continue;
         }
 
+        if (is_dart_unnamed_extension(ctx, node)) {
+            push_dart_unnamed_extension_members(node, &s, frame.enclosing_class_qn);
+            continue;
+        }
+
         if (cbm_kind_in_set(node, spec->class_node_types)) {
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
@@ -8246,7 +8549,14 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
             mod.route_method = "GET"; /* a routable page is reached by navigation */
         }
     }
+    int mod_idx = ctx->result->defs.count;
     cbm_defs_push(&ctx->result->defs, a, mod);
 
     cbm_extract_definitions_without_module(ctx);
+
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
+        /* Same language set as extract_js_vars, which marks the bindings. */
+        js_mark_default_export_client(ctx, mod_idx);
+    }
 }

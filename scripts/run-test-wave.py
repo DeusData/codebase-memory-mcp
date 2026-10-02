@@ -55,6 +55,16 @@ POLL_SECONDS = 0.05
 WINDOWS_DESCENDANT_PROBE_SECONDS = 15
 WINDOWS_DESCENDANT_PROBE_ATTEMPTS = 2
 
+# WHY: the same defect as the probe above, one call earlier. `taskkill /F`
+# cannot be resisted -- a live tree is terminated as soon as the tool runs --
+# so what bounding it measures is taskkill.exe's own cold start on the runner,
+# not the tree. Timed with --kill-grace (1s in the harness contract), a slow
+# start was reported as "taskkill could not prove process-tree cleanup" for an
+# ordinary hung suite (#2345). The tree does not change while the tool starts,
+# so this is a stable-state budget; --kill-grace keeps bounding what it names:
+# how long the leader may take to be reaped once taskkill has succeeded.
+WINDOWS_TASKKILL_SECONDS = 15
+
 
 @dataclass
 class ActiveSuite:
@@ -225,6 +235,27 @@ def windows_tree_cleanup_blocker(pid: int) -> str | None:
     return unproven
 
 
+def windows_taskkill_tree(pid: int) -> bool:
+    """Force-terminate `pid` and its whole tree; True only on proven success.
+
+    A tool that cannot start, cannot finish within its own budget, or reports
+    failure is never read as success -- the caller refuses to call the tree
+    clean.
+    """
+    try:
+        completed = subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=WINDOWS_TASKKILL_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
 def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
     process = active.process
     leader_exited = process.poll() is not None
@@ -243,24 +274,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
                     f"could not be proven: {blocker}"
                 )
             return
-        try:
-            completed = subprocess.run(
-                [
-                    "taskkill.exe",
-                    "/PID",
-                    str(process.pid),
-                    "/T",
-                    "/F",
-                ],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=kill_grace,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is None or completed.returncode != 0:
+        if not windows_taskkill_tree(process.pid):
             if process.poll() is None:
                 process.kill()
                 try:

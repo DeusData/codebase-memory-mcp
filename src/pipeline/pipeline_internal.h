@@ -23,7 +23,10 @@
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
-/* Maximum byte budget for tree-sitter extraction per file */
+/* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time
+ * (5 s). Passed as cbm_extract_file*()'s timeout_micros; a generous wall-clock
+ * ceiling (CBM_PARSE_WALL_CEILING_FACTOR x, ~60 s) backstops a stuck parse.
+ * It is a time budget, not a byte budget. */
 #define CBM_EXTRACT_BUDGET 5000000
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
@@ -211,6 +214,21 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path);
 
+/* #1916: HTTP client-instance calls. When `call` is `<recv>.<verb>(url)` with
+ * an HTTP verb suffix and a path/URL first argument, and `recv` is bound —
+ * in the calling module itself, or via an ES import (named or default) — to a
+ * binding the extractor marked as an `axios.create(...)` instance
+ * (`http_client` node property), write the request URL to `out` (the
+ * instance's literal `http_base_url` joined with a '/'-leading path, the path
+ * unchanged when the base is unknown or the URL is absolute) and return true.
+ * Both call resolvers (pass_calls.c, pass_parallel.c) call this before any
+ * route-registration or registry fallback, so a wrapper client's `api.get`
+ * is never mistaken for an Express `app.get` route registration. */
+bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                       const CBMFileResult *result, const char **imp_keys,
+                                       const char **imp_vals, int imp_count, const CBMCall *call,
+                                       char *out, size_t out_sz);
+
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
  * Resolution order (first hit wins):
@@ -281,6 +299,23 @@ static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
  * is external and the correct result is no edge. Pure; exercised through
  * ei_go_import_never_binds_symbol. */
 bool cbm_import_symbol_fallback_allowed(CBMLanguage lang);
+
+/* #2127: true when the module segments preceding `name` in a Python import
+ * path (`unittest.mock.patch` -> unittest, mock) occur, in order, among the
+ * enclosing segments of `hit_qn`. Leading relative dots and ` as alias` are
+ * ignored; a path with no module chain before `name` always matches. Gates
+ * the import resolver's symbol-name fallback for Python. */
+bool cbm_python_import_path_matches_qn(const char *module_path, const char *name,
+                                       const char *hit_qn);
+
+/* #2127: true when the callee's root identifier is bound by the file's Python
+ * imports and every such binding is EXTERNAL (no IMPORTS edge from `rel_path`
+ * in `gbuf` carries its local name; NULL gbuf = none) with a module chain that
+ * contradicts `resolved_qn`. Feeds cbm_suppress_weak_import_bound_call at both
+ * resolver call sites. */
+bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
+                                           const char *resolved_qn, const cbm_gbuf_t *gbuf,
+                                           const char *project_name, const char *rel_path);
 
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);

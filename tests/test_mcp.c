@@ -1397,13 +1397,13 @@ TEST(mcp_tools_have_behavior_annotations) {
          * left in place, never quarantined or rebuilt. Quarantine/rebuild is
          * a write-side job (index_repository, manage_adr writes), so the
          * read-only annotations are honest and plan-mode clients can expose
-         * these tools. get_file_outline arrived after this split and keeps
-         * its upstream conservative annotation. */
+         * these tools. get_file_outline reads through the same resolve_store
+         * path and is annotated the same way (#2118). */
         {"search_graph", true, false, true, false},
         {"query_graph", true, false, true, false},
         {"trace_path", true, false, true, false},
         {"get_code_snippet", true, false, true, false},
-        {"get_file_outline", false, true, true, false},
+        {"get_file_outline", true, false, true, false},
         {"get_graph_schema", true, false, true, false},
         {"compare_graphs", true, false, true, false},
         {"get_architecture", true, false, true, false},
@@ -1414,7 +1414,10 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
         {"manage_adr", false, true, false, false},
-        {"ingest_traces", false, false, false, false},
+        /* ingest_traces only validates and counts its input; it writes
+         * nothing, so it is read-only and idempotent until edge creation
+         * actually lands (#2118). */
+        {"ingest_traces", true, false, true, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -1462,6 +1465,80 @@ TEST(mcp_tools_have_behavior_annotations) {
     }
 
     ASSERT_EQ(matched, sizeof(expected) / sizeof(expected[0]));
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
+/* #2118: annotations drive client auto-approval, so a mis-stamped read tool
+ * is a real integration bug. Walk the REGISTERED tool list (not a mirrored
+ * table) so a newly added tool cannot slip through: every tool must carry
+ * annotations, a read-only tool can never be destructive, and only the tools
+ * whose handlers actually mutate state may be non-read-only. */
+static yyjson_val *find_tool_json(yyjson_val *tools, const char *name) {
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *tool;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        const char *tool_name = yyjson_get_str(yyjson_obj_get(tool, "name"));
+        if (tool_name && strcmp(tool_name, name) == 0) {
+            return tool;
+        }
+    }
+    return NULL;
+}
+
+static bool tool_in_list(const char *name, const char *const *list, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(name, list[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118) {
+    /* Handlers that write user-visible state: index_repository (builds the
+     * index), manage_adr (writes/overwrites ADR sections), delete_project
+     * (removes the index). Everything else must be read-only. */
+    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project"};
+    /* Of those, only the ones that can remove/overwrite existing data. */
+    static const char *const destructive[] = {"manage_adr", "delete_project"};
+    const size_t n_mut = sizeof(mutating) / sizeof(mutating[0]);
+    const size_t n_des = sizeof(destructive) / sizeof(destructive[0]);
+
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_NOT_NULL(tools);
+
+    int count = cbm_mcp_tool_count();
+    ASSERT_GT(count, 0);
+    ASSERT_EQ(yyjson_arr_size(tools), (size_t)count);
+    for (int i = 0; i < count; i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        ASSERT_NOT_NULL(name);
+        yyjson_val *tool = find_tool_json(tools, name);
+        ASSERT_NOT_NULL(tool);
+        yyjson_val *annotations = yyjson_obj_get(tool, "annotations");
+        ASSERT_NOT_NULL(annotations);
+        yyjson_val *read_only = yyjson_obj_get(annotations, "readOnlyHint");
+        yyjson_val *destr = yyjson_obj_get(annotations, "destructiveHint");
+        ASSERT_TRUE(yyjson_is_bool(read_only));
+        ASSERT_TRUE(yyjson_is_bool(destr));
+        bool is_mut = tool_in_list(name, mutating, n_mut);
+        bool is_des = tool_in_list(name, destructive, n_des);
+        if (yyjson_get_bool(read_only) == is_mut || yyjson_get_bool(destr) != is_des) {
+            printf("  tool %s: readOnlyHint=%d destructiveHint=%d (want %d/%d)\n", name,
+                   (int)yyjson_get_bool(read_only), (int)yyjson_get_bool(destr), (int)!is_mut,
+                   (int)is_des);
+        }
+        ASSERT_EQ(yyjson_get_bool(read_only), !is_mut);
+        ASSERT_EQ(yyjson_get_bool(destr), is_des);
+    }
+
     yyjson_doc_free(doc);
     free(json);
     PASS();
@@ -7187,6 +7264,67 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+/* Leak regression: trace_path by a qualified name resolves only through the
+ * qualified_name fallback. The bare-name lookup that precedes it returns a
+ * heap array even for zero rows (find_nodes_generic allocates its initial
+ * capacity up front), and the fallback used to overwrite that pointer —
+ * leaking ~1 KB per call for the daemon's lifetime. The sanitizer lanes
+ * (LSan: default-on under Linux ASan, `make -f Makefile.cbm test-lsan` on
+ * macOS) report the leak at exit; the assertions pin that this test really
+ * takes the fallback path. */
+TEST(tool_trace_call_path_qn_fallback_frees_name_miss) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "qnfb-proj";
+    const char *qn = "qnfb-proj.src.qnfb_entry";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/qnfb");
+    cbm_node_t entry = {.project = proj,
+                        .label = "Function",
+                        .name = "qnfb_entry",
+                        .qualified_name = qn,
+                        .file_path = "src/qnfb.c",
+                        .start_line = 1,
+                        .end_line = 10};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "qnfb_callee",
+                         .qualified_name = "qnfb-proj.src.qnfb_callee",
+                         .file_path = "src/qnfb.c",
+                         .start_line = 20,
+                         .end_line = 30};
+    int64_t id_entry = cbm_store_upsert_node(st, &entry);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_entry, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t e = {
+        .project = proj, .source_id = id_entry, .target_id = id_callee, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    /* Precondition: the qualified name is NOT a bare name, so the handler's
+     * first lookup misses and the fallback is the only way to resolve it. */
+    cbm_node_t *by_name = NULL;
+    int by_name_count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(st, proj, qn, &by_name, &by_name_count), CBM_STORE_OK);
+    ASSERT_EQ(by_name_count, 0);
+    cbm_store_free_nodes(by_name, by_name_count);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":"
+             "\"qnfb-proj.src.qnfb_entry\",\"project\":\"qnfb-proj\",\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "function not found"));
+    /* resolved through the fallback -> its outbound CALLS edge shows */
+    ASSERT_NOT_NULL(strstr(inner, "qnfb_callee"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* CONTRACT PIN for the closed strategy vocabulary published by
  * trace_path(include_evidence:true).
  *
@@ -8435,6 +8573,197 @@ TEST(tool_project_arg_resolves_unique_tail_issue1025) {
     th_rmtree(repo_a);
     th_rmtree(repo_b);
     th_rmtree(repo_c);
+    th_rmtree(cache);
+    PASS();
+}
+
+/* #1827: a repo under a non-ASCII folder ("中文测试仓库") gets a project name
+ * whose non-ASCII bytes are hex-transliterated (#571), e.g.
+ * "...-e4b8ade69687e6b58be8af95e4bb93e5ba93". That stored identity stays
+ * stable (it is the cache DB file name), but the project must stay reachable
+ * by what the user actually knows: the real path (already normalized) AND the
+ * real folder name, which the #1025 tail match skipped because the raw
+ * non-ASCII name fails the project-name validator before any lookup. */
+TEST(tool_project_arg_resolves_non_ascii_folder_issue1827) {
+    char parent[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(parent, sizeof(parent), "/tmp/cbm-i1827a-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i1827c-XXXXXX");
+    if (!cbm_mkdtemp(parent) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *folder = "\xe4\xb8\xad\xe6\x96\x87\xe6\xb5\x8b\xe8\xaf\x95\xe4\xbb\x93\xe5\xba\x93";
+    char repo[CBM_SZ_512];
+    snprintf(repo, sizeof(repo), "%s/%s", parent, folder);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+    char file[CBM_SZ_1K];
+    snprintf(file, sizeof(file), "%s/hello.js", repo);
+    FILE *f = cbm_fopen(file, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "function greet_1827(){return 'hi';}\n");
+    fclose(f);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    /* The stored identity keeps its existing hex form (no DB rename). */
+    char *stored = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(stored);
+    ASSERT_NOT_NULL(strstr(stored, "-e4b8ade69687e6b58be8af95e4bb93e5ba93"));
+    free(stored);
+
+    /* 1. The real folder name resolves (RED before: "project not found"). */
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*greet_1827.*\"}",
+             folder);
+    r = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(r);
+    if (strstr(r, "project not found")) {
+        fprintf(stderr, "  [1827] FAIL folder name did not resolve: %.200s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "greet_1827"));
+    free(r);
+
+    /* 2. The real path keeps resolving. */
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*greet_1827.*\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "greet_1827"));
+    free(r);
+
+    /* 3. A non-ASCII name matching nothing stays a not-found error. */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"\xe4\xb8\x8d\xe5\xad\x98\xe5\x9c\xa8\","
+                            "\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(parent);
+    th_rmtree(cache);
+    PASS();
+}
+
+/* #2134: re-indexing a root WITHOUT `name` must update the project that
+ * already owns that root_path, not fork a second index under the
+ * path-derived name (both then list the same root_path and the stale one
+ * keeps being read as fresh). Several owners of one root are ambiguous: the
+ * call must fail loudly and name them instead of guessing or forking. */
+static int i2134_count_occurrences(const char *haystack, const char *needle) {
+    int count = 0;
+    for (const char *p = haystack ? strstr(haystack, needle) : NULL; p; p = strstr(p + 1, needle)) {
+        count++;
+    }
+    return count;
+}
+
+TEST(tool_index_repository_reuses_existing_project_for_root_issue2134) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-i2134r-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i2134c-XXXXXX");
+    if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    char canonical_repo[CBM_SZ_4K]; /* cbm_canonical_path needs >= 4096 bytes */
+    if (!cbm_canonical_path(repo, canonical_repo, sizeof(canonical_repo))) {
+        FAIL("cbm_canonical_path failed");
+    }
+    /* Stored root_path values use forward slashes on every platform. */
+    cbm_normalize_path_sep(canonical_repo);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    const char *saved_sup = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sup_copy = saved_sup ? cbm_strdup(saved_sup) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+    i1025_write_repo(repo, "root_owner_2134");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* 1. Index once under an explicit name. */
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"named-2134\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    free(r);
+
+    /* 2. Re-index the same root without a name: must update named-2134. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    if (!strstr(r, "named-2134")) {
+        fprintf(stderr, "  [2134] reindex without name forked: %.300s\n", r);
+    }
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    free(r);
+
+    /* Every listed project carries its root_path once in structuredContent,
+     * so the canonical root occurring once there means exactly one owner. */
+    r = cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"structuredContent\""));
+    int owners = i2134_count_occurrences(strstr(r, "\"structuredContent\""), canonical_repo);
+    if (owners != 1) {
+        fprintf(stderr, "  [2134] %d projects share root %s: %.400s\n", owners, canonical_repo, r);
+    }
+    ASSERT_EQ(owners, 1);
+    free(r);
+
+    /* 3. An explicit second name is the caller's choice; afterwards the root
+     * has two owners, so an unnamed re-index must refuse and list both. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"other-2134\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "other-2134"));
+    free(r);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    ASSERT_NOT_NULL(strstr(r, "other-2134"));
+    ASSERT_NOT_NULL(strstr(r, "\"isError\":true"));
+    free(r);
+    r = cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"structuredContent\""));
+    ASSERT_EQ(i2134_count_occurrences(strstr(r, "\"structuredContent\""), canonical_repo), 2);
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_sup_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sup_copy, 1);
+        free(saved_sup_copy);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    th_rmtree(repo);
     th_rmtree(cache);
     PASS();
 }
@@ -14179,6 +14508,146 @@ TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed) {
     ASSERT_EQ(th_rmtree(repo), 0);
 
     ASSERT_TRUE(exact_nested_path);
+    ASSERT_TRUE(seed_found);
+    ASSERT_TRUE(impact_found);
+    PASS();
+}
+
+/* Issue #1951: the indexed project root is a SUBDIRECTORY of a normal Git
+ * repository. Git reports changed paths relative to the Git root
+ * ("game/src/math.c"), while graph file_paths are relative to the project
+ * root ("src/math.c"). detect_changes must translate Git-root paths into the
+ * project's coordinate system (diff, hunk and status records alike) and leave
+ * changes outside the project out, or the seed lookup finds nothing. */
+TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-subdir-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-subdir-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char project_root[CBM_SZ_4K];
+    snprintf(project_root, sizeof(project_root), "%s/game", repo);
+    ASSERT_EQ(cbm_mkdir(project_root), 0);
+    char source_dir[CBM_SZ_4K];
+    snprintf(source_dir, sizeof(source_dir), "%s/src", project_root);
+    ASSERT_EQ(cbm_mkdir(source_dir), 0);
+    char math_source[CBM_SZ_4K];
+    snprintf(math_source, sizeof(math_source), "%s/math.c", source_dir);
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 1; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char use_source[CBM_SZ_4K];
+    snprintf(use_source, sizeof(use_source), "%s/use.c", source_dir);
+    ASSERT_EQ(
+        th_write_file(use_source, "int add_one(int x);\nint use_it(void) { return add_one(4); }\n"),
+        0);
+    char outside_source[CBM_SZ_4K];
+    snprintf(outside_source, sizeof(outside_source), "%s/outside.c", repo);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 0; }\n"), 0);
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+
+    /* Worktree edits: a tracked change inside the project (diff + hunk path),
+     * an untracked file inside it (status path) and a change outside it. */
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 2; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char fresh_source[CBM_SZ_4K];
+    snprintf(fresh_source, sizeof(fresh_source), "%s/fresh.c", source_dir);
+    ASSERT_EQ(th_write_file(fresh_source, "int fresh(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 1; }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-subdir-project";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, project_root), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t seed = {.project = project,
+                       .label = "Function",
+                       .name = "add_one",
+                       .qualified_name = "fixture.src.math.add_one",
+                       .file_path = "src/math.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    int64_t seed_id = cbm_store_upsert_node(store, &seed);
+    ASSERT_GT(seed_id, 0);
+    /* Same file, untouched line: only hunk scoping (project-relative hunk
+     * paths) keeps it out of the seeds; whole-file fallback would add it. */
+    cbm_node_t untouched = {.project = project,
+                            .label = "Function",
+                            .name = "untouched",
+                            .qualified_name = "fixture.src.math.untouched",
+                            .file_path = "src/math.c",
+                            .start_line = 2,
+                            .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(store, &untouched), 0);
+    cbm_node_t caller = {.project = project,
+                         .label = "Function",
+                         .name = "use_it",
+                         .qualified_name = "fixture.src.use.use_it",
+                         .file_path = "src/use.c",
+                         .start_line = 2,
+                         .end_line = 2};
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t edge = {
+        .project = project, .source_id = caller_id, .target_id = seed_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "detect_changes",
+                            "{\"project\":\"detect-subdir-project\",\"base_branch\":\"HEAD\","
+                            "\"scope\":\"impact\",\"depth\":2,\"max_output_tokens\":10000,"
+                            "\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *changed_files = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    yyjson_val *first_path = changed_files ? yyjson_arr_get(changed_files, 0) : NULL;
+    yyjson_val *second_path = changed_files ? yyjson_arr_get(changed_files, 1) : NULL;
+    yyjson_val *impacted = root ? yyjson_obj_get(root, "impacted") : NULL;
+    yyjson_val *first_impact = impacted ? yyjson_arr_get(impacted, 0) : NULL;
+    bool project_relative_paths =
+        root && yyjson_get_int(yyjson_obj_get(root, "changed_total")) == 2 && first_path &&
+        second_path && strcmp(yyjson_get_str(first_path), "src/fresh.c") == 0 &&
+        strcmp(yyjson_get_str(second_path), "src/math.c") == 0;
+    bool seed_found = root && yyjson_get_int(yyjson_obj_get(root, "seed_symbols")) == 1;
+    bool impact_found = first_impact && strcmp(yyjson_get_str(yyjson_obj_get(first_impact, "qn")),
+                                               "fixture.src.use.use_it") == 0;
+    if (!project_relative_paths || !seed_found || !impact_found) {
+        fprintf(stderr, "  issue1951 response: %s\n", inner ? inner : "(null)");
+    }
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+
+    ASSERT_TRUE(project_relative_paths);
     ASSERT_TRUE(seed_found);
     ASSERT_TRUE(impact_found);
     PASS();
@@ -20454,7 +20923,70 @@ TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
     PASS();
 }
 
+/* #2144: async/status need the daemon's job registry. An in-process server
+ * (index worker, embedder) has no process that outlives the call, so it must
+ * refuse both modes instead of silently running a blocking index. */
+TEST(index_repository_async_and_status_refused_without_daemon_issue2144) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *async_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                            "{\"repo_path\":\"/nonexistent-2144\","
+                                            "\"async\":true}");
+    char *status_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                             "{\"repo_path\":\"/nonexistent-2144\","
+                                             "\"status\":true}");
+    cbm_mcp_server_free(srv);
+    ASSERT_NOT_NULL(async_reply);
+    ASSERT_NOT_NULL(strstr(async_reply, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(async_reply, "daemon"));
+    ASSERT_NOT_NULL(status_reply);
+    ASSERT_NOT_NULL(strstr(status_reply, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(status_reply, "daemon"));
+    free(async_reply);
+    free(status_reply);
+    PASS();
+}
+
+/* #2144: the tool schema advertises both flags and the description explains
+ * the deadline problem and the polling pattern. */
+TEST(index_repository_schema_documents_async_polling_issue2144) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2144,\"method\":\"tools/list\"}");
+    cbm_mcp_server_free(srv);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"async\":{\"type\":\"boolean\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"status\":{\"type\":\"boolean\""));
+    ASSERT_NOT_NULL(strstr(resp, "per-call deadline"));
+    ASSERT_NOT_NULL(strstr(resp, "poll with status:true"));
+    free(resp);
+    PASS();
+}
+
+/* #2144: a notice rides on a JSON payload as a key (content text and
+ * structuredContent together) and on a text payload as a paragraph. */
+TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
+    char *object = cbm_mcp_tool_result_add_notice(
+        cbm_mcp_text_result("{\"status\":\"indexed\"}", false), "retry async");
+    char *text =
+        cbm_mcp_tool_result_add_notice(cbm_mcp_text_result("plain failure", true), "retry async");
+    ASSERT_NOT_NULL(object);
+    ASSERT_NOT_NULL(strstr(object, "\"structuredContent\":{\"status\":\"indexed\","
+                                   "\"notice\":\"retry async\"}"));
+    ASSERT_NOT_NULL(strstr(object, "\"isError\":false"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "plain failure\\n\\nretry async"));
+    ASSERT_NOT_NULL(strstr(text, "\"isError\":true"));
+    free(object);
+    free(text);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
+    RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
+    RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
     RUN_TEST(bm25_finds_module_by_promoted_description_issue519);
@@ -20503,6 +21035,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_discovery_defaults_match_runtime_contract);
     RUN_TEST(mcp_metadata_byte_budget);
     RUN_TEST(mcp_tools_have_behavior_annotations);
+    RUN_TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
@@ -20638,6 +21171,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_reports_engine_saturation_as_lower_bound);
     RUN_TEST(store_bfs_edge_data_is_skippable_and_bounded);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
@@ -20655,6 +21189,8 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
+    RUN_TEST(tool_project_arg_resolves_non_ascii_folder_issue1827);
+    RUN_TEST(tool_index_repository_reuses_existing_project_for_root_issue2134);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
@@ -20755,6 +21291,7 @@ SUITE(mcp) {
     RUN_TEST(tool_detect_changes_invalid_base_is_an_error);
     RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
     RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
+    RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
     RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);
     RUN_TEST(tool_detect_changes_staged_rename_uses_exact_destination_record);
     RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);

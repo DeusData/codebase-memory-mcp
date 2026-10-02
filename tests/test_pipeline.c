@@ -5914,6 +5914,297 @@ TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_r
 }
 #endif
 
+/* #1916: one index of the axios-wrapper fixture, reduced to the edge counts
+ * the test asserts. */
+typedef struct {
+    int run_rc;
+    int wrapper_http;        /* loadWrapperOrders -HTTP_CALLS-> <base>/orders */
+    int wrapper_http_v3;     /* same call after the wrapper's base moves to /v3 */
+    int wrapper_http_v3_inv; /* ... and then the caller's path moves to /invoices */
+    int wrapper_raw_http;    /* loadWrapperOrders -HTTP_CALLS-> /orders (uncomposed) */
+    int wrapper_route_reg;   /* loadWrapperOrders -CALLS-> /orders (phantom route reg) */
+    int named_http;          /* named import, base with trailing '/' */
+    int local_http;          /* same-file instance spelled axiosInstance */
+    int local_raw_http;      /* ... uncomposed (the #523 spelling match) */
+    int dynamic_http;        /* non-literal baseURL: path kept, never guessed */
+    int dynamic_route_reg;   /* ... misread as a route registration */
+    int direct_http;         /* control: axios.get('/direct') */
+    int fake_http;           /* look-alike factory.create: never a client */
+    int provider_handles;    /* control: Express app.get stays a registration */
+} AxiosWrapperObs;
+
+static AxiosWrapperObs observe_axios_wrapper(const char *repo, const char *db) {
+    AxiosWrapperObs o;
+    memset(&o, 0xff, sizeof(o)); /* -1 everywhere: "not observed" */
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
+    if (!p) {
+        return o;
+    }
+    o.run_rc = cbm_pipeline_run(p);
+    const char *proj = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (s && proj) {
+        o.wrapper_http =
+            named_edge_count(s, proj, "HTTP_CALLS", "loadWrapperOrders", "/api/orders");
+        o.wrapper_http_v3 =
+            named_edge_count(s, proj, "HTTP_CALLS", "loadWrapperOrders", "/v3/orders");
+        o.wrapper_http_v3_inv =
+            named_edge_count(s, proj, "HTTP_CALLS", "loadWrapperOrders", "/v3/invoices");
+        o.wrapper_raw_http =
+            named_edge_count(s, proj, "HTTP_CALLS", "loadWrapperOrders", "/orders");
+        o.wrapper_route_reg = named_edge_count(s, proj, "CALLS", "loadWrapperOrders", "/orders");
+        o.named_http = named_edge_count(s, proj, "HTTP_CALLS", "loadNamedItems", "/v2/items");
+        o.local_http = named_edge_count(s, proj, "HTTP_CALLS", "loadLocal", "/local/x");
+        o.local_raw_http = named_edge_count(s, proj, "HTTP_CALLS", "loadLocal", "/x");
+        o.dynamic_http = named_edge_count(s, proj, "HTTP_CALLS", "loadDynamic", "/dynamic");
+        o.dynamic_route_reg = named_edge_count(s, proj, "CALLS", "loadDynamic", "/dynamic");
+        o.direct_http = named_edge_count(s, proj, "HTTP_CALLS", "loadDirectOrders", "/direct");
+        o.fake_http = named_edge_count(s, proj, "HTTP_CALLS", "loadFake", "/api/fake");
+        o.provider_handles = named_edge_count(s, proj, "HANDLES", "provideOrders", "/api/orders");
+    }
+    if (s) {
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    return o;
+}
+
+/* #1916: `const api = axios.create({ baseURL: '/api' }); export default api`
+ * in one module and `api.get('/orders')` in another is THE Vue-admin wrapper
+ * pattern. The call must become HTTP_CALLS to GET /api/orders — before the
+ * fix the `.get` suffix made it an Express route REGISTRATION (a CALLS edge
+ * to a phantom server route /orders) and cross-repo matching found nothing.
+ * 52 fillers put the default run on the parallel resolver; the
+ * single-thread run is the sequential oracle; a same-DB reindex after the
+ * wrapper's base changes must converge with the fresh index. */
+TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_axios_wrapper_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/client.ts",
+                    "import axios from 'axios';\n"
+                    "const api = axios.create({ baseURL: '/api', timeout: 5000 });\n"
+                    "export default api;\n");
+    write_temp_file(
+        tmp, "src/orders.ts",
+        "import api from './client';\n"
+        "import axios from 'axios';\n"
+        "export function loadWrapperOrders(): unknown { return api.get('/orders'); }\n"
+        "export function loadDirectOrders(): unknown { return axios.get('/direct'); }\n");
+    write_temp_file(tmp, "src/named-client.ts",
+                    "import axios from 'axios';\n"
+                    "export const http = axios.create({ baseURL: '/v2/' });\n");
+    write_temp_file(tmp, "src/named-caller.ts",
+                    "import { http } from './named-client';\n"
+                    "export function loadNamedItems(): unknown { return http.post('/items'); }\n");
+    write_temp_file(tmp, "src/local.ts",
+                    "import axios from 'axios';\n"
+                    "const axiosInstance = axios.create({ baseURL: '/local' });\n"
+                    "export function loadLocal(): unknown { return axiosInstance.get('/x'); }\n");
+    write_temp_file(tmp, "src/dynamic-client.ts",
+                    "import axios from 'axios';\n"
+                    "const dynamicApi = axios.create({ baseURL: process.env.API_BASE });\n"
+                    "export default dynamicApi;\n");
+    write_temp_file(
+        tmp, "src/dynamic-caller.ts",
+        "import dynamicApi from './dynamic-client';\n"
+        "export function loadDynamic(): unknown { return dynamicApi.get('/dynamic'); }\n");
+    write_temp_file(tmp, "src/fake-client.ts",
+                    "const factory = { create: (config: unknown) => config };\n"
+                    "const fakeApi = factory.create({ baseURL: '/api' });\n"
+                    "export default fakeApi;\n");
+    write_temp_file(tmp, "src/fake-caller.ts",
+                    "import fakeApi from './fake-client';\n"
+                    "export function loadFake(): unknown { return fakeApi.get('/fake'); }\n");
+    write_temp_file(tmp, "src/provider.ts",
+                    "import express from 'express';\n"
+                    "const app = express();\n"
+                    "function provideOrders(): void {}\n"
+                    "app.get('/api/orders', provideOrders);\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/wrapper_pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function wrapperPad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    char db_seq[512];
+    char db_par[512];
+    char db_fresh[512];
+    char db_fresh2[512];
+    snprintf(db_seq, sizeof(db_seq), "%s/seq.db", tmp);
+    snprintf(db_par, sizeof(db_par), "%s/par.db", tmp);
+    snprintf(db_fresh, sizeof(db_fresh), "%s/fresh.db", tmp);
+    snprintf(db_fresh2, sizeof(db_fresh2), "%s/fresh2.db", tmp);
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    AxiosWrapperObs seq = observe_axios_wrapper(tmp, db_seq);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    AxiosWrapperObs par = observe_axios_wrapper(tmp, db_par);
+
+    /* Only the wrapper changes; the importing caller is untouched. */
+    write_temp_file(tmp, "src/client.ts",
+                    "import axios from 'axios';\n"
+                    "const api = axios.create({ baseURL: '/v3' });\n"
+                    "export default api;\n");
+    AxiosWrapperObs incr = observe_axios_wrapper(tmp, db_par);
+    AxiosWrapperObs fresh = observe_axios_wrapper(tmp, db_fresh);
+    /* Then only the caller changes; the (unchanged) wrapper's base must
+     * still be found when the caller alone is re-resolved. */
+    write_temp_file(
+        tmp, "src/orders.ts",
+        "import api from './client';\n"
+        "import axios from 'axios';\n"
+        "export function loadWrapperOrders(): unknown { return api.get('/invoices'); }\n"
+        "export function loadDirectOrders(): unknown { return axios.get('/direct'); }\n");
+    AxiosWrapperObs incr2 = observe_axios_wrapper(tmp, db_par);
+    AxiosWrapperObs fresh2 = observe_axios_wrapper(tmp, db_fresh2);
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(seq.run_rc, 0);
+    ASSERT_EQ(par.run_rc, 0);
+    /* Controls: direct axios and an Express registration are unchanged, and
+     * a look-alike factory never becomes a client. */
+    ASSERT_EQ(seq.direct_http, 1);
+    ASSERT_EQ(seq.provider_handles, 1);
+    ASSERT_EQ(seq.fake_http, 0);
+
+    /* The issue: default-imported wrapper composes base + path. */
+    ASSERT_EQ(seq.wrapper_http, 1);
+    ASSERT_EQ(seq.wrapper_raw_http, 0);
+    ASSERT_EQ(seq.wrapper_route_reg, 0);
+    ASSERT_EQ(seq.named_http, 1);
+    ASSERT_EQ(seq.local_http, 1);
+    ASSERT_EQ(seq.local_raw_http, 0);
+    ASSERT_EQ(seq.dynamic_http, 1);
+    ASSERT_EQ(seq.dynamic_route_reg, 0);
+
+    /* Sequential and parallel resolvers agree edge for edge. */
+    ASSERT_MEM_EQ(&seq, &par, sizeof(seq));
+
+    /* Reindex after the base moved converges with a fresh index. */
+    ASSERT_EQ(fresh.run_rc, 0);
+    ASSERT_EQ(fresh.wrapper_http_v3, 1);
+    ASSERT_EQ(fresh.wrapper_http, 0);
+    ASSERT_EQ(incr.run_rc, 0);
+    ASSERT_MEM_EQ(&incr, &fresh, sizeof(fresh));
+    ASSERT_EQ(fresh2.run_rc, 0);
+    ASSERT_EQ(fresh2.wrapper_http_v3_inv, 1);
+    ASSERT_EQ(fresh2.wrapper_http_v3, 0);
+    ASSERT_MEM_EQ(&incr2, &fresh2, sizeof(fresh2));
+    PASS();
+}
+
+/* Issue #1354: a method call on an instance built with `new ImportedClass()`
+ * produced no CALLS edge (only the constructor edge), while the identical
+ * shape in the class's own file resolved via lsp_ts_method. End to end:
+ * both cross-file shapes must now carry the type-aware lsp_ts_method edge,
+ * and the same-file control must keep it. */
+TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ts_1354_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* write_temp_file creates one directory level only. */
+    write_temp_file(tmp, "lib/toast.service.ts",
+                    "export class ToastService {\n"
+                    "  openSuccessUniqueXyz(msg: string): void {\n"
+                    "    console.log(msg);\n"
+                    "  }\n"
+                    "}\n"
+                    "\n"
+                    "export function sameFileControl(): void {\n"
+                    "  const t = new ToastService();\n"
+                    "  t.openSuccessUniqueXyz('same-file control');\n"
+                    "}\n");
+    write_temp_file(tmp, "app/variants.ts",
+                    "import { ToastService } from '../lib/toast.service';\n"
+                    "\n"
+                    "export function crossNewLocal(): void {\n"
+                    "  const t = new ToastService();\n"
+                    "  t.openSuccessUniqueXyz('cross-file');\n"
+                    "}\n"
+                    "\n"
+                    "export function crossNewChain(): void {\n"
+                    "  new ToastService().openSuccessUniqueXyz('chained');\n"
+                    "}\n");
+    /* File named after its class (`NotifierService.ts` exports
+     * `NotifierService`): the imported module QN already ends in the class
+     * name, which must not be mistaken for the class QN. */
+    write_temp_file(tmp, "lib/NotifierService.ts",
+                    "export class NotifierService {\n"
+                    "  notifyUniqueAbc(): void {}\n"
+                    "}\n");
+    write_temp_file(tmp, "app/notify.ts",
+                    "import { NotifierService } from '../lib/NotifierService';\n"
+                    "\n"
+                    "export function crossSameNameNew(): void {\n"
+                    "  const n = new NotifierService();\n"
+                    "  n.notifyUniqueAbc();\n"
+                    "}\n"
+                    "\n"
+                    "export function crossSameNameTyped(n: NotifierService): void {\n"
+                    "  n.notifyUniqueAbc();\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ts_1354.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    bool same_file = cross_file_call_has_strategy(s, project, "sameFileControl",
+                                                  "openSuccessUniqueXyz", "lsp_ts_method");
+    bool cross_local = cross_file_call_has_strategy(s, project, "crossNewLocal",
+                                                    "openSuccessUniqueXyz", "lsp_ts_method");
+    bool cross_chain = cross_file_call_has_strategy(s, project, "crossNewChain",
+                                                    "openSuccessUniqueXyz", "lsp_ts_method");
+    bool same_name_new = cross_file_call_has_strategy(s, project, "crossSameNameNew",
+                                                      "notifyUniqueAbc", "lsp_ts_method");
+    bool same_name_typed = cross_file_call_has_strategy(s, project, "crossSameNameTyped",
+                                                        "notifyUniqueAbc", "lsp_ts_method");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(same_file);
+    ASSERT_TRUE(cross_local);
+    ASSERT_TRUE(cross_chain);
+    ASSERT_TRUE(same_name_new);
+    ASSERT_TRUE(same_name_typed);
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_recv_XXXXXX");
@@ -6310,6 +6601,111 @@ TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     cbm_pipeline_free(p);
     th_rmtree(tmp);
     PASS();
+}
+
+/* Fixture for the #2053 Rust std-receiver probes (sequential and parallel
+ * twins). The Rust LSP types `root: &Path` and dispatches `root.join(..)` to
+ * std's Path::join — a symbol with no graph node. Before the fix the pipeline
+ * then fell back to the textual registry, which bound the call to the only
+ * project method named `join` (EvidenceTier::join, unique_name). The
+ * call-expression receiver (`root.to_path_buf().join(..)`) is the same class
+ * one hop later: it needs to_path_buf's return type and PathBuf's Deref to
+ * Path. POSITIVE tripwires: the typed project call keeps its LSP edge, and a
+ * closure-parameter receiver the LSP cannot type still reaches the registry,
+ * so the fix removes only calls the LSP positively placed outside the
+ * project. `m.get(k)` on a std HashMap guards the parallel route fallback,
+ * which must not turn the skipped call into a self-call. pad_files > 0
+ * crosses the parallel-pipeline threshold. */
+static void write_rust_std_receiver_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"stdrecv\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "use std::collections::HashMap;\n"
+                    "use std::path::{Path, PathBuf};\n"
+                    "\n"
+                    "pub struct EvidenceTier(pub u8);\n"
+                    "impl EvidenceTier {\n"
+                    "    pub fn join(&self, other: &EvidenceTier) -> EvidenceTier {\n"
+                    "        EvidenceTier(self.0.max(other.0))\n"
+                    "    }\n"
+                    "}\n"
+                    "\n"
+                    "pub struct Gauge(pub u8);\n"
+                    "impl Gauge {\n"
+                    "    pub fn recalibrate_gauge(&self) -> u8 {\n"
+                    "        self.0\n"
+                    "    }\n"
+                    "}\n"
+                    "\n"
+                    "pub fn real_caller() -> EvidenceTier {\n"
+                    "    EvidenceTier(1).join(&EvidenceTier(2))\n"
+                    "}\n"
+                    "\n"
+                    "pub fn stdlib_receiver(root: &Path) -> PathBuf {\n"
+                    "    root.join(\"subdir\")\n"
+                    "}\n"
+                    "\n"
+                    "pub fn call_expr_receiver(root: &Path) -> PathBuf {\n"
+                    "    root.to_path_buf().join(\"nested\")\n"
+                    "}\n"
+                    "\n"
+                    "pub fn untyped_receiver(gauges: &[Gauge]) -> u8 {\n"
+                    "    gauges.iter().map(|g| g.recalibrate_gauge()).sum()\n"
+                    "}\n"
+                    "\n"
+                    "pub fn std_map_lookup(m: &HashMap<String, u8>, k: &str) -> Option<u8> {\n"
+                    "    m.get(k).copied()\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> i32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int run_rust_std_receiver_probe(int pad_files, const char *tag) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_%s_XXXXXX", tag);
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_rust_std_receiver_fixture(tmp, pad_files);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rs_std_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: std's Path::join / PathBuf::join are not project symbols. */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "stdlib_receiver", "join"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "call_expr_receiver", "join"), 0);
+    /* NEGATIVE: a std `map.get(k)` with no route path is no self-call (the
+     * parallel empty-resolution route fallback must not bind source->source). */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "std_map_lookup", "std_map_lookup"), 0);
+    /* POSITIVE: the typed project call keeps its edge. */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "real_caller", "join"), 1);
+    /* POSITIVE: an untyped receiver still reaches the registry fallback. */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "untyped_receiver", "recalibrate_gauge"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_std_receiver_never_binds_project_method) {
+    return run_rust_std_receiver_probe(0, "seq");
+}
+
+TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel) {
+    return run_rust_std_receiver_probe(52, "par");
 }
 
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name);
@@ -7042,6 +7438,72 @@ TEST(pipeline_arg_url_rejects_non_http_slash_arguments) {
     ASSERT_EQ(count_nodes_named(s, project, "/<table/i"), 0);
     ASSERT_EQ(count_nodes_named(s, project, "/tmp/pgv_fuzz.bin"), 0);
     ASSERT_GTE(count_nodes_named(s, project, "/api/data"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* #2235: an Orval-style generated client passes its URL inside a request
+ * config object to a LOCAL helper -- `http({url: `/api/customers/${id}`,
+ * method: 'GET'})`. The template literal itself already canonicalizes to
+ * "/api/customers/{}"; what was lost is the object wrapper: the arg-url
+ * heuristic only read bare string/template arguments, so the call produced
+ * no HTTP_CALLS edge and cross-repo matching had nothing to join. Parallel
+ * resolver (> 50 files), where the arg-url heuristic lives. A config object
+ * without a `url` key must not mint a route. */
+TEST(pipeline_ts_config_object_url_http_calls_issue2235) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_i2235_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/http.ts",
+                    "export const http = <T,>(config: { url: string; method: string }): "
+                    "Promise<T> => {\n"
+                    "  return fetch(config.url, { method: config.method }).then((r) => r.json());\n"
+                    "};\n");
+    write_temp_file(
+        tmp, "src/gen/customer-controller.ts",
+        "import { http } from '../http';\n"
+        "export const get1 = (id: string, signal?: AbortSignal) => {\n"
+        "  return http<unknown>({url: `/api/customers/${id}`, method: 'GET', signal});\n"
+        "};\n"
+        "export const noUrl = () => {\n"
+        "  return http<unknown>({path: '/api/ignored/x', method: 'GET'});\n"
+        "};\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/i2235.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* RED before the fix: the url inside the config object was never read. */
+    ASSERT_EQ(named_edge_count(s, project, "HTTP_CALLS", "get1", "/api/customers/{}"), 1);
+    /* Only the `url` key names the request URL. */
+    ASSERT_EQ(count_nodes_named(s, project, "/api/ignored/x"), 0);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -15879,11 +16341,15 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916);
+    RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
+    RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
@@ -15893,6 +16359,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
+    RUN_TEST(pipeline_ts_config_object_url_http_calls_issue2235);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);

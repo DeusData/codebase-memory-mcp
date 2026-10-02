@@ -327,6 +327,7 @@ FOUNDATION_SRCS = \
     src/foundation/limits.c \
     src/foundation/index_policy.c \
     src/foundation/subprocess.c \
+    src/foundation/git_env.c \
     src/foundation/sha256.c \
     src/foundation/secure_random.c \
     src/foundation/macos_acl.c \
@@ -832,8 +833,14 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
+# $(TEST_SEAM_DEFINE): these prod objects (grammars, ts_runtime, lsp_all) are
+# linked into the same binary as the CFLAGS_PROD sources, so both halves must
+# agree on the seam switch. lsp_all holds seam code of its own (ts_lsp.c's
+# budget probes, any seam counter a resolver defines): without the define a
+# TEST_SEAMS=1 binary silently lacks those seams, and a seam symbol that cbm.c
+# references fails to link. GRAMMAR_CFLAGS_TEST always carries the define.
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                 $(MEMWASTE_VENDOR_CFLAGS)
+                 $(TEST_SEAM_DEFINE) $(MEMWASTE_VENDOR_CFLAGS)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
@@ -941,7 +948,9 @@ $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) Makefile.cbm | $(BUILD_DIR)
+# .build-config: SQLITE3_CFLAGS carries MEMWASTE_VENDOR_CFLAGS (see the stamp
+# under "Production binary").
+$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) Makefile.cbm $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
 
 # TRE regex (only compiled on Windows — POSIX uses system <regex.h>)
@@ -971,7 +980,7 @@ $(BUILD_DIR)/tre.o: $(TRE_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/prod_tre.o: $(TRE_SRC) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 $(MEMWASTE_VENDOR_CFLAGS) -c -o $@ $<
 endif
 
@@ -1125,28 +1134,35 @@ TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 
-$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c $(GRAMMAR_UNITY_DEPS) | $(BUILD_DIR)
+# Every prod object whose flags carry a BUILD_CONFIG_SIG variable
+# (TEST_SEAM_DEFINE via GRAMMAR_CFLAGS, MEMWASTE_VENDOR_CFLAGS) depends on the
+# $(BUILD_DIR)/.build-config stamp. These objects are compiled once and linked
+# into every later binary, so without the stamp a TEST_SEAMS or MEMWASTE flip
+# relinks the PREVIOUS flavour: a release binary keeps seam code compiled into
+# lsp_all, or a seams binary misses it. prod_mimalloc.o and the unixcoder blob
+# take no config variable and stay off the stamp.
+$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c $(GRAMMAR_UNITY_DEPS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
 LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
-$(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR) -c -o $@ $<
-$(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (compiled separately, not unity-built via zstd_store.c)
 ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
-$(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
@@ -1162,7 +1178,8 @@ MAIN_SRC = src/main.c
 # configuration and it is rewritten only when that content changes, so ordinary
 # incremental builds are unaffected. (Single-quoted: the signature may contain
 # the escaped quotes of -DCBM_VERSION, which are literal inside '', but must not
-# contain a literal single quote.)
+# contain a literal single quote.) The config-flavoured prod objects above
+# depend on the stamp for the same reason as the binary.
 # SANITIZE belongs here: it changes the instrumentation compiled into every
 # object, so a build that only changes it MUST rebuild. Its absence made
 # `scripts/test.sh SANITIZE= ...` -- the documented way to get a plain build

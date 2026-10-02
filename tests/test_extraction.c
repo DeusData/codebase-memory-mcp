@@ -183,11 +183,12 @@ TEST(extract_ts_factory_object_methods_issue341) {
  *
  * The bound is derived, not tuned. Measured on this source, total_alloc was
  * 365984 before the scratch arena and is 87456 after, exactly that difference.
- * Of the 87456 that remain, 7680 is the defs item array at GROW_ARRAY's
- * starting capacity of 32 times sizeof(CBMDefinition) 240, and the other 79776
- * is everything else this file's extraction interns; none of it is traversal
- * scratch. So the bound sits above 87456 with room and a factor of four below
- * 365984.
+ * #1916 added two pointers to CBMDefinition (240 -> 256 bytes), so it now
+ * measures 87968: 8192 is the defs item array at GROW_ARRAY's starting
+ * capacity of 32 times sizeof(CBMDefinition) 256, and the other 79776 is
+ * everything else this file's extraction interns; none of it is traversal
+ * scratch. So the bound sits above 87968 with room and a factor of four below
+ * the 365984 the scratch stacks cost.
  *
  * It is a byte budget, not a proof of lifetime; that is
  * extract_traversal_stacks_come_from_ctx_scratch_issue2010 in test_mem.c. */
@@ -912,6 +913,43 @@ TEST(dart_class) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Animal"));
     ASSERT(has_def(r, "Method", "speak"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* --- Dart extension members (#1457) --- */
+TEST(dart_extension_members) {
+    CBMFileResult *r =
+        extract("class Holder {\n  final int value;\n  const Holder(this.value);\n}\n\n"
+                "extension HolderMath on Holder {\n  int doubled() => value + value;\n"
+                "  int tripled() => value + value + value;\n"
+                "  String describeHolder() => 'holder';\n}\n\n"
+                "int topLevelHelper(int x) => x + 1;\n",
+                CBM_LANG_DART, "t", "a.dart");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Holder"));
+    ASSERT(has_def(r, "Function", "topLevelHelper"));
+    ASSERT(has_def(r, "Class", "HolderMath"));
+    ASSERT(has_def(r, "Method", "doubled"));
+    ASSERT(has_def(r, "Method", "tripled"));
+    ASSERT(has_def(r, "Method", "describeHolder"));
+    /* Members hang off the extension (DEFINES_METHOD source), not the file. */
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "doubled") == 0) {
+            ASSERT_NOT_NULL(d->parent_class);
+            ASSERT_STR_EQ(d->parent_class, "t.a.HolderMath");
+        }
+    }
+    cbm_free_result(r);
+
+    /* Unnamed extension: its members are still indexed. */
+    r = extract("extension on String {\n  bool isShout() => this == toUpperCase();\n}\n",
+                CBM_LANG_DART, "t", "b.dart");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def_any(r, "isShout"));
     cbm_free_result(r);
     PASS();
 }
@@ -4631,6 +4669,57 @@ TEST(extract_java_spring_relative_string_not_route_path) {
     PASS();
 }
 
+/* Issue #1428: NestJS routes are TypeScript decorators — the class-level
+ * @Controller('users') prefix composes with the method-level @Get(':id')
+ * verb + path. Nest paths carry no leading slash, and the decorator's call is
+ * a `call_expression` (not Python's `call`), so no Route was ever formed. */
+TEST(extract_ts_nestjs_controller_routes_issue1428) {
+    CBMFileResult *r =
+        extract("import { Controller, Get, Post, Patch, Delete, Param } from '@nestjs/common';\n"
+                "@Controller({ path: 'users', version: '1' })\n"
+                "export class UsersController {\n"
+                "  @Get() findAll() { return []; }\n"
+                "  @Get(':id') findOne(@Param('id') id: string) { return id; }\n"
+                "  @Post() create() { return 1; }\n"
+                "  @Patch(':id') update(@Param('id') id: string) { return id; }\n"
+                "  @Delete('/:id') remove(@Param('id') id: string) { return id; }\n"
+                "  helper() { return 0; }\n"
+                "}\n"
+                "@Controller('health')\n"
+                "export class HealthController {\n"
+                "  @Get() check() { return { status: 'ok' }; }\n"
+                "}\n"
+                "@Controller()\n"
+                "export class RootController {\n"
+                "  @Get('ping') ping() { return 'pong'; }\n"
+                "}\n",
+                CBM_LANG_TYPESCRIPT, "t", "src/users/users.controller.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const struct {
+        const char *name;
+        const char *method;
+        const char *path;
+    } want[] = {
+        {"findAll", "GET", "/users"},       {"findOne", "GET", "/users/:id"},
+        {"create", "POST", "/users"},       {"update", "PATCH", "/users/:id"},
+        {"remove", "DELETE", "/users/:id"}, {"check", "GET", "/health"},
+        {"ping", "GET", "/ping"},
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        const CBMDefinition *d = find_def_by_name(r, want[i].name);
+        ASSERT_NOT_NULL(d);
+        ASSERT_NOT_NULL(d->route_path);
+        ASSERT_STR_EQ(d->route_path, want[i].path);
+        ASSERT_STR_EQ(d->route_method, want[i].method);
+    }
+    const CBMDefinition *helper = find_def_by_name(r, "helper");
+    ASSERT_NOT_NULL(helper);
+    ASSERT_NULL(helper->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Return the file's Module definition (extraction pushes it first), or NULL. */
 static const CBMDefinition *find_module_def(CBMFileResult *r) {
     for (int i = 0; i < r->defs.count; i++) {
@@ -5104,6 +5193,62 @@ TEST(extract_ts_template_string_url_issue1006) {
         }
     }
     ASSERT(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #2235: a request-config object argument carries the URL in its `url`
+ * property (Orval/axios style: `http({url: `/x/${id}`, method: 'GET'})`).
+ * The property's template literal flattens to the canonical "{}" form both on
+ * the argument (read by the arg-url heuristic for local helpers) and as the
+ * call's URL (read by HTTP-client classification, e.g. `axios({url})`). Other
+ * keys never stand in for the URL, and a route registration keeps its own
+ * (object-free) handling. */
+TEST(extract_ts_config_object_url_issue2235) {
+    CBMFileResult *r =
+        extract("export const get1 = (id: string) => {\n"
+                "  return http<Customer>({url: `/api/customers/${id}`, method: 'GET'});\n"
+                "};\n"
+                "export const load = () => axios({method: 'POST', 'url': '/api/orders'});\n"
+                "export const other = () => http({path: '/api/ignored/x'});\n"
+                "export const reg = () => fastify.route({url: '/srv/x', handler: h});\n"
+                "export const u = () => axiosInstance.getUri({url: `/pets`});\n",
+                CBM_LANG_TYPESCRIPT, "t", "client.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = NULL;
+    const CBMCall *o = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *k = &r->calls.items[i];
+        if (k->callee_name && strcmp(k->callee_name, "http") == 0 && k->arg_count > 0) {
+            if (k->args[0].expr && strstr(k->args[0].expr, "customers")) {
+                c = k;
+            } else {
+                o = k;
+            }
+        }
+    }
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->args[0].value);
+    ASSERT_STR_EQ(c->args[0].value, "/api/customers/{}");
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/customers/{}");
+    const CBMCall *a = find_call_by_callee(r, "axios");
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(a->first_string_arg);
+    ASSERT_STR_EQ(a->first_string_arg, "/api/orders");
+    ASSERT_NOT_NULL(o);
+    ASSERT_NULL(o->args[0].value);
+    ASSERT_NULL(o->first_string_arg);
+    const CBMCall *g = find_call_by_callee(r, "fastify.route");
+    ASSERT_NOT_NULL(g);
+    ASSERT_NULL(g->first_string_arg);
+    ASSERT(g->arg_count == 0 || g->args[0].value == NULL);
+    /* getUri only formats the URL; it sends no request. */
+    const CBMCall *gu = find_call_by_callee(r, "axiosInstance.getUri");
+    ASSERT_NOT_NULL(gu);
+    ASSERT_NULL(gu->first_string_arg);
+    ASSERT(gu->arg_count == 0 || gu->args[0].value == NULL);
     cbm_free_result(r);
     PASS();
 }
@@ -8632,6 +8777,37 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     PASS();
 }
 
+/* The low-disk guard, pinned through the free-space seam rather than the host
+ * disk: one byte under the floor refuses (spilling onto a nearly full disk is
+ * a worse failure than the memory pressure it relieves), the floor itself
+ * opens. The runner pins ample space everywhere else; restored before asserts. */
+TEST(extract_spill_refuses_below_the_free_disk_floor) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+
+    size_t floor_bytes = cbm_result_spill_free_floor_bytes_for_tests();
+    size_t saved = cbm_result_spill_pin_free_bytes_for_tests(floor_bytes - 1);
+    cbm_result_spill_t *below = cbm_result_spill_open(dir, 1, 1);
+    (void)cbm_result_spill_pin_free_bytes_for_tests(floor_bytes);
+    cbm_result_spill_t *at = cbm_result_spill_open(dir, 1, 1);
+    (void)cbm_result_spill_pin_free_bytes_for_tests(saved);
+
+    bool refused = below == NULL;
+    bool opened = at != NULL;
+    cbm_result_spill_close(below);
+    cbm_result_spill_close(at);
+    char spill_sub[600];
+    snprintf(spill_sub, sizeof(spill_sub), "%s/spill", dir);
+    cbm_rmdir(spill_sub);
+    cbm_rmdir(dir);
+
+    ASSERT_EQ(floor_bytes, (size_t)10 * 1024 * 1024 * 1024);
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(opened);
+    PASS();
+}
+
 /* ── A skipped file gets no LSP walk, per-file or cross-file ── */
 
 /* CBM_TEST_LSP_SKIP_ON names the file: the result carries lsp_skipped, the
@@ -8691,6 +8867,7 @@ SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
+    RUN_TEST(extract_spill_refuses_below_the_free_disk_floor);
     RUN_TEST(extract_lsp_skipped_file_gets_no_walk);
     RUN_TEST(extract_walk_truncated_when_a_node_budget_is_set);
     /* Initialize extraction library */
@@ -8794,6 +8971,7 @@ SUITE(extraction) {
     RUN_TEST(scala_function);
     RUN_TEST(scala_class);
     RUN_TEST(dart_class);
+    RUN_TEST(dart_extension_members);
     RUN_TEST(groovy_class);
 
     /* Systems */
@@ -9043,11 +9221,13 @@ SUITE(extraction) {
     RUN_TEST(extract_java_jaxrs_relative_path_templates);
     RUN_TEST(extract_java_jaxrs_empty_path_means_class_path);
     RUN_TEST(extract_java_spring_relative_string_not_route_path);
+    RUN_TEST(extract_ts_nestjs_controller_routes_issue1428);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
     RUN_TEST(extract_razor_layout_without_page_has_no_route);
     RUN_TEST(extract_ts_template_string_url_issue1006);
+    RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);

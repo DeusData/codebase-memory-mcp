@@ -522,6 +522,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
+    append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -938,6 +940,88 @@ static int pp_spill_sweep(extract_ctx_t *ec, int worker_id) {
     }
     atomic_fetch_sub_explicit(&ec->spill_sweeps_running, 1, memory_order_acq_rel);
     return parked;
+}
+
+/* ── Post-extraction projection (#2184) ───────────────────────────────
+ * Spill is entered DURING extraction, when the charge crosses the latch below.
+ * The phases after it -- registry build, cross-LSP prepare (all_defs, the
+ * per-language registries, surface rows, the module index) and resolve (edges
+ * into the graph buffer, cross-LSP appends into the cached results) -- cannot
+ * spill, and they grow the charge by a sizeable fraction of what extraction
+ * left. A run that ended extraction just under the latch therefore kept every
+ * result in memory and went over the budget later: openclaw, 8 workers,
+ * 4079 MB budget: 3678 MB charged at extraction end, 5829 MB in resolve.
+ *
+ * So extraction end projects that growth from the result counts and spills
+ * before handing over when charged + growth would cross the latch. A pure
+ * function of counts (O9): the same repo decides the same way on every run.
+ * Per-unit costs fitted 2026-09-25 (M5 Pro, release build, 8 workers) on the
+ * charge growth from the parallel_extract mark to the parallel_resolve mark:
+ *
+ *   corpus    files   defs    calls+usages  growth   model
+ *   go        21882  735895     5,504,282   1307 MB  1909 MB
+ *   django     4169   75419       591,350    231 MB   215 MB
+ *   kotlin     5247   49669       421,788    129 MB   166 MB
+ *   rust        818   23717       265,957     79 MB    76 MB
+ *   php        2435   14691       137,969     47 MB    58 MB
+ *   openclaw  48203  748829   >= 7,402,832   2151 MB >= 2419 MB
+ *
+ * It never under-reads by more than 7% (inside the budget/16 margin) and
+ * over-reads Go by 46% -- the safe side: an unneeded spill costs disk reads,
+ * never graph content (spilled and in-memory runs build the same graph). */
+enum {
+    PP_POST_BYTES_PER_DEF = 1280,  /* registry entry + LSP def + cross registries */
+    PP_POST_BYTES_PER_REF = 160,   /* per call / usage: resolved edge + appends */
+    PP_POST_BYTES_PER_FILE = 8192, /* per-file tables: modules, surfaces, imports */
+};
+
+static size_t pp_post_extract_growth(const extract_ctx_t *ec, int64_t *defs_out,
+                                     int64_t *refs_out) {
+    int64_t defs = 0;
+    int64_t refs = 0;
+    for (int i = 0; i < ec->file_count; i++) {
+        const CBMFileResult *r = ec->result_cache[i];
+        if (r) {
+            defs += r->defs.count;
+            refs += (int64_t)r->calls.count + r->usages.count;
+        }
+    }
+    *defs_out = defs;
+    *refs_out = refs;
+    return (size_t)defs * PP_POST_BYTES_PER_DEF + (size_t)refs * PP_POST_BYTES_PER_REF +
+           (size_t)ec->file_count * PP_POST_BYTES_PER_FILE;
+}
+
+/* Enter spill mode at extraction end when the projected post-extraction growth
+ * would carry the charge over the latch; the final sweep then parks every
+ * cached result before registry build. No-op when spill is already on, not
+ * allowed for this owner, or no budget is set. */
+static void pp_spill_if_projected_over(extract_ctx_t *ec) {
+    size_t budget = cbm_mem_budget();
+    if (budget == 0 || !ec->pctx || !ec->pctx->spill_allowed || !pp_spill_allowed(ec) ||
+        pp_spill_active(ec) || atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
+        return;
+    }
+    int64_t defs = 0;
+    int64_t refs = 0;
+    size_t growth = pp_post_extract_growth(ec, &defs, &refs);
+    size_t charged = cbm_mem_charged();
+    size_t line = budget - budget / PP_SPILL_EARLY_DIV;
+    bool spill = growth > line || charged > line - growth;
+    const size_t mb = (size_t)1024 * 1024;
+    char v[6][CBM_SZ_32];
+    snprintf(v[0], sizeof(v[0]), "%zu", charged / mb);
+    snprintf(v[1], sizeof(v[1]), "%zu", growth / mb);
+    snprintf(v[2], sizeof(v[2]), "%zu", line / mb);
+    snprintf(v[3], sizeof(v[3]), "%lld", (long long)defs);
+    snprintf(v[4], sizeof(v[4]), "%lld", (long long)refs);
+    snprintf(v[5], sizeof(v[5]), "%d", ec->file_count);
+    cbm_log_info("mem.post_extract.projection", "charged_mb", v[0], "growth_mb", v[1], "line_mb",
+                 v[2], "defs", v[3], "refs", v[4], "files", v[5], "decision",
+                 spill ? "spill" : "keep");
+    if (spill) {
+        pp_spill_enter(ec, "post_extract_projection");
+    }
 }
 
 /* Diagnostic (CBM_MEM_PHASES=1): where does the charge go between the
@@ -1485,6 +1569,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_parallel_for_opts_t parallel_opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_scale_begin(&ec.scale, "parallel_extract", (long)file_count);
     cbm_parallel_for(worker_count, extract_worker, &ec, parallel_opts);
+    pp_spill_if_projected_over(&ec);
     if (pp_spill_active(&ec) &&
         !atomic_load_explicit(&ec.over_budget_abort, memory_order_relaxed)) {
         /* Spill mode was entered, so results belong on disk: park every
@@ -1493,7 +1578,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
          * run only on an over-budget observation; a run that latched early
          * and then stayed under budget through extraction (kernel, 15 GB,
          * 2026-09-14: 14,949 MB at this point, 44,797 results = 8 GB still
-         * cached) reached resolve with no headroom and aborted there. */
+         * cached) reached resolve with no headroom and aborted there.
+         * The projection above enters spill mode here too when the phases
+         * after extraction would carry the charge over the latch (#2184). */
         int parked = pp_spill_sweep(&ec, 0);
         cbm_log_info("mem.spill.final_sweep", "parked", itoa_log(parked), "charged_mb",
                      itoa_log((int)(cbm_mem_charged() / ((size_t)1024 * 1024))));
@@ -2895,7 +2982,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * semantic candidates are deliberately excluded: they require an
          * exact LSP target and must fail closed rather than accepting a textual
          * registry match. */
-        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution) {
+        /* #2053: a Rust call the LSP placed on an EXTERNAL symbol (std's
+         * Path::join, a seeded crate API) is resolved — it just has no graph
+         * node. The textual registry would bind it to a same-named project
+         * method instead, so it must not run for such a row. Mirrors
+         * pass_calls.c; the service fallbacks below still see the call. */
+        bool rust_external = lsp && cbm_pipeline_rust_external_target(
+                                        lang, lsp->strategy, lsp->callee_qn, rc->project_name);
+        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
+            !rust_external) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
@@ -2957,7 +3052,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                  call->receiver_is_self_attribute,
                                                  call->callee_name, res.strategy)) ||
             cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
-                                                 call->callee_is_locally_bound, res.strategy);
+                                                 call->callee_is_locally_bound, res.strategy) ||
+            /* Import-binding suppression (#2127) — see pass_calls.c; this gate
+             * MUST stay identical to the one there. */
+            (lang == CBM_LANG_PYTHON &&
+             cbm_suppress_weak_import_bound_call(true, true, res.strategy) &&
+             cbm_python_import_binding_contradicts(&result->imports, call->callee_name,
+                                                   res.qualified_name, rc->main_gbuf,
+                                                   rc->project_name, rel));
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
@@ -2966,7 +3068,22 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * pattern, so the resolved-QN service checks below miss it and the call
          * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
          * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
-         * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+         * node, not the unindexed library). Mirrors pass_calls.c. (#523)
+         *
+         * First: a call on an axios.create() instance (#1916) — decided by the
+         * receiver's binding, before the #523 spelling check and the
+         * route-registration suffix fallback. MUST match pass_calls.c. */
+        char client_url[CBM_SZ_512];
+        if (cbm_pipeline_http_client_call_url(rc->main_gbuf, rc->project_name, rel, result,
+                                              imp_keys, imp_vals, imp_count, call, client_url,
+                                              sizeof(client_url))) {
+            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                        .confidence = PP_HALF_CONF,
+                                        .strategy = "http_client_instance"};
+            emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &svc_res,
+                                         CBM_SVC_HTTP, client_url);
+            continue;
+        }
         cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;
@@ -2989,9 +3106,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
+                /* #2053: an LSP-external Rust call (`map.get(k)` on a std
+                 * HashMap) reaches this branch only because its registry
+                 * fallback was skipped. Without a route path the plain-CALLS
+                 * fall-through would bind source -> source, a fabricated
+                 * self-call, so it keeps only the route/service edges. */
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
+                                  imp_count, rust_external);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level

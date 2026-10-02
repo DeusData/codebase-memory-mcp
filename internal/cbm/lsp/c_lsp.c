@@ -2880,6 +2880,23 @@ static bool c_base_declares_member(CLSPContext *ctx, const char *type_qn, const 
     return false;
 }
 
+/* Type of the idx-th declared field, for structured-binding decomposition.
+ * field_types[] is parallel to field_names[] and may hold NULL entries, so
+ * only field_names[] bounds it: a binding list longer than the field list
+ * (ill-formed, but present in compiler test suites) must yield NULL, never
+ * read past the array into the next arena object (#1743). */
+static const CBMType *c_struct_field_type_at(const CBMRegisteredType *rt, int idx) {
+    if (!rt || !rt->field_names || !rt->field_types || idx < 0) {
+        return NULL;
+    }
+    for (int i = 0; i < idx; i++) {
+        if (!rt->field_names[i]) {
+            return NULL;
+        }
+    }
+    return rt->field_names[idx] ? rt->field_types[idx] : NULL;
+}
+
 // Field type lookup
 static const CBMType *c_lookup_field_type(CLSPContext *ctx, const char *type_qn,
                                           const char *field_name, int depth) {
@@ -3055,9 +3072,10 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                                                     ctx->registry,
                                                     cbm_arena_sprintf(ctx->arena, "%s.%s",
                                                                       ctx->module_qn, rhs_qn));
-                                            if (rt && rt->field_types &&
-                                                rt->field_types[binding_idx])
-                                                elem_type = rt->field_types[binding_idx];
+                                            const CBMType *ft =
+                                                c_struct_field_type_at(rt, binding_idx);
+                                            if (ft)
+                                                elem_type = ft;
                                         }
                                         cbm_scope_bind(ctx->current_scope, bname, elem_type);
                                         binding_idx++;
@@ -3140,8 +3158,9 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                                             ctx->registry,
                                             cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn,
                                                               rhs_qn));
-                                    if (rt && rt->field_types && rt->field_types[binding_idx]) {
-                                        elem_type = rt->field_types[binding_idx];
+                                    const CBMType *ft = c_struct_field_type_at(rt, binding_idx);
+                                    if (ft) {
+                                        elem_type = ft;
                                     }
                                 }
                                 cbm_scope_bind(ctx->current_scope, bname, elem_type);
@@ -3551,8 +3570,9 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                                 rt = cbm_registry_lookup_type(
                                     ctx->registry,
                                     cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, eq));
-                            if (rt && rt->field_types && rt->field_types[binding_idx])
-                                bt = rt->field_types[binding_idx];
+                            const CBMType *ft = c_struct_field_type_at(rt, binding_idx);
+                            if (ft)
+                                bt = ft;
                         }
                         cbm_scope_bind(ctx->current_scope, bname, bt);
                         binding_idx++;

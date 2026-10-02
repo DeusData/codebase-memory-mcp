@@ -230,6 +230,18 @@ static void iso_now(char *buf, size_t sz) {
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
+bool cbm_store_edges_schema_current(cbm_store_t *s) {
+    sqlite3_stmt *probe = NULL;
+    if (!s || !s->db ||
+        sqlite3_prepare_v2(s->db, "SELECT local_name_gen FROM edges LIMIT 0;", CBM_NOT_FOUND,
+                           &probe, NULL) != SQLITE_OK) {
+        sqlite3_finalize(probe);
+        return false;
+    }
+    sqlite3_finalize(probe);
+    return true;
+}
+
 static int init_schema(cbm_store_t *s) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
@@ -357,15 +369,9 @@ static int init_schema(cbm_store_t *s) {
      * callers already treat an unopenable DB as incompatible (a full index
      * deletes + rebuilds it, artifact import refuses and falls back to a
      * reindex). Read-only query opens skip init_schema and keep working. */
-    {
-        sqlite3_stmt *probe = NULL;
-        if (sqlite3_prepare_v2(s->db, "SELECT local_name_gen FROM edges LIMIT 0;", CBM_NOT_FOUND,
-                               &probe, NULL) != SQLITE_OK) {
-            cbm_log_warn("store.schema", "result", "incompatible", "missing",
-                         "edges.local_name_gen");
-            return CBM_STORE_ERR;
-        }
-        sqlite3_finalize(probe);
+    if (!cbm_store_edges_schema_current(s)) {
+        cbm_log_warn("store.schema", "result", "incompatible", "missing", "edges.local_name_gen");
+        return CBM_STORE_ERR;
     }
 
     /* FTS5 contentless virtual table for BM25 full-text search.

@@ -200,7 +200,21 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
+**WSL2 and Windows drives (`/mnt/c`, `/mnt/e`, ...).** `CBM_CACHE_DIR` goes through
+the same private-directory check. With WSL's default automount options, DrvFs
+reports every directory as `0777` and ignores `chmod`, so a cache under
+`/mnt/<drive>` is refused, and the refusal names this remedy. Either turn on
+permission metadata in `/etc/wsl.conf`, then run `wsl --shutdown` and reopen WSL:
+
+```ini
+[automount]
+options = "metadata,umask=22,fmask=11"
+```
+
+or keep the cache on the Linux filesystem (the default `~/.cache/codebase-memory-mcp`),
+which is also much faster than a 9p-mounted Windows drive.
+
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running, so its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon — joining an already-running daemon, it inherits that daemon's already-captured values instead.
 
 
 ### Roots that are always refused
