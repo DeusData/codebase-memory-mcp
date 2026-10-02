@@ -2088,6 +2088,164 @@ TEST(tslsp_crossfile_method_dispatch) {
     PASS();
 }
 
+/* Exact resolved-call probe: caller QN, callee QN and strategy all match. */
+static bool has_exact_resolved(const CBMResolvedCallArray *arr, const char *caller_qn,
+                               const char *callee_qn, const char *strategy) {
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->confidence > 0 && rc->caller_qn && rc->callee_qn && rc->strategy &&
+            strcmp(rc->caller_qn, caller_qn) == 0 && strcmp(rc->callee_qn, callee_qn) == 0 &&
+            strcmp(rc->strategy, strategy) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Issue #1354: `new ImportedClass()` typed the instance as a phantom
+ * CURRENT-module class (`test.main.Conn`), so every method call on it missed
+ * the shared registry and fell to method_not_in_registry. Driven through the
+ * production Tier-2 path (shared sealed registry + per-file overlay). A local
+ * class with the imported name must still shadow the import. */
+TEST(tslsp_crossfile_new_expression_receiver_issue1354) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.conn.Conn",
+         .short_name = "Conn",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.conn",
+         .method_names_str = "ping"},
+        {.qualified_name = "test.conn.Conn.ping",
+         .short_name = "ping",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.conn",
+         .receiver_type = "test.conn.Conn"},
+        {.qualified_name = "test.main.viaLocal",
+         .short_name = "viaLocal",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.main.viaChain",
+         .short_name = "viaChain",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.shadow.Conn",
+         .short_name = "Conn",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.shadow",
+         .method_names_str = "ping"},
+        {.qualified_name = "test.shadow.Conn.ping",
+         .short_name = "ping",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.shadow",
+         .receiver_type = "test.shadow.Conn"},
+        {.qualified_name = "test.shadow.viaShadow",
+         .short_name = "viaShadow",
+         .label = "Function",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.shadow"},
+    };
+    enum { NDEFS = (int)(sizeof(defs) / sizeof(defs[0])) };
+    const char *imp_names[] = {"Conn"};
+    const char *imp_qns[] = {"test.conn"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, defs, NDEFS);
+    ASSERT_NOT_NULL(reg);
+
+    const char *main_src = "import { Conn } from './conn';\n"
+                           "export function viaLocal() { const c = new Conn(); c.ping(); }\n"
+                           "export function viaChain() { new Conn().ping(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross_with_registry(&arena, main_src, (int)strlen(main_src), "test.main", false,
+                                       false, false, reg, defs, NDEFS, imp_names, imp_qns, 1, NULL,
+                                       &out);
+    ASSERT_TRUE(
+        has_exact_resolved(&out, "test.main.viaLocal", "test.conn.Conn.ping", "lsp_ts_method"));
+    ASSERT_TRUE(
+        has_exact_resolved(&out, "test.main.viaChain", "test.conn.Conn.ping", "lsp_ts_method"));
+
+    /* Shadow control: the file declares its own Conn and imports nothing. */
+    const char *shadow_src = "export class Conn { ping() {} }\n"
+                             "export function viaShadow() { const c = new Conn(); c.ping(); }\n";
+    CBMResolvedCallArray out2 = {0};
+    cbm_run_ts_lsp_cross_with_registry(&arena, shadow_src, (int)strlen(shadow_src), "test.shadow",
+                                       false, false, false, reg, defs, NDEFS, NULL, NULL, 0, NULL,
+                                       &out2);
+    ASSERT_TRUE(has_exact_resolved(&out2, "test.shadow.viaShadow", "test.shadow.Conn.ping",
+                                   "lsp_ts_method"));
+    ASSERT_FALSE(
+        has_exact_resolved(&out2, "test.shadow.viaShadow", "test.conn.Conn.ping", "lsp_ts_method"));
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Issue #1354, file named after its class: `Conn.ts` exports `class Conn`, so
+ * the imported module QN `test.Conn` already ends in `.Conn`. The spelling was
+ * read as an already-qualified symbol QN and the receiver typed as the MODULE,
+ * losing every method call on imported same-name classes (the dominant TS file
+ * convention). The registry must decide; an import value that really is the
+ * symbol QN (`test.conn.Conn`, no `test.conn.Conn.Conn`) keeps resolving. */
+TEST(tslsp_crossfile_same_name_file_receiver_issue1354) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.Conn.Conn",
+         .short_name = "Conn",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.Conn",
+         .method_names_str = "ping"},
+        {.qualified_name = "test.Conn.Conn.ping",
+         .short_name = "ping",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.Conn",
+         .receiver_type = "test.Conn.Conn"},
+        {.qualified_name = "test.conn.Link",
+         .short_name = "Link",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.conn",
+         .method_names_str = "open"},
+        {.qualified_name = "test.conn.Link.open",
+         .short_name = "open",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.conn",
+         .receiver_type = "test.conn.Link"},
+    };
+    enum { NDEFS = (int)(sizeof(defs) / sizeof(defs[0])) };
+    const char *imp_names[] = {"Conn", "Link"};
+    const char *imp_qns[] = {"test.Conn", "test.conn.Link"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, defs, NDEFS);
+    ASSERT_NOT_NULL(reg);
+
+    const char *src = "import { Conn } from './Conn';\n"
+                      "import { Link } from './conn';\n"
+                      "export function viaNew() { const c = new Conn(); c.ping(); }\n"
+                      "export function viaTyped(c: Conn) { c.ping(); }\n"
+                      "export function viaQualified(l: Link) { l.open(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.main", false, false,
+                                       false, reg, defs, NDEFS, imp_names, imp_qns, 2, NULL, &out);
+    ASSERT_TRUE(
+        has_exact_resolved(&out, "test.main.viaNew", "test.Conn.Conn.ping", "lsp_ts_method"));
+    ASSERT_TRUE(
+        has_exact_resolved(&out, "test.main.viaTyped", "test.Conn.Conn.ping", "lsp_ts_method"));
+    ASSERT_TRUE(
+        has_exact_resolved(&out, "test.main.viaQualified", "test.conn.Link.open", "lsp_ts_method"));
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* Issue #344 / #340: SIGSEGV in the TS cross-file LSP pass when the collected
  * def array exceeded ~1189 entries — scale-dependent, not file-specific. Drive
  * the resolver with a def array far past that threshold; the v0.7.0 rewrite
@@ -4519,6 +4677,8 @@ SUITE(ts_lsp) {
 
     /* Cross-file resolution */
     RUN_TEST(tslsp_crossfile_method_dispatch);
+    RUN_TEST(tslsp_crossfile_new_expression_receiver_issue1354);
+    RUN_TEST(tslsp_crossfile_same_name_file_receiver_issue1354);
     RUN_TEST(tslsp_scale_many_defs_no_crash_issue344);
     RUN_TEST(tslsp_crossfile_function_call);
     RUN_TEST(tslsp_crossfile_chain_through_return);

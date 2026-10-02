@@ -214,7 +214,7 @@ options = "metadata,umask=22,fmask=11"
 or keep the cache on the Linux filesystem (the default `~/.cache/codebase-memory-mcp`),
 which is also much faster than a 9p-mounted Windows drive.
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running, so its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon — joining an already-running daemon, it inherits that daemon's already-captured values instead.
 
 
 ### Roots that are always refused
