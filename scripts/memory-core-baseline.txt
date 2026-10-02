@@ -62,7 +62,7 @@ src/pipeline/pass_compile_commands.c	17
 src/pipeline/pass_complexity.c	15
 src/pipeline/pass_configlink.c	3
 src/pipeline/pass_cross_repo.c	8
-src/pipeline/pass_definitions.c	14
+src/pipeline/pass_definitions.c	12
 src/pipeline/pass_enrichment.c	15
 src/pipeline/pass_ensemble_routing.c	10
 src/pipeline/pass_envscan.c	2
@@ -71,15 +71,15 @@ src/pipeline/pass_importance.c	4
 src/pipeline/pass_infrascan.c	2
 src/pipeline/pass_k8s.c	6
 src/pipeline/pass_lsp_cross.c	50
-src/pipeline/pass_parallel.c	31
-src/pipeline/pass_pkgmap.c	82
+src/pipeline/pass_parallel.c	29
+src/pipeline/pass_pkgmap.c	80
 src/pipeline/pass_semantic.c	3
 src/pipeline/pass_tests.c	3
 src/pipeline/pass_usages.c	4
 src/pipeline/path_alias.c	42
 src/pipeline/pipeline.c	134
 src/pipeline/pipeline_delta.c	19
-src/pipeline/pipeline_incremental.c	144
+src/pipeline/pipeline_incremental.c	142
 src/pipeline/registry.c	17
 src/pipeline/worker_pool.c	2
 src/store/store.c	358
