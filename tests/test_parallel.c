@@ -2668,6 +2668,201 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
     PASS();
 }
 
+/* #2120 residual, reported on a real repo: step 8b binds only namespace-
+ * qualified TOP-LEVEL types. A qualified `A.B` whose qualifier A is a TYPE
+ * (nested-type constructor `new Command.Result(...)`, chained-constructor
+ * receiver `new Grain.Handler(dep).Handle(...)`) and a top-level type with NO
+ * namespace declaration (global namespace, e.g. a `[Inject]`-consumed service)
+ * both fell through to the short-name fallback, where the prefix score against
+ * a path-derived QN is 0 for every variant — registration order picked the
+ * target. Decoy files are registered FIRST so the old registry-order behavior
+ * binds every check to the decoy and the test fails. */
+TEST(parallel_csharp_nested_type_and_global_namespace_binding) {
+    static const char decoy_src[] =
+        "namespace Acme.Layouts.Cqrs;\n"
+        "public class GrainCommand {\n"
+        "    public class Handler {\n"
+        "        public int Handle() => 9;\n"
+        "    }\n"
+        "    public class Result {\n"
+        "        public Result(bool ok) { }\n"
+        "        public int Code() => 9;\n"
+        "    }\n"
+        "}\n";
+    static const char partner_src[] =
+        "namespace Acme.Partner.Cqrs;\n"
+        "public class GrainCommand {\n"
+        "    public class Handler {\n"
+        "        private readonly int _v;\n"
+        "        public Handler(int v) { _v = v; }\n"
+        "        public int Handle() => _v;\n"
+        "    }\n"
+        "    public class Result {\n"
+        "        public Result(bool ok) { }\n"
+        "        public int Code() => 1;\n"
+        "    }\n"
+        "}\n";
+    static const char backoffice_src[] =
+        "namespace Acme.BackOffice.Cqrs;\n"
+        "public class GrainCommand {\n"
+        "    public class Result {\n"
+        "        public Result(bool ok) { }\n"
+        "        public int Code() => 2;\n"
+        "    }\n"
+        "}\n";
+    static const char nested_user_src[] =
+        "using Acme.Partner.Cqrs;\n"
+        "namespace Acme.App;\n"
+        "public class NestedUser {\n"
+        "    public int Run() {\n"
+        "        var r = new GrainCommand.Result(true);\n"
+        "        return r.Code();\n"
+        "    }\n"
+        "}\n";
+    static const char chained_user_src[] =
+        "using Acme.Partner.Cqrs;\n"
+        "namespace Acme.App;\n"
+        "public class ChainedUser {\n"
+        "    public int Run() {\n"
+        "        return new GrainCommand.Handler(3).Handle();\n"
+        "    }\n"
+        "}\n";
+    static const char other_update_src[] =
+        "namespace Acme.Other.Web.Services;\n"
+        "public class UpdateService {\n"
+        "    public string Check() => \"other\";\n"
+        "}\n";
+    /* No namespace declaration: the global namespace. */
+    static const char global_update_src[] =
+        "public class UpdateService {\n"
+        "    public string Check() => \"global\";\n"
+        "}\n";
+    static const char boot_src[] =
+        "namespace Acme.App;\n"
+        "public class Boot {\n"
+        "    public string Boot1() {\n"
+        "        var u = new UpdateService();\n"
+        "        return u.Check();\n"
+        "    }\n"
+        "}\n";
+    /* The lookup-order probe: the SAME simple name resolves through an
+     * imported namespace AND exists in the global namespace. C# binds the
+     * imported namespace first, so ImportUser.Run2 must hit the Other variant
+     * and never the global one — proving the global namespace is appended
+     * last in cs_visible_namespaces, not merged as an equal. */
+    static const char import_user_src[] =
+        "using Acme.Other.Web.Services;\n"
+        "namespace Acme.App;\n"
+        "public class ImportUser {\n"
+        "    public string Run2() {\n"
+        "        var u = new UpdateService();\n"
+        "        return u.Check();\n"
+    "    }\n"
+        "}\n";
+    const char *project = "cbm_cs_nested";
+    static const char *rels[] = {
+        "src/Decoy/Layouts.cs",
+        "src/Decoy/OtherUpdate.cs",
+        "src/Partner/Cqrs/GrainCommand.cs",
+        "src/BackOffice/Cqrs/GrainCommand.cs",
+        "src/Globals/UpdateService.cs",
+        "src/App/NestedUser.cs",
+        "src/App/ChainedUser.cs",
+        "src/App/Boot.cs",
+        "src/App/ImportUser.cs",
+    };
+    const char *srcs[] = {decoy_src,       other_update_src, partner_src,
+                          backoffice_src,  global_update_src, nested_user_src,
+                          chained_user_src, boot_src, import_user_src};
+    enum { N_FILES = 9, N_CHECKS = 10 };
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_nested_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write C# nested-type fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *pf_code = "cbm_cs_nested.src.Partner.Cqrs.GrainCommand.GrainCommand."
+                         "Result.Code";
+    const char *pf_handle = "cbm_cs_nested.src.Partner.Cqrs.GrainCommand.GrainCommand."
+                           "Handler.Handle";
+    const char *bo_code = "cbm_cs_nested.src.BackOffice.Cqrs.GrainCommand.GrainCommand."
+                          "Result.Code";
+    const char *decoy_code = "cbm_cs_nested.src.Decoy.Layouts.GrainCommand.GrainCommand."
+                            "Result.Code";
+    const char *decoy_handle = "cbm_cs_nested.src.Decoy.Layouts.GrainCommand.GrainCommand."
+                              "Handler.Handle";
+    const char *global_check = "cbm_cs_nested.src.Globals.UpdateService.UpdateService.Check";
+    const char *other_check = "cbm_cs_nested.src.Decoy.OtherUpdate.UpdateService.Check";
+    bool ok[2][N_CHECKS];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        ok[g][0] = has_edge_from_callable_to_qn(gb, "NestedUser.Run", pf_code, "CALLS");
+        ok[g][1] = !has_edge_from_callable_to_qn(gb, "NestedUser.Run", bo_code, "CALLS") &&
+                   !has_edge_from_callable_to_qn(gb, "NestedUser.Run", decoy_code, "CALLS");
+        /* The ctor EDGE itself joins through the pipeline's textual carrier and
+         * is out of scope here (see PR notes); what must hold is that the
+         * nested type RESOLUTION is right, proven by the Code()/Handle() edges
+         * above, and that no ctor edge binds to a variant the caller cannot
+         * see: neither the BackOffice nor the registry-first decoy. */
+        ok[g][2] = !has_edge_from_callable_to_qn(
+                       gb, "NestedUser.Run",
+                       "cbm_cs_nested.src.BackOffice.Cqrs.GrainCommand.GrainCommand.Result",
+                       "CALLS") &&
+                   !has_edge_from_callable_to_qn(
+                       gb, "NestedUser.Run",
+                       "cbm_cs_nested.src.BackOffice.Cqrs.GrainCommand.GrainCommand."
+                       "Result.Result",
+                       "CALLS");
+        ok[g][3] = !has_edge_from_callable_to_qn(gb, "NestedUser.Run",
+                                                 "cbm_cs_nested.src.Decoy.Layouts.GrainCommand."
+                                                 "GrainCommand.Result.Result",
+                                                 "CALLS");
+        ok[g][4] = has_edge_from_callable_to_qn(gb, "ChainedUser.Run", pf_handle, "CALLS");
+        ok[g][5] = !has_edge_from_callable_to_qn(gb, "ChainedUser.Run", decoy_handle, "CALLS");
+        ok[g][6] = has_edge_from_callable_to_qn(gb, "Boot.Boot1", global_check, "CALLS");
+        ok[g][7] = !has_edge_from_callable_to_qn(gb, "Boot.Boot1", other_check, "CALLS");
+        ok[g][8] = has_edge_from_callable_to_qn(gb, "ImportUser.Run2", other_check, "CALLS");
+        ok[g][9] = !has_edge_from_callable_to_qn(gb, "ImportUser.Run2", global_check, "CALLS");
+        for (int k = 0; k < N_CHECKS; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  C# nested/global diagnostic %s: nested_code=%d/%d nested_ctor=%d/%d "
+                   "chained=%d/%d global_ns=%d/%d imported=%d/%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
+}
+
 /* External Kotlin protocol targets must not borrow a project method merely
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
@@ -4786,6 +4981,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_typescript_import_namespace_exact_parity);
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
     RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
+    RUN_TEST(parallel_csharp_nested_type_and_global_namespace_binding);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);

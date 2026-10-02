@@ -383,6 +383,11 @@ static int cs_visible_namespaces(CSLSPContext *ctx, const char *qualifier, const
         if (u->kind == CBM_CS_USING_NAMESPACE && u->target_qn && u->target_qn[0])
             out[n++] = u->target_qn;
     }
+    /* The global namespace is checked last: an unqualified name binds to a
+     * top-level type declared without a namespace whatever the file imports
+     * (#2120 residual — such types used to be invisible to step 8b). */
+    if (n < cap)
+        out[n++] = "";
     return n;
 }
 
@@ -419,6 +424,20 @@ static const char *cs_resolve_by_declared_namespace(CSLSPContext *ctx, const cha
                 best_rank = r;
                 break;
             }
+        }
+    }
+    /* No namespace-qualified hit: a qualified `A.B` may name a NESTED type —
+     * A a type in scope (resolved recursively, one segment shorter), B a
+     * member type of it. Nested QNs are the parent QN plus the simple name,
+     * which step 8b's namespace scan can never produce because nested types
+     * carry no namespace_qn (#2120 residual: `new Command.Result(...)`,
+     * `new Grain.Handler(dep).Handle(...)`). */
+    if (!best && qualifier) {
+        const char *qtype = cs_resolve_type_name(ctx, qualifier);
+        if (qtype) {
+            const char *nested = cbm_arena_sprintf(ctx->arena, "%s.%s", qtype, simple);
+            if (cs_lookup_type_qn(ctx, nested))
+                return nested;
         }
     }
     return best ? best->qualified_name : NULL;
@@ -3749,13 +3768,16 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
  * type is not reachable by its simple name through a namespace). */
 static const char *cs_top_level_namespace(const char *type_qn, const char *short_name,
                                           const char *module_qn, const char *namespace_name) {
-    if (!type_qn || !short_name || !module_qn || !namespace_name || !namespace_name[0])
+    if (!type_qn || !short_name || !module_qn)
         return NULL;
     size_t mlen = strlen(module_qn);
     if (strncmp(type_qn, module_qn, mlen) != 0 || type_qn[mlen] != '.' ||
         strcmp(type_qn + mlen + 1, short_name) != 0)
         return NULL;
-    return namespace_name;
+    /* Top-level C# type: its declared namespace, "" when it declares none
+     * (global namespace) so step 8b can bind it — NULL stays reserved for
+     * nested types, which no namespace can reach by simple name. */
+    return (namespace_name && namespace_name[0]) ? namespace_name : "";
 }
 
 /* Register one batch of CBMLSPDef[] into a registry. Shared by the
