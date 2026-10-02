@@ -2349,6 +2349,53 @@ TEST(tool_list_projects_empty) {
     PASS();
 }
 
+/* A cache directory that exists but holds no project is the first-run state.
+ * list_projects must answer it with a well-formed empty page in both
+ * encodings: zero rows, zero totals, no further page, and the indexing hint.
+ *
+ * This is also the one input on which the record array is never allocated.
+ * The assertions are the behavioural half and hold on every platform; that the
+ * sort is not handed a null base is visible only where the C library declares
+ * it nonnull and the sanitizer halts on the report (see the same note on
+ * pass_similarity_empty_graph_no_entries). Do not read a green run on a
+ * recovering lane as proof that the guard is still in place. */
+TEST(tool_list_projects_empty_cache_returns_wellformed_empty_page) {
+    mcp_search_cache_t cache;
+    ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-list-empty"));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *json_response =
+        srv ? cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}") : NULL;
+    char *json_text = json_response ? extract_text_content(json_response) : NULL;
+    bool json_empty_page =
+        json_text && strstr(json_text, "\"projects\":[]") && strstr(json_text, "\"total\":0") &&
+        strstr(json_text, "\"returned\":0") && strstr(json_text, "\"has_more\":false") &&
+        !strstr(json_text, "next_offset") && strstr(json_text, "No projects indexed");
+    bool json_not_error = json_response && !strstr(json_response, "\"isError\":true");
+
+    char *tree_response = srv ? cbm_mcp_handle_tool(srv, "list_projects", "{}") : NULL;
+    char *tree_text = tree_response ? extract_text_content(tree_response) : NULL;
+    bool tree_empty_page =
+        tree_text && strstr(tree_text, "projects: 0 ") && strstr(tree_text, "total: 0\n") &&
+        strstr(tree_text, "returned: 0\n") && strstr(tree_text, "has_more: false\n") &&
+        !strstr(tree_text, "next_offset") && strstr(tree_text, "No projects indexed");
+    bool tree_not_error = tree_response && !strstr(tree_response, "\"isError\":true");
+
+    free(json_text);
+    free(json_response);
+    free(tree_text);
+    free(tree_response);
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(mcp_search_cache_close(&cache));
+
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(json_not_error);
+    ASSERT_TRUE(json_empty_page);
+    ASSERT_TRUE(tree_not_error);
+    ASSERT_TRUE(tree_empty_page);
+    PASS();
+}
+
 TEST(tool_get_graph_schema_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -21095,6 +21142,7 @@ SUITE(mcp) {
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
+    RUN_TEST(tool_list_projects_empty_cache_returns_wellformed_empty_page);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_compare_graphs_registered_issue525);
