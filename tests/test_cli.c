@@ -14958,6 +14958,260 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
 #endif
 }
 
+/* ── hook-augment breadcrumb log location ──────────────────────────
+ * Arming the deadline opens the breadcrumb log with O_CREAT. Its path was
+ * "$HOME/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log" built in
+ * 1 KiB buffers with no length check, so a long HOME created a file at a
+ * cut-off name, and CBM_CACHE_DIR, which every other cbm log honours, was
+ * ignored. These run the real entry point in a child with a no-op Bash
+ * payload: the deadline is armed (the log opened), then the hook passes
+ * through with exit 0. POSIX only: the in-process deadline and its log are
+ * compiled out on Windows. */
+#ifndef _WIN32
+enum { HL_PATH_CAP = 1024, HL_SEGMENT = 200 };
+
+/* Exit code of `hook-augment` run in a child with HOME = home and
+ * CBM_CACHE_DIR = cache_dir (unset when NULL), or -1 when it did not exit. */
+static int hl_run_hook(const char *home, const char *cache_dir) {
+    static const char payload[] = "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\","
+                                  "\"tool_input\":{\"command\":\"ls\"}}";
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+    /* Queued before the fork, so no write can meet a reader that has gone. */
+    ssize_t queued = write(fds[1], payload, sizeof(payload) - 1);
+    close(fds[1]);
+    if (queued != (ssize_t)(sizeof(payload) - 1)) {
+        close(fds[0]);
+        return -1;
+    }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(fds[0], STDIN_FILENO);
+        close(fds[0]);
+        cbm_setenv("HOME", home, 1);
+        cbm_unsetenv("USERPROFILE");
+        cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
+        if (cache_dir) {
+            cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+        } else {
+            cbm_unsetenv("CBM_CACHE_DIR");
+        }
+        _exit(cbm_cmd_hook_augment(0, NULL));
+    }
+    close(fds[0]);
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) {
+        return -1;
+    }
+    return WEXITSTATUS(status);
+}
+
+/* A fresh synthetic root with its links resolved. The kernel bounds the
+ * EXPANDED path, and macOS /tmp is a link to /private/tmp: under the link a
+ * near-1 KiB path can be neither created nor probed, which hides the very
+ * cut-off file these tests look for. */
+static bool hl_make_root(char *root, size_t root_sz) {
+    char tmpl[256];
+    char real[4096];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm-hooklog-XXXXXX");
+    if (!cbm_mkdtemp(tmpl)) {
+        return false;
+    }
+    if (!cbm_canonical_path(tmpl, real, sizeof(real))) {
+        th_rmtree(tmpl);
+        return false;
+    }
+    int n = snprintf(root, root_sz, "%s", real);
+    return n > 0 && (size_t)n < root_sz;
+}
+
+/* "<root>/hhh…/hhh…" of exactly `len` bytes, every component short of
+ * NAME_MAX. False when it cannot be built. */
+static bool hl_long_dir(char *out, size_t out_sz, const char *root, size_t len) {
+    int n = snprintf(out, out_sz, "%s", root);
+    if (n <= 0 || (size_t)n >= len || len >= out_sz) {
+        return false;
+    }
+    size_t at = (size_t)n;
+    while (at < len) {
+        out[at++] = '/';
+        for (int seg = 0; seg < HL_SEGMENT && at < len; seg++) {
+            out[at++] = 'h';
+        }
+    }
+    out[at] = '\0';
+    return out[len - 1] != '/';
+}
+
+/* The first HL_PATH_CAP - 1 bytes of "<base>/<suffix>": the name the old
+ * unchecked 1 KiB buffer cut that path down to. */
+static void hl_cut_name(char *out, const char *base, const char *suffix) {
+    char full[2 * HL_PATH_CAP];
+    snprintf(full, sizeof(full), "%s/%s", base, suffix);
+    snprintf(out, HL_PATH_CAP, "%.*s", HL_PATH_CAP - 1, full);
+}
+
+static bool hl_is_ancestor_or_self(const char *path, const char *of) {
+    size_t n = strlen(path);
+    return of && strncmp(of, path, n) == 0 && (of[n] == '/' || of[n] == '\0');
+}
+
+/* Entries under dir that are neither keep_a, keep_b nor one of their
+ * ancestors: whatever the hook created. Each is printed by its tail. */
+static int hl_count_strays(const char *dir, const char *keep_a, const char *keep_b) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return 0;
+    }
+    int strays = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0) {
+            continue;
+        }
+        char child[HL_PATH_CAP];
+        int n = snprintf(child, sizeof(child), "%s/%s", dir, entry->name);
+        bool named = n > 0 && (size_t)n < sizeof(child);
+        if (named &&
+            (hl_is_ancestor_or_self(child, keep_a) || hl_is_ancestor_or_self(child, keep_b))) {
+            if (entry->is_dir) {
+                strays += hl_count_strays(child, keep_a, keep_b);
+            }
+            continue;
+        }
+        size_t len = named ? (size_t)n : strlen(child);
+        printf("  stray entry: ...%s\n", child + (len > 60 ? len - 60 : 0));
+        strays++;
+    }
+    cbm_closedir(d);
+    return strays;
+}
+#endif
+
+/* A HOME of ~1 KiB: the log path "<HOME>/.cache/codebase-memory-mcp/logs/
+ * hook-augment-timeouts.log" does not fit the buffer. The old code opened its
+ * cut-off prefix ".../logs/hook-augme" with O_CREAT. Nothing may be created at
+ * a cut path (nothing at all under the synthetic root), and the hook must
+ * still exit 0: it never fails the host agent's hook call. */
+TEST(cli_hook_augment_log_long_home_creates_no_cut_path) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process deadline breadcrumb log is POSIX-only");
+#else
+    enum { HL_HOME_LEN = 980 }; /* "<HOME>/.cache/.../logs" fits 1 KiB, the file name does not */
+    char root[256];
+    if (!hl_make_root(root, sizeof(root))) {
+        FAIL("synthetic root failed");
+    }
+    char home[HL_PATH_CAP];
+    bool built = hl_long_dir(home, sizeof(home), root, HL_HOME_LEN) && th_mkdir_p(home) == 0;
+    char cut[HL_PATH_CAP];
+    hl_cut_name(cut, home, ".cache/codebase-memory-mcp/logs/hook-augment-timeouts.log");
+
+    int rc = built ? hl_run_hook(home, NULL) : -1;
+    bool cut_exists = cbm_file_exists(cut);
+    int strays = hl_count_strays(root, home, NULL);
+    test_rmdir_r(root);
+
+    ASSERT_TRUE(built);
+    ASSERT_EQ(rc, 0);
+    if (cut_exists) {
+        printf("  log opened at the cut-off name ...%s\n", cut + strlen(cut) - 40);
+    }
+    ASSERT_FALSE(cut_exists);
+    ASSERT_EQ(strays, 0);
+    PASS();
+#endif
+}
+
+/* CBM_CACHE_DIR is where every cbm log goes (<cache_dir>/logs), so the hook's
+ * breadcrumb goes there too, and not under HOME. A CBM_CACHE_DIR of ~1 KiB
+ * whose log path does not fit is no log at all: no cut-off file, no stray
+ * directory, and the hook still exits 0. */
+TEST(cli_hook_augment_log_honours_cache_dir) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process deadline breadcrumb log is POSIX-only");
+#else
+    enum { HL_CACHE_LEN = 1000 }; /* "<cache>/logs" fits 1 KiB, the file name does not */
+    char root[256];
+    if (!hl_make_root(root, sizeof(root))) {
+        FAIL("synthetic root failed");
+    }
+    char home[512];
+    char cache[512];
+    char expected[640];
+    snprintf(home, sizeof(home), "%s/home", root);
+    snprintf(cache, sizeof(cache), "%s/cache", root);
+    snprintf(expected, sizeof(expected), "%s/logs/hook-augment-timeouts.log", cache);
+    bool made = th_mkdir_p(home) == 0 && th_mkdir_p(cache) == 0;
+
+    /* A configured cache dir holds the log; HOME is left alone. */
+    int rc = made ? hl_run_hook(home, cache) : -1;
+    bool in_cache = cbm_file_exists(expected);
+    int strays = hl_count_strays(root, home, expected);
+
+    /* A configured cache dir too long for the log path: no log anywhere. */
+    char long_cache[HL_PATH_CAP];
+    char cut[HL_PATH_CAP];
+    bool long_built = hl_long_dir(long_cache, sizeof(long_cache), root, HL_CACHE_LEN) &&
+                      th_mkdir_p(long_cache) == 0;
+    hl_cut_name(cut, long_cache, "logs/hook-augment-timeouts.log");
+    bool reset = th_rmtree(home) == 0 && th_rmtree(cache) == 0 && th_mkdir_p(home) == 0;
+    int long_rc = long_built && reset ? hl_run_hook(home, long_cache) : -1;
+    bool cut_exists = cbm_file_exists(cut);
+    int long_strays = hl_count_strays(root, home, long_cache);
+    test_rmdir_r(root);
+
+    ASSERT_TRUE(made);
+    ASSERT_EQ(rc, 0);
+    if (!in_cache) {
+        printf("  no breadcrumb log under CBM_CACHE_DIR/logs\n");
+    }
+    ASSERT_TRUE(in_cache);
+    ASSERT_EQ(strays, 0);
+    ASSERT_TRUE(long_built);
+    ASSERT_TRUE(reset);
+    ASSERT_EQ(long_rc, 0);
+    ASSERT_FALSE(cut_exists);
+    ASSERT_EQ(long_strays, 0);
+    PASS();
+#endif
+}
+
+/* Positive control: with a normal HOME and no CBM_CACHE_DIR the breadcrumb log
+ * stays exactly where it always was,
+ * "$HOME/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log", and the
+ * hook creates nothing else. */
+TEST(cli_hook_augment_log_default_location_unchanged) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process deadline breadcrumb log is POSIX-only");
+#else
+    char root[256];
+    if (!hl_make_root(root, sizeof(root))) {
+        FAIL("synthetic root failed");
+    }
+    char home[512];
+    char expected[640];
+    snprintf(home, sizeof(home), "%s/home", root);
+    snprintf(expected, sizeof(expected),
+             "%s/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log", home);
+    bool made = th_mkdir_p(home) == 0;
+
+    int rc = made ? hl_run_hook(home, NULL) : -1;
+    bool at_default = cbm_file_exists(expected);
+    int strays = hl_count_strays(root, expected, NULL);
+    test_rmdir_r(root);
+
+    ASSERT_TRUE(made);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(at_default);
+    ASSERT_EQ(strays, 0);
+    PASS();
+#endif
+}
+
 TEST(cli_upsert_claude_hook_existing) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-XXXXXX");
@@ -17032,6 +17286,9 @@ SUITE(cli) {
     RUN_TEST(cli_claude_exec_hooks_custom_dir_uninstall_issue1733);
     RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
+    RUN_TEST(cli_hook_augment_log_long_home_creates_no_cut_path);
+    RUN_TEST(cli_hook_augment_log_honours_cache_dir);
+    RUN_TEST(cli_hook_augment_log_default_location_unchanged);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_tool_hooks_preserve_foreign_same_matcher);

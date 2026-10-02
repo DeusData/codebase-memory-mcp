@@ -10421,7 +10421,13 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
     char path[CBM_SZ_1K];
     const char *override = getenv("CBM_INDEX_LOG");
     if (override && override[0]) {
-        snprintf(path, sizeof(path), "%s", override);
+        /* An override that does not fit is cut off into another file's name,
+         * and "wb" would create or truncate that file: no logfile then. */
+        int written = snprintf(path, sizeof(path), "%s", override);
+        if (written <= 0 || (size_t)written >= sizeof(path)) {
+            cbm_log_warn("index.logfile_path_too_long", "source", "CBM_INDEX_LOG");
+            return false;
+        }
     } else {
         const char *cdir = cbm_resolve_cache_dir();
         if (!cdir) {
