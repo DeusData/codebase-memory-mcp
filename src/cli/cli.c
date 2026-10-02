@@ -2774,9 +2774,40 @@ static void cbm_kiro_home_dir(const char *home_dir, char *out, size_t out_sz) {
     cbm_env_home_dir("KIRO_HOME", home_dir, ".kiro", out, out_sz);
 }
 
-static void cbm_hermes_home_dir(const char *home_dir, char *out, size_t out_sz) {
-    cbm_env_home_dir("HERMES_HOME", home_dir, ".hermes", out, out_sz);
+/* #1180: native Windows Hermes -- the install.ps1 CLI, the MSIX package and
+ * the Desktop app -- defaults HERMES_HOME to %LOCALAPPDATA%\hermes and keeps a
+ * legacy ~/.hermes only while the new directory is absent (hermes-agent
+ * website/docs/user-guide/windows-native.md "Data layout";
+ * apps/desktop/electron/data-paths.mjs resolveDesktopHermesHome). Probing
+ * only ~/.hermes missed those installs and aimed config.yaml at a home Hermes
+ * never reads. Other platforms use ~/.hermes. */
+static void cbm_hermes_home_dir_for(const char *home_dir, bool windows, char *out, size_t out_sz) {
+    const char *fallback = ".hermes";
+    if (windows) {
+        char native[CLI_BUF_1K];
+        char legacy[CLI_BUF_1K];
+        snprintf(native, sizeof(native), "%s/AppData/Local/hermes", home_dir);
+        snprintf(legacy, sizeof(legacy), "%s/.hermes", home_dir);
+        if (dir_exists(native) || !dir_exists(legacy)) {
+            fallback = "AppData/Local/hermes";
+        }
+    }
+    cbm_env_home_dir("HERMES_HOME", home_dir, fallback, out, out_sz);
 }
+
+static void cbm_hermes_home_dir(const char *home_dir, char *out, size_t out_sz) {
+#ifdef _WIN32
+    cbm_hermes_home_dir_for(home_dir, true, out, out_sz);
+#else
+    cbm_hermes_home_dir_for(home_dir, false, out, out_sz);
+#endif
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_hermes_home_dir_for_testing(const char *home_dir, bool windows, char *out, size_t out_sz) {
+    cbm_hermes_home_dir_for(home_dir, windows, out, out_sz);
+}
+#endif
 
 static void cbm_qwen_home_dir(const char *home_dir, char *out, size_t out_sz) {
     cbm_env_home_dir("QWEN_HOME", home_dir, ".qwen", out, out_sz);
@@ -3079,6 +3110,53 @@ static int cbm_resolve_released_hook_command(const char *script_name, char *out,
     return written > 0 && (size_t)written < out_sz ? CLI_OK : CLI_ERR;
 }
 
+/* #1180: a bare ~/.claude directory is not a Claude Code install -- other
+ * tools create it -- and treating it as one wrote hooks, skills and MCP
+ * entries for a client the user never installed. Claude Code itself leaves
+ * its user config .claude.json (under CLAUDE_CONFIG_DIR when set), its
+ * settings.json, or the claude CLI. */
+static bool cbm_claude_code_detected(const char *home_dir) {
+    char dir[CLI_BUF_1K];
+    char path[CLI_BUF_1K];
+    cbm_claude_config_dir(home_dir, dir, sizeof(dir));
+    int written = snprintf(path, sizeof(path), "%s/settings.json", dir);
+    if (dir[0] && written > 0 && (size_t)written < sizeof(path) && cbm_file_exists(path)) {
+        return true;
+    }
+    cbm_claude_user_root(home_dir, dir, sizeof(dir));
+    written = snprintf(path, sizeof(path), "%s/.claude.json", dir);
+    if (dir[0] && written > 0 && (size_t)written < sizeof(path) && cbm_file_exists(path)) {
+        return true;
+    }
+    return cbm_agent_cli_exists("claude", home_dir);
+}
+
+/* OpenCode keeps its data (auth, logs, sessions; the global config itself on
+ * older installs) in ~/.local/share/opencode on every OS --
+ * %USERPROFILE%\.local\share\opencode on Windows (opencode.ai/docs/
+ * troubleshooting, "Storage"). The CLI and the Desktop app's bundled
+ * opencode-cli server both create it, so it identifies an install that has
+ * no config file, no ~/.config/opencode and no `opencode` on PATH
+ * (#1167, #1180). */
+static bool cbm_opencode_detected(const char *home_dir) {
+    char path[CLI_BUF_1K];
+    cbm_opencode_config_path(home_dir, path, sizeof(path));
+    if (cbm_file_exists(path) || cbm_agent_cli_exists("opencode", home_dir)) {
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s/.config/opencode", home_dir);
+    if (dir_exists(path)) {
+        return true;
+    }
+    char env_buf[CLI_BUF_1K];
+    const char *config_dir = cbm_safe_getenv("OPENCODE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (config_dir && config_dir[0] && dir_exists(config_dir)) {
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s/.local/share/opencode", home_dir);
+    return dir_exists(path);
+}
+
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_detected_agents_t agents;
     memset(&agents, 0, sizeof(agents));
@@ -3088,8 +3166,7 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     char path[CLI_BUF_1K];
 
-    cbm_claude_config_dir(home_dir, path, sizeof(path));
-    agents.claude_code = path[0] != '\0' && dir_exists(path);
+    agents.claude_code = cbm_claude_code_detected(home_dir);
 
     cbm_codex_config_dir(home_dir, path, sizeof(path));
     agents.codex = path[0] != '\0' && dir_exists(path);
@@ -3103,18 +3180,7 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_zed_config_dir(home_dir, path, sizeof(path));
     agents.zed = dir_exists(path);
 
-    cbm_opencode_config_path(home_dir, path, sizeof(path));
-    agents.opencode = cbm_file_exists(path) || cbm_agent_cli_exists("opencode", home_dir);
-    if (!agents.opencode) {
-        snprintf(path, sizeof(path), "%s/.config/opencode", home_dir);
-        agents.opencode = dir_exists(path);
-    }
-    if (!agents.opencode) {
-        char env_buf[CLI_BUF_1K];
-        const char *config_dir =
-            cbm_safe_getenv("OPENCODE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
-        agents.opencode = config_dir && config_dir[0] && dir_exists(config_dir);
-    }
+    agents.opencode = cbm_opencode_detected(home_dir);
 
     agents.aider = cbm_agent_cli_exists("aider", home_dir);
 

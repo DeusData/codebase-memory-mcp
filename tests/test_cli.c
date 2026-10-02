@@ -6049,6 +6049,11 @@ TEST(cli_detect_agents_finds_claude) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/.claude", tmpdir);
     test_mkdirp(dir);
+    /* #1180: a bare directory is not evidence; the settings file Claude Code
+     * reads is. */
+    char settings[640];
+    snprintf(settings, sizeof(settings), "%s/settings.json", dir);
+    write_test_file(settings, "{}\n");
 
     /* Unset CLAUDE_CONFIG_DIR so detection is exercised against home_dir/.claude
      * and the runner's real env (which may set it) does not leak in. */
@@ -6078,6 +6083,10 @@ TEST(cli_detect_agents_finds_claude_via_env) {
     char ccd[512];
     snprintf(ccd, sizeof(ccd), "%s/custom-claude", tmpdir);
     test_mkdirp(ccd);
+    /* #1180: Claude Code keeps .claude.json inside CLAUDE_CONFIG_DIR. */
+    char user_config[640];
+    snprintf(user_config, sizeof(user_config), "%s/.claude.json", ccd);
+    write_test_file(user_config, "{}\n");
 
     const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
     char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
@@ -6095,6 +6104,255 @@ TEST(cli_detect_agents_finds_claude_via_env) {
     }
 
     test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* #1167/#1180: detection runs against a synthetic home with every env var that
+ * can redirect Claude/OpenCode/Hermes lookups cleared and PATH reduced to one
+ * empty directory, so the host's own installs never leak into the verdict. */
+typedef struct {
+    char *path;
+    char *claude_config_dir;
+    char *opencode_config;
+    char *opencode_config_dir;
+    char *hermes_home;
+} client_detect_env_t;
+
+static client_detect_env_t client_detect_env_isolate(const char *path_dir) {
+    client_detect_env_t saved = {
+        save_test_env("PATH"), save_test_env("CLAUDE_CONFIG_DIR"), save_test_env("OPENCODE_CONFIG"),
+        save_test_env("OPENCODE_CONFIG_DIR"), save_test_env("HERMES_HOME")};
+    cbm_setenv("PATH", path_dir, 1);
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    cbm_unsetenv("OPENCODE_CONFIG");
+    cbm_unsetenv("OPENCODE_CONFIG_DIR");
+    cbm_unsetenv("HERMES_HOME");
+    return saved;
+}
+
+static void client_detect_env_restore(client_detect_env_t *saved) {
+    restore_test_env("PATH", saved->path);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved->claude_config_dir);
+    restore_test_env("OPENCODE_CONFIG", saved->opencode_config);
+    restore_test_env("OPENCODE_CONFIG_DIR", saved->opencode_config_dir);
+    restore_test_env("HERMES_HOME", saved->hermes_home);
+}
+
+/* Fresh home plus an empty bin dir used as the whole PATH. */
+static bool client_detect_fixture(char *home, size_t home_sz, char *bin, size_t bin_sz) {
+    snprintf(home, home_sz, "/tmp/cli-client-detect-XXXXXX");
+    if (!cbm_mkdtemp(home)) {
+        return false;
+    }
+    snprintf(bin, bin_sz, "%s/bin", home);
+    test_mkdirp(bin);
+    return true;
+}
+
+/* #1180: a bare ~/.claude directory no longer counts as Claude Code. Fixtures
+ * that model a Claude Code user add the user config Claude Code itself writes
+ * (.claude.json in the home, or in CLAUDE_CONFIG_DIR when that is set). */
+static void test_mark_claude_code_installed(const char *user_root) {
+    char path[768];
+    snprintf(path, sizeof(path), "%s/.claude.json", user_root);
+    write_test_file(path, "{}\n");
+}
+
+/* #1180: a user with only an (empty) ~/.claude folder and no Claude Code CLI
+ * was reported as "Detected agents: Claude-Code" and got hooks, skills and
+ * MCP entries written for a client they never installed. */
+TEST(cli_detect_claude_empty_dir_not_detected_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.claude", home);
+    test_mkdirp(dir);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (agents.claude_code)
+        FAIL("an empty ~/.claude directory must not count as an installed Claude Code");
+    PASS();
+}
+
+TEST(cli_detect_claude_empty_config_dir_env_not_detected_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char ccd[512];
+    snprintf(ccd, sizeof(ccd), "%s/custom-claude", home);
+    test_mkdirp(ccd);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_setenv("CLAUDE_CONFIG_DIR", ccd, 1);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (agents.claude_code)
+        FAIL("an empty CLAUDE_CONFIG_DIR must not count as an installed Claude Code");
+    PASS();
+}
+
+/* The evidence that DOES mean Claude Code is installed, one at a time: its
+ * settings file, its user config ~/.claude.json, or the claude CLI. */
+TEST(cli_detect_claude_real_install_detected_issue1180) {
+    enum { EVIDENCE_SETTINGS, EVIDENCE_USER_CONFIG, EVIDENCE_CLI, EVIDENCE_COUNT };
+    static const char *const names[EVIDENCE_COUNT] = {"settings.json", ".claude.json",
+                                                      "claude CLI"};
+    for (int kind = 0; kind < EVIDENCE_COUNT; kind++) {
+        char home[256];
+        char bin[320];
+        if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+            FAIL("cbm_mkdtemp failed");
+        char path[640];
+        if (kind == EVIDENCE_SETTINGS) {
+            snprintf(path, sizeof(path), "%s/.claude", home);
+            test_mkdirp(path);
+            snprintf(path, sizeof(path), "%s/.claude/settings.json", home);
+            write_test_file(path, "{}\n");
+        } else if (kind == EVIDENCE_USER_CONFIG) {
+            snprintf(path, sizeof(path), "%s/.claude.json", home);
+            write_test_file(path, "{}\n");
+        } else {
+            snprintf(path, sizeof(path), "%s/claude", bin);
+            write_test_file(path, "#!/bin/sh\nexit 0\n");
+            chmod(path, 0755);
+        }
+        client_detect_env_t saved = client_detect_env_isolate(bin);
+        cbm_detected_agents_t agents = cbm_detect_agents(home);
+        client_detect_env_restore(&saved);
+        test_rmdir_r(home);
+        if (!agents.claude_code) {
+            printf("  evidence: %s\n", names[kind]);
+            FAIL("real Claude Code evidence must be detected");
+        }
+    }
+    PASS();
+}
+
+/* #1180: OpenCode keeps its data in ~/.local/share/opencode on every OS
+ * (opencode.ai/docs/troubleshooting, "Storage"; Windows:
+ * %USERPROFILE%\.local\share\opencode), and the Desktop app's bundled
+ * opencode-cli server creates it too. With no config file, no
+ * ~/.config/opencode and no opencode on PATH it is the remaining evidence. */
+TEST(cli_detect_opencode_desktop_storage_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.local/share/opencode", home);
+    test_mkdirp(dir);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (!agents.opencode)
+        FAIL("OpenCode's data dir ~/.local/share/opencode must detect OpenCode");
+    PASS();
+}
+
+/* #1180: native Windows Hermes (install.ps1 CLI, MSIX package, Desktop app)
+ * defaults HERMES_HOME to %LOCALAPPDATA%\hermes and reads a legacy ~/.hermes
+ * only while that directory is absent (hermes-agent windows-native.md "Data
+ * layout"; apps/desktop/electron/data-paths.mjs). cbm probed and wrote
+ * ~/.hermes only. Elsewhere the home stays ~/.hermes. */
+TEST(cli_hermes_home_windows_localappdata_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char native[512];
+    char legacy[512];
+    snprintf(native, sizeof(native), "%s/AppData/Local/hermes", home);
+    snprintf(legacy, sizeof(legacy), "%s/.hermes", home);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    char fresh_windows[512];
+    char fresh_posix[512];
+    char legacy_windows[512];
+    char both_windows[512];
+    char both_posix[512];
+    cbm_hermes_home_dir_for_testing(home, true, fresh_windows, sizeof(fresh_windows));
+    cbm_hermes_home_dir_for_testing(home, false, fresh_posix, sizeof(fresh_posix));
+    test_mkdirp(legacy);
+    cbm_hermes_home_dir_for_testing(home, true, legacy_windows, sizeof(legacy_windows));
+    test_mkdirp(native);
+    cbm_hermes_home_dir_for_testing(home, true, both_windows, sizeof(both_windows));
+    cbm_hermes_home_dir_for_testing(home, false, both_posix, sizeof(both_posix));
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+
+    bool ok = strcmp(fresh_windows, native) == 0 && strcmp(fresh_posix, legacy) == 0 &&
+              strcmp(legacy_windows, legacy) == 0 && strcmp(both_windows, native) == 0 &&
+              strcmp(both_posix, legacy) == 0;
+    if (!ok) {
+        printf("  fresh: windows=%s posix=%s\n  legacy-only windows=%s\n"
+               "  both: windows=%s posix=%s\n",
+               fresh_windows, fresh_posix, legacy_windows, both_windows, both_posix);
+        FAIL("Windows Hermes home must be AppData/Local/hermes unless only ~/.hermes exists");
+    }
+    PASS();
+}
+
+/* #1180 end to end on the compiled-in platform: a Hermes Desktop home in
+ * AppData/Local/hermes is detected and receives config.yaml + the skill on
+ * Windows, and is not evidence anywhere else. */
+TEST(cli_detect_hermes_desktop_home_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/AppData/Local/hermes", home);
+    test_mkdirp(dir);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    char *json = cbm_build_install_plan_json(home, "/usr/local/bin/codebase-memory-mcp");
+    client_detect_env_restore(&saved);
+#ifdef _WIN32
+    bool ok = agents.hermes && json && strstr(json, "/AppData/Local/hermes/config.yaml") &&
+              strstr(json, "/AppData/Local/hermes/skills/codebase-memory/SKILL.md") &&
+              !strstr(json, "/.hermes/config.yaml");
+#else
+    bool ok = !agents.hermes && json && !strstr(json, "/AppData/Local/hermes/");
+#endif
+    free(json);
+    test_rmdir_r(home);
+    if (!ok)
+        FAIL("the Hermes home must follow the platform's documented default");
+    PASS();
+}
+
+/* Control: look-alike neighbours of every new probe must not detect anything. */
+TEST(cli_detect_client_non_install_control_issue1167_1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char path[640];
+    snprintf(path, sizeof(path), "%s/.local/share/opencode-other", home);
+    test_mkdirp(path);
+    snprintf(path, sizeof(path), "%s/.claude-other", home);
+    test_mkdirp(path);
+    snprintf(path, sizeof(path), "%s/claude.json", home);
+    write_test_file(path, "{}\n");
+    snprintf(path, sizeof(path), "%s/AppData/Local/hermes-other", home);
+    test_mkdirp(path);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (agents.claude_code || agents.opencode || agents.hermes)
+        FAIL("unrelated files next to the probed locations must not detect a client");
     PASS();
 }
 
@@ -6975,6 +7233,7 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
         test_mkdirp(path);
     }
+    test_mark_claude_code_installed(tmpdir);
     snprintf(path, sizeof(path), "%s/mcp-config.json", copilot_home);
     write_test_file(path, "{}\n");
 
@@ -8221,6 +8480,7 @@ TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
     if (!cbm_mkdir_p(hooks_dir, 0755))
         FAIL("mkdir hooks_dir failed");
+    test_mark_claude_code_installed(tmpdir);
     /* A gate script that is NOT ours: a manual install pointing at another
      * binary. The real install refuses to rewrite it (TEXT_UNOWNED). */
     char gate_path[768];
@@ -9385,6 +9645,7 @@ TEST(cli_devin_does_not_duplicate_owned_claude_session_start) {
     snprintf(claude_settings, sizeof(claude_settings), "%s/settings.json", claude_dir);
     snprintf(devin_config, sizeof(devin_config), "%s/config.json", devin_dir);
     test_mkdirp(claude_dir);
+    test_mark_claude_code_installed(tmpdir);
     test_mkdirp(devin_dir);
     write_test_file(devin_config, "{}\n");
 
@@ -9651,6 +9912,7 @@ TEST(cli_claude_user_scope_avoids_nested_mcp_json) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/.claude", tmpdir);
     test_mkdirp(dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
     bool has_user_config = json && strstr(json, "/.claude.json") != NULL;
@@ -10315,7 +10577,13 @@ TEST(cli_relative_kiro_and_hermes_homes_never_target_root) {
     char expected_kiro[512];
     char expected_hermes[512];
     snprintf(expected_kiro, sizeof(expected_kiro), "%s/.kiro/settings/mcp.json", tmpdir);
+#ifdef _WIN32
+    /* #1180: native Windows Hermes defaults to %LOCALAPPDATA%\hermes. */
+    snprintf(expected_hermes, sizeof(expected_hermes), "%s/AppData/Local/hermes/config.yaml",
+             tmpdir);
+#else
     snprintf(expected_hermes, sizeof(expected_hermes), "%s/.hermes/config.yaml", tmpdir);
+#endif
     bool safe = json && strstr(json, expected_kiro) && strstr(json, expected_hermes) &&
                 !strstr(json, "\"/settings/mcp.json\"") && !strstr(json, "\"/config.yaml\"");
 
@@ -10352,7 +10620,12 @@ TEST(cli_fresh_cli_only_yaml_and_toml_agents_create_parent_dirs) {
     cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
 
     char path[768];
+#ifdef _WIN32
+    /* #1180: native Windows Hermes defaults to %LOCALAPPDATA%\hermes. */
+    snprintf(path, sizeof(path), "%s/AppData/Local/hermes/config.yaml", tmpdir);
+#else
     snprintf(path, sizeof(path), "%s/.hermes/config.yaml", tmpdir);
+#endif
     bool installed = test_file_contains_all(
         path, (const char *const[]){"mcp_servers:", "codebase-memory-mcp:"}, 2);
 #ifdef _WIN32
@@ -11060,6 +11333,7 @@ TEST(cli_uninstall_preserves_hook_script_with_modified_binary) {
     snprintf(script_path, sizeof(script_path), "%s/hooks/cbm-session-reminder", claude_dir);
 #endif
     test_mkdirp(claude_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -11402,6 +11676,7 @@ TEST(cli_claude_lifecycle_hooks_delegate_to_augmenter) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_path = save_test_env("PATH");
     char *saved_claude = save_test_env("CLAUDE_CONFIG_DIR");
@@ -12055,6 +12330,7 @@ TEST(cli_claude_hook_scripts_shell_quote_binary_path) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
     char copilot_dir[512];
     snprintf(copilot_dir, sizeof(copilot_dir), "%s/.copilot", tmpdir);
     test_mkdirp(copilot_dir);
@@ -12128,6 +12404,7 @@ TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir) {
     snprintf(config_dir, sizeof(config_dir), "%s/custom claude;$(touch cbm-hook-path-pwned)",
              tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(config_dir);
     char *saved_path = save_test_env("PATH");
     char *saved_claude = save_test_env("CLAUDE_CONFIG_DIR");
     cbm_setenv("PATH", tmpdir, 1);
@@ -13128,6 +13405,7 @@ TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
     snprintf(subagent_path, sizeof(subagent_path), "%s/cbm-subagent-reminder", hooks_dir);
     snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char legacy_gate[8192];
     ASSERT_TRUE(test_build_released_gate_hook_script("/opt/codebase-memory-mcp", legacy_gate,
@@ -13198,6 +13476,7 @@ TEST(cli_upgrade_preserves_near_legacy_claude_hook_script) {
     snprintf(gate_path, sizeof(gate_path), "%s/cbm-code-discovery-gate", hooks_dir);
     snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(tmpdir);
     const char *modified_legacy =
         "#!/usr/bin/env bash\n"
         "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
@@ -13289,6 +13568,7 @@ TEST(cli_claude_hook_script_collisions_are_not_registered) {
     snprintf(session, sizeof(session), "%s/cbm-session-reminder", hooks_dir);
     snprintf(settings, sizeof(settings), "%s/.claude/settings.json", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(tmpdir);
     write_test_file(victim, "victim-owned\n");
     ASSERT_EQ(symlink(victim, gate), 0);
     write_test_file(session, "#!/bin/sh\necho user-owned\n");
@@ -13355,6 +13635,7 @@ TEST(cli_uninstall_removes_claude_hook_scripts) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -13425,6 +13706,7 @@ TEST(cli_uninstall_preserves_modified_claude_hook_script) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -14581,6 +14863,7 @@ TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes) {
     snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
     snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(config_dir);
 
     const char *const env_names[] = {"HOME",        "PATH",       "CLAUDE_CONFIG_DIR",
                                      "APPDATA",     "CODEX_HOME", "OPENCODE_CONFIG",
@@ -16845,6 +17128,13 @@ SUITE(cli) {
     /* Agent detection (6 tests — group A) */
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
+    RUN_TEST(cli_detect_claude_empty_dir_not_detected_issue1180);
+    RUN_TEST(cli_detect_claude_empty_config_dir_env_not_detected_issue1180);
+    RUN_TEST(cli_detect_claude_real_install_detected_issue1180);
+    RUN_TEST(cli_detect_opencode_desktop_storage_issue1180);
+    RUN_TEST(cli_hermes_home_windows_localappdata_issue1180);
+    RUN_TEST(cli_detect_hermes_desktop_home_issue1180);
+    RUN_TEST(cli_detect_client_non_install_control_issue1167_1180);
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_grok);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
