@@ -26,6 +26,7 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "repro_runner.h"
 #include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
 #include "daemon/bootstrap.h"  /* refuse the developer's default daemon rendezvous */
@@ -139,6 +140,8 @@ int main(void) {
      * loudly instead of reaching it. */
     cbm_daemon_bootstrap_forbid_default_runtime_for_test(true);
 #endif
+    /* #2003: fixture git commands must never reach the caller's repository. */
+    th_clear_git_repo_env();
 
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
      * leak) before stdio flushes — keep every printed line so the summary and the
