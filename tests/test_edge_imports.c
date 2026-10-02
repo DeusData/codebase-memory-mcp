@@ -455,6 +455,66 @@ TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682) {
     PASS();
 }
 
+/* #514 follow-up: the tsconfig `paths` branch must preserve dotted basenames
+ * like the relative branch (#1682). It stripped `.service` from
+ * `@app/cats/cat.service`, missed the module, and bound the import by last
+ * segment to an unrelated node. */
+TEST(ei_typescript_dotted_alias_import_targets_source_module) {
+    static const char *service_path = "apps/api/src/cats/cat.service.ts";
+    static const char *controller_path = "apps/api/src/cats/cat.controller.ts";
+    static const EILangFile f[] = {
+        {"apps/api/tsconfig.json",
+         "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{\"@app/*\":[\"src/*\"]}}}\n"},
+        {"apps/api/src/cats/cat.service.ts", "export class CatService {\n"
+                                             "  findAll(): string[] {\n"
+                                             "    return [\"a\"];\n"
+                                             "  }\n"
+                                             "}\n"},
+        {"apps/api/src/cats/cat.controller.ts",
+         "import { CatService } from \"@app/cats/cat.service\";\n"
+         "export class CatController {\n"
+         "  constructor(private readonly catService: CatService) {}\n"
+         "}\n"},
+        {"apps/api/src/other/service.ts", "export function service(): number {\n"
+                                          "  return 1;\n"
+                                          "}\n"},
+    };
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int64_t controller_id = ei_node_id_for_file_label(store, lp.project, controller_path, "File");
+    ASSERT_GT(controller_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, controller_id, "IMPORTS", &edges, &edge_count),
+        CBM_STORE_OK);
+
+    bool saw_import = false;
+    bool target_ok = false;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        if (!strstr(props, "\"local_name\":\"CatService\"")) {
+            continue;
+        }
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        saw_import = true;
+        target_ok = target->file_path && strcmp(target->file_path, service_path) == 0;
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+
+    ASSERT_TRUE(saw_import);
+    ASSERT_TRUE(target_ok);
+    PASS();
+}
+
 /* TypeScript: default import `import helper from './util'`. */
 TEST(ei_typescript_default_import) {
     static const EILangFile f[] = {
@@ -1261,6 +1321,7 @@ SUITE(edge_imports) {
     /* ── GREEN GUARDS — TypeScript (must stay passing) ── */
     RUN_TEST(ei_typescript_named_relative_import);
     RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
+    RUN_TEST(ei_typescript_dotted_alias_import_targets_source_module);
     RUN_TEST(ei_typescript_default_import);
     RUN_TEST(ei_typescript_namespace_import);
     RUN_TEST(ei_typescript_aliased_import);

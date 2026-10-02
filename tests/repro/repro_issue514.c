@@ -220,34 +220,82 @@ static const RFile k_nest_files[] = {
                                    "}\n"},
 };
 
-TEST(repro_issue514_ctor_param_property_callers) {
-    RProj lp;
-    cbm_store_t *store =
-        rh_index_files(&lp, k_nest_files, (int)(sizeof(k_nest_files) / sizeof(k_nest_files[0])));
-    ASSERT_NOT_NULL(store);
-
+/* Run trace_path inbound depth 1 on fn_name against the fixture project.
+ * rh_index_files restores CBM_CACHE_DIR after indexing; point the query at
+ * the fixture's cache so trace_path finds the project. */
+static char *rh514_trace_inbound(RProj *lp, const char *fn_name) {
     char args[512];
     snprintf(args, sizeof(args),
-             "{\"function_name\":\"findAll\","
+             "{\"function_name\":\"%s\","
              "\"project\":\"%s\","
              "\"direction\":\"inbound\","
              "\"depth\":1}",
-             lp.project);
+             fn_name, lp->project);
 
-    /* rh_index_files restores CBM_CACHE_DIR after indexing; point the query at
-     * the fixture's cache so trace_path finds the project. */
     const char *prior_cache_dir = getenv("CBM_CACHE_DIR");
     char *saved_cache_dir = prior_cache_dir ? strdup(prior_cache_dir) : NULL;
-    cbm_setenv("CBM_CACHE_DIR", lp.cachedir, 1);
-    char *resp = cbm_mcp_handle_tool(lp.srv, "trace_path", args);
+    cbm_setenv("CBM_CACHE_DIR", lp->cachedir, 1);
+    char *resp = cbm_mcp_handle_tool(lp->srv, "trace_path", args);
     if (saved_cache_dir) {
         cbm_setenv("CBM_CACHE_DIR", saved_cache_dir, 1);
         free(saved_cache_dir);
     } else {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
+    return resp;
+}
+
+TEST(repro_issue514_ctor_param_property_callers) {
+    RProj lp;
+    cbm_store_t *store =
+        rh_index_files(&lp, k_nest_files, (int)(sizeof(k_nest_files) / sizeof(k_nest_files[0])));
+    ASSERT_NOT_NULL(store);
+
+    char *resp = rh514_trace_inbound(&lp, "findAll");
     ASSERT_NOT_NULL(resp);
     fprintf(stderr, "  [514] trace_path inbound response: %.400s\n", resp);
+
+    ASSERT_NULL(strstr(resp, "function not found"));
+    ASSERT_NOT_NULL(strstr(resp, "CatController.list"));
+
+    free(resp);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
+/* Same DI shape, but the injected class is imported through a tsconfig
+ * `paths` alias, the norm in NestJS monorepos. The alias branch of import
+ * resolution stripped the dotted basename (`cat.service` -> `cat`), so the
+ * IMPORTS edge missed the module and the DI call lost its target. */
+static const RFile k_nest_alias_files[] = {
+    {"apps/api/tsconfig.json",
+     "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{\"@app/*\":[\"src/*\"]}}}\n"},
+    {"apps/api/src/cats/cat.service.ts", "export class CatService {\n"
+                                         "  findAll(): string[] {\n"
+                                         "    return [\"a\"];\n"
+                                         "  }\n"
+                                         "}\n"},
+    {"apps/api/src/cats/cat.controller.ts",
+     "import { CatService } from \"@app/cats/cat.service\";\n"
+     "\n"
+     "export class CatController {\n"
+     "  constructor(private readonly catService: CatService) {}\n"
+     "\n"
+     "  list() {\n"
+     "    return this.catService.findAll();\n"
+     "  }\n"
+     "}\n"},
+};
+
+TEST(repro_issue514_ctor_param_property_alias_import_callers) {
+    RProj lp;
+    cbm_store_t *store = rh_index_files(
+        &lp, k_nest_alias_files, (int)(sizeof(k_nest_alias_files) / sizeof(k_nest_alias_files[0])));
+    ASSERT_NOT_NULL(store);
+
+    char *resp = rh514_trace_inbound(&lp, "findAll");
+    ASSERT_NOT_NULL(resp);
+    fprintf(stderr, "  [514] trace_path inbound (alias) response: %.400s\n", resp);
 
     ASSERT_NULL(strstr(resp, "function not found"));
     ASSERT_NOT_NULL(strstr(resp, "CatController.list"));
@@ -261,4 +309,5 @@ TEST(repro_issue514_ctor_param_property_callers) {
 SUITE(repro_issue514) {
     RUN_TEST(repro_issue514_data_flow_surfaces_arg_expr);
     RUN_TEST(repro_issue514_ctor_param_property_callers);
+    RUN_TEST(repro_issue514_ctor_param_property_alias_import_callers);
 }
