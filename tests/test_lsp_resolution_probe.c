@@ -1272,6 +1272,108 @@ TEST(lrp_ts_s8_field_type_hint) {
     PASS();
 }
 
+/* Barrels: a type imported through an index.ts that re-exports it must resolve
+ * to the defining module. Covers a dotted folder imported by alias (B1), a lib
+ * barrel with a named re-export (B2), a relative import of a barrel folder
+ * (B3) and a nested `export *` barrel (B4). The import used to stop at the
+ * Folder/barrel module, so every DI call below had no CALLS edge. */
+TEST(lrp_ts_barrel_reexport_member_calls) {
+    static const LRP_File f[] = {
+        {"apps/api/tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{"
+                                   "\"@acme/shipping\":[\"libs/shipping/src\"],"
+                                   "\"@acme/shipping/*\":[\"libs/shipping/src/*\"]}}}\n"},
+        {"apps/api/libs/shipping/src/application/service/label-print.service/"
+         "label-print.service.ts",
+         "import { LabelPrintParams } from \"./label-print.interface\";\n"
+         "export class LabelPrintService {\n"
+         "  printStream(params: LabelPrintParams): string {\n"
+         "    return this.printWithStats(params).body;\n"
+         "  }\n"
+         "  printWithStats(params: LabelPrintParams): { body: string; pages: number } {\n"
+         "    return { body: params.shipmentId, pages: 1 };\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/application/service/label-print.service/"
+         "label-print.interface.ts",
+         "export interface LabelPrintParams {\n"
+         "  shipmentId: string;\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/application/service/label-print.service/index.ts",
+         "export * from \"./label-print.service\";\n"
+         "export * from \"./label-print.interface\";\n"},
+        {"apps/api/libs/shipping/src/domain/tracking/tracking-code.service.ts",
+         "export class TrackingCodeService {\n"
+         "  generate(shipmentId: string): string {\n"
+         "    return shipmentId;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/domain/tracking/index.ts",
+         "export * from \"./tracking-code.service\";\n"},
+        {"apps/api/libs/shipping/src/domain/carrier.service.ts",
+         "export class CarrierService {\n"
+         "  quote(weightKg: number): number {\n"
+         "    return weightKg * 2;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/shipping/src/index.ts",
+         "export * from \"./domain/tracking\";\n"
+         "export {\n"
+         "  CarrierService,\n"
+         "} from \"./domain/carrier.service\";\n"
+         "export type { LabelPrintParams } from \"./application/service/label-print.service\";\n"},
+        {"apps/api/libs/invoice/src/application/command/handler/ship-invoice.handler.ts",
+         "import { LabelPrintService } from "
+         "\"@acme/shipping/application/service/label-print.service\";\n"
+         "import { CarrierService, TrackingCodeService } from \"@acme/shipping\";\n"
+         "export class ShipInvoiceHandler {\n"
+         "  constructor(\n"
+         "    private readonly labelPrintService: LabelPrintService,\n"
+         "    private readonly carrierService: CarrierService,\n"
+         "    private readonly trackingCodeService: TrackingCodeService,\n"
+         "  ) {}\n"
+         "  execute(shipmentId: string): string {\n"
+         "    const cost = this.carrierService.quote(3);\n"
+         "    const code = this.trackingCodeService.generate(shipmentId);\n"
+         "    const label = this.labelPrintService.printStream({ shipmentId });\n"
+         "    return `${label}:${code}:${cost}`;\n"
+         "  }\n"
+         "}\n"},
+        {"apps/api/libs/invoice/src/application/service/label-preview.service.ts",
+         "import { LabelPrintService } from "
+         "\"../../../../shipping/src/application/service/label-print.service\";\n"
+         "export class LabelPreviewService {\n"
+         "  constructor(private readonly labelPrintService: LabelPrintService) {}\n"
+         "  preview(shipmentId: string): number {\n"
+         "    return this.labelPrintService.printWithStats({ shipmentId }).pages;\n"
+         "  }\n"
+         "}\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int b1 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
+                                         "LabelPrintService.printStream");
+    int b2 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
+                                         "CarrierService.quote");
+    int b3 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "LabelPreviewService.preview",
+                                         "LabelPrintService.printWithStats");
+    int b4 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
+                                         "TrackingCodeService.generate");
+    int self =
+        lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "LabelPrintService.printStream",
+                                    "LabelPrintService.printWithStats");
+    printf("  [ts/barrel] B1=%d B2=%d B3=%d B4=%d self=%d\n", b1, b2, b3, b4, self);
+    lrp_cleanup(&lp, store);
+
+    ASSERT_EQ(b1, 1);
+    ASSERT_EQ(b2, 1);
+    ASSERT_EQ(b3, 1);
+    ASSERT_EQ(b4, 1);
+    ASSERT_EQ(self, 1);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -1919,6 +2021,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_s6_inherited_method);
     RUN_TEST(lrp_ts_s7_generic);
     RUN_TEST(lrp_ts_s8_field_type_hint);
+    RUN_TEST(lrp_ts_barrel_reexport_member_calls);
 
     /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
     RUN_TEST(lrp_java_s1_crossfile_call);
