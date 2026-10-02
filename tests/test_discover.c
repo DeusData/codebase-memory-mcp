@@ -6,6 +6,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "discover/userconfig.h"
 #include "foundation/platform.h"
 
 typedef struct {
@@ -2272,6 +2273,49 @@ TEST(shebang_oversized_first_line_unindexed) {
     PASS();
 }
 
+/* ── .d: D source vs make/cargo dep-info ───────────────────────── */
+
+/* rustc/cargo dep-info (and gcc -MD, CMake .o.d) files share .d with D source
+ * but are Makefile rules the D grammar parses slowly into nothing useful, so
+ * they must not be indexed as D. */
+static const char CARGO_DEP_INFO[] = "/home/u/proj/t/debug/deps/foo-abc123.d: src/lib.rs src/a.rs\n"
+                                     "\n"
+                                     "src/lib.rs:\n"
+                                     "src/a.rs:\n";
+
+TEST(discover_d_dep_info_not_indexed_as_dlang) {
+    CBMLanguage dep;
+    CBMLanguage src;
+    ASSERT(shebang_probe("cbm_disc_dotd", "t/debug/deps/foo-abc123.d", CARGO_DEP_INFO, &dep));
+    ASSERT(shebang_probe("cbm_disc_dotd", "app.d", "module app;\nimport std.stdio : writeln;\n",
+                         &src));
+    ASSERT_EQ(dep, CBM_LANG_COUNT);
+    ASSERT_EQ(src, CBM_LANG_DLANG);
+    PASS();
+}
+
+/* The probe runs only while .d maps to D, so a user override to another
+ * language wins. */
+TEST(discover_d_user_override_skips_dep_info_probe) {
+    char *cfg_dir = th_mktempdir("cbm_disc_dotd_uc");
+    ASSERT(cfg_dir != NULL);
+    ASSERT_EQ(th_write_file(TH_PATH(cfg_dir, ".codebase-memory.json"),
+                            "{\"extra_extensions\":{\".d\":\"makefile\"}}"),
+              0);
+    cbm_userconfig_t *cfg = cbm_userconfig_load(cfg_dir);
+    th_cleanup(cfg_dir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_set_user_lang_config(cfg);
+    CBMLanguage lang;
+    bool ok = shebang_probe("cbm_disc_dotd_uc", "foo-abc123.d", CARGO_DEP_INFO, &lang);
+    cbm_set_user_lang_config(NULL);
+    cbm_userconfig_free(cfg);
+    ASSERT(ok);
+    ASSERT_EQ(lang, CBM_LANG_MAKEFILE);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -2363,6 +2407,10 @@ SUITE(discover) {
     RUN_TEST(shebang_env_unsupported_option_unindexed);
     RUN_TEST(shebang_embedded_nul_unindexed);
     RUN_TEST(shebang_oversized_first_line_unindexed);
+
+    /* .d: D source vs make/cargo dep-info */
+    RUN_TEST(discover_d_dep_info_not_indexed_as_dlang);
+    RUN_TEST(discover_d_user_override_skips_dep_info_probe);
 
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);

@@ -1330,6 +1330,108 @@ CBMLanguage cbm_disambiguate_res(const char *path) {
     return memchr(buf, '\0', n) ? CBM_LANG_COUNT : CBM_LANG_RESCRIPT;
 }
 
+/* A make rule's targets end at a ':' followed by whitespace or the end of the
+ * file, which skips drive-letter colons ("C:/", "C:\"). */
+static bool is_rule_colon(const char *p, bool whole_file) {
+    char next = p[SKIP_ONE];
+    return *p == ':' && (next == ' ' || next == '\t' || next == '\r' || next == '\n' ||
+                         (next == '\0' && whole_file));
+}
+
+/* Bytes of D whitespace at p, or 0: space, tab, vertical tab, form feed, CR
+ * and the UTF-8 line and paragraph separators U+2028/U+2029, all of which split
+ * D tokens. '\n' ends the line and is the caller's. */
+static size_t d_space_len(const char *p) {
+    if (*p == ' ' || *p == '\t' || *p == '\v' || *p == '\f' || *p == '\r') {
+        return SKIP_ONE;
+    }
+    if (strncmp(p, "\xE2\x80\xA8", SLEN("\xE2\x80\xA8")) == 0 ||
+        strncmp(p, "\xE2\x80\xA9", SLEN("\xE2\x80\xA9")) == 0) {
+        return SLEN("\xE2\x80\xA8");
+    }
+    return 0;
+}
+
+/* True if the line at p is a make rule "target...: prereq..." whose targets all
+ * look like paths (contain '/', '\' or '.'); a backslash-escaped space stays
+ * inside its target. D source fails this: "public:", "@safe:", "extern(C):"
+ * and "import a.b : c" all have a non-path word or D punctuation before the
+ * colon. An attribute ('@', as in "@1.0:") or a comment between tokens
+ * ("public/+ +/:") is D even with a '.' or '/' before the colon, so a target
+ * holding either is never dep-info. */
+static bool is_dep_rule_line(const char *p, bool whole_file) {
+    bool in_target = false;
+    bool path_like = false;
+    bool any_target = false;
+    for (; *p && *p != '\n'; p++) {
+        if (is_rule_colon(p, whole_file)) {
+            return in_target ? path_like : any_target;
+        }
+        size_t space = d_space_len(p);
+        if (space) {
+            if (in_target && !path_like) {
+                return false;
+            }
+            in_target = false;
+            path_like = false;
+            p += space - SKIP_ONE;
+            continue;
+        }
+        if (strchr("(){};=\"',@", *p)) {
+            return false;
+        }
+        if (*p == '/' && (p[SKIP_ONE] == '*' || p[SKIP_ONE] == '+' || p[SKIP_ONE] == '/')) {
+            return false;
+        }
+        in_target = true;
+        any_target = true;
+        path_like = path_like || *p == '/' || *p == '\\' || *p == '.';
+        if (*p == '\\' && p[SKIP_ONE] == ' ') {
+            p++; /* escaped space: part of this target */
+        }
+    }
+    return false;
+}
+
+/* Disambiguate .d files: shared by D source and make-style dependency files
+ * written by rustc/cargo (target/<profile>/deps/<crate>-<hash>.d), gcc/clang -MD
+ * and CMake (<object>.o.d). Those are "target: prereq ..." rules, often tens of
+ * KB on one line, which the D grammar parses slowly into nothing but a module
+ * node, so they are reported as unsupported (CBM_LANG_COUNT). Defaults to D on
+ * any doubt (preserves existing behaviour). */
+CBMLanguage cbm_disambiguate_d(const char *path) {
+    if (!path) {
+        return CBM_LANG_DLANG;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_DLANG;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+    /* A colon at the end of buf only ends the rule if nothing was cut off. */
+    bool whole_file = n < CBM_SZ_4K && strlen(buf) == n;
+
+    const char *p = buf;
+    if (strncmp(p, "\xEF\xBB\xBF", SLEN("\xEF\xBB\xBF")) == 0) {
+        p += SLEN("\xEF\xBB\xBF");
+    }
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    /* A shebang or a leading D comment (including the DUB single-file
+     * "/+ dub.sdl:" recipe) is D; dep-info never starts that way. */
+    if (*p == '#' ||
+        (p[0] == '/' && (p[SKIP_ONE] == '/' || p[SKIP_ONE] == '*' || p[SKIP_ONE] == '+'))) {
+        return CBM_LANG_DLANG;
+    }
+    return is_dep_rule_line(p, whole_file) ? CBM_LANG_COUNT : CBM_LANG_DLANG;
+}
+
 /* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
  * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
  * with a line of the form "Class <UppercasePackage>..."; VB6 class modules

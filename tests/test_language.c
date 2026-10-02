@@ -835,6 +835,73 @@ TEST(lang_cfc_default_on_read_fail) {
     PASS();
 }
 
+/* ── .d: D source vs make/cargo dep-info ───────────────────────── */
+
+/* Write content to a temp .d file and return cbm_disambiguate_d() for it. A
+ * setup failure returns -1 so neither a D nor a COUNT expectation can pass
+ * vacuously. */
+static int disambiguate_d_content(const char *content) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_dotd.d", cbm_tmpdir());
+    if (!write_probe_file(path, content)) {
+        return -1;
+    }
+    CBMLanguage lang = cbm_disambiguate_d(path);
+    remove(path);
+    return (int)lang;
+}
+
+TEST(lang_d_dep_info_unsupported) {
+    /* cargo (absolute target), gcc -MD continuation, CMake object rule, Windows
+     * drive letter (not the rule colon), escaped space (one target, not "app"),
+     * and the GNU make manual's "foo.o foo.d : ..." (two targets, spaced colon). */
+    ASSERT_EQ(disambiguate_d_content("/home/u/t/debug/deps/foo-abc123.d: src/lib.rs src/a.rs\n"
+                                     "\nsrc/lib.rs:\n"),
+              CBM_LANG_COUNT);
+    ASSERT_EQ(disambiguate_d_content("foo.o: foo.c /usr/include/stdio.h \\\n"
+                                     " /usr/include/features.h\n"),
+              CBM_LANG_COUNT);
+    ASSERT_EQ(disambiguate_d_content("CMakeFiles/x.dir/a.cpp.o: \\\n /src/a.cpp\n"),
+              CBM_LANG_COUNT);
+    ASSERT_EQ(disambiguate_d_content("C:/b/foo.o: C:/s/foo.c \\\r\n C:/s/foo.h\r\n"),
+              CBM_LANG_COUNT);
+    ASSERT_EQ(disambiguate_d_content("out/my\\ app: main.c\n"), CBM_LANG_COUNT);
+    ASSERT_EQ(disambiguate_d_content("foo.o foo.d : foo.c defs.h\n"), CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(lang_d_source_stays_dlang) {
+    ASSERT_EQ(disambiguate_d_content("module a;\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("import std.stdio : writeln;\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("@safe:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    /* A leading comment is D, even DUB's "/+ dub.sdl:" single-file recipe. */
+    ASSERT_EQ(disambiguate_d_content("/+ dub.sdl:\n    name \"hello\"\n+/\nvoid main() {}\n"),
+              CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("enum E : ubyte {\n    a,\n}\n"), CBM_LANG_DLANG);
+    /* A float UDA ("@ FloatLiteral") has a '.' before its colon, alone or glued
+     * to a keyword. */
+    ASSERT_EQ(disambiguate_d_content("@1.0:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("nothrow@1.0:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    /* A comment between tokens puts a '/' before the colon. */
+    ASSERT_EQ(disambiguate_d_content("public/**/:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("public/+ +/:\nvoid f() {}\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("public//note: x\nvoid f() {}\n"), CBM_LANG_DLANG);
+    /* Every D whitespace splits tokens, not only space, tab and CR: form feed,
+     * vertical tab, U+2028 and U+2029. */
+    ASSERT_EQ(disambiguate_d_content("import\fstd.stdio : writeln;\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("import\vstd.stdio : writeln;\n"), CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("import\xE2\x80\xA8"
+                                     "std.stdio : writeln;\n"),
+              CBM_LANG_DLANG);
+    ASSERT_EQ(disambiguate_d_content("import\xE2\x80\xA9"
+                                     "std.stdio : writeln;\n"),
+              CBM_LANG_DLANG);
+    /* Default on doubt: empty or unreadable. */
+    ASSERT_EQ(disambiguate_d_content(""), CBM_LANG_DLANG);
+    ASSERT_EQ(cbm_disambiguate_d("/tmp/nonexistent_file_12345.d"), CBM_LANG_DLANG);
+    PASS();
+}
+
 /* --- New languages (auto-generated) --- */
 TEST(lang_ext_solidity) {
     ASSERT_EQ(cbm_language_for_extension(".sol"), CBM_LANG_SOLIDITY);
@@ -1488,6 +1555,8 @@ SUITE(language) {
     RUN_TEST(lang_frm_form_stays_form);
     RUN_TEST(lang_res_binary_resource_unsupported);
     RUN_TEST(lang_res_rescript_stays_rescript);
+    RUN_TEST(lang_d_dep_info_unsupported);
+    RUN_TEST(lang_d_source_stays_dlang);
 
     /* Go test ports */
     /* New languages */

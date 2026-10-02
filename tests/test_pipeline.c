@@ -631,6 +631,71 @@ TEST(pipeline_structure_nodes) {
     PASS();
 }
 
+/* Number of `label` nodes whose file_path starts with `prefix`, or -1. */
+static int count_nodes_with_path_prefix(cbm_store_t *s, const char *project, const char *label,
+                                        const char *prefix) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(s, project, label, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int hits = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].file_path && strncmp(nodes[i].file_path, prefix, strlen(prefix)) == 0) {
+            hits++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return hits;
+}
+
+/* Make-style dep-info .d files are dropped at discovery, so the graph holds no
+ * File or Module node for them and no Folder for a directory that held only
+ * dep-info. Real D source beside a dep-info file keeps its nodes and folder. */
+TEST(pipeline_d_dep_info_leaves_no_nodes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dotd_graph_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    write_temp_file(repo, "cargo-target/debug/deps/app-0123abcd.d",
+                    "/r/cargo-target/debug/deps/app-0123abcd.d: src/main.rs\n\nsrc/main.rs:\n");
+    write_temp_file(repo, "src/app.d", "module app;\n\nvoid main() {}\n");
+    write_temp_file(repo, "src/app.o.d", "src/app.o: src/app.d\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    int dep_folders = count_nodes_with_path_prefix(s, project, "Folder", "cargo-target");
+    int dep_files = count_nodes_with_path_prefix(s, project, "File", "cargo-target");
+    int dep_modules = count_nodes_with_path_prefix(s, project, "Module", "cargo-target");
+    int obj_files = count_nodes_with_path_prefix(s, project, "File", "src/app.o.d");
+    int obj_modules = count_nodes_with_path_prefix(s, project, "Module", "src/app.o.d");
+    int src_folders = count_nodes_with_path_prefix(s, project, "Folder", "src");
+    int src_files = count_nodes_with_path_prefix(s, project, "File", "src/app.d");
+    int src_modules = count_nodes_with_path_prefix(s, project, "Module", "src/app.d");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(dep_folders, 0);
+    ASSERT_EQ(dep_files, 0);
+    ASSERT_EQ(dep_modules, 0);
+    ASSERT_EQ(obj_files, 0);
+    ASSERT_EQ(obj_modules, 0);
+    ASSERT_EQ(src_folders, 1);
+    ASSERT_EQ(src_files, 1);
+    ASSERT_EQ(src_modules, 1);
+    PASS();
+}
+
 /* Issue #516: an ADR stored via manage_adr (project_summaries) must survive a
  * full re-index. A full re-index deletes the DB and rebuilds it from the graph
  * buffer, which writes an empty project_summaries table; the fix captures the
@@ -16305,6 +16370,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735);
     RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_d_dep_info_leaves_no_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
