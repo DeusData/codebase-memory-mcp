@@ -47,20 +47,23 @@ enum {
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
-/* Strip .ts/.tsx/.js/.jsx in place. Returns its argument. */
+/* Strip an explicit JS/TS module extension in place, keeping dotted
+ * basenames such as "cat.service". Same set as the relative resolver in
+ * fqn.c. Returns its argument. */
 static char *strip_resolved_ext(char *path) {
     if (!path) {
         return path;
     }
+    static const char *const extensions[] = {
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
+    };
     size_t len = strlen(path);
-    if (len > 3 && path[len - 3] == '.' && (path[len - 2] == 't' || path[len - 2] == 'j') &&
-        path[len - 1] == 's') {
-        path[len - 3] = '\0';
-        return path;
-    }
-    if (len > 4 && path[len - 4] == '.' && (path[len - 3] == 't' || path[len - 3] == 'j') &&
-        path[len - 2] == 's' && path[len - 1] == 'x') {
-        path[len - 4] = '\0';
+    for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
+        size_t ext_len = strlen(extensions[i]);
+        if (len > ext_len && strcmp(path + len - ext_len, extensions[i]) == 0) {
+            path[len - ext_len] = '\0';
+            break;
+        }
     }
     return path;
 }
