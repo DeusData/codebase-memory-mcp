@@ -239,6 +239,14 @@ void cbm_registry_free(cbm_registry_t *r);
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
 
+/* cbm_registry_add for a definition with a known declaring file. The one
+ * entry point the pipeline registers through: besides the plain add, a
+ * type-like `Foo$` declared in a Scala file is recorded as a companion owner,
+ * which is the only thing that lets the resolver read `Foo.m` as `Foo$.m`.
+ * `Foo$` from any other language is an ordinary name. */
+void cbm_registry_add_def(cbm_registry_t *r, const char *name, const char *qualified_name,
+                          const char *label, const char *file_path);
+
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
  * Returns result with qualified_name="" if unresolved.
@@ -321,6 +329,14 @@ bool cbm_python_is_builtin_member(const char *name);
  * Pure; unit-tested in test_registry.c. */
 bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
                                         const char *callee_name, const char *strategy);
+
+/* The Scala member guard's exemption (#2155): a receiver call whose weak match
+ * (unique_name / field_type_hint, NOT suffix_match) lands in the CALLER'S OWN
+ * FILE keeps its edge — an inherited or sibling method the file itself
+ * declares is the likely target. Combine as `suppress && !exempt` in both
+ * pass_calls.c and pass_parallel.c. Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_same_file_exempt(bool is_scala, const char *strategy, const char *caller_file,
+                                      const char *target_file);
 
 /* Bare-call counterpart of the guard above. True when a resolved BARE call edge
  * binds a callee that is shadowed by an enclosing parameter, and the match came
