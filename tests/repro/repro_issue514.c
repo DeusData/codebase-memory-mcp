@@ -305,9 +305,61 @@ TEST(repro_issue514_ctor_param_property_alias_import_callers) {
     PASS();
 }
 
+/* Repositories are injected by string token and typed as an INTERFACE:
+ * `@Inject("order.OrderRepository") private readonly repo: OrderRepository`.
+ * Interface method signatures were not graph nodes, so the call had no
+ * target and trace_path found no callers. */
+static const RFile k_nest_iface_files[] = {
+    {"apps/api/tsconfig.json", "{\"compilerOptions\":{\"baseUrl\":\"./\",\"paths\":{\"@acme/order/"
+                               "*\":[\"libs/order/src/*\"]}}}\n"},
+    {"apps/api/libs/order/src/domain/order.repository.ts",
+     "export interface OrderRepository {\n"
+     "  save(orderId: string): Promise<void>;\n"
+     "  findOneOrFail(orderId: string): Promise<{ id: string }>;\n"
+     "}\n"},
+    {"apps/api/libs/order/src/application/command/handler/cancel-order.handler.ts",
+     "import { Inject } from \"@nestjs/common\";\n"
+     "import { OrderRepository } from \"@acme/order/domain/order.repository\";\n"
+     "\n"
+     "export class CancelOrderHandler {\n"
+     "  constructor(\n"
+     "    @Inject(\"order.OrderRepository\")\n"
+     "    private readonly orderRepository: OrderRepository,\n"
+     "  ) {}\n"
+     "\n"
+     "  async execute(orderId: string): Promise<void> {\n"
+     "    const order = await this.orderRepository.findOneOrFail(orderId);\n"
+     "    await this.orderRepository.save(order.id);\n"
+     "  }\n"
+     "}\n"},
+};
+
+TEST(repro_issue514_inject_token_interface_callers) {
+    RProj lp;
+    cbm_store_t *store = rh_index_files(
+        &lp, k_nest_iface_files, (int)(sizeof(k_nest_iface_files) / sizeof(k_nest_iface_files[0])));
+    ASSERT_NOT_NULL(store);
+
+    char *save = rh514_trace_inbound(&lp, "save");
+    char *find = rh514_trace_inbound(&lp, "findOneOrFail");
+    ASSERT_NOT_NULL(save);
+    ASSERT_NOT_NULL(find);
+    fprintf(stderr, "  [514] trace_path inbound save: %.400s\n", save);
+    fprintf(stderr, "  [514] trace_path inbound findOneOrFail: %.400s\n", find);
+
+    ASSERT_NOT_NULL(strstr(save, "CancelOrderHandler.execute"));
+    ASSERT_NOT_NULL(strstr(find, "CancelOrderHandler.execute"));
+
+    free(save);
+    free(find);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────────────────── */
 SUITE(repro_issue514) {
     RUN_TEST(repro_issue514_data_flow_surfaces_arg_expr);
     RUN_TEST(repro_issue514_ctor_param_property_callers);
     RUN_TEST(repro_issue514_ctor_param_property_alias_import_callers);
+    RUN_TEST(repro_issue514_inject_token_interface_callers);
 }
