@@ -302,6 +302,10 @@ typedef struct {
                                      // (self.compiler.apply_converters()). An object the
                                      // class owns, not a parameter: read by the weak-member
                                      // guard's unique-name exemption. Default false.
+    /* Ephemeral coverage evidence, set only while resolving this file. Capture
+     * it before releasing a spilled result; never retain registry pointers. */
+    bool coverage_calls_emitted;
+    const char *coverage_candidate_qn;
 } CBMCall;
 
 typedef struct {

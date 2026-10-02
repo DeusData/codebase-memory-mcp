@@ -2003,7 +2003,7 @@ static int format_call_arg(char *buf, size_t bufsize, const CBMCallArg *a, const
     return snprintf(buf, bufsize, "{\"i\":%d,\"e\":\"%s\"}", a->index, esc_e);
 }
 
-static size_t append_args_json(char *buf, size_t bufsize, size_t pos, const CBMCall *call) {
+static size_t append_args_json(char *buf, size_t bufsize, size_t pos, CBMCall *call) {
     if (call->arg_count == 0 || pos >= bufsize - PP_ARGS_MARGIN) {
         return pos;
     }
@@ -2059,7 +2059,7 @@ static bool is_route_path_shaped(const char *val) {
     return val && val[0] == '/' && !cbm_service_pattern_is_comment_text(val);
 }
 
-static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler) {
+static const char *find_route_path_in_args(CBMCall *call, const char **out_handler) {
     *out_handler = NULL;
     /* 1. First string arg starting with / */
     if (is_route_path_shaped(call->first_string_arg)) {
@@ -2099,7 +2099,7 @@ static const char *find_route_path_in_args(const CBMCall *call, const char **out
 
 /* Build props JSON, append args, close brace, emit edge. */
 static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
-                              const char *edge_type, char *props, int n, const CBMCall *call) {
+                              const char *edge_type, char *props, int n, CBMCall *call) {
     if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
         size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
         if (call->start_line > 0 && strcmp(edge_type, "CALLS") == 0 &&
@@ -2114,7 +2114,10 @@ static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
             props[pos + SKIP_ONE] = '\0';
         }
     }
-    cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, props);
+    if (cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, edge_type, props) > 0 &&
+        strcmp(edge_type, "CALLS") == 0) {
+        call->coverage_calls_emitted = true;
+    }
 }
 
 /* Build Route node QN and properties for HTTP/async service edges. */
@@ -2144,7 +2147,7 @@ static int64_t build_service_route(cbm_gbuf_t *gbuf, const char *arg, const char
 
 /* Emit HTTP_CALLS or ASYNC_CALLS edge via Route node. */
 static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                                         const CBMCall *call, const cbm_resolution_t *res,
+                                         CBMCall *call, const cbm_resolution_t *res,
                                          cbm_svc_kind_t svc, const char *arg) {
     const char *edge_type = (svc == CBM_SVC_HTTP) ? "HTTP_CALLS" : "ASYNC_CALLS";
     const char *method =
@@ -2171,7 +2174,7 @@ static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
 
 /* Emit CONFIGURES edge. */
 static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                             const cbm_gbuf_node_t *target, const CBMCall *call,
+                             const cbm_gbuf_node_t *target, CBMCall *call,
                              const cbm_resolution_t *res, const char *arg) {
     /* emit_service_edge may be reached with target==NULL on the HTTP/ASYNC
      * external-client bypass (#523); a CONFIGURES edge needs a real target, so
@@ -2191,7 +2194,7 @@ static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
 /* Emit normal CALLS edge. */
 static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                                   const cbm_gbuf_node_t *target, const CBMCall *call,
+                                   const cbm_gbuf_node_t *target, CBMCall *call,
                                    const cbm_resolution_t *res) {
     /* A CALLS edge needs a real target; the HTTP/ASYNC external-client bypass
      * (#523) can reach emit_service_edge with target==NULL, so guard the deref. */
@@ -2210,11 +2213,11 @@ static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
 
 /* Classify a resolved call by library identity and emit the appropriate edge. */
 /* Create Route node + CALLS + HANDLES edges for a route registration call. */
-static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                                    const CBMCall *call, const char *route_path,
-                                    const char *handler_ref, const char *module_qn,
-                                    const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                                    const char **ik, const char **iv, int ic) {
+static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, CBMCall *call,
+                                    const char *route_path, const char *handler_ref,
+                                    const char *module_qn, const cbm_registry_t *registry,
+                                    const cbm_gbuf_t *main_gbuf, const char **ik, const char **iv,
+                                    int ic) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
@@ -2231,7 +2234,9 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_rp);
-    cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
+    if (cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props) > 0) {
+        call->coverage_calls_emitted = true;
+    }
     if (handler_ref && handler_ref[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(registry, handler_ref, module_qn, ik, iv, ic);
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
@@ -2299,8 +2304,7 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
 }
 
 /* Detect API paths in call arguments and create HTTP_CALLS edges. */
-static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                               const CBMCall *call) {
+static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, CBMCall *call) {
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
         /* A slash-prefixed raw expression is not a URL string. In JS/TS this
@@ -2405,7 +2409,7 @@ bool extract_grpc_service_method(const char *callee, char *service, size_t srv_s
 }
 
 /* Emit GRPC_CALLS edge via gRPC Route node. */
-static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, CBMCall *call,
                            const cbm_resolution_t *res) {
     char service[CBM_SZ_256];
     char method[CBM_SZ_256];
@@ -2442,7 +2446,7 @@ static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
 }
 
 /* Emit GRAPHQL_CALLS edge. Extract operation from first string arg if available. */
-static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, CBMCall *call,
                               const cbm_resolution_t *res) {
     const char *op = call->first_string_arg;
     if (!op || !op[0]) {
@@ -2479,7 +2483,7 @@ static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, c
 }
 
 /* Emit TRPC_CALLS edge. Extract procedure path from callee chain. */
-static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, CBMCall *call,
                            const cbm_resolution_t *res) {
     /* tRPC calls: trpc.user.getById.query() → extract "user.getById" */
     const char *callee = call->callee_name;
@@ -2522,7 +2526,7 @@ static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
  * a verb-suffix HTTP client (api.patch('/x')), broker, or route registration
  * keeps its edge; only the fabricated project CALLS edge is dropped. */
 static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                              const cbm_gbuf_node_t *target, const CBMCall *call,
+                              const cbm_gbuf_node_t *target, CBMCall *call,
                               const cbm_resolution_t *res, const char *module_qn,
                               const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                               const char **imp_keys, const char **imp_vals, int imp_count,
@@ -2779,7 +2783,7 @@ static bool lsp_idx_insert_leaf(CBMHashTable *index, CBMResolvedCall *candidate,
     return inserted;
 }
 
-static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, const CBMCall *call,
+static const CBMResolvedCall *lsp_idx_lookup(const CBMHashTable *index, CBMCall *call,
                                              bool exact_site, bool *key_built, bool *ambiguous) {
     if (key_built) {
         *key_built = false;
@@ -3171,6 +3175,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             }
             continue;
         }
+        call->coverage_candidate_qn = target_node->qualified_name;
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
@@ -3571,6 +3576,28 @@ static bool pp_has_pending_lsp_site(const CBMFileResult *result) {
     return false;
 }
 
+static CBMFileResult *resolve_load_result(resolve_ctx_t *rc, resolve_worker_state_t *ws,
+                                          int file_idx) {
+    if (ws->loaded) {
+        cbm_free_result(ws->loaded);
+        ws->loaded = NULL;
+    }
+    CBMFileResult *result = rc->result_cache[file_idx];
+    if (!result && rc->pctx && rc->pctx->spill && cbm_result_spill_has(rc->pctx->spill, file_idx)) {
+        result = cbm_result_spill_load(rc->pctx->spill, file_idx);
+        ws->loaded = result;
+        if (!result) {
+            cbm_pipeline_mark_unresolved_capture_failed(rc->pctx->pipeline);
+        }
+    }
+    return result;
+}
+
+static void resolve_capture_coverage(const resolve_ctx_t *rc, const char *rel,
+                                     const CBMFileResult *result) {
+    cbm_pipeline_record_unresolved_calls(rc->pctx ? rc->pctx->pipeline : NULL, rel, result);
+}
+
 static void resolve_worker(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
@@ -3604,16 +3631,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t _loop_t0 = extract_now_ns();
 
-        if (ws->loaded) {
-            cbm_free_result(ws->loaded);
-            ws->loaded = NULL;
-        }
-        CBMFileResult *result = rc->result_cache[file_idx];
-        if (!result && rc->pctx && rc->pctx->spill &&
-            cbm_result_spill_has(rc->pctx->spill, file_idx)) {
-            result = cbm_result_spill_load(rc->pctx->spill, file_idx);
-            ws->loaded = result;
-        }
+        CBMFileResult *result = resolve_load_result(rc, ws, file_idx);
         if (!result) {
             atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                       memory_order_relaxed);
@@ -3669,6 +3687,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
             result->rw.count == 0 && result->defs.count == 0 && result->impl_traits.count == 0 &&
             !cross_lsp_eligible) {
+            resolve_capture_coverage(rc, rel, result);
             continue;
         }
 
@@ -3816,6 +3835,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         resolve_file_semantic(rc, ws, result, module_qn, imp_keys, imp_vals, imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_semantic, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
+
+        /* The cross-file additions and actual emitted-site evidence live in
+         * this result, including when it was loaded from the spill store. */
+        resolve_capture_coverage(rc, rel, result);
 
         cbm_registry_reach_cache_end();
         cbm_registry_import_map_cache_end();

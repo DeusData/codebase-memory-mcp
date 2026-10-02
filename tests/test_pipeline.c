@@ -765,6 +765,200 @@ TEST(pipeline_adr_survives_full_reindex) {
     PASS();
 }
 
+static int pipeline_unresolved_review_case(int padding, bool spill) {
+    char tmp[256] = "/tmp/cbm_unresolved_review_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512], path[512];
+    const char *names[] = {"cliente.js", "servicio.js", "ayudante.js",
+                           "directo.js", "missing.js",  "route.js"};
+    const char *sources[] = {
+        "export function crearCliente() { function buscar(id) { return id; } return { buscar }; "
+        "}\n",
+        "export function crearServicio({ cliente }) {\n"
+        "  function procesar(id) {\n"
+        "    cliente.buscar(id); return cliente.buscar(id + 1);\n"
+        "  }\n  return { procesar };\n}\n",
+        "export function ayudante(id) { return id; }\n",
+        "import { ayudante } from './ayudante.js';\n"
+        "export function usarDirecto(id) { ayudante(id); return ayudante(id + 1); }\n",
+        "import { absent } from './ayudante.js';\n"
+        "export function missing(id) { return absent(id); }\n",
+        "export function setup({ app }) { app.get('/x', handler); }\n"
+        "function handler() { return 1; }\n"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmp, names[i]);
+        FILE *f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fputs(sources[i], f);
+        fclose(f);
+    }
+    for (int i = 0; i < padding; i++) {
+        snprintf(path, sizeof(path), "%s/pad%d.js", tmp, i);
+        FILE *f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "export function pad%d() { return %d; }\n", i, i);
+        fclose(f);
+    }
+    snprintf(db, sizeof(db), "%s/index.db", tmp);
+    if (spill)
+        cbm_setenv("CBM_MEM_SPILL", "1", 1);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    if (spill)
+        cbm_unsetenv("CBM_MEM_SPILL");
+    ASSERT_EQ(rc, 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *st = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(st);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "directo.js", &rows, &count), CBM_STORE_OK);
+    for (int i = 0; i < count; i++)
+        ASSERT_FALSE(strcmp(rows[i].kind, "unresolved_calls") == 0);
+    cbm_store_free_coverage(rows, count);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "route.js", &rows, &count), CBM_STORE_OK);
+    for (int i = 0; i < count; i++)
+        ASSERT_FALSE(strcmp(rows[i].kind, "unresolved_calls") == 0);
+    cbm_store_free_coverage(rows, count);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    yyjson_doc *doc = yyjson_read(rows[0].detail, strlen(rows[0].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *sites = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_arr_size(sites), 2);
+    for (size_t i = 0; i < 2; i++) {
+        yyjson_val *site = yyjson_arr_get(sites, i);
+        const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
+        ASSERT_NOT_NULL(caller);
+        ASSERT_NOT_NULL(strstr(caller, ".procesar"));
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(site, "line")), 3);
+        ASSERT_NOT_NULL(yyjson_get_str(yyjson_obj_get(site, "candidate")));
+    }
+    yyjson_doc_free(doc);
+    cbm_store_free_coverage(rows, count);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "missing.js", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    doc = yyjson_read(rows[0].detail, strlen(rows[0].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_arr_size(yyjson_doc_get_root(doc)), 1);
+    yyjson_doc_free(doc);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+    rm_rf(tmp);
+    PASS();
+}
+
+TEST(pipeline_unresolved_review_sequential) {
+    return pipeline_unresolved_review_case(0, false);
+}
+TEST(pipeline_unresolved_review_parallel) {
+    return pipeline_unresolved_review_case(55, false);
+}
+TEST(pipeline_unresolved_review_spill) {
+    return pipeline_unresolved_review_case(55, true);
+}
+
+TEST(pipeline_records_unresolved_injected_call_sites) {
+    char tmp[256] = "/tmp/cbm_unresolved_calls_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db_path[512], path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    snprintf(path, sizeof(path), "%s/cliente.js", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export function crearCliente() { function buscar(id) { return id; } "
+          "return { buscar }; }\n",
+          f);
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/servicio.js", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export function crearServicio({ cliente }) {\n"
+          "  function procesar(id) { return cliente.buscar(id); }\n"
+          "  return { procesar };\n}\n",
+          f);
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    bool found = false;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(rows[i].kind, "unresolved_calls") == 0 && strstr(rows[i].detail, "buscar") &&
+            strstr(rows[i].detail, "method_not_in_registry")) {
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+
+    /* Reindexing another file must retain this file's diagnostic. */
+    snprintf(path, sizeof(path), "%s/cliente.js", tmp);
+    f = fopen(path, "a");
+    ASSERT_NOT_NULL(f);
+    fputs("\n// unrelated edit\n", f);
+    fclose(f);
+    p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    found = false;
+    for (int i = 0; i < count; i++) {
+        found |= strcmp(rows[i].kind, "unresolved_calls") == 0;
+    }
+    ASSERT_TRUE(found);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+
+    /* The edited file must lose its old diagnostic on the next generation. */
+    snprintf(path, sizeof(path), "%s/servicio.js", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs(
+        "export function crearServicio({ cliente }) { return { procesar(id) { return id; } }; }\n",
+        f);
+    fclose(f);
+    p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    for (int i = 0; i < count; i++) {
+        ASSERT_FALSE(strcmp(rows[i].kind, "unresolved_calls") == 0);
+    }
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_structure_edges) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -16308,6 +16502,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
+    RUN_TEST(pipeline_records_unresolved_injected_call_sites);
+    RUN_TEST(pipeline_unresolved_review_sequential);
+    RUN_TEST(pipeline_unresolved_review_parallel);
+    RUN_TEST(pipeline_unresolved_review_spill);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
