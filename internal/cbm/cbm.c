@@ -1284,24 +1284,63 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
     return true;
 }
 
+/* The two walks below visit, in source order, every ERROR or MISSING node that
+ * is top-most in its chain: they step into a child that merely contains an
+ * error and never into an ERROR subtree. That descent follows the nesting of
+ * the construct that failed — every ancestor of the failing node carries
+ * ts_node_has_error — so a recursive walk used one stack frame per nesting
+ * level of the indexed file, and a deep enough nest ran the worker thread out
+ * of stack. The cursor keeps that path on the heap. The nodes visited and
+ * their order are those of the child-index loop it replaced: the cursor
+ * stops on exactly the visible children ts_node_child enumerates. */
+typedef void (*cbm_error_node_fn)(TSNode node, void *arg);
+
+static void cbm_walk_error_nodes(TSNode root, const char *source, int source_len,
+                                 cbm_error_node_fn fn, void *arg) {
+    /* The thread's reusable cursor: the walk completes before anything else on
+     * this thread can ask for it, and the callbacks never do. */
+    TSTreeCursor *cursor = cbm_thread_cursor(root);
+    if (!ts_tree_cursor_goto_first_child(cursor)) {
+        return;
+    }
+    int depth = 0; /* 0 while on a direct child of root */
+    for (;;) {
+        TSNode c = ts_tree_cursor_current_node(cursor);
+        bool descend = false;
+        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
+            /* An absent final newline only means nothing was dropped. Anything
+             * else is the top-most region; do not descend. */
+            if (!cbm_is_eof_terminator_miss(c, source, source_len)) {
+                fn(c, arg);
+            }
+        } else if (ts_node_has_error(c)) {
+            descend = true;
+        }
+        if (descend && ts_tree_cursor_goto_first_child(cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(cursor)) {
+            if (depth == 0) {
+                return;
+            }
+            (void)ts_tree_cursor_goto_parent(cursor);
+            depth--;
+        }
+    }
+}
+
 /* Walks to the end even after the cap is full, so `dropped` is the real number
  * of ranges lost rather than a lower bound. This costs little: the walk never
  * descends into an ERROR subtree — it records the top-most node and moves on —
  * so it only visits the spine of nodes that contain an error, plus one level. */
+static void cbm_collect_error_region(TSNode c, void *arg) {
+    cbm_error_regions_push((cbm_error_regions_t *)arg, c);
+}
+
 static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
                                       int source_len) {
-    uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k; i++) {
-        TSNode c = ts_node_child(n, i);
-        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
-                continue; /* absent final newline only — nothing was dropped */
-            }
-            cbm_error_regions_push(acc, c); /* top-most region; do not descend */
-        } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc, source, source_len);
-        }
-    }
+    cbm_walk_error_nodes(n, source, source_len, cbm_collect_error_region, acc);
 }
 
 /* ── Phase 2 line map: what the preprocessed parse already explained ───────
@@ -1408,24 +1447,24 @@ static void cbm_mark_no_code_lines(const char *src, int src_len, uint8_t *map,
  * Step 2 walks the expanded lines and, for each one that is unmarked, belongs
  * to the file itself (not an included header) and maps back to a real
  * original line, records that original line as parsed. */
+typedef struct {
+    uint8_t *rows;
+    uint32_t row_count;
+} cbm_pp_error_rows_t;
+
+static void cbm_mark_pp_error_row(TSNode c, void *arg) {
+    cbm_pp_error_rows_t *marks = (cbm_pp_error_rows_t *)arg;
+    uint32_t s = ts_node_start_point(c).row + 1;
+    uint32_t e = ts_node_end_point(c).row + 1;
+    for (uint32_t r = s; r <= e && r <= marks->row_count; r++) {
+        marks->rows[r] = 1;
+    }
+}
+
 static void cbm_mark_pp_error_rows(TSNode n, uint8_t *rows, uint32_t row_count, const char *src,
                                    int src_len) {
-    uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k; i++) {
-        TSNode c = ts_node_child(n, i);
-        if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, src, src_len)) {
-                continue; /* absent final newline only — nothing was dropped */
-            }
-            uint32_t s = ts_node_start_point(c).row + 1;
-            uint32_t e = ts_node_end_point(c).row + 1;
-            for (uint32_t r = s; r <= e && r <= row_count; r++) {
-                rows[r] = 1;
-            }
-        } else if (ts_node_has_error(c)) {
-            cbm_mark_pp_error_rows(c, rows, row_count, src, src_len);
-        }
-    }
+    cbm_pp_error_rows_t marks = {rows, row_count};
+    cbm_walk_error_nodes(n, src, src_len, cbm_mark_pp_error_row, &marks);
 }
 
 /* Recovery subtraction (#963): tree-sitter error recovery plus the

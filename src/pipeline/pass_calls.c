@@ -486,8 +486,14 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
         /* Add rather than subtract: pos is unsigned, so `cap - pos - PAIR_LEN`
          * wraps once pos reaches cap - PAIR_LEN and stops bounding the memcpy
          * below. The closing write at the end of this function already guards
-         * additively; match it. */
-        if (n <= 0 || pos + (size_t)n + PAIR_LEN >= cap) {
+         * additively; match it.
+         *
+         * snprintf reports the untruncated length, so an argument `one` could
+         * not hold whole is never copied out of it: copying n bytes would read
+         * past the local and plant its terminator inside the props text. It
+         * ends the array exactly like an argument the props buffer cannot
+         * take. */
+        if (n <= 0 || (size_t)n >= sizeof(one) || pos + (size_t)n + PAIR_LEN >= cap) {
             break; /* not enough room — close the array with what fits */
         }
         memcpy(props + pos, one, (size_t)n);
@@ -498,6 +504,11 @@ static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
         props[pos++] = '}';
         props[pos] = '\0';
     }
+}
+
+/* Test seam for the formatter above. Not part of the public API. */
+void cbm_pipeline_calls_append_args_for_tests(char *props, size_t cap, const CBMCall *call) {
+    calls_append_args(props, cap, call);
 }
 
 static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
