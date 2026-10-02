@@ -824,7 +824,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 4 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
