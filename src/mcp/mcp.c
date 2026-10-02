@@ -786,8 +786,8 @@ static const tool_def_t TOOLS[] = {
      "\"module_cursor\":{\"type\":\"string\"},"
      "\"max_output_tokens\":{\"type\":\"integer\",\"default\":3200,\"minimum\":128,"
      "\"maximum\":1000000,\"description\":\"Sizing hint; hard ceiling is 4 UTF-8 bytes/token.\"},"
-     "\"base_branch\":{\"type\":"
-     "\"string\",\"default\":\"main\"},\"since\":{\"type\":\"string\"},"
+     "\"base_branch\":{\"type\":\"string\",\"description\":\"Default: origin/HEAD, else "
+     "main, else master, else the upstream.\"},\"since\":{\"type\":\"string\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\"}},"
      "\"required\":"
      "[\"project\"]}"},
@@ -16021,6 +16021,92 @@ static bool detect_valid_object_id(const char *value) {
     return true;
 }
 
+/* Run one contained git query and return its first output line. False when
+ * the command fails, is cancelled, prints nothing, or prints a value that
+ * cannot be spliced back into the later git commands safely. */
+static bool detect_git_first_line(cbm_mcp_server_t *srv, const char *command, char *out,
+                                  size_t out_size) {
+    out[0] = '\0';
+    char output_path[CBM_SZ_2K] = {0};
+    cbm_proc_result_t result = {0};
+    int run = mcp_run_shell_command_cancellable(srv, command, output_path, &result);
+    bool ok = run == 0 && result.exit_code == 0 && !result.cancellation_requested &&
+              !mcp_request_cancelled(srv);
+    FILE *fp = ok ? cbm_fopen(output_path, "rb") : NULL;
+    bool read = fp && fgets(out, (int)out_size, fp) != NULL;
+    if (fp) {
+        (void)fclose(fp);
+    }
+    if (output_path[0]) {
+        (void)cbm_unlink(output_path);
+    }
+    size_t length = read ? strlen(out) : 0;
+    /* A line that filled the buffer without its newline was truncated. */
+    bool complete = length > 0 && out[length - 1] == '\n';
+    while (length > 0 && (out[length - 1] == '\n' || out[length - 1] == '\r')) {
+        out[--length] = '\0';
+    }
+    ok = ok && complete && length > 0 && out[0] != '-' && cbm_validate_shell_arg(out) &&
+         validate_windows_cmd_interpolation_arg(out);
+    if (!ok) {
+        out[0] = '\0';
+    }
+    return ok;
+}
+
+/* #1357: without base_branch, diff against the repository's default branch
+ * rather than a literal "main" that trunk/master/develop repositories do not
+ * have. Order: origin/HEAD (what the clone calls the default), a local main,
+ * a local master, then the current branch's upstream. main and master come
+ * before the upstream on purpose: a pushed feature branch tracks its own
+ * remote twin, and diffing against that would silently shrink the impact
+ * analysis to unpushed commits. Nothing resolves -> false, out = "main", and
+ * the caller reports that ref as the one it tried. */
+static bool detect_default_base(cbm_mcp_server_t *srv, const char *root_path, char *out,
+                                size_t out_size) {
+#ifdef _WIN32
+#define DETECT_GIT_Q "\""
+#define DETECT_GIT_NULL "2>NUL"
+#else
+#define DETECT_GIT_Q "'"
+#define DETECT_GIT_NULL "2>/dev/null"
+#endif
+    char command[CBM_SZ_2K];
+    char line[CBM_SZ_1K];
+    snprintf(command, sizeof(command),
+             "git -C " DETECT_GIT_Q "%s" DETECT_GIT_Q
+             " symbolic-ref -q --short refs/remotes/origin/HEAD " DETECT_GIT_NULL,
+             root_path);
+    if (detect_git_first_line(srv, command, line, sizeof(line))) {
+        snprintf(out, out_size, "%s", line);
+        return true;
+    }
+    static const char *const local_defaults[] = {"main", "master"};
+    for (size_t i = 0; i < sizeof(local_defaults) / sizeof(local_defaults[0]); i++) {
+        snprintf(command, sizeof(command),
+                 "git -C " DETECT_GIT_Q "%s" DETECT_GIT_Q " rev-parse -q --verify " DETECT_GIT_Q
+                 "refs/heads/%s^{commit}" DETECT_GIT_Q " " DETECT_GIT_NULL,
+                 root_path, local_defaults[i]);
+        if (detect_git_first_line(srv, command, line, sizeof(line))) {
+            snprintf(out, out_size, "%s", local_defaults[i]);
+            return true;
+        }
+    }
+    snprintf(command, sizeof(command),
+             "git -C " DETECT_GIT_Q "%s" DETECT_GIT_Q
+             " rev-parse -q --abbrev-ref --symbolic-full-name " DETECT_GIT_Q
+             "@{upstream}" DETECT_GIT_Q " " DETECT_GIT_NULL,
+             root_path);
+    if (detect_git_first_line(srv, command, line, sizeof(line))) {
+        snprintf(out, out_size, "%s", line);
+        return true;
+    }
+#undef DETECT_GIT_Q
+#undef DETECT_GIT_NULL
+    snprintf(out, out_size, "%s", "main");
+    return false;
+}
+
 typedef struct {
     char stream;       /* c=changed files, i=impacted symbols, m=module rollup */
     char snapshot[33]; /* first 128 bits of the SHA-256 live-state fingerprint */
@@ -16267,17 +16353,17 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     }
     free(since); /* no-op after the swap (since is NULL); frees it otherwise */
 
-    if (!base_branch) {
-        base_branch = heap_strdup("main");
-    }
+    /* No base given: resolved from the repository after the project root is
+     * known (#1357). An explicit base_branch/since is used as given. */
+    bool base_defaulted = base_branch == NULL;
 
     /* Reject shell metacharacters, and a leading '-', in the user-supplied
      * branch name. base_branch is spliced into `git diff --name-only
      * "<base>"...HEAD`; a value starting with '-' would be read by git as an
      * option rather than a ref (e.g. `--output=<path>` writes the diff to an
      * arbitrary file). A real git ref never begins with '-'. */
-    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-' ||
-        !validate_windows_cmd_interpolation_arg(base_branch)) {
+    if (base_branch && (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-' ||
+                        !validate_windows_cmd_interpolation_arg(base_branch))) {
         free(project);
         free(base_branch);
         free(scope);
@@ -16295,13 +16381,24 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return res;
     }
 
-    if (!validate_search_path_arg(root_path) ||
-        !validate_windows_cmd_interpolation_arg(root_path)) {
+    /* The default base is looked up only once root_path is known to be safe
+     * to splice into the git command line. */
+    bool root_ok =
+        validate_search_path_arg(root_path) && validate_windows_cmd_interpolation_arg(root_path);
+    bool default_base_found = true;
+    if (root_ok && base_defaulted) {
+        char default_base[CBM_SZ_1K];
+        default_base_found =
+            detect_default_base(srv, root_path, default_base, sizeof(default_base));
+        base_branch = heap_strdup(default_base);
+    }
+    if (!root_ok || !base_branch) {
         free(root_path);
         free(project);
         free(base_branch);
         free(scope);
-        return cbm_mcp_text_result("project path contains invalid characters", true);
+        return cbm_mcp_text_result(
+            root_ok ? "out of memory" : "project path contains invalid characters", true);
     }
 
     /* Every detect snapshot and cursor is generation-bound. Validate the
@@ -16391,6 +16488,25 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     }
     if (resolve_cancelled || resolve_run != 0 || resolve_result.exit_code != 0 || resolve_oom ||
         !head_oid[0] || !base_oid[0] || !git_prefix_valid) {
+        /* Name the ref that was tried: a bare "not a commit" left callers of
+         * the implicit default guessing which base was meant (#1357). */
+        char resolve_error[CBM_SZ_2K];
+        if (!base_defaulted) {
+            snprintf(resolve_error, sizeof(resolve_error),
+                     "git revision resolution failed: base_branch \"%s\" or HEAD is not a commit",
+                     base_branch);
+        } else if (!default_base_found) {
+            snprintf(resolve_error, sizeof(resolve_error),
+                     "git revision resolution failed: no default base found (tried origin/HEAD, "
+                     "main, master and the upstream; fell back to \"%s\"), or HEAD is not a "
+                     "commit; pass base_branch",
+                     base_branch);
+        } else {
+            snprintf(resolve_error, sizeof(resolve_error),
+                     "git revision resolution failed: default base \"%s\" or HEAD is not a "
+                     "commit; pass base_branch",
+                     base_branch);
+        }
         free(direction);
         free(root_path);
         free(project);
@@ -16409,8 +16525,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 "worktree could not be determined",
                 true);
         }
-        return cbm_mcp_text_result(
-            "git revision resolution failed: base_branch or HEAD is not a commit", true);
+        return cbm_mcp_text_result(resolve_error, true);
     }
 
     char merge_base[65] = "";

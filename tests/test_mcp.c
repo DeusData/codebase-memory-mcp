@@ -14317,6 +14317,155 @@ TEST(tool_detect_changes_invalid_base_is_an_error) {
     PASS();
 }
 
+/* #1357: detect_changes without base_branch must diff against the
+ * repository's default branch, not a literal "main". Each fixture is a real
+ * git repository: a base commit on the default branch, then a feature branch
+ * with one committed file, so the correct base yields exactly that file. */
+typedef struct {
+    char repo[CBM_SZ_4K];
+    char cache[CBM_SZ_4K];
+    char base[CBM_SZ_256];
+    bool is_error;
+    bool feature_listed;
+    char error_text[CBM_SZ_1K];
+} detect_default_base_probe_t;
+
+static bool detect_default_base_repo(const char *repo, const char *default_branch,
+                                     bool set_origin_head) {
+    char head_ref[CBM_SZ_256];
+    snprintf(head_ref, sizeof(head_ref), "refs/heads/%s", default_branch);
+    char remote_ref[CBM_SZ_256];
+    snprintf(remote_ref, sizeof(remote_ref), "refs/remotes/origin/%s", default_branch);
+    char base_file[CBM_SZ_4K];
+    char feature_file[CBM_SZ_4K];
+    snprintf(base_file, sizeof(base_file), "%s/base.c", repo);
+    snprintf(feature_file, sizeof(feature_file), "%s/feature.c", repo);
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const head_args[] = {"symbolic-ref", "HEAD", head_ref, NULL};
+    const char *const add_base_args[] = {"add", "base.c", NULL};
+    const char *const add_feature_args[] = {"add", "feature.c", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    const char *const remote_args[] = {"update-ref", remote_ref, "HEAD", NULL};
+    const char *const origin_head_args[] = {"symbolic-ref", "refs/remotes/origin/HEAD", remote_ref,
+                                            NULL};
+    const char *const feature_args[] = {"checkout", "-q", "-b", "feature", NULL};
+    bool ok = mcp_test_git(repo, init_args) == 0 && mcp_test_git(repo, head_args) == 0 &&
+              th_write_file(base_file, "int base_value = 1;\n") == 0 &&
+              mcp_test_git(repo, add_base_args) == 0 && mcp_test_git(repo, commit_args) == 0;
+    if (ok && set_origin_head) {
+        ok = mcp_test_git(repo, remote_args) == 0 && mcp_test_git(repo, origin_head_args) == 0;
+    }
+    return ok && mcp_test_git(repo, feature_args) == 0 &&
+           th_write_file(feature_file, "int feature_value = 2;\n") == 0 &&
+           mcp_test_git(repo, add_feature_args) == 0 && mcp_test_git(repo, commit_args) == 0;
+}
+
+static bool detect_default_base_run(const char *default_branch, bool set_origin_head,
+                                    const char *base_arg, detect_default_base_probe_t *probe) {
+    memset(probe, 0, sizeof(*probe));
+    snprintf(probe->repo, sizeof(probe->repo), "%s/cbm-detect-default-XXXXXX", cbm_tmpdir());
+    snprintf(probe->cache, sizeof(probe->cache), "%s/cbm-detect-default-cache-XXXXXX",
+             cbm_tmpdir());
+    if (!cbm_mkdtemp(probe->repo) || !cbm_mkdtemp(probe->cache) ||
+        !detect_default_base_repo(probe->repo, default_branch, set_origin_head)) {
+        return false;
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    bool ok = cbm_setenv("CBM_CACHE_DIR", probe->cache, 1) == 0;
+    cbm_mcp_server_t *srv = ok ? cbm_mcp_server_new(NULL) : NULL;
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    const char *project = "detect-default-base-project";
+    ok = store && cbm_store_upsert_project(store, project, probe->repo) == CBM_STORE_OK;
+    char args[CBM_SZ_1K];
+    if (base_arg) {
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"base_branch\":\"%s\",\"scope\":\"files\","
+                 "\"format\":\"json\"}",
+                 project, base_arg);
+    } else {
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"scope\":\"files\",\"format\":\"json\"}",
+                 project);
+    }
+    if (ok) {
+        cbm_mcp_server_set_project(srv, project);
+    }
+    char *response = ok ? cbm_mcp_handle_tool(srv, "detect_changes", args) : NULL;
+    char *inner = response ? extract_text_content(response) : NULL;
+    probe->is_error = response && response_contains_json_fragment(response, "\"isError\":true");
+    if (inner && probe->is_error) {
+        snprintf(probe->error_text, sizeof(probe->error_text), "%s", inner);
+    }
+    yyjson_doc *doc = inner && !probe->is_error ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *base = root ? yyjson_get_str(yyjson_obj_get(root, "base")) : NULL;
+    if (base) {
+        snprintf(probe->base, sizeof(probe->base), "%s", base);
+    }
+    yyjson_val *changed = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    size_t index;
+    size_t count;
+    yyjson_val *entry;
+    yyjson_arr_foreach(changed, index, count, entry) {
+        if (yyjson_is_str(entry) && strcmp(yyjson_get_str(entry), "feature.c") == 0) {
+            probe->feature_listed = true;
+        }
+    }
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    if (srv) {
+        cbm_mcp_server_free(srv);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    bool cleaned = th_rmtree(probe->cache) == 0 && th_rmtree(probe->repo) == 0;
+    return ok && cleaned;
+}
+
+TEST(detect_changes_default_base_follows_origin_head_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("trunk", true, NULL, &probe));
+    ASSERT_FALSE(probe.is_error);
+    ASSERT_STR_EQ(probe.base, "origin/trunk");
+    ASSERT_TRUE(probe.feature_listed);
+    PASS();
+}
+
+TEST(detect_changes_default_base_falls_back_to_master_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("master", false, NULL, &probe));
+    ASSERT_FALSE(probe.is_error);
+    ASSERT_STR_EQ(probe.base, "master");
+    ASSERT_TRUE(probe.feature_listed);
+    PASS();
+}
+
+TEST(detect_changes_explicit_base_is_used_as_given_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("trunk", true, "trunk", &probe));
+    ASSERT_FALSE(probe.is_error);
+    ASSERT_STR_EQ(probe.base, "trunk");
+    ASSERT_TRUE(probe.feature_listed);
+    PASS();
+}
+
+TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357) {
+    detect_default_base_probe_t probe;
+    ASSERT_TRUE(detect_default_base_run("develop", false, NULL, &probe));
+    ASSERT_TRUE(probe.is_error);
+    ASSERT_NOT_NULL(strstr(probe.error_text, "\"main\""));
+    ASSERT_NOT_NULL(strstr(probe.error_text, "origin/HEAD"));
+    PASS();
+}
+
 TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed) {
     char repo[CBM_SZ_4K];
     snprintf(repo, sizeof(repo), "%s/cbm-detect-utf8-path-XXXXXX", cbm_tmpdir());
@@ -21289,6 +21438,10 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
     RUN_TEST(tool_detect_changes_not_found_rich_error);
     RUN_TEST(tool_detect_changes_invalid_base_is_an_error);
+    RUN_TEST(detect_changes_default_base_follows_origin_head_issue1357);
+    RUN_TEST(detect_changes_default_base_falls_back_to_master_issue1357);
+    RUN_TEST(detect_changes_explicit_base_is_used_as_given_issue1357);
+    RUN_TEST(detect_changes_unresolvable_default_names_tried_ref_issue1357);
     RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
     RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
     RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
