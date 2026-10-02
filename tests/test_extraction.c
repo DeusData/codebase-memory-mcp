@@ -4365,6 +4365,38 @@ static const CBMDefinition *find_def_by_name(CBMFileResult *r, const char *name)
     return NULL;
 }
 
+/* Grouped `var ( ... )` nests its specs under var_spec_list; they were skipped,
+ * so only single-spec vars and const groups got a Variable. */
+TEST(go_grouped_var_specs_mint_variables) {
+    CBMFileResult *r = extract("package main\n" /* 1 */
+                               "var (\n"        /* 2 */
+                               "\tA = 1\n"      /* 3 */
+                               "\tB = \"x\"\n"  /* 4 */
+                               ")\n"            /* 5 */
+                               "const (\n"      /* 6 */
+                               "\tC = 1\n"      /* 7 */
+                               "\tD = 2\n"      /* 8 */
+                               ")\n"            /* 9 */
+                               "var E = 3\n",   /* 10 */
+                               CBM_LANG_GO, "t", "vars.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const struct {
+        const char *name;
+        int line;
+    } want[] = {{"A", 3}, {"B", 4}, {"C", 7}, {"D", 8}, {"E", 10}};
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        const CBMDefinition *d = find_def_by_name(r, want[i].name);
+        ASSERT_NOT_NULL(d);
+        ASSERT_STR_EQ(d->label, "Variable");
+        ASSERT_EQ(d->start_line, want[i].line);
+        ASSERT_EQ(d->end_line, want[i].line);
+    }
+    ASSERT_EQ(count_defs_with_label(r, "Variable"), 5);
+    cbm_free_result(r);
+    PASS();
+}
+
 static int decorators_contain(const CBMDefinition *d, const char *needle) {
     if (!d || !d->decorators) {
         return 0;
@@ -8980,6 +9012,7 @@ SUITE(extraction) {
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
     RUN_TEST(go_interface);
+    RUN_TEST(go_grouped_var_specs_mint_variables);
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
     RUN_TEST(c_function_return_type_preserves_pointer_and_qualifier);
