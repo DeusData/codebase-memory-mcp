@@ -609,6 +609,19 @@ TEST(project_name_encodes_unicode_segments_issue571) {
     PASS();
 }
 
+TEST(project_name_unicode_segments_do_not_collide_issue571) {
+    char *first = cbm_project_name_from_path("/Users/dev/\xe5\xbc\x80\xe5\x8f\x91");
+    char *second = cbm_project_name_from_path("/Users/dev/\xe5\x90\x8e\xe7\xab\xaf");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_NEQ(first, second);
+    ASSERT_TRUE(cbm_validate_project_name(first));
+    ASSERT_TRUE(cbm_validate_project_name(second));
+    free(first);
+    free(second);
+    PASS();
+}
+
 /* issue #624: #571 preserves non-ASCII path segments by hex-encoding each byte
  * (1 byte -> 2 hex chars), so a DEEP non-ASCII path triples in length and can
  * blow past the filesystem's 255-byte filename-component limit. Then
@@ -780,6 +793,7 @@ SUITE(fqn) {
     RUN_TEST(project_name_deep_path);
     RUN_TEST(project_name_always_validator_safe_issue349);
     RUN_TEST(project_name_encodes_unicode_segments_issue571);
+    RUN_TEST(project_name_unicode_segments_do_not_collide_issue571);
     RUN_TEST(project_name_length_capped_issue624);
     RUN_TEST(project_name_colon_only);
     RUN_TEST(project_name_backslash_only);
