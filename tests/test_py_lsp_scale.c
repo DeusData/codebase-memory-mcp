@@ -111,6 +111,72 @@ TEST(pylsp_scale_linear_growth) {
     PASS();
 }
 
+/* Time cbm_py_build_cross_registry over n classes, each followed by two
+ * methods (extraction order): every method probes the registry for its
+ * receiver while the registry is still being built. */
+static double measure_cross_registry(int n_classes, int *out_types) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    int n_defs = n_classes * 3;
+    CBMLSPDef *defs = (CBMLSPDef *)cbm_arena_calloc(&arena, (size_t)n_defs * sizeof(*defs));
+    if (!defs) {
+        cbm_arena_destroy(&arena);
+        return -1.0;
+    }
+    for (int i = 0; i < n_classes; i++) {
+        CBMLSPDef *cls = &defs[i * 3];
+        cls->qualified_name = cbm_arena_sprintf(&arena, "scale.mod.Cls%d", i);
+        cls->short_name = cls->qualified_name + strlen("scale.mod.");
+        cls->label = "Class";
+        cls->def_module_qn = "scale.mod";
+        cls->lang = CBM_LANG_PYTHON;
+        for (int j = 1; j <= 2; j++) {
+            CBMLSPDef *m = &defs[i * 3 + j];
+            m->qualified_name = cbm_arena_sprintf(&arena, "%s.m%d", cls->qualified_name, j);
+            m->short_name = j == 1 ? "m1" : "m2";
+            m->label = "Method";
+            m->receiver_type = cls->qualified_name;
+            m->def_module_qn = "scale.mod";
+            m->lang = CBM_LANG_PYTHON;
+        }
+    }
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, n_defs);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (out_types)
+        *out_types = reg ? reg->type_count : -1;
+    cbm_arena_destroy(&arena);
+    return elapsed_ms(t0, t1);
+}
+
+/* The shared build registers defs one at a time into an unfinalized registry;
+ * a receiver probe that scans every type registered so far makes the build
+ * O(methods x types). 16x input: linear ~16x time, quadratic well over 100x. */
+TEST(pylsp_scale_cross_registry_build_linear) {
+    int ty_small = 0, ty_large = 0;
+    /* Best of three for the small size: it is short enough for host noise. */
+    double t_small = measure_cross_registry(1000, &ty_small);
+    for (int k = 0; k < 2; k++) {
+        double t = measure_cross_registry(1000, NULL);
+        if (t >= 0.0 && t < t_small)
+            t_small = t;
+    }
+    double t_large = measure_cross_registry(16000, &ty_large);
+    printf("    cross registry: 1000 classes=%.1fms (types=%d)  16000 classes=%.1fms "
+           "(types=%d)\n",
+           t_small, ty_small, t_large, ty_large);
+    ASSERT(t_small >= 0.0 && t_large >= 0.0);
+    ASSERT_EQ(ty_large - ty_small, 15000);
+    if (t_small > 0.5) {
+        double ratio = t_large / t_small;
+        printf("    cross registry ratio 16000/1000: %.1fx (linear ~16x)\n", ratio);
+        ASSERT(ratio < 48.0);
+    }
+    PASS();
+}
+
 SUITE(py_lsp_scale) {
     RUN_TEST(pylsp_scale_linear_growth);
+    RUN_TEST(pylsp_scale_cross_registry_build_linear);
 }
