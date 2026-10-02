@@ -1349,6 +1349,15 @@ static char *application_job_failure_response(const cbm_index_worker_result_t *r
         (void)snprintf(message, sizeof(message),
                        "index worker containment failed (%s); inspect log: %s",
                        cbm_proc_outcome_str(result->outcome), log_path ? log_path : "unavailable");
+    } else if (result && result->response_missing) {
+        /* #1300: name the silent clean exit, where it stopped, and the log. */
+        const char *log = log_path                ? log_path
+                          : result->worker_log[0] ? result->worker_log
+                                                  : "unavailable";
+        (void)snprintf(message, sizeof(message),
+                       "index worker exited cleanly (exit 0) without writing a response; the "
+                       "index was not published; last phase reached: %s; inspect log: %s",
+                       result->last_phase[0] ? result->last_phase : "unknown", log);
     } else if (result) {
         (void)snprintf(message, sizeof(message),
                        "index worker ended with %s (exit=%d, signal=%d); inspect log: %s",

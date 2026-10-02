@@ -10870,6 +10870,44 @@ int cbm_index_restart_cap_for_testing(void) {
     return index_restart_cap();
 }
 
+char *cbm_mcp_index_worker_no_response_failure(const char *args,
+                                               const cbm_index_worker_result_t *worker_result) {
+    const char *phase =
+        worker_result && worker_result->last_phase[0] ? worker_result->last_phase : "unknown";
+    const char *log =
+        worker_result && worker_result->worker_log[0] ? worker_result->worker_log : "unavailable";
+    /* Borrow repo_path from a parsed view and write into a stack buffer: no
+     * raw heap strings to hand back (memory-core ratchet). */
+    yyjson_doc *args_doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    const char *repo_path =
+        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(args_doc), "repo_path"));
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(CBM_PROC_CLEAN));
+    yyjson_mut_obj_add_str(doc, root, "reason", "no_response");
+    yyjson_mut_obj_add_strcpy(doc, root, "last_phase", phase);
+    yyjson_mut_obj_add_strcpy(doc, root, "worker_log", log);
+    char hint[CBM_SZ_1K];
+    (void)snprintf(hint, sizeof(hint),
+                   "Indexing worker exited cleanly (exit 0) without writing a response; the "
+                   "index was not published. Last phase reached: %s. Inspect the worker log: %s",
+                   phase, log);
+    yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    yyjson_doc_free(args_doc);
+    char json[CBM_SZ_16K];
+    bool written = yy_mut_normalize_output_text(doc, root, true) &&
+                   yyjson_mut_write_buf(json, sizeof(json), doc, 0, NULL) > 0;
+    yyjson_mut_doc_free(doc);
+    /* The fields are bounded (hint 1 KiB, log 4 KiB, phase 128 B), so the
+     * plain hint is only the fallback for a pathological repo_path. */
+    return cbm_mcp_text_result(written ? json : hint, true);
+}
+
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     invalidate_cached_store(srv);
 
@@ -10881,6 +10919,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     cbm_mcp_supervised_result_disposition_t disposition =
         cbm_mcp_supervised_result_disposition(rc, &wr);
 
+    if (wr.response_missing) {
+        /* #1300: a clean exit without a response is a named failure. */
+        char *failure = cbm_mcp_index_worker_no_response_failure(args, &wr);
+        cbm_index_worker_result_free(&wr);
+        invalidate_cached_store(srv);
+        return failure;
+    }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
         cbm_proc_outcome_t outcome = wr.outcome;
         cbm_index_worker_result_free(&wr);
@@ -10949,6 +10994,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
             srv ? &srv->pipeline_cancel_requested : NULL, &wr2);
         cbm_mcp_supervised_result_disposition_t recovery_disposition =
             cbm_mcp_supervised_result_disposition(rc2, &wr2);
+        if (wr2.response_missing) {
+            /* #1300: a recovery run that exits cleanly without a response is
+             * reported as such, not as a failed recovery start. */
+            resp = cbm_mcp_index_worker_no_response_failure(args, &wr2);
+            cbm_index_worker_result_free(&wr2);
+            break;
+        }
         if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
             /* Keep the original worker failure if recovery setup fails. */
             cbm_log_error("index.supervisor.recovery_start_failed", "original_outcome",

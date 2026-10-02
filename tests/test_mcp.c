@@ -18635,6 +18635,45 @@ TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery) {
     PASS();
 }
 
+/* #1300: a clean worker exit without a response is never a success, and its
+ * error response names the reason, the last phase and the worker log. */
+TEST(index_supervisor_clean_exit_without_response_response_issue1300) {
+    cbm_index_worker_result_t result = {
+        .outcome = CBM_PROC_CLEAN,
+        .exit_code = 0,
+        .tree_quiesced = true,
+        .response_missing = true,
+    };
+    (void)snprintf(result.last_phase, sizeof(result.last_phase), "%s", "incremental.edge_snapshot");
+    (void)snprintf(result.worker_log, sizeof(result.worker_log), "%s",
+                   "/cache/logs/.worker-log-abc123");
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_FALLBACK);
+
+    char *response = cbm_mcp_index_worker_no_response_failure(
+        "{\"repo_path\":\"/work/repo\",\"mode\":\"full\"}", &result);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"isError\":true"));
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"status\":\"error\""));
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"reason\":\"no_response\""));
+    ASSERT_TRUE(
+        response_contains_json_fragment(response, "\"last_phase\":\"incremental.edge_snapshot\""));
+    ASSERT_TRUE(response_contains_json_fragment(
+        response, "\"worker_log\":\"/cache/logs/.worker-log-abc123\""));
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"repo_path\":\"/work/repo\""));
+    free(response);
+
+    /* No phase recorded, no log known: still named, never blank. */
+    result.last_phase[0] = '\0';
+    result.worker_log[0] = '\0';
+    response = cbm_mcp_index_worker_no_response_failure(NULL, &result);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"last_phase\":\"unknown\""));
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"worker_log\":\"unavailable\""));
+    free(response);
+    PASS();
+}
+
 /* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
  * Distinct exit codes so the parent can report the exact failure mode. */
 enum {
@@ -21278,6 +21317,7 @@ SUITE(mcp) {
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
+    RUN_TEST(index_supervisor_clean_exit_without_response_response_issue1300);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
