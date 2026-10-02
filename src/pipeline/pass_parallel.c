@@ -2441,40 +2441,43 @@ static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRPC_CALLS", props);
 }
 
-/* Emit GRAPHQL_CALLS edge. Extract operation from first string arg if available. */
+/* Emit GRAPHQL_CALLS edge. The Route is keyed by the operation NAME only
+ * (#598), never by the operation text:
+ *   named operation          -> __graphql__<Name>                  name "<Name>"
+ *   anonymous query/mutation/ -> __graphql__<type>__anonymous       name "(anonymous <type>)"
+ *   subscription (incl. the `{ ... }` query shorthand)
+ *   no GraphQL document      -> __graphql__operation__anonymous    name "(anonymous operation)"
+ *   (URL, variable, missing string argument)
+ * Keys are bounded by the GraphQL Name grammar and deterministic. */
 static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
                               const cbm_resolution_t *res) {
-    const char *op = call->first_string_arg;
-    if (!op || !op[0]) {
-        op = call->callee_name;
-    }
-    /* Try to extract a query/mutation name from the operation string */
-    char op_name[CBM_SZ_256];
-    snprintf(op_name, sizeof(op_name), "%s", op);
-    /* Trim leading whitespace and "query "/"mutation " prefix */
-    const char *p = op_name;
-    while (*p == ' ' || *p == '\t' || *p == '\n') {
-        p++;
-    }
-    if (strncmp(p, "query ", CBM_SZ_6) == 0) {
-        p += CBM_SZ_6;
-    } else if (strncmp(p, "mutation ", CBM_SZ_8) == 0) {
-        p += CBM_SZ_8;
+    const char *op_type = "operation";
+    char op_name[CBM_SZ_128];
+    bool named = cbm_service_pattern_graphql_operation(call->first_string_arg, &op_type, op_name,
+                                                       sizeof(op_name));
+
+    char route_name[CBM_SZ_256];
+    char route_qn[CBM_SZ_256];
+    if (named) {
+        snprintf(route_name, sizeof(route_name), "%s", op_name);
+        snprintf(route_qn, sizeof(route_qn), "__graphql__%s", op_name);
+    } else {
+        snprintf(route_name, sizeof(route_name), "(anonymous %s)", op_type);
+        snprintf(route_qn, sizeof(route_qn), "__graphql__%s__anonymous", op_type);
     }
 
-    char route_qn[CBM_SZ_512];
-    snprintf(route_qn, sizeof(route_qn), "__graphql__%s", p);
-
-    int64_t route_id =
-        cbm_gbuf_upsert_node(gbuf, "Route", p, route_qn, "", 0, 0, "{\"source\":\"graphql\"}");
+    int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", route_name, route_qn, "", 0, 0,
+                                            "{\"source\":\"graphql\"}");
 
     char esc_c[CBM_SZ_256];
     char esc_op[CBM_SZ_512];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
-    cbm_json_escape(esc_op, sizeof(esc_op), p);
+    cbm_json_escape(esc_op, sizeof(esc_op), route_name);
     char props[CBM_SZ_1K];
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"operation\":\"%s\",\"confidence\":%.2f}",
-             esc_c, esc_op, res->confidence);
+    snprintf(props, sizeof(props),
+             "{\"callee\":\"%s\",\"operation\":\"%s\",\"operation_type\":\"%s\","
+             "\"confidence\":%.2f}",
+             esc_c, esc_op, op_type, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRAPHQL_CALLS", props);
 }
 

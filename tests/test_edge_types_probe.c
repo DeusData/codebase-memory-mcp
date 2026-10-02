@@ -43,6 +43,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "cbm.h"
+#include "service_patterns.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -220,6 +221,136 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
         n++;
     }
     return et_index_files(lp, files, n);
+}
+
+/* #598: a call that resolves to a GraphQL client used to name its Route after
+ * the WHOLE operation text (minus a leading "query "/"mutation "), so an
+ * anonymous `query { ... }` became one long Route and even a named operation
+ * carried its variables and selection set in the name. GraphQL Routes are now
+ * keyed by operation name only; anonymous operations share one bounded key per
+ * operation type. The Route set is asserted exactly (QN + name). Parallel path
+ * only: GRAPHQL_CALLS is emitted by pass_parallel.c. */
+typedef struct {
+    const char *qn;
+    const char *name;
+} EtGqlRoute;
+
+static int et_graphql_routes_exact(const EtFile *files, int nfiles, const EtGqlRoute *want,
+                                   int nwant) {
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int ok = store != NULL;
+    int got = 0;
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    }
+    for (int ni = 0; nodes && ni < node_count; ni++) {
+        const char *qn = nodes[ni].qualified_name ? nodes[ni].qualified_name : "";
+        const char *name = nodes[ni].name ? nodes[ni].name : "";
+        if (strncmp(qn, "__graphql__", 11) != 0) {
+            continue;
+        }
+        got++;
+        int matched = 0;
+        for (int wi = 0; wi < nwant; wi++) {
+            if (strcmp(qn, want[wi].qn) == 0 && strcmp(name, want[wi].name) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+        /* Operation text (selection sets, variables) must never leak into a key. */
+        if (!matched || strchr(qn, '{') || strchr(name, '{') || strlen(qn) > 160) {
+            fprintf(stderr, "  [ET-GQL] unexpected Route qn='%s' name='%s'\n", qn, name);
+            ok = 0;
+        }
+    }
+    if (got != nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL graphql routes expected=%d actual=%d\n", nwant, got);
+        ok = 0;
+    }
+    int edges = store ? cbm_store_count_edges_by_type(store, lp.project, "GRAPHQL_CALLS") : -1;
+    if (edges < nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL GRAPHQL_CALLS=%d expected>=%d\n", edges, nwant);
+        ok = 0;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(graphql_route_keyed_by_operation_name_issue598) {
+    static const EtFile f[] = {
+        {"graphql/client.py", "def gql(query):\n    return query\n"},
+        {"api/ops.py",
+         "from graphql.client import gql\n\n\n"
+         "def get_user():\n"
+         "    return gql('query GetUser($id: ID!) { user(id: $id) { name } }')\n\n\n"
+         "def update_user():\n"
+         "    return gql('mutation UpdateUser($id: ID!) { updateUser(id: $id) { id } }')\n\n\n"
+         "def list_users():\n"
+         "    return gql('fragment U on User { id } query ListUsers { users { ...U } }')\n\n\n"
+         "def on_event():\n"
+         "    return gql('subscription OnEvent { event { id } }')\n\n\n"
+         "def products():\n"
+         "    return gql('query { products(search: \"x\") { items { sku } } }')\n\n\n"
+         "def orders():\n"
+         "    return gql('{ orders { id total } }')\n\n\n"
+         "def logout():\n"
+         "    return gql('mutation { logout }')\n"}};
+    static const EtGqlRoute want[] = {
+        {"__graphql__GetUser", "GetUser"},
+        {"__graphql__UpdateUser", "UpdateUser"},
+        {"__graphql__ListUsers", "ListUsers"},
+        {"__graphql__OnEvent", "OnEvent"},
+        /* products + orders: `query { }` and the `{ }` shorthand are both
+         * anonymous queries and share one key. */
+        {"__graphql__query__anonymous", "(anonymous query)"},
+        {"__graphql__mutation__anonymous", "(anonymous mutation)"},
+    };
+    ASSERT_TRUE(et_graphql_routes_exact(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                        (int)(sizeof(want) / sizeof(want[0]))));
+    PASS();
+}
+
+/* #598 parser edges the end-to-end fixture cannot reach through one language's
+ * string extraction: comments/strings/interpolations that contain braces, a
+ * bare word, non-document arguments and name truncation. */
+TEST(graphql_operation_identity_parser_issue598) {
+    const char *type = NULL;
+    char name[16];
+    static const struct {
+        const char *doc;
+        int named;
+        const char *type;
+        const char *name;
+    } cases[] = {
+        {"# fetch { all }\nquery Q1 { a }", 1, "query", "Q1"},
+        {"${UserFields} query WithFrag($id: ID) { u { ...UserFields } }", 1, "query", "WithFrag"},
+        {"fragment F on T @dir(x: \"{\") { a } mutation M2 { b }", 1, "mutation", "M2"},
+        {"\"\"\"doc { brace\"\"\" subscription S3 { c }", 1, "subscription", "S3"},
+        {"  query  \n ( $x: Int ) { a }", 0, "query", ""},
+        {"  { viewer { id } }", 0, "query", ""},
+        {"query GetUserByIdentifier { a }", 1, "query", "GetUserByIdenti"}, /* bounded */
+        {"data", 0, "operation", ""}, /* a bare word is not evidence of an operation */
+        {"https://api.example.com/graphql", 0, "operation", ""},
+        {"/graphql", 0, "operation", ""},
+        {"", 0, "operation", ""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool named = cbm_service_pattern_graphql_operation(cases[i].doc, &type, name, sizeof(name));
+        if ((int)named != cases[i].named || strcmp(type, cases[i].type) != 0 ||
+            strcmp(name, cases[i].name) != 0) {
+            fprintf(stderr, "  [ET-GQL] case %zu '%s' -> named=%d type=%s name=%s\n", i,
+                    cases[i].doc, (int)named, type, name);
+            ASSERT_TRUE(0);
+        }
+    }
+    ASSERT_FALSE(cbm_service_pattern_graphql_operation(NULL, &type, name, sizeof(name)));
+    ASSERT_STR_EQ(type, "operation");
+    PASS();
 }
 
 /* #1085: count CALLS edges whose target node has `name`, indexing via the
@@ -1691,6 +1822,8 @@ TEST(override_go_interface) {
 SUITE(edge_types_probe) {
     /* HANDLES — route→handler across web frameworks */
     RUN_TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085);
+    RUN_TEST(graphql_route_keyed_by_operation_name_issue598);
+    RUN_TEST(graphql_operation_identity_parser_issue598);
     RUN_TEST(handles_flask_python);
     RUN_TEST(handles_fastapi_python);
     RUN_TEST(handles_drf_action_python);
