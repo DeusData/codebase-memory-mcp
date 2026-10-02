@@ -29,7 +29,10 @@ codes) and rejects unknown flags with exit 2 + `Please consult --help.`
 Internal harnesses — never called directly by a venue (the contract forbids
 it): `smoke-test.sh` (phases; wrappers provide fixture server + sandbox),
 `soak-test.sh` (one soak run; `soak-legs.sh` provides the sequence + guards),
-`run-tests-parallel.sh` (reached through `test.sh`).
+`run-tests-parallel.sh` (reached through `test.sh`), which sources
+`suite-failure-report.sh` for its end-of-run failure summary (failure sites,
+sanitizer report, running test, last lines) and for `test-logs/failed/`, the
+logs of every suite that did not end green.
 
 ## Conventions
 
