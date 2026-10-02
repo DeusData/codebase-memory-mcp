@@ -3411,43 +3411,48 @@ static TSNode primary_callee_expr(TSNode node) {
 }
 
 static TSNode terminal_callee_leaf(const CBMExtractCtx *ctx, TSNode expr) {
-    if (ts_node_is_null(expr) || is_dynamic_callee_expr(ctx, expr)) {
-        return (TSNode){0};
-    }
-
     static const char *const terminal_fields[] = {"property", "field", "attribute",
                                                   "method",   "name",  NULL};
-    TSNode terminal = first_present_field(expr, terminal_fields);
-    if (!ts_node_is_null(terminal)) {
-        if (is_dynamic_callee_expr(ctx, expr)) {
+    // Each step either returns or moves `expr` to the child the search goes
+    // on in. Recursing for that step cost one stack frame per wrapper level of
+    // the callee — `((((f))))(...)`, or the head of a curried application —
+    // so stack use followed the nesting depth of the indexed file and a deep
+    // enough callee ran the worker thread out of stack. The loop visits the
+    // same nodes in the same order.
+    for (;;) {
+        if (ts_node_is_null(expr) || is_dynamic_callee_expr(ctx, expr)) {
             return (TSNode){0};
         }
-        return terminal_callee_leaf(ctx, terminal);
-    }
 
-    const char *kind = ts_node_type(expr);
-    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
-        strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
-        strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
-        strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
-        strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
-        strcmp(kind, "user_symbol") == 0) {
-        return expr;
-    }
+        TSNode terminal = first_present_field(expr, terminal_fields);
+        if (!ts_node_is_null(terminal)) {
+            expr = terminal;
+            continue;
+        }
 
-    // Known wrappers keep their static terminal in one of their named children.
-    // Prefer the last child for qualified/member/navigation forms and the first
-    // for transparent parentheses and generic wrappers whose name field was not
-    // exposed by the grammar.
-    uint32_t count = ts_node_named_child_count(expr);
-    if (count == 0) {
-        return (TSNode){0};
+        const char *kind = ts_node_type(expr);
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
+            strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
+            strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
+            strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
+            strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
+            strcmp(kind, "user_symbol") == 0) {
+            return expr;
+        }
+
+        // Known wrappers keep their static terminal in one of their named
+        // children. Prefer the last child for qualified/member/navigation forms
+        // and the first for transparent parentheses and generic wrappers whose
+        // name field was not exposed by the grammar.
+        uint32_t count = ts_node_named_child_count(expr);
+        if (count == 0) {
+            return (TSNode){0};
+        }
+        bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
+                                strstr(kind, "member") || strstr(kind, "selector") ||
+                                strstr(kind, "navigation") || strstr(kind, "field_expression");
+        expr = ts_node_named_child(expr, terminal_is_last ? count - 1 : 0);
     }
-    bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
-                            strstr(kind, "member") || strstr(kind, "selector") ||
-                            strstr(kind, "navigation") || strstr(kind, "field_expression");
-    TSNode child = ts_node_named_child(expr, terminal_is_last ? count - 1 : 0);
-    return terminal_callee_leaf(ctx, child);
 }
 
 typedef struct {

@@ -16270,6 +16270,85 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 }
 #endif
 
+/* ── calls_append_args: an argument longer than its formatting buffer ────── */
+
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid: isolate a copy that runs past a local buffer */
+#endif
+
+/* The sequential CALLS pass formats each argument into a 512-byte local before
+ * copying it into the props buffer (calls_append_args, pass_calls.c). snprintf
+ * reports the untruncated length, so an argument the local cannot hold must end
+ * the array exactly like one the props buffer cannot take; copying that length
+ * out of the local reads past it and plants the local's terminator inside the
+ * props text. Two 250-byte strings make the formatted argument about 520
+ * bytes, and the props buffer is large enough to take it, so only the local's
+ * own bound can stop the copy. 0 when the props came out right, 1 otherwise. */
+static int calls_args_overlong_probe(void) {
+    enum { CAP = 4 * CBM_SZ_1K, LONG_LEN = 250 };
+    static char expr[LONG_LEN + 1];
+    static char value[LONG_LEN + 1];
+    static char props[CAP];
+    memset(expr, 'a', LONG_LEN);
+    expr[LONG_LEN] = '\0';
+    memset(value, 'b', LONG_LEN);
+    value[LONG_LEN] = '\0';
+    CBMCallArg args[2] = {{"x", NULL, NULL, 0}, {expr, value, NULL, 1}};
+    CBMCall call = {0};
+    call.callee_name = "sink";
+    call.args = args;
+    call.arg_count = 2;
+
+    const char *base = "{\"line\":7}";
+    memset(props, 0x7f, CAP); /* a sentinel the formatter never writes */
+    memcpy(props, base, strlen(base) + 1);
+    cbm_pipeline_calls_append_args_for_tests(props, CAP, &call);
+
+    /* The short argument is kept; the overlong one ends the array cleanly. */
+    const char *expected = "{\"line\":7,\"args\":[{\"i\":0,\"e\":\"x\"}]}";
+    size_t expected_len = strlen(expected);
+    if (strncmp(props, expected, expected_len + 1) != 0) {
+        printf("    props: %.80s\n    expected: %s\n", props, expected);
+        return 1;
+    }
+    for (size_t i = expected_len + 1; i < CAP; i++) {
+        if ((unsigned char)props[i] != 0x7f) {
+            printf("    byte %zu past the terminator was written\n", i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(pipeline_calls_args_overlong_argument_stops_cleanly) {
+#if defined(_WIN32)
+    ASSERT_EQ(calls_args_overlong_probe(), 0);
+#else
+    /* A forked child, so a copy that runs past the local surfaces as the
+     * child's killing signal (the sanitizer build aborts on it) rather than
+     * taking the runner down. */
+    fflush(NULL);
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        int rc = calls_args_overlong_probe();
+        fflush(NULL);
+        _exit(rc);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "formatter killed by signal %d: a copy ran past its local buffer",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+#endif
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_nested_fixture_files_are_written);
     RUN_TEST(pipeline_fixture_file_parent_is_preserved);
@@ -16636,6 +16715,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
     RUN_TEST(pipeline_semantic_edges_no_functions);
     RUN_TEST(pipeline_semantic_batched_matches_unbatched);
+    RUN_TEST(pipeline_calls_args_overlong_argument_stops_cleanly);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the

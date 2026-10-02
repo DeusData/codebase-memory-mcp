@@ -1346,37 +1346,47 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
 }
 
 static bool is_direct_argument_value(TSNode node) {
-    usage_slow_parent_fallback_test_note();
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent)) {
-        return false;
-    }
-    if (is_labeled_argument_kind(ts_node_type(parent))) {
-        TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
-        return !ts_node_is_null(value) && ts_node_eq(value, node) &&
-               is_direct_argument_value(parent);
-    }
-    TSNode direct_arguments = ts_node_child_by_field_name(parent, TS_FIELD("arguments"));
-    if (!ts_node_is_null(direct_arguments) && ts_node_eq(direct_arguments, node)) {
-        return true;
-    }
-    if (is_argument_container_kind(ts_node_type(parent))) {
-        return true;
-    }
-    const char *parent_kind = ts_node_type(parent);
-    if (strcmp(parent_kind, "list_expression") == 0) {
-        TSNode call = ts_node_parent(parent);
-        if (!ts_node_is_null(call)) {
-            TSNode arguments = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
-            return !ts_node_is_null(arguments) && ts_node_eq(arguments, parent);
+    /* A labeled argument (keyword_argument and kin) is itself what the call
+     * site holds, so when `node` is its value the question moves one level up.
+     * That step used to recurse; the loop asks it in place and takes the
+     * slow-parent note once per level, as each recursive entry did. */
+    for (;;) {
+        usage_slow_parent_fallback_test_note();
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent)) {
+            return false;
         }
-        return false;
+        if (is_labeled_argument_kind(ts_node_type(parent))) {
+            TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
+            if (ts_node_is_null(value) || !ts_node_eq(value, node)) {
+                return false;
+            }
+            node = parent;
+            continue;
+        }
+        TSNode direct_arguments = ts_node_child_by_field_name(parent, TS_FIELD("arguments"));
+        if (!ts_node_is_null(direct_arguments) && ts_node_eq(direct_arguments, node)) {
+            return true;
+        }
+        if (is_argument_container_kind(ts_node_type(parent))) {
+            return true;
+        }
+        const char *parent_kind = ts_node_type(parent);
+        if (strcmp(parent_kind, "list_expression") == 0) {
+            TSNode call = ts_node_parent(parent);
+            if (!ts_node_is_null(call)) {
+                TSNode arguments = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+                return !ts_node_is_null(arguments) && ts_node_eq(arguments, parent);
+            }
+            return false;
+        }
+        if (strcmp(parent_kind, "argument") != 0 && strcmp(parent_kind, "value_argument") != 0) {
+            return false;
+        }
+        TSNode grandparent = ts_node_parent(parent);
+        return !ts_node_is_null(grandparent) &&
+               is_argument_container_kind(ts_node_type(grandparent));
     }
-    if (strcmp(parent_kind, "argument") != 0 && strcmp(parent_kind, "value_argument") != 0) {
-        return false;
-    }
-    TSNode grandparent = ts_node_parent(parent);
-    return !ts_node_is_null(grandparent) && is_argument_container_kind(ts_node_type(grandparent));
 }
 
 /* The body of the walk above, entered one level in: for a caller that has

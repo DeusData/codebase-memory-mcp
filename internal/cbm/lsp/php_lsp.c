@@ -1352,39 +1352,45 @@ static bool php_callable_reference_has_dynamic_member_name(PHPLSPContext *ctx, T
  * USAGE passes attach the same exact token occurrence to a first-class
  * callable, including qualified free-function references. */
 static TSNode php_reference_callee_leaf(PHPLSPContext *ctx, TSNode expr) {
-    if (ts_node_is_null(expr) || php_dynamic_reference_expr(ctx, expr)) {
-        return (TSNode){0};
-    }
-
     static const char *const terminal_fields[] = {"property", "field", "attribute",
                                                   "method",   "name",  NULL};
-    for (int i = 0; terminal_fields[i]; i++) {
-        TSNode terminal = ts_node_child_by_field_name(expr, terminal_fields[i],
-                                                      (uint32_t)strlen(terminal_fields[i]));
-        if (!ts_node_is_null(terminal)) {
-            return php_reference_callee_leaf(ctx, terminal);
+    /* A loop for the same reason as terminal_callee_leaf: recursing once per
+     * wrapper level of the callee made stack use follow the nesting depth of
+     * the file. Same nodes, same order. */
+    for (;;) {
+        if (ts_node_is_null(expr) || php_dynamic_reference_expr(ctx, expr)) {
+            return (TSNode){0};
         }
-    }
 
-    const char *kind = ts_node_type(expr);
-    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
-        strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
-        strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
-        strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
-        strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
-        strcmp(kind, "user_symbol") == 0) {
-        return expr;
-    }
+        TSNode terminal = {0};
+        for (int i = 0; terminal_fields[i] && ts_node_is_null(terminal); i++) {
+            terminal = ts_node_child_by_field_name(expr, terminal_fields[i],
+                                                   (uint32_t)strlen(terminal_fields[i]));
+        }
+        if (!ts_node_is_null(terminal)) {
+            expr = terminal;
+            continue;
+        }
 
-    uint32_t count = ts_node_named_child_count(expr);
-    if (count == 0) {
-        return (TSNode){0};
+        const char *kind = ts_node_type(expr);
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
+            strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
+            strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
+            strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
+            strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
+            strcmp(kind, "user_symbol") == 0) {
+            return expr;
+        }
+
+        uint32_t count = ts_node_named_child_count(expr);
+        if (count == 0) {
+            return (TSNode){0};
+        }
+        bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
+                                strstr(kind, "member") || strstr(kind, "selector") ||
+                                strstr(kind, "navigation") || strstr(kind, "field_expression");
+        expr = ts_node_named_child(expr, terminal_is_last ? count - 1 : 0);
     }
-    bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
-                            strstr(kind, "member") || strstr(kind, "selector") ||
-                            strstr(kind, "navigation") || strstr(kind, "field_expression");
-    return php_reference_callee_leaf(ctx,
-                                     ts_node_named_child(expr, terminal_is_last ? count - 1 : 0));
 }
 
 static TSNode php_callable_reference_leaf(PHPLSPContext *ctx, TSNode call, const char *kind) {

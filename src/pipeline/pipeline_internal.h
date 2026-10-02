@@ -927,6 +927,12 @@ void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
                                             int (*hook)(const char *, const char *, void *),
                                             void *ctx);
 
+/* Test seam: the sequential CALLS pass's args formatter (pass_calls.c), so a
+ * test can hand it an argument longer than its formatting buffer and read the
+ * props it leaves behind. `props` is a NUL-terminated JSON object of `cap`
+ * bytes; the formatter appends its "args" array in place. */
+void cbm_pipeline_calls_append_args_for_tests(char *props, size_t cap, const CBMCall *call);
+
 /* Synchronous thread-local seam for deterministic cross-repo cancellation
  * tests. The callback runs immediately after a CROSS_* edge is committed and
  * is never retained; it must not re-enter cross-repo matching. */

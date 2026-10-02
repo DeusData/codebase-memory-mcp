@@ -19,6 +19,13 @@
 #include "helpers.h"    /* cbm_count_branching (walker stack cap) */
 #include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
 
+/* Deep-nesting probes: extraction on a worker-sized stack, crash-isolated. */
+#include "pipeline/worker_pool.h"            /* CBM_WORKER_STACK_SIZE */
+#include "../src/foundation/compat_thread.h" /* cbm_thread_create */
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid */
+#endif
+
 /* ── Helpers ───────────────────────────────────────────────────── */
 
 /* Check if any definition with the given label has the given name. */
@@ -8863,6 +8870,315 @@ TEST(extract_walk_truncated_when_a_node_budget_is_set) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Deep nesting: the syntax-tree walkers must not spend stack per level
+ *
+ * Extraction runs on pipeline worker threads whose stack is
+ * CBM_WORKER_STACK_SIZE (src/pipeline/worker_pool.h), not on the test runner's
+ * main thread, whose size depends on the platform and its rlimit. Each probe
+ * below therefore runs cbm_extract_file on a thread of exactly that size, so
+ * a walker that recurses once per nesting level runs out of stack at the
+ * depth it would in the pipeline. On POSIX the thread lives in a forked child
+ * and an overflow surfaces as the child's killing signal instead of taking
+ * the runner with it (the pattern of tests/test_stack_overflow.c); Windows
+ * runs it in-process, where a real overflow is a visible runner abort. A
+ * probe returns 0 when every expectation held and prints what did not.
+ *
+ * DEEP_NEST_LEVELS: a walker frame holds at least its saved frame pointer and
+ * return address plus the 32-byte TSNode it passes down (on arm64 a TSNode is
+ * passed by reference to a copy in the caller's frame), 48 bytes, so 200,000
+ * frames need 9.6 MB — past the 8 MB worker stack even at that floor;
+ * measured frames are larger and the sanitizer build adds red zones. The
+ * parser is not the limit: tree-sitter keeps the nesting on its heap parse
+ * stack and its node and cursor helpers are iterative, so the depth is the
+ * walker's problem alone. The fixtures nest parentheses, which copy no text
+ * per level (a nested call copies its argument text at every level, which is
+ * what makes the stack_overflow_b suite slow).
+ * ═══════════════════════════════════════════════════════════════════ */
+
+enum { DEEP_NEST_LEVELS = 200000 };
+
+typedef int (*deep_probe_fn)(void);
+
+typedef struct {
+    deep_probe_fn fn;
+    int rc;
+} deep_probe_job_t;
+
+static void *deep_probe_thread_main(void *arg) {
+    deep_probe_job_t *job = (deep_probe_job_t *)arg;
+    job->rc = job->fn();
+    return NULL;
+}
+
+/* 0 when the probe passed, its own code otherwise, 2 if no thread came up. */
+static int deep_probe_on_worker_stack(deep_probe_fn fn) {
+    deep_probe_job_t job = {fn, 3};
+    cbm_thread_t thread;
+    if (cbm_thread_create(&thread, CBM_WORKER_STACK_SIZE, deep_probe_thread_main, &job) != 0) {
+        return 2;
+    }
+    (void)cbm_thread_join(&thread);
+    return job.rc;
+}
+
+/* 1 when the probe passed; otherwise `why` says what happened. */
+static int deep_probe_passed(deep_probe_fn fn, char *why, size_t why_len) {
+#if defined(_WIN32)
+    int rc = deep_probe_on_worker_stack(fn);
+    if (rc != 0) {
+        snprintf(why, why_len, "probe returned %d", rc);
+    }
+    return rc == 0;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(why, why_len, "fork failed");
+        return 0;
+    }
+    if (pid == 0) {
+        int rc = deep_probe_on_worker_stack(fn);
+        fflush(NULL);
+        _exit(rc);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        snprintf(why, why_len,
+                 "extraction killed by signal %d on a worker-sized stack: a walker recursed once "
+                 "per nesting level",
+                 WTERMSIG(status));
+        return 0;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(why, why_len, "probe returned %d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 0;
+    }
+    return 1;
+#endif
+}
+
+/* head, `levels` times '(', core, `levels` times ')', tail. *core_at receives
+ * the byte offset of core. */
+static char *build_nested_source(const char *head, const char *core, const char *tail, int levels,
+                                 uint32_t *core_at) {
+    size_t head_len = strlen(head);
+    size_t core_len = strlen(core);
+    size_t tail_len = strlen(tail);
+    char *src = malloc(head_len + core_len + tail_len + 2 * (size_t)levels + 1);
+    if (!src) {
+        return NULL;
+    }
+    char *w = src;
+    memcpy(w, head, head_len);
+    w += head_len;
+    memset(w, '(', (size_t)levels);
+    w += levels;
+    *core_at = (uint32_t)(w - src);
+    memcpy(w, core, core_len);
+    w += core_len;
+    memset(w, ')', (size_t)levels);
+    w += levels;
+    memcpy(w, tail, tail_len + 1);
+    return src;
+}
+
+/* `$x = ((...((f))...))(...);` — a first-class callable whose callee sits under
+ * DEEP_NEST_LEVELS parentheses. PHP, because its first-class callable syntax
+ * is the path that hands a parenthesised callee to terminal_callee_leaf
+ * (extract_calls.c): the leaf finder steps into one named child per wrapper
+ * node that has no terminal field, while every ordinary call path first needs
+ * a textual callee name, which the field resolver only yields for identifier
+ * and member shapes whose leaf sits one or two levels down (a member chain
+ * `a.b.c()` stops at its `property`; nested calls `f(f(f()))` are arguments,
+ * visited by the explicit-stack walker). Expected: the exact occurrence the
+ * leaf finder names — one CALL_REFERENCE usage of `f` at the byte of the `f`
+ * token — in a cleanly parsed file. */
+static int deep_callee_chain_probe(void) {
+    uint32_t f_at = 0;
+    char *src = build_nested_source("<?php\n$x = ", "f", "(...);\n", DEEP_NEST_LEVELS, &f_at);
+    if (!src) {
+        return 4;
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_PHP, "t", "deep_callee.php");
+    int rc = 0;
+    if (!r || r->has_error || r->parse_incomplete) {
+        printf("    deep callee: extraction failed or the parse was not clean\n");
+        rc = 1;
+    } else {
+        int references = 0;
+        for (int i = 0; i < r->usages.count; i++) {
+            const CBMUsage *u = &r->usages.items[i];
+            if (u->kind != CBM_USAGE_CALL_REFERENCE || !u->ref_name ||
+                strcmp(u->ref_name, "f") != 0) {
+                continue;
+            }
+            references++;
+            if (u->site_start_byte != f_at || u->site_end_byte != f_at + 1) {
+                printf("    deep callee: reference site %u-%u, expected %u-%u\n",
+                       u->site_start_byte, u->site_end_byte, f_at, f_at + 1);
+                rc = 1;
+            }
+        }
+        if (references != 1) {
+            printf("    deep callee: %d CALL_REFERENCE usages of f, expected 1\n", references);
+            rc = 1;
+        }
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+    free(src);
+    return rc;
+}
+
+TEST(extract_deep_callee_chain_completes) {
+    char why[160];
+    if (!deep_probe_passed(deep_callee_chain_probe, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
+/* One invalid token at the bottom of DEEP_NEST_LEVELS parentheses. Every
+ * enclosing parenthesized_expression then carries ts_node_has_error without
+ * being an ERROR node, which is the chain cbm_collect_error_regions (cbm.c)
+ * descends: it steps into a child that contains an error and stops at the
+ * top-most ERROR or MISSING node. Nested ERROR nodes would not do — the walk
+ * never enters an ERROR subtree, so they cost it one level. Expected: one
+ * region, on the line of the nest only, with the neighbouring definition
+ * intact and the file still usable. */
+static int deep_error_regions_probe(void) {
+    uint32_t core_at = 0;
+    char *src = build_nested_source("def ok():\n    return 1\nx = ", "1 2", "\ny = ok()\n",
+                                    DEEP_NEST_LEVELS, &core_at);
+    if (!src) {
+        return 4;
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "deep_error.py");
+    int rc = 0;
+    if (!r) {
+        printf("    deep error regions: extraction failed\n");
+        rc = 1;
+    } else {
+        if (!r->parse_incomplete || r->error_region_count != 1 || !r->error_ranges ||
+            strcmp(r->error_ranges, "3-3") != 0) {
+            printf("    deep error regions: incomplete=%d count=%d ranges=%s, expected one "
+                   "region 3-3\n",
+                   r->parse_incomplete ? 1 : 0, r->error_region_count,
+                   r->error_ranges ? r->error_ranges : "(none)");
+            rc = 1;
+        }
+        if (r->parse_unusable) {
+            printf("    deep error regions: one line of five must not make the file unusable\n");
+            rc = 1;
+        }
+        if (!has_def(r, "Function", "ok")) {
+            printf("    deep error regions: the definition next to the nest was lost\n");
+            rc = 1;
+        }
+        cbm_free_result(r);
+    }
+    free(src);
+    return rc;
+}
+
+TEST(extract_deep_error_regions_complete) {
+    char why[160];
+    if (!deep_probe_passed(deep_error_regions_probe, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
+/* `f(cb=((...(obj.handler)...)))`: a labeled argument whose value is a bound
+ * method under LABELED_WRAPPERS parentheses. The usage pass classifies
+ * `handler` by climbing the wrappers (python_direct_callable_attribute_site, a
+ * loop) and then asking is_direct_argument_value, whose one recursive step
+ * moved from the value to the labeled argument holding it. The grammar never
+ * nests a labeled argument inside another's value, so that step is bounded
+ * and no stack depth is at stake; what the test pins is the answer across the
+ * conversion of that step to a loop: the usage is a callable-value candidate
+ * whose site is the outermost wrapper, and the keyword `cb` is no usage. The
+ * bare form pins the site on the attribute itself. */
+enum { LABELED_WRAPPERS = 2000 };
+
+static int handler_candidate_site(const CBMFileResult *r, uint32_t expect_start,
+                                  uint32_t expect_end, const char *form) {
+    int seen = 0;
+    int rc = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *u = &r->usages.items[i];
+        if (!u->ref_name) {
+            continue;
+        }
+        if (strcmp(u->ref_name, "cb") == 0) {
+            printf("    %s argument: the keyword label became a usage\n", form);
+            rc = 1;
+        }
+        if (strcmp(u->ref_name, "handler") != 0) {
+            continue;
+        }
+        seen++;
+        if (!u->may_be_call_reference || u->site_start_byte != expect_start ||
+            u->site_end_byte != expect_end) {
+            printf("    %s argument: handler candidate=%d site %u-%u, expected candidate site "
+                   "%u-%u\n",
+                   form, u->may_be_call_reference ? 1 : 0, u->site_start_byte, u->site_end_byte,
+                   expect_start, expect_end);
+            rc = 1;
+        }
+    }
+    if (seen != 1) {
+        printf("    %s argument: %d usages of handler, expected 1\n", form, seen);
+        rc = 1;
+    }
+    return rc;
+}
+
+static int deep_argument_nesting_probe(void) {
+    const uint32_t attribute_len = (uint32_t)strlen("obj.handler");
+    uint32_t core_at = 0;
+    char *src = build_nested_source("f(cb=", "obj.handler", ")\n", LABELED_WRAPPERS, &core_at);
+    if (!src) {
+        return 4;
+    }
+    int rc = 0;
+    CBMFileResult *wrapped = extract(src, CBM_LANG_PYTHON, "t", "deep_arg.py");
+    if (!wrapped || wrapped->has_error || wrapped->parse_incomplete) {
+        printf("    wrapped argument: extraction failed or the parse was not clean\n");
+        rc = 1;
+    } else {
+        rc |= handler_candidate_site(wrapped, core_at - LABELED_WRAPPERS,
+                                     core_at + attribute_len + LABELED_WRAPPERS, "wrapped");
+    }
+    if (wrapped) {
+        cbm_free_result(wrapped);
+    }
+    free(src);
+
+    CBMFileResult *bare = extract("f(cb=obj.handler)\n", CBM_LANG_PYTHON, "t", "bare_arg.py");
+    if (!bare || bare->has_error || bare->parse_incomplete) {
+        printf("    bare argument: extraction failed or the parse was not clean\n");
+        rc = 1;
+    } else {
+        rc |= handler_candidate_site(bare, 5, 5 + attribute_len, "bare");
+    }
+    if (bare) {
+        cbm_free_result(bare);
+    }
+    return rc;
+}
+
+TEST(extract_deep_argument_nesting_completes) {
+    char why[160];
+    if (!deep_probe_passed(deep_argument_nesting_probe, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
 SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
@@ -9304,6 +9620,11 @@ SUITE(extraction) {
     RUN_TEST(json_toplevel_description_promoted_to_module_issue519);
     RUN_TEST(config_description_only_at_top_level_issue519);
     RUN_TEST(non_config_language_module_has_no_promoted_description_issue519);
+
+    /* Syntax-tree walkers spend no stack per nesting level */
+    RUN_TEST(extract_deep_callee_chain_completes);
+    RUN_TEST(extract_deep_error_regions_complete);
+    RUN_TEST(extract_deep_argument_nesting_completes);
 
     cbm_shutdown();
 }
