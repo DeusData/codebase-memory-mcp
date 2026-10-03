@@ -1,15 +1,58 @@
 #include "c_lsp.h"
 #include "lsp_node_iter.h"
+#include "lsp_work.h"
 #include "../helpers.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <limits.h>
 
 /* Safe kind accessor — returns CBM_TYPE_UNKNOWN for NULL types.
  * Prevents SEGV in c_eval_expr_type_inner on unusual C++ AST shapes. */
 static inline CBMTypeKind safe_kind(const CBMType *t) {
     return t ? t->kind : CBM_TYPE_UNKNOWN;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int c_test_memo_allocations_left = -1;
+static _Thread_local bool c_test_depth_failure;
+void cbm_c_lsp_test_depth_fail(bool enabled) {
+    c_test_depth_failure = enabled;
+}
+static _Thread_local uint32_t c_test_walks;
+uint32_t cbm_c_lsp_test_walks_take(void) {
+    uint32_t walks = c_test_walks;
+    c_test_walks = 0;
+    return walks;
+}
+void cbm_c_lsp_test_memo_fail_after(int successful_allocations) {
+    c_test_memo_allocations_left = successful_allocations;
+}
+#endif
+
+static void c_memo_test_stage(CLSPContext *ctx, const char *stage) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    c_test_walks++;
+    const char *depth_stage = getenv("CBM_TEST_C_LSP_DEPTH_FAIL_STAGE");
+    if (depth_stage && strcmp(depth_stage, stage) == 0)
+        ctx->eval_depth = 257;
+    const char *fail_stage = getenv("CBM_TEST_C_LSP_MEMO_FAIL_STAGE");
+    if (fail_stage && strcmp(fail_stage, stage) == 0)
+        ctx->test_memo_allocations_left = 0;
+#else
+    (void)ctx;
+    (void)stage;
+#endif
+}
+
+void cbm_c_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status) {
+    result->has_error = true;
+    result->lsp_skipped = true;
+    /* Static lifetime keeps the reason available even when the arena is full.
+     * Result compaction/spilling copies strings, including non-arena strings. */
+    result->error_msg =
+        status == CBM_LSP_DEPTH_EXCEEDED ? CBM_C_LSP_DEPTH_ERROR : CBM_C_LSP_MEMO_ERROR;
 }
 
 // Forward declarations
@@ -59,6 +102,11 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
                 const CBMTypeRegistry *registry, const char *module_qn, bool cpp_mode,
                 CBMResolvedCallArray *out) {
     memset(ctx, 0, sizeof(CLSPContext));
+#ifdef CBM_ENABLE_TEST_SEAMS
+    ctx->test_memo_allocations_left = c_test_memo_allocations_left;
+    if (c_test_depth_failure)
+        ctx->eval_depth = 257;
+#endif
     ctx->arena = arena;
     ctx->source = source;
     ctx->source_len = source_len;
@@ -191,14 +239,7 @@ static bool c_scope_declares_name(const CBMScope *scope, const char *var_name) {
     if (!scope || !var_name) {
         return false;
     }
-    for (const CBMScopeChunk *chunk = scope->chunks; chunk; chunk = chunk->next) {
-        for (int i = 0; i < chunk->used; i++) {
-            if (chunk->bindings[i].name && strcmp(chunk->bindings[i].name, var_name) == 0) {
-                return true;
-            }
-        }
-    }
-    return false;
+    return cbm_scope_lookup_local(scope, var_name) != NULL;
 }
 
 /* Return the exact fp-state entry for the nearest lexical declaration. An
@@ -1474,26 +1515,129 @@ static const char *type_to_qn(const CBMType *t) {
 
 static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node);
 
+/* Stack guard: the evaluator recurses once per expression nesting level.
+ * There is deliberately NO per-file work budget (#1527): the 10000-step cap
+ * that used to sit here (#323) left every later expression in a large file
+ * unresolved while the file still reported status `indexed`. What it was
+ * containing -- a fluent chain re-evaluating its receiver at every link, 2^N
+ * evaluations (the Bitcoin versionbits hang) -- is removed at the root by the
+ * per-evaluation memo below. */
 #define C_EVAL_DEPTH_LIMIT 256
-#define C_EVAL_MAX_STEPS_PER_FILE 10000
+enum { C_EVAL_MEMO_INITIAL_CAP = 64 };
+
+static uint32_t c_eval_memo_hash(const void *id) {
+    uintptr_t v = (uintptr_t)id >> 3; /* node structs are >=8-byte aligned */
+    return (uint32_t)((v ^ (v >> 29)) * 2654435761u);
+}
+
+/* Empty the memo for a new outermost evaluation: O(slots the last one used). */
+static void c_eval_memo_reset(CLSPContext *ctx) {
+    for (int i = 0; i < ctx->eval_memo_count; i++) {
+        ctx->eval_memo[ctx->eval_memo_used[i]].node_id = NULL;
+    }
+    ctx->eval_memo_count = 0;
+}
+
+static const CBMType *c_eval_memo_lookup(const CLSPContext *ctx, const void *id) {
+    if (ctx->eval_memo_cap == 0) {
+        return NULL;
+    }
+    uint32_t mask = (uint32_t)ctx->eval_memo_cap - 1;
+    for (uint32_t i = c_eval_memo_hash(id) & mask;; i = (i + 1) & mask) {
+        const struct CLSPEvalMemoSlot *e = &ctx->eval_memo[i];
+        if (!e->node_id) {
+            return NULL;
+        }
+        if (e->node_id == id) {
+            return e->result;
+        }
+    }
+}
+
+static void c_eval_memo_place(CLSPContext *ctx, const void *id, const CBMType *result) {
+    uint32_t mask = (uint32_t)ctx->eval_memo_cap - 1;
+    uint32_t i = c_eval_memo_hash(id) & mask;
+    while (ctx->eval_memo[i].node_id) {
+        i = (i + 1) & mask;
+    }
+    ctx->eval_memo[i].node_id = id;
+    ctx->eval_memo[i].result = result;
+    ctx->eval_memo_used[ctx->eval_memo_count++] = (int)i;
+}
+
+static void *c_eval_memo_alloc(CLSPContext *ctx, size_t size) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (ctx->test_memo_allocations_left == 0)
+        return NULL;
+    if (ctx->test_memo_allocations_left > 0)
+        ctx->test_memo_allocations_left--;
+#endif
+    return cbm_arena_alloc(ctx->arena, size);
+}
+
+/* Memoization is required to bound receiver re-evaluation. An allocation
+ * failure stops this file's refinement and is reported to the caller. */
+static bool c_eval_memo_insert(CLSPContext *ctx, const void *id, const CBMType *result) {
+    if (ctx->eval_memo_count >= ctx->eval_memo_cap / 2) {
+        if (ctx->eval_memo_cap > INT_MAX / 2)
+            return false;
+        int new_cap = ctx->eval_memo_cap ? ctx->eval_memo_cap * 2 : C_EVAL_MEMO_INITIAL_CAP;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(struct CLSPEvalMemoSlot) ||
+            (size_t)(new_cap / 2) > SIZE_MAX / sizeof(int))
+            return false;
+        struct CLSPEvalMemoSlot *slots = c_eval_memo_alloc(ctx, (size_t)new_cap * sizeof(*slots));
+        if (!slots)
+            return false;
+        int *used = c_eval_memo_alloc(ctx, (size_t)(new_cap / 2) * sizeof(int));
+        if (!used)
+            return false;
+        memset(slots, 0, (size_t)new_cap * sizeof(*slots));
+        struct CLSPEvalMemoSlot *old = ctx->eval_memo;
+        const int *old_used = ctx->eval_memo_used;
+        int old_count = ctx->eval_memo_count;
+        ctx->eval_memo = slots;
+        ctx->eval_memo_used = used;
+        ctx->eval_memo_cap = new_cap;
+        ctx->eval_memo_count = 0;
+        for (int k = 0; k < old_count; k++) {
+            const struct CLSPEvalMemoSlot *e = &old[old_used[k]];
+            c_eval_memo_place(ctx, e->node_id, e->result);
+        }
+    }
+    c_eval_memo_place(ctx, id, result);
+    return true;
+}
 
 const CBMType *c_eval_expr_type(CLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node))
+    if (ctx->eval_failure || ts_node_is_null(node))
         return cbm_type_unknown();
-    /* Expression type evaluation is best-effort. Some recovery-mode C++ ASTs
-     * can repeatedly drive member/type lookup without increasing recursion
-     * depth. Keep a generous per-file work budget so pathological expressions
-     * degrade to unknown instead of hanging repository indexing. */
-    if (ctx->eval_depth > C_EVAL_DEPTH_LIMIT || ctx->eval_steps++ > C_EVAL_MAX_STEPS_PER_FILE) {
-        if (ctx->debug && ctx->eval_steps == C_EVAL_MAX_STEPS_PER_FILE + 2) {
-            fprintf(stderr, "  [clsp] expression eval step budget exhausted; returning unknown\n");
-        }
+    if (ctx->eval_depth > C_EVAL_DEPTH_LIMIT) {
+        ctx->eval_truncations++;
+        ctx->eval_failure = CBM_LSP_DEPTH_EXCEEDED;
         return cbm_type_unknown();
     }
+    if (ctx->eval_depth == 0) {
+        c_eval_memo_reset(ctx); /* scope may have changed since the last evaluation */
+    }
+    const CBMType *cached = c_eval_memo_lookup(ctx, node.id);
+    if (cached) {
+        return cached;
+    }
+    CBM_LSP_WORK(1); /* one real evaluation (complexity tests) */
+    uint32_t trunc_before = ctx->eval_truncations;
     ctx->eval_depth++;
     const CBMType *result = c_eval_expr_type_inner(ctx, node);
     ctx->eval_depth--;
-    return result ? result : cbm_type_unknown();
+    if (!result) {
+        result = cbm_type_unknown();
+    }
+    /* Never memoize a result a depth cutoff may have truncated: the incomplete walk
+     * must stop before a second receiver branch repeats the truncated work. */
+    if (!ctx->eval_failure && ctx->eval_truncations == trunc_before &&
+        !c_eval_memo_insert(ctx, node.id, result)) {
+        ctx->eval_failure = CBM_LSP_MEMO_FAILED;
+    }
+    return ctx->eval_failure ? cbm_type_unknown() : result;
 }
 
 static const CBMType *c_eval_expr_type_inner(CLSPContext *ctx, TSNode node) {
@@ -2963,6 +3107,8 @@ static const CBMType *c_parse_declaration_type(CLSPContext *ctx, TSNode decl_nod
 }
 
 void c_process_statement(CLSPContext *ctx, TSNode node) {
+    if (ctx->eval_failure)
+        return;
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
@@ -3930,6 +4076,8 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node);
  * frames via c_adl_resolve). Past the cap the subtree is skipped — its calls
  * stay unresolved, which is graceful degradation, not a crash. */
 static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node) {
+    if (ctx->eval_failure)
+        return;
     if (ctx->walk_depth >= C_LSP_MAX_WALK_DEPTH)
         return;
     ctx->walk_depth++;
@@ -4783,6 +4931,8 @@ recurse:;
 // ============================================================================
 
 static void c_process_function(CLSPContext *ctx, TSNode func_node) {
+    if (ctx->eval_failure)
+        return;
     TSNode decl = ts_node_child_by_field_name(func_node, "declarator", 10);
     if (ts_node_is_null(decl))
         return;
@@ -4973,6 +5123,8 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
 // Process a top-level or nested declaration within a namespace/class body,
 // handling template_declaration wrapping.
 static void c_process_body_child(CLSPContext *ctx, TSNode child) {
+    if (ctx->eval_failure)
+        return;
     if (ts_node_is_null(child))
         return;
     const char *ck = ts_node_type(child);
@@ -5429,6 +5581,8 @@ void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root))
         return;
 
+    int resolved_before = ctx->resolved_calls ? ctx->resolved_calls->count : 0;
+
     // Collect top-level children once (O(n)); both passes reuse the array.
     // Indexing ts_node_child(root,i) per iteration is O(i) → O(n²) on a wide root.
     uint32_t kn = 0;
@@ -5437,7 +5591,7 @@ void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     TSNode inner;
 
     // Pass 1: process using declarations and global variables
-    for (uint32_t i = 0; i < kn; i++) {
+    for (uint32_t i = 0; i < kn && !ctx->eval_failure; i++) {
         child = kids[i];
         const char *ck = ts_node_type(child);
 
@@ -5461,7 +5615,7 @@ void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     }
 
     // Pass 2: process functions, namespaces, classes, templates
-    for (uint32_t i = 0; i < kn; i++) {
+    for (uint32_t i = 0; i < kn && !ctx->eval_failure; i++) {
         child = kids[i];
         c_process_body_child(ctx, child);
     }
@@ -5469,6 +5623,8 @@ void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     // Release the per-file negative-lookup memo (malloc-owned; only allocated in
     // shared-registry mode). No-op when it was never populated.
     c_neg_memo_free(ctx);
+    if (ctx->eval_failure && ctx->resolved_calls)
+        ctx->resolved_calls->count = resolved_before;
 }
 
 // ============================================================================
@@ -5682,8 +5838,116 @@ static void c_rewrite_proved_destructor_candidates(CBMFileResult *result) {
     }
 }
 
+/* QN -> index of its FIRST registration in reg->types, for the single-file
+ * registration loop below (#1527). That loop asked "is this type registered
+ * yet, and where?" by scanning every registered type per Field and per
+ * Method -- O(defs x types) before the registry was indexed. Tracking the
+ * first index as types are added answers the same question in O(1); the
+ * types array may be reallocated as it grows, so indices, not pointers. */
+typedef struct {
+    const char **qn; /* NULL = empty slot */
+    int *first;
+    int cap; /* power of two, or 0 when unavailable */
+    int count;
+} CTypeFirstIndex;
+
+static uint32_t c_type_first_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Slot holding qn, or the empty slot where it belongs. */
+static int c_type_first_slot(const CTypeFirstIndex *ix, const char *qn) {
+    uint32_t mask = (uint32_t)ix->cap - 1;
+    uint32_t i = c_type_first_hash(qn) & mask;
+    while (ix->qn[i] && strcmp(ix->qn[i], qn) != 0) {
+        CBM_LSP_WORK(1);
+        i = (i + 1) & mask;
+    }
+    return (int)i;
+}
+
+static bool c_type_first_alloc(CTypeFirstIndex *ix, CBMArena *arena, int cap) {
+    const char **qn = (const char **)cbm_arena_alloc(arena, (size_t)cap * sizeof(*qn));
+    int *first = (int *)cbm_arena_alloc(arena, (size_t)cap * sizeof(*first));
+    if (!qn || !first) {
+        return false;
+    }
+    memset(qn, 0, (size_t)cap * sizeof(*qn));
+    ix->qn = qn;
+    ix->first = first;
+    ix->cap = cap;
+    ix->count = 0;
+    return true;
+}
+
+/* Record reg->types[idx]; an existing QN keeps its first index. On OOM the
+ * index turns itself off (cap 0) and callers fall back to the scan. */
+static void c_type_first_note(CTypeFirstIndex *ix, CBMArena *arena, const CBMTypeRegistry *reg,
+                              int idx) {
+    const char *qn = reg->types[idx].qualified_name;
+    if (ix->cap == 0 || !qn) {
+        return;
+    }
+    if ((ix->count + 1) * 2 > ix->cap) {
+        CTypeFirstIndex grown = {0};
+        if (!c_type_first_alloc(&grown, arena, ix->cap * 2)) {
+            ix->cap = 0;
+            return;
+        }
+        for (int i = 0; i < ix->cap; i++) {
+            if (ix->qn[i]) {
+                int s = c_type_first_slot(&grown, ix->qn[i]);
+                grown.qn[s] = ix->qn[i];
+                grown.first[s] = ix->first[i];
+                grown.count++;
+            }
+        }
+        *ix = grown;
+    }
+    int s = c_type_first_slot(ix, qn);
+    if (!ix->qn[s]) {
+        ix->qn[s] = qn;
+        ix->first[s] = idx;
+        ix->count++;
+    }
+}
+
+/* Index of the first registered type named qn, or -1. Same answer as the
+ * linear scan it replaces (which also serves as the OOM fallback). */
+static int c_type_first_find(const CTypeFirstIndex *ix, const CBMTypeRegistry *reg,
+                             const char *qn) {
+    if (ix->cap > 0) {
+        int s = c_type_first_slot(ix, qn);
+        return ix->qn[s] ? ix->first[s] : -1;
+    }
+    for (int ri = 0; ri < reg->type_count; ri++) {
+        CBM_LSP_WORK(1);
+        if (strcmp(reg->types[ri].qualified_name, qn) == 0) {
+            return ri;
+        }
+    }
+    return -1;
+}
+
+/* cbm_registry_add_type plus the first-index bookkeeping. */
+static void c_add_type_indexed(CBMTypeRegistry *reg, CTypeFirstIndex *ix, CBMArena *arena,
+                               CBMRegisteredType rt) {
+    int before = reg->type_count;
+    cbm_registry_add_type(reg, rt);
+    if (reg->type_count > before) {
+        c_type_first_note(ix, arena, reg, before);
+    }
+}
+
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                    TSNode root, bool cpp_mode, CBMSourceOrigin source_origin) {
+    if (result->lsp_skipped)
+        return;
 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
@@ -5694,6 +5958,18 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
         cbm_cpp_stdlib_register(&reg, arena);
 
     const char *module_qn = result->module_qn;
+
+    /* Scratch for the registration index and the registry's hash index; both
+     * die with this call (quadratic-pattern #6: never per-file index memory in
+     * a longer-lived arena). */
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    CTypeFirstIndex first_ix = {0};
+    if (c_type_first_alloc(&first_ix, &idx_arena, 256)) {
+        for (int ti = 0; ti < reg.type_count; ti++) {
+            c_type_first_note(&first_ix, &idx_arena, &reg, ti);
+        }
+    }
 
     // Register file's own definitions
     for (int i = 0; i < result->defs.count; i++) {
@@ -5728,19 +6004,14 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
                     rt.embedded_types = embedded;
                 }
             }
-            cbm_registry_add_type(&reg, rt);
+            c_add_type_indexed(&reg, &first_ix, &idx_arena, rt);
         }
 
         // Field definitions → populate field_names/field_types on parent type
         if (d->label && strcmp(d->label, "Field") == 0 && d->parent_class && d->return_type) {
             // Find or add the parent type in registry
-            CBMRegisteredType *parent_rt = NULL;
-            for (int ri = 0; ri < reg.type_count; ri++) {
-                if (strcmp(reg.types[ri].qualified_name, d->parent_class) == 0) {
-                    parent_rt = &reg.types[ri];
-                    break;
-                }
-            }
+            int parent_idx = c_type_first_find(&first_ix, &reg, d->parent_class);
+            CBMRegisteredType *parent_rt = parent_idx >= 0 ? &reg.types[parent_idx] : NULL;
             if (parent_rt) {
                 // Count existing fields
                 int existing = 0;
@@ -5807,14 +6078,14 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
             if (strcmp(d->label, "Method") == 0 && d->parent_class) {
                 rf.receiver_type = d->parent_class;
                 // Auto-create type if needed
-                if (!cbm_registry_lookup_type(&reg, d->parent_class)) {
+                if (c_type_first_find(&first_ix, &reg, d->parent_class) < 0) {
                     CBMRegisteredType auto_type;
                     memset(&auto_type, 0, sizeof(auto_type));
                     auto_type.qualified_name = d->parent_class;
                     // Extract short name
                     const char *dot = strrchr(d->parent_class, '.');
                     auto_type.short_name = dot ? dot + 1 : d->parent_class;
-                    cbm_registry_add_type(&reg, auto_type);
+                    c_add_type_indexed(&reg, &first_ix, &idx_arena, auto_type);
                 }
             }
 
@@ -5822,13 +6093,27 @@ void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, i
         }
     }
 
+    /* Hash-index the registry before the walk (#1527): unindexed, every
+     * resolver lookup scanned the stdlib plus all of this file's definitions,
+     * O(calls x defs) per file. First-registered chains keep each duplicated
+     * name resolving to the entry the scan returned; resolver additions after
+     * this point stay visible through the registry's tail scan. */
+    reg.index_first_registered = true;
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     // Initialize context and run
     CLSPContext ctx;
     c_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, cpp_mode, &result->resolved_calls);
     ctx.source_origin = source_origin;
+    c_memo_test_stage(&ctx,
+                      source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED ? "preprocessed" : "raw");
 
     c_lsp_process_file(&ctx, root);
-    c_rewrite_proved_destructor_candidates(result);
+    if (ctx.eval_failure)
+        cbm_c_lsp_record_failure(result, ctx.eval_failure);
+    else
+        c_rewrite_proved_destructor_candidates(result);
+    cbm_arena_destroy(&idx_arena);
 }
 
 // ============================================================================
@@ -6000,13 +6285,22 @@ CBMTypeRegistry *cbm_c_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, in
     return reg;
 }
 
-void cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+bool cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                        const char *module_qn, bool cpp_mode, CBMTypeRegistry *reg,
                                        const char **include_paths, const char **include_ns_qns,
                                        int include_count, TSTree *cached_tree,
                                        CBMResolvedCallArray *out) {
+    return cbm_run_c_lsp_cross_with_registry_status(
+               arena, source, source_len, module_qn, cpp_mode, reg, include_paths, include_ns_qns,
+               include_count, cached_tree, out) == CBM_LSP_COMPLETE;
+}
+
+CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMTypeRegistry *reg, const char **include_paths, const char **include_ns_qns,
+    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out) {
     if (!source || source_len == 0 || !out || !reg)
-        return;
+        return CBM_LSP_COMPLETE;
 
     TSParser *parser = NULL;
     TSTree *tree = cached_tree;
@@ -6014,14 +6308,14 @@ void cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int 
     if (!tree) {
         parser = ts_parser_new();
         if (!parser)
-            return;
+            return CBM_LSP_COMPLETE;
         const TSLanguage *ts_lang = cpp_mode ? tree_sitter_cpp() : tree_sitter_c();
         ts_parser_set_language(parser, ts_lang);
         tree = ts_parser_parse_string(parser, NULL, source, source_len);
         ts_parser_delete(parser);
         owns_tree = true;
         if (!tree)
-            return;
+            return CBM_LSP_COMPLETE;
     }
     TSNode root = ts_tree_root_node(tree);
 
@@ -6031,20 +6325,32 @@ void cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int 
     for (int i = 0; i < include_count; i++) {
         c_lsp_add_include(&ctx, include_paths[i], include_ns_qns[i]);
     }
+    c_memo_test_stage(&ctx, "cross");
     c_lsp_process_file(&ctx, root);
 
     if (owns_tree) {
         ts_tree_delete(tree);
     }
+    return ctx.eval_failure;
 }
 
-void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,
+bool cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,
                          bool cpp_mode, CBMLSPDef *defs, int def_count, const char **include_paths,
                          const char **include_ns_qns, int include_count, TSTree *cached_tree,
                          CBMResolvedCallArray *out) {
+    return cbm_run_c_lsp_cross_status(arena, source, source_len, module_qn, cpp_mode, defs,
+                                      def_count, include_paths, include_ns_qns, include_count,
+                                      cached_tree, out) == CBM_LSP_COMPLETE;
+}
+
+CBMLSPStatus cbm_run_c_lsp_cross_status(CBMArena *arena, const char *source, int source_len,
+                                        const char *module_qn, bool cpp_mode, CBMLSPDef *defs,
+                                        int def_count, const char **include_paths,
+                                        const char **include_ns_qns, int include_count,
+                                        TSTree *cached_tree, CBMResolvedCallArray *out) {
 
     if (!source || source_len == 0 || !out)
-        return;
+        return CBM_LSP_COMPLETE;
 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
@@ -6064,14 +6370,14 @@ void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, co
     if (!tree) {
         parser = ts_parser_new();
         if (!parser)
-            return;
+            return CBM_LSP_COMPLETE;
         const TSLanguage *ts_lang = cpp_mode ? tree_sitter_cpp() : tree_sitter_c();
         ts_parser_set_language(parser, ts_lang);
         tree = ts_parser_parse_string(parser, NULL, source, source_len);
         ts_parser_delete(parser);
         owns_tree = true;
         if (!tree)
-            return;
+            return CBM_LSP_COMPLETE;
     }
 
     TSNode root = ts_tree_root_node(tree);
@@ -6090,20 +6396,23 @@ void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, co
         c_lsp_add_include(&ctx, include_paths[i], include_ns_qns[i]);
     }
 
+    c_memo_test_stage(&ctx, "cross");
     c_lsp_process_file(&ctx, root);
 
     if (owns_tree) {
         ts_tree_delete(tree);
     }
+    return ctx.eval_failure;
 }
 
 // --- Batch cross-file LSP ---
 
-void cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_count,
+bool cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_count,
                            CBMResolvedCallArray *out) {
     if (!files || file_count <= 0 || !out)
-        return;
+        return true;
 
+    bool complete = true;
     for (int f = 0; f < file_count; f++) {
         CBMBatchCLSPFile *file = &files[f];
         memset(&out[f], 0, sizeof(CBMResolvedCallArray));
@@ -6119,10 +6428,12 @@ void cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_co
         memset(&file_out, 0, sizeof(file_out));
 
         // Delegate to existing per-file function
-        cbm_run_c_lsp_cross(&file_arena, file->source, file->source_len, file->module_qn,
-                            file->cpp_mode, file->defs, file->def_count, file->include_paths,
-                            file->include_ns_qns, file->include_count, file->cached_tree,
-                            &file_out);
+        bool file_complete = cbm_run_c_lsp_cross(
+            &file_arena, file->source, file->source_len, file->module_qn, file->cpp_mode,
+            file->defs, file->def_count, file->include_paths, file->include_ns_qns,
+            file->include_count, file->cached_tree, &file_out);
+
+        complete = complete && file_complete;
 
         // Copy results to output arena (must outlive per-file arena)
         if (file_out.count > 0) {
@@ -6147,4 +6458,5 @@ void cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_co
 
         cbm_arena_destroy(&file_arena);
     }
+    return complete;
 }
