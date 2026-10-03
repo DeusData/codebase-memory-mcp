@@ -4933,7 +4933,9 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
 
     uint32_t nc = rk.n;
     const char *prev_func = ctx->enclosing_func_qn;
-    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.__module__", ctx->module_qn);
+    /* Extraction uses the file's Module QN at top level. Keep the caller
+     * arena-owned for cross-file APIs whose module_qn input may be temporary. */
+    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s", ctx->module_qn);
     // Pass 1: execute top-level binding effects in source order. Function
     // bodies remain deferred until the final module scope has been assembled.
     for (uint32_t i = 0; i < nc && !ctx->eval_failure; i++) {
