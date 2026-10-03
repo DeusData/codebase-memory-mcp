@@ -10,6 +10,7 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
 #include "../src/foundation/mem.h"      /* cbm_mem_set_budget_for_tests — over-budget seam */
+#include "../src/foundation/str_util.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/workspace.h"
 #include "../src/mcp/compact_out.h"
@@ -17734,6 +17735,186 @@ static bool issue704_make_db(const char *dir, const char *filename, const char *
     return ok;
 }
 
+/* Cache entry classification must use exact internal names. CI workspace
+ * paths can produce real project names beginning with one or more underscores. */
+TEST(tool_underscore_projects_visible_in_cache_scans) {
+    char cache[CBM_SZ_512];
+    int path_len = snprintf(cache, sizeof(cache), "%s/cbm-uscore-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_TRUE(path_len > 0 && (size_t)path_len < sizeof(cache));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    bool setup = (!saved || saved_copy) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    bool seeded = setup &&
+                  issue704_make_db(cache, "__w-org-uscorerepo.db", "__w-org-uscorerepo",
+                                   "uscore_target_fn") &&
+                  issue704_make_db(cache, "_renamed.db", "uscore-drift", "uscore_drift_fn") &&
+                  issue704_make_db(cache, "_config-extra.db", "_config-extra", "uscore_extra_fn") &&
+                  issue704_make_db(cache, CBM_CONFIG_DB_FILENAME, "hidden-config", "hidden_fn") &&
+                  issue704_make_db(cache, CBM_CROSS_REPO_DB_FILENAME, "hidden-cross", "hidden_fn");
+    cbm_mcp_server_t *srv = seeded ? cbm_mcp_server_new(NULL) : NULL;
+    bool server_created = srv != NULL;
+    bool listed = false;
+    bool queried[3] = {false};
+    bool hinted = false;
+    bool hidden = false;
+    if (srv) {
+        char *response = cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}");
+        char *inner = response ? extract_text_content(response) : NULL;
+        yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+        if (doc) {
+            yyjson_val *root = yyjson_doc_get_root(doc);
+            yyjson_val *projects = yyjson_obj_get(root, "projects");
+            bool found[3] = {false};
+            const char *expected[] = {"__w-org-uscorerepo", "uscore-drift", "_config-extra"};
+            for (size_t i = 0; i < yyjson_arr_size(projects); i++) {
+                const char *name =
+                    yyjson_get_str(yyjson_obj_get(yyjson_arr_get(projects, i), "name"));
+                for (size_t j = 0; j < 3; j++) {
+                    found[j] = found[j] || (name && strcmp(name, expected[j]) == 0);
+                }
+            }
+            listed = yyjson_arr_size(projects) == 3 &&
+                     yyjson_get_int(yyjson_obj_get(root, "total")) == 3 && found[0] && found[1] &&
+                     found[2];
+            yyjson_doc_free(doc);
+        }
+        free(inner);
+        free(response);
+        const char *args[] = {
+            "{\"project\":\"__w-org-uscorerepo\",\"name_pattern\":\"uscore_target_fn\"}",
+            "{\"project\":\"uscorerepo\",\"name_pattern\":\"uscore_target_fn\"}",
+            "{\"project\":\"uscore-drift\",\"name_pattern\":\"uscore_drift_fn\"}"};
+        const char *targets[] = {"uscore_target_fn", "uscore_target_fn", "uscore_drift_fn"};
+        for (size_t i = 0; i < 3; i++) {
+            response = cbm_mcp_handle_tool(srv, "search_graph", args[i]);
+            queried[i] = response && !strstr(response, "\"isError\":true") &&
+                         !strstr(response, "project not found") && strstr(response, targets[i]);
+            free(response);
+        }
+        response =
+            cbm_mcp_handle_tool(srv, "search_graph",
+                                "{\"project\":\"unknown-uscore-project\",\"name_pattern\":\".*\"}");
+        hinted = response && strstr(response, "project not found") &&
+                 strstr(response, "__w-org-uscorerepo") && strstr(response, "uscore-drift") &&
+                 strstr(response, "_config-extra") && !strstr(response, "hidden-config") &&
+                 !strstr(response, "hidden-cross");
+        free(response);
+        response = cbm_mcp_handle_tool(
+            srv, "search_graph", "{\"project\":\"hidden-config\",\"name_pattern\":\"hidden_fn\"}");
+        hidden = response && strstr(response, "project not found");
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    bool restored = !setup || (saved_copy ? cbm_setenv("CBM_CACHE_DIR", saved_copy, 1)
+                                          : cbm_unsetenv("CBM_CACHE_DIR")) == 0;
+    free(saved_copy);
+    bool removed = th_rmtree(cache) == 0;
+    ASSERT_TRUE(setup && seeded && server_created);
+    ASSERT_TRUE(restored && removed);
+    ASSERT_TRUE(listed);
+    ASSERT_TRUE(queried[0] && queried[1] && queried[2]);
+    ASSERT_TRUE(hinted && hidden);
+    PASS();
+}
+
+/* The fifth cache scan adopts an existing root owner before reindexing.
+ * Ignoring its underscore name would create a second path-derived project. */
+TEST(tool_reindex_reuses_underscore_root_owner) {
+    char repo[CBM_SZ_4K];
+    char cache[CBM_SZ_4K];
+    int repo_len = snprintf(repo, sizeof(repo), "%s/cbm-uscore-repo-XXXXXX", cbm_tmpdir());
+    int cache_len = snprintf(cache, sizeof(cache), "%s/cbm-uscore-root-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_TRUE(repo_len > 0 && (size_t)repo_len < sizeof(repo));
+    ASSERT_TRUE(cache_len > 0 && (size_t)cache_len < sizeof(cache));
+    bool repo_created = cbm_mkdtemp(repo) != NULL;
+    bool cache_created = repo_created && cbm_mkdtemp(cache) != NULL;
+    char canonical[CBM_SZ_4K];
+    bool setup = cache_created && cbm_canonical_path(repo, canonical, sizeof(canonical));
+    if (setup) {
+        cbm_normalize_path_sep(canonical);
+    }
+    const char *keys[] = {"CBM_CACHE_DIR", "CBM_INDEX_SUPERVISOR"};
+    char *saved[2] = {NULL};
+    bool present[2] = {false};
+    for (size_t i = 0; i < 2; i++) {
+        const char *value = getenv(keys[i]);
+        present[i] = value != NULL;
+        saved[i] = value ? cbm_strdup(value) : NULL;
+        setup = setup && (!value || saved[i]);
+    }
+    bool env_changed = setup;
+    if (setup) {
+        setup = cbm_setenv(keys[0], cache, 1) == 0 && cbm_setenv(keys[1], "0", 1) == 0;
+    }
+    char path[CBM_SZ_4K];
+    int length = setup ? snprintf(path, sizeof(path), "%s/mod.py", repo) : -1;
+    FILE *source = length > 0 && (size_t)length < sizeof(path) ? cbm_fopen(path, "w") : NULL;
+    bool written = source && fputs("def underscore_root_target():\n    return 1\n", source) >= 0;
+    if (source) {
+        written = fclose(source) == 0 && written;
+    }
+    length = setup ? snprintf(path, sizeof(path), "%s/_root-owner.db", cache) : -1;
+    cbm_store_t *store =
+        written && length > 0 && (size_t)length < sizeof(path) ? cbm_store_open_path(path) : NULL;
+    bool seeded =
+        store && cbm_store_upsert_project(store, "_root-owner", canonical) == CBM_STORE_OK;
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_mcp_server_t *srv = seeded ? cbm_mcp_server_new(NULL) : NULL;
+    bool server_created = srv != NULL;
+    bool session_bound = srv && cbm_mcp_server_set_session_context(srv, canonical, canonical);
+    bool indexed = false;
+    bool resolved = false;
+    bool no_duplicate = false;
+    if (session_bound) {
+        yyjson_mut_doc *args = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *object = args ? yyjson_mut_obj(args) : NULL;
+        char *serialized = NULL;
+        if (object) {
+            yyjson_mut_doc_set_root(args, object);
+            if (yyjson_mut_obj_add_str(args, object, "repo_path", canonical)) {
+                serialized = yyjson_mut_write(args, 0, NULL);
+            }
+        }
+        char *response =
+            serialized ? cbm_mcp_handle_tool(srv, "index_repository", serialized) : NULL;
+        indexed =
+            response && !strstr(response, "\"isError\":true") && strstr(response, "_root-owner");
+        free(response);
+        free(serialized);
+        yyjson_mut_doc_free(args);
+        response = cbm_mcp_handle_tool(
+            srv, "search_graph",
+            "{\"project\":\"_root-owner\",\"name_pattern\":\"underscore_root_target\"}");
+        resolved = response && !strstr(response, "\"isError\":true") &&
+                   strstr(response, "underscore_root_target") &&
+                   !strstr(response, "project not found");
+        free(response);
+        char *derived = cbm_project_name_from_path(canonical);
+        length = derived ? snprintf(path, sizeof(path), "%s/%s.db", cache, derived) : -1;
+        no_duplicate = derived && strcmp(derived, "_root-owner") != 0 && length > 0 &&
+                       (size_t)length < sizeof(path) && !cbm_file_exists(path);
+        free(derived);
+    }
+    cbm_mcp_server_free(srv);
+    bool restored = true;
+    for (size_t i = 0; i < 2; i++) {
+        if (env_changed) {
+            int rc = present[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+            restored = rc == 0 && restored;
+        }
+        free(saved[i]);
+    }
+    bool repo_removed = !repo_created || th_rmtree(repo) == 0;
+    bool cache_removed = !cache_created || th_rmtree(cache) == 0;
+    ASSERT_TRUE(setup && written && seeded && server_created && session_bound);
+    ASSERT_TRUE(restored && repo_removed && cache_removed);
+    ASSERT_TRUE(indexed && resolved && no_duplicate);
+    PASS();
+}
+
 TEST(tool_resolve_store_by_internal_name_issue704) {
     char cache[256];
     snprintf(cache, sizeof(cache), "/tmp/cbm-issue704-XXXXXX");
@@ -21350,6 +21531,8 @@ SUITE(mcp) {
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
+    RUN_TEST(tool_underscore_projects_visible_in_cache_scans);
+    RUN_TEST(tool_reindex_reuses_underscore_root_owner);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
     RUN_TEST(tool_list_projects_ignores_missed_shadow_issue1044);
 
