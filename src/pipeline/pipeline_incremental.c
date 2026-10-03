@@ -1817,8 +1817,9 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         goto done;
     }
 
-    /* Early cutoff per changed file; surface-changed files seed the
-     * dependent query. Deleted files always seed it. */
+    /* Validate Python namespace metadata before any hash cutoff or dependent
+     * query. Python changes require a full rebuild; other surface changes and
+     * deletions seed the dependent query. */
     int n_surface_changed = 0;
     const char **dep_targets =
         (const char **)calloc((size_t)(n_changed + n_deleted), sizeof(char *));
@@ -1843,6 +1844,15 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             decline = "missing_surface_row";
             goto done;
         }
+        int python_change =
+            cbm_lsp_surface_python_change(stored_row->defs_json, fresh_row->defs_json);
+        if (python_change != 0) {
+            free(dep_targets);
+            cbm_ht_free(rows_by_path);
+            decline = python_change < 0 ? "python_namespace_metadata_invalid"
+                                        : "python_namespace_changed";
+            goto done;
+        }
         if (strcmp(stored_row->surface_sha, fresh_row->surface_sha) == 0) {
             continue; /* body edit: the file re-resolves, nobody else does */
         }
@@ -1858,6 +1868,17 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         dep_targets[dep_target_count++] = changed_paths[i];
     }
     for (int i = 0; i < n_deleted; i++) {
+        const cbm_lsp_surface_row_t *stored_row =
+            cbm_ht_get(rows_by_path, changed_paths[n_changed + i]);
+        int python_change =
+            cbm_lsp_surface_python_change(stored_row ? stored_row->defs_json : NULL, NULL);
+        if (python_change != 0) {
+            free(dep_targets);
+            cbm_ht_free(rows_by_path);
+            decline = python_change < 0 ? "python_namespace_metadata_invalid"
+                                        : "python_namespace_changed";
+            goto done;
+        }
         dep_targets[dep_target_count++] = changed_paths[n_changed + i];
     }
     cbm_ht_free(rows_by_path);

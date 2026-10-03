@@ -10,6 +10,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lsp/py_lsp.h"
+#include "lsp/lsp_work.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 
@@ -576,6 +577,119 @@ TEST(pylsp_crossfile_method_dispatch) {
                          imp_qns, 1, NULL, &out, NULL);
 
     ASSERT_GTE(find_resolved_arr(&out, "process", "Get"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Issue #1277 (reproducer contributed by @Enferlain): a method call through a
+ * typed instance field of a class imported from ANOTHER file. The field type
+ * reaches the resolver only through CBMLSPDef.field_defs on the class def. */
+TEST(pylsp_crossfile_receiver_through_typed_field) {
+    const char *source = "from trainer import Trainer\n"
+                         "def run(trainer: Trainer):\n"
+                         "    strategies = trainer.strategies\n"
+                         "    return strategies.process_batch()\n";
+
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+
+    defs[0].qualified_name = "contracts.Contract";
+    defs[0].short_name = "Contract";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "contracts";
+
+    defs[1].qualified_name = "contracts.Contract.process_batch";
+    defs[1].short_name = "process_batch";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "contracts.Contract";
+    defs[1].def_module_qn = "contracts";
+
+    defs[2].qualified_name = "trainer.Trainer";
+    defs[2].short_name = "Trainer";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "trainer";
+    defs[2].field_defs = "strategies:contracts.Contract";
+
+    const char *imp_names[] = {"Trainer"};
+    const char *imp_qns[] = {"trainer.Trainer"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.loop", defs, 3, imp_names,
+                         imp_qns, 1, NULL, &out, NULL);
+
+    ASSERT_GTE(find_resolved_arr(&out, "run", "process_batch"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* #1277 on the production path: the sealed shared Tier-2 registry. Covers the
+ * direct chain, the local alias, a field inherited from a base class, and two
+ * controls: an undeclared field and a field whose type has no such method
+ * must stay unresolved (never guessed). */
+TEST(pylsp_crossfile_typed_field_shared_registry) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    CBMLSPDef defs[5];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "contracts.Contract";
+    defs[0].short_name = "Contract";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "contracts";
+    defs[1].qualified_name = "contracts.Contract.process_batch";
+    defs[1].short_name = "process_batch";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "contracts.Contract";
+    defs[1].def_module_qn = "contracts";
+    defs[2].qualified_name = "trainer.Trainer";
+    defs[2].short_name = "Trainer";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "trainer";
+    defs[2].field_defs = "strategies:contracts.Contract|name:builtins.str";
+    defs[3].qualified_name = "trainer.SubTrainer";
+    defs[3].short_name = "SubTrainer";
+    defs[3].label = "Class";
+    defs[3].def_module_qn = "trainer";
+    defs[3].embedded_types = "trainer.Trainer";
+    defs[4].qualified_name = "trainer.Other";
+    defs[4].short_name = "Other";
+    defs[4].label = "Class";
+    defs[4].def_module_qn = "trainer";
+    for (int i = 0; i < 5; i++) {
+        defs[i].lang = CBM_LANG_PYTHON;
+    }
+
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 5);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+
+    const char *src = "from trainer import Trainer, SubTrainer, Other\n"
+                      "def direct(t: Trainer):\n"
+                      "    return t.strategies.process_batch()\n"
+                      "def alias(t: Trainer):\n"
+                      "    s = t.strategies\n"
+                      "    return s.process_batch()\n"
+                      "def inherited(t: SubTrainer):\n"
+                      "    return t.strategies.process_batch()\n"
+                      "def undeclared(t: Other):\n"
+                      "    return t.strategies.process_batch()\n"
+                      "def wrong_type(t: Trainer):\n"
+                      "    return t.name.process_batch()\n";
+    const char *imp_names[] = {"Trainer", "SubTrainer", "Other"};
+    const char *imp_qns[] = {"trainer.Trainer", "trainer.SubTrainer", "trainer.Other"};
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.loop", reg, imp_names,
+                                       imp_qns, 3, NULL, &out, NULL);
+
+    ASSERT_GTE(find_resolved_arr(&out, "direct", "Contract.process_batch"), 0);
+    ASSERT_GTE(find_resolved_arr(&out, "alias", "Contract.process_batch"), 0);
+    ASSERT_GTE(find_resolved_arr(&out, "inherited", "Contract.process_batch"), 0);
+    ASSERT_EQ(find_resolved_arr(&out, "undeclared", "process_batch"), -1);
+    ASSERT_EQ(find_resolved_arr(&out, "wrong_type", "process_batch"), -1);
+
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -2110,16 +2224,30 @@ TEST(pylsp_issue710_heterogeneous_receiver_chain) {
     PASS();
 }
 
-TEST(pylsp_eval_steps_budget_degrades_gracefully) {
-    /* PY_EVAL_MAX_STEPS_PER_FILE guard: a file whose expressions demand
-     * more evaluator work than the per-file budget must still complete
-     * quickly and keep everything resolved BEFORE exhaustion — graceful
-     * partial degradation, not a hang, crash, or corrupted result. 90
-     * statements x 30-link chains re-evaluated across the bind + emit
-     * phases (the assignment bind flushes the memo generation in between)
-     * comfortably exceed the 10000-step budget. */
-    enum { BUDGET_STMTS = 90, BUDGET_LINKS = 30 };
-    size_t sz = 4096 + (size_t)BUDGET_STMTS * (32 + (size_t)BUDGET_LINKS * 8);
+/* Resolved INVOCATION rows whose callee QN ends with `suffix` (e.g. ".compile"). */
+static int count_resolved_suffix(const CBMFileResult *r, const char *suffix) {
+    size_t sl = strlen(suffix);
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t ql = rc->callee_qn ? strlen(rc->callee_qn) : 0;
+        if (rc->kind == CBM_RESOLVED_INVOCATION && ql >= sl &&
+            strcmp(rc->callee_qn + ql - sl, suffix) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(pylsp_issue1527_chain_statements_resolve_completely) {
+    /* #1527 replaces the old budget-degradation guard: with no per-file
+     * evaluation budget, the #710 chain shape -- 90 statements x 30-link
+     * chains, re-evaluated across the bind + emit phases (the assignment bind
+     * flushes the memo generation in between) -- must still finish quickly
+     * AND resolve EVERY link and EVERY final call (each is a distinct call
+     * site), not merely the first statements. */
+    enum { CHAIN_STMTS = 90, CHAIN_LINKS = 30 };
+    size_t sz = 4096 + (size_t)CHAIN_STMTS * (32 + (size_t)CHAIN_LINKS * 8);
     char *src = malloc(sz);
     ASSERT_NOT_NULL(src);
     char *p = src;
@@ -2134,11 +2262,11 @@ TEST(pylsp_eval_steps_budget_degrades_gracefully) {
                      "def run():\n");
     p += n;
     left -= (size_t)n;
-    for (int s = 0; s < BUDGET_STMTS; s++) {
+    for (int s = 0; s < CHAIN_STMTS; s++) {
         n = snprintf(p, left, "    v%d = G()", s);
         p += n;
         left -= (size_t)n;
-        for (int l = 0; l < BUDGET_LINKS; l++) {
+        for (int l = 0; l < CHAIN_LINKS; l++) {
             n = snprintf(p, left, ".add(%d)", l);
             p += n;
             left -= (size_t)n;
@@ -2151,15 +2279,1522 @@ TEST(pylsp_eval_steps_budget_degrades_gracefully) {
     CBMFileResult *r = extract_py(src);
     free(src);
     ASSERT_NOT_NULL(r);
-    /* The first statements run with budget to spare — they must resolve. */
-    ASSERT_GTE(require_resolved(r, "run", "G.compile"), 0);
+    ASSERT_EQ(count_resolved_suffix(r, ".G.compile"), CHAIN_STMTS);
+    ASSERT_EQ(count_resolved_suffix(r, ".G.add"), CHAIN_STMTS * CHAIN_LINKS);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pylsp_issue1527_large_module_resolves_every_call) {
+    /* #1527 reproduction: a module of 8000 classes plus one function calling
+     * `ClsN().chain().chain().method()` for each. Before the fix the per-file
+     * step cap stopped resolution after ~3333 statements (CALLS 14,666 of
+     * 24,000 in the graph) while the file still reported status `indexed`.
+     * Every one of the 8000 x 3 method call sites must resolve. */
+    enum { N_CLASSES = 8000 };
+    size_t sz = (size_t)N_CLASSES * 192 + 1024;
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, sz, "from typing import Self\n");
+    for (int i = 0; i < N_CLASSES; i++) {
+        pos += (size_t)snprintf(src + pos, sz - pos,
+                                "class Cls%d:\n"
+                                "    def method(self) -> int:\n"
+                                "        return %d\n"
+                                "    def chain(self) -> Self:\n"
+                                "        return self\n",
+                                i, i);
+    }
+    pos += (size_t)snprintf(src + pos, sz - pos, "def use():\n");
+    for (int i = 0; i < N_CLASSES; i++) {
+        pos += (size_t)snprintf(src + pos, sz - pos, "    Cls%d().chain().chain().method()\n", i);
+    }
+    ASSERT(pos < sz);
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)pos, CBM_LANG_PYTHON, "test", "scale.py", 0, NULL, NULL);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved_suffix(r, ".method"), N_CLASSES);
+    ASSERT_EQ(count_resolved_suffix(r, ".chain"), 2 * N_CLASSES);
+    /* The last class is resolved exactly, not just some class. */
+    ASSERT_GTE(require_resolved(r, "use", "Cls7999.method"), 0);
     cbm_free_result(r);
     PASS();
 }
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+static char *pylsp_work_fixture(int n_classes, int *out_len) {
+    /* Per class: ~140 chars (5-line def). Per call: ~50 chars. Overhead
+     * for the class number digits scales with log10(n) but the constant
+     * 256 covers up to 9-digit indices comfortably. */
+    int approx = n_classes * 256 + 1024;
+    char *buf = (char *)malloc((size_t)approx);
+    if (!buf)
+        return NULL;
+    int pos = 0;
+    pos += snprintf(buf + pos, (size_t)(approx - pos), "from typing import Self\n");
+    for (int i = 0; i < n_classes; i++) {
+        int n = snprintf(buf + pos, (size_t)(approx - pos),
+                         "class Cls%d:\n"
+                         "    def method(self) -> int:\n"
+                         "        return %d\n"
+                         "    def chain(self) -> Self:\n"
+                         "        return self\n",
+                         i, i);
+        if (n < 0 || pos + n >= approx)
+            break;
+        pos += n;
+    }
+    int n = snprintf(buf + pos, (size_t)(approx - pos), "def use():\n");
+    pos += n;
+    for (int i = 0; i < n_classes; i++) {
+        int m = snprintf(buf + pos, (size_t)(approx - pos),
+                         "    Cls%d().chain().chain().method()\n", i);
+        if (m < 0 || pos + m >= approx)
+            break;
+        pos += m;
+    }
+    *out_len = pos;
+    return buf;
+}
+
+/* Deterministic complexity gate (#1527, O9: no clock). The resolver
+ * primitives count every candidate they examine -- scope-frame probes,
+ * registry lookup probes, enclosing-definition candidates -- plus every real
+ * (non-memoized) expression evaluation, into a seam-build work counter. 4x
+ * the input must cost about 4x the work: a linear-scan lookup or a lost memo
+ * lands at ~16x (quadratic) or worse. Also asserts every call site resolved,
+ * so the work is not "linear" because resolution stopped early. */
+static uint64_t work_for(int n_classes, int *out_resolved) {
+    int slen = 0;
+    char *src = pylsp_work_fixture(n_classes, &slen);
+    if (!src)
+        return 0;
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r =
+        cbm_extract_file(src, slen, CBM_LANG_PYTHON, "test", "scale.py", 0, NULL, NULL);
+    uint64_t work = cbm_lsp_work_take();
+    *out_resolved = r ? r->resolved_calls.count : -1;
+    if (r)
+        cbm_free_result(r);
+    free(src);
+    return work;
+}
+
+TEST(pylsp_scale_work_is_linear) {
+    int r1 = 0, r4 = 0;
+    uint64_t w1 = work_for(1000, &r1);
+    uint64_t w4 = work_for(4000, &r4);
+    double ratio = w1 ? (double)w4 / (double)w1 : 0.0;
+    printf("    work: 1000=%llu (resolved=%d)  4000=%llu (resolved=%d)  ratio=%.2fx "
+           "(linear ~4x, quadratic ~16x)\n",
+           (unsigned long long)w1, r1, (unsigned long long)w4, r4, ratio);
+    /* Each class line: ClsN() + chain() + chain() + method() = 4 resolved sites. */
+    ASSERT_EQ(r1, 4 * 1000);
+    ASSERT_EQ(r4, 4 * 4000);
+    ASSERT_GT(w1, 0);
+    ASSERT(ratio < 5.0);
+    PASS();
+}
+
+extern const TSLanguage *tree_sitter_python(void);
+
+TEST(pylsp_issue1527_memo_allocation_failure_is_reported) {
+    int len = 0;
+    char *src = pylsp_work_fixture(200, &len);
+    ASSERT_NOT_NULL(src);
+    bool failures_reported = true;
+    for (int fail_after = 0; fail_after <= 1; fail_after++) {
+        cbm_py_lsp_test_memo_fail_after(fail_after);
+        CBMFileResult *r = extract_py(src);
+        cbm_py_lsp_test_memo_fail_after(-1);
+        failures_reported = failures_reported && r && r->has_error && r->lsp_skipped &&
+                            r->error_msg && strcmp(r->error_msg, CBM_PY_LSP_MEMO_ERROR) == 0 &&
+                            r->resolved_calls.count == 0;
+        if (r) {
+            cbm_result_compact(r);
+            failures_reported = failures_reported && r->error_msg &&
+                                strcmp(r->error_msg, CBM_PY_LSP_MEMO_ERROR) == 0;
+            cbm_free_result(r);
+        }
+    }
+    CBMFileResult *fresh = extract_py(src);
+    bool recovered = fresh && !fresh->has_error && fresh->resolved_calls.count > 0;
+    if (fresh)
+        cbm_free_result(fresh);
+    free(src);
+    ASSERT_TRUE(failures_reported);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+
+TEST(pylsp_issue1527_memo_and_depth_failures_stop_work) {
+    const char *src = "x\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ts_parser_set_language(parser, tree_sitter_python());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    if (!tree) {
+        ts_parser_delete(parser);
+        FAIL("failed to parse memo fixture");
+    }
+    TSNode node = ts_node_named_child(ts_node_named_child(ts_tree_root_node(tree), 0), 0);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+    CBMResolvedCallArray out = {0};
+    PyLSPContext ctx;
+    py_lsp_init(&ctx, &arena, src, (int)strlen(src), &reg, "test", &out);
+    const CBMType *known = cbm_type_named(&arena, "test.Known");
+    cbm_scope_bind(ctx.current_scope, "x", known);
+    ctx.eval_depth = 256;
+    bool depth_unknown = cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node)) &&
+                         ctx.eval_failure == CBM_LSP_DEPTH_EXCEEDED;
+    ctx.eval_depth = 0;
+    (void)cbm_lsp_work_take();
+    bool depth_stopped = cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node));
+    depth_stopped = depth_stopped && cbm_lsp_work_take() == 0;
+    /* A fresh walk can resolve this shallow expression; the failed one cannot. */
+    py_lsp_init(&ctx, &arena, src, (int)strlen(src), &reg, "test", &out);
+    cbm_scope_bind(ctx.current_scope, "x", known);
+    bool depth_recovered = cbm_py_lsp_test_eval(&ctx, node) == known && !ctx.eval_failure;
+    bool stopped = true;
+    for (int capacity_failure = 0; capacity_failure < 2; capacity_failure++) {
+        py_lsp_init(&ctx, &arena, src, (int)strlen(src), &reg, "test", &out);
+        cbm_scope_bind(ctx.current_scope, "x", known);
+        ctx.test_memo_allocations_left = 0;
+        /* Pin the maximum-capacity refusal without allocating a huge table.
+         * A NULL table bypasses lookup; insertion must report failed growth. */
+        if (capacity_failure)
+            ctx.type_cache_cap = 1 << 26;
+        stopped =
+            stopped && cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node)) && ctx.eval_failure;
+        (void)cbm_lsp_work_take();
+        for (int i = 0; i < 20; i++)
+            stopped = cbm_type_is_unknown(cbm_py_lsp_test_eval(&ctx, node)) && stopped;
+        stopped = stopped && cbm_lsp_work_take() == 0;
+    }
+    cbm_arena_destroy(&arena);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    ASSERT_TRUE(depth_unknown);
+    ASSERT_TRUE(depth_stopped);
+    ASSERT_TRUE(depth_recovered);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(pylsp_issue1527_root_class_name_failure_binds_no_external_class) {
+    const char *src = "class Local:\n    pass\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ts_parser_set_language(parser, tree_sitter_python());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    if (!tree) {
+        ts_parser_delete(parser);
+        FAIL("failed to parse root-name fixture");
+    }
+    bool closed = true, control = false;
+    for (int failure = 0; failure <= 2; failure++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMTypeRegistry reg;
+        cbm_registry_init(&reg, &arena);
+        cbm_registry_add_type(
+            &reg, (CBMRegisteredType){.qualified_name = "test.Local", .short_name = "Local"});
+        cbm_registry_add_type(
+            &reg, (CBMRegisteredType){.qualified_name = "test.External", .short_name = "External"});
+        CBMResolvedCallArray out = {0};
+        PyLSPContext ctx;
+        py_lsp_init(&ctx, &arena, src, (int)strlen(src), &reg, "test", &out);
+        ctx.test_root_name_failure = failure;
+        cbm_py_lsp_test_bind_external_classes(&ctx, ts_tree_root_node(tree));
+        bool local_absent = !cbm_scope_lookup_local(ctx.current_scope, "Local");
+        bool external_present = cbm_scope_lookup_local(ctx.current_scope, "External") != NULL;
+        if (failure)
+            closed =
+                closed && ctx.callable_value_proof_disabled && local_absent && !external_present;
+        else
+            control = !ctx.callable_value_proof_disabled && local_absent && external_present;
+        cbm_arena_destroy(&arena);
+    }
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    ASSERT_TRUE(control);
+    ASSERT_TRUE(closed);
+    PASS();
+}
+
+TEST(pylsp_issue1527_cross_memo_failure_preserves_completed_rows) {
+    char src[4096];
+    size_t pos = (size_t)snprintf(src, sizeof(src), "def run(s: S):\n    s + s\n");
+    for (int i = 0; i < 200; i++)
+        pos += (size_t)snprintf(src + pos, sizeof(src) - pos, "    s.m()\n");
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.S", .short_name = "S", .label = "Class", .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.S.__add__",
+         .short_name = "__add__",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "S",
+         .lang = CBM_LANG_PYTHON},
+    };
+    bool correct = true;
+    for (int mode = 0; mode < 3; mode++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMResolvedCall prior = {.caller_qn = "test.run",
+                                 .callee_qn = "test.S.__add__",
+                                 .kind = CBM_RESOLVED_INVOCATION,
+                                 .confidence = 0.1f,
+                                 .strategy = "prior.strategy",
+                                 .reason = "prior.reason",
+                                 .site_start_byte = (uint32_t)(strstr(src, "s + s") - src),
+                                 .site_end_byte = (uint32_t)(strstr(src, "s + s") - src) + 5};
+        CBMCall prior_synthetic = {.callee_name = "completed.synthetic"};
+        CBMResolvedCallArray out = {.items = &prior, .count = 1, .cap = 1};
+        CBMCallArray synthetic = {.items = &prior_synthetic, .count = 1, .cap = 1};
+        CBMTypeRegistry *base = mode == 1 ? cbm_py_build_cross_registry(&shared, defs, 3) : NULL;
+        CBMTypeRegistry overlay;
+        cbm_registry_init(&overlay, &arena);
+        overlay.fallback = base;
+        CBMBatchPyLSPFile file = {.source = src,
+                                  .source_len = (int)strlen(src),
+                                  .module_qn = "test",
+                                  .defs = defs,
+                                  .def_count = 3};
+        cbm_py_lsp_test_memo_fail_after(1);
+        bool complete =
+            mode == 0   ? cbm_run_py_lsp_cross(&arena, src, (int)strlen(src), "test", defs, 3, NULL,
+                                               NULL, 0, NULL, &out, &synthetic)
+            : mode == 1 ? cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test",
+                                                             &overlay, NULL, NULL, 0, NULL, &out,
+                                                             &synthetic)
+                        : cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+        cbm_py_lsp_test_memo_fail_after(-1);
+        correct = correct && !complete && out.count == (mode == 2 ? 0 : 1) &&
+                  synthetic.count == 1 && prior.confidence == 0.1f &&
+                  strcmp(prior.strategy, "prior.strategy") == 0 &&
+                  strcmp(prior.reason, "prior.reason") == 0 &&
+                  strcmp(prior_synthetic.callee_name, "completed.synthetic") == 0;
+        if (mode != 2)
+            correct = correct && out.items[0].confidence == 0.1f &&
+                      strcmp(out.items[0].strategy, "prior.strategy") == 0 &&
+                      strcmp(out.items[0].reason, "prior.reason") == 0;
+        if (mode == 2)
+            out = (CBMResolvedCallArray){0};
+        complete = mode == 0 ? cbm_run_py_lsp_cross(&arena, src, (int)strlen(src), "test", defs, 3,
+                                                    NULL, NULL, 0, NULL, &out, &synthetic)
+                   : mode == 1 ? cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src),
+                                                                    "test", &overlay, NULL, NULL, 0,
+                                                                    NULL, &out, &synthetic)
+                               : cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+        correct = correct && complete && out.count > 200 &&
+                  (mode == 2 || (synthetic.count > 1 && out.items[0].confidence > 0.1f));
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_issue1527_cross_memo_failure_fallback_reports_error) {
+    const char *src = "def run(s: S):\n    s.m()\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.S", .short_name = "S", .label = "Class", .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+    };
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_py_lsp_test_memo_fail_after(0);
+    cbm_pxc_run_one(CBM_LANG_PYTHON, &result, src, (int)strlen(src), "test", defs, 2, NULL, NULL,
+                    0);
+    cbm_py_lsp_test_memo_fail_after(-1);
+    bool reported = result.has_error && result.lsp_skipped && result.error_msg &&
+                    strcmp(result.error_msg, CBM_PY_LSP_MEMO_ERROR) == 0 &&
+                    result.resolved_calls.count == 0;
+    cbm_arena_destroy(&result.arena);
+    ASSERT_TRUE(reported);
+    PASS();
+}
+
+TEST(pylsp_issue1527_depth_failure_reports_all_entry_points) {
+    const char *src = "class S:\n    def m(self):\n        return 1\ndef run(s: S):\n    s.m()\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.S", .short_name = "S", .label = "Class", .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+    };
+    cbm_py_lsp_test_depth_fail(true);
+    CBMFileResult *raw = extract_py(src);
+    bool correct = raw && raw->has_error && raw->lsp_skipped && raw->error_msg &&
+                   strcmp(raw->error_msg, CBM_PY_LSP_DEPTH_ERROR) == 0 &&
+                   raw->resolved_calls.count == 0;
+    if (raw)
+        cbm_free_result(raw);
+    for (int mode = 0; mode < 3; mode++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMTypeRegistry *base = mode == 1 ? cbm_py_build_cross_registry(&shared, defs, 2) : NULL;
+        CBMTypeRegistry overlay;
+        cbm_registry_init(&overlay, &arena);
+        overlay.fallback = base;
+        CBMResolvedCallArray out = {0};
+        CBMBatchPyLSPFile file = {.source = src,
+                                  .source_len = (int)strlen(src),
+                                  .module_qn = "test",
+                                  .defs = defs,
+                                  .def_count = 2};
+        if (mode == 2) {
+            correct = !cbm_batch_py_lsp_cross(&arena, &file, 1, &out) && correct;
+        } else {
+            CBMLSPStatus status =
+                mode == 0 ? cbm_run_py_lsp_cross_status(&arena, src, (int)strlen(src), "test", defs,
+                                                        2, NULL, NULL, 0, NULL, &out, NULL)
+                          : cbm_run_py_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
+                                                                      "test", &overlay, NULL, NULL,
+                                                                      0, NULL, &out, NULL);
+            correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
+        }
+        correct = correct && out.count == 0;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    CBMFileResult fallback = {0};
+    cbm_arena_init(&fallback.arena);
+    cbm_pxc_run_one(CBM_LANG_PYTHON, &fallback, src, (int)strlen(src), "test", defs, 2, NULL, NULL,
+                    0);
+    correct = correct && fallback.has_error && fallback.lsp_skipped && fallback.error_msg &&
+              strcmp(fallback.error_msg, CBM_PY_LSP_DEPTH_ERROR) == 0 &&
+              fallback.resolved_calls.count == 0;
+    cbm_arena_destroy(&fallback.arena);
+    cbm_py_lsp_test_depth_fail(false);
+    CBMFileResult *fresh = extract_py(src);
+    bool recovered = fresh && !fresh->has_error && fresh->resolved_calls.count > 0;
+    if (fresh)
+        cbm_free_result(fresh);
+    ASSERT_TRUE(correct);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+
+/* Join one known source occurrence, not merely two equal aggregate counts.
+ * Changing the owner or range must not borrow a neighbouring resolution. */
+static bool pylsp_module_site_joins(const CBMCallArray *calls, const CBMResolvedCallArray *resolved,
+                                    const char *source, const char *site_text, const char *caller,
+                                    const char *target) {
+    const char *site = strstr(source, site_text);
+    if (!site || strstr(site + 1, site_text))
+        return false;
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen(site_text);
+    const CBMCall *call = NULL;
+    int call_count = 0;
+    for (int i = 0; i < calls->count; i++) {
+        const CBMCall *candidate = &calls->items[i];
+        if (candidate->enclosing_func_qn && strcmp(candidate->enclosing_func_qn, caller) == 0 &&
+            candidate->site_start_byte == start && candidate->site_end_byte == end) {
+            call = candidate;
+            call_count++;
+        }
+    }
+    if (call_count != 1)
+        return false;
+    const CBMResolvedCall *hit = cbm_pipeline_find_lsp_resolution(resolved, call, false);
+    if (!hit || !hit->caller_qn || strcmp(hit->caller_qn, caller) != 0 || !hit->callee_qn ||
+        strcmp(hit->callee_qn, target) != 0 || hit->kind != CBM_RESOLVED_INVOCATION ||
+        hit->site_start_byte != start || hit->site_end_byte != end ||
+        hit->source_origin != call->source_origin)
+        return false;
+    int semantic_count = 0;
+    for (int i = 0; i < resolved->count; i++) {
+        const CBMResolvedCall *candidate = &resolved->items[i];
+        if (candidate->kind == CBM_RESOLVED_INVOCATION && candidate->caller_qn &&
+            strcmp(candidate->caller_qn, caller) == 0 && candidate->site_start_byte == start &&
+            candidate->site_end_byte == end)
+            semantic_count++;
+    }
+    CBMCall wrong = *call;
+    wrong.enclosing_func_qn = "unrelated.module.caller";
+    bool rejects_owner = cbm_pipeline_find_lsp_resolution(resolved, &wrong, false) == NULL;
+    wrong = *call;
+    wrong.site_start_byte++;
+    return semantic_count == 1 && rejects_owner &&
+           cbm_pipeline_find_lsp_resolution(resolved, &wrong, false) == NULL;
+}
+
+static bool pylsp_module_has_def(const CBMFileResult *r, const char *qn) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name && strcmp(r->defs.items[i].qualified_name, qn) == 0)
+            return true;
+    }
+    return false;
+}
+
+TEST(pylsp_module_callers_join_exact_raw_occurrences) {
+    static const char source[] = "class Alpha:\n"
+                                 "    def render(self):\n"
+                                 "        return 1\n"
+                                 "class Beta:\n"
+                                 "    def render(self):\n"
+                                 "        return 2\n"
+                                 "def helper():\n"
+                                 "    return 3\n"
+                                 "def control():\n"
+                                 "    function_a = Alpha()\n"
+                                 "    function_a.render()\n"
+                                 "    helper()\n"
+                                 "class Controller:\n"
+                                 "    def control(self):\n"
+                                 "        method_b = Beta()\n"
+                                 "        method_b.render()\n"
+                                 "module_a = Alpha()\n"
+                                 "module_b = Beta()\n"
+                                 "module_a.render()\n"
+                                 "module_b.render()\n";
+    CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                        "app.py", 0, NULL, NULL);
+    bool correct = r && !r->has_error && !r->parse_incomplete && !r->lsp_skipped && r->module_qn &&
+                   strcmp(r->module_qn, "test.app") == 0;
+    if (correct) {
+        correct =
+            pylsp_module_has_def(r, "test.app.Alpha.render") &&
+            pylsp_module_has_def(r, "test.app.Beta.render") &&
+            pylsp_module_has_def(r, "test.app.control") &&
+            pylsp_module_has_def(r, "test.app.Controller.control") &&
+            pylsp_module_site_joins(&r->calls, &r->resolved_calls, source, "module_a.render()",
+                                    "test.app", "test.app.Alpha.render") &&
+            pylsp_module_site_joins(&r->calls, &r->resolved_calls, source, "module_b.render()",
+                                    "test.app", "test.app.Beta.render") &&
+            pylsp_module_site_joins(&r->calls, &r->resolved_calls, source, "function_a.render()",
+                                    "test.app.control", "test.app.Alpha.render") &&
+            pylsp_module_site_joins(&r->calls, &r->resolved_calls, source, "method_b.render()",
+                                    "test.app.Controller.control", "test.app.Beta.render");
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+
+    /* Package symbol-scope normalization is separate. A builtin isolates
+     * this package Module's raw caller identity from that remaining issue. */
+    static const char init_source[] = "PACKAGE_SIZE = len([1])\n";
+    r = cbm_extract_file(init_source, (int)strlen(init_source), CBM_LANG_PYTHON, "test",
+                         "pkg/__init__.py", 0, NULL, NULL);
+    correct = r && !r->has_error && !r->parse_incomplete && !r->lsp_skipped && r->module_qn &&
+              strcmp(r->module_qn, "test.pkg.__init__") == 0 &&
+              pylsp_module_has_def(r, "builtins.len") &&
+              pylsp_module_site_joins(&r->calls, &r->resolved_calls, init_source, "len([1])",
+                                      "test.pkg.__init__", "builtins.len");
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_module_named_lambda_keeps_exact_dunder_pair) {
+    static const char source[] = "class Number:\n"
+                                 "    def __add__(self, other):\n"
+                                 "        return self\n"
+                                 "module_number = Number()\n"
+                                 "add = lambda left, right: left + right\n"
+                                 "first = add(module_number, module_number)\n"
+                                 "second = add(module_number, module_number)\n";
+    CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                        "app.py", 0, NULL, NULL);
+    bool correct = r && !r->has_error && !r->parse_incomplete && !r->lsp_skipped &&
+                   pylsp_module_has_def(r, "test.app.Number.__add__") &&
+                   pylsp_module_site_joins(&r->calls, &r->resolved_calls, source, "left + right",
+                                           "test.app.<lambda>", "test.app.Number.__add__");
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_module_cross_callers_own_input_and_join_exact_sites) {
+    static const char source[] = "from helpers import Alpha, Beta\n"
+                                 "module_a = Alpha()\n"
+                                 "module_b = Beta()\n"
+                                 "module_a.render()\n"
+                                 "module_b.render()\n";
+    static const char *const paths[] = {"app.py", "pkg/__init__.py"};
+    static const char *const modules[] = {"test.app", "test.pkg.__init__"};
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.helpers.Alpha",
+         .short_name = "Alpha",
+         .label = "Class",
+         .def_module_qn = "test.helpers",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.helpers.Alpha.render",
+         .short_name = "render",
+         .label = "Method",
+         .receiver_type = "test.helpers.Alpha",
+         .def_module_qn = "test.helpers",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.helpers.Beta",
+         .short_name = "Beta",
+         .label = "Class",
+         .def_module_qn = "test.helpers",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.helpers.Beta.render",
+         .short_name = "render",
+         .label = "Method",
+         .receiver_type = "test.helpers.Beta",
+         .def_module_qn = "test.helpers",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+    };
+    const char *import_names[] = {"Alpha", "Beta"};
+    const char *import_qns[] = {"test.helpers.Alpha", "test.helpers.Beta"};
+    bool correct = true;
+    for (int path = 0; path < 2; path++) {
+        CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                            paths[path], 0, NULL, NULL);
+        if (!r || r->has_error || r->parse_incomplete || r->lsp_skipped || !r->module_qn ||
+            strcmp(r->module_qn, modules[path]) != 0) {
+            correct = false;
+            if (r)
+                cbm_free_result(r);
+            continue;
+        }
+        for (int prebuilt = 0; prebuilt < 2; prebuilt++) {
+            CBMArena arena, shared;
+            cbm_arena_init(&arena);
+            cbm_arena_init(&shared);
+            CBMTypeRegistry *base = prebuilt ? cbm_py_build_cross_registry(&shared, defs, 4) : NULL;
+            CBMTypeRegistry overlay;
+            cbm_registry_init(&overlay, &arena);
+            overlay.fallback = base;
+            char module_input[64];
+            snprintf(module_input, sizeof(module_input), "%s", modules[path]);
+            CBMResolvedCallArray out = {0};
+            CBMLSPStatus status =
+                prebuilt ? cbm_run_py_lsp_cross_with_registry_status(
+                               &arena, source, (int)strlen(source), module_input, &overlay,
+                               import_names, import_qns, 2, NULL, &out, NULL)
+                         : cbm_run_py_lsp_cross_status(&arena, source, (int)strlen(source),
+                                                       module_input, defs, 4, import_names,
+                                                       import_qns, 2, NULL, &out, NULL);
+            /* Returned caller strings must outlive the caller's input buffer.
+             * Overwrite live storage, avoiding a dangling-pointer test. */
+            memset(module_input, 'x', strlen(module_input));
+            correct = correct && (!prebuilt || (base && base->read_only)) &&
+                      status == CBM_LSP_COMPLETE &&
+                      pylsp_module_site_joins(&r->calls, &out, source, "module_a.render()",
+                                              modules[path], "test.helpers.Alpha.render") &&
+                      pylsp_module_site_joins(&r->calls, &out, source, "module_b.render()",
+                                              modules[path], "test.helpers.Beta.render");
+            cbm_arena_destroy(&arena);
+            cbm_arena_destroy(&shared);
+        }
+        cbm_free_result(r);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+/* Package symbols use their parent scope while Module callers retain the file. */
+TEST(pylsp_init_scope_context_and_helper) {
+    static const struct {
+        const char *raw;
+        const char *scope;
+    } cases[] = {
+        {"test.__init__", "test"},
+        {"test.pkg.__init__", "test.pkg"},
+        {"test.pkg.nested.__init__", "test.pkg.nested"},
+        {"test.plain", "test.plain"},
+        {"test.x__init__", "test.x__init__"},
+        {"__init__", "__init__"},
+        {"test.index", "test.index"},
+        {NULL, NULL},
+    };
+    bool correct = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMTypeRegistry registry;
+        cbm_registry_init(&registry, &arena);
+        CBMResolvedCallArray out = {0};
+        PyLSPContext ctx;
+        py_lsp_init(&ctx, &arena, "pass\n", 5, &registry, cases[i].raw, &out);
+        correct =
+            correct && ctx.eval_failure == CBM_LSP_COMPLETE && ctx.current_scope &&
+            ctx.file_module_qn == cases[i].raw &&
+            cbm_fqn_symbol_scope_len(cases[i].raw) == (cases[i].scope ? strlen(cases[i].scope) : 0);
+        correct =
+            correct && (cases[i].scope ? ctx.module_qn && strcmp(ctx.module_qn, cases[i].scope) == 0
+                                       : ctx.module_qn == NULL);
+        cbm_arena_destroy(&arena);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_init_scope_raw_exact_occurrences_and_annotations) {
+    static const char source[] =
+        "class Store:\n    def get(self):\n        return 1\n"
+        "def identity(value: Store) -> Store:\n    return value\n"
+        "def quoted(value: 'Store') -> 'Store':\n    return value\n"
+        "def wrapped(values: list[Store]) -> Store:\n    return values[0]\n"
+        "def run(first: Store, second: 'Store', values: list[Store]):\n"
+        "    first.get()\n    second.get()\n    values[0].get()\n"
+        "    identity(first).get()\n    quoted(second).get()\n"
+        "    wrapped(values).get()\n"
+        "class User:\n    def use(self, item: Store):\n        return item.get()\n"
+        "top = Store()\ntop.get()\n";
+    static const char *paths[] = {"plain.py", "__init__.py", "pkg/nested/__init__.py"};
+    static const char *scopes[] = {"test.plain", "test", "test.pkg.nested"};
+    static const char *modules[] = {"test.plain", "test.__init__", "test.pkg.nested.__init__"};
+    static const char *sites[] = {"first.get()",          "second.get()",
+                                  "values[0].get()",      "identity(first).get()",
+                                  "quoted(second).get()", "wrapped(values).get()"};
+    bool correct = true;
+    for (int mode = 0; mode < 3; mode++) {
+        CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                            paths[mode], 0, NULL, NULL);
+        bool extracted = r && !r->has_error && !r->parse_incomplete && !r->lsp_skipped &&
+                         r->module_qn && strcmp(r->module_qn, modules[mode]) == 0;
+        correct = correct && extracted;
+        if (extracted) {
+            char caller[128], target[128], method[128];
+            snprintf(caller, sizeof(caller), "%s.run", scopes[mode]);
+            snprintf(target, sizeof(target), "%s.Store.get", scopes[mode]);
+            snprintf(method, sizeof(method), "%s.User.use", scopes[mode]);
+            correct = correct && pylsp_module_has_def(r, caller) &&
+                      pylsp_module_has_def(r, target) && pylsp_module_has_def(r, method);
+            for (size_t j = 0; j < sizeof(sites) / sizeof(sites[0]); j++) {
+                bool joined = pylsp_module_site_joins(&r->calls, &r->resolved_calls, source,
+                                                      sites[j], caller, target);
+                correct = correct && joined;
+            }
+            bool method_join = pylsp_module_site_joins(&r->calls, &r->resolved_calls, source,
+                                                       "item.get()", method, target);
+            bool module_join = pylsp_module_site_joins(&r->calls, &r->resolved_calls, source,
+                                                       "top.get()", modules[mode], target);
+            correct = correct && method_join && module_join;
+        }
+        if (r)
+            cbm_free_result(r);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+static bool pylsp_init_named_type(const CBMType *type, const char *qn) {
+    return type && type->kind == CBM_TYPE_NAMED && type->data.named.qualified_name &&
+           strcmp(type->data.named.qualified_name, qn) == 0;
+}
+
+static bool pylsp_init_signature(const CBMTypeRegistry *registry, const char *function,
+                                 const char *expected_type) {
+    const CBMRegisteredFunc *f = cbm_registry_lookup_func(registry, function);
+    const CBMType *sig = f ? f->signature : NULL;
+    if (!sig || sig->kind != CBM_TYPE_FUNC || !sig->data.func.param_types)
+        return false;
+    const CBMType **params = sig->data.func.param_types;
+    if (!pylsp_init_named_type(params[0], expected_type) ||
+        !pylsp_init_named_type(params[1], expected_type) || !params[2] || params[3])
+        return false;
+    const CBMType *container = params[2];
+    return container->kind == CBM_TYPE_TEMPLATE && container->data.template_type.template_name &&
+           strcmp(container->data.template_type.template_name, "list") == 0 &&
+           container->data.template_type.arg_count == 1 &&
+           container->data.template_type.template_args &&
+           pylsp_init_named_type(container->data.template_type.template_args[0], expected_type);
+}
+
+TEST(pylsp_init_scope_cross_signatures_keep_definition_language) {
+    const char *params[] = {"Token", "'Token'", "list[Token]"};
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.pkg.call",
+         .short_name = "call",
+         .label = "Function",
+         .def_module_qn = "test.pkg.__init__",
+         .lang = CBM_LANG_PYTHON,
+         .signature_param_types = params,
+         .signature_param_count = 3},
+        {.qualified_name = "test.foreign.__init__.call",
+         .short_name = "call",
+         .label = "Function",
+         .def_module_qn = "test.foreign.__init__",
+         .lang = CBM_LANG_GO,
+         .signature_param_types = params,
+         .signature_param_count = 3},
+        {.qualified_name = "test.unknown.__init__.call",
+         .short_name = "call",
+         .label = "Function",
+         .def_module_qn = "test.unknown.__init__",
+         .lang = (CBMLanguage)-1,
+         .signature_param_types = params,
+         .signature_param_count = 3},
+    };
+    CBMArena arena, shared;
+    cbm_arena_init(&arena);
+    cbm_arena_init(&shared);
+    CBMTypeRegistry fallback;
+    cbm_registry_init(&fallback, &arena);
+    bool registered = cbm_py_lsp_test_register_defs(&arena, &fallback, defs, 3);
+    bool correct = registered &&
+                   pylsp_init_signature(&fallback, "test.pkg.call", "test.pkg.Token") &&
+                   pylsp_init_signature(&fallback, "test.foreign.__init__.call",
+                                        "test.foreign.__init__.Token") &&
+                   pylsp_init_signature(&fallback, "test.unknown.__init__.call",
+                                        "test.unknown.__init__.Token");
+    CBMTypeRegistry *base = cbm_py_build_cross_registry(&shared, defs, 3);
+    correct = correct && base && base->read_only &&
+              pylsp_init_signature(base, "test.pkg.call", "test.pkg.Token") &&
+              !cbm_registry_lookup_func(base, "test.foreign.__init__.call") &&
+              !cbm_registry_lookup_func(base, "test.unknown.__init__.call");
+    cbm_arena_destroy(&arena);
+    cbm_arena_destroy(&shared);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_init_scope_external_classes_and_cross_exact_joins) {
+    const char *source = "from pkg.sub import Widget as Imported\n"
+                         "def use():\n    store = Store()\n    store.get()\n"
+                         "    imported = Imported()\n    imported.get()\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.pkg.Store",
+         .short_name = "Store",
+         .label = "Class",
+         .def_module_qn = "test.pkg.__init__",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.Store.get",
+         .short_name = "get",
+         .label = "Method",
+         .def_module_qn = "test.pkg.__init__",
+         .receiver_type = "test.pkg.Store",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.sub.Widget",
+         .short_name = "Widget",
+         .label = "Class",
+         .def_module_qn = "test.pkg.sub",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.sub.Widget.get",
+         .short_name = "get",
+         .label = "Method",
+         .def_module_qn = "test.pkg.sub",
+         .receiver_type = "test.pkg.sub.Widget",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.Outer.Nested",
+         .short_name = "Nested",
+         .label = "Class",
+         .def_module_qn = "test.pkg.__init__",
+         .lang = CBM_LANG_PYTHON},
+    };
+    const char *names[] = {"Imported"};
+    const char *qns[] = {"test.pkg.sub.Widget"};
+    CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                        "pkg/__init__.py", 0, NULL, NULL);
+    TSParser *parser = ts_parser_new();
+    if (parser)
+        ts_parser_set_language(parser, tree_sitter_python());
+    TSTree *tree =
+        parser ? ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source)) : NULL;
+    bool correct = r && !r->has_error && !r->parse_incomplete && !r->lsp_skipped && tree &&
+                   pylsp_module_has_def(r, "test.pkg.use");
+    for (int prebuilt = 0; correct && prebuilt < 2; prebuilt++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMTypeRegistry *base = cbm_py_build_cross_registry(&shared, defs, 5);
+        CBMTypeRegistry overlay;
+        cbm_registry_init(&overlay, &arena);
+        overlay.fallback = base;
+        CBMResolvedCallArray out = {0};
+        PyLSPContext ctx;
+        py_lsp_init(&ctx, &arena, source, (int)strlen(source), &overlay, "test.pkg.__init__", &out);
+        cbm_py_lsp_test_bind_external_classes(&ctx, ts_tree_root_node(tree));
+        bool globals = base && ctx.eval_failure == CBM_LSP_COMPLETE &&
+                       pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "Store"),
+                                             "test.pkg.Store") &&
+                       !cbm_scope_lookup_local(ctx.current_scope, "Widget") &&
+                       !cbm_scope_lookup_local(ctx.current_scope, "Nested");
+        char module_input[] = "test.pkg.__init__";
+        CBMLSPStatus status =
+            prebuilt
+                ? cbm_run_py_lsp_cross_with_registry_status(&arena, source, (int)strlen(source),
+                                                            module_input, &overlay, names, qns, 1,
+                                                            tree, &out, NULL)
+                : cbm_run_py_lsp_cross_status(&arena, source, (int)strlen(source), module_input,
+                                              defs, 5, names, qns, 1, tree, &out, NULL);
+        memset(module_input, 'x', sizeof(module_input) - 1);
+        bool store = pylsp_module_site_joins(&r->calls, &out, source, "store.get()", "test.pkg.use",
+                                             "test.pkg.Store.get");
+        bool imported = pylsp_module_site_joins(&r->calls, &out, source, "imported.get()",
+                                                "test.pkg.use", "test.pkg.sub.Widget.get");
+        correct = correct && globals && status == CBM_LSP_COMPLETE && store && imported;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    if (tree)
+        ts_tree_delete(tree);
+    if (parser)
+        ts_parser_delete(parser);
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_init_scope_failure_preserves_outputs_and_wrappers) {
+    const char *source = "def run():\n    value = Store()\n    return value.get()\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.pkg.Store",
+         .short_name = "Store",
+         .label = "Class",
+         .def_module_qn = "test.pkg.__init__",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.Store.get",
+         .short_name = "get",
+         .label = "Method",
+         .def_module_qn = "test.pkg.__init__",
+         .receiver_type = "test.pkg.Store",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+    };
+    bool correct = true;
+    cbm_py_lsp_test_scope_fail_after(0);
+    CBMFileResult *raw = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                          "pkg/__init__.py", 0, NULL, NULL);
+    cbm_py_lsp_test_scope_fail_after(-1);
+    correct = raw && raw->has_error && raw->lsp_skipped && raw->error_msg &&
+              strcmp(raw->error_msg, CBM_PY_LSP_SCOPE_ERROR) == 0 &&
+              raw->resolved_calls.count == 0 && pylsp_module_has_def(raw, "test.pkg.run");
+    if (raw)
+        cbm_free_result(raw);
+    for (int mode = 0; mode < 3; mode++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMTypeRegistry *base = cbm_py_build_cross_registry(&shared, defs, 2);
+        CBMTypeRegistry overlay;
+        cbm_registry_init(&overlay, &arena);
+        overlay.fallback = base;
+        CBMResolvedCall prior = {.caller_qn = "completed.caller",
+                                 .callee_qn = "completed.target",
+                                 .strategy = "prior.strategy",
+                                 .reason = "prior.reason",
+                                 .confidence = 0.125f,
+                                 .kind = CBM_RESOLVED_INVOCATION,
+                                 .site_start_byte = 7,
+                                 .site_end_byte = 14};
+        unsigned char saved[sizeof(prior)];
+        memcpy(saved, &prior, sizeof(prior));
+        CBMCall previous_synthetic = {.callee_name = "completed.synthetic"};
+        CBMCallArray synthetic = {.items = &previous_synthetic, .count = 1, .cap = 1};
+        CBMResolvedCallArray out = {.items = &prior, .count = 1, .cap = 1};
+        cbm_py_lsp_test_scope_fail_after(mode == 2 ? 1 : 0);
+        /* mode 2 gets past context normalization, then fails signature scope. */
+        CBMLSPStatus status = mode == 1
+                                  ? cbm_run_py_lsp_cross_with_registry_status(
+                                        &arena, source, (int)strlen(source), "test.pkg.__init__",
+                                        &overlay, NULL, NULL, 0, NULL, &out, &synthetic)
+                                  : cbm_run_py_lsp_cross_status(&arena, source, (int)strlen(source),
+                                                                "test.pkg.__init__", defs, 2, NULL,
+                                                                NULL, 0, NULL, &out, &synthetic);
+        cbm_py_lsp_test_scope_fail_after(-1);
+        correct = correct && base && status == CBM_LSP_SCOPE_FAILED && out.count == 1 &&
+                  out.items == &prior && memcmp(saved, &prior, sizeof(prior)) == 0 &&
+                  synthetic.count == 1 && synthetic.items == &previous_synthetic &&
+                  strcmp(previous_synthetic.callee_name, "completed.synthetic") == 0;
+        cbm_py_lsp_test_scope_fail_after(0);
+        bool complete =
+            mode == 1
+                ? cbm_run_py_lsp_cross_with_registry(&arena, source, (int)strlen(source),
+                                                     "test.pkg.__init__", &overlay, NULL, NULL, 0,
+                                                     NULL, &out, &synthetic)
+                : cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.pkg.__init__",
+                                       defs, 2, NULL, NULL, 0, NULL, &out, &synthetic);
+        cbm_py_lsp_test_scope_fail_after(-1);
+        correct =
+            correct && !complete && out.count == 1 && memcmp(saved, &prior, sizeof(prior)) == 0;
+        CBMBatchPyLSPFile file = {.source = source,
+                                  .source_len = (int)strlen(source),
+                                  .module_qn = "test.pkg.__init__",
+                                  .defs = defs,
+                                  .def_count = 2};
+        CBMResolvedCallArray batch = {0};
+        cbm_py_lsp_test_scope_fail_after(0);
+        bool batch_complete = cbm_batch_py_lsp_cross(&arena, &file, 1, &batch);
+        cbm_py_lsp_test_scope_fail_after(-1);
+        correct = correct && !batch_complete && batch.count == 0;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_init_scope_shared_failure_keeps_arena_and_needed_fallback) {
+    const char *source = "def use():\n    obj = Item()\n    return obj.get()\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.plain.Item",
+         .short_name = "Item",
+         .label = "Class",
+         .def_module_qn = "test.plain",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.plain.Item.get",
+         .short_name = "get",
+         .label = "Method",
+         .def_module_qn = "test.plain",
+         .receiver_type = "test.plain.Item",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.unused.work",
+         .short_name = "work",
+         .label = "Function",
+         .def_module_qn = "test.unused.__init__",
+         .lang = CBM_LANG_PYTHON},
+    };
+    CBMArena arena, shared;
+    cbm_arena_init(&arena);
+    cbm_arena_init(&shared);
+    char *sentinel = cbm_arena_strdup(&shared, "caller-owned shared data");
+    cbm_py_lsp_test_scope_fail_after(0);
+    CBMTypeRegistry *failed = cbm_py_build_cross_registry(&shared, defs, 3);
+    CBMResolvedCallArray out = {0};
+    CBMLSPStatus fallback =
+        cbm_run_py_lsp_cross_status(&arena, source, (int)strlen(source), "test.plain", defs, 2,
+                                    NULL, NULL, 0, NULL, &out, NULL);
+    cbm_py_lsp_test_scope_fail_after(-1);
+    bool correct = !failed && sentinel && strcmp(sentinel, "caller-owned shared data") == 0 &&
+                   fallback == CBM_LSP_COMPLETE;
+    CBMFileResult *extracted = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
+                                                "test", "plain.py", 0, NULL, NULL);
+    correct = correct && extracted && !extracted->has_error && !extracted->parse_incomplete &&
+              pylsp_module_has_def(extracted, "test.plain.use") &&
+              pylsp_module_site_joins(&extracted->calls, &out, source, "obj.get()",
+                                      "test.plain.use", "test.plain.Item.get");
+    CBMTypeRegistry *fresh = cbm_py_build_cross_registry(&shared, defs, 3);
+    correct = correct && fresh && fresh->read_only &&
+              cbm_registry_lookup_func(fresh, "test.unused.work") &&
+              strcmp(sentinel, "caller-owned shared data") == 0;
+    if (extracted)
+        cbm_free_result(extracted);
+    cbm_arena_destroy(&arena);
+    cbm_arena_destroy(&shared);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+/* Class execution keeps the extracted caller and exact source occurrence. */
+static bool pylsp_class_site_unjoined(const CBMFileResult *r, const char *source,
+                                      const char *site_text, const char *caller) {
+    const char *site = strstr(source, site_text);
+    if (!site || strstr(site + 1, site_text))
+        return false;
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen(site_text);
+    const CBMCall *call = NULL;
+    int count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *candidate = &r->calls.items[i];
+        if (candidate->enclosing_func_qn && strcmp(candidate->enclosing_func_qn, caller) == 0 &&
+            candidate->site_start_byte == start && candidate->site_end_byte == end) {
+            call = candidate;
+            count++;
+        }
+    }
+    if (count != 1 || cbm_pipeline_find_lsp_resolution(&r->resolved_calls, call, false))
+        return false;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *hit = &r->resolved_calls.items[i];
+        if (hit->kind == CBM_RESOLVED_INVOCATION && hit->site_start_byte == start &&
+            hit->site_end_byte == end)
+            return false;
+    }
+    return true;
+}
+
+typedef struct {
+    const char *site;
+    const char *caller;
+    const char *target; /* NULL requires an extracted, unresolved occurrence. */
+} PylspClassSite;
+
+static bool pylsp_class_sites(const CBMFileResult *r, const char *source,
+                              const PylspClassSite *sites, size_t count) {
+    if (!r || r->has_error || r->parse_incomplete || r->lsp_skipped || !r->module_qn)
+        return false;
+    for (size_t i = 0; i < count; i++) {
+        const PylspClassSite *s = &sites[i];
+        if (strcmp(s->caller, r->module_qn) != 0 && !pylsp_module_has_def(r, s->caller))
+            return false;
+        if (s->target) {
+            if (!pylsp_module_has_def(r, s->target) ||
+                !pylsp_module_site_joins(&r->calls, &r->resolved_calls, source, s->site, s->caller,
+                                         s->target))
+                return false;
+        } else if (!pylsp_class_site_unjoined(r, source, s->site, s->caller)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(pylsp_classbody_calls_join_extracted_caller) {
+    static const char source[] =
+        "def field(n):\n    return n\n"
+        "class Svc:\n"
+        "    @staticmethod\n    def make(n):\n        return Svc()\n"
+        "class Model:\n"
+        "    first = field(11)\n    second = Svc(12)\n    third = Svc.make(13)\n"
+        "def control():\n    field(21)\n    Svc(22)\n    Svc.make(23)\n";
+    static const char *const paths[] = {"main.py", "pkg/__init__.py"};
+    static const char *const modules[] = {"test.main", "test.pkg.__init__"};
+    static const char *const scopes[] = {"test.main", "test.pkg"};
+    bool correct = true;
+    for (int path = 0; path < 2; path++) {
+        CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                            paths[path], 0, NULL, NULL);
+        char field[64], svc[64], make[64], control[64];
+        snprintf(field, sizeof(field), "%s.field", scopes[path]);
+        snprintf(svc, sizeof(svc), "%s.Svc", scopes[path]);
+        snprintf(make, sizeof(make), "%s.Svc.make", scopes[path]);
+        snprintf(control, sizeof(control), "%s.control", scopes[path]);
+        const PylspClassSite sites[] = {{"field(11)", modules[path], field},
+                                        {"Svc(12)", modules[path], svc},
+                                        {"Svc.make(13)", modules[path], make},
+                                        {"field(21)", control, field},
+                                        {"Svc(22)", control, svc},
+                                        {"Svc.make(23)", control, make}};
+        correct = pylsp_class_sites(r, source, sites, 6) && correct;
+        if (r)
+            cbm_free_result(r);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_classbody_names_visible_to_later_statements_only) {
+    static const char source[] =
+        "def helper(n):\n    return n\n"
+        "class Svc:\n    def run(self, n):\n        return n\n"
+        "class Model:\n"
+        "    obj = Svc()\n    result = obj.run(101)\n"
+        "    def helper(self):\n        return 2\n"
+        "    later = helper(None)\n"
+        "    def m(self):\n        return helper(102)\n"
+        "    def n(self):\n        return obj.run(103)\n"
+        "class Shadow:\n    helper = None\n    value = helper(104)\n"
+        "def control():\n    obj = Svc()\n    obj.run(105)\n    helper(106)\n";
+    const PylspClassSite sites[] = {
+        {"obj.run(101)", "test.main", "test.main.Svc.run"},
+        {"helper(None)", "test.main", "test.main.Model.helper"},
+        {"helper(102)", "test.main.Model.m", "test.main.helper"},
+        {"obj.run(103)", "test.main.Model.n", NULL},
+        {"helper(104)", "test.main", NULL},
+        {"obj.run(105)", "test.main.control", "test.main.Svc.run"},
+        {"helper(106)", "test.main.control", "test.main.helper"},
+    };
+    CBMFileResult *r = extract_py(source);
+    bool correct = pylsp_class_sites(r, source, sites, 7);
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_decorator_and_base_calls_join_extracted_caller) {
+    static const char source[] = "def deco(fn):\n    return fn\n"
+                                 "def deco_arg(n):\n    return deco\n"
+                                 "def base_factory(n):\n    return object\n"
+                                 "class Svc:\n    def run(self):\n        return 1\n"
+                                 "@deco_arg(11)\ndef top():\n    pass\n"
+                                 "@deco\ndef bare():\n    pass\n"
+                                 "@deco_arg(12)\nclass Model(base_factory(13)):\n"
+                                 "    marker = Svc()\n"
+                                 "    @deco_arg(marker.run())\n    def m(self):\n        pass\n"
+                                 "    @property\n    def p(self):\n        return 1\n"
+                                 "def outer():\n    @deco_arg(14)\n    def inner():\n        pass\n"
+                                 "    return inner\n";
+    bool correct = true;
+    for (int package = 0; package < 2; package++) {
+        const char *scope = package ? "test.pkg" : "test.main";
+        const char *module = package ? "test.pkg.__init__" : "test.main";
+        char deco[64], base[64], run[64], outer[64];
+        snprintf(deco, sizeof(deco), "%s.deco_arg", scope);
+        snprintf(base, sizeof(base), "%s.base_factory", scope);
+        snprintf(run, sizeof(run), "%s.Svc.run", scope);
+        snprintf(outer, sizeof(outer), "%s.outer", scope);
+        const PylspClassSite sites[] = {
+            {"deco_arg(11)", module, deco},     {"deco_arg(12)", module, deco},
+            {"base_factory(13)", module, base}, {"deco_arg(marker.run())", module, deco},
+            {"marker.run()", module, run},      {"deco_arg(14)", outer, deco}};
+        CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                            package ? "pkg/__init__.py" : "main.py", 0, NULL, NULL);
+        correct = pylsp_class_sites(r, source, sites, 6) && correct;
+        if (r) {
+            const char *bare_sites[] = {"@deco\n", "@property\n"};
+            for (int b = 0; b < 2; b++) {
+                const char *hit = strstr(source, bare_sites[b]);
+                uint32_t lo = (uint32_t)(hit - source);
+                uint32_t hi = lo + (uint32_t)strlen(bare_sites[b]);
+                for (int i = 0; i < r->calls.count; i++)
+                    correct = !(r->calls.items[i].site_start_byte >= lo &&
+                                r->calls.items[i].site_start_byte < hi) &&
+                              correct;
+                for (int i = 0; i < r->resolved_calls.count; i++)
+                    correct = !(r->resolved_calls.items[i].kind == CBM_RESOLVED_INVOCATION &&
+                                r->resolved_calls.items[i].site_start_byte >= lo &&
+                                r->resolved_calls.items[i].site_start_byte < hi) &&
+                              correct;
+            }
+            cbm_free_result(r);
+        }
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_nested_and_local_classbody_calls_join_extracted_caller) {
+    static const char source[] =
+        "def field(n):\n    return n\n"
+        "class Svc:\n    def run(self):\n        return 1\n"
+        "class Outer:\n    tag = Svc()\n"
+        "    class Meta:\n        ordering = field(31)\n        probe = tag.run()\n"
+        "    inner = Meta()\n"
+        "def build():\n    before = field(32)\n"
+        "    class Local:\n        value = field(33)\n"
+        "        class Inner:\n            value = field(34)\n"
+        "    return Local\n"
+        "class Controller:\n    def build(self):\n"
+        "        class Local:\n            value = field(35)\n"
+        "        return Local\n";
+    const PylspClassSite sites[] = {
+        {"field(31)", "test.main", "test.main.field"},
+        {"tag.run()", "test.main", NULL},
+        {"Meta()", "test.main", "test.main.Outer.Meta"},
+        {"field(32)", "test.main.build", "test.main.field"},
+        {"field(33)", "test.main.build", "test.main.field"},
+        {"field(34)", "test.main.build", "test.main.field"},
+        {"field(35)", "test.main.Controller.build", "test.main.field"},
+    };
+    CBMFileResult *r = extract_py(source);
+    bool correct = pylsp_class_sites(r, source, sites, 7) &&
+                   !pylsp_module_has_def(r, "test.main.build.Local") &&
+                   !pylsp_module_has_def(r, "test.main.Controller.build.Local");
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_class_comprehensions_separate_iterable_and_body_scopes) {
+    static const char source[] =
+        "class ModuleSvc:\n    def run(self, n):\n        return n\n"
+        "class ClassSvc:\n"
+        "    def run(self, n):\n        return n\n"
+        "    def items(self) -> list[ModuleSvc]:\n        return []\n"
+        "shared = ModuleSvc()\n"
+        "class Model:\n"
+        "    shared = ClassSvc()\n    local = ClassSvc()\n"
+        "    a = [item.run(41) for item in local.items()]\n"
+        "    b = {shared.run(42) for item in [1]}\n"
+        "    c = {item: shared.run(43) for item in [1]}\n"
+        "    d = (shared.run(44) for item in [1])\n"
+        "    e = [local.run(45) for item in [1]]\n"
+        "    f = [item for item in [1] if local.run(46)]\n"
+        "    g = [item for item in [1] for other in local.items(47)]\n"
+        "    h = [[inner.run(48) for inner in [outer]] for outer in [ModuleSvc()]]\n"
+        "    class Nested:\n"
+        "        shared = ClassSvc()\n"
+        "        a = [shared.run(49) for item in [1]]\n"
+        "    after = shared.run(50)\n"
+        "def control():\n    return [item.run(51) for item in [ModuleSvc()]]\n";
+    const PylspClassSite sites[] = {
+        {"local.items()", "test.main", "test.main.ClassSvc.items"},
+        {"item.run(41)", "test.main", "test.main.ModuleSvc.run"},
+        {"shared.run(42)", "test.main", "test.main.ModuleSvc.run"},
+        {"shared.run(43)", "test.main", "test.main.ModuleSvc.run"},
+        {"shared.run(44)", "test.main", "test.main.ModuleSvc.run"},
+        {"local.run(45)", "test.main", NULL},
+        {"local.run(46)", "test.main", NULL},
+        {"local.items(47)", "test.main", NULL},
+        {"inner.run(48)", "test.main", "test.main.ModuleSvc.run"},
+        {"shared.run(49)", "test.main", "test.main.ModuleSvc.run"},
+        {"shared.run(50)", "test.main", "test.main.ClassSvc.run"},
+        {"item.run(51)", "test.main.control", "test.main.ModuleSvc.run"},
+    };
+    CBMFileResult *r = extract_py(source);
+    bool correct = pylsp_class_sites(r, source, sites, 12) &&
+                   pylsp_module_has_def(r, "test.main.ClassSvc.run") &&
+                   pylsp_module_has_def(r, "test.main.ClassSvc.items");
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_class_legacy_dispatch_cannot_bypass_or_publish_shadows) {
+    static const char source[] = "def wanted(n):\n    return n\n"
+                                 "def other(n):\n    return n\n"
+                                 "class Svc:\n    def run(self, n):\n        return n\n"
+                                 "table = {'x': wanted}\n"
+                                 "fn = lambda obj: obj.run(61)\n"
+                                 "stable = lambda obj: obj.run(62)\n"
+                                 "class Shadow:\n"
+                                 "    table = None\n    a = table['x'](63)\n"
+                                 "    fn = None\n    b = fn(Svc(64))\n"
+                                 "class Replacements:\n"
+                                 "    table = {'x': other}\n    c = table['x'](65)\n"
+                                 "    stable = lambda obj: obj.run(66)\n"
+                                 "outside = table['x'](67)\n"
+                                 "outside_lambda = stable(Svc(68))\n";
+    const PylspClassSite sites[] = {
+        {"table['x'](63)", "test.main", NULL},
+        {"Svc(64)", "test.main", "test.main.Svc"},
+        {"table['x'](65)", "test.main", NULL},
+        {"table['x'](67)", "test.main", "test.main.wanted"},
+        {"Svc(68)", "test.main", "test.main.Svc"},
+    };
+    CBMFileResult *r = extract_py(source);
+    bool correct = pylsp_class_sites(r, source, sites, 5) &&
+                   pylsp_module_has_def(r, "test.main.other") &&
+                   pylsp_module_has_def(r, "test.main.Svc.run");
+    /* A replay has the lambda body's site, not the invocation's site. Verify
+     * those exact sites independently so output dedup cannot hide a replay. */
+    if (r) {
+        const char *body[] = {"obj.run(61)", "obj.run(62)", "obj.run(66)"};
+        for (int b = 0; b < 3; b++) {
+            uint32_t lo = (uint32_t)(strstr(source, body[b]) - source);
+            uint32_t hi = lo + (uint32_t)strlen(body[b]);
+            int extracted = 0, resolved = 0;
+            for (int i = 0; i < r->calls.count; i++)
+                extracted += r->calls.items[i].site_start_byte == lo &&
+                             r->calls.items[i].site_end_byte == hi;
+            for (int i = 0; i < r->resolved_calls.count; i++) {
+                const CBMResolvedCall *hit = &r->resolved_calls.items[i];
+                if (hit->kind == CBM_RESOLVED_INVOCATION && hit->site_start_byte == lo &&
+                    hit->site_end_byte == hi) {
+                    resolved++;
+                    correct = hit->caller_qn && strcmp(hit->caller_qn, "test.main.<lambda>") == 0 &&
+                              hit->callee_qn && strcmp(hit->callee_qn, "test.main.Svc.run") == 0 &&
+                              correct;
+                }
+            }
+            correct = extracted == 1 && resolved == (b == 1 ? 1 : 0) && correct;
+        }
+        cbm_free_result(r);
+    }
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pylsp_class_frame_failure_restores_context_and_stops) {
+    static const char source[] = "class Outer:\n    leaked = 1\n"
+                                 "    first = hit(71)\n"
+                                 "    values = [hit(72) for item in [1]]\n"
+                                 "later = hit(73)\n";
+    TSParser *parser = ts_parser_new();
+    bool setup = parser && ts_parser_set_language(parser, tree_sitter_python());
+    TSTree *tree =
+        setup ? ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source)) : NULL;
+    bool correct = tree && !ts_node_has_error(ts_tree_root_node(tree));
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.hit",
+                         .short_name = "hit",
+                         .label = "Function",
+                         .def_module_qn = "test.main",
+                         .lang = CBM_LANG_PYTHON}};
+    for (int failure = 0; tree && failure < 2; failure++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMTypeRegistry reg;
+        cbm_registry_init(&reg, &arena);
+        bool registered = cbm_py_lsp_test_register_defs(&arena, &reg, defs, 1);
+        CBMResolvedCallArray out = {0};
+        PyLSPContext ctx;
+        py_lsp_init(&ctx, &arena, source, (int)strlen(source), &reg, "test.main", &out);
+        CBMScope *root_scope = ctx.current_scope;
+        ctx.enclosing_func_qn = "saved.caller";
+        ctx.enclosing_class_qn = "saved.class";
+        cbm_py_lsp_test_class_frame_fail_after(failure);
+        py_lsp_process_file(&ctx, ts_tree_root_node(tree));
+        cbm_py_lsp_test_class_frame_fail_after(-1);
+        correct = registered && root_scope && ctx.eval_failure == CBM_LSP_SCOPE_FAILED &&
+                  ctx.current_scope == root_scope && !ctx.class_body_outer_scope &&
+                  !ctx.class_body_qn && !ctx.class_body_in_comprehension &&
+                  strcmp(ctx.enclosing_func_qn, "saved.caller") == 0 &&
+                  strcmp(ctx.enclosing_class_qn, "saved.class") == 0 && out.count == 0 &&
+                  !cbm_scope_lookup_local(root_scope, "leaked") &&
+                  !cbm_scope_lookup_local(root_scope, "Outer") &&
+                  !cbm_scope_lookup_local(root_scope, "later") && correct;
+        (void)cbm_lsp_work_take();
+        py_lsp_process_file(&ctx, ts_tree_root_node(tree));
+        correct = cbm_lsp_work_take() == 0 && out.count == 0 && correct;
+        cbm_arena_destroy(&arena);
+    }
+    if (tree)
+        ts_tree_delete(tree);
+    if (parser)
+        ts_parser_delete(parser);
+    /* The pre-existing package seam must still ignore ordinary module names,
+     * including the new class/comprehension frames. */
+    static const char healthy[] = "def hit(n):\n    return n\n"
+                                  "class Outer:\n    first = hit(74)\n"
+                                  "    values = [hit(75) for item in [1]]\n";
+    cbm_py_lsp_test_scope_fail_after(0);
+    CBMFileResult *r = extract_py(healthy);
+    cbm_py_lsp_test_scope_fail_after(-1);
+    const PylspClassSite sites[] = {{"hit(74)", "test.main", "test.main.hit"},
+                                    {"hit(75)", "test.main", "test.main.hit"}};
+    bool recovered = pylsp_class_sites(r, healthy, sites, 2);
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+
+TEST(pylsp_class_frame_failure_rolls_back_raw_and_cross_outputs) {
+    static const char source[] = "class Outer:\n    item = S()\n    item + item\n    item.m()\n"
+                                 "    class Inner:\n        later = S(81)\n"
+                                 "after = S(82)\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.S",
+         .short_name = "S",
+         .label = "Class",
+         .def_module_qn = "test.main",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.main.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.main.S",
+         .def_module_qn = "test.main",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.main.S.__add__",
+         .short_name = "__add__",
+         .label = "Method",
+         .receiver_type = "test.main.S",
+         .def_module_qn = "test.main",
+         .return_types = "S",
+         .lang = CBM_LANG_PYTHON},
+    };
+    bool correct = true;
+    for (int prebuilt = 0; prebuilt < 2; prebuilt++) {
+        CBMArena arena, shared;
+        cbm_arena_init(&arena);
+        cbm_arena_init(&shared);
+        CBMTypeRegistry *base = prebuilt ? cbm_py_build_cross_registry(&shared, defs, 3) : NULL;
+        CBMTypeRegistry overlay;
+        cbm_registry_init(&overlay, &arena);
+        overlay.fallback = base;
+        CBMResolvedCall prior = {
+            .caller_qn = "test.main",
+            .callee_qn = "test.main.S.__add__",
+            .kind = CBM_RESOLVED_INVOCATION,
+            .confidence = 0.1f,
+            .strategy = "prior.strategy",
+            .reason = "prior.reason",
+            .site_start_byte = (uint32_t)(strstr(source, "item + item") - source),
+            .site_end_byte = (uint32_t)(strstr(source, "item + item") - source) + 11};
+        CBMResolvedCall saved_prior;
+        memcpy(&saved_prior, &prior, sizeof(prior));
+        CBMCall prior_synthetic = {.callee_name = "completed.synthetic"};
+        CBMResolvedCallArray out = {.items = &prior, .count = 1, .cap = 1};
+        CBMCallArray synthetic = {.items = &prior_synthetic, .count = 1, .cap = 1};
+        cbm_py_lsp_test_class_frame_fail_after(1);
+        CBMLSPStatus status =
+            prebuilt
+                ? cbm_run_py_lsp_cross_with_registry_status(&arena, source, (int)strlen(source),
+                                                            "test.main", &overlay, NULL, NULL, 0,
+                                                            NULL, &out, &synthetic)
+                : cbm_run_py_lsp_cross_status(&arena, source, (int)strlen(source), "test.main",
+                                              defs, 3, NULL, NULL, 0, NULL, &out, &synthetic);
+        cbm_py_lsp_test_class_frame_fail_after(-1);
+        correct = (!prebuilt || base) && status == CBM_LSP_SCOPE_FAILED && out.count == 1 &&
+                  synthetic.count == 1 && memcmp(&prior, &saved_prior, sizeof(prior)) == 0 &&
+                  memcmp(&out.items[0], &saved_prior, sizeof(prior)) == 0 &&
+                  strcmp(prior_synthetic.callee_name, "completed.synthetic") == 0 && correct;
+        bool complete =
+            prebuilt ? cbm_run_py_lsp_cross_with_registry(&arena, source, (int)strlen(source),
+                                                          "test.main", &overlay, NULL, NULL, 0,
+                                                          NULL, &out, &synthetic)
+                     : cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs,
+                                            3, NULL, NULL, 0, NULL, &out, &synthetic);
+        correct = complete && out.count > 1 && synthetic.count > 1 &&
+                  out.items[0].confidence > saved_prior.confidence && correct;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&shared);
+    }
+    static const char raw_source[] = "class S:\n    def m(self):\n        return 1\n"
+                                     "class Outer:\n    item = S()\n    item.m()\n"
+                                     "    class Inner:\n        later = S(83)\n";
+    cbm_py_lsp_test_class_frame_fail_after(2);
+    CBMFileResult *r = extract_py(raw_source);
+    cbm_py_lsp_test_class_frame_fail_after(-1);
+    correct = r && r->has_error && r->lsp_skipped && !r->parse_incomplete && r->error_msg &&
+              strcmp(r->error_msg, CBM_PY_LSP_SCOPE_ERROR) == 0 && r->resolved_calls.count == 0 &&
+              r->calls.count > 0 && correct;
+    if (r) {
+        cbm_result_compact(r);
+        correct = r->error_msg && strcmp(r->error_msg, CBM_PY_LSP_SCOPE_ERROR) == 0 && correct;
+        cbm_free_result(r);
+    }
+    r = extract_py(raw_source);
+    const PylspClassSite sites[] = {{"item.m()", "test.main", "test.main.S.m"},
+                                    {"S(83)", "test.main", "test.main.S"}};
+    bool recovered = pylsp_class_sites(r, raw_source, sites, 2);
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(correct);
+    ASSERT_TRUE(recovered);
+    PASS();
+}
+
 SUITE(py_lsp) {
+    RUN_TEST(pylsp_classbody_calls_join_extracted_caller);
+    RUN_TEST(pylsp_classbody_names_visible_to_later_statements_only);
+    RUN_TEST(pylsp_decorator_and_base_calls_join_extracted_caller);
+    RUN_TEST(pylsp_nested_and_local_classbody_calls_join_extracted_caller);
+    RUN_TEST(pylsp_class_comprehensions_separate_iterable_and_body_scopes);
+    RUN_TEST(pylsp_class_legacy_dispatch_cannot_bypass_or_publish_shadows);
+    RUN_TEST(pylsp_class_frame_failure_restores_context_and_stops);
+    RUN_TEST(pylsp_class_frame_failure_rolls_back_raw_and_cross_outputs);
+
+    RUN_TEST(pylsp_init_scope_context_and_helper);
+    RUN_TEST(pylsp_init_scope_raw_exact_occurrences_and_annotations);
+    RUN_TEST(pylsp_init_scope_cross_signatures_keep_definition_language);
+    RUN_TEST(pylsp_init_scope_external_classes_and_cross_exact_joins);
+    RUN_TEST(pylsp_init_scope_failure_preserves_outputs_and_wrappers);
+    RUN_TEST(pylsp_init_scope_shared_failure_keeps_arena_and_needed_fallback);
+
+    RUN_TEST(pylsp_module_callers_join_exact_raw_occurrences);
+    RUN_TEST(pylsp_module_named_lambda_keeps_exact_dunder_pair);
+    RUN_TEST(pylsp_module_cross_callers_own_input_and_join_exact_sites);
+    RUN_TEST(pylsp_issue1527_depth_failure_reports_all_entry_points);
+    RUN_TEST(pylsp_issue1527_cross_memo_failure_fallback_reports_error);
+    RUN_TEST(pylsp_issue1527_cross_memo_failure_preserves_completed_rows);
+    RUN_TEST(pylsp_issue1527_root_class_name_failure_binds_no_external_class);
+    RUN_TEST(pylsp_issue1527_memo_and_depth_failures_stop_work);
+    RUN_TEST(pylsp_issue1527_memo_allocation_failure_is_reported);
+    RUN_TEST(pylsp_scale_work_is_linear);
     /* Phase 2 — smoke */
     RUN_TEST(pylsp_smoke_empty);
     RUN_TEST(pylsp_smoke_one_function);
@@ -2193,6 +3828,8 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_pep695_generic_class);
     /* Phase 9 — cross-file + batch */
     RUN_TEST(pylsp_crossfile_method_dispatch);
+    RUN_TEST(pylsp_crossfile_receiver_through_typed_field);
+    RUN_TEST(pylsp_crossfile_typed_field_shared_registry);
     RUN_TEST(pylsp_fused_self_attr_chain_via_overlay);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);
@@ -2251,5 +3888,6 @@ SUITE(py_lsp) {
     /* Evaluator guards — #710/#720 (distilled PRs #732 + #758) */
     RUN_TEST(pylsp_issue710_deep_call_chain_resolves);
     RUN_TEST(pylsp_issue710_heterogeneous_receiver_chain);
-    RUN_TEST(pylsp_eval_steps_budget_degrades_gracefully);
+    RUN_TEST(pylsp_issue1527_chain_statements_resolve_completely);
+    RUN_TEST(pylsp_issue1527_large_module_resolves_every_call);
 }
