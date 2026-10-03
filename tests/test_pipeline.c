@@ -9141,6 +9141,153 @@ TEST(pipeline_python_module_callers_parallel) {
     return python_module_callers_pipeline_case(true);
 }
 
+/* Distinct targets keep each newly walked class/decorator site observable
+ * even though the stored graph aggregates calls by caller/target pair. */
+static int python_class_body_pipeline_case(bool parallel) {
+    static const char helpers[] =
+        "def top_field():\n    return 1\n"
+        "def nested_field():\n    return 2\n"
+        "def class_decorator(value):\n    return lambda target: target\n"
+        "def class_argument():\n    return 3\n"
+        "def method_decorator(value):\n    return lambda target: target\n"
+        "def method_argument():\n    return 4\n"
+        "def method_control():\n    return 5\n"
+        "def local_field():\n    return 6\n"
+        "def method_local_field():\n    return 7\n"
+        "def base_factory():\n    return object\n"
+        "def package_field():\n    return 8\n"
+        "def package_decorator(value):\n    return lambda target: target\n"
+        "def package_argument():\n    return 9\n";
+    static const char app[] =
+        "from helpers import top_field, nested_field, class_decorator, class_argument\n"
+        "from helpers import method_decorator, method_argument, method_control\n"
+        "from helpers import local_field, method_local_field, base_factory\n"
+        "class Base(base_factory()):\n"
+        "    value = top_field()\n"
+        "    @method_decorator(method_argument())\n"
+        "    def run(self):\n"
+        "        method_control()\n"
+        "        class MethodLocal:\n"
+        "            value = method_local_field()\n"
+        "@class_decorator(class_argument())\n"
+        "class Admin:\n"
+        "    class Meta:\n"
+        "        value = nested_field()\n"
+        "def outer():\n"
+        "    class Local:\n"
+        "        value = local_field()\n"
+        "    return Local\n";
+    static const char package[] =
+        "from helpers import package_field, package_decorator, package_argument\n"
+        "@package_decorator(package_argument())\n"
+        "class Package:\n"
+        "    value = package_field()\n";
+    static const struct {
+        const char *caller;
+        const char *caller_label;
+        const char *target;
+    } expected[] = {
+        {"app", "Module", "helpers.base_factory"},
+        {"app", "Module", "helpers.top_field"},
+        {"app", "Module", "helpers.nested_field"},
+        {"app", "Module", "helpers.class_decorator"},
+        {"app", "Module", "helpers.class_argument"},
+        {"app", "Module", "helpers.method_decorator"},
+        {"app", "Module", "helpers.method_argument"},
+        {"app.Base.run", "Method", "helpers.method_control"},
+        {"app.Base.run", "Method", "helpers.method_local_field"},
+        {"app.outer", "Function", "helpers.local_field"},
+        {"pkg.__init__", "Module", "helpers.package_decorator"},
+        {"pkg.__init__", "Module", "helpers.package_argument"},
+        {"pkg.__init__", "Module", "helpers.package_field"},
+    };
+    char root[512], path[768];
+    int n = snprintf(root, sizeof(root), "%s/cbm-python-class-body-XXXXXX", cbm_tmpdir());
+    if (n <= 0 || (size_t)n >= sizeof(root) || !cbm_mkdtemp(root))
+        FAIL("failed to create Python class-body fixture");
+    n = snprintf(path, sizeof(path), "%s/pkg", root);
+    bool written = n > 0 && (size_t)n < sizeof(path);
+    if (written) {
+        cbm_mkdir_p(path, 0755);
+        written = python_module_write_fixture_file(root, "helpers.py", helpers) &&
+                  python_module_write_fixture_file(root, "app.py", app) &&
+                  python_module_write_fixture_file(root, "pkg/__init__.py", package);
+    }
+    for (int i = 0; written && parallel && i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "class_body_pad_%02d.py", i);
+        written = python_module_write_fixture_file(root, name, "# inert parallel routing file\n");
+    }
+    if (!written) {
+        th_rmtree(root);
+        FAIL("failed to write Python class-body fixture");
+    }
+    const char *keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {0};
+    bool saved_ok = true;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        saved_ok = saved_ok && (!old || saved[i]);
+    }
+    if (!saved_ok) {
+        free(saved[0]);
+        free(saved[1]);
+        th_rmtree(root);
+        FAIL("failed to save Python class-body fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    n = snprintf(path, sizeof(path), "%s/class-body.db", root);
+    cbm_pipeline_t *pipeline = set_rc == 0 && n > 0 && (size_t)n < sizeof(path)
+                                   ? cbm_pipeline_new(root, path, CBM_MODE_FULL)
+                                   : NULL;
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    cbm_pipeline_get_file_errors(pipeline, &errors, &error_count);
+    cbm_store_t *store = run_rc == 0 ? cbm_store_open_path(path) : NULL;
+    bool correct = store != NULL;
+    if (store) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        cbm_node_t *files = NULL;
+        int file_count = 0;
+        correct = project &&
+                  cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
+                      CBM_STORE_OK &&
+                  file_count == (parallel ? 55 : 3);
+        cbm_store_free_nodes(files, file_count);
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            bool edge = project && python_module_exact_lsp_edge(store, project, expected[i].caller,
+                                                                expected[i].caller_label,
+                                                                expected[i].target, "Function");
+            correct = correct && edge;
+        }
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    int restore_rc = 0;
+    for (int i = 0; i < 2; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    int cleanup_rc = th_rmtree(root);
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(cleanup_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(error_count, 0);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pipeline_python_class_body_calls_sequential) {
+    return python_class_body_pipeline_case(false);
+}
+TEST(pipeline_python_class_body_calls_parallel) {
+    return python_class_body_pipeline_case(true);
+}
+
 /* Python file identity keeps .__init__; its exported symbols do not. */
 static bool python_init_local_inheritance(cbm_store_t *store, const char *project,
                                           const char *module) {
@@ -18218,6 +18365,8 @@ TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153) {
 SUITE(pipeline) {
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);
+    RUN_TEST(pipeline_python_class_body_calls_sequential);
+    RUN_TEST(pipeline_python_class_body_calls_parallel);
     RUN_TEST(pipeline_python_init_scope_sequential);
     RUN_TEST(pipeline_python_init_scope_parallel);
     RUN_TEST(pipeline_python_init_raw_scope_failure_sequential);
