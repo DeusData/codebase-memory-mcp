@@ -7,6 +7,15 @@
 #include "../cbm.h"
 #include "go_lsp.h"  /* CBMLSPDef reused across languages */
 
+/* Per-file typed import evidence. NULL targets means unknown; otherwise
+ * targets has one slot per represented import, NULL only for a binding whose
+ * absence was established. Any unsupported unresolved binding makes the whole
+ * file unknown. The array is caller-owned; strings and import records borrowed. */
+typedef struct {
+    const CBMImportArray *imports;
+    const char **targets;
+} CBMPHPImportBindings;
+
 /* PHPLSPContext — per-file state for PHP type-aware call resolution.
  * Mirrors GoLSPContext / CLSPContext structure. */
 typedef struct {
@@ -27,6 +36,13 @@ typedef struct {
     enum { CBM_PHP_USE_CLASS = 0, CBM_PHP_USE_FUNCTION, CBM_PHP_USE_CONST } *use_kinds;
     int use_count;
     int use_cap;
+
+    /* Cross-file mode: dotted targets of the file's class `use` declarations
+     * that the pipeline's import map left unresolved (vendor / unmapped
+     * namespaces, #1186). A type named through one is outside the project: it
+     * never matches a project type by short name. */
+    const char **external_use_qns;
+    int external_use_count;
 
     /* Current function/method/class context. */
     const char *enclosing_func_qn;
@@ -115,6 +131,15 @@ void cbm_run_php_lsp_cross(
     const char **import_names, const char **import_qns, int import_count,
     TSTree *cached_tree,           /* NULL = parse internally */
     CBMResolvedCallArray *out);
+
+/* Complete typed bindings enable external receiver evidence. */
+void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, int source_len,
+                                         const char *module_qn, CBMLSPDef *defs, int def_count,
+                                         const char **import_names, const char **import_qns,
+                                         int import_count,
+                                         TSTree *cached_tree, /* NULL = parse internally */
+                                         CBMResolvedCallArray *out,
+                                         const CBMPHPImportBindings *bindings);
 
 /* --- Batch cross-file LSP --- */
 

@@ -253,6 +253,17 @@ const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name) {
     return php_ns_to_dot(ctx->arena, name);
 }
 
+/* True when `qn` is, or lies under, the target of a class `use` the pipeline
+ * left unresolved: a type outside the project (cross-file mode only). */
+static bool php_external_qn(const PHPLSPContext *ctx, const char *qn) {
+    for (int i = 0; qn && i < ctx->external_use_count; i++) {
+        size_t n = strlen(ctx->external_use_qns[i]);
+        if (strncmp(qn, ctx->external_use_qns[i], n) == 0 && (qn[n] == '\0' || qn[n] == '.'))
+            return true;
+    }
+    return false;
+}
+
 /* Try to find a registered type for a "namespaced" QN.
  *
  * Lookup order:
@@ -265,13 +276,17 @@ const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name) {
  *
  * Step 4 is critical for PHP because the unified extractor builds QNs from
  * file paths but `use App\\Models\\User` produces an "App.Models.User" key.
- * Without short-name fallback, every cross-file class resolution would miss. */
+ * Without short-name fallback, every cross-file class resolution would miss.
+ * A QN named through a vendor `use` stops after step 1: `Saloon.Http.Request`
+ * is not the project's App.Http.Requests.Request (#1186). */
 static const CBMRegisteredType *lookup_type_with_project(PHPLSPContext *ctx, const char *qn) {
     if (!qn)
         return NULL;
     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, qn);
     if (t)
         return t;
+    if (php_external_qn(ctx, qn))
+        return NULL;
 
     if (ctx->module_qn && ctx->module_qn[0]) {
         const char *combo = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);
@@ -1410,6 +1425,23 @@ static void php_stamp_resolved_site(PHPLSPContext *ctx, int first, TSNode site) 
     }
 }
 
+/* The method of a class the index does not hold. When the class came from a
+ * vendor `use` (cross-file mode), the row is emitted above the pipeline's
+ * confidence floor as php_external_receiver: the receiver is PROVEN to be a
+ * type outside the project, so no name-only fallback may bind the call to a
+ * same-named project method (#1186). Otherwise the existing low-confidence
+ * `unindexed_strategy` row. */
+static void emit_external_or_unindexed(PHPLSPContext *ctx, const char *class_qn,
+                                       const char *method_name, const char *unindexed_strategy,
+                                       CBMResolvedKind kind) {
+    const char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name);
+    if (php_external_qn(ctx, class_qn)) {
+        emit_resolved_kind(ctx, target, "php_external_receiver", 0.95f, kind);
+        return;
+    }
+    emit_resolved_kind(ctx, target, unindexed_strategy, 0.55f, kind);
+}
+
 static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const char *reason) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn)
         return;
@@ -1727,8 +1759,7 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
      * at "<class_qn>.<method>" so the pipeline bridge can BLOCK the unified
      * extractor's likely-incorrect short-name fallback. The bridge filters
      * unknown targets and yields no edge — better than a wrong edge. */
-    emit_resolved_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                       "php_method_typed_unindexed", 0.55f, kind);
+    emit_external_or_unindexed(ctx, class_qn, method_name, "php_method_typed_unindexed", kind);
 }
 
 static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind kind) {
@@ -1787,8 +1818,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
     /* Class resolved (e.g., from a `use` clause), method unknown — emit
      * synthetic resolved call so the pipeline bridge can suppress the
      * unified extractor's name-fallback misroute. */
-    emit_resolved_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                       "php_static_unindexed", 0.55f, kind);
+    emit_external_or_unindexed(ctx, class_qn, method_name, "php_static_unindexed", kind);
 }
 
 /* ── type narrowing ─────────────────────────────────────────────────
@@ -4483,10 +4513,95 @@ void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegi
     }
 }
 
+static int php_pipeline_use_kind(CBMImportKind kind) {
+    if (kind == CBM_IMPORT_KIND_FUNCTION)
+        return CBM_PHP_USE_FUNCTION;
+    if (kind == CBM_IMPORT_KIND_CONST)
+        return CBM_PHP_USE_CONST;
+    return CBM_PHP_USE_CLASS;
+}
+
+/* Import edges name files, while the use table names symbols. Bind only a
+ * unique definition in that proven file; never use an unrelated short-name
+ * match to manufacture the imported symbol. Namespace aliases retain their
+ * source namespace spelling when no such definition exists. */
+static const char *php_pipeline_import_qn(PHPLSPContext *ctx, const CBMImport *imp,
+                                          const char *target, CBMLSPDef *defs, int def_count) {
+    const char *leaf = imp->module_path ? strrchr(imp->module_path, '\\') : NULL;
+    leaf = leaf ? leaf + 1 : imp->module_path;
+    if (!leaf || !leaf[0])
+        return target;
+    size_t target_len = strlen(target);
+    static const char file_suffix[] = ".__file__";
+    bool file = target_len >= sizeof(file_suffix) - 1 &&
+                strcmp(target + target_len - (sizeof(file_suffix) - 1), file_suffix) == 0;
+    size_t module_len = file ? target_len - (sizeof(file_suffix) - 1) : 0;
+    const char *found = NULL;
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *def = &defs[i];
+        if (!def->qualified_name || !def->short_name || !def->label ||
+            strcmp(def->short_name, leaf) != 0)
+            continue;
+        bool in_file = file && def->def_module_qn && strlen(def->def_module_qn) == module_len &&
+                       strncmp(def->def_module_qn, target, module_len) == 0;
+        if (!in_file && strcmp(def->qualified_name, target) != 0)
+            continue;
+        bool kind_matches =
+            imp->kind == CBM_IMPORT_KIND_FUNCTION ? strcmp(def->label, "Function") == 0
+            : imp->kind == CBM_IMPORT_KIND_CONST
+                ? strcmp(def->label, "Constant") == 0 || strcmp(def->label, "Variable") == 0
+                : strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
+                      strcmp(def->label, "Trait") == 0 || strcmp(def->label, "Enum") == 0;
+        if (!kind_matches)
+            continue;
+        if (found && strcmp(found, def->qualified_name) != 0) {
+            found = NULL;
+            break;
+        }
+        found = def->qualified_name;
+    }
+    if (found)
+        return found;
+    const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
+    return php_ns_to_dot(ctx->arena, name);
+}
+
+static void php_collect_external_uses(PHPLSPContext *ctx, const CBMPHPImportBindings *bindings) {
+    if (!bindings || !bindings->targets || !bindings->imports)
+        return;
+    int count = bindings->imports->count;
+    ctx->external_use_qns =
+        cbm_arena_alloc(ctx->arena, (size_t)(count > 0 ? count : 1) * sizeof(char *));
+    if (!ctx->external_use_qns)
+        return;
+    for (int i = 0; i < count; i++) {
+        const CBMImport *imp = &bindings->imports->items[i];
+        if (imp->kind == CBM_IMPORT_KIND_DEFAULT && !bindings->targets[i] && imp->local_name &&
+            imp->local_name[0] && imp->module_path && imp->module_path[0]) {
+            const char *name =
+                imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
+            const char *qn = php_ns_to_dot(ctx->arena, name);
+            if (qn)
+                ctx->external_use_qns[ctx->external_use_count++] = qn;
+        }
+    }
+}
+
 void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
                            const char *module_qn, CBMLSPDef *defs, int def_count,
                            const char **import_names, const char **import_qns, int import_count,
                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_php_lsp_cross_with_bindings(arena, source, source_len, module_qn, defs, def_count,
+                                        import_names, import_qns, import_count, cached_tree, out,
+                                        NULL);
+}
+
+void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, int source_len,
+                                         const char *module_qn, CBMLSPDef *defs, int def_count,
+                                         const char **import_names, const char **import_qns,
+                                         int import_count, TSTree *cached_tree,
+                                         CBMResolvedCallArray *out,
+                                         const CBMPHPImportBindings *bindings) {
     if (!arena || !source || source_len <= 0 || !out)
         return;
 
@@ -4526,11 +4641,23 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     /* Caller-supplied imports register first. process_file's own AST walk
      * adds file-internal `use` declarations on top of these. */
-    for (int i = 0; i < import_count; i++) {
-        if (import_names && import_qns && import_names[i] && import_qns[i]) {
-            php_lsp_add_use(&ctx, import_names[i], import_qns[i], CBM_PHP_USE_CLASS);
+    if (bindings && bindings->targets && bindings->imports) {
+        for (int i = 0; i < bindings->imports->count; i++) {
+            const CBMImport *imp = &bindings->imports->items[i];
+            if (imp->local_name && bindings->targets[i])
+                php_lsp_add_use(
+                    &ctx, imp->local_name,
+                    php_pipeline_import_qn(&ctx, imp, bindings->targets[i], defs, def_count),
+                    php_pipeline_use_kind(imp->kind));
+        }
+    } else {
+        for (int i = 0; i < import_count; i++) {
+            if (import_names && import_qns && import_names[i] && import_qns[i]) {
+                php_lsp_add_use(&ctx, import_names[i], import_qns[i], CBM_PHP_USE_CLASS);
+            }
         }
     }
+    int supplied_use_count = ctx.use_count;
 
     /* Class field collection — same flow as cbm_run_php_lsp. Walks the AST
      * to populate typed-property field maps so $this->prop and $obj->prop
@@ -4548,10 +4675,11 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
                 collect_use_declaration(&ctx, c);
             }
         }
+        php_collect_external_uses(&ctx, bindings);
         cbm_php_refine_lsp_registry(&ctx, &reg, root);
         ctx.current_namespace_qn = "";
         /* Reset to caller-supplied uses only — process_file re-adds AST uses. */
-        ctx.use_count = import_count;
+        ctx.use_count = supplied_use_count;
     }
 
     php_lsp_process_file(&ctx, root);
