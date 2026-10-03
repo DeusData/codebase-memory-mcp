@@ -1453,6 +1453,7 @@ static const char *const JSX_AMP_BODIES[] = {
     "<p title=\"a&\">x</p>",                   /* '&' right before the quote */
     "<p>Tom &Jerry</p>",                       /* '&' + letter in JSX text */
     "<p>Tom & Jerry</p>",                      /* '&' + space in JSX text */
+    "<th className=\"p-4 font-semibold\">Role & Dept</th>", /* #2481 report reproduction */
     "<p>x &1 y</p>",                           /* '&' + digit in JSX text */
     /* controls: references keep parsing; '& ' / '&1' in attributes */
     "<p title=\"x&amp;y&#38;z & w &1\">A&amp;B &#38; C</p>",
