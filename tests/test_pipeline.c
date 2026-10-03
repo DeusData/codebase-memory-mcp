@@ -8331,6 +8331,205 @@ TEST(pipeline_issue1527_cross_memo_failure_fallback) {
     PASS();
 }
 
+static bool python_module_write_fixture_file(const char *root, const char *name, const char *text) {
+    char path[768];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, name);
+    return n > 0 && (size_t)n < sizeof(path) && th_write_file(path, text) == 0;
+}
+
+/* An absent node, failed edge query, or heuristic edge must not satisfy this
+ * integration check. Exact source/target identities precede strategy checks. */
+static bool python_module_exact_lsp_edge(cbm_store_t *store, const char *project,
+                                         const char *caller, const char *caller_label,
+                                         const char *target, const char *target_label) {
+    char source_qn[768], target_qn[768];
+    int sn = snprintf(source_qn, sizeof(source_qn), "%s.%s", project, caller);
+    int tn = snprintf(target_qn, sizeof(target_qn), "%s.%s", project, target);
+    if (sn <= 0 || (size_t)sn >= sizeof(source_qn) || tn <= 0 || (size_t)tn >= sizeof(target_qn))
+        return false;
+    cbm_node_t source = {0}, destination = {0};
+    bool correct =
+        cbm_store_find_node_by_qn(store, project, source_qn, &source) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(store, project, target_qn, &destination) == CBM_STORE_OK &&
+        source.id > 0 && destination.id > 0 && source.label && destination.label &&
+        strcmp(source.label, caller_label) == 0 && strcmp(destination.label, target_label) == 0;
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0, hits = 0;
+    if (correct) {
+        correct = cbm_store_find_edges_by_source_type(store, source.id, "CALLS", &edges,
+                                                      &edge_count) == CBM_STORE_OK;
+        for (int i = 0; correct && i < edge_count; i++) {
+            if (edges[i].source_id != source.id || edges[i].target_id != destination.id)
+                continue;
+            hits++;
+            const char *properties = edges[i].properties_json;
+            yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
+            const char *strategy =
+                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
+            correct = strategy && strncmp(strategy, "lsp_", 4) == 0;
+            if (doc)
+                yyjson_doc_free(doc);
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_node_free_fields(&source);
+    cbm_node_free_fields(&destination);
+    return correct && hits == 1;
+}
+
+static int python_module_callers_pipeline_case(bool parallel) {
+    static const char helpers[] = "def helper():\n"
+                                  "    return 1\n"
+                                  "class Service:\n"
+                                  "    def run(self):\n"
+                                  "        return 2\n";
+    static const char app[] = "from helpers import helper, Service\n"
+                              "def local_helper():\n"
+                              "    return 3\n"
+                              "class Local:\n"
+                              "    def run(self):\n"
+                              "        return 4\n"
+                              "class Controller:\n"
+                              "    def run(self):\n"
+                              "        helper()\n"
+                              "        method_service = Service()\n"
+                              "        method_service.run()\n"
+                              "def control():\n"
+                              "    helper()\n"
+                              "    function_service = Service()\n"
+                              "    function_service.run()\n"
+                              "    local_helper()\n"
+                              "    function_local = Local()\n"
+                              "    function_local.run()\n"
+                              "helper()\n"
+                              "module_service = Service()\n"
+                              "module_service.run()\n"
+                              "local_helper()\n"
+                              "module_local = Local()\n"
+                              "module_local.run()\n";
+    static const struct {
+        const char *caller;
+        const char *caller_label;
+        const char *target;
+        const char *target_label;
+    } expected[] = {
+        {"app", "Module", "helpers.helper", "Function"},
+        {"app", "Module", "helpers.Service.run", "Method"},
+        {"app", "Module", "app.local_helper", "Function"},
+        {"app", "Module", "app.Local.run", "Method"},
+        {"app.control", "Function", "helpers.helper", "Function"},
+        {"app.control", "Function", "helpers.Service.run", "Method"},
+        {"app.control", "Function", "app.local_helper", "Function"},
+        {"app.control", "Function", "app.Local.run", "Method"},
+        {"app.Controller.run", "Method", "helpers.helper", "Function"},
+        {"app.Controller.run", "Method", "helpers.Service.run", "Method"},
+        {"pkg.__init__", "Module", "helpers.helper", "Function"},
+    };
+    char root[512];
+    int n = snprintf(root, sizeof(root), "%s/cbm-python-module-XXXXXX", cbm_tmpdir());
+    if (n <= 0 || (size_t)n >= sizeof(root) || !cbm_mkdtemp(root))
+        FAIL("failed to create Python module fixture");
+    char path[768];
+    n = snprintf(path, sizeof(path), "%s/pkg", root);
+    bool written = n > 0 && (size_t)n < sizeof(path);
+    if (written) {
+        cbm_mkdir_p(path, 0755);
+        written = python_module_write_fixture_file(root, "helpers.py", helpers) &&
+                  python_module_write_fixture_file(root, "app.py", app) &&
+                  python_module_write_fixture_file(root, "pkg/__init__.py",
+                                                   "from helpers import helper\n"
+                                                   "PACKAGE_VALUE = helper()\n");
+    }
+    for (int i = 0; written && parallel && i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "module_pad_%02d.py", i);
+        written = python_module_write_fixture_file(root, name, "padding = 0\n");
+    }
+    if (!written) {
+        th_rmtree(root);
+        FAIL("failed to write Python module fixture");
+    }
+
+    const char *keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {0};
+    bool saved_ok = true;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        saved_ok = saved_ok && (!old || saved[i]);
+    }
+    if (!saved_ok) {
+        free(saved[0]);
+        free(saved[1]);
+        th_rmtree(root);
+        FAIL("failed to save Python module fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    n = snprintf(path, sizeof(path), "%s/module.db", root);
+    cbm_pipeline_t *pipeline = set_rc == 0 && n > 0 && (size_t)n < sizeof(path)
+                                   ? cbm_pipeline_new(root, path, CBM_MODE_FULL)
+                                   : NULL;
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    cbm_pipeline_get_file_errors(pipeline, &errors, &error_count);
+    cbm_store_t *store = run_rc == 0 ? cbm_store_open_path(path) : NULL;
+    bool correct = store != NULL;
+    int file_count = 0;
+    if (store) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        cbm_node_t *files = NULL;
+        correct = project &&
+                  cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
+                      CBM_STORE_OK &&
+                  file_count == (parallel ? 55 : 3);
+        cbm_store_free_nodes(files, file_count);
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            bool edge = project && python_module_exact_lsp_edge(
+                                       store, project, expected[i].caller, expected[i].caller_label,
+                                       expected[i].target, expected[i].target_label);
+            correct = correct && edge;
+        }
+        /* Neither the ordinary nor package Module should acquire a fake
+         * __module__ owner node. A failed lookup query is not absence proof. */
+        const char *phantoms[] = {"app.__module__", "pkg.__init__.__module__"};
+        for (int i = 0; project && i < 2; i++) {
+            char qn[768];
+            n = snprintf(qn, sizeof(qn), "%s.%s", project, phantoms[i]);
+            cbm_node_t node = {0};
+            bool absent =
+                n > 0 && (size_t)n < sizeof(qn) &&
+                cbm_store_find_node_by_qn(store, project, qn, &node) == CBM_STORE_NOT_FOUND;
+            correct = correct && absent;
+            cbm_node_free_fields(&node);
+        }
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    int restore_rc = 0;
+    for (int i = 0; i < 2; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    int cleanup_rc = th_rmtree(root);
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(cleanup_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(error_count, 0);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pipeline_python_module_callers_sequential) {
+    return python_module_callers_pipeline_case(false);
+}
+
+TEST(pipeline_python_module_callers_parallel) {
+    return python_module_callers_pipeline_case(true);
+}
+
 /* #1277: typed instance fields of a Python class imported from another file.
  * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
  * LSP strategy. */
@@ -16575,6 +16774,8 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_python_module_callers_sequential);
+    RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_sequential);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_parallel);
     RUN_TEST(pipeline_issue1527_python_cross_memo_failure_sequential);
