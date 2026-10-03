@@ -304,10 +304,20 @@ typedef struct {
                                      // guard's unique-name exemption. Default false.
 } CBMCall;
 
+// What an import statement names, when the syntax says so. Only PHP's
+// `use function` / `use const` set a non-default kind today: they name a
+// namespace MEMBER, so they must never be mapped to a class file (#1186).
+typedef enum {
+    CBM_IMPORT_KIND_DEFAULT = 0, // module / class / namespace (language default)
+    CBM_IMPORT_KIND_FUNCTION,    // PHP `use function A\b`
+    CBM_IMPORT_KIND_CONST,       // PHP `use const A\B`
+} CBMImportKind;
+
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
+    CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
 
 typedef enum {
