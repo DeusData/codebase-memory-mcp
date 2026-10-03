@@ -3032,11 +3032,28 @@ static _Thread_local bool g_cypher_timed_out = false;
 static _Thread_local bool g_cypher_truncated = false;
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local cbm_cypher_test_clock_fn g_cypher_deadline_clock = NULL;
+
+void cbm_cypher_test_set_deadline_clock(cbm_cypher_test_clock_fn clock_fn) {
+    g_cypher_deadline_clock = clock_fn;
+}
+#endif
+
+static uint64_t cypher_deadline_now(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_cypher_deadline_clock) {
+        return g_cypher_deadline_clock();
+    }
+#endif
+    return cbm_now_ms();
+}
+
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
     int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
                                                         : CYPHER_DEADLINE_BUDGET_MS;
-    g_cypher_deadline_ms = cbm_now_ms() + (uint64_t)budget;
+    g_cypher_deadline_ms = cypher_deadline_now() + (uint64_t)budget;
 }
 
 /* True once the query has run past its wall-clock budget. Sticky: after the
@@ -3048,7 +3065,7 @@ static bool cypher_deadline_exceeded(void) {
     if (g_cypher_deadline_ms == 0) {
         return false;
     }
-    if (cbm_now_ms() >= g_cypher_deadline_ms) {
+    if (cypher_deadline_now() >= g_cypher_deadline_ms) {
         g_cypher_timed_out = true;
         return true;
     }
