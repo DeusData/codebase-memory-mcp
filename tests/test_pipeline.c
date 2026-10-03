@@ -10,7 +10,10 @@
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
 #include "pipeline/lsp_surface.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
@@ -8166,6 +8169,506 @@ static void teardown_usages_repo(void) {
     g_usages_tmpdir[0] = '\0';
 }
 
+/* Real cross-file memo failure, after successful extraction. The failure
+ * must reach the public per-file error list on both production drivers. */
+static int pipeline_lsp_failure_case(bool parallel, const char *stage, bool python, bool depth) {
+    const char *src = "struct S { int m() { return 1; } };\n"
+                      "void run() { S s; s.m(); }\n";
+    if (python)
+        src = "class S:\n    def m(self):\n        return 1\ndef run():\n    s = S()\n    s.m()\n";
+    const char *filename = python ? "memo.py" : "memo.cpp";
+    if (setup_usages_repo(filename, src, NULL, NULL) != 0)
+        FAIL("failed to create memo fixture");
+    char path[512];
+    if (parallel) {
+        for (int i = 0; i < 51; i++) {
+            snprintf(path, sizeof(path), "%s/memo_pad_%02d.%s", g_usages_tmpdir, i,
+                     python ? "py" : "cpp");
+            if (th_write_file(path, python ? "# inert parallel routing fixture\n"
+                                           : "// inert parallel routing fixture\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to create parallel routing fixture");
+            }
+        }
+    }
+    const char *keys[] = {
+        "CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD",
+        depth ? (python ? "CBM_TEST_PY_LSP_DEPTH_FAIL_STAGE" : "CBM_TEST_C_LSP_DEPTH_FAIL_STAGE")
+              : (python ? "CBM_TEST_PY_LSP_MEMO_FAIL_STAGE" : "CBM_TEST_C_LSP_MEMO_FAIL_STAGE")};
+    char *saved[3] = {0};
+    bool env_saved = true;
+    for (int i = 0; i < 3; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        env_saved = env_saved && (!old || saved[i]);
+    }
+    if (!env_saved) {
+        for (int i = 0; i < 3; i++)
+            free(saved[i]);
+        teardown_usages_repo();
+        FAIL("failed to save memo fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    set_rc |= cbm_setenv(keys[2], stage, 1);
+    snprintf(path, sizeof(path), "%s/memo.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = set_rc == 0 ? cbm_pipeline_new(g_usages_tmpdir, path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    cbm_pipeline_get_file_errors(p, &errors, &error_count);
+    int memo_errors = 0;
+    const char *expected_phase = strcmp(stage, "cross") == 0 ? "lsp_skipped" : "extract";
+    bool precise = true;
+    for (int i = 0; i < error_count; i++) {
+        if (errors[i].path && strcmp(errors[i].path, filename) == 0) {
+            memo_errors++;
+            precise = precise && errors[i].phase && strcmp(errors[i].phase, expected_phase) == 0 &&
+                      errors[i].reason &&
+                      strcmp(errors[i].reason,
+                             depth ? (python ? CBM_PY_LSP_DEPTH_ERROR : CBM_C_LSP_DEPTH_ERROR)
+                                   : (python ? CBM_PY_LSP_MEMO_ERROR : CBM_C_LSP_MEMO_ERROR)) == 0;
+        }
+    }
+    cbm_pipeline_free(p);
+    int restore_rc = 0;
+    for (int i = 0; i < 3; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    teardown_usages_repo();
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(memo_errors, 1);
+    ASSERT_TRUE(precise);
+    PASS();
+}
+
+TEST(pipeline_issue1527_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", false, false);
+}
+TEST(pipeline_issue1527_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", false, false);
+}
+
+TEST(pipeline_issue1527_raw_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", false, false);
+}
+TEST(pipeline_issue1527_raw_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", false, false);
+}
+
+TEST(pipeline_issue1527_python_raw_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", true, false);
+}
+
+TEST(pipeline_issue1527_python_raw_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", true, false);
+}
+
+TEST(pipeline_issue1527_python_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", true, false);
+}
+
+TEST(pipeline_issue1527_python_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", true, false);
+}
+
+TEST(pipeline_issue1527_c_raw_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", false, true);
+}
+
+TEST(pipeline_issue1527_c_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", false, true);
+}
+
+TEST(pipeline_issue1527_c_raw_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", false, true);
+}
+
+TEST(pipeline_issue1527_c_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", false, true);
+}
+
+TEST(pipeline_issue1527_python_raw_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", true, true);
+}
+
+TEST(pipeline_issue1527_python_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", true, true);
+}
+
+TEST(pipeline_issue1527_python_raw_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", true, true);
+}
+
+TEST(pipeline_issue1527_python_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", true, true);
+}
+
+TEST(pipeline_issue1527_cross_memo_failure_fallback) {
+    const char *src = "struct S { int m() { return 1; } }; void run() { S s; s.m(); }";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.S", .short_name = "S", .label = "Class", .lang = CBM_LANG_CPP},
+        {.qualified_name = "test.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "int",
+         .lang = CBM_LANG_CPP},
+    };
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_c_lsp_test_memo_fail_after(0);
+    cbm_pxc_run_one(CBM_LANG_CPP, &result, src, (int)strlen(src), "test", defs, 2, NULL, NULL, 0);
+    cbm_c_lsp_test_memo_fail_after(-1);
+    bool reported = result.has_error && result.lsp_skipped && result.error_msg &&
+                    strcmp(result.error_msg, CBM_C_LSP_MEMO_ERROR) == 0 &&
+                    result.resolved_calls.count == 0;
+    cbm_arena_destroy(&result.arena);
+    ASSERT_TRUE(reported);
+    PASS();
+}
+
+static bool python_module_write_fixture_file(const char *root, const char *name, const char *text) {
+    char path[768];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, name);
+    return n > 0 && (size_t)n < sizeof(path) && th_write_file(path, text) == 0;
+}
+
+/* An absent node, failed edge query, or heuristic edge must not satisfy this
+ * integration check. Exact source/target identities precede strategy checks. */
+static bool python_module_exact_lsp_edge(cbm_store_t *store, const char *project,
+                                         const char *caller, const char *caller_label,
+                                         const char *target, const char *target_label) {
+    char source_qn[768], target_qn[768];
+    int sn = snprintf(source_qn, sizeof(source_qn), "%s.%s", project, caller);
+    int tn = snprintf(target_qn, sizeof(target_qn), "%s.%s", project, target);
+    if (sn <= 0 || (size_t)sn >= sizeof(source_qn) || tn <= 0 || (size_t)tn >= sizeof(target_qn))
+        return false;
+    cbm_node_t source = {0}, destination = {0};
+    bool correct =
+        cbm_store_find_node_by_qn(store, project, source_qn, &source) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(store, project, target_qn, &destination) == CBM_STORE_OK &&
+        source.id > 0 && destination.id > 0 && source.label && destination.label &&
+        strcmp(source.label, caller_label) == 0 && strcmp(destination.label, target_label) == 0;
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0, hits = 0;
+    if (correct) {
+        correct = cbm_store_find_edges_by_source_type(store, source.id, "CALLS", &edges,
+                                                      &edge_count) == CBM_STORE_OK;
+        for (int i = 0; correct && i < edge_count; i++) {
+            if (edges[i].source_id != source.id || edges[i].target_id != destination.id)
+                continue;
+            hits++;
+            const char *properties = edges[i].properties_json;
+            yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
+            const char *strategy =
+                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
+            correct = strategy && strncmp(strategy, "lsp_", 4) == 0;
+            if (doc)
+                yyjson_doc_free(doc);
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_node_free_fields(&source);
+    cbm_node_free_fields(&destination);
+    return correct && hits == 1;
+}
+
+static int python_module_callers_pipeline_case(bool parallel) {
+    static const char helpers[] = "def helper():\n"
+                                  "    return 1\n"
+                                  "class Service:\n"
+                                  "    def run(self):\n"
+                                  "        return 2\n";
+    static const char app[] = "from helpers import helper, Service\n"
+                              "def local_helper():\n"
+                              "    return 3\n"
+                              "class Local:\n"
+                              "    def run(self):\n"
+                              "        return 4\n"
+                              "class Controller:\n"
+                              "    def run(self):\n"
+                              "        helper()\n"
+                              "        method_service = Service()\n"
+                              "        method_service.run()\n"
+                              "def control():\n"
+                              "    helper()\n"
+                              "    function_service = Service()\n"
+                              "    function_service.run()\n"
+                              "    local_helper()\n"
+                              "    function_local = Local()\n"
+                              "    function_local.run()\n"
+                              "helper()\n"
+                              "module_service = Service()\n"
+                              "module_service.run()\n"
+                              "local_helper()\n"
+                              "module_local = Local()\n"
+                              "module_local.run()\n";
+    static const struct {
+        const char *caller;
+        const char *caller_label;
+        const char *target;
+        const char *target_label;
+    } expected[] = {
+        {"app", "Module", "helpers.helper", "Function"},
+        {"app", "Module", "helpers.Service.run", "Method"},
+        {"app", "Module", "app.local_helper", "Function"},
+        {"app", "Module", "app.Local.run", "Method"},
+        {"app.control", "Function", "helpers.helper", "Function"},
+        {"app.control", "Function", "helpers.Service.run", "Method"},
+        {"app.control", "Function", "app.local_helper", "Function"},
+        {"app.control", "Function", "app.Local.run", "Method"},
+        {"app.Controller.run", "Method", "helpers.helper", "Function"},
+        {"app.Controller.run", "Method", "helpers.Service.run", "Method"},
+        {"pkg.__init__", "Module", "helpers.helper", "Function"},
+    };
+    char root[512];
+    int n = snprintf(root, sizeof(root), "%s/cbm-python-module-XXXXXX", cbm_tmpdir());
+    if (n <= 0 || (size_t)n >= sizeof(root) || !cbm_mkdtemp(root))
+        FAIL("failed to create Python module fixture");
+    char path[768];
+    n = snprintf(path, sizeof(path), "%s/pkg", root);
+    bool written = n > 0 && (size_t)n < sizeof(path);
+    if (written) {
+        cbm_mkdir_p(path, 0755);
+        written = python_module_write_fixture_file(root, "helpers.py", helpers) &&
+                  python_module_write_fixture_file(root, "app.py", app) &&
+                  python_module_write_fixture_file(root, "pkg/__init__.py",
+                                                   "from helpers import helper\n"
+                                                   "PACKAGE_VALUE = helper()\n");
+    }
+    for (int i = 0; written && parallel && i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "module_pad_%02d.py", i);
+        written = python_module_write_fixture_file(root, name, "padding = 0\n");
+    }
+    if (!written) {
+        th_rmtree(root);
+        FAIL("failed to write Python module fixture");
+    }
+
+    const char *keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {0};
+    bool saved_ok = true;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        saved_ok = saved_ok && (!old || saved[i]);
+    }
+    if (!saved_ok) {
+        free(saved[0]);
+        free(saved[1]);
+        th_rmtree(root);
+        FAIL("failed to save Python module fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    n = snprintf(path, sizeof(path), "%s/module.db", root);
+    cbm_pipeline_t *pipeline = set_rc == 0 && n > 0 && (size_t)n < sizeof(path)
+                                   ? cbm_pipeline_new(root, path, CBM_MODE_FULL)
+                                   : NULL;
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    cbm_pipeline_get_file_errors(pipeline, &errors, &error_count);
+    cbm_store_t *store = run_rc == 0 ? cbm_store_open_path(path) : NULL;
+    bool correct = store != NULL;
+    int file_count = 0;
+    if (store) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        cbm_node_t *files = NULL;
+        correct = project &&
+                  cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
+                      CBM_STORE_OK &&
+                  file_count == (parallel ? 55 : 3);
+        cbm_store_free_nodes(files, file_count);
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            bool edge = project && python_module_exact_lsp_edge(
+                                       store, project, expected[i].caller, expected[i].caller_label,
+                                       expected[i].target, expected[i].target_label);
+            correct = correct && edge;
+        }
+        /* Neither the ordinary nor package Module should acquire a fake
+         * __module__ owner node. A failed lookup query is not absence proof. */
+        const char *phantoms[] = {"app.__module__", "pkg.__init__.__module__"};
+        for (int i = 0; project && i < 2; i++) {
+            char qn[768];
+            n = snprintf(qn, sizeof(qn), "%s.%s", project, phantoms[i]);
+            cbm_node_t node = {0};
+            bool absent =
+                n > 0 && (size_t)n < sizeof(qn) &&
+                cbm_store_find_node_by_qn(store, project, qn, &node) == CBM_STORE_NOT_FOUND;
+            correct = correct && absent;
+            cbm_node_free_fields(&node);
+        }
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    int restore_rc = 0;
+    for (int i = 0; i < 2; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    int cleanup_rc = th_rmtree(root);
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(cleanup_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(error_count, 0);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pipeline_python_module_callers_sequential) {
+    return python_module_callers_pipeline_case(false);
+}
+
+TEST(pipeline_python_module_callers_parallel) {
+    return python_module_callers_pipeline_case(true);
+}
+
+/* #1277: typed instance fields of a Python class imported from another file.
+ * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
+ * LSP strategy. */
+static int count_lsp_calls(cbm_store_t *s, const char *project, const char *caller_suffix,
+                           const char *callee_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    int hits = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            size_t cs = strlen(caller_suffix);
+            size_t ts = strlen(callee_suffix);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0 &&
+                edges[i].properties_json && strstr(edges[i].properties_json, "lsp")) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return hits;
+}
+
+static int check_python_crossfile_typed_field_calls_issue1277(bool parallel) {
+    const char *contracts = "class Contract:\n"
+                            "    def process_batch(self) -> None:\n"
+                            "        ...\n";
+    const char *trainer = "from contracts import Contract\n\n"
+                          "def make():\n"
+                          "    return None\n\n"
+                          "class Trainer:\n"
+                          "    engine: Contract\n\n"
+                          "    def __init__(self, strategies: Contract) -> None:\n"
+                          "        self.strategies = strategies\n"
+                          "        self.typed: Contract = strategies\n"
+                          "        self.plain = make()\n";
+    const char *loop = "from trainer import Trainer\n\n"
+                       "def run(trainer: Trainer) -> None:\n"
+                       "    strategies = trainer.strategies\n"
+                       "    strategies.process_batch()\n\n"
+                       "def run_typed(trainer: Trainer) -> None:\n"
+                       "    trainer.typed.process_batch()\n\n"
+                       "def run_classlevel(trainer: Trainer) -> None:\n"
+                       "    trainer.engine.process_batch()\n\n"
+                       "def run_untyped(trainer: Trainer) -> None:\n"
+                       "    trainer.plain.process_batch()\n";
+    if (setup_usages_repo("contracts.py", contracts, "trainer.py", trainer) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/loop.py", g_usages_tmpdir);
+    if (th_write_file(path, loop) != 0) {
+        teardown_usages_repo();
+        FAIL("failed to write loop.py");
+    }
+    if (parallel) {
+        /* Three semantic files plus 50 inert files exceed the production
+         * threshold for the fused parallel pipeline. */
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/field_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "field_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_1277.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int via_alias = -1, via_typed = -1, via_class = -1, via_untyped = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        via_alias = count_lsp_calls(s, project, "loop.run", "contracts.Contract.process_batch");
+        via_typed =
+            count_lsp_calls(s, project, "loop.run_typed", "contracts.Contract.process_batch");
+        via_class =
+            count_lsp_calls(s, project, "loop.run_classlevel", "contracts.Contract.process_batch");
+        via_untyped = count_lsp_calls(s, project, "loop.run_untyped", "process_batch");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(via_alias, 1);   /* self.x = <annotated __init__ parameter> */
+    ASSERT_EQ(via_typed, 1);   /* self.x: T = ... */
+    ASSERT_EQ(via_class, 1);   /* class-level x: T */
+    ASSERT_EQ(via_untyped, 0); /* control: no annotation, no guess */
+    PASS();
+}
+
+TEST(python_crossfile_typed_field_calls_issue1277) {
+    return check_python_crossfile_typed_field_calls_issue1277(false);
+}
+
+TEST(python_crossfile_typed_field_calls_issue1277_parallel) {
+    return check_python_crossfile_typed_field_calls_issue1277(true);
+}
+
 TEST(usages_creates_edges) {
     /* Port of TestPassUsagesCreatesEdges.
      * Go source with callback reference → USAGE edge. */
@@ -16271,6 +16774,25 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_python_module_callers_sequential);
+    RUN_TEST(pipeline_python_module_callers_parallel);
+    RUN_TEST(pipeline_issue1527_python_raw_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_raw_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_c_raw_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_c_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_c_raw_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_c_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_raw_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_raw_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_raw_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_raw_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_fallback);
     RUN_TEST(pipeline_nested_fixture_files_are_written);
     RUN_TEST(pipeline_fixture_file_parent_is_preserved);
     RUN_TEST(pipeline_fixture_node_count_requires_exact_source_nodes);
@@ -16378,6 +16900,8 @@ SUITE(pipeline) {
     RUN_TEST(implements_creates_override);
     RUN_TEST(implements_no_match);
     /* Usages pass (full pipeline integration) */
+    RUN_TEST(python_crossfile_typed_field_calls_issue1277);
+    RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
     RUN_TEST(usages_creates_edges);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);
