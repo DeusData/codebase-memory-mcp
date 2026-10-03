@@ -21,6 +21,15 @@
 #include <stdatomic.h>
 #include <string.h>
 
+/* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
+cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
+                                           const char *module_qn, const char **import_map_keys,
+                                           const char **import_map_vals, int import_map_count,
+                                           CBMLanguage lang);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
+#endif
+
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
 /* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time

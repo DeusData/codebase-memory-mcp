@@ -1288,7 +1288,277 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
     PASS();
 }
 
+/* Python package scope is an explicit resolver input, not a property inferred
+ * from a QN shared by other languages. Keep these fixtures separate from the
+ * raw public-API tests above. */
+static bool registry_scope_match(cbm_resolution_t result, const char *qn, const char *strategy) {
+    return qn && strategy && result.qualified_name && result.strategy &&
+           strcmp(result.qualified_name, qn) == 0 && strcmp(result.strategy, strategy) == 0 &&
+           result.candidate_count == 1;
+}
+
+TEST(python_symbol_scope_len_preserves_file_identity) {
+    const char *inputs[] = {"proj.pkg.__init__",
+                            "proj.__init__",
+                            "proj.pkg.__init__.__init__",
+                            "proj.pkg.mod",
+                            "proj.pkg.x__init__",
+                            "__init__",
+                            ".__init__",
+                            "proj.pkg.index",
+                            "",
+                            NULL};
+    const char *scopes[] = {"proj.pkg",
+                            "proj",
+                            "proj.pkg.__init__",
+                            "proj.pkg.mod",
+                            "proj.pkg.x__init__",
+                            "__init__",
+                            ".__init__",
+                            "proj.pkg.index",
+                            "",
+                            ""};
+    bool lengths = true;
+    for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
+        lengths = cbm_fqn_symbol_scope_len(inputs[i]) == strlen(scopes[i]) && lengths;
+    }
+    char *module = cbm_pipeline_fqn_module("proj", "pkg/__init__.py");
+    char *symbol = cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "Field");
+    bool identities = module && symbol && strcmp(module, "proj.pkg.__init__") == 0 &&
+                      strcmp(symbol, "proj.pkg.Field") == 0 &&
+                      cbm_fqn_symbol_scope_len(module) == strlen("proj.pkg");
+    free(module);
+    free(symbol);
+    ASSERT_TRUE(lengths && identities);
+    PASS();
+}
+
+TEST(registry_python_package_scope_is_explicit) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Field", "proj.forms.fields.Field", "Class");
+    cbm_registry_add(r, "Field", "proj.db.fields.Field", "Class");
+    cbm_registry_add(r, "Field", "proj.db.fields.__init__.Field", "Class");
+    cbm_registry_add(r, "Field", "proj.db.plain.Field", "Class");
+    cbm_registry_add(r, "Field", "proj.db.index.Field", "Class");
+    const char *keys[] = {"forms"};
+    const char *vals[] = {"proj.forms"};
+    const char *module = "proj.db.fields.__init__";
+    bool seeded = cbm_registry_size(r) == 5;
+    cbm_resolution_t package =
+        cbm_registry_resolve_lang(r, "Field", module, keys, vals, 1, CBM_LANG_PYTHON);
+    bool python = registry_scope_match(package, "proj.db.fields.Field", "same_module");
+    cbm_resolution_t plain =
+        cbm_registry_resolve_lang(r, "Field", "proj.db.plain", keys, vals, 1, CBM_LANG_PYTHON);
+    bool normal = registry_scope_match(plain, "proj.db.plain.Field", "same_module");
+    cbm_resolution_t raw = cbm_registry_resolve(r, "Field", module, keys, vals, 1);
+    bool preserved = registry_scope_match(raw, "proj.db.fields.__init__.Field", "same_module");
+    const CBMLanguage raw_languages[] = {CBM_LANG_JAVA, CBM_LANG_GO, CBM_LANG_JAVASCRIPT,
+                                         (CBMLanguage)-1, CBM_LANG_COUNT};
+    for (size_t i = 0; i < sizeof(raw_languages) / sizeof(raw_languages[0]); i++) {
+        cbm_resolution_t result =
+            cbm_registry_resolve_lang(r, "Field", module, keys, vals, 1, raw_languages[i]);
+        preserved = registry_scope_match(result, raw.qualified_name, "same_module") &&
+                    result.confidence == raw.confidence && preserved;
+    }
+    cbm_resolution_t index =
+        cbm_registry_resolve_lang(r, "Field", "proj.db.index", keys, vals, 1, CBM_LANG_JAVASCRIPT);
+    bool index_raw = registry_scope_match(index, "proj.db.index.Field", "same_module");
+    cbm_registry_free(r);
+    ASSERT_TRUE(seeded && python && normal && preserved && index_raw);
+    PASS();
+}
+
+TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Field", "proj.vendor.Field", "Class");
+    cbm_registry_add(r, "Field", "proj.pkg.Field", "Class");
+    cbm_registry_add(r, "Field", "proj.pkg.__init__.Field", "Class");
+    cbm_registry_add(r, "choose", "proj.pkg.__init__.child.choose", "Function");
+    cbm_registry_add(r, "choose", "proj.pkg.peer.choose", "Function");
+    const char *keys[] = {"Field"};
+    const char *vals[] = {"proj.vendor.Field"};
+    bool seeded = cbm_registry_size(r) == 5;
+    cbm_resolution_t imported =
+        cbm_registry_resolve_lang(r, "Field", "proj.pkg.__init__", keys, vals, 1, CBM_LANG_PYTHON);
+    bool precedence = registry_scope_match(imported, "proj.vendor.Field", "import_map");
+    cbm_resolution_t raw = cbm_registry_resolve(r, "choose", "proj.pkg.__init__", NULL, NULL, 0);
+    cbm_resolution_t python =
+        cbm_registry_resolve_lang(r, "choose", "proj.pkg.__init__", NULL, NULL, 0, CBM_LANG_PYTHON);
+    bool scoring =
+        raw.qualified_name && python.qualified_name && raw.strategy && python.strategy &&
+        strcmp(raw.qualified_name, "proj.pkg.__init__.child.choose") == 0 &&
+        strcmp(python.qualified_name, raw.qualified_name) == 0 &&
+        strcmp(raw.strategy, "suffix_match") == 0 && strcmp(python.strategy, raw.strategy) == 0 &&
+        python.confidence == raw.confidence && python.candidate_count == raw.candidate_count;
+    cbm_registry_free(r);
+    ASSERT_TRUE(seeded && precedence && scoring);
+    PASS();
+}
+
+TEST(registry_python_scope_cache_modes_and_raw_lineage) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "Entry", "proj.pkg.Entry", "Function");
+    cbm_registry_add(r, "Entry", "proj.pkg.__init__.Entry", "Function");
+    cbm_registry_add(r, "Reject", "proj.pkg.Reject", "Table");
+    cbm_registry_add(r, "Reject", "proj.pkg.__init__.Reject", "Function");
+    cbm_registry_add(r, "Accept", "proj.pkg.Accept", "Function");
+    cbm_registry_add(r, "Accept", "proj.pkg.__init__.Accept", "Table");
+    cbm_registry_add(r, "Relation", "proj.pkg.Relation", "View");
+    cbm_registry_add(r, "Relation", "proj.pkg.__init__.Relation", "Table");
+    bool seeded = cbm_registry_size(r) == 8;
+    bool correct = true;
+    /* Each cache lifetime has one fixed module/import map. Alternate modes in
+     * both starting orders; repeated same-mode requests also exercise hits. */
+    for (int first_python = 0; first_python < 2; first_python++) {
+        cbm_registry_resolve_cache_begin(8);
+        for (int turn = 0; turn < 16; turn++) {
+            bool python = ((turn / 2 + first_python) % 2) != 0;
+            const char *names[] = {"Entry", "Reject", "Accept", "Relation", "Missing"};
+            for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+                cbm_resolution_t result =
+                    python ? cbm_registry_resolve_lang(r, names[i], "proj.pkg.__init__", NULL, NULL,
+                                                       0, CBM_LANG_PYTHON)
+                           : cbm_registry_resolve(r, names[i], "proj.pkg.__init__", NULL, NULL, 0);
+                const char *expected = NULL;
+                if (i == 0) {
+                    expected = python ? "proj.pkg.Entry" : "proj.pkg.__init__.Entry";
+                } else if (i == 1 && !python) {
+                    expected = "proj.pkg.__init__.Reject";
+                } else if (i == 2 && python) {
+                    expected = "proj.pkg.Accept";
+                }
+                correct =
+                    (expected ? registry_scope_match(result, expected, "same_module")
+                              : result.qualified_name == NULL && result.candidate_count == 0) &&
+                    correct;
+            }
+            /* The cached relation veto must never poison the uncached SQL API,
+             * nor may the SQL result bypass the next default cached veto. */
+            cbm_resolution_t lineage =
+                cbm_registry_resolve_lineage(r, "Relation", "proj.pkg.__init__", NULL, NULL, 0);
+            correct = registry_scope_match(lineage, "proj.pkg.__init__.Relation", "same_module") &&
+                      correct;
+            cbm_resolution_t veto = cbm_registry_resolve_lang(r, "Relation", "proj.pkg.__init__",
+                                                              NULL, NULL, 0, CBM_LANG_PYTHON);
+            correct = veto.qualified_name == NULL && veto.candidate_count == 0 && correct;
+        }
+        cbm_registry_resolve_cache_end();
+    }
+    cbm_registry_free(r);
+    ASSERT_TRUE(seeded && correct);
+    PASS();
+}
+
+static const char *registry_scope_canonical(cbm_registry_t *r, const char *name, const char *qn) {
+    const char **candidates = NULL;
+    int count = 0;
+    cbm_registry_find_by_name(r, name, &candidates, &count);
+    for (int i = 0; i < count; i++) {
+        if (strcmp(candidates[i], qn) == 0) {
+            return candidates[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(registry_python_scope_complete_candidate_boundaries) {
+    const size_t lengths[] = {511, 512, 513, 1536};
+    bool complete = true;
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        cbm_registry_t *r = cbm_registry_new();
+        if (!r) {
+            complete = false;
+            break;
+        }
+        char scope[2048];
+        char module[2048];
+        char target[2048];
+        const char *name = "LongTarget";
+        size_t scope_len = lengths[i] - strlen(name) - 1;
+        memcpy(scope, "proj.", 5);
+        memset(scope + 5, 'a', scope_len - 5);
+        scope[scope_len] = '\0';
+        int mn = snprintf(module, sizeof(module), "%s.__init__", scope);
+        int tn = snprintf(target, sizeof(target), "%s.%s", scope, name);
+        bool shape = mn > 0 && (size_t)mn < sizeof(module) && tn > 0 && (size_t)tn == lengths[i] &&
+                     (size_t)tn < sizeof(target);
+        cbm_registry_add(r, name, target, "Function");
+        if (lengths[i] > 511) {
+            char truncated[512];
+            memcpy(truncated, target, sizeof(truncated) - 1);
+            truncated[sizeof(truncated) - 1] = '\0';
+            cbm_registry_add(r, "truncated_decoy", truncated, "Function");
+        }
+        const char *canonical = registry_scope_canonical(r, name, target);
+        cbm_resolution_t python =
+            cbm_registry_resolve_lang(r, name, module, NULL, NULL, 0, CBM_LANG_PYTHON);
+        cbm_resolution_t normal = cbm_registry_resolve(r, name, scope, NULL, NULL, 0);
+        complete = shape && canonical && python.qualified_name == canonical &&
+                   normal.qualified_name == canonical &&
+                   registry_scope_match(python, target, "same_module") &&
+                   registry_scope_match(normal, target, "same_module") && complete;
+        cbm_registry_free(r);
+    }
+    ASSERT_TRUE(complete);
+    PASS();
+}
+
+TEST(registry_python_scope_qualified_terminal_bucket_uncapped) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    /* The exact targets are inserted after the heuristic limit. A long exact
+     * comparison must use the canonical terminal bucket, not "Owner.perform"
+     * as the bucket key, and must not stop at 256 candidates. */
+    bool shape = true;
+    for (int i = 0; i < 300; i++) {
+        char qn[80];
+        int n = snprintf(qn, sizeof(qn), "proj.noise%d.perform", i);
+        shape = n > 0 && (size_t)n < sizeof(qn) && shape;
+        cbm_registry_add(r, "perform", qn, "Method");
+    }
+    char scope[1024];
+    memcpy(scope, "proj.", 5);
+    memset(scope + 5, 'b', 900);
+    scope[905] = '\0';
+    char module[1024];
+    int mn = snprintf(module, sizeof(module), "%s.__init__", scope);
+    shape = mn > 0 && (size_t)mn < sizeof(module) && shape;
+    const char *names[] = {"Owner.perform", "Owner::perform"};
+    bool resolved = true;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char target[1024];
+        char prefixed[80];
+        int tn = snprintf(target, sizeof(target), "%s.%s", scope, names[i]);
+        int pn = snprintf(prefixed, sizeof(prefixed), "receiver.%s", names[i]);
+        shape = tn > 0 && (size_t)tn < sizeof(target) && pn > 0 && (size_t)pn < sizeof(prefixed) &&
+                shape;
+        cbm_registry_add(r, "perform", target, "Method");
+        const char *canonical = registry_scope_canonical(r, "perform", target);
+        cbm_resolution_t direct =
+            cbm_registry_resolve_lang(r, names[i], module, NULL, NULL, 0, CBM_LANG_PYTHON);
+        cbm_resolution_t suffix =
+            cbm_registry_resolve_lang(r, prefixed, module, NULL, NULL, 0, CBM_LANG_PYTHON);
+        resolved = canonical && direct.qualified_name == canonical &&
+                   suffix.qualified_name == canonical &&
+                   registry_scope_match(direct, target, "same_module") &&
+                   registry_scope_match(suffix, target, "same_module") && resolved;
+    }
+    bool seeded = cbm_registry_size(r) == 302;
+    cbm_registry_free(r);
+    ASSERT_TRUE(shape && seeded && resolved);
+    PASS();
+}
+
 SUITE(registry) {
+    RUN_TEST(python_symbol_scope_len_preserves_file_identity);
+    RUN_TEST(registry_python_package_scope_is_explicit);
+    RUN_TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring);
+    RUN_TEST(registry_python_scope_cache_modes_and_raw_lineage);
+    RUN_TEST(registry_python_scope_complete_candidate_boundaries);
+    RUN_TEST(registry_python_scope_qualified_terminal_bucket_uncapped);
     /* FQN */
     RUN_TEST(fqn_simple);
     RUN_TEST(fqn_no_name);

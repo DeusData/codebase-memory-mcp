@@ -24,7 +24,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #define REG_HALF_PENALTY 0.5
 
 #define DEFAULT_CONFIDENCE 0.5
-#include "pipeline/pipeline.h"
+#include "pipeline_internal.h"
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
@@ -387,6 +387,7 @@ void cbm_registry_import_map_cache_end(void) {
  * eliminated. */
 typedef struct {
     cbm_resolution_t res;
+    size_t scope_len; /* raw and Python-scoped requests may share one file cache */
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
@@ -1099,22 +1100,45 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     return empty_result();
 }
 
-/* Strategy 2: Same-module match */
-static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
-                                            const char *suffix, const char *module_qn) {
+/* Exact same-module lookup without ever hashing a truncated candidate. The
+ * long path uses the canonical short-name bucket, not heuristic name limits. */
+static const char *same_module_candidate(const cbm_registry_t *r, const char *module_qn,
+                                         size_t scope_len, const char *name) {
+    if (!module_qn || !name)
+        return NULL;
+    size_t name_len = strlen(name);
     char candidate[CBM_SZ_512];
-    snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, callee_name);
-    const char *stored_key = cbm_ht_get_key(r->exact, candidate);
-    if (stored_key) {
+    if (scope_len < sizeof(candidate) && name_len < sizeof(candidate) - scope_len - 1) {
+        memcpy(candidate, module_qn, scope_len);
+        candidate[scope_len] = '.';
+        memcpy(candidate + scope_len + 1, name, name_len + 1);
+        return cbm_ht_get_key(r->exact, candidate);
+    }
+    qn_array_t *arr = (qn_array_t *)cbm_ht_get(r->by_name, simple_name(name));
+    if (!arr)
+        return NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        if (!qn)
+            continue;
+        size_t qn_len = strlen(qn);
+        if (qn_len > scope_len && qn_len - scope_len - 1 == name_len &&
+            memcmp(qn, module_qn, scope_len) == 0 && qn[scope_len] == '.' &&
+            memcmp(qn + scope_len + 1, name, name_len) == 0)
+            return qn;
+    }
+    return NULL;
+}
+
+/* Strategy 2: Same-module match. Scoring elsewhere retains the raw file QN. */
+static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
+                                            const char *suffix, const char *module_qn,
+                                            size_t scope_len) {
+    const char *stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
+    if (!stored_key && suffix && suffix[0])
+        stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
+    if (stored_key)
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
-    }
-    if (suffix && suffix[0]) {
-        snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
-        stored_key = cbm_ht_get_key(r->exact, candidate);
-        if (stored_key) {
-            return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
-        }
-    }
     return empty_result();
 }
 
@@ -1360,7 +1384,8 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
  * cbm_registry_resolve owns the per-file cache). */
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
-                                               const char **import_map_vals, int import_map_count) {
+                                               const char **import_map_vals, int import_map_count,
+                                               size_t scope_len) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -1393,7 +1418,7 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
         resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
-        res = resolve_same_module(r, callee_name, suffix, module_qn);
+        res = resolve_same_module(r, callee_name, suffix, module_qn, scope_len);
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
@@ -1402,9 +1427,10 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
     return res;
 }
 
-cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
-                                      const char *module_qn, const char **import_map_keys,
-                                      const char **import_map_vals, int import_map_count) {
+static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                const char *module_qn, const char **import_map_keys,
+                                                const char **import_map_vals, int import_map_count,
+                                                size_t scope_len) {
     if (!r || !callee_name) {
         return empty_result();
     }
@@ -1412,16 +1438,13 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     /* Per-file cache: same callee_name in N call sites → 1 chain walk
      * + N-1 O(1) hash hits. module_qn is constant per file so the
      * cache key only needs callee_name. */
-    if (_resolve_cache) {
-        resolve_cache_entry_t *cached =
-            (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name);
-        if (cached) {
-            return cached->res;
-        }
-    }
+    resolve_cache_entry_t *cached =
+        _resolve_cache ? (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name) : NULL;
+    if (cached && cached->scope_len == scope_len)
+        return cached->res;
 
     cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
-                                                  import_map_vals, import_map_count);
+                                                  import_map_vals, import_map_count, scope_len);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -1437,10 +1460,15 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
 
     /* Cache the result (including empty — caching the negative answer
      * is just as valuable; same name asks the same question). */
-    if (_resolve_cache) {
+    if (cached) {
+        /* Same key, different effective scope: reuse its owned entry/key. */
+        cached->res = res;
+        cached->scope_len = scope_len;
+    } else if (_resolve_cache) {
         resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
         if (e) {
             e->res = res;
+            e->scope_len = scope_len;
             char *kdup = strdup(callee_name);
             if (kdup) {
                 cbm_ht_set(_resolve_cache, kdup, e);
@@ -1450,6 +1478,23 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         }
     }
     return res;
+}
+
+cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
+                                      const char *module_qn, const char **import_map_keys,
+                                      const char **import_map_vals, int import_map_count) {
+    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, module_qn ? strlen(module_qn) : 0);
+}
+
+cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
+                                           const char *module_qn, const char **import_map_keys,
+                                           const char **import_map_vals, int import_map_count,
+                                           CBMLanguage lang) {
+    size_t scope_len = lang == CBM_LANG_PYTHON ? cbm_fqn_symbol_scope_len(module_qn)
+                                               : (module_qn ? strlen(module_qn) : 0);
+    return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                   import_map_count, scope_len);
 }
 
 cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
@@ -1464,7 +1509,7 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * it would poison one variant with the other's semantics. SQL files hold
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count);
+                                  import_map_count, module_qn ? strlen(module_qn) : 0);
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

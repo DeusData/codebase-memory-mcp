@@ -13,6 +13,7 @@
 #include "py_lsp.h"
 #include "../cbm.h"
 #include "../helpers.h"
+#include "lsp_node_iter.h"
 #include "tree_sitter/api.h"
 #include <ctype.h>
 #include <stdint.h>
@@ -25,13 +26,88 @@
  * only from py_lsp.c, never compiled standalone. */
 #include "py_builtins.c"
 
-/* Guards for py_eval_expr_type — mirrors c_eval_expr_type's guard design
- * (C_EVAL_DEPTH_LIMIT / C_EVAL_MAX_STEPS_PER_FILE in c_lsp.c). */
+/* Stack guard for py_eval_expr_type (#720; same limit as C_EVAL_DEPTH_LIMIT).
+ * There is deliberately NO per-file work budget (#1527): the step cap that
+ * used to sit here stopped resolution after 10000 evaluations and left the
+ * rest of a large file silently unresolved while the file still reported
+ * status `indexed`. Memoized evaluation (#710), hashed scope frames, and
+ * cursor-based child access reduce the repeated work. Memo failure is reported
+ * explicitly; the existing depth bound now reports an incomplete walk too. */
 #define PY_LSP_MAX_EVAL_DEPTH 256
-#define PY_EVAL_MAX_STEPS_PER_FILE 10000
+#include "lsp_work.h"
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int py_test_memo_allocations_left = -1;
+static _Thread_local bool py_test_depth_failure;
+static _Thread_local int py_test_scope_allocations_left = -1;
+static _Thread_local int py_test_class_frames_left = -1;
+void cbm_py_lsp_test_class_frame_fail_after(int successful_allocations) {
+    py_test_class_frames_left = successful_allocations;
+}
+void cbm_py_lsp_test_scope_fail_after(int successful_allocations) {
+    py_test_scope_allocations_left = successful_allocations;
+}
+void cbm_py_lsp_test_depth_fail(bool enabled) {
+    py_test_depth_failure = enabled;
+}
+void cbm_py_lsp_test_memo_fail_after(int successful_allocations) {
+    py_test_memo_allocations_left = successful_allocations;
+}
+#endif
+
+static void py_memo_test_stage(PyLSPContext *ctx, const char *stage) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    const char *depth_stage = getenv("CBM_TEST_PY_LSP_DEPTH_FAIL_STAGE");
+    if (depth_stage && strcmp(depth_stage, stage) == 0)
+        ctx->eval_depth = 256;
+    const char *fail_stage = getenv("CBM_TEST_PY_LSP_MEMO_FAIL_STAGE");
+    if (fail_stage && strcmp(fail_stage, stage) == 0)
+        ctx->test_memo_allocations_left = 0;
+#else
+    (void)ctx;
+    (void)stage;
+#endif
+}
+
+void cbm_py_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status) {
+    result->has_error = true;
+    result->lsp_skipped = true;
+    /* Static lifetime also works when the result arena cannot allocate. */
+    result->error_msg = status == CBM_LSP_SCOPE_FAILED     ? CBM_PY_LSP_SCOPE_ERROR
+                        : status == CBM_LSP_DEPTH_EXCEEDED ? CBM_PY_LSP_DEPTH_ERROR
+                                                           : CBM_PY_LSP_MEMO_ERROR;
+}
 
 // Forward decls
 static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node);
+
+/* Named children of one node for an index loop (#1527). ts_node_named_child(n, i)
+ * restarts tree-sitter's child iterator at the first child, so indexing every
+ * child of a wide node is O(n^2) -- a module of thousands of classes, or a body
+ * of thousands of statements, spent most of its resolve time re-walking its
+ * own children. Wide nodes are collected once (lsp_node_iter.h); narrow nodes
+ * keep plain indexed access, which is cheaper than an allocation. */
+enum { PY_KIDS_COLLECT_MIN = 64 };
+typedef struct {
+    TSNode node;
+    TSNode *kids; /* NULL = index the node directly */
+    uint32_t n;
+} PyKids;
+
+static PyKids py_kids(CBMArena *arena, TSNode node) {
+    PyKids k = {node, NULL, ts_node_named_child_count(node)};
+    if (k.n >= PY_KIDS_COLLECT_MIN) {
+        uint32_t got = 0;
+        TSNode *kids = cbm_lsp_collect_named_children(arena, node, &got);
+        if (kids && got == k.n)
+            k.kids = kids;
+    }
+    return k;
+}
+
+static TSNode py_kid(const PyKids *k, uint32_t i) {
+    return k->kids ? k->kids[i] : ts_node_named_child(k->node, i);
+}
 
 /* Decorators are extracted as raw syntax (`@property`, `@pkg.cache(...)`),
  * not resolved qualified names.  Preserve the raw array for sound callable-
@@ -142,7 +218,7 @@ static void py_mark_ambiguous_callable_bindings(CBMTypeRegistry *registry) {
  * The walk_depth-- runs after the inner returns, so early returns in the body
  * never leak the counter. */
 static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
-    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+    if (!ctx || ctx->eval_failure || ctx->walk_depth >= cbm_lsp_max_walk_depth())
         return;
     ctx->walk_depth++;
     py_resolve_calls_in_inner(ctx, node);
@@ -151,6 +227,7 @@ static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
+static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node);
 static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int depth);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name);
@@ -212,6 +289,25 @@ static CBMScope *py_scope_push_checked(PyLSPContext *ctx) {
     return child;
 }
 
+/* New class execution frames must never fall back to their parent: body
+ * bindings would escape and subsequent calls could use those stale bindings. */
+static CBMScope *py_class_frame_push(PyLSPContext *ctx, CBMScope *parent) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_test_class_frames_left == 0) {
+        ctx->eval_failure = CBM_LSP_SCOPE_FAILED;
+        return NULL;
+    }
+    if (py_test_class_frames_left > 0)
+        py_test_class_frames_left--;
+#endif
+    CBMScope *frame = cbm_scope_push(ctx->arena, parent);
+    if (!frame || frame == parent) {
+        ctx->eval_failure = CBM_LSP_SCOPE_FAILED;
+        return NULL;
+    }
+    return frame;
+}
+
 static void py_scope_clear_callable(PyLSPContext *ctx, const char *name) {
     if (cbm_scope_update_callable(ctx->current_scope, name, NULL)) {
         ctx->type_cache_gen++;
@@ -223,22 +319,62 @@ static void py_scope_restore(PyLSPContext *ctx, CBMScope *saved) {
     ctx->current_scope = saved;
 }
 
-void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
-                 const CBMTypeRegistry *registry, const char *module_qn,
-                 CBMResolvedCallArray *out) {
+/* Only a changed Python scope needs storage. Failure is explicit: never
+ * register or walk a package using the raw file scope as an OOM fallback. */
+static bool py_symbol_scope(CBMArena *arena, const char *module_qn, const char *stage,
+                            const char **out) {
+    *out = module_qn;
+    size_t len = cbm_fqn_symbol_scope_len(module_qn);
+    if (!module_qn || module_qn[len] == '\0')
+        return true;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    const char *fail_stage = getenv("CBM_TEST_PY_LSP_SCOPE_FAIL_STAGE");
+    if ((fail_stage && strcmp(fail_stage, stage) == 0) || py_test_scope_allocations_left == 0)
+        return false;
+    if (py_test_scope_allocations_left > 0)
+        py_test_scope_allocations_left--;
+#else
+    (void)stage;
+#endif
+    char *scope = cbm_arena_strndup(arena, module_qn, len);
+    if (!scope)
+        return false;
+    *out = scope;
+    return true;
+}
+
+static void py_lsp_init_for_stage(PyLSPContext *ctx, CBMArena *arena, const char *source,
+                                  int source_len, const CBMTypeRegistry *registry,
+                                  const char *module_qn, CBMResolvedCallArray *out,
+                                  const char *stage) {
     if (!ctx)
         return;
     memset(ctx, 0, sizeof(PyLSPContext));
+#ifdef CBM_ENABLE_TEST_SEAMS
+    ctx->test_memo_allocations_left = py_test_memo_allocations_left;
+    if (py_test_depth_failure)
+        ctx->eval_depth = 256;
+#endif
     ctx->arena = arena;
     ctx->source = source;
     ctx->source_len = source_len;
     ctx->registry = registry;
     ctx->registry_head = (CBMTypeRegistry *)registry;
-    ctx->module_qn = module_qn;
+    ctx->file_module_qn = module_qn;
     ctx->resolved_calls = out;
+    if (!py_symbol_scope(arena, module_qn, stage, &ctx->module_qn)) {
+        ctx->eval_failure = CBM_LSP_SCOPE_FAILED;
+        return;
+    }
     ctx->current_scope = py_scope_push_checked(ctx);
     const char *dbg = getenv("CBM_LSP_DEBUG");
     ctx->debug = dbg && dbg[0] && dbg[0] != '0';
+}
+
+void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
+                 const CBMTypeRegistry *registry, const char *module_qn,
+                 CBMResolvedCallArray *out) {
+    py_lsp_init_for_stage(ctx, arena, source, source_len, registry, module_qn, out, "context");
 }
 
 void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *module_qn) {
@@ -505,16 +641,19 @@ static PyDirectImportKind py_import_kind_from_statement(PyLSPContext *ctx, TSNod
     return py_import_match_result(&match, qn_io);
 }
 
-static PyDirectImportKind py_import_kind_from_ast(PyLSPContext *ctx, TSNode root, const char *local,
-                                                  const char **qn_io) {
+/* stmts: the root's import statements, collected once per root by the caller
+ * (#1527) -- only they can match, and rescanning every top-level statement
+ * once per import made classification O(imports x module size). */
+static PyDirectImportKind py_import_kind_from_ast(PyLSPContext *ctx, bool have_root,
+                                                  const TSNode *stmts, uint32_t stmt_count,
+                                                  const char *local, const char **qn_io) {
     const char *qn = qn_io ? *qn_io : NULL;
-    if (!ctx || !local || !qn || !qn_io || ts_node_is_null(root))
+    if (!ctx || !local || !qn || !qn_io || !have_root)
         return PY_DIRECT_IMPORT_UNKNOWN;
 
     PyImportSyntaxMatch match = {0};
-    uint32_t root_count = ts_node_named_child_count(root);
-    for (uint32_t i = 0; i < root_count; i++) {
-        py_import_match_statement(ctx, ts_node_named_child(root, i), local, qn, &match);
+    for (uint32_t i = 0; i < stmt_count; i++) {
+        py_import_match_statement(ctx, stmts[i], local, qn, &match);
     }
     return py_import_match_result(&match, qn_io);
 }
@@ -561,12 +700,32 @@ static void py_bind_dotted_prefixes(PyLSPContext *ctx, const char *qn) {
 static void py_classify_imports_for_root(PyLSPContext *ctx, TSNode root) {
     if (!ctx)
         return;
+    /* A null root classifies every import UNKNOWN, as it always has; so does
+     * a root whose statement list cannot be allocated (no proof either way). */
+    bool have_root = !ts_node_is_null(root);
+    TSNode *stmts = NULL;
+    uint32_t stmt_count = 0;
+    if (have_root && ctx->import_count > 0) {
+        PyKids rk = py_kids(ctx->arena, root);
+        if (rk.n > 0) {
+            stmts = (TSNode *)cbm_arena_alloc(ctx->arena, (size_t)rk.n * sizeof(TSNode));
+            if (!stmts)
+                have_root = false;
+        }
+        for (uint32_t i = 0; stmts && i < rk.n; i++) {
+            TSNode c = py_kid(&rk, i);
+            const char *ck = ts_node_type(c);
+            if (strcmp(ck, "import_statement") == 0 || strcmp(ck, "import_from_statement") == 0)
+                stmts[stmt_count++] = c;
+        }
+    }
     for (int i = 0; i < ctx->import_count; i++) {
         const char *local = ctx->import_local_names[i];
         const char *qn = ctx->import_module_qns[i];
         if (!local || !qn)
             continue;
-        PyDirectImportKind direct_kind = py_import_kind_from_ast(ctx, root, local, &qn);
+        PyDirectImportKind direct_kind =
+            py_import_kind_from_ast(ctx, have_root, stmts, stmt_count, local, &qn);
         ctx->import_module_qns[i] = qn;
         if (ctx->import_kinds)
             ctx->import_kinds[i] = (unsigned char)direct_kind;
@@ -783,6 +942,8 @@ static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, c
     return NULL;
 }
 
+enum { PY_RESOLVED_DEDUP_WINDOW = 256 };
+
 static void py_emit_resolved_call_reason(PyLSPContext *ctx, const char *callee_qn,
                                          const char *strategy, float confidence, const char *reason,
                                          TSNode site) {
@@ -796,9 +957,8 @@ static void py_emit_resolved_call_reason(PyLSPContext *ctx, const char *callee_q
     // entries catches the common case while keeping per-emission O(1).
     // Without this cap the dedup is O(N) per emission -> O(N^2) per file
     // and dominates above ~1k call sites.
-    enum { DEDUP_WINDOW = 256 };
     int n = ctx->resolved_calls->count;
-    int start = n > DEDUP_WINDOW ? n - DEDUP_WINDOW : 0;
+    int start = n > PY_RESOLVED_DEDUP_WINDOW ? n - PY_RESOLVED_DEDUP_WINDOW : 0;
     for (int i = start; i < n; i++) {
         CBMResolvedCall *rc = &ctx->resolved_calls->items[i];
         if (rc->kind == CBM_RESOLVED_INVOCATION && rc->site_start_byte == site_start &&
@@ -1422,7 +1582,7 @@ static const CBMType *py_iterable_element_type(PyLSPContext *ctx, const CBMType 
 }
 
 /* The real recursive-descent evaluator. Never call directly — go through
- * the memoizing, depth- and budget-guarded py_eval_expr_type wrapper below
+ * the memoizing, depth-guarded py_eval_expr_type wrapper below
  * (every recursive call inside this body already does). */
 static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
@@ -2086,6 +2246,14 @@ static bool py_type_cache_grow(PyLSPContext *ctx) {
     if (ctx->type_cache_cap >= PY_TYPE_CACHE_MAX_CAP)
         return false;
     int new_cap = ctx->type_cache_cap ? ctx->type_cache_cap * 2 : PY_TYPE_CACHE_INITIAL_CAP;
+    if ((size_t)new_cap > SIZE_MAX / sizeof(CBMPyTypeCacheEntry))
+        return false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (ctx->test_memo_allocations_left == 0)
+        return false;
+    if (ctx->test_memo_allocations_left > 0)
+        ctx->test_memo_allocations_left--;
+#endif
     CBMPyTypeCacheEntry *new_entries = (CBMPyTypeCacheEntry *)cbm_arena_alloc(
         ctx->arena, (size_t)new_cap * sizeof(CBMPyTypeCacheEntry));
     if (!new_entries)
@@ -2111,9 +2279,9 @@ static bool py_type_cache_grow(PyLSPContext *ctx) {
     return true;
 }
 
-static void py_type_cache_insert(PyLSPContext *ctx, const void *id, const CBMType *result) {
+static bool py_type_cache_insert(PyLSPContext *ctx, const void *id, const CBMType *result) {
     if (!id || !result)
-        return;
+        return true;
     /* Keep load strictly below 75% so probe chains stay short. If growth
      * fails (OOM / max cap), REJECT the insert rather than filling up: a
      * full table would turn every probe loop into a full-table scan, and
@@ -2121,7 +2289,7 @@ static void py_type_cache_insert(PyLSPContext *ctx, const void *id, const CBMTyp
     if (!ctx->type_cache || (ctx->type_cache_count + 1) * 4 > ctx->type_cache_cap * 3) {
         if (!py_type_cache_grow(ctx) &&
             (!ctx->type_cache || (ctx->type_cache_count + 1) * 4 > ctx->type_cache_cap * 3))
-            return;
+            return false;
     }
     uint32_t mask = (uint32_t)ctx->type_cache_cap - 1;
     uint32_t idx = py_type_cache_hash(id) & mask;
@@ -2132,31 +2300,33 @@ static void py_type_cache_insert(PyLSPContext *ctx, const void *id, const CBMTyp
             e->gen = ctx->type_cache_gen;
             e->result = result;
             ctx->type_cache_count++;
-            return;
+            return true;
         }
         if (e->node_id == id) {
             e->gen = ctx->type_cache_gen; /* refresh a stale-generation entry in place */
             e->result = result;
-            return;
+            return true;
         }
         idx = (idx + 1) & mask;
     }
     /* Probe bound exhausted — only reachable with a corrupt count; drop the
      * insert instead of spinning. */
+    return false;
 }
 
-/* Memoizing, depth- and budget-guarded wrapper — the function every call
- * site in this file goes through. */
+/* Memoizing, depth-guarded wrapper — the function every call site in this
+ * file goes through. */
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
-    if (!ctx || ts_node_is_null(node))
+    if (!ctx || ctx->eval_failure || ts_node_is_null(node))
         return cbm_type_unknown();
 
     /* Depth cap (issue #720): the evaluator recurses once per expression
      * nesting level, so a pathologically deep expression (tens of
-     * thousands of parens) overflowed the native stack. Same limit as
-     * C_EVAL_DEPTH_LIMIT. Past the cap: unknown, and NEVER cached. */
+     * thousands of parens) overflowed the native stack. At the existing bound,
+     * stop this walk explicitly; never memoize a truncated result as complete. */
     if (ctx->eval_depth >= PY_LSP_MAX_EVAL_DEPTH) {
         ctx->eval_truncations++;
+        ctx->eval_failure = CBM_LSP_DEPTH_EXCEEDED;
         return cbm_type_unknown();
     }
 
@@ -2164,17 +2334,9 @@ static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
     if (cached)
         return cached;
 
-    /* Per-file work budget (mirrors C_EVAL_MAX_STEPS_PER_FILE): expression
-     * type evaluation is best-effort, so pathological files degrade to
-     * unknown instead of stalling repository indexing. Only real
-     * evaluations consume budget — cache hits above are O(1). */
-    if (ctx->eval_steps++ > PY_EVAL_MAX_STEPS_PER_FILE) {
-        ctx->eval_truncations++;
-        if (ctx->debug && ctx->eval_steps == PY_EVAL_MAX_STEPS_PER_FILE + 2) {
-            fprintf(stderr, "  [pylsp] expression eval step budget exhausted; returning unknown\n");
-        }
-        return cbm_type_unknown();
-    }
+    /* One real (non-memoized) evaluation: the work the complexity tests count
+     * to prove evaluation stays linear without a budget. */
+    CBM_LSP_WORK(1);
 
     uint32_t trunc_before = ctx->eval_truncations;
     ctx->eval_depth++;
@@ -2184,19 +2346,25 @@ static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
         result = cbm_type_unknown();
 
     /* Only cache full-fidelity results: if any descendant evaluation was
-     * cut off by the depth cap or the step budget, this result may be a
-     * truncated `unknown`. Caching it would poison later evaluations that
-     * reach the same node from a shallower frame (or with fresh budget) —
-     * exactly the reuse the guards are supposed to preserve. */
-    if (ctx->eval_truncations == trunc_before)
-        py_type_cache_insert(ctx, node.id, result);
-    return result;
+     * cut off by the depth cap, this result may be a truncated `unknown`.
+     * The sticky failure stops this walk instead of repeating uncached branches;
+     * a fresh walk starts with a fresh cache. */
+    if (!ctx->eval_failure && ctx->eval_truncations == trunc_before &&
+        !py_type_cache_insert(ctx, node.id, result))
+        ctx->eval_failure = CBM_LSP_MEMO_FAILED;
+    return ctx->eval_failure ? cbm_type_unknown() : result;
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+const CBMType *cbm_py_lsp_test_eval(PyLSPContext *ctx, TSNode node) {
+    return py_eval_expr_type(ctx, node);
+}
+#endif
 
 /* ── statement processing: bind from assignments, for-loops, with-as ──── */
 
 static void py_process_statement(PyLSPContext *ctx, TSNode node) {
-    if (!ctx || ts_node_is_null(node))
+    if (!ctx || ctx->eval_failure || ts_node_is_null(node))
         return;
     const char *k = ts_node_type(node);
 
@@ -2305,13 +2473,16 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
                 } else {
                     py_scope_bind(ctx, name, rhs_type);
                 }
+                // Class attributes must not replace file-wide dispatch entries.
                 // Lambda registry: `fn = lambda x: ...`.
-                if (!ts_node_is_null(right) && strcmp(ts_node_type(right), "lambda") == 0) {
+                if (!ctx->class_body_outer_scope && !ts_node_is_null(right) &&
+                    strcmp(ts_node_type(right), "lambda") == 0) {
                     py_register_lambda(ctx, name, right);
                 }
                 // Dict literal dispatch table: `funcs = {"a": foo, "b": bar}`
                 // with all values being known function QNs.
-                if (!ts_node_is_null(right) && strcmp(ts_node_type(right), "dictionary") == 0) {
+                if (!ctx->class_body_outer_scope && !ts_node_is_null(right) &&
+                    strcmp(ts_node_type(right), "dictionary") == 0) {
                     py_register_dict_literal(ctx, name, right);
                 }
             }
@@ -2502,6 +2673,8 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
 /* ── Recursive walker: process statements + emit resolved_calls ── */
 
 static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
+    if (!ctx || ctx->eval_failure)
+        return;
     if (!ctx || ctx->callable_value_proof_disabled)
         return;
     TSNode fn = ts_node_child_by_field_name(call_node, "function", 8);
@@ -2517,7 +2690,11 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
         // Walk the lambda body for any nested call sites with the params
         // bound to the call's arg types. Resolved calls get caller_qn
         // set to a synthetic <lambda> child of the enclosing function.
-        TSNode lambda_node = py_lookup_lambda(ctx, fname);
+        /* These legacy entries have no lexical frame identity. During class
+         * execution, leave lambda replay unresolved instead of bypassing a
+         * local shadow or running the lambda against class locals. */
+        TSNode lambda_node =
+            ctx->class_body_outer_scope ? (TSNode){0} : py_lookup_lambda(ctx, fname);
         if (!ts_node_is_null(lambda_node)) {
             TSNode params = ts_node_child_by_field_name(lambda_node, "parameters", 10);
             TSNode body = ts_node_child_by_field_name(lambda_node, "body", 4);
@@ -2628,7 +2805,7 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
 
     // Subscript-as-call: `funcs["a"]()` where funcs is a registered
     // dict-literal dispatch table.
-    if (strcmp(fk, "subscript") == 0) {
+    if (!ctx->class_body_outer_scope && strcmp(fk, "subscript") == 0) {
         TSNode container = ts_node_child_by_field_name(fn, "value", 5);
         TSNode key = ts_node_child_by_field_name(fn, "subscript", 9);
         if (!ts_node_is_null(container) && !ts_node_is_null(key) &&
@@ -2730,17 +2907,18 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             // segment) and look up "<root>.<mod>". A genuinely-external module
             // (requests, os) has no such project def, so it correctly stays
             // lsp_module_attr_unresolved.
-            if (mod && ctx->module_qn) {
-                const char *last_dot = strrchr(ctx->module_qn, '.');
-                if (last_dot && last_dot > ctx->module_qn) {
-                    size_t root_len = (size_t)(last_dot - ctx->module_qn);
+            if (mod && ctx->file_module_qn) {
+                const char *last_dot = strrchr(ctx->file_module_qn, '.');
+                if (last_dot && last_dot > ctx->file_module_qn) {
+                    size_t root_len = (size_t)(last_dot - ctx->file_module_qn);
                     // Skip if mod is already rooted under the project to avoid
                     // "<root>.<root>.mod".
-                    if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
+                    if (!(strncmp(mod, ctx->file_module_qn, root_len) == 0 &&
+                          mod[root_len] == '.')) {
                         char *qual_mod =
                             (char *)cbm_arena_alloc(ctx->arena, root_len + 1 + strlen(mod) + 1);
                         if (qual_mod) {
-                            memcpy(qual_mod, ctx->module_qn, root_len);
+                            memcpy(qual_mod, ctx->file_module_qn, root_len);
                             qual_mod[root_len] = '.';
                             strcpy(qual_mod + root_len + 1, mod);
                             const CBMRegisteredFunc *qf =
@@ -3202,6 +3380,65 @@ static void py_emit_dunder_call(PyLSPContext *ctx, const CBMType *recv, const ch
     }
 }
 
+/* A class comprehension evaluates its leftmost iterable in the class frame,
+ * but the implicit body scope skips class locals. Nested comprehensions keep
+ * the surrounding comprehension frame. Keep class execution marked active so
+ * legacy bare-name dispatch cannot bypass either frame's lexical bindings. */
+static void py_resolve_class_comprehension(PyLSPContext *ctx, TSNode node) {
+    if (ctx->eval_failure)
+        return;
+    PyKids kids = py_kids(ctx->arena, node);
+    uint32_t first_for = kids.n;
+    TSNode first_right = {0};
+    for (uint32_t i = 0; i < kids.n && !ctx->eval_failure; i++) {
+        TSNode child = py_kid(&kids, i);
+        if (strcmp(ts_node_type(child), "for_in_clause") == 0) {
+            first_for = i;
+            first_right = ts_node_child_by_field_name(child, "right", 5);
+            break;
+        }
+    }
+    if (first_for == kids.n)
+        return;
+    const CBMType *first_type = py_eval_expr_type(ctx, first_right);
+    py_resolve_calls_in(ctx, first_right);
+    if (ctx->eval_failure)
+        return;
+    const CBMType *first_elem = py_iterable_element_type(ctx, first_type);
+    CBMScope *saved_scope = ctx->current_scope;
+    bool saved_comprehension = ctx->class_body_in_comprehension;
+    CBMScope *parent = saved_comprehension ? saved_scope : ctx->class_body_outer_scope;
+    CBMScope *frame = py_class_frame_push(ctx, parent);
+    if (!frame)
+        return;
+    py_scope_restore(ctx, frame);
+    ctx->class_body_in_comprehension = true;
+    /* Clauses precede the body at evaluation time, although tree-sitter stores
+     * the body first. Walk each iterable/filter only once, before later binds. */
+    for (uint32_t i = first_for; i < kids.n && !ctx->eval_failure; i++) {
+        TSNode child = py_kid(&kids, i);
+        if (strcmp(ts_node_type(child), "for_in_clause") == 0) {
+            TSNode left = ts_node_child_by_field_name(child, "left", 4);
+            const CBMType *elem = first_elem;
+            if (i != first_for) {
+                TSNode right = ts_node_child_by_field_name(child, "right", 5);
+                const CBMType *iter = py_eval_expr_type(ctx, right);
+                py_resolve_calls_in(ctx, right);
+                if (ctx->eval_failure)
+                    break;
+                elem = py_iterable_element_type(ctx, iter);
+            }
+            py_bind_for_target(ctx, left, elem);
+        } else {
+            py_resolve_calls_in(ctx, child);
+        }
+    }
+    for (uint32_t i = 0; i < first_for && !ctx->eval_failure; i++)
+        py_resolve_calls_in(ctx, py_kid(&kids, i));
+    ctx->class_body_in_comprehension = saved_comprehension;
+    py_scope_restore(ctx, saved_scope);
+}
+
 static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return;
@@ -3404,6 +3641,10 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     // iterable's element type, then walk inner expressions.
     if (strcmp(k, "list_comprehension") == 0 || strcmp(k, "dictionary_comprehension") == 0 ||
         strcmp(k, "set_comprehension") == 0 || strcmp(k, "generator_expression") == 0) {
+        if (ctx->class_body_outer_scope) {
+            py_resolve_class_comprehension(ctx, node);
+            return;
+        }
         CBMScope *saved = ctx->current_scope;
         ctx->current_scope = py_scope_push_checked(ctx);
         uint32_t cnc = ts_node_named_child_count(node);
@@ -3436,16 +3677,20 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     // Recurse: children. We don't push scope for control-flow blocks
     // here (Python scoping is function-level apart from comprehension /
     // lambda / class), but we do for nested function / class / lambda.
-    if (strcmp(k, "function_definition") == 0 || strcmp(k, "class_definition") == 0 ||
-        strcmp(k, "lambda") == 0) {
+    if (strcmp(k, "function_definition") == 0 || strcmp(k, "lambda") == 0) {
         // These are processed by the top-level pass; skip recursion to
         // avoid double-walking their bodies.
         return;
     }
 
-    uint32_t nc = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < nc; i++) {
-        py_resolve_calls_in(ctx, ts_node_named_child(node, i));
+    if (strcmp(k, "class_definition") == 0) {
+        py_exec_class_definition(ctx, node);
+        return;
+    }
+
+    PyKids nk = py_kids(ctx->arena, node);
+    for (uint32_t i = 0; i < nk.n && !ctx->eval_failure; i++) {
+        py_resolve_calls_in(ctx, py_kid(&nk, i));
     }
 }
 
@@ -4006,6 +4251,8 @@ static void py_bind_parameters(PyLSPContext *ctx, TSNode params) {
 }
 
 static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char *container_qn) {
+    if (!ctx || ctx->eval_failure)
+        return;
     TSNode name_node = ts_node_child_by_field_name(func_node, "name", 4);
     if (ts_node_is_null(name_node))
         return;
@@ -4034,9 +4281,9 @@ static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char 
     if (!ts_node_is_null(body)) {
         py_resolve_calls_in(ctx, body);
         // Also descend into nested function/class definitions in the body.
-        uint32_t bnc = ts_node_named_child_count(body);
-        for (uint32_t i = 0; i < bnc; i++) {
-            TSNode c = ts_node_named_child(body, i);
+        PyKids bk = py_kids(ctx->arena, body);
+        for (uint32_t i = 0; i < bk.n; i++) {
+            TSNode c = py_kid(&bk, i);
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "function_definition") == 0) {
                 py_process_function(ctx, c, ctx->enclosing_func_qn);
@@ -4063,7 +4310,123 @@ static bool py_is_init_method(PyLSPContext *ctx, TSNode func_node) {
     return nm && (strcmp(nm, "__init__") == 0 || strcmp(nm, "__post_init__") == 0);
 }
 
+/* Decorator expressions of a decorated definition, in source order. They
+ * evaluate in the scope enclosing the definition, before it is bound. A bare
+ * `@name` is no call and emits nothing; `@name(args)` is one. */
+static void py_resolve_decorators(PyLSPContext *ctx, TSNode decorated) {
+    if (!ctx || ctx->eval_failure)
+        return;
+    PyKids kids = py_kids(ctx->arena, decorated);
+    for (uint32_t i = 0; i < kids.n && !ctx->eval_failure; i++) {
+        TSNode child = py_kid(&kids, i);
+        if (strcmp(ts_node_type(child), "decorator") == 0)
+            py_resolve_calls_in(ctx, child);
+    }
+}
+
+/* Bind the name a class-body `def`/`class` statement defines in the class
+ * frame, so later class-body statements see it (and never the same-named
+ * module symbol). Its value is exact only for an undecorated function or a
+ * registered class whose QN is known; anything else is an UNKNOWN shadow. */
+static void py_bind_class_body_def(PyLSPContext *ctx, TSNode stmt) {
+    if (ctx->eval_failure)
+        return;
+    TSNode def = stmt;
+    bool decorated = strcmp(ts_node_type(stmt), "decorated_definition") == 0;
+    if (decorated) {
+        def = ts_node_child_by_field_name(stmt, "definition", 10);
+        if (ts_node_is_null(def))
+            return;
+    }
+    const char *kind = ts_node_type(def);
+    bool is_class = strcmp(kind, "class_definition") == 0;
+    if (!is_class && strcmp(kind, "function_definition") != 0)
+        return;
+    char *name = py_node_text(ctx, ts_node_child_by_field_name(def, "name", 4));
+    if (!name || !name[0]) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    const char *qn = ctx->class_body_qn
+                         ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->class_body_qn, name)
+                         : NULL;
+    if (is_class) {
+        const CBMRegisteredType *type = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+        py_scope_bind(ctx, name,
+                      type ? cbm_type_named(ctx->arena, type->qualified_name) : cbm_type_unknown());
+        return;
+    }
+    const CBMRegisteredFunc *func = qn ? cbm_registry_lookup_func(ctx->registry, qn) : NULL;
+    if (!decorated && py_func_is_exact_callable_value(func)) {
+        py_scope_bind_callable(ctx, name, cbm_type_unknown(), func->qualified_name);
+    } else {
+        py_scope_bind(ctx, name, cbm_type_unknown());
+    }
+}
+
+/* Execute a class definition where it stands: its bases in the enclosing
+ * scope, then its body statements in source order in a class frame. Calls
+ * keep the caller the extraction gives them: the enclosing function, or the
+ * module QN at module level (enclosing_func_qn is left unchanged).
+ *
+ * Scoping follows Python: a name bound earlier in the body is visible to
+ * later body statements (and to decorators of methods), but the class frame
+ * is not an enclosing scope for anything nested in it. Method bodies are
+ * resolved later by py_process_class against the module scope, and a nested
+ * class body chains to the nearest enclosing non-class scope. Each body
+ * statement is walked exactly once. */
+static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node) {
+    if (!ctx || ctx->eval_failure || ts_node_is_null(class_node))
+        return;
+    TSNode supers = ts_node_child_by_field_name(class_node, "superclasses", 12);
+    if (!ts_node_is_null(supers))
+        py_resolve_calls_in(ctx, supers);
+    TSNode body = ts_node_child_by_field_name(class_node, "body", 4);
+    if (ctx->eval_failure || ts_node_is_null(body))
+        return;
+
+    char *cname = py_node_text(ctx, ts_node_child_by_field_name(class_node, "name", 4));
+    const char *class_qn = NULL;
+    if (cname && cname[0]) {
+        if (ctx->class_body_outer_scope) {
+            class_qn = ctx->class_body_qn
+                           ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->class_body_qn, cname)
+                           : NULL;
+        } else if (ctx->module_qn && ctx->enclosing_func_qn && ctx->file_module_qn &&
+                   strcmp(ctx->enclosing_func_qn, ctx->file_module_qn) == 0) {
+            class_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+        }
+    }
+
+    CBMScope *saved_scope = ctx->current_scope;
+    CBMScope *saved_outer = ctx->class_body_outer_scope;
+    const char *saved_qn = ctx->class_body_qn;
+    bool saved_comprehension = ctx->class_body_in_comprehension;
+    CBMScope *outer = saved_outer ? saved_outer : saved_scope;
+    CBMScope *frame = py_class_frame_push(ctx, outer);
+    if (!frame)
+        return;
+    py_scope_restore(ctx, frame);
+    ctx->class_body_outer_scope = outer;
+    ctx->class_body_qn = class_qn;
+    ctx->class_body_in_comprehension = false;
+
+    PyKids bk = py_kids(ctx->arena, body);
+    for (uint32_t i = 0; i < bk.n && !ctx->eval_failure; i++) {
+        TSNode stmt = py_kid(&bk, i);
+        py_resolve_calls_in(ctx, stmt);
+        py_bind_class_body_def(ctx, stmt);
+    }
+
+    ctx->class_body_outer_scope = saved_outer;
+    ctx->class_body_qn = saved_qn;
+    ctx->class_body_in_comprehension = saved_comprehension;
+    py_scope_restore(ctx, saved_scope);
+}
+
 static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
+    if (!ctx || ctx->eval_failure)
+        return;
     TSNode name_node = ts_node_child_by_field_name(class_node, "name", 4);
     if (ts_node_is_null(name_node))
         return;
@@ -4076,13 +4439,14 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
 
     TSNode body = ts_node_child_by_field_name(class_node, "body", 4);
     if (!ts_node_is_null(body)) {
-        uint32_t bnc = ts_node_named_child_count(body);
+        PyKids bk = py_kids(ctx->arena, body);
+        uint32_t bnc = bk.n;
         // First pass: process class-level annotated assignments (PEP 526
         // class-body field annotations like `x: int`) and dunder __init__
         // methods so fields are registered before sibling methods that
         // reference them.
         for (uint32_t i = 0; i < bnc; i++) {
-            TSNode c = ts_node_named_child(body, i);
+            TSNode c = py_kid(&bk, i);
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "expression_statement") == 0 && ts_node_named_child_count(c) > 0) {
                 TSNode inner = ts_node_named_child(c, 0);
@@ -4105,7 +4469,7 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
         }
         // Second pass: __init__ (so self.x assignments populate fields).
         for (uint32_t i = 0; i < bnc; i++) {
-            TSNode c = ts_node_named_child(body, i);
+            TSNode c = py_kid(&bk, i);
             const char *ck = ts_node_type(c);
             TSNode fn_node = c;
             bool is_decorated = strcmp(ck, "decorated_definition") == 0;
@@ -4123,7 +4487,7 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
         }
         // Third pass: every other method (and nested classes).
         for (uint32_t i = 0; i < bnc; i++) {
-            TSNode c = ts_node_named_child(body, i);
+            TSNode c = py_kid(&bk, i);
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "function_definition") == 0) {
                 if (!py_is_init_method(ctx, c)) {
@@ -4148,10 +4512,17 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
 /* Module bindings are replayed in source order before deferred function bodies
  * are analyzed. Class definitions always replace an earlier callable identity;
  * the registry decides whether the resulting class type is known precisely. */
-static bool py_root_defines_class_named(PyLSPContext *ctx, TSNode root, const char *name) {
-    uint32_t count = ts_node_named_child_count(root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_named_child(root, i);
+/* The names of the classes this source defines at module level, as a name set
+ * (a detached, hash-indexed CBMScope frame). Built in one pass over the root:
+ * asking "does the root define a class named X?" by rescanning the root once
+ * per registry type made module assembly O(types x top-level statements).
+ * Returns NULL if a class name or set entry cannot be collected completely. */
+static CBMScope *py_root_class_names(PyLSPContext *ctx, const PyKids *rk) {
+    CBMScope *names = cbm_scope_push(ctx->arena, NULL);
+    if (!names)
+        return NULL;
+    for (uint32_t i = 0; i < rk->n; i++) {
+        TSNode node = py_kid(rk, i);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "decorated_definition") == 0) {
             node = ts_node_child_by_field_name(node, "definition", 10);
@@ -4159,21 +4530,35 @@ static bool py_root_defines_class_named(PyLSPContext *ctx, TSNode root, const ch
         }
         if (strcmp(kind, "class_definition") != 0)
             continue;
-        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
-        if (py_import_node_text_equals(ctx, name_node, name))
-            return true;
+        char *name = py_node_text(ctx, ts_node_child_by_field_name(node, "name", 4));
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (ctx->test_root_name_failure == 1)
+            name = NULL;
+        else if (ctx->test_root_name_failure == 2)
+            name = "";
+#endif
+        if (!name || !name[0] || !cbm_scope_bind_checked(names, name, cbm_type_unknown()))
+            return NULL;
     }
-    return false;
+    return names;
 }
 
 /* A project registry can contain another file's class in the same logical
  * Python module. Keep those cross-file globals available, but do not prebind
  * classes declared by this source: their binding epoch belongs in the ordered
  * replay below. */
-static void py_bind_external_module_classes(PyLSPContext *ctx, TSNode root) {
+static void py_bind_external_module_classes(PyLSPContext *ctx, const PyKids *rk) {
     if (!ctx || !ctx->registry || !ctx->module_qn)
         return;
+    CBMScope *defined = py_root_class_names(ctx, rk);
+    if (!defined) {
+        /* Without the set no external class can be proven undeclared here;
+         * binding none is the fail-closed direction. */
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
     size_t prefix_len = strlen(ctx->module_qn);
+    bool package_scope = ctx->file_module_qn && strcmp(ctx->file_module_qn, ctx->module_qn) != 0;
     CBMTypeShortIter all_types;
     cbm_registry_all_types_chain(ctx->registry, &all_types);
     for (int i = -1; (i = cbm_type_short_iter_next(&all_types)) >= 0;) {
@@ -4181,12 +4566,21 @@ static void py_bind_external_module_classes(PyLSPContext *ctx, TSNode root) {
         const char *qn = type->qualified_name;
         const char *name = type->short_name;
         if (!qn || !name || strncmp(qn, ctx->module_qn, prefix_len) != 0 || qn[prefix_len] != '.' ||
-            py_root_defines_class_named(ctx, root, name)) {
+            cbm_scope_lookup_local(defined, name)) {
             continue;
         }
+        if (package_scope && strchr(qn + prefix_len + 1, '.'))
+            continue; /* submodule/nested classes are not package globals */
         py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
     }
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_py_lsp_test_bind_external_classes(PyLSPContext *ctx, TSNode root) {
+    PyKids rk = py_kids(ctx->arena, root);
+    py_bind_external_module_classes(ctx, &rk);
+}
+#endif
 
 static void py_bind_module_class(PyLSPContext *ctx, TSNode class_node) {
     if (!ctx || ts_node_is_null(class_node) || !ctx->module_qn)
@@ -4564,9 +4958,9 @@ static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int 
         }
         return;
     }
-    uint32_t count = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < count; i++)
-        py_invalidate_possible_bindings(ctx, ts_node_named_child(node, i), depth + 1);
+    PyKids nk = py_kids(ctx->arena, node);
+    for (uint32_t i = 0; i < nk.n; i++)
+        py_invalidate_possible_bindings(ctx, py_kid(&nk, i), depth + 1);
 }
 
 static bool py_replayable_import_kind(PyDirectImportKind kind) {
@@ -4654,10 +5048,22 @@ static bool py_expression_is_annotation_only_assignment(TSNode statement) {
 }
 
 void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
-    if (!ctx || ts_node_is_null(root))
+    if (!ctx || ctx->eval_failure || ts_node_is_null(root))
         return;
+    int resolved_start = ctx->resolved_calls ? ctx->resolved_calls->count : 0;
+    int synthetic_start = ctx->syn_calls ? ctx->syn_calls->count : 0;
+    /* Only invocation dedup mutates prior rows, within this fixed tail.
+     * Snapshot once per walk: no full-output copy or fallible rollback allocation. */
+    int tail_count =
+        resolved_start < PY_RESOLVED_DEDUP_WINDOW ? resolved_start : PY_RESOLVED_DEDUP_WINDOW;
+    int tail_start = resolved_start - tail_count;
+    CBMResolvedCall saved_tail[PY_RESOLVED_DEDUP_WINDOW];
+    CBMResolvedCall *original_tail = tail_count ? ctx->resolved_calls->items + tail_start : NULL;
+    if (tail_count)
+        memcpy(saved_tail, original_tail, (size_t)tail_count * sizeof(*saved_tail));
+    PyKids rk = py_kids(ctx->arena, root);
     py_classify_imports_for_root(ctx, root);
-    py_bind_external_module_classes(ctx, root);
+    py_bind_external_module_classes(ctx, &rk);
     unsigned char *consumed_imports = NULL;
     if (ctx->import_count > 0) {
         consumed_imports = (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)ctx->import_count);
@@ -4665,28 +5071,36 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
             memset(consumed_imports, 0, (size_t)ctx->import_count);
     }
 
-    uint32_t nc = ts_node_named_child_count(root);
+    uint32_t nc = rk.n;
     const char *prev_func = ctx->enclosing_func_qn;
-    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.__module__", ctx->module_qn);
+    /* Extraction uses the file's Module QN at top level. Keep the caller
+     * arena-owned for cross-file APIs whose module_qn input may be temporary. */
+    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s", ctx->file_module_qn);
     // Pass 1: execute top-level binding effects in source order. Function
     // bodies remain deferred until the final module scope has been assembled.
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_named_child(root, i);
+    for (uint32_t i = 0; i < nc && !ctx->eval_failure; i++) {
+        TSNode c = py_kid(&rk, i);
         const char *ck = ts_node_type(c);
         if (strcmp(ck, "import_statement") == 0 || strcmp(ck, "import_from_statement") == 0) {
             py_replay_import_statement(ctx, c, consumed_imports);
         } else if (strcmp(ck, "function_definition") == 0) {
             py_bind_module_function(ctx, c);
         } else if (strcmp(ck, "class_definition") == 0) {
-            py_bind_module_class(ctx, c);
+            py_exec_class_definition(ctx, c);
+            if (!ctx->eval_failure)
+                py_bind_module_class(ctx, c);
         } else if (strcmp(ck, "decorated_definition") == 0) {
+            py_resolve_decorators(ctx, c);
             TSNode def = ts_node_child_by_field_name(c, "definition", 10);
-            if (!ts_node_is_null(def)) {
+            if (!ctx->eval_failure && !ts_node_is_null(def)) {
                 const char *dk = ts_node_type(def);
-                if (strcmp(dk, "function_definition") == 0)
+                if (strcmp(dk, "function_definition") == 0) {
                     py_bind_module_function(ctx, def);
-                else if (strcmp(dk, "class_definition") == 0)
-                    py_bind_module_class(ctx, def);
+                } else if (strcmp(dk, "class_definition") == 0) {
+                    py_exec_class_definition(ctx, def);
+                    if (!ctx->eval_failure)
+                        py_bind_module_class(ctx, def);
+                }
             }
         } else if (strcmp(ck, "expression_statement") == 0) {
             /* An expression statement is resolved for calls, not scanned as a
@@ -4709,8 +5123,8 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
         }
     }
     // Pass 2: top-level calls (rare) and nested definitions.
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_named_child(root, i);
+    for (uint32_t i = 0; i < nc && !ctx->eval_failure; i++) {
+        TSNode c = py_kid(&rk, i);
         const char *ck = ts_node_type(c);
         if (strcmp(ck, "function_definition") == 0) {
             py_process_function(ctx, c, NULL);
@@ -4729,6 +5143,17 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
         }
     }
     ctx->enclosing_func_qn = prev_func;
+    if (ctx->eval_failure) {
+        if (tail_count) {
+            memcpy(original_tail, saved_tail, (size_t)tail_count * sizeof(*saved_tail));
+            memcpy(ctx->resolved_calls->items + tail_start, saved_tail,
+                   (size_t)tail_count * sizeof(*saved_tail));
+        }
+        if (ctx->resolved_calls)
+            ctx->resolved_calls->count = resolved_start;
+        if (ctx->syn_calls)
+            ctx->syn_calls->count = synthetic_start;
+    }
 }
 
 /* Register one definition into the registry. Returns true if recognized. */
@@ -4887,8 +5312,18 @@ static bool py_register_def(CBMArena *arena, CBMTypeRegistry *reg, CBMDefinition
 
 void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                     TSNode root) {
-    if (!arena || !result)
+    if (!arena || !result || result->lsp_skipped)
         return;
+
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, arena);
+    PyLSPContext ctx;
+    py_lsp_init_for_stage(&ctx, arena, source, source_len, &reg, result->module_qn,
+                          &result->resolved_calls, "raw");
+    if (ctx.eval_failure) {
+        cbm_py_lsp_record_failure(result, ctx.eval_failure);
+        return;
+    }
 
     /* Inject minimal builtin definitions as real graph nodes (builtins.len,
      * builtins.str, builtins.str.upper, ...). The typeshed registry already
@@ -4899,12 +5334,9 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
      * builtin/constructor/method edges point at. Upsert dedups by QN. */
     py_builtins_inject_defs(result, arena);
 
-    CBMTypeRegistry reg;
-    cbm_registry_init(&reg, arena);
-
     cbm_python_stdlib_register(&reg, arena);
 
-    const char *module_qn = result->module_qn;
+    const char *module_qn = ctx.module_qn;
 
     // Register the file's own definitions so calls inside this file can
     // resolve via the registry.
@@ -4913,8 +5345,18 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     }
     py_mark_ambiguous_callable_bindings(&reg);
 
-    PyLSPContext ctx;
-    py_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
+    /* Hash-index the registry before the walk (#1527). Unfinalized, every
+     * lookup scanned the stdlib plus all of this file's definitions, which
+     * made resolving a large module O(calls x defs). The index answers each
+     * duplicated name with its first registration, as the scan did, so the
+     * resolution result is unchanged; post-walk additions (instance fields)
+     * stay visible through the registry's tail scan. The index lives in a
+     * scratch arena that dies with this call, not in the result arena. */
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    reg.index_first_registered = true;
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     /* Let the resolver inject synthetic syntactic calls for operator/subscript
      * dunder desugaring so those recovered calls reach the CALLS-edge pipeline. */
     ctx.syn_calls = &result->calls;
@@ -4926,7 +5368,11 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         }
     }
 
+    py_memo_test_stage(&ctx, "raw");
     py_lsp_process_file(&ctx, root);
+    if (ctx.eval_failure)
+        cbm_py_lsp_record_failure(result, ctx.eval_failure);
+    cbm_arena_destroy(&idx_arena);
 }
 
 /* ── Cross-file + batch ───────────────────────────────────────── */
@@ -4965,9 +5411,50 @@ static const char **py_split_pipe(CBMArena *arena, const char *text) {
     return out;
 }
 
+/* Split a class def's field_defs ("name:QN|name:QN", built by the Python
+ * field fold in pass_lsp_cross.c) into the parallel NULL-terminated arrays a
+ * CBMRegisteredType carries. The types are already project QNs, so each one
+ * becomes a NAMED type verbatim. Without this, `obj.field.method()` on a class
+ * from another file lost the field's type (#1277); same-file classes get their
+ * fields from the per-file walk instead. Pure string work: no registry lookup
+ * happens here, so it is safe inside the type-registration pass. */
+static void py_split_field_defs(CBMArena *arena, const char *field_defs, const char ***names_out,
+                                const CBMType ***types_out) {
+    *names_out = NULL;
+    *types_out = NULL;
+    const char **pairs = py_split_pipe(arena, field_defs);
+    if (!pairs)
+        return;
+    int n = 0;
+    while (pairs[n])
+        n++;
+    const char **names =
+        (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const CBMType *));
+    if (!names || !types)
+        return;
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        char *colon = strchr(pairs[i], ':');
+        if (!colon || colon == pairs[i] || !colon[1])
+            continue;
+        *colon = '\0'; /* pairs[i] is this call's own arena copy */
+        names[kept] = pairs[i];
+        types[kept] = cbm_type_named(arena, colon + 1);
+        kept++;
+    }
+    if (kept == 0)
+        return;
+    names[kept] = NULL;
+    types[kept] = NULL;
+    *names_out = names;
+    *types_out = types;
+}
+
 /* Build a registry from CBMLSPDef[] supplied by the caller — covers both
  * the source file's own defs and cross-file referenced defs. */
-static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
+static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
                                  CBMLSPDef *defs, int def_count) {
     /* Pass 1: types only — the method pass probes the registry per Method def
      * (receiver auto-registration), which is a LINEAR scan pre-finalize:
@@ -4990,6 +5477,7 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             if (d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = py_split_pipe(arena, d->method_names_str);
             }
+            py_split_field_defs(arena, d->field_defs, &rt.field_names, &rt.field_types);
             cbm_registry_add_type(reg, rt);
         }
     }
@@ -5030,7 +5518,13 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
                     ret_types[n] = NULL;
                 }
             }
-            PySignatureParamParserContext parser_ctx = {.module_qn = d->def_module_qn};
+            const char *symbol_scope = d->def_module_qn;
+            /* Fallback definitions can be mixed-language. Only authoritative
+             * Python metadata opts into package scope normalization. */
+            if (d->lang == CBM_LANG_PYTHON &&
+                !py_symbol_scope(arena, d->def_module_qn, "register", &symbol_scope))
+                return false;
+            PySignatureParamParserContext parser_ctx = {.module_qn = symbol_scope};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 py_signature_param_type_adapter, &parser_ctx);
@@ -5050,15 +5544,33 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             cbm_registry_add_func(reg, rf);
         }
     }
+    return true;
 }
 
-void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_py_lsp_test_register_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
+                                   int def_count) {
+    return py_register_lsp_defs(arena, NULL, reg, defs, def_count);
+}
+#endif
+
+bool cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           const char *module_qn, CBMLSPDef *defs, int def_count,
                           const char **import_names, const char **import_qns, int import_count,
                           TSTree *cached_tree, CBMResolvedCallArray *out,
                           CBMCallArray *synthetic_calls) {
+    return cbm_run_py_lsp_cross_status(arena, source, source_len, module_qn, defs, def_count,
+                                       import_names, import_qns, import_count, cached_tree, out,
+                                       synthetic_calls) == CBM_LSP_COMPLETE;
+}
+
+CBMLSPStatus cbm_run_py_lsp_cross_status(CBMArena *arena, const char *source, int source_len,
+                                         const char *module_qn, CBMLSPDef *defs, int def_count,
+                                         const char **import_names, const char **import_qns,
+                                         int import_count, TSTree *cached_tree,
+                                         CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     if (!arena || !source || source_len <= 0 || !out)
-        return;
+        return CBM_LSP_COMPLETE;
 
     TSParser *parser = NULL;
     TSTree *tree = cached_tree;
@@ -5066,13 +5578,13 @@ void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
     if (!tree) {
         parser = ts_parser_new();
         if (!parser)
-            return;
+            return CBM_LSP_COMPLETE;
         ts_parser_set_language(parser, tree_sitter_python());
         tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
-            return;
+            return CBM_LSP_COMPLETE;
         }
     }
     TSNode root = ts_tree_root_node(tree);
@@ -5084,28 +5596,36 @@ void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
     /* Index allocations go to a per-call scratch arena (see php_lsp_cross). */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
-    py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count);
+    PyLSPContext ctx;
+    py_lsp_init_for_stage(&ctx, arena, source, source_len, &reg, module_qn, out, "cross");
+    if (ctx.eval_failure)
+        goto cross_cleanup;
+    if (!py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count)) {
+        ctx.eval_failure = CBM_LSP_SCOPE_FAILED;
+        goto cross_cleanup;
+    }
     py_mark_ambiguous_callable_bindings(&reg);
 
     /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
      * comment for the rationale. */
     cbm_registry_finalize_into(&reg, &idx_arena);
 
-    PyLSPContext ctx;
-    py_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
     ctx.syn_calls = synthetic_calls;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
             py_lsp_add_import(&ctx, import_names[i], import_qns[i]);
         }
     }
+    py_memo_test_stage(&ctx, "cross");
     py_lsp_process_file(&ctx, root);
+cross_cleanup:
     cbm_arena_destroy(&idx_arena);
 
     if (owns_tree && tree)
         ts_tree_delete(tree);
     if (parser)
         ts_parser_delete(parser);
+    return ctx.eval_failure;
 }
 
 /* ── Tier 2: pre-built per-language registry (mirrors Go pilot) ── */
@@ -5124,7 +5644,8 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
         if (d->lang != CBM_LANG_PYTHON)
             continue;
         /* Reuse the existing register fn on a single-def slice (n=1 inline). */
-        py_register_lsp_defs(arena, NULL, reg, d, 1);
+        if (!py_register_lsp_defs(arena, NULL, reg, d, 1))
+            return NULL; /* caller owns the shared arena and other registries */
     }
 
     py_mark_ambiguous_callable_bindings(reg);
@@ -5133,13 +5654,22 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     return reg;
 }
 
-void cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+bool cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                         const char *module_qn, CBMTypeRegistry *reg,
                                         const char **import_names, const char **import_qns,
                                         int import_count, TSTree *cached_tree,
                                         CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
+    return cbm_run_py_lsp_cross_with_registry_status(
+               arena, source, source_len, module_qn, reg, import_names, import_qns, import_count,
+               cached_tree, out, synthetic_calls) == CBM_LSP_COMPLETE;
+}
+
+CBMLSPStatus cbm_run_py_lsp_cross_with_registry_status(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    CBMTypeRegistry *reg, const char **import_names, const char **import_qns, int import_count,
+    TSTree *cached_tree, CBMResolvedCallArray *out, CBMCallArray *synthetic_calls) {
     if (!arena || !source || source_len <= 0 || !out || !reg)
-        return;
+        return CBM_LSP_COMPLETE;
 
     TSParser *parser = NULL;
     TSTree *tree = cached_tree;
@@ -5147,38 +5677,43 @@ void cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int
     if (!tree) {
         parser = ts_parser_new();
         if (!parser)
-            return;
+            return CBM_LSP_COMPLETE;
         ts_parser_set_language(parser, tree_sitter_python());
         tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
-            return;
+            return CBM_LSP_COMPLETE;
         }
     }
     TSNode root = ts_tree_root_node(tree);
 
     PyLSPContext ctx;
-    py_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
+    py_lsp_init_for_stage(&ctx, arena, source, source_len, reg, module_qn, out, "cross");
+    if (ctx.eval_failure)
+        goto prebuilt_cleanup;
     ctx.syn_calls = synthetic_calls;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
             py_lsp_add_import(&ctx, import_names[i], import_qns[i]);
         }
     }
+    py_memo_test_stage(&ctx, "cross");
     py_lsp_process_file(&ctx, root);
-
+prebuilt_cleanup:
     if (owns_tree && tree)
         ts_tree_delete(tree);
     if (parser)
         ts_parser_delete(parser);
+    return ctx.eval_failure;
 }
 
-void cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
+bool cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
                             CBMResolvedCallArray *out) {
     if (!arena || !files || file_count <= 0 || !out)
-        return;
+        return true;
 
+    bool complete = true;
     for (int f = 0; f < file_count; f++) {
         CBMBatchPyLSPFile *file = &files[f];
         memset(&out[f], 0, sizeof(CBMResolvedCallArray));
@@ -5191,9 +5726,10 @@ void cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_
         CBMResolvedCallArray file_out;
         memset(&file_out, 0, sizeof(file_out));
 
-        cbm_run_py_lsp_cross(&file_arena, file->source, file->source_len, file->module_qn,
-                             file->defs, file->def_count, file->import_names, file->import_qns,
-                             file->import_count, file->cached_tree, &file_out, NULL);
+        if (!cbm_run_py_lsp_cross(&file_arena, file->source, file->source_len, file->module_qn,
+                                  file->defs, file->def_count, file->import_names, file->import_qns,
+                                  file->import_count, file->cached_tree, &file_out, NULL))
+            complete = false;
 
         if (file_out.count > 0) {
             out[f].count = file_out.count;
@@ -5222,6 +5758,7 @@ void cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_
 
         cbm_arena_destroy(&file_arena);
     }
+    return complete;
 }
 
 /* ── Stdlib stub — Phase 10 replaces with auto-generated body ─── */
