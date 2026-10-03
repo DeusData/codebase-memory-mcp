@@ -7,6 +7,7 @@
 
 #include "doclink.h"
 #include "foundation/arena.h"
+#include "foundation/compat.h" /* cbm_clock_gettime */
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
@@ -17,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ── Reasons ─────────────────────────────────────────────────────── */
 
@@ -132,11 +134,22 @@ struct cbm_doclinks {
     _Atomic int64_t local_refs;
     _Atomic int64_t no_source;
     _Atomic int64_t reasons[CBM_DOCLINK_REASON_COUNT];
+    /* what the layer cost, for the doc_links.timing log line (never a gate) */
+    int64_t build_ns;                /* the per-language indexes */
+    _Atomic int64_t resolve_ns;      /* summed over the files, i.e. over the workers */
+    _Atomic int64_t resolved_files;  /* files that had references */
+    _Atomic int64_t resolved_tokens; /* references handed to a resolver */
 };
 
 static const char *itoa64(int64_t v, char *buf, size_t n) {
     snprintf(buf, n, "%lld", (long long)v);
     return buf;
+}
+
+static int64_t doclinks_now_ns(void) {
+    struct timespec ts;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((int64_t)ts.tv_sec * 1000000000LL) + (int64_t)ts.tv_nsec;
 }
 
 static bool want_doc_scope(const CBMFileResult *header) {
@@ -279,6 +292,7 @@ cbm_doclinks_t *cbm_doclinks_build(const cbm_pipeline_ctx_t *ctx, const cbm_file
         cbm_doclinks_free(dl);
         return NULL;
     }
+    int64_t started = doclinks_now_ns();
     for (int s = 0; s < DOCLINK_RESOLVER_COUNT; s++) {
         const char *why = "alloc";
         if (!build_language(dl, s, ctx, files, file_count, cache, base, base_count, graph, &why)) {
@@ -287,6 +301,7 @@ cbm_doclinks_t *cbm_doclinks_build(const cbm_pipeline_ctx_t *ctx, const cbm_file
             return NULL;
         }
     }
+    dl->build_ns = doclinks_now_ns() - started;
     return dl;
 }
 
@@ -357,6 +372,7 @@ void cbm_doclinks_resolve_file(cbm_doclinks_t *dl, int file_idx, const CBMFileRe
         result->doc_links.count == 0 || !result->doc_links.items) {
         return;
     }
+    int64_t started = doclinks_now_ns();
     const cbm_file_info_t *fi = &dl->files[file_idx];
     int slot = resolver_slot(fi->language);
     const cbm_doclink_resolver_t *R = slot >= 0 ? DOCLINK_RESOLVERS[slot] : NULL;
@@ -448,6 +464,9 @@ void cbm_doclinks_resolve_file(cbm_doclinks_t *dl, int file_idx, const CBMFileRe
         emit_mentions(dl, mentions, nm, edge_out);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, mentions);
+    atomic_fetch_add_explicit(&dl->resolve_ns, doclinks_now_ns() - started, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dl->resolved_files, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dl->resolved_tokens, n, memory_order_relaxed);
     if (nr == 0) {
         cbm_free(CBM_MEM_CLASS_STORE, rows);
         return;
@@ -519,6 +538,14 @@ void cbm_doclinks_take_rows(cbm_doclinks_t *dl, cbm_doc_link_row_t **rows, int *
         itoa64(atomic_load(&dl->reasons[CBM_DOCLINK_REASON_NOT_INDEXED]), b[6], sizeof(b[6])),
         "below_bar_tier",
         itoa64(atomic_load(&dl->reasons[CBM_DOCLINK_REASON_BELOW_BAR]), b[7], sizeof(b[7])));
+    /* resolve_cpu_ms is the time inside the resolvers added up over the
+     * files: with N workers the wall share is about a N-th of it */
+    enum { NS_PER_MS = 1000000 };
+    cbm_log_info("doc_links.timing", "index_build_ms",
+                 itoa64(dl->build_ns / NS_PER_MS, b[0], sizeof(b[0])), "resolve_cpu_ms",
+                 itoa64(atomic_load(&dl->resolve_ns) / NS_PER_MS, b[1], sizeof(b[1])), "files",
+                 itoa64(atomic_load(&dl->resolved_files), b[2], sizeof(b[2])), "references",
+                 itoa64(atomic_load(&dl->resolved_tokens), b[3], sizeof(b[3])));
 }
 
 void cbm_doclinks_free_rows(cbm_doc_link_row_t *rows, int count) {
@@ -703,6 +730,7 @@ int cbm_doclinks_scopes_from_surfaces(const cbm_lsp_surface_row_t *rows, int row
     if (!rows || row_count <= 0) {
         return 0;
     }
+    int64_t started = doclinks_now_ns();
     cbm_doclink_scope_t *scopes = NULL;
     int n = 0;
     int cap = 0;
@@ -741,6 +769,11 @@ int cbm_doclinks_scopes_from_surfaces(const cbm_lsp_surface_row_t *rows, int row
     }
     *out = scopes;
     *count = n;
+    /* an incremental run pays this instead of extracting the files again */
+    char b[3][CBM_SZ_32];
+    cbm_log_info("doc_links.stored_scopes", "rows", itoa64(row_count, b[0], sizeof(b[0])), "scopes",
+                 itoa64(n, b[1], sizeof(b[1])), "elapsed_ms",
+                 itoa64((doclinks_now_ns() - started) / 1000000, b[2], sizeof(b[2])));
     return 0;
 }
 

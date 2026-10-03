@@ -1,137 +1,314 @@
 /*
  * doc_links_cs.c — C# cref resolution for doc_links.h.
  *
- * The project-wide index is built from every C# file's doc-link scope
- * (internal/cbm/doclink_cs.c): namespaces, usings, type and member
- * declarations. Graph nodes are only looked up by qualified name, never by
+ * The project-wide index is built from every C# file's doc-link scope and
+ * every MSBuild project file's (internal/cbm/doclink_cs.c). Nothing is read
+ * from the disk. Graph nodes are only looked up by qualified name, never by
  * line, so the closure-repair route (whose unchanged nodes are line-less
  * proxies) resolves exactly as a full build does.
  *
- * Entities. A type entity is (FQN, generic arity): the namespace of the
- * declaring region plus the dotted local path, e.g. Acme.Core.Widget`1.
- * Partial types contribute several declarations. A declaration owns the node
- * at <module>.<path> when it is the last declaration of that path in its
- * file (the extractor keeps one node per qualified name and the last
- * declaration wins, so `Foo` / `Foo<T>` in one file leave one of them without
- * a node: a graph gap, never a fallback to the other arity). The same holds
- * for their members: `Foo.X` and `Foo<T>.X` share one node, and it belongs to
- * the later declaration.
+ * Assemblies. The index does not know which files a project compiles; it
+ * goes by where a file stands. A project is a directory that holds a
+ * *.csproj -- one whose SDK compiles something: a project file of the
+ * NoTargets or Traversal SDK only runs build steps, and is the project of no
+ * file. A file belongs to the nearest project at or above it. An
+ * assembly is named by its project file: projects whose project files have
+ * the same name are one assembly (a reference source beside its
+ * implementation, the flavours of one library). A directory that holds
+ * several project files is an assembly of its own: which of them a file
+ * there is compiled into is not known. A file no project file stands above
+ * is of a shared tree -- the largest directory around it with no project
+ * file in or below it. A shared tree belongs to no assembly: the projects
+ * that include its files compile them. (A repository without any project
+ * file is one tree.)
  *
- * Lookup follows the field-tested prototype (private/field-tests/tools/h1,
- * v2 rules + the five recommended rules; H8 R1-R4):
- *   - scope order: documented/enclosing types (own, then inherited) ->
- *     namespace chain innermost first -> using alias -> usings (file and
- *     namespace-block usings in scope, `global using` and MSBuild usings of
- *     the project) and `using static` members; the first level with a visible
- *     candidate decides, more than one entity there is ambiguous
- *   - a single segment never takes a fully-qualified shortcut; qualified
- *     prefixes are tried namespace-relative (innermost first) before absolute
- *   - member kind: a parameter list or a type-argument list selects
- *     callables only; a property and a method of one name are ambiguous; an
- *     overload group without a signature is ambiguous
- *   - constructors are named by a parameter list on the type's name
- *     (`Foo(int)`) or by qualification (`Foo.Foo`); a bare `Foo` is the type,
- *     and no constructor is inherited
- *   - arity (R2/R3): a segment without type arguments names the arity-0 type
- *     (declared with or without a node) wherever one is in scope; only when
- *     no scope level has one does a generic type of the name bind. Type
- *     arguments select the types and generic methods of that arity only
- *   - explicit interface implementations are not addressable by simple name
+ * Entities. A type entity is (scope, name, generic arity, owner): the scope
+ * is its namespace, or its outer type's entity, so `Outer.Inner` and
+ * `Outer<T>.Inner` are two types. The owner of a top-level type is its
+ * assembly: the declarations of one full name in one assembly are one type
+ * with several declarations (its parts, a stub beside the implementation,
+ * one per flavour), and declarations in two assemblies are two types, which
+ * see nothing of each other. The shared trees' declarations have no
+ * assembly. A complete declaration there is a type of its tree. The parts of
+ * a `partial` type there are one entity whatever tree they stand in, and
+ * they are parts of every assembly's type of that name whose implementation
+ * is itself declared partial: what a reference sees of a partial type is its
+ * own assembly's parts and the shared trees'. Seen without an assembly's own
+ * parts -- from a shared tree, or from an assembly that has none --, a name
+ * those parts declare is ambiguous: it is neither bound to what else has
+ * that name nor missing.
+ *
+ * Contracts. A declaration in a project directory named `ref` is a stub:
+ * `ref` is the .NET convention for reference-assembly sources. Inside one
+ * assembly the stub stands behind the implementation: the implementation's
+ * node binds, the stub's only where the implementation has none (its file
+ * did not parse, it lacks the member, or a parse error hides it). An
+ * assembly whose every declaration of a type is a stub holds only the
+ * contract, and the rule joins a contract to the one implementation it can
+ * belong to: the declaration of that full name and arity the shared trees
+ * hold, when they hold exactly one and no assembly holds another
+ * implementation of the name (entity_twins). The stub is then no second
+ * type; a binding that exists only through the join is never exact.
+ * Nothing is chosen between two implementations, two assemblies or two
+ * shared trees.
+ *
+ * What a reference sees of a name: its own assembly's type -- for a file of
+ * a shared tree, what its own tree declares. Else every shared tree's and
+ * every other assembly's type of that name alike: one binds, several are
+ * ambiguous. Which assemblies a project references is not known, so nothing
+ * chooses between two of them -- no stub, no nearer directory.
+ *
+ * Alternatives. Complete declarations of one type in two or more projects
+ * (the flavours of one assembly) are alternatives: the one of the
+ * referencing file's own project binds, and from anywhere else the
+ * reference is ambiguous. The same holds for one member declared in two or
+ * more projects or shared trees, and for the parts of a type in two or more
+ * shared trees. The parts of a partial type in one place are no
+ * alternatives: the type's node is the part's that stands nearest to the
+ * reference (a choice of presentation: every part is the type).
+ *
+ * Nodes. A declaration owns the node at <module>.<path> when it is the last
+ * declaration of that path in its file (the extractor keeps one node per
+ * qualified name and the last declaration wins, so `Foo` / `Foo<T>` in one
+ * file leave one of them without a node: a graph gap, never a fallback to
+ * the other). The same holds for members: overloads share one node; `Foo.X`
+ * and `Foo<T>.X` share one, and it belongs to the later declaration.
+ * Operators, indexers, events, delegates, implicit and primary constructors
+ * have no node at all: a reference to one that is declared is a graph gap.
+ *
+ * Lookup is the C# compiler's cref binding, and it guesses nothing: the first
+ * scope level that has the name decides, and more than one candidate there
+ * is ambiguous.
+ *   - a simple name: the documented method's type parameters; then for every
+ *     enclosing type, innermost first: its type parameters, its own nested
+ *     types and members; then for every enclosing namespace, innermost
+ *     first: the types and namespaces in it, then (where a namespace
+ *     declaration of the file stands) that declaration's aliases and after
+ *     them its usings. The file's own usings and the project's global ones
+ *     belong to the outermost level. A using of an inner namespace
+ *     declaration is therefore asked before an outer namespace
+ *   - a qualified name: its first segment is looked up as a simple name that
+ *     names a type or a namespace; every further segment is a member of what
+ *     the one before named. There is no second try from another level, and
+ *     no fully-qualified shortcut past a nearer namespace of that name
+ *   - inherited members are not looked up: the compiler does not consider
+ *     them in a cref, in a class or in an interface, by a simple name or
+ *     through the derived type's name. Such a reference is a row
+ *     (CS_BIND_INHERITED says what else it could be)
+ *   - arity: a name without type arguments is the arity-0 type. A generic
+ *     type of that name never stands in (no cross-arity fallback); type
+ *     arguments select the types and the generic methods of that arity. A
+ *     method name without type arguments takes methods of any arity, the
+ *     non-generic ones first
+ *   - the level that has the name decides also when a parameter list
+ *     follows: a written signature binds the overload of THAT level with
+ *     exactly these parameter types; a type variable matches by its position
+ *     only (`{K}` ... `(K)` against `<TKey>` ... `(TKey)`); only when no
+ *     overload matches does one with a parameter type nothing is known about
+ *     count, and several of those are ambiguous. Without a parameter list an
+ *     overload group is ambiguous
+ *   - constructors: a parameter list on a type's name (`Foo(int)`,
+ *     `Ns.Foo(int)`, `Outer.Inner(int)`), `Foo.Foo`, and `Foo(int)` written
+ *     inside a generic `Foo<T>`; a bare `Foo` is the type; no constructor is
+ *     inherited
+ *   - `using static` brings in a type's nested types and its static members,
+ *     extension methods excepted
+ *   - explicit interface implementations are not addressable by name
  *   - visibility: product code never binds a test-only declaration
- *     (test_only_target, no fallback); a test program does not bind another
+ *     (test_only_target, no fallback), and a namespace that only test code
+ *     declares is no name in its scope; a test program does not bind another
  *     program's global-namespace test type
- *   - external (R4): keyword aliases and System.* names missing from the
- *     corpus, open scopes (usings of namespaces outside the corpus) and open
- *     hierarchies (a base outside the corpus) are external, not missing
- *   - namespaces: a reference to one of the repository's namespaces is a
- *     graph gap (declared, no node); `Namespace.Type` for a type that
- *     namespace does not declare is missing (or external by R4), never a gap
- *   - MSBuild global usings (R1): Directory.Build.props -> project ->
- *     Directory.Build.targets, <Using Include/Remove>, ImplicitUsings SDK sets
- *   - what the parser could not place is never resolved around: a type whose
- *     members a parse error hides answers a member it does not show with
- *     graph_gap (not with an inherited or outer one); inside such a type a
- *     simple name found nowhere is graph_gap where it would otherwise be
- *     missing; and a name some file declares without an establishable
- *     namespace is graph_gap wherever it is referenced
+ *
+ * Reasons.
+ *   - external is structural: a name through a namespace the repository does
+ *     not declare (a using of one, a qualifier that is one, an open
+ *     hierarchy: a base outside the repository), a keyword alias the
+ *     repository does not declare, a project whose global usings could not
+ *     be evaluated. There is no list of well-known outside names; the one
+ *     namespace treated as never the repository's own is `System` with what
+ *     is under it (CS_STANDARD_ROOT)
+ *   - missing: a name every scope level was asked for, in declared
+ *     namespaces only; a name whose level has no overload with the written
+ *     parameters; an inherited member named through a derived type or by a
+ *     simple name (the compiler binds no such cref) when the hierarchy is
+ *     the repository's
+ *   - graph_gap: declared, and no node (see Nodes); a namespace; what the
+ *     parser could not place (a type whose members a parse error hides
+ *     answers a member it does not show with graph_gap; a name some file
+ *     declares without an establishable scope is a gap wherever it is
+ *     written)
+ *   - ambiguous: several candidates at the level that has the name; two
+ *     assemblies' (or two shared trees') types of one name; the flavours of
+ *     one type or member seen from outside their projects; a name that parts
+ *     of the type out of the reference's view declare; also an overload
+ *     group -- or one project's complete declarations of one type -- larger
+ *     than CS_MAX_OVERLOADS that would have to be compared, and a name more
+ *     than CS_MAX_FOREIGN assemblies declare. The index's log line
+ *     doc_links.cs.ambiguous counts the references by these causes
+ *   - unparseable: a reference longer than CS_REF_BUF, with more segments
+ *     than CS_MAX_SEGS or more parameters than CS_MAX_PARAMS
+ * No limit decides silently: every one of them ends in one of these rows.
  */
 #include "pipeline/doc_links.h"
 
 #include "doclink.h"
 #include "helpers.h" /* cbm_fqn_module_source_lang */
+#include "pipeline/doc_links_msbuild.h"
 #include "foundation/arena.h"
-#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 enum {
-    CS_MAX_CANDS = 32,
-    CS_MAX_SEGS = 16,
-    CS_MAX_PARAMS = 24,
-    CS_MAX_CHAIN = 16,
-    CS_MAX_BFS = 64,
-    CS_BFS_DEPTH = 25,
-    CS_KEY_BUF = 2048,
-    CS_PARAM_BUF = 160,
-    CS_REF_BUF = 1024,
+    CS_MAX_SEGS = 16,       /* segments of a written reference */
+    CS_MAX_PARAMS = 24,     /* its parameters */
+    CS_MAX_SUPERS = 64,     /* supertypes one lookup follows */
+    CS_MAX_OVERLOADS = 256, /* declarations of one name one lookup compares */
+    CS_MAX_FOREIGN = 64,    /* other owners' types of one name one lookup compares */
+    CS_MAX_NEST = 64,       /* the scanner's nesting limits (types, namespace segments) */
+    CS_KEY_BUF = 2048,      /* a node's qualified name */
+    CS_NAME_BUF = 513,      /* one name (the scanner's CS_NAME_MAX and its terminator) */
+    CS_PARAM_BUF = 256,     /* one normalized parameter type */
+    CS_REF_BUF = 1024,      /* a written reference */
     CS_ARITY_NONE = -1,
+    CS_NONE = -1,
+    CS_AMBIGUOUS = -2,
+    /* An entity's owner: an assembly (>= 0); CS_POOL, the shared trees' parts
+     * of a partial type; below it, the one shared tree that holds a complete
+     * declaration (shared_owner()). */
+    CS_POOL = -1,
+    CS_FIELDS = 9,    /* the most fields a scope record has (T) */
+    CS_MAX_ROOTS = 3, /* Enum, ValueType, Object */
+    /* 0: the compiler's rule, inherited members are never bound. 1: where the
+     * compiler's lookup binds nothing, the nearest supertype that has the
+     * member binds (a class's base classes, an interface's base interfaces,
+     * then the implicit roots the repository declares). Never a different
+     * binding than the compiler's: only one where it has none. */
+    CS_BIND_INHERITED = 0,
 };
 
 /* ── Index data ──────────────────────────────────────────────────── */
 
+/* A namespace of the repository: the global one (id 0), every declared one,
+ * and every namespace above a declared one. */
 typedef struct {
     int parent;
-    uint32_t start;
+    const char *name; /* its own segment */
+    bool declared;    /* a file declares it; else it is only above a declared one */
+    bool prod;        /* product code declares it, or a namespace under it */
+    bool standard;    /* `System`, or a namespace under it (see CS_STANDARD_ROOT) */
+} cs_ns_t;
+
+/* The one namespace no repository owns by declaring it. `System` is the
+ * standard library's namespace by the language standard, and user code adds
+ * to it (polyfills) without owning it: a name of `System`, or of a namespace
+ * under it, that the repository does not have is the standard library's --
+ * outside -- also where the repository declares that namespace. No other
+ * root is treated so, and no list of names stands behind this: every other
+ * namespace is the repository's as soon as a file declares it. */
+static const char CS_STANDARD_ROOT[] = "System";
+
+/* The IDs below retain the original directive order. Two written directives
+ * remain two candidates even when they name the same target. */
+typedef struct {
+    const char *name;
+    int id;
+} cs_alias_id_t;
+
+typedef struct {
+    int scope; /* namespace or entity, according to the array */
+    int id;
+} cs_using_id_t;
+
+typedef struct {
+    cs_alias_id_t *aliases; /* by (name, directive ID) */
+    size_t naliases;
+    cs_using_id_t *namespaces; /* by (namespace, directive ID) */
+    size_t nnamespaces;
+    cs_using_id_t *entities; /* by (view entity, directive ID), at most two per using */
+    size_t nentities;
+    bool ready; /* published only after all targets and arrays are complete */
+} cs_using_index_t;
+
+typedef struct {
+    const char *name;
+    int scope;
+    bool top; /* a namespace's top-level type, else an entity's named declaration */
+} cs_name_scope_t;
+
+typedef struct {
+    int parent; /* region index; CS_NONE for the file's own region 0 */
+    int ns;
+    uint32_t start; /* its lines (see the note on lines below) */
     uint32_t end;
-    const char *ns;
+    int u_lo; /* its usings: [u_lo, u_hi) of the file's */
+    int u_hi;
+    cs_using_index_t using_index;
+    bool open; /* a using of its own, or of a region around it, names something
+                * outside the repository */
 } cs_region_t;
 
 typedef struct {
     int region;
-    char kind; /* n namespace, s static, a alias, g global */
+    char kind; /* n namespace, s static, a alias */
+    bool global;
     const char *alias;
-    const char *target;
+    const char *target; /* as written */
+    int ns;             /* what it names: a namespace (CS_NONE: none of the repository) */
+    int ent;            /* ... or a type (CS_NONE; CS_AMBIGUOUS) */
+    bool joined;        /* ... one type only because a contract is joined to it */
 } cs_using_t;
 
 typedef struct {
     int region;
     uint32_t start;
     uint32_t end;
-    char kind;
-    const char *path;
+    char kind; /* c s i e r t d */
+    bool partial;
+    bool incomplete; /* a parse error hides some of its members */
+    bool owns_node;  /* the last declaration of its path in the file */
+    int outer;       /* the enclosing type (index in the file), or CS_NONE */
+    int depth;
     const char *name;
-    const char *tparams;
     const char *bases;
     int arity;
     int entity;
-    bool owns_node;  /* last declaration of its path in the file */
-    bool incomplete; /* a parse error hides some of its members */
+    int gid;                     /* types of one path in the file share it */
+    const cbm_gbuf_node_t *node; /* its graph node, when it owns one */
 } cs_type_t;
 
 /* Line numbers (start, end) are meaningful only in a file re-extracted by
  * this run: the persisted scope of every other file carries zeros (so an edit
  * that only moves lines keeps the file's surface). Lines are therefore read
- * only for the SOURCE file's own context, never for a target; target-side
- * ties are broken by declaration order. */
+ * only for the SOURCE file's own context, never for a target. */
 typedef struct {
     uint32_t start;
-    int order;    /* declaration order in the file */
-    int type_idx; /* the declaration it belongs to (index into the file's types) */
-    int arity;    /* generic method arity */
-    char kind;    /* c callable, v value, e event */
+    int type;  /* the declaration it belongs to (index into the file's types) */
+    int arity; /* generic method arity */
+    char kind; /* c method or constructor, v field or enum member, p property, e event,
+                  o operator, x indexer */
     bool explicit_impl;
-    const char *owner;
+    bool is_static; /* what `using static` brings in: static, and no extension method */
     const char *name;
-    const char *tparams;
-    const char *sig; /* NULL for a non-callable */
+    const char *sig;             /* '|'-joined parameter types; NULL for v, p and e */
+    int nparams;                 /* how many `sig` holds */
+    const cbm_gbuf_node_t *node; /* the node a reference to it binds; NULL: none */
 } cs_member_t;
+
+/* A type parameter: of a type (owner = its index) or of a generic method
+ * (owner = the file's type count + the member's index). */
+typedef struct {
+    int owner;
+    int pos;
+    const char *name;
+} cs_tparam_t;
 
 typedef struct {
     uint32_t from;
@@ -142,19 +319,21 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     bool is_test;
-    cs_span_lines_t *unplaced; /* line ranges whose declarations could not be placed */
-    int nunplaced;
+    bool is_ref; /* of a project directory named `ref`: a reference assembly's source */
     int unit;
+    cs_span_lines_t *unplaced; /* line ranges without a scope: sorted, disjoint */
+    int nunplaced;
     cs_region_t *regions;
     int nregions;
-    cs_using_t *usings;
+    cs_using_t *usings; /* by region */
     int nusings;
-    cs_type_t *types;
+    cs_type_t *types; /* document order: index = the T record's ordinal */
     int ntypes;
-    int *types_by_path; /* indices sorted by (path, blob order) */
-    cs_member_t *members;
+    cs_member_t *members; /* document order */
     int nmembers;
     int *members_by_start;
+    cs_tparam_t *tparams; /* by (owner, name) */
+    int ntparams;
 } cs_file_t;
 
 typedef struct {
@@ -162,60 +341,231 @@ typedef struct {
     int type;
 } cs_decl_t;
 
+/* Where a declaration stands for choosing the one a reference binds: with a
+ * node before without, an implementation before a reference assembly's stub,
+ * product code and test code apart. Entries of one class are in path order. */
+enum { CS_CLS_TEST = 1, CS_CLS_REF = 2, CS_CLS_NO_NODE = 4, CS_CLS_COUNT = 8 };
+
 typedef struct {
-    const char *fqn;
+    int file;
+    int type;
+    unsigned char cls;
+} cs_bind_t;
+
+/* A complete (not `partial`) declaration outside a reference assembly's
+ * source, by the project or shared tree it stands in. */
+typedef struct {
+    int unit;
+    int file;
+    int type;
+} cs_full_t;
+
+typedef struct {
+    int ns;     /* a top-level type's namespace; CS_NONE for a nested type */
+    int parent; /* a nested type's outer entity; CS_NONE */
+    int owner;  /* a top-level type's: its assembly, CS_POOL, or a shared tree */
+    int twin;   /* the shared trees' parts that are parts of this type too; CS_NONE */
+    /* For the shared trees' declaration, what the assemblies make of it: */
+    bool used;        /* an assembly's type has it as its twin */
+    int stub;         /* the assembly's type that has only stubs and takes it as its
+                       * implementation; CS_NONE: none does, CS_AMBIGUOUS: several do */
+    bool rival_known; /* `rival` was asked for */
+    bool rival;       /* an assembly holds an implementation of the name that is no part
+                       * of it (see rival_implementation) */
     const char *name;
-    const char *ns;
     int arity;
     char kind;
     cs_decl_t *decls;
     int ndecls;
     int dcap;
+    int *units; /* the projects and shared trees that declare it: sorted, unique */
+    int nunits;
     int *bases;
     int nbases;
-    bool open;
-    bool incomplete; /* a declaration of it has members a parse error hides */
+    cs_bind_t *binds; /* its declarations, by (class, file, type) */
+    /* Its complete declarations, when two or more projects (or shared trees)
+     * hold one: alternatives, by (unit, file, type). NULL when at most one
+     * does. */
+    cs_full_t *fulls;
+    int nfulls;
+    int full_units;      /* how many units hold a complete declaration */
+    int full_units_prod; /* ... one that is not test code */
+    bool open;           /* a base of its own is outside the repository */
+    bool open_any;       /* ... or one of a supertype's is */
+    bool incomplete;     /* a declaration of it has members a parse error hides */
     bool any_prod;
     bool all_test;
+    bool has_impl;     /* a declaration outside a reference assembly's source */
+    bool impl_partial; /* ... that is declared partial */
+    bool shared_parts; /* the shared trees' parts of a partial type, or nested in them */
+    bool joined;       /* stubs only, joined to the shared trees' one implementation (twin) */
 } cs_entity_t;
 
+/* A type by the scope that declares it: `scope` is a namespace for a
+ * top-level type and the outer entity for a nested one. */
 typedef struct {
-    int *items;
-    int count;
-    int cap;
-} cs_ilist_t;
+    int scope;
+    const char *name;
+    int arity;
+    int owner; /* the entity's (a nested type has its outer type's: 0 here) */
+    int ent;
+} cs_named_t;
 
+/* A member by the entity that declares it. */
+typedef struct {
+    int ent;
+    int file;
+    int midx;
+    unsigned char group; /* 0 value or event, 1 callable, 2 operator or indexer */
+    unsigned char cls;
+} cs_mref_t;
+
+/* A name that an assembly's own parts of a type declare beyond the shared
+ * trees' declaration `twin` they belong to: a nested type the shared trees
+ * do not have (`ent`), or members (`ent` and `arity` CS_NONE; one entry for
+ * all of a name, `prod`: one of them is no test declaration). */
+typedef struct {
+    int twin;
+    const char *name;
+    int arity;
+    int ent;
+    bool prod;
+} cs_extra_t;
+
+/* A project (a directory with a *.csproj and what is below it, up to the
+ * next one), or a shared tree. */
 typedef struct {
     const char *dir;
-    const char **usings;
+    int group;          /* its assembly; CS_NONE for a shared tree */
+    bool is_ref;        /* a project directory named `ref` */
+    cs_using_t *usings; /* global usings: its files' and its project files' */
     int nusings;
     int cap;
+    cs_using_index_t using_index;
+    bool open; /* a global using could not be evaluated, or names something outside */
 } cs_unit_t;
+
+/* A directory that holds project files. */
+typedef struct {
+    int count;        /* its *.csproj files */
+    const char *stem; /* the name of the first, without the extension */
+} cs_pdir_t;
+
+/* Why a reference is ambiguous. The row says `ambiguous`; the index's log
+ * line says how many references of each kind there were. */
+typedef enum {
+    CS_WHY_SCOPE = 0,  /* by the language's rules: candidates of one scope level, overloads */
+    CS_WHY_SHARED,     /* two or more shared trees declare the type */
+    CS_WHY_ASSEMBLIES, /* two or more assemblies do */
+    CS_WHY_FLAVOURS,   /* declarations of one type or member in several projects of one
+                          assembly, seen from outside them */
+    CS_WHY_PARTS,      /* declared by a part of the type the reference does not see */
+    CS_WHY_LIMIT,      /* more candidates than one lookup compares */
+    CS_WHY_COUNT,
+} cs_why_t;
+
+/* Counted while references are resolved (by every worker at once). */
+typedef struct {
+    _Atomic uint64_t ambiguous[CS_WHY_COUNT];
+} cs_stats_t;
 
 typedef struct {
     CBMArena arena;
     bool oom; /* an index allocation failed */
     const char *project;
-    const char *repo_path;
     cs_file_t *files;
     int nfiles;
     int *run_to_file;
     int run_count;
+    cs_ns_t *nss;
+    int nnss;
+    int nscap;
+    CBMHashTable *ns_by_key; /* "<parent>\x1f<segment>" -> id + 1 */
     cs_entity_t *ents;
     int nents;
     int ecap;
-    CBMHashTable *ent_by_key;      /* "fqn`arity" -> ent+1 */
-    CBMHashTable *fqn_ents;        /* fqn -> cs_ilist_t* */
-    CBMHashTable *ns_types;        /* "ns\x1f name" -> cs_ilist_t* (top-level types) */
-    CBMHashTable *namespaces;      /* every namespace and prefix */
-    CBMHashTable *type_names;      /* every type simple name */
+    CBMHashTable *ent_by_key;
+    cs_named_t *tops; /* by (namespace, name, arity, entity) */
+    int ntops;
+    cs_named_t *kids; /* by (outer entity, name, arity, entity) */
+    int nkids;
+    cs_mref_t *mrefs; /* by (entity, name, group, signature, class, file, order) */
+    int nmrefs;
+    cs_extra_t *extras; /* by (twin, name, arity, entity): a name's members first */
+    int nextras;
+    cs_name_scope_t *name_scopes; /* distinct (name, kind, scope) reverse postings */
+    size_t nname_scopes;
+    bool name_scopes_ready;
+    /* "P<entity>\x1f<name>": the entity declares an operator or indexer of
+     * that name outside test code; "A...": it declares one at all */
+    CBMHashTable *specials;
+    CBMHashTable *type_names;      /* every type's simple name */
     CBMHashTable *quarantine;      /* names of types declared where no scope is known */
     CBMHashTable *quarantine_test; /* the same, declared by test code only */
-    CBMHashTable *unit_by_dir;     /* dir -> unit+1 */
+    CBMHashTable *unit_by_dir;     /* dir -> unit + 1 */
     cs_unit_t *units;
     int nunits;
     int ucap;
+    cbm_msb_t *msb;             /* the repository's MSBuild project files */
+    CBMHashTable *project_dirs; /* directory -> cs_pdir_t: the ones that hold a *.csproj */
+    const char **projects;      /* the *.csproj files, in path order */
+    int nprojects;
+    CBMHashTable *project_above; /* directories with a *.csproj in or below them */
+    CBMHashTable *group_by_stem; /* project file name -> assembly + 1 */
+    int ngroups;                 /* assemblies */
+    int nshared;                 /* shared trees */
+    cs_stats_t *stats;
+    bool bind_inherited; /* CS_BIND_INHERITED */
 } cs_index_t;
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: scope levels, supertypes and overloads the resolver looked at,
+ * and the directories it walked for the files' projects, since the last
+ * reset. A test holds it against the size of its input. */
+static _Atomic uint64_t cs_work_counter;
+/* New import index construction is measured separately from lookup work. */
+static _Atomic uint64_t cs_index_work_counter;
+static _Atomic bool cs_fail_candidate_alloc;
+static _Atomic bool cs_candidate_alloc_failed;
+
+void cbm_doclink_cs_test_fail_candidate_alloc(bool enabled) {
+    atomic_store(&cs_candidate_alloc_failed, false);
+    atomic_store(&cs_fail_candidate_alloc, enabled);
+}
+
+bool cbm_doclink_cs_test_candidate_alloc_failed(void) {
+    return atomic_load(&cs_candidate_alloc_failed);
+}
+
+void cbm_doclink_cs_test_work_reset(void) {
+    atomic_store(&cs_work_counter, 0);
+    atomic_store(&cs_index_work_counter, 0);
+}
+
+uint64_t cbm_doclink_cs_test_work(void) {
+    return atomic_load(&cs_work_counter);
+}
+
+uint64_t cbm_doclink_cs_test_index_work(void) {
+    return atomic_load(&cs_index_work_counter);
+}
+
+static void cs_work(uint64_t n) {
+    atomic_fetch_add_explicit(&cs_work_counter, n, memory_order_relaxed);
+}
+
+static void cs_index_work(uint64_t n) {
+    atomic_fetch_add_explicit(&cs_index_work_counter, n, memory_order_relaxed);
+}
+#else
+static void cs_work(uint64_t n) {
+    (void)n;
+}
+
+static void cs_index_work(uint64_t n) {
+    (void)n;
+}
+#endif
 
 /* ── Small helpers ───────────────────────────────────────────────── */
 
@@ -225,6 +575,14 @@ typedef struct {
 static void *ix_alloc(cs_index_t *ix, size_t n) {
     void *p = cbm_arena_alloc(&ix->arena, n ? n : SKIP_ONE);
     ix->oom = ix->oom || !p;
+    return p;
+}
+
+static void *ix_zalloc(cs_index_t *ix, size_t n) {
+    void *p = ix_alloc(ix, n);
+    if (p) {
+        memset(p, 0, n ? n : SKIP_ONE);
+    }
     return p;
 }
 
@@ -238,43 +596,6 @@ static char *ix_strdup(cs_index_t *ix, const char *s) {
     char *p = cbm_arena_strdup(&ix->arena, s ? s : "");
     ix->oom = ix->oom || !p;
     return p;
-}
-
-static bool ilist_push(cs_index_t *ix, cs_ilist_t *l, int v) {
-    for (int i = 0; i < l->count; i++) {
-        if (l->items[i] == v) {
-            return true;
-        }
-    }
-    if (l->count >= l->cap) {
-        int ncap = l->cap ? l->cap * PAIR_LEN : CBM_SZ_4;
-        int *grown = (int *)ix_alloc(ix, (size_t)ncap * sizeof(int));
-        if (!grown) {
-            return false;
-        }
-        if (l->count > 0) {
-            memcpy(grown, l->items, (size_t)l->count * sizeof(int));
-        }
-        l->items = grown;
-        l->cap = ncap;
-    }
-    l->items[l->count++] = v;
-    return true;
-}
-
-static cs_ilist_t *ht_ilist(cs_index_t *ix, CBMHashTable *ht, const char *key, bool create) {
-    cs_ilist_t *l = (cs_ilist_t *)cbm_ht_get(ht, key);
-    if (l || !create) {
-        return l;
-    }
-    l = (cs_ilist_t *)ix_alloc(ix, sizeof(*l));
-    char *k = ix_strdup(ix, key);
-    if (!l || !k) {
-        return NULL;
-    }
-    memset(l, 0, sizeof(*l));
-    cbm_ht_set(ht, k, l);
-    return l;
 }
 
 /* Add `key` to a name set; false when memory ran out. */
@@ -328,12 +649,26 @@ static bool cs_is_test_path(const char *rel) {
     }
 }
 
-/* Split `s` in place at `sep` into at most `max` fields; returns the count. */
-static int split_fields(char *s, char sep, char **out, int max) {
+static bool cs_ci_suffix(const char *s, const char *sfx) {
+    size_t n = strlen(s);
+    size_t sl = strlen(sfx);
+    if (n < sl) {
+        return false;
+    }
+    for (size_t i = 0; i < sl; i++) {
+        if (tolower((unsigned char)s[n - sl + i]) != sfx[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Split `s` in place at tabs into at most `max` fields; returns the count. */
+static int split_fields(char *s, char **out, int max) {
     int n = 0;
     out[n++] = s;
     for (char *p = s; *p && n < max; p++) {
-        if (*p == sep) {
+        if (*p == '\t') {
             *p = '\0';
             out[n++] = p + SKIP_ONE;
         }
@@ -352,226 +687,448 @@ static int count_list(const char *s, char sep) {
     return n;
 }
 
-/* ── Scope blob parsing ──────────────────────────────────────────── */
-
-/* Sort keys carry their own comparison data: no global sort context. */
-typedef struct {
-    const char *path;
-    uint32_t start;
-    int idx;
-} cs_sort_key_t;
-
-static int sort_key_path_cmp(const void *a, const void *b) {
-    const cs_sort_key_t *x = (const cs_sort_key_t *)a;
-    const cs_sort_key_t *y = (const cs_sort_key_t *)b;
-    int c = strcmp(x->path, y->path);
-    return c ? c : (x->idx < y->idx ? -1 : (x->idx > y->idx));
+/* A decimal index of a scope record: its value when it is one below `limit`,
+ * else CS_NONE. A scope comes from the store: nothing in it is trusted to be
+ * in range. */
+static int field_index(const char *s, int limit) {
+    if (!s[0] || strlen(s) > CBM_SZ_8) {
+        return CS_NONE;
+    }
+    int v = 0;
+    for (const char *p = s; *p; p++) {
+        if (!isdigit((unsigned char)*p)) {
+            return CS_NONE;
+        }
+        v = (v * 10) + (*p - '0');
+    }
+    return v < limit ? v : CS_NONE;
 }
 
-static int sort_key_start_cmp(const void *a, const void *b) {
-    const cs_sort_key_t *x = (const cs_sort_key_t *)a;
-    const cs_sort_key_t *y = (const cs_sort_key_t *)b;
+/* ── Namespaces ──────────────────────────────────────────────────── */
+
+static bool ns_key(char *key, size_t cap, int parent, const char *seg, size_t len) {
+    if (len == 0 || len >= CS_NAME_BUF) {
+        return false;
+    }
+    int kl = snprintf(key, cap, "%d\x1f%.*s", parent, (int)len, seg);
+    return kl > 0 && (size_t)kl < cap;
+}
+
+/* The namespace `seg` directly under `parent`, or CS_NONE. */
+static int ns_find(const cs_index_t *ix, int parent, const char *seg, size_t len) {
+    char key[CS_NAME_BUF + CBM_SZ_16];
+    if (!ns_key(key, sizeof(key), parent, seg, len)) {
+        return CS_NONE;
+    }
+    intptr_t v = (intptr_t)cbm_ht_get(ix->ns_by_key, key);
+    return v > 0 ? (int)(v - SKIP_ONE) : CS_NONE;
+}
+
+/* The same, created when it is not there yet. CS_NONE for a name that is
+ * none, and when memory ran out. */
+static int ns_make(cs_index_t *ix, int parent, const char *seg, size_t len) {
+    int found = ns_find(ix, parent, seg, len);
+    char key[CS_NAME_BUF + CBM_SZ_16];
+    if (found >= 0 || !ns_key(key, sizeof(key), parent, seg, len)) {
+        return found;
+    }
+    if (ix->nnss >= ix->nscap) {
+        int ncap = ix->nscap ? ix->nscap * PAIR_LEN : CBM_SZ_256;
+        cs_ns_t *grown = (cs_ns_t *)ix_alloc(ix, (size_t)ncap * sizeof(cs_ns_t));
+        if (!grown) {
+            return CS_NONE;
+        }
+        if (ix->nnss > 0) {
+            memcpy(grown, ix->nss, (size_t)ix->nnss * sizeof(cs_ns_t));
+        }
+        ix->nss = grown;
+        ix->nscap = ncap;
+    }
+    char *k = ix_strdup(ix, key);
+    char *name = ix_strndup(ix, seg, len);
+    if (!k || !name) {
+        return CS_NONE;
+    }
+    int id = ix->nnss++;
+    ix->nss[id] = (cs_ns_t){.parent = parent, .name = name};
+    cbm_ht_set(ix->ns_by_key, k, (void *)(intptr_t)(id + SKIP_ONE));
+    return id;
+}
+
+/* The namespace the dotted `path` names under `from`, every segment created
+ * on the way; CS_NONE for a bad name or when memory ran out. */
+static int ns_make_path(cs_index_t *ix, int from, const char *path) {
+    int ns = from;
+    for (const char *p = path; ns >= 0 && *p;) {
+        const char *dot = strchr(p, '.');
+        size_t n = dot ? (size_t)(dot - p) : strlen(p);
+        ns = ns_make(ix, ns, p, n);
+        p = dot ? dot + SKIP_ONE : p + n;
+    }
+    return ns;
+}
+
+/* ── Scope blob parsing ──────────────────────────────────────────── */
+
+static int tparam_cmp(const void *a, const void *b) {
+    const cs_tparam_t *x = (const cs_tparam_t *)a;
+    const cs_tparam_t *y = (const cs_tparam_t *)b;
+    if (x->owner != y->owner) {
+        return x->owner < y->owner ? -1 : 1;
+    }
+    int c = strcmp(x->name, y->name);
+    return c ? c : (x->pos > y->pos) - (x->pos < y->pos);
+}
+
+/* Position of the type parameter `name` of `owner` in `f`, or CS_NONE. */
+static int tparam_find(const cs_file_t *f, int owner, const char *name, size_t len) {
+    int lo = 0;
+    int hi = f->ntparams;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        const cs_tparam_t *t = &f->tparams[mid];
+        int c = t->owner != owner ? (t->owner < owner ? -1 : 1) : strncmp(t->name, name, len);
+        if (c == 0 && t->name[len] != '\0') {
+            c = 1;
+        }
+        if (c < 0) {
+            lo = mid + SKIP_ONE;
+        } else if (c > 0) {
+            hi = mid;
+        } else {
+            return t->pos;
+        }
+    }
+    return CS_NONE;
+}
+
+static int span_cmp(const void *a, const void *b) {
+    const cs_span_lines_t *x = (const cs_span_lines_t *)a;
+    const cs_span_lines_t *y = (const cs_span_lines_t *)b;
+    if (x->from != y->from) {
+        return x->from < y->from ? -1 : 1;
+    }
+    return (x->to > y->to) - (x->to < y->to);
+}
+
+typedef struct {
+    uint32_t start;
+    bool plain; /* no generic method: those stand first among one line's members */
+    int idx;
+} cs_start_key_t;
+
+static int start_key_cmp(const void *a, const void *b) {
+    const cs_start_key_t *x = (const cs_start_key_t *)a;
+    const cs_start_key_t *y = (const cs_start_key_t *)b;
     if (x->start != y->start) {
         return x->start < y->start ? -1 : 1;
     }
-    return x->idx < y->idx ? -1 : (x->idx > y->idx);
+    if (x->plain != y->plain) {
+        return x->plain ? 1 : -1;
+    }
+    return (x->idx > y->idx) - (x->idx < y->idx);
 }
 
-static int member_cmp(const void *a, const void *b) {
-    const cs_member_t *x = (const cs_member_t *)a;
-    const cs_member_t *y = (const cs_member_t *)b;
-    int c = strcmp(x->owner, y->owner);
-    if (c) {
-        return c;
+static int using_region_cmp(const void *a, const void *b) {
+    const cs_using_t *x = (const cs_using_t *)a;
+    const cs_using_t *y = (const cs_using_t *)b;
+    if (x->region != y->region) {
+        return x->region < y->region ? -1 : 1;
     }
-    c = strcmp(x->name, y->name);
-    if (c) {
-        return c;
-    }
-    return x->order < y->order ? -1 : (x->order > y->order);
+    /* document order within a region: the targets are fields of one buffer,
+     * in the order they were read */
+    return (x->target > y->target) - (x->target < y->target);
 }
 
-static bool parse_scope(cs_index_t *ix, cs_file_t *f, const char *blob) {
-    size_t len = strlen(blob);
-    char *buf = ix_strndup(ix, blob, len);
-    if (!buf) {
-        return false;
-    }
-    int nr = 1;
-    int nu = 0;
-    int nt = 0;
-    int nm = 0;
-    int nx = 0;
-    int max_region = 0;
+/* What a scan of the blob's lines found, to size the file's arrays. */
+typedef struct {
+    int regions;
+    int usings;
+    int types;
+    int members;
+    int unplaced;
+    int tparams;
+} cs_counts_t;
+
+static void count_records(const char *buf, cs_counts_t *n) {
+    memset(n, 0, sizeof(*n));
+    n->regions = SKIP_ONE; /* region 0: the file */
     for (const char *p = buf; *p;) {
         const char *nl = strchr(p, '\n');
-        char tag = *p;
-        if (tag == 'R') {
-            nr++;
-            int id = atoi(p + PAIR_LEN);
-            max_region = id > max_region ? id : max_region;
-        } else if (tag == 'U') {
-            nu++;
-        } else if (tag == 'T') {
-            nt++;
-        } else if (tag == 'M') {
-            nm++;
-        } else if (tag == 'X') {
-            nx++;
+        switch (*p) {
+        case 'R':
+            n->regions++;
+            break;
+        case 'U':
+            n->usings++;
+            break;
+        case 'T':
+            n->types++;
+            break;
+        case 'M':
+            n->members++;
+            break;
+        case 'X':
+            n->unplaced++;
+            break;
+        default:
+            break;
+        }
+        /* an upper bound for the type parameters: one per record that can
+         * have a list, and one more per comma */
+        if (*p == 'T' || *p == 'M') {
+            n->tparams++;
+            for (const char *q = p; *q && *q != '\n'; q++) {
+                n->tparams += *q == ',';
+            }
         }
         if (!nl) {
             break;
         }
         p = nl + SKIP_ONE;
     }
-    f->nregions = (max_region + SKIP_ONE) > nr ? max_region + SKIP_ONE : nr;
-    f->regions = (cs_region_t *)ix_alloc(ix, (size_t)f->nregions * sizeof(cs_region_t));
-    f->usings = (cs_using_t *)ix_alloc(ix, (size_t)nu * sizeof(cs_using_t));
-    f->types = (cs_type_t *)ix_alloc(ix, (size_t)nt * sizeof(cs_type_t));
-    f->members = (cs_member_t *)ix_alloc(ix, (size_t)nm * sizeof(cs_member_t));
-    f->unplaced = (cs_span_lines_t *)ix_alloc(ix, (size_t)nx * sizeof(cs_span_lines_t));
-    if (!f->regions || !f->usings || !f->types || !f->members || !f->unplaced) {
+}
+
+/* Add the ','-joined type parameters `list` of `owner`. The list is cut at
+ * its commas in place, so every name is a string of its own afterwards. */
+static void add_tparams(cs_file_t *f, int owner, char *list) {
+    int pos = 0;
+    for (char *p = list; p && *p;) {
+        char *e = strchr(p, ',');
+        if (e) {
+            *e = '\0';
+        }
+        f->tparams[f->ntparams++] = (cs_tparam_t){.owner = owner, .pos = pos++, .name = p};
+        p = e ? e + SKIP_ONE : NULL;
+    }
+}
+
+static bool parse_region(cs_index_t *ix, cs_file_t *f, char **fld, int n, int *next_region) {
+    /* R id parent start end name */
+    if (n != 6) {
         return false;
     }
-    for (int i = 0; i < f->nregions; i++) {
-        f->regions[i] =
-            (cs_region_t){.parent = CBM_NOT_FOUND, .start = 0, .end = UINT32_MAX, .ns = ""};
+    int id = field_index(fld[1], f->nregions);
+    int parent = field_index(fld[2], f->nregions);
+    if (id != *next_region || parent < 0 || parent >= id) {
+        return false; /* regions are numbered in order, each under an earlier one */
     }
-    char *line = buf;
+    (*next_region)++;
+    int ns = ns_make_path(ix, f->regions[parent].ns, fld[5]);
+    if (ns < 0) {
+        return false;
+    }
+    ix->nss[ns].declared = true;
+    /* product code declares it, and with it every namespace above: one that
+     * is marked has its upper ones marked already */
+    for (int up = ns; !f->is_test && up > 0 && !ix->nss[up].prod; up = ix->nss[up].parent) {
+        ix->nss[up].prod = true;
+    }
+    f->regions[id] = (cs_region_t){.parent = parent,
+                                   .ns = ns,
+                                   .start = (uint32_t)strtoul(fld[3], NULL, 10),
+                                   .end = (uint32_t)strtoul(fld[4], NULL, 10)};
+    return true;
+}
+
+static bool parse_using(cs_file_t *f, char **fld, int n, int regions_seen) {
+    /* U region kind alias target */
+    if (n != 5) {
+        return false;
+    }
+    int region = field_index(fld[1], regions_seen);
+    char kind = fld[2][0];
+    bool global = kind && fld[2][1] == 'g';
+    if (region < 0 || !kind || !strchr("nsa", kind) || (fld[2][1] && !(global && !fld[2][2]))) {
+        return false;
+    }
+    f->usings[f->nusings++] = (cs_using_t){.region = region,
+                                           .kind = kind,
+                                           .global = global,
+                                           .alias = strcmp(fld[3], "-") == 0 ? "" : fld[3],
+                                           .target = fld[4],
+                                           .ns = CS_NONE,
+                                           .ent = CS_NONE};
+    return true;
+}
+
+static bool parse_type(cs_file_t *f, char **fld, int n, int regions_seen) {
+    /* T region start end kind outer name tparams bases */
+    if (n != 9) {
+        return false;
+    }
+    cs_type_t *t = &f->types[f->ntypes];
+    memset(t, 0, sizeof(*t));
+    t->region = field_index(fld[1], regions_seen);
+    t->start = (uint32_t)strtoul(fld[2], NULL, 10);
+    t->end = (uint32_t)strtoul(fld[3], NULL, 10);
+    t->kind = fld[4][0];
+    const char *flags = t->kind ? fld[4] + SKIP_ONE : "";
+    t->partial = flags[0] == 'p';
+    flags += t->partial;
+    t->incomplete = flags[0] == '!';
+    flags += t->incomplete;
+    bool top_level = strcmp(fld[5], "-") == 0;
+    t->outer = top_level ? CS_NONE : field_index(fld[5], f->ntypes);
+    t->depth = t->outer >= 0 ? f->types[t->outer].depth + SKIP_ONE : 0;
+    t->name = fld[6];
+    t->bases = fld[8];
+    t->arity = count_list(fld[7], ',');
+    t->entity = CS_NONE;
+    size_t nl = strlen(t->name);
+    if (t->region < 0 || !t->kind || !strchr("csiertd", t->kind) || flags[0] ||
+        (t->outer < 0 && !top_level) || nl == 0 || nl >= CS_NAME_BUF || t->depth >= CS_MAX_NEST) {
+        return false;
+    }
+    add_tparams(f, f->ntypes, fld[7]);
+    f->ntypes++;
+    return true;
+}
+
+static bool parse_member(cs_file_t *f, char **fld, int n) {
+    /* M start kind explicit type name tparams sig */
+    if (n != 8) {
+        return false;
+    }
+    cs_member_t *m = &f->members[f->nmembers];
+    memset(m, 0, sizeof(*m));
+    m->start = (uint32_t)strtoul(fld[1], NULL, 10);
+    m->kind = fld[2][0];
+    m->is_static = m->kind && fld[2][1] == 's';
+    m->explicit_impl = fld[3][0] == '1';
+    m->type = field_index(fld[4], f->ntypes);
+    m->name = fld[5];
+    m->arity = count_list(fld[6], ',');
+    bool callable_like = m->kind == 'c' || m->kind == 'o' || m->kind == 'x';
+    m->sig = callable_like ? fld[7] : NULL;
+    m->nparams = (m->sig && m->sig[0]) ? count_list(m->sig, '|') : 0;
+    size_t nl = strlen(m->name);
+    if (m->type < 0 || !m->kind || !strchr("cvpeox", m->kind) ||
+        fld[2][m->is_static ? PAIR_LEN : SKIP_ONE] || nl == 0 || nl >= CS_NAME_BUF) {
+        return false;
+    }
+    /* owners of type parameters: the types come first, the members after
+     * the LAST type the blob has, whose count is known only at the end */
+    add_tparams(f, -(f->nmembers + PAIR_LEN), fld[6]);
+    f->nmembers++;
+    return true;
+}
+
+/* Everything the records of one blob say, into `f`. false for a blob this
+ * code did not write (or one the store damaged), and when memory ran out. */
+static bool parse_records(cs_index_t *ix, cs_file_t *f, char *buf) {
+    int next_region = SKIP_ONE;
     bool first = true;
-    while (line && *line) {
+    for (char *line = buf; line && *line;) {
         char *nl = strchr(line, '\n');
         if (nl) {
             *nl = '\0';
         }
-        char *fld[CBM_SZ_8];
+        bool ok = true;
         if (first) {
             first = false;
-            if (strcmp(line, CBM_DOCLINK_CS_SCOPE_TAG) != 0) {
-                return false;
-            }
-        } else if (line[0] == 'R') {
-            int n = split_fields(line, '\t', fld, CBM_SZ_6);
-            if (n == CBM_SZ_6) {
-                int id = atoi(fld[1]);
-                if (id > 0 && id < f->nregions) {
-                    f->regions[id] = (cs_region_t){.parent = atoi(fld[2]),
-                                                   .start = (uint32_t)strtoul(fld[3], NULL, 10),
-                                                   .end = (uint32_t)strtoul(fld[4], NULL, 10),
-                                                   .ns = fld[5]};
+            ok = strcmp(line, CBM_DOCLINK_CS_SCOPE_TAG) == 0;
+        } else {
+            char *fld[CS_FIELDS + SKIP_ONE];
+            int n = split_fields(line, fld, CS_FIELDS + SKIP_ONE);
+            switch (line[0]) {
+            case 'R':
+                ok = parse_region(ix, f, fld, n, &next_region);
+                break;
+            case 'U':
+                ok = parse_using(f, fld, n, next_region);
+                break;
+            case 'T':
+                ok = parse_type(f, fld, n, next_region);
+                break;
+            case 'M':
+                ok = parse_member(f, fld, n);
+                break;
+            case 'X':
+                ok = n == 3;
+                if (ok) {
+                    f->unplaced[f->nunplaced++] =
+                        (cs_span_lines_t){.from = (uint32_t)strtoul(fld[1], NULL, 10),
+                                          .to = (uint32_t)strtoul(fld[2], NULL, 10)};
                 }
+                break;
+            case 'Q':
+                ok = n == PAIR_LEN && fld[1][0] && quarantine_name(ix, f, fld[1]);
+                break;
+            default:
+                ok = false;
+                break;
             }
-        } else if (line[0] == 'U') {
-            int n = split_fields(line, '\t', fld, CBM_SZ_5);
-            if (n == CBM_SZ_5) {
-                f->usings[f->nusings++] =
-                    (cs_using_t){.region = atoi(fld[1]),
-                                 .kind = fld[2][0],
-                                 .alias = strcmp(fld[3], "-") == 0 ? "" : fld[3],
-                                 .target = fld[4]};
-            }
-        } else if (line[0] == 'T') {
-            int n = split_fields(line, '\t', fld, CBM_SZ_8);
-            if (n == CBM_SZ_8) {
-                cs_type_t *t = &f->types[f->ntypes++];
-                memset(t, 0, sizeof(*t));
-                t->region = atoi(fld[1]);
-                t->start = (uint32_t)strtoul(fld[2], NULL, 10);
-                t->end = (uint32_t)strtoul(fld[3], NULL, 10);
-                t->kind = fld[4][0];
-                t->incomplete = fld[4][0] && fld[4][1] == '!';
-                t->path = fld[5];
-                const char *dot = strrchr(t->path, '.');
-                t->name = dot ? dot + SKIP_ONE : t->path;
-                t->tparams = fld[6];
-                t->bases = fld[7];
-                t->arity = count_list(t->tparams, ',');
-                t->entity = CBM_NOT_FOUND;
-            }
-        } else if (line[0] == 'M') {
-            int n = split_fields(line, '\t', fld, CBM_SZ_7);
-            if (n == CBM_SZ_7) {
-                cs_member_t *m = &f->members[f->nmembers];
-                memset(m, 0, sizeof(*m));
-                m->start = (uint32_t)strtoul(fld[1], NULL, 10);
-                m->order = f->nmembers;
-                m->kind = fld[2][0];
-                m->explicit_impl = fld[3][0] == '1';
-                char *path = fld[4];
-                char *dot = strrchr(path, '.');
-                /* records are in document order: a member belongs to the
-                 * nearest preceding declaration of its type path (which of
-                 * two same-path declarations -- Foo and Foo<T> -- matters) */
-                int ti = f->ntypes - SKIP_ONE;
-                if (dot) {
-                    *dot = '\0';
-                    while (ti >= 0 && strcmp(f->types[ti].path, path) != 0) {
-                        ti--;
-                    }
-                }
-                if (dot && ti >= 0) {
-                    m->owner = path;
-                    m->name = dot + SKIP_ONE;
-                    m->type_idx = ti;
-                    m->tparams = fld[5];
-                    m->arity = count_list(m->tparams, ',');
-                    m->sig = m->kind == 'c' ? fld[6] : NULL;
-                    f->nmembers++;
-                }
-            }
-        } else if (line[0] == 'X') {
-            int n = split_fields(line, '\t', fld, CBM_SZ_4);
-            if (n == 3 && f->nunplaced < nx) {
-                f->unplaced[f->nunplaced++] =
-                    (cs_span_lines_t){.from = (uint32_t)strtoul(fld[1], NULL, 10),
-                                      .to = (uint32_t)strtoul(fld[2], NULL, 10)};
-            }
-        } else if (line[0] == 'Q') {
-            int n = split_fields(line, '\t', fld, PAIR_LEN);
-            if (n == PAIR_LEN && fld[1][0] && !quarantine_name(ix, f, fld[1])) {
-                return false;
-            }
+        }
+        if (!ok) {
+            return false;
         }
         line = nl ? nl + SKIP_ONE : NULL;
     }
-    if (first) {
-        return false;
+    return !first && next_region == f->nregions;
+}
+
+/* Sort the usings by region, give every region its range, and close the
+ * unplaced ranges into sorted, disjoint ones. */
+static void finish_ranges(cs_file_t *f) {
+    if (f->nusings > 1) {
+        qsort(f->usings, (size_t)f->nusings, sizeof(cs_using_t), using_region_cmp);
     }
-    /* Paths are unique per type except for same-file collisions; the last
-     * declaration of a path owns its node. */
-    f->types_by_path = (int *)ix_alloc(ix, (size_t)f->ntypes * sizeof(int));
+    int u = 0;
+    for (int r = 0; r < f->nregions; r++) {
+        f->regions[r].u_lo = u;
+        while (u < f->nusings && f->usings[u].region == r) {
+            u++;
+        }
+        f->regions[r].u_hi = u;
+    }
+    if (f->nunplaced > 1) {
+        qsort(f->unplaced, (size_t)f->nunplaced, sizeof(cs_span_lines_t), span_cmp);
+        int w = 0;
+        for (int i = 1; i < f->nunplaced; i++) {
+            if (f->unplaced[i].from <= f->unplaced[w].to) {
+                if (f->unplaced[i].to > f->unplaced[w].to) {
+                    f->unplaced[w].to = f->unplaced[i].to;
+                }
+            } else {
+                f->unplaced[++w] = f->unplaced[i];
+            }
+        }
+        f->nunplaced = w + SKIP_ONE;
+    }
+}
+
+/* The type parameters by (owner, name), and the members in line order -- of
+ * the members that start at one line, the generic methods first.
+ * false when memory ran out. */
+static bool finish_lookups(cs_index_t *ix, cs_file_t *f) {
+    /* a member's parameters were filed under -(index + 2) while the type
+     * count was still growing */
+    for (int i = 0; i < f->ntparams; i++) {
+        if (f->tparams[i].owner < 0) {
+            f->tparams[i].owner = f->ntypes + (-f->tparams[i].owner - PAIR_LEN);
+        }
+    }
+    if (f->ntparams > 1) {
+        qsort(f->tparams, (size_t)f->ntparams, sizeof(cs_tparam_t), tparam_cmp);
+    }
+    if (f->nmembers == 0) {
+        return true;
+    }
     f->members_by_start = (int *)ix_alloc(ix, (size_t)f->nmembers * sizeof(int));
-    if ((f->ntypes && !f->types_by_path) || (f->nmembers && !f->members_by_start)) {
+    cs_start_key_t *keys = (cs_start_key_t *)cbm_alloc(
+        CBM_MEM_CLASS_OTHER, (size_t)f->nmembers * sizeof(cs_start_key_t));
+    if (!f->members_by_start || !keys) {
+        cbm_free(CBM_MEM_CLASS_OTHER, keys);
+        ix->oom = true;
         return false;
-    }
-    int nkeys = f->ntypes > f->nmembers ? f->ntypes : f->nmembers;
-    cs_sort_key_t *keys =
-        nkeys > 0
-            ? (cs_sort_key_t *)cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)nkeys * sizeof(cs_sort_key_t))
-            : NULL;
-    if (nkeys > 0 && !keys) {
-        return false;
-    }
-    for (int i = 0; i < f->ntypes; i++) {
-        keys[i] = (cs_sort_key_t){.path = f->types[i].path, .start = 0, .idx = i};
-    }
-    if (f->ntypes > 0) {
-        qsort(keys, (size_t)f->ntypes, sizeof(*keys), sort_key_path_cmp);
-    }
-    for (int i = 0; i < f->ntypes; i++) {
-        f->types_by_path[i] = keys[i].idx;
-        bool last = i + SKIP_ONE >= f->ntypes || strcmp(keys[i + SKIP_ONE].path, keys[i].path) != 0;
-        f->types[keys[i].idx].owns_node = last;
-    }
-    if (f->nmembers > 0) {
-        qsort(f->members, (size_t)f->nmembers, sizeof(cs_member_t), member_cmp);
     }
     for (int i = 0; i < f->nmembers; i++) {
-        keys[i] = (cs_sort_key_t){.path = "", .start = f->members[i].start, .idx = i};
+        const cs_member_t *m = &f->members[i];
+        keys[i] = (cs_start_key_t){
+            .start = m->start, .plain = !(m->kind == 'c' && m->arity > 0), .idx = i};
     }
-    if (f->nmembers > 0) {
-        qsort(keys, (size_t)f->nmembers, sizeof(*keys), sort_key_start_cmp);
-    }
+    qsort(keys, (size_t)f->nmembers, sizeof(*keys), start_key_cmp);
     for (int i = 0; i < f->nmembers; i++) {
         f->members_by_start[i] = keys[i].idx;
     }
@@ -579,29 +1136,138 @@ static bool parse_scope(cs_index_t *ix, cs_file_t *f, const char *blob) {
     return true;
 }
 
-/* ── Units (C# projects) and their global usings ─────────────────── */
-
-static bool dir_has_csproj(const char *repo, const char *dir) {
-    char full[CS_KEY_BUF];
-    if (snprintf(full, sizeof(full), "%s%s%s", repo, dir[0] ? "/" : "", dir) >= (int)sizeof(full)) {
+static bool parse_scope(cs_index_t *ix, cs_file_t *f, const char *blob) {
+    char *buf = ix_strdup(ix, blob);
+    if (!buf) {
         return false;
     }
-    cbm_dir_t *d = cbm_opendir(full);
-    if (!d) {
+    cs_counts_t n;
+    count_records(buf, &n);
+    f->nregions = n.regions;
+    f->regions = (cs_region_t *)ix_zalloc(ix, (size_t)n.regions * sizeof(cs_region_t));
+    f->usings = (cs_using_t *)ix_alloc(ix, (size_t)n.usings * sizeof(cs_using_t));
+    f->types = (cs_type_t *)ix_alloc(ix, (size_t)n.types * sizeof(cs_type_t));
+    f->members = (cs_member_t *)ix_alloc(ix, (size_t)n.members * sizeof(cs_member_t));
+    f->unplaced = (cs_span_lines_t *)ix_alloc(ix, (size_t)n.unplaced * sizeof(cs_span_lines_t));
+    f->tparams = (cs_tparam_t *)ix_alloc(ix, (size_t)n.tparams * sizeof(cs_tparam_t));
+    if (ix->oom) {
         return false;
     }
-    bool found = false;
-    cbm_dirent_t *e;
-    while (!found && (e = cbm_readdir(d)) != NULL) {
-        size_t n = strlen(e->name);
-        found = !e->is_dir && n > strlen(".csproj") &&
-                strcmp(e->name + n - strlen(".csproj"), ".csproj") == 0;
+    f->regions[0].parent = CS_NONE;
+    if (!parse_records(ix, f, buf)) {
+        return false;
     }
-    cbm_closedir(d);
-    return found;
+    finish_ranges(f);
+    return finish_lookups(ix, f);
 }
 
-static int unit_get(cs_index_t *ix, const char *dir) {
+/* ── Units (C# projects) and their global usings ─────────────────── */
+
+/* Nothing here reads the disk: a project file is one the index holds (its
+ * path among the resolver's files, its content in its scope blob). What
+ * discovery did not take -- a symbolic link, a named pipe -- is no project
+ * file. */
+
+static const char CS_PROJECT_EXT[] = ".csproj";
+
+/* The name of a project directory that holds a reference assembly's source:
+ * the .NET convention (<library>/ref beside <library>/src). It tells the
+ * stub from the implementation inside one assembly, and nothing else. */
+static const char CS_REF_DIR[] = "ref";
+
+/* Length of the directory above the one of length `len` in `path`. */
+static size_t parent_dir_len(const char *path, size_t len) {
+    while (len > 0 && path[len - SKIP_ONE] != '/') {
+        len--;
+    }
+    return len > 0 ? len - SKIP_ONE : 0;
+}
+
+/* Take the project files out of the resolver's file list: every MSBuild blob
+ * goes to the evaluator, every *.csproj marks its directory as a project and
+ * names it. false when memory ran out. */
+static bool collect_projects(cs_index_t *ix, const cbm_doclink_build_in_t *in) {
+    int n = 0;
+    for (int i = 0; i < in->file_count; i++) {
+        n += cs_ci_suffix(in->files[i].rel_path, CS_PROJECT_EXT);
+    }
+    ix->projects = (const char **)ix_alloc(ix, (size_t)n * sizeof(char *));
+    if (!ix->projects) {
+        return false;
+    }
+    for (int i = 0; i < in->file_count; i++) {
+        const cbm_doclink_file_t *src = &in->files[i];
+        if (cbm_msb_is_project_scope(src->scope) &&
+            !cbm_msb_add(ix->msb, src->rel_path, src->scope)) {
+            return false;
+        }
+        /* a project file of an SDK that compiles nothing (it runs build steps
+         * or builds other projects) is the project of no source file */
+        if (!cs_ci_suffix(src->rel_path, CS_PROJECT_EXT) ||
+            !cbm_msb_compiles(ix->msb, src->rel_path)) {
+            continue;
+        }
+        const char *slash = strrchr(src->rel_path, '/');
+        const char *name = slash ? slash + SKIP_ONE : src->rel_path;
+        char *dir = ix_strndup(ix, src->rel_path, slash ? (size_t)(slash - src->rel_path) : 0);
+        char *path = ix_strdup(ix, src->rel_path);
+        if (!dir || !path) {
+            return false;
+        }
+        ix->projects[ix->nprojects++] = path; /* the file list is in path order */
+        cs_pdir_t *pd = (cs_pdir_t *)cbm_ht_get(ix->project_dirs, dir);
+        if (pd) {
+            pd->count++;
+            continue;
+        }
+        pd = (cs_pdir_t *)ix_zalloc(ix, sizeof(*pd));
+        char *stem = ix_strndup(ix, name, strlen(name) - (sizeof(CS_PROJECT_EXT) - SKIP_ONE));
+        if (!pd || !stem) {
+            return false;
+        }
+        pd->count = SKIP_ONE;
+        pd->stem = stem;
+        cbm_ht_set(ix->project_dirs, dir, pd);
+        /* the directory and every one above it has a project in or below
+         * it; one that is marked has its upper ones marked already */
+        for (size_t len = strlen(dir);; len = parent_dir_len(dir, len)) {
+            char *above = ix_strndup(ix, dir, len);
+            if (!above) {
+                return false;
+            }
+            if (cbm_ht_get(ix->project_above, above)) {
+                break;
+            }
+            cbm_ht_set(ix->project_above, above, above);
+            if (len == 0) {
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+/* The assembly of a project directory: the one its project file names --
+ * projects whose project files have the same name are one assembly. A
+ * directory with several project files is an assembly of its own (which of
+ * them compiles a file there is not known). CS_NONE when memory ran out. */
+static int group_of(cs_index_t *ix, const cs_pdir_t *pd) {
+    if (pd->count != SKIP_ONE) {
+        return ix->ngroups++;
+    }
+    intptr_t g = (intptr_t)cbm_ht_get(ix->group_by_stem, pd->stem);
+    if (g <= 0) {
+        g = (intptr_t)ix->ngroups + SKIP_ONE;
+        ix->ngroups++;
+        cbm_ht_set(ix->group_by_stem, pd->stem, (void *)g);
+    }
+    return (int)(g - SKIP_ONE);
+}
+
+/* The unit of directory `dir`, made on first sight: a project when `pd` says
+ * which project files the directory holds, else a shared tree. CS_NONE when
+ * memory ran out. */
+static int unit_get(cs_index_t *ix, const char *dir, const cs_pdir_t *pd) {
     intptr_t v = (intptr_t)cbm_ht_get(ix->unit_by_dir, dir);
     if (v > 0) {
         return (int)(v - SKIP_ONE);
@@ -610,7 +1276,7 @@ static int unit_get(cs_index_t *ix, const char *dir) {
         int ncap = ix->ucap ? ix->ucap * PAIR_LEN : CBM_SZ_64;
         cs_unit_t *grown = (cs_unit_t *)ix_alloc(ix, (size_t)ncap * sizeof(cs_unit_t));
         if (!grown) {
-            return CBM_NOT_FOUND;
+            return CS_NONE;
         }
         if (ix->nunits > 0) {
             memcpy(grown, ix->units, (size_t)ix->nunits * sizeof(cs_unit_t));
@@ -618,150 +1284,266 @@ static int unit_get(cs_index_t *ix, const char *dir) {
         ix->units = grown;
         ix->ucap = ncap;
     }
+    char *key = ix_strdup(ix, dir);
+    if (!key) {
+        return CS_NONE;
+    }
     int id = ix->nunits++;
-    memset(&ix->units[id], 0, sizeof(cs_unit_t));
-    ix->units[id].dir = ix_strdup(ix, dir);
-    cbm_ht_set(ix->unit_by_dir, ix->units[id].dir, (void *)(intptr_t)(id + SKIP_ONE));
+    cs_unit_t *u = &ix->units[id];
+    memset(u, 0, sizeof(*u));
+    u->dir = key;
+    u->group = CS_NONE;
+    if (pd) {
+        const char *base = strrchr(key, '/');
+        u->is_ref = strcmp(base ? base + SKIP_ONE : key, CS_REF_DIR) == 0;
+        u->group = group_of(ix, pd);
+    } else {
+        ix->nshared++;
+    }
+    cbm_ht_set(ix->unit_by_dir, key, (void *)(intptr_t)(id + SKIP_ONE));
     return id;
 }
 
-/* The nearest directory at or above the file's own that holds a *.csproj
- * (the repository root when none does). Directories walked on the way are
- * memoized to the same unit. */
+/* The tree of the project-less directory rel[0, len): the length of its root
+ * -- the largest directory around it that has no project in or below it; the
+ * directory itself when a project stands below it (*whole stays unset: what
+ * is under it is not all of its tree). `memo` is what `dir_unit` holds for
+ * the directory the walk for a project stopped at: a tree's root when that
+ * directory is of a known tree, and then everything under it is of that tree
+ * too. `dir` is scratch for the paths asked. */
+static size_t tree_root(const cs_index_t *ix, const char *rel, size_t len, intptr_t memo, char *dir,
+                        bool *whole) {
+    if (memo < CS_NONE) {
+        *whole = true;
+        return (size_t)(-(memo + PAIR_LEN));
+    }
+    memcpy(dir, rel, len);
+    dir[len] = '\0';
+    if (cbm_ht_get(ix->project_above, dir)) {
+        return len;
+    }
+    *whole = true;
+    size_t root = len;
+    while (root > 0) {
+        cs_work(SKIP_ONE);
+        size_t up = parent_dir_len(rel, root);
+        dir[up] = '\0';
+        if (cbm_ht_get(ix->project_above, dir)) {
+            break;
+        }
+        root = up;
+    }
+    return root;
+}
+
+/* The unit a file belongs to: its project -- the nearest directory at or
+ * above its own that holds a *.csproj. A file no project file stands above
+ * is of a shared tree (sources that projects elsewhere compile in): which
+ * programs it is part of is not known, and all such files of a repository
+ * are not one program. Its unit is the tree: the largest directory around it
+ * that has no project in or below it -- the file's own directory when a
+ * project stands below that. (A repository without any project file is one
+ * tree.) Every directory walked on the way up is remembered in `dir_unit`:
+ * its project's unit + 1; for one no project stands at or above, -1, or
+ * -(length of its tree's root + 2) when it has no project below it either.
+ * So a directory is walked once, for its project and for its tree, however
+ * many files it and the directories under it hold. CS_NONE when memory ran
+ * out. */
 static int unit_of(cs_index_t *ix, CBMHashTable *dir_unit, const char *rel) {
-    char dir[CS_KEY_BUF];
     const char *slash = strrchr(rel, '/');
-    snprintf(dir, sizeof(dir), "%.*s", slash ? (int)(slash - rel) : 0, rel);
-    char walked[CBM_SZ_64][CS_KEY_BUF / CBM_SZ_8];
-    int nwalked = 0;
-    int unit = CBM_NOT_FOUND;
+    size_t len = slash ? (size_t)(slash - rel) : 0;
+    char *dir = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, len + SKIP_ONE);
+    if (!dir) {
+        ix->oom = true;
+        return CS_NONE;
+    }
+    memcpy(dir, rel, len);
+    size_t cur = len;
+    int unit = CS_NONE;
+    intptr_t memo = 0;
+    bool projectless = false;
+    bool failed = false;
     for (;;) {
-        intptr_t memo = (intptr_t)cbm_ht_get(dir_unit, dir);
+        cs_work(SKIP_ONE);
+        dir[cur] = '\0';
+        memo = (intptr_t)cbm_ht_get(dir_unit, dir);
         if (memo > 0) {
             unit = (int)(memo - SKIP_ONE);
             break;
         }
-        if (!dir[0] || dir_has_csproj(ix->repo_path, dir)) {
-            unit = unit_get(ix, dir);
-            if (nwalked < CBM_SZ_64 && strlen(dir) < sizeof(walked[0])) {
-                snprintf(walked[nwalked++], sizeof(walked[0]), "%s", dir);
-            }
+        const cs_pdir_t *pd = (const cs_pdir_t *)cbm_ht_get(ix->project_dirs, dir);
+        if (pd) {
+            unit = unit_get(ix, dir, pd);
+            failed = unit < 0;
             break;
         }
-        if (nwalked < CBM_SZ_64 && strlen(dir) < sizeof(walked[0])) {
-            snprintf(walked[nwalked++], sizeof(walked[0]), "%s", dir);
+        if (memo < 0 || cur == 0) {
+            projectless = true;
+            break;
         }
-        char *s = strrchr(dir, '/');
-        if (s) {
-            *s = '\0';
-        } else {
-            dir[0] = '\0';
-        }
+        cur = parent_dir_len(rel, cur);
     }
-    for (int i = 0; i < nwalked && unit >= 0; i++) {
-        if (!cbm_ht_get(dir_unit, walked[i])) {
-            char *k = ix_strdup(ix, walked[i]);
-            if (k) {
-                cbm_ht_set(dir_unit, k, (void *)(intptr_t)(unit + SKIP_ONE));
+    bool whole = false;
+    size_t root = projectless ? tree_root(ix, rel, len, memo, dir, &whole) : 0;
+    for (size_t l = len; !failed;) {
+        memcpy(dir, rel, l);
+        dir[l] = '\0';
+        if (!cbm_ht_get(dir_unit, dir)) {
+            char *key = ix_strdup(ix, dir);
+            if (!key) {
+                failed = true;
+                break;
             }
+            intptr_t known = unit + SKIP_ONE;
+            if (projectless) {
+                known = (whole && l >= root) ? -(intptr_t)(root + PAIR_LEN) : CS_NONE;
+            }
+            cbm_ht_set(dir_unit, key, (void *)known);
         }
+        if (l <= cur) {
+            break;
+        }
+        l = parent_dir_len(rel, l);
     }
-    return unit;
+    if (projectless && !failed) {
+        memcpy(dir, rel, root);
+        dir[root] = '\0';
+        unit = unit_get(ix, dir, NULL);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, dir);
+    return failed ? CS_NONE : unit;
 }
 
-static void unit_add_using(cs_index_t *ix, cs_unit_t *u, const char *target) {
-    for (int i = 0; i < u->nusings; i++) {
-        if (strcmp(u->usings[i], target) == 0) {
-            return;
-        }
-    }
+static bool unit_add_using(cs_index_t *ix, cs_unit_t *u, char kind, const char *alias,
+                           const char *target) {
     if (u->nusings >= u->cap) {
         int ncap = u->cap ? u->cap * PAIR_LEN : CBM_SZ_8;
-        const char **grown = (const char **)ix_alloc(ix, (size_t)ncap * sizeof(char *));
+        cs_using_t *grown = (cs_using_t *)ix_alloc(ix, (size_t)ncap * sizeof(cs_using_t));
         if (!grown) {
-            return;
+            return false;
         }
         if (u->nusings > 0) {
-            memcpy(grown, u->usings, (size_t)u->nusings * sizeof(char *));
+            memcpy(grown, u->usings, (size_t)u->nusings * sizeof(cs_using_t));
         }
         u->usings = grown;
         u->cap = ncap;
     }
-    u->usings[u->nusings++] = ix_strdup(ix, target);
+    char *a = ix_strdup(ix, alias);
+    char *t = ix_strdup(ix, target);
+    if (!a || !t) {
+        return false;
+    }
+    u->usings[u->nusings++] = (cs_using_t){
+        .kind = kind, .global = true, .alias = a, .target = t, .ns = CS_NONE, .ent = CS_NONE};
+    return true;
 }
 
-static int strp_cmp(const void *a, const void *b) {
-    return strcmp(*(const char *const *)a, *(const char *const *)b);
+static int unit_using_cmp(const void *a, const void *b) {
+    const cs_using_t *x = (const cs_using_t *)a;
+    const cs_using_t *y = (const cs_using_t *)b;
+    if (x->kind != y->kind) {
+        return x->kind < y->kind ? -1 : 1;
+    }
+    int c = strcmp(x->alias, y->alias);
+    return c ? c : strcmp(x->target, y->target);
 }
 
-/* Global usings of every unit: `global using` directives of its files and the
- * MSBuild usings of the project files in its directory. */
-static void units_collect_usings(cs_index_t *ix) {
+/* What the project files could not tell, over all of them. */
+typedef struct {
+    int unevaluable;
+    int outside;
+} cs_msb_totals_t;
+
+/* Global usings of every unit: the `global using` directives of its files
+ * (of a namespace, of a type's static members, of an alias alike) and the
+ * <Using> items of every project file in its directory -- all of them, in
+ * path order, so the union does not depend on how a directory is listed.
+ * false when memory ran out. */
+static bool units_collect_usings(cs_index_t *ix, cs_msb_totals_t *totals) {
     for (int fi = 0; fi < ix->nfiles; fi++) {
         const cs_file_t *f = &ix->files[fi];
-        if (f->unit < 0) {
-            continue;
-        }
-        for (int u = 0; u < f->nusings; u++) {
-            if (f->usings[u].kind == 'g') {
-                unit_add_using(ix, &ix->units[f->unit], f->usings[u].target);
+        for (int u = 0; f->unit >= 0 && u < f->nusings; u++) {
+            const cs_using_t *us = &f->usings[u];
+            if (us->global &&
+                !unit_add_using(ix, &ix->units[f->unit], us->kind, us->alias, us->target)) {
+                return false;
             }
         }
     }
+    cbm_msb_eval_context_t *eval_context = cbm_msb_eval_context_new(ix->msb);
+    if (!eval_context) {
+        return false;
+    }
+    for (int p = 0; p < ix->nprojects; p++) {
+        const char *slash = strrchr(ix->projects[p], '/');
+        char *dir = ix_strndup(ix, ix->projects[p], slash ? (size_t)(slash - ix->projects[p]) : 0);
+        intptr_t unit = dir ? (intptr_t)cbm_ht_get(ix->unit_by_dir, dir) : 0;
+        if (unit <= 0) {
+            continue; /* a project directory without a C# file */
+        }
+        cs_unit_t *u = &ix->units[unit - SKIP_ONE];
+        if (!cbm_msb_has(ix->msb, ix->projects[p])) {
+            /* a *.csproj the extractor has no blob for: what it sets is not known */
+            totals->unevaluable++;
+            u->open = true;
+            continue;
+        }
+        cbm_msb_result_t res;
+        if (!cbm_msb_eval_context_eval(eval_context, ix->projects[p], &res)) {
+            cbm_msb_eval_context_free(eval_context);
+            return false;
+        }
+        bool ok = true;
+        for (int k = 0; ok && k < res.count; k++) {
+            ok = unit_add_using(ix, u, res.usings[k].kind, res.usings[k].alias,
+                                res.usings[k].target);
+        }
+        u->open = u->open || res.open;
+        totals->unevaluable += res.unevaluable;
+        totals->outside += res.outside;
+        cbm_msb_result_free(&res);
+        if (!ok) {
+            cbm_msb_eval_context_free(eval_context);
+            return false;
+        }
+    }
+    cbm_msb_eval_context_free(eval_context);
     for (int ui = 0; ui < ix->nunits; ui++) {
         cs_unit_t *u = &ix->units[ui];
-        char full[CS_KEY_BUF];
-        if (snprintf(full, sizeof(full), "%s%s%s", ix->repo_path, u->dir[0] ? "/" : "", u->dir) >=
-            (int)sizeof(full)) {
+        if (u->nusings < PAIR_LEN) {
             continue;
         }
-        cbm_dir_t *d = cbm_opendir(full);
-        if (!d) {
-            continue;
-        }
-        /* Project files of the directory, sorted: a deterministic union. */
-        char *projs[CBM_SZ_32] = {0};
-        int np = 0;
-        cbm_dirent_t *e;
-        while ((e = cbm_readdir(d)) != NULL) {
-            size_t n = strlen(e->name);
-            if (!e->is_dir && n > strlen(".csproj") &&
-                strcmp(e->name + n - strlen(".csproj"), ".csproj") == 0 && np < CBM_SZ_32) {
-                char rel[CS_KEY_BUF];
-                snprintf(rel, sizeof(rel), "%s%s%s", u->dir, u->dir[0] ? "/" : "", e->name);
-                projs[np] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, rel);
-                np += projs[np] != NULL;
+        qsort(u->usings, (size_t)u->nusings, sizeof(cs_using_t), unit_using_cmp);
+        int w = 0;
+        for (int i = 1; i < u->nusings; i++) {
+            if (unit_using_cmp(&u->usings[w], &u->usings[i]) != 0) {
+                u->usings[++w] = u->usings[i];
             }
         }
-        cbm_closedir(d);
-        qsort(projs, (size_t)np, sizeof(char *), strp_cmp);
-        for (int p = 0; p < np; p++) {
-            char **usings = NULL;
-            int n = cbm_doclinks_msbuild_usings(ix->repo_path, projs[p], &usings);
-            for (int k = 0; k < n; k++) {
-                unit_add_using(ix, u, usings[k]);
-            }
-            cbm_doclinks_free_strv(usings);
-            cbm_free(CBM_MEM_CLASS_OTHER, projs[p]);
-        }
-        if (u->nusings > 1) {
-            qsort(u->usings, (size_t)u->nusings, sizeof(char *), strp_cmp);
-        }
+        u->nusings = w + SKIP_ONE;
     }
+    return !ix->oom;
 }
 
 /* ── Entities ────────────────────────────────────────────────────── */
 
-enum { CS_ENT_FAIL = -1, CS_ENT_SKIP = -2 };
+/* The owner of a complete declaration in the shared tree `unit`. */
+static int shared_owner(int unit) {
+    return -(unit + PAIR_LEN);
+}
 
-/* The entity (fqn, arity), created on first sight. CS_ENT_SKIP for a name too
- * long to be a declaration (the type is left out, never guessed at);
- * CS_ENT_FAIL when memory ran out. */
-static int entity_get(cs_index_t *ix, const char *fqn, int arity, const char *name, const char *ns,
+/* The entity of this scope, name, arity and owner, created on first sight. A
+ * top-level type has a namespace `ns` and an `owner`; a nested type has its
+ * outer entity `parent` (and the owner 0: its outer type's is the one that
+ * counts). CS_NONE when memory ran out. */
+static int entity_get(cs_index_t *ix, int ns, int parent, int owner, const char *name, int arity,
                       char kind) {
-    char key[CS_KEY_BUF];
-    if (snprintf(key, sizeof(key), "%s`%d", fqn, arity) >= (int)sizeof(key)) {
-        return CS_ENT_SKIP;
+    char key[CS_NAME_BUF + CBM_SZ_64];
+    int kl = snprintf(key, sizeof(key), "%c%d\x1f%d\x1f%d\x1f%s", parent >= 0 ? 'E' : 'N',
+                      parent >= 0 ? parent : ns, owner, arity, name);
+    if (kl < 0 || kl >= (int)sizeof(key)) {
+        ix->oom = true; /* cannot be: parse_type bounds the name */
+        return CS_NONE;
     }
     intptr_t v = (intptr_t)cbm_ht_get(ix->ent_by_key, key);
     if (v > 0) {
@@ -772,7 +1554,8 @@ static int entity_get(cs_index_t *ix, const char *fqn, int arity, const char *na
         cs_entity_t *grown =
             (cs_entity_t *)cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)ncap * sizeof(cs_entity_t));
         if (!grown) {
-            return CS_ENT_FAIL;
+            ix->oom = true;
+            return CS_NONE;
         }
         if (ix->nents > 0) {
             memcpy(grown, ix->ents, (size_t)ix->nents * sizeof(cs_entity_t));
@@ -781,25 +1564,24 @@ static int entity_get(cs_index_t *ix, const char *fqn, int arity, const char *na
         ix->ents = grown;
         ix->ecap = ncap;
     }
+    char *k = ix_strdup(ix, key);
+    if (!k) {
+        return CS_NONE;
+    }
     int id = ix->nents++;
     cs_entity_t *e = &ix->ents[id];
     memset(e, 0, sizeof(*e));
-    e->fqn = ix_strdup(ix, fqn);
+    e->ns = parent >= 0 ? CS_NONE : ns;
+    e->parent = parent >= 0 ? parent : CS_NONE;
+    e->owner = owner;
+    e->twin = CS_NONE;
+    e->stub = CS_NONE;
+    e->shared_parts = parent >= 0 ? ix->ents[parent].shared_parts : owner == CS_POOL;
     e->name = name;
-    e->ns = ns;
     e->arity = arity;
     e->kind = kind;
     e->all_test = true;
-    char *k = ix_strdup(ix, key);
-    if (!e->fqn || !k) {
-        ix->nents--;
-        return CS_ENT_FAIL;
-    }
     cbm_ht_set(ix->ent_by_key, k, (void *)(intptr_t)(id + SKIP_ONE));
-    cs_ilist_t *l = ht_ilist(ix, ix->fqn_ents, fqn, true);
-    if (l) {
-        ilist_push(ix, l, id);
-    }
     return id;
 }
 
@@ -817,99 +1599,384 @@ static bool entity_add_decl(cs_index_t *ix, cs_entity_t *e, int file, int type) 
         e->dcap = ncap;
     }
     e->decls[e->ndecls++] = (cs_decl_t){.file = file, .type = type};
-    bool test = ix->files[file].is_test;
-    e->any_prod = e->any_prod || !test;
-    e->all_test = e->all_test && test;
+    const cs_file_t *f = &ix->files[file];
+    e->any_prod = e->any_prod || !f->is_test;
+    e->all_test = e->all_test && f->is_test;
+    e->has_impl = e->has_impl || !f->is_ref;
+    e->impl_partial = e->impl_partial || (!f->is_ref && f->types[type].partial);
+    e->incomplete = e->incomplete || f->types[type].incomplete;
     return true;
 }
 
-static bool mark_namespace(cs_index_t *ix, const char *ns) {
-    if (!ns || !ns[0]) {
-        return true;
-    }
-    char buf[CS_KEY_BUF];
-    snprintf(buf, sizeof(buf), "%s", ns);
-    for (;;) {
-        if (!ht_mark(ix, ix->namespaces, buf)) {
-            return false;
-        }
-        char *dot = strrchr(buf, '.');
-        if (!dot) {
-            break;
-        }
-        *dot = '\0';
-    }
-    return true;
+/* A top-level type as one shared tree declares it. false when it does not
+ * fit (cannot be: parse_type bounds the name). */
+static bool tree_type_key(char *key, size_t cap, const cs_file_t *f, const cs_type_t *t) {
+    int n = snprintf(key, cap, "%d\x1f%d\x1f%d\x1f%s", f->regions[t->region].ns, f->unit, t->arity,
+                     t->name);
+    return n > 0 && (size_t)n < cap;
 }
 
-/* The entities of every declared type. *skipped counts declarations left out
- * because their qualified name is too long to index (machine-generated
- * nesting tests); their names are quarantined, so a reference to one never
- * binds anything else. false only when memory ran out. */
-static bool build_entities(cs_index_t *ix, int *skipped) {
+/* The top-level types the shared trees declare partial, by tree: into
+ * `partials` (keys in `keys`). false when memory ran out. */
+static bool tree_partials(const cs_index_t *ix, CBMHashTable *partials, CBMArena *keys) {
+    char key[CS_NAME_BUF + CBM_SZ_64];
     for (int fi = 0; fi < ix->nfiles; fi++) {
-        cs_file_t *f = &ix->files[fi];
-        for (int r = 0; r < f->nregions; r++) {
-            if (!mark_namespace(ix, f->regions[r].ns)) {
-                return false;
-            }
-        }
-        for (int ti = 0; ti < f->ntypes; ti++) {
-            cs_type_t *t = &f->types[ti];
-            int region = (t->region >= 0 && t->region < f->nregions) ? t->region : 0;
-            const char *ns = f->regions[region].ns;
-            char fqn[CS_KEY_BUF];
-            char key[CS_KEY_BUF];
-            int fl = (ns && ns[0]) ? snprintf(fqn, sizeof(fqn), "%s.%s", ns, t->path)
-                                   : snprintf(fqn, sizeof(fqn), "%s", t->path);
-            int kl = snprintf(key, sizeof(key), "%s\x1f%s", ns ? ns : "", t->name);
-            int id = (fl < 0 || fl >= (int)sizeof(fqn) || kl < 0 || kl >= (int)sizeof(key))
-                         ? CS_ENT_SKIP
-                         : entity_get(ix, fqn, t->arity, t->name, ns, t->kind);
-            if (id == CS_ENT_SKIP) {
-                (*skipped)++;
-                if (!quarantine_name(ix, f, t->name)) {
-                    return false;
-                }
+        const cs_file_t *f = &ix->files[fi];
+        for (int ti = 0; ix->units[f->unit].group < 0 && ti < f->ntypes; ti++) {
+            const cs_type_t *t = &f->types[ti];
+            if (t->outer >= 0 || !t->partial || !tree_type_key(key, sizeof(key), f, t) ||
+                cbm_ht_get(partials, key)) {
                 continue;
             }
-            if (id < 0) {
+            char *k = cbm_arena_strdup(keys, key);
+            if (!k) {
                 return false;
             }
-            t->entity = id;
-            if (!entity_add_decl(ix, &ix->ents[id], fi, ti)) {
-                return false;
-            }
-            ix->ents[id].incomplete = ix->ents[id].incomplete || t->incomplete;
-            if (!ht_mark(ix, ix->type_names, t->name)) {
-                return false;
-            }
-            if (!strchr(t->path, '.')) {
-                cs_ilist_t *l = ht_ilist(ix, ix->ns_types, key, true);
-                if (!l || !ilist_push(ix, l, id)) {
-                    return false;
-                }
-            }
+            cbm_ht_set(partials, k, k);
         }
     }
     return true;
+}
+
+/* The owner of a top-level type declared in `f`: the file's assembly. For a
+ * file of a shared tree: the shared trees' parts of that name when the
+ * declaration is partial -- or stands in a tree that has partial ones of the
+ * name: one tree's declarations of a name are one type --, else the tree. */
+static int decl_owner(const cs_index_t *ix, const cs_file_t *f, const cs_type_t *t,
+                      const CBMHashTable *partials) {
+    int group = ix->units[f->unit].group;
+    if (group >= 0) {
+        return group;
+    }
+    char key[CS_NAME_BUF + CBM_SZ_64];
+    bool parts = t->partial || (tree_type_key(key, sizeof(key), f, t) && cbm_ht_get(partials, key));
+    return parts ? CS_POOL : shared_owner(f->unit);
+}
+
+/* The entity of every declared type. An outer type stands before the types
+ * it holds, so its entity is known when theirs is asked for. false when
+ * memory ran out. */
+static bool build_entities(cs_index_t *ix) {
+    CBMHashTable *partials = cbm_ht_create(CBM_SZ_1K);
+    CBMArena keys;
+    cbm_arena_init(&keys);
+    bool ok = partials && tree_partials(ix, partials, &keys);
+    for (int fi = 0; ok && fi < ix->nfiles; fi++) {
+        cs_file_t *f = &ix->files[fi];
+        for (int ti = 0; ok && ti < f->ntypes; ti++) {
+            cs_type_t *t = &f->types[ti];
+            int ent = t->outer >= 0
+                          ? entity_get(ix, CS_NONE, f->types[t->outer].entity, 0, t->name, t->arity,
+                                       t->kind)
+                          : entity_get(ix, f->regions[t->region].ns, CS_NONE,
+                                       decl_owner(ix, f, t, partials), t->name, t->arity, t->kind);
+            ok = ent >= 0 && entity_add_decl(ix, &ix->ents[ent], fi, ti) &&
+                 ht_mark(ix, ix->type_names, t->name);
+            t->entity = ent;
+        }
+    }
+    cbm_ht_free(partials);
+    cbm_arena_destroy(&keys);
+    ix->oom = ix->oom || !ok;
+    return ok;
+}
+
+static int int_cmp(const void *a, const void *b) {
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+static int full_cmp(const void *a, const void *b) {
+    const cs_full_t *x = (const cs_full_t *)a;
+    const cs_full_t *y = (const cs_full_t *)b;
+    if (x->unit != y->unit) {
+        return x->unit < y->unit ? -1 : 1;
+    }
+    if (x->file != y->file) {
+        return x->file < y->file ? -1 : 1;
+    }
+    return (x->type > y->type) - (x->type < y->type);
+}
+
+/* The complete declarations of every entity that has them in two or more
+ * projects (or shared trees): the flavours of one type, alternatives of each
+ * other. A reference assembly's stubs stand behind and are not
+ * counted. false when memory ran out. */
+static bool entity_fulls(cs_index_t *ix) {
+    for (int i = 0; i < ix->nents; i++) {
+        cs_entity_t *e = &ix->ents[i];
+        int n = 0;
+        for (int d = 0; d < e->ndecls; d++) {
+            const cs_file_t *f = &ix->files[e->decls[d].file];
+            n += !f->is_ref && !f->types[e->decls[d].type].partial;
+        }
+        if (n < PAIR_LEN) {
+            continue;
+        }
+        cs_full_t *fulls = (cs_full_t *)ix_alloc(ix, (size_t)n * sizeof(cs_full_t));
+        if (!fulls) {
+            return false;
+        }
+        int w = 0;
+        for (int d = 0; d < e->ndecls; d++) {
+            const cs_file_t *f = &ix->files[e->decls[d].file];
+            if (!f->is_ref && !f->types[e->decls[d].type].partial) {
+                fulls[w++] = (cs_full_t){
+                    .unit = f->unit, .file = e->decls[d].file, .type = e->decls[d].type};
+            }
+        }
+        qsort(fulls, (size_t)n, sizeof(cs_full_t), full_cmp);
+        int units = 0;
+        int prod = 0;
+        for (int k = 0; k < n;) {
+            int unit = fulls[k].unit;
+            bool product = false;
+            for (; k < n && fulls[k].unit == unit; k++) {
+                product = product || !ix->files[fulls[k].file].is_test;
+            }
+            units++;
+            prod += product;
+        }
+        if (units >= PAIR_LEN) {
+            e->fulls = fulls;
+            e->nfulls = n;
+            e->full_units = units;
+            e->full_units_prod = prod;
+        }
+    }
+    return true;
+}
+
+/* The projects and shared trees that declare each entity: sorted, unique. */
+static bool entity_units(cs_index_t *ix) {
+    for (int i = 0; i < ix->nents; i++) {
+        cs_entity_t *e = &ix->ents[i];
+        e->units = (int *)ix_alloc(ix, (size_t)e->ndecls * sizeof(int));
+        if (!e->units) {
+            return false;
+        }
+        for (int d = 0; d < e->ndecls; d++) {
+            e->units[d] = ix->files[e->decls[d].file].unit;
+        }
+        qsort(e->units, (size_t)e->ndecls, sizeof(int), int_cmp);
+        int w = 0;
+        for (int d = 1; d < e->ndecls; d++) {
+            if (e->units[d] != e->units[w]) {
+                e->units[++w] = e->units[d];
+            }
+        }
+        e->nunits = e->ndecls > 0 ? w + SKIP_ONE : 0;
+    }
+    return true;
+}
+
+static bool ent_in_unit(const cs_entity_t *e, int unit) {
+    return bsearch(&unit, e->units, (size_t)e->nunits, sizeof(int), int_cmp) != NULL;
+}
+
+/* ── Types by scope and name ─────────────────────────────────────── */
+
+/* Order: scope, name, arity, then the owner -- the shared trees' (the
+ * directories' complete declarations, then the parts: CS_POOL) before the
+ * assemblies' -- then the entity. */
+static int named_key_cmp(const cs_named_t *e, int scope, const char *name, int arity) {
+    if (e->scope != scope) {
+        return e->scope < scope ? -1 : 1;
+    }
+    int c = strcmp(e->name, name);
+    if (c) {
+        return c;
+    }
+    return (e->arity > arity) - (e->arity < arity);
+}
+
+static int named_cmp(const void *a, const void *b) {
+    const cs_named_t *x = (const cs_named_t *)a;
+    const cs_named_t *y = (const cs_named_t *)b;
+    int c = named_key_cmp(x, y->scope, y->name, y->arity);
+    if (c) {
+        return c;
+    }
+    if (x->owner != y->owner) {
+        return x->owner < y->owner ? -1 : 1;
+    }
+    return (x->ent > y->ent) - (x->ent < y->ent);
+}
+
+/* The entry of `owner` within [lo, hi) (one scope, name and arity: sorted by
+ * owner, and an owner has one entity there), or CS_NONE. */
+static int named_of_owner(const cs_named_t *arr, int lo, int hi, int owner) {
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (arr[mid].owner < owner) {
+            lo = mid + SKIP_ONE;
+        } else if (arr[mid].owner > owner) {
+            hi = mid;
+        } else {
+            return mid;
+        }
+    }
+    return CS_NONE;
+}
+
+/* Where the assemblies' entries start within [lo, hi): before it stand the
+ * shared trees'. */
+static int named_first_assembly(const cs_named_t *arr, int lo, int hi) {
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (arr[mid].owner < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* [return, *hi) of arr[0..n): the entries of this scope, name and arity. */
+static int named_range(const cs_named_t *arr, int n, int scope, const char *name, int arity,
+                       int *hi) {
+    int lo = 0;
+    int end = n;
+    while (lo < end) {
+        int mid = lo + ((end - lo) / PAIR_LEN);
+        if (named_key_cmp(&arr[mid], scope, name, arity) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            end = mid;
+        }
+    }
+    int a = lo;
+    end = n;
+    while (a < end) {
+        int mid = a + ((end - a) / PAIR_LEN);
+        if (named_key_cmp(&arr[mid], scope, name, arity) <= 0) {
+            a = mid + SKIP_ONE;
+        } else {
+            end = mid;
+        }
+    }
+    *hi = a;
+    return lo;
+}
+
+/* The two tables: top-level types by namespace, nested types by their outer
+ * entity. */
+static bool build_named(cs_index_t *ix) {
+    for (int i = 0; i < ix->nents; i++) {
+        ix->ntops += ix->ents[i].parent < 0;
+    }
+    ix->nkids = ix->nents - ix->ntops;
+    ix->tops = (cs_named_t *)ix_alloc(ix, (size_t)ix->ntops * sizeof(cs_named_t));
+    ix->kids = (cs_named_t *)ix_alloc(ix, (size_t)ix->nkids * sizeof(cs_named_t));
+    if (!ix->tops || !ix->kids) {
+        return false;
+    }
+    int t = 0;
+    int k = 0;
+    for (int i = 0; i < ix->nents; i++) {
+        const cs_entity_t *e = &ix->ents[i];
+        cs_named_t row = {.scope = e->parent >= 0 ? e->parent : e->ns,
+                          .name = e->name,
+                          .arity = e->arity,
+                          .owner = e->owner,
+                          .ent = i};
+        if (e->parent >= 0) {
+            ix->kids[k++] = row;
+        } else {
+            ix->tops[t++] = row;
+        }
+    }
+    if (ix->ntops > 1) {
+        qsort(ix->tops, (size_t)ix->ntops, sizeof(cs_named_t), named_cmp);
+    }
+    if (ix->nkids > 1) {
+        qsort(ix->kids, (size_t)ix->nkids, sizeof(cs_named_t), named_cmp);
+    }
+    return true;
+}
+
+/* True when an assembly among tops[lo, hi) -- the assemblies' types of the
+ * shared declaration `shared`'s name -- holds an implementation of the name
+ * that is no part of that declaration: a complete type, or parts where the
+ * shared declaration is no partial type. Every contract of the name asks;
+ * the assemblies are walked for the first, and the answer is kept with the
+ * shared declaration. */
+static bool rival_implementation(cs_index_t *ix, int lo, int hi, int shared) {
+    cs_entity_t *s = &ix->ents[shared];
+    if (!s->rival_known) {
+        bool pool = s->owner == CS_POOL;
+        for (int i = lo; !s->rival && i < hi; i++) {
+            const cs_entity_t *e = &ix->ents[ix->tops[i].ent];
+            s->rival = e->has_impl && !(pool && e->impl_partial);
+        }
+        s->rival_known = true;
+    }
+    return s->rival;
+}
+
+/* The shared trees' declaration that belongs to an assembly's type: its
+ * twin. Two rules give a top-level type one:
+ *   - parts: a type an assembly's implementation declares `partial` has the
+ *     shared trees' parts of that name (CS_POOL) as parts of it -- what a
+ *     reference sees of a partial type is its own assembly's parts and the
+ *     shared trees'. A complete type has no further parts;
+ *   - contract: an assembly whose every declaration of the type stands in a
+ *     project directory named `ref` holds only the contract. `ref` is the
+ *     .NET convention for reference-assembly sources, and the rule joins a
+ *     contract to the one implementation it can belong to: the declaration
+ *     the shared trees hold of that full name and arity, when they hold
+ *     exactly one (the parts of one tree count as one) and no assembly
+ *     holds another implementation of it. The stub is then no second type.
+ *     Nothing is chosen between two trees' declarations, two
+ *     implementations or two assemblies: no join there.
+ * A type nested in a type that has a twin has the one of its name nested in
+ * the twin. An entity is made after its outer type's, so one pass in order
+ * sees every outer type first. What the twin says of the type (test code,
+ * hidden members) is folded into it. */
+static void entity_twins(cs_index_t *ix) {
+    for (int i = 0; i < ix->nents; i++) {
+        cs_entity_t *e = &ix->ents[i];
+        int hi = 0;
+        if (e->parent >= 0) {
+            int outer = ix->ents[e->parent].twin;
+            if (outer < 0) {
+                continue;
+            }
+            int lo = named_range(ix->kids, ix->nkids, outer, e->name, e->arity, &hi);
+            e->twin = lo < hi ? ix->kids[lo].ent : CS_NONE;
+            e->joined = e->twin >= 0 && ix->ents[e->parent].joined;
+        } else {
+            if (e->owner < 0 || (e->has_impl && !e->impl_partial)) {
+                continue;
+            }
+            int lo = named_range(ix->tops, ix->ntops, e->ns, e->name, e->arity, &hi);
+            int split = named_first_assembly(ix->tops, lo, hi);
+            int at = CS_NONE;
+            if (e->has_impl) {
+                at = named_of_owner(ix->tops, lo, split, CS_POOL);
+            } else if (split - lo == SKIP_ONE && ix->ents[ix->tops[lo].ent].nunits == SKIP_ONE &&
+                       !rival_implementation(ix, split, hi, ix->tops[lo].ent)) {
+                at = lo;
+                e->joined = true;
+            }
+            e->twin = at >= 0 ? ix->tops[at].ent : CS_NONE;
+        }
+        if (e->twin >= 0) {
+            cs_entity_t *parts = &ix->ents[e->twin];
+            e->incomplete = e->incomplete || parts->incomplete;
+            e->any_prod = e->any_prod || parts->any_prod;
+            e->all_test = e->all_test && parts->all_test;
+            parts->used = true;
+            if (!e->has_impl) {
+                parts->stub = parts->stub == CS_NONE ? i : CS_AMBIGUOUS;
+            }
+        }
+    }
 }
 
 /* ── Node binding ────────────────────────────────────────────────── */
-
-static const cbm_gbuf_node_t *decl_node(const cs_index_t *ix, const cbm_gbuf_t *g, cs_decl_t d) {
-    const cs_file_t *f = &ix->files[d.file];
-    const cs_type_t *t = &f->types[d.type];
-    if (!t->owns_node || t->kind == 'd') {
-        return NULL; /* a same-file twin took the node; delegates have none */
-    }
-    char qn[CS_KEY_BUF];
-    if (snprintf(qn, sizeof(qn), "%s.%s", f->module_qn, t->path) >= (int)sizeof(qn)) {
-        return NULL;
-    }
-    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(g, qn);
-    return (n && cbm_label_is_type_like(n->label)) ? n : NULL;
-}
 
 static bool label_is_callable(const char *l) {
     return l && (strcmp(l, "Method") == 0 || strcmp(l, "Function") == 0);
@@ -920,41 +1987,625 @@ static bool label_is_value(const char *l) {
                  strcmp(l, "Property") == 0 || strcmp(l, "Constant") == 0);
 }
 
-/* The member's node; NULL when it has none. The node of <module>.<owner>.
- * <name> belongs to the last declaration of that qualified name in the file:
- * overloads of one type share it, but when `Foo` and `Foo<T>` both declare
- * the member, the earlier type's member has no node of its own (the same
- * rule as for the types themselves). NULL as well when the slot holds a
- * member of the other kind (an explicit implementation that won the name). */
-static const cbm_gbuf_node_t *member_node(const cs_index_t *ix, const cbm_gbuf_t *g, int file,
-                                          const cs_member_t *m) {
-    const cs_file_t *f = &ix->files[file];
-    const cs_member_t *last = m;
-    for (const cs_member_t *p = m + SKIP_ONE; p < f->members + f->nmembers; p++) {
-        if (strcmp(p->owner, m->owner) != 0 || strcmp(p->name, m->name) != 0) {
-            break;
-        }
-        last = p;
+/* <module>.<Outer>.<Inner> of type `t` into `buf`, its length into *len.
+ * false when it does not fit: such a declaration has no node to be found. */
+static bool type_qn(const cs_file_t *f, int t, char *buf, size_t cap, size_t *len) {
+    size_t ml = strlen(f->module_qn);
+    size_t total = ml;
+    for (int x = t; x >= 0; x = f->types[x].outer) {
+        total += strlen(f->types[x].name) + SKIP_ONE;
     }
-    if (f->types[last->type_idx].entity != f->types[m->type_idx].entity) {
-        return NULL;
+    if (total >= cap) {
+        return false;
     }
-    char qn[CS_KEY_BUF];
-    if (snprintf(qn, sizeof(qn), "%s.%s.%s", f->module_qn, m->owner, m->name) >= (int)sizeof(qn)) {
-        return NULL;
+    size_t w = total;
+    buf[w] = '\0';
+    for (int x = t; x >= 0; x = f->types[x].outer) {
+        size_t nl = strlen(f->types[x].name);
+        w -= nl;
+        memcpy(buf + w, f->types[x].name, nl);
+        buf[--w] = '.';
     }
+    memcpy(buf, f->module_qn, ml);
+    *len = total;
+    return true;
+}
+
+/* The node a member's own qualified name has, when it is one a reference to
+ * a member of this kind can bind. */
+static const cbm_gbuf_node_t *member_node_at(const cbm_gbuf_t *g, const cs_member_t *m, char *qn,
+                                             size_t type_len, size_t cap) {
+    size_t nl = strlen(m->name);
+    if (m->kind == 'o' || m->kind == 'x' || type_len + nl + PAIR_LEN > cap) {
+        return NULL; /* operators and indexers have no node */
+    }
+    qn[type_len] = '.';
+    memcpy(qn + type_len + SKIP_ONE, m->name, nl + SKIP_ONE);
     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(g, qn);
+    qn[type_len] = '\0';
     if (!n) {
         return NULL;
     }
-    bool ok = m->kind == 'c' ? label_is_callable(n->label) : label_is_value(n->label);
-    return ok ? n : NULL;
+    return (m->kind == 'c' ? label_is_callable(n->label) : label_is_value(n->label)) ? n : NULL;
 }
 
-/* Representative ordering of declarations (the prototype's presentation
- * rule, made deterministic without node ids or lines): an implementation
- * before a /ref/ API stub, the source file itself, the longest common
- * directory prefix with it, then path and declaration order. */
+/* Scratch tables of the node pass: cleared for every file. */
+typedef struct {
+    CBMHashTable *names; /* "<gid>\x1f<name>" -> index + 1 */
+    CBMArena keys;
+    int *last; /* per gid: the last type that has it */
+    int cap_last;
+} cs_node_pass_t;
+
+/* The path group of every type of the file (types with one path -- `Foo` and
+ * `Foo<T>`, and what is nested in them under one name -- share the node
+ * <module>.<path>), and which declaration owns that node: the last one. */
+static bool assign_gids(cs_index_t *ix, cs_file_t *f, cs_node_pass_t *np) {
+    if (f->ntypes > np->cap_last) {
+        cbm_free(CBM_MEM_CLASS_OTHER, np->last);
+        np->last = (int *)cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)f->ntypes * sizeof(int));
+        np->cap_last = np->last ? f->ntypes : 0;
+        if (!np->last) {
+            ix->oom = true;
+            return false;
+        }
+    }
+    cbm_ht_clear(np->names);
+    cbm_arena_rewind(&np->keys); /* the cleared table held the only pointers into it */
+    int gids = 0;
+    for (int t = 0; t < f->ntypes; t++) {
+        cs_type_t *ty = &f->types[t];
+        char key[CS_NAME_BUF + CBM_SZ_16];
+        snprintf(key, sizeof(key), "%d\x1f%s", ty->outer >= 0 ? f->types[ty->outer].gid : CS_NONE,
+                 ty->name);
+        intptr_t v = (intptr_t)cbm_ht_get(np->names, key);
+        if (v > 0) {
+            ty->gid = (int)(v - SKIP_ONE);
+        } else {
+            char *k = cbm_arena_strdup(&np->keys, key);
+            if (!k) {
+                ix->oom = true;
+                return false;
+            }
+            ty->gid = gids++;
+            cbm_ht_set(np->names, k, (void *)(intptr_t)(ty->gid + SKIP_ONE));
+        }
+        np->last[ty->gid] = t;
+    }
+    for (int t = 0; t < f->ntypes; t++) {
+        f->types[t].owns_node = np->last[f->types[t].gid] == t;
+    }
+    return true;
+}
+
+/* The graph node of every type and member of the file that has one a
+ * reference may bind. A member's node <module>.<path>.<name> belongs to the
+ * last declaration of that qualified name in the file: overloads of one type
+ * share it, but when `Foo` and `Foo<T>` both declare the member, the earlier
+ * type's member has none of its own (the same rule as for the types). No
+ * node either where the slot holds a member of the other kind. */
+static bool bind_nodes(cs_index_t *ix, cs_file_t *f, const cbm_gbuf_t *g, cs_node_pass_t *np) {
+    if (!assign_gids(ix, f, np)) {
+        return false;
+    }
+    char qn[CS_KEY_BUF];
+    size_t len = 0;
+    for (int t = 0; t < f->ntypes; t++) {
+        cs_type_t *ty = &f->types[t];
+        if (ty->owns_node && ty->kind != 'd' && type_qn(f, t, qn, sizeof(qn), &len)) {
+            const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(g, qn);
+            ty->node = (n && cbm_label_is_type_like(n->label)) ? n : NULL;
+        }
+    }
+    /* which member is the last of its (path, name) */
+    cbm_ht_clear(np->names);
+    cbm_arena_rewind(&np->keys);
+    for (int m = 0; m < f->nmembers; m++) {
+        char key[(CS_NAME_BUF) + CBM_SZ_16];
+        snprintf(key, sizeof(key), "%d\x1f%s", f->types[f->members[m].type].gid,
+                 f->members[m].name);
+        const char *k = cbm_ht_get_key(np->names, key);
+        if (!k) {
+            k = cbm_arena_strdup(&np->keys, key);
+            if (!k) {
+                ix->oom = true;
+                return false;
+            }
+        }
+        cbm_ht_set(np->names, k, (void *)(intptr_t)(m + SKIP_ONE));
+    }
+    int cached = CS_NONE;
+    bool fits = false;
+    for (int m = 0; m < f->nmembers; m++) {
+        cs_member_t *mem = &f->members[m];
+        char key[(CS_NAME_BUF) + CBM_SZ_16];
+        snprintf(key, sizeof(key), "%d\x1f%s", f->types[mem->type].gid, mem->name);
+        intptr_t last = (intptr_t)cbm_ht_get(np->names, key);
+        if (last <= 0 ||
+            f->types[f->members[last - SKIP_ONE].type].entity != f->types[mem->type].entity) {
+            continue; /* a declaration of another type took the name's node */
+        }
+        if (mem->type != cached) {
+            cached = mem->type;
+            fits = type_qn(f, cached, qn, sizeof(qn), &len);
+        }
+        mem->node = fits ? member_node_at(g, mem, qn, len, sizeof(qn)) : NULL;
+    }
+    return true;
+}
+
+static unsigned char decl_class(const cs_file_t *f, bool has_node) {
+    return (unsigned char)((has_node ? 0 : CS_CLS_NO_NODE) | (f->is_ref ? CS_CLS_REF : 0) |
+                           (f->is_test ? CS_CLS_TEST : 0));
+}
+
+static int bind_cmp(const void *a, const void *b) {
+    const cs_bind_t *x = (const cs_bind_t *)a;
+    const cs_bind_t *y = (const cs_bind_t *)b;
+    if (x->cls != y->cls) {
+        return x->cls < y->cls ? -1 : 1;
+    }
+    if (x->file != y->file) {
+        return x->file < y->file ? -1 : 1;
+    }
+    return (x->type > y->type) - (x->type < y->type);
+}
+
+/* Every entity's declarations by (class, path). */
+static bool build_binds(cs_index_t *ix) {
+    for (int i = 0; i < ix->nents; i++) {
+        cs_entity_t *e = &ix->ents[i];
+        e->binds = (cs_bind_t *)ix_alloc(ix, (size_t)e->ndecls * sizeof(cs_bind_t));
+        if (!e->binds) {
+            return false;
+        }
+        for (int d = 0; d < e->ndecls; d++) {
+            const cs_file_t *f = &ix->files[e->decls[d].file];
+            e->binds[d] =
+                (cs_bind_t){.file = e->decls[d].file,
+                            .type = e->decls[d].type,
+                            .cls = decl_class(f, f->types[e->decls[d].type].node != NULL)};
+        }
+        if (e->ndecls > 1) {
+            qsort(e->binds, (size_t)e->ndecls, sizeof(cs_bind_t), bind_cmp);
+        }
+    }
+    return true;
+}
+
+/* ── Members by entity and name ──────────────────────────────────── */
+
+/* One member for sorting: the sort keys carry their own comparison data (no
+ * global sort context). */
+typedef struct {
+    cs_mref_t ref;
+    const char *name;
+    const char *sig;
+} cs_mkey_t;
+
+static int mkey_cmp(const void *a, const void *b) {
+    const cs_mkey_t *x = (const cs_mkey_t *)a;
+    const cs_mkey_t *y = (const cs_mkey_t *)b;
+    if (x->ref.ent != y->ref.ent) {
+        return x->ref.ent < y->ref.ent ? -1 : 1;
+    }
+    int c = strcmp(x->name, y->name);
+    if (c) {
+        return c;
+    }
+    if (x->ref.group != y->ref.group) {
+        return x->ref.group < y->ref.group ? -1 : 1;
+    }
+    c = strcmp(x->sig, y->sig);
+    if (c) {
+        return c;
+    }
+    if (x->ref.cls != y->ref.cls) {
+        return x->ref.cls < y->ref.cls ? -1 : 1;
+    }
+    if (x->ref.file != y->ref.file) {
+        return x->ref.file < y->ref.file ? -1 : 1;
+    }
+    return (x->ref.midx > y->ref.midx) - (x->ref.midx < y->ref.midx);
+}
+
+/* The key of the operators and indexers named `name` that `ent` declares:
+ * those outside test code (`prod`), or all of them. false when it does not
+ * fit (cannot be for a declared one: parse_member bounds the name). */
+static bool special_key(char *key, size_t cap, bool prod, int ent, const char *name) {
+    int n = snprintf(key, cap, "%c%d\x1f%s", prod ? 'P' : 'A', ent, name);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* Note an operator or indexer of `ent`. false when memory ran out. */
+static bool special_mark(cs_index_t *ix, int ent, const char *name, unsigned char cls) {
+    char key[CS_NAME_BUF + CBM_SZ_64];
+    if (!special_key(key, sizeof(key), false, ent, name)) {
+        return true;
+    }
+    if (!ht_mark(ix, ix->specials, key)) {
+        return false;
+    }
+    key[0] = 'P';
+    return (cls & CS_CLS_TEST) != 0 || ht_mark(ix, ix->specials, key);
+}
+
+/* Every member a name can address, by (entity, name, group, signature,
+ * class, path, order). Explicit interface implementations are left out: no
+ * name addresses one. */
+static bool build_mrefs(cs_index_t *ix) {
+    size_t total = 0;
+    for (int fi = 0; fi < ix->nfiles; fi++) {
+        total += (size_t)ix->files[fi].nmembers;
+    }
+    cs_mkey_t *keys =
+        (cs_mkey_t *)cbm_alloc(CBM_MEM_CLASS_OTHER, (total ? total : SKIP_ONE) * sizeof(cs_mkey_t));
+    ix->mrefs = (cs_mref_t *)ix_alloc(ix, total * sizeof(cs_mref_t));
+    if (!keys || !ix->mrefs) {
+        cbm_free(CBM_MEM_CLASS_OTHER, keys);
+        ix->oom = true;
+        return false;
+    }
+    size_t n = 0;
+    for (int fi = 0; fi < ix->nfiles; fi++) {
+        const cs_file_t *f = &ix->files[fi];
+        for (int m = 0; m < f->nmembers; m++) {
+            const cs_member_t *mem = &f->members[m];
+            if (mem->explicit_impl) {
+                continue;
+            }
+            unsigned char group = mem->kind == 'c'
+                                      ? SKIP_ONE
+                                      : ((mem->kind == 'o' || mem->kind == 'x') ? PAIR_LEN : 0);
+            unsigned char cls = decl_class(f, mem->node != NULL);
+            int ent = f->types[mem->type].entity;
+            if (group == PAIR_LEN && !special_mark(ix, ent, mem->name, cls)) {
+                cbm_free(CBM_MEM_CLASS_OTHER, keys);
+                return false;
+            }
+            keys[n++] =
+                (cs_mkey_t){.ref = {.ent = ent, .file = fi, .midx = m, .group = group, .cls = cls},
+                            .name = mem->name,
+                            .sig = mem->sig ? mem->sig : ""};
+        }
+    }
+    if (n > 1) {
+        qsort(keys, n, sizeof(cs_mkey_t), mkey_cmp);
+    }
+    for (size_t i = 0; i < n; i++) {
+        ix->mrefs[i] = keys[i].ref;
+    }
+    ix->nmrefs = (int)n;
+    cbm_free(CBM_MEM_CLASS_OTHER, keys);
+    return true;
+}
+
+static const cs_member_t *mref_member(const cs_index_t *ix, const cs_mref_t *r) {
+    return &ix->files[r->file].members[r->midx];
+}
+
+/* Order of a member entry against a key (entity, name, and when `group` is
+ * not negative: group and signature). */
+static int mref_key_cmp(const cs_index_t *ix, const cs_mref_t *r, int ent, const char *name,
+                        int group, const char *sig) {
+    if (r->ent != ent) {
+        return r->ent < ent ? -1 : 1;
+    }
+    const cs_member_t *m = mref_member(ix, r);
+    int c = strcmp(m->name, name);
+    if (c || group < 0) {
+        return c;
+    }
+    if (r->group != group) {
+        return (int)r->group < group ? -1 : 1;
+    }
+    return strcmp(m->sig ? m->sig : "", sig);
+}
+
+/* [return, *hi): the entity's members named `name`; with `group` >= 0 only
+ * those of that group with exactly the signature `sig`. */
+static int mref_range(const cs_index_t *ix, int ent, const char *name, int group, const char *sig,
+                      int *hi) {
+    int lo = 0;
+    int end = ix->nmrefs;
+    while (lo < end) {
+        int mid = lo + ((end - lo) / PAIR_LEN);
+        if (mref_key_cmp(ix, &ix->mrefs[mid], ent, name, group, sig) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            end = mid;
+        }
+    }
+    int a = lo;
+    end = ix->nmrefs;
+    while (a < end) {
+        int mid = a + ((end - a) / PAIR_LEN);
+        if (mref_key_cmp(ix, &ix->mrefs[mid], ent, name, group, sig) <= 0) {
+            a = mid + SKIP_ONE;
+        } else {
+            end = mid;
+        }
+    }
+    *hi = a;
+    return lo;
+}
+
+/* ── What an assembly's own parts add to a shared declaration ────── */
+
+static int extra_key_cmp(const cs_extra_t *x, int twin, const char *name, int arity) {
+    if (x->twin != twin) {
+        return x->twin < twin ? -1 : 1;
+    }
+    int c = strcmp(x->name, name);
+    if (c) {
+        return c;
+    }
+    return (x->arity > arity) - (x->arity < arity);
+}
+
+static int extra_cmp(const void *a, const void *b) {
+    const cs_extra_t *x = (const cs_extra_t *)a;
+    const cs_extra_t *y = (const cs_extra_t *)b;
+    int c = extra_key_cmp(x, y->twin, y->name, y->arity);
+    return c ? c : (x->ent > y->ent) - (x->ent < y->ent);
+}
+
+/* The shared trees' declaration beside which the type `ent` stands: a type
+ * nested in an assembly's own parts of a type, implemented there, that the
+ * shared trees' declaration of that type does not have. CS_NONE for every
+ * other type. */
+static int extra_type_twin(const cs_index_t *ix, int ent) {
+    const cs_entity_t *e = &ix->ents[ent];
+    if (e->parent < 0 || !e->has_impl || e->twin >= 0) {
+        return CS_NONE;
+    }
+    return ix->ents[e->parent].twin;
+}
+
+/* The same for a member: one an assembly's own parts of a type declare. A
+ * stub does not count: it declares what the implementation declares. */
+static int extra_member_twin(const cs_index_t *ix, const cs_mref_t *r) {
+    return (r->cls & CS_CLS_REF) ? CS_NONE : ix->ents[r->ent].twin;
+}
+
+/* The names the assemblies' own parts declare beyond the shared trees'
+ * declarations they belong to, by that declaration and name: what a
+ * reference that sees the shared declaration without those parts cannot tell
+ * from what is not there (unseen_part_declares). One walk over the types and
+ * the members, so that no lookup walks the assemblies. false when memory ran
+ * out. */
+static bool build_extras(cs_index_t *ix) {
+    size_t n = 0;
+    for (int i = 0; i < ix->nents; i++) {
+        n += extra_type_twin(ix, i) >= 0;
+    }
+    for (int i = 0; i < ix->nmrefs; i++) {
+        n += extra_member_twin(ix, &ix->mrefs[i]) >= 0;
+    }
+    cs_extra_t *arr = (cs_extra_t *)ix_alloc(ix, n * sizeof(cs_extra_t));
+    if (!arr) {
+        return false;
+    }
+    size_t w = 0;
+    for (int i = 0; i < ix->nents; i++) {
+        int twin = extra_type_twin(ix, i);
+        if (twin >= 0) {
+            arr[w++] = (cs_extra_t){
+                .twin = twin, .name = ix->ents[i].name, .arity = ix->ents[i].arity, .ent = i};
+        }
+    }
+    for (int i = 0; i < ix->nmrefs; i++) {
+        const cs_mref_t *r = &ix->mrefs[i];
+        int twin = extra_member_twin(ix, r);
+        if (twin >= 0) {
+            arr[w++] = (cs_extra_t){.twin = twin,
+                                    .name = mref_member(ix, r)->name,
+                                    .arity = CS_NONE,
+                                    .ent = CS_NONE,
+                                    .prod = !(r->cls & CS_CLS_TEST)};
+        }
+    }
+    if (n > 1) {
+        qsort(arr, n, sizeof(cs_extra_t), extra_cmp);
+    }
+    /* a name's members are one entry */
+    size_t out = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (out > 0 && arr[i].ent < 0 && arr[out - SKIP_ONE].ent < 0 &&
+            extra_key_cmp(&arr[out - SKIP_ONE], arr[i].twin, arr[i].name, arr[i].arity) == 0) {
+            arr[out - SKIP_ONE].prod = arr[out - SKIP_ONE].prod || arr[i].prod;
+        } else {
+            arr[out++] = arr[i];
+        }
+    }
+    ix->extras = arr;
+    ix->nextras = (int)out;
+    return true;
+}
+
+/* [return, *hi): the extras of this shared declaration, name and arity
+ * (CS_NONE: the name's members). */
+static int extra_range(const cs_index_t *ix, int twin, const char *name, int arity, int *hi) {
+    int lo = 0;
+    int end = ix->nextras;
+    while (lo < end) {
+        int mid = lo + ((end - lo) / PAIR_LEN);
+        if (extra_key_cmp(&ix->extras[mid], twin, name, arity) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            end = mid;
+        }
+    }
+    int a = lo;
+    end = ix->nextras;
+    while (a < end) {
+        int mid = a + ((end - a) / PAIR_LEN);
+        if (extra_key_cmp(&ix->extras[mid], twin, name, arity) <= 0) {
+            a = mid + SKIP_ONE;
+        } else {
+            end = mid;
+        }
+    }
+    *hi = a;
+    return lo;
+}
+
+/* ── Import candidate indexes ───────────────────────────────────── */
+
+static int alias_id_cmp(const void *a, const void *b) {
+    const cs_alias_id_t *x = (const cs_alias_id_t *)a;
+    const cs_alias_id_t *y = (const cs_alias_id_t *)b;
+    cs_index_work(SKIP_ONE);
+    int order = strcmp(x->name, y->name);
+    return order ? order : (x->id > y->id) - (x->id < y->id);
+}
+
+static int using_id_cmp(const void *a, const void *b) {
+    const cs_using_id_t *x = (const cs_using_id_t *)a;
+    const cs_using_id_t *y = (const cs_using_id_t *)b;
+    cs_index_work(SKIP_ONE);
+    if (x->scope != y->scope) {
+        return (x->scope > y->scope) - (x->scope < y->scope);
+    }
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+static int name_scope_cmp(const void *a, const void *b) {
+    const cs_name_scope_t *x = (const cs_name_scope_t *)a;
+    const cs_name_scope_t *y = (const cs_name_scope_t *)b;
+    cs_index_work(SKIP_ONE);
+    int order = strcmp(x->name, y->name);
+    if (order) {
+        return order;
+    }
+    if (x->top != y->top) {
+        return x->top ? 1 : -1;
+    }
+    return (x->scope > y->scope) - (x->scope < y->scope);
+}
+
+static void *import_array(cs_index_t *ix, size_t n, size_t size) {
+    if (n > SIZE_MAX / size) {
+        ix->oom = true;
+        return NULL;
+    }
+    return n ? ix_alloc(ix, n * size) : NULL;
+}
+
+/* One repository-wide pass, never one member-table expansion per import.
+ * Include test-only names and extras: the ordinary resolver, not this
+ * candidate filter, decides visibility, arity and unseen-part ambiguity. */
+static bool build_name_scopes(cs_index_t *ix) {
+    size_t n = 0;
+    const int counts[] = {ix->ntops, ix->nkids, ix->nmrefs, ix->nextras};
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+        if ((size_t)counts[i] > SIZE_MAX - n) {
+            ix->oom = true;
+            return false;
+        }
+        n += (size_t)counts[i];
+    }
+    cs_name_scope_t *rows = (cs_name_scope_t *)import_array(ix, n, sizeof(*rows));
+    if (n && !rows) {
+        return false;
+    }
+    size_t w = 0;
+    for (int i = 0; i < ix->ntops; i++) {
+        cs_index_work(SKIP_ONE);
+        rows[w++] =
+            (cs_name_scope_t){.name = ix->tops[i].name, .scope = ix->tops[i].scope, .top = true};
+    }
+    for (int i = 0; i < ix->nkids; i++) {
+        cs_index_work(SKIP_ONE);
+        rows[w++] = (cs_name_scope_t){.name = ix->kids[i].name, .scope = ix->kids[i].scope};
+    }
+    for (int i = 0; i < ix->nmrefs; i++) {
+        cs_index_work(SKIP_ONE);
+        rows[w++] = (cs_name_scope_t){.name = mref_member(ix, &ix->mrefs[i])->name,
+                                      .scope = ix->mrefs[i].ent};
+    }
+    for (int i = 0; i < ix->nextras; i++) {
+        cs_index_work(SKIP_ONE);
+        rows[w++] = (cs_name_scope_t){.name = ix->extras[i].name, .scope = ix->extras[i].twin};
+    }
+    if (w > 1) {
+        qsort(rows, w, sizeof(*rows), name_scope_cmp);
+    }
+    size_t out = 0;
+    for (size_t i = 0; i < w; i++) {
+        if (!out || name_scope_cmp(&rows[out - SKIP_ONE], &rows[i])) {
+            rows[out++] = rows[i];
+        }
+    }
+    ix->name_scopes = rows;
+    ix->nname_scopes = out;
+    ix->name_scopes_ready = true;
+    return true;
+}
+
+/* Build only after these directives have resolved. A static import is
+ * associated with its own entity and its twin, without copying either
+ * entity's declarations into every region that imports it. */
+static bool build_using_index(cs_index_t *ix, const cs_using_t *us, int n,
+                              cs_using_index_t *index) {
+    cs_using_index_t out = {0};
+    for (int i = 0; i < n; i++) {
+        cs_index_work(SKIP_ONE);
+        const cs_using_t *u = &us[i];
+        if (u->kind == 'a') {
+            out.naliases++;
+        } else if (u->kind == 'n' && u->ns >= 0) {
+            out.nnamespaces++;
+        } else if (u->kind == 's' && u->ent >= 0) {
+            size_t extra = ix->ents[u->ent].twin >= 0 ? PAIR_LEN : SKIP_ONE;
+            if (extra > SIZE_MAX - out.nentities) {
+                ix->oom = true;
+                return false;
+            }
+            out.nentities += extra;
+        }
+    }
+    out.aliases = (cs_alias_id_t *)import_array(ix, out.naliases, sizeof(*out.aliases));
+    out.namespaces = (cs_using_id_t *)import_array(ix, out.nnamespaces, sizeof(*out.namespaces));
+    out.entities = (cs_using_id_t *)import_array(ix, out.nentities, sizeof(*out.entities));
+    if (ix->oom) {
+        return false;
+    }
+    size_t a = 0;
+    size_t ns = 0;
+    size_t e = 0;
+    for (int i = 0; i < n; i++) {
+        cs_index_work(SKIP_ONE);
+        const cs_using_t *u = &us[i];
+        if (u->kind == 'a') {
+            out.aliases[a++] = (cs_alias_id_t){.name = u->alias, .id = i};
+        } else if (u->kind == 'n' && u->ns >= 0) {
+            out.namespaces[ns++] = (cs_using_id_t){.scope = u->ns, .id = i};
+        } else if (u->kind == 's' && u->ent >= 0) {
+            out.entities[e++] = (cs_using_id_t){.scope = u->ent, .id = i};
+            int twin = ix->ents[u->ent].twin;
+            if (twin >= 0) {
+                out.entities[e++] = (cs_using_id_t){.scope = twin, .id = i};
+            }
+        }
+    }
+    if (a > 1) {
+        qsort(out.aliases, a, sizeof(*out.aliases), alias_id_cmp);
+    }
+    if (ns > 1) {
+        qsort(out.namespaces, ns, sizeof(*out.namespaces), using_id_cmp);
+    }
+    if (e > 1) {
+        qsort(out.entities, e, sizeof(*out.entities), using_id_cmp);
+    }
+    out.ready = true;
+    *index = out;
+    return true;
+}
+
+/* ── Choosing the declaration a reference binds ──────────────────── */
+
+/* Number of leading directories two paths share. */
 static int common_dir_prefix(const char *a, const char *b) {
     int n = 0;
     for (;;) {
@@ -973,83 +2624,132 @@ static int common_dir_prefix(const char *a, const char *b) {
     }
 }
 
-static bool path_is_ref_stub(const char *rel) {
-    return strncmp(rel, "ref/", 4) == 0 || strstr(rel, "/ref/") != NULL;
+/* Length of the first `dirs` directories of `path`, each with its '/'. */
+static size_t dir_prefix_len(const char *path, int dirs) {
+    const char *p = path;
+    for (int i = 0; i < dirs; i++) {
+        const char *slash = strchr(p, '/');
+        if (!slash) {
+            break;
+        }
+        p = slash + SKIP_ONE;
+    }
+    return (size_t)(p - path);
 }
 
-static bool decl_better(const cs_index_t *ix, int fa, int la, int fb, int lb, const char *src) {
-    const char *ra = ix->files[fa].rel_path;
-    const char *rb = ix->files[fb].rel_path;
-    bool refa = path_is_ref_stub(ra);
-    bool refb = path_is_ref_stub(rb);
-    if (refa != refb) {
-        return !refa;
+/* Of the declarations [lo, hi) -- one class, so in path order -- the one a
+ * reference written in file `src` binds (a choice of presentation among the
+ * parts of one type, made without a scan): the one in `src` itself; else the
+ * first one in the directory that shares the longest leading path with it;
+ * else the first. */
+static int nearest_bind(const cs_index_t *ix, const cs_bind_t *arr, int lo, int hi, int src) {
+    int a = lo;
+    int b = hi;
+    while (a < b) {
+        int mid = a + ((b - a) / PAIR_LEN);
+        if (arr[mid].file < src) {
+            a = mid + SKIP_ONE;
+        } else {
+            b = mid;
+        }
     }
-    bool sa = strcmp(ra, src) == 0;
-    bool sb = strcmp(rb, src) == 0;
-    if (sa != sb) {
-        return sa;
+    if (a < hi && arr[a].file == src) {
+        return a;
     }
-    int pa = common_dir_prefix(ra, src);
-    int pb = common_dir_prefix(rb, src);
-    if (pa != pb) {
-        return pa > pb;
+    const char *sp = ix->files[src].rel_path;
+    int left = a > lo ? common_dir_prefix(ix->files[arr[a - SKIP_ONE].file].rel_path, sp) : 0;
+    int right = a < hi ? common_dir_prefix(ix->files[arr[a].file].rel_path, sp) : 0;
+    int best = left > right ? left : right;
+    if (best == 0) {
+        return lo;
     }
-    int c = strcmp(ra, rb);
-    if (c != 0) {
-        return c < 0;
+    /* the entries before `a` that share those directories are the last ones
+     * before it: the first of them */
+    size_t plen = dir_prefix_len(sp, best);
+    int x = lo;
+    int y = a;
+    while (x < y) {
+        int mid = x + ((y - x) / PAIR_LEN);
+        if (strncmp(ix->files[arr[mid].file].rel_path, sp, plen) < 0) {
+            x = mid + SKIP_ONE;
+        } else {
+            y = mid;
+        }
     }
-    return la < lb;
+    return x;
+}
+
+/* [return, *hi): the declarations of class `cls` among arr[0, n), which is
+ * sorted by class first. */
+static int class_range(const cs_bind_t *arr, int n, unsigned char cls, int *out_hi) {
+    int a = 0;
+    int b = n;
+    while (a < b) {
+        int mid = a + ((b - a) / PAIR_LEN);
+        if (arr[mid].cls < cls) {
+            a = mid + SKIP_ONE;
+        } else {
+            b = mid;
+        }
+    }
+    int first = a;
+    b = n;
+    while (a < b) {
+        int mid = a + ((b - a) / PAIR_LEN);
+        if (arr[mid].cls <= cls) {
+            a = mid + SKIP_ONE;
+        } else {
+            b = mid;
+        }
+    }
+    *out_hi = a;
+    return first;
+}
+
+/* True when a declaration in file `fa` is the better one to bind than one in
+ * `fb`, for a reference written in `src`: its own file, then the longer
+ * shared path, then the path order. */
+static bool file_nearer(const cs_index_t *ix, int fa, int fb, int src) {
+    if ((fa == src) != (fb == src)) {
+        return fa == src;
+    }
+    const char *sp = ix->files[src].rel_path;
+    int pa = common_dir_prefix(ix->files[fa].rel_path, sp);
+    int pb = common_dir_prefix(ix->files[fb].rel_path, sp);
+    return pa != pb ? pa > pb : fa < fb;
 }
 
 /* ── Resolution context ──────────────────────────────────────────── */
 
-enum { CS_WANT_ANY = 0, CS_WANT_TYPE, CS_WANT_MEMBER };
 enum { CS_OK = 0, CS_UNRES, CS_LOCAL };
-enum { CS_MAX_USINGS = 128 };
 
 typedef struct {
     int st;
     const cbm_gbuf_node_t *node;
     bool exact;
     int reason;
-    bool sig_mismatch;
-    bool is_namespace; /* a graph gap because the path is one of the repository's
-                        * namespaces (declared, and without a node) */
+    cs_why_t why; /* of an ambiguous one */
 } cs_res_t;
 
 typedef struct {
     const cs_index_t *ix;
-    const cbm_gbuf_t *g;
     int file;
     const cs_file_t *f;
-    const char *ns;
-    int chain[CS_MAX_CHAIN];
-    int nchain;
-    const char *tparams[CS_MAX_CHAIN + SKIP_ONE];
-    int ntparams;
-    bool prod;
-    int unit;
-    bool glob;
-    bool inherit; /* false while resolving base types (no recursion) */
-    const char *usings[CS_MAX_USINGS];
-    int nusings;
-    const cs_using_t *aliases[CS_MAX_USINGS];
-    int naliases;
-    const char *statics[CS_MAX_USINGS];
-    int nstatics;
+    int type;   /* the innermost type declaration around the definition, or CS_NONE */
+    int member; /* the documented member, when it has type parameters; CS_NONE */
+    int region; /* the namespace declaration around it */
+    int unit;   /* the file's project, or its directory in a shared tree */
+    int group;  /* its assembly; CS_NONE in a shared tree */
+    bool prod;  /* product code: test-only declarations are not bound */
+    bool glob;  /* the reference starts with global:: */
+    /* The namespace declaration whose own aliases and usings are not asked
+     * (CS_NONE: none): a using directive's target is resolved without the
+     * directives beside it. */
+    int skip_region;
+    /* Set when a namespace this context does not see was passed over (NULL:
+     * nobody asks). */
+    bool *passed_over;
 } cs_ctx_t;
-
-typedef struct {
-    char kind; /* T type, M member, G graph gap, X external */
-    int ent;
-    const char *name;
-} cs_cand_t;
-
-typedef struct {
-    cs_cand_t items[CS_MAX_CANDS];
-    int count;
-} cs_cands_t;
 
 static cs_res_t res_edge(const cbm_gbuf_node_t *n, bool exact) {
     return (cs_res_t){.st = CS_OK, .node = n, .exact = exact};
@@ -1059,308 +2759,452 @@ static cs_res_t res_unres(int reason) {
     return (cs_res_t){.st = CS_UNRES, .reason = reason};
 }
 
-static void cands_push(cs_cands_t *c, char kind, int ent, const char *name) {
-    for (int i = 0; i < c->count; i++) {
-        if (c->items[i].kind == kind && c->items[i].ent == ent &&
-            ((!name && !c->items[i].name) ||
-             (name && c->items[i].name && strcmp(name, c->items[i].name) == 0))) {
-            return;
-        }
-    }
-    if (c->count < CS_MAX_CANDS) {
-        c->items[c->count++] = (cs_cand_t){.kind = kind, .ent = ent, .name = name};
-    }
+static cs_res_t res_ambiguous(cs_why_t why) {
+    return (cs_res_t){.st = CS_UNRES, .reason = CBM_DOCLINK_REASON_AMBIGUOUS, .why = why};
 }
 
-static int region_at(const cs_file_t *f, uint32_t line) {
-    int best = 0;
-    for (int r = SKIP_ONE; r < f->nregions; r++) {
-        const cs_region_t *g = &f->regions[r];
-        if (g->parent < 0 || line < g->start || line > g->end) {
-            continue;
-        }
-        /* the innermost region; of two starting on one line, the later one */
-        if (g->start >= f->regions[best].start) {
-            best = r;
-        }
-    }
-    return best;
+static bool res_is(const cs_res_t *r, int reason) {
+    return r->st == CS_UNRES && r->reason == reason;
 }
 
-/* Usings in scope at `region`: its own and every enclosing region's (a
- * namespace block's usings apply inside it only), plus the unit's global
- * usings. */
-static void ctx_collect_usings(cs_ctx_t *c, int region) {
-    const cs_file_t *f = c->f;
-    int guard = 0;
-    for (int r = region; r >= 0 && r < f->nregions && guard < f->nregions; guard++) {
-        for (int u = 0; u < f->nusings; u++) {
-            const cs_using_t *us = &f->usings[u];
-            if (us->region != r) {
-                continue;
-            }
-            if (us->kind == 'n' && c->nusings < CS_MAX_USINGS) {
-                c->usings[c->nusings++] = us->target;
-            } else if (us->kind == 'a' && c->naliases < CS_MAX_USINGS) {
-                c->aliases[c->naliases++] = us;
-            } else if (us->kind == 's' && c->nstatics < CS_MAX_USINGS) {
-                c->statics[c->nstatics++] = us->target;
-            }
-        }
-        if (r == 0) {
-            break;
-        }
-        r = f->regions[r].parent;
-    }
-    if (c->unit >= 0) {
-        const cs_unit_t *u = &c->ix->units[c->unit];
-        for (int i = 0; i < u->nusings && c->nusings < CS_MAX_USINGS; i++) {
-            c->usings[c->nusings++] = u->usings[i];
-        }
-    }
-}
+/* What choosing among declarations came to. */
+typedef enum { CS_PICK_NODE = 0, CS_PICK_GAP, CS_PICK_AMBIGUOUS } cs_pick_t;
 
-/* ── Arity, nesting, members ─────────────────────────────────────── */
-
-/* Entities of `list` the written arity can denote: type arguments select that
- * arity; none select the arity-0 type when one is declared, else (only then)
- * any arity. */
-static int arity_filter(const cs_index_t *ix, const int *list, int n, int arity, int *out,
-                        int cap) {
-    int k = 0;
-    if (arity == CS_ARITY_NONE) {
-        for (int i = 0; i < n && k < cap; i++) {
-            if (ix->ents[list[i]].arity == 0) {
-                out[k++] = list[i];
-            }
-        }
-        if (k > 0) {
-            return k;
-        }
-        for (int i = 0; i < n && k < cap; i++) {
-            out[k++] = list[i];
-        }
-        return k;
-    }
-    for (int i = 0; i < n && k < cap; i++) {
-        if (ix->ents[list[i]].arity == arity) {
-            out[k++] = list[i];
-        }
-    }
-    return k;
-}
-
-static int fqn_lookup(const cs_index_t *ix, const char *fqn, int arity, int *out, int cap) {
-    const cs_ilist_t *l = (const cs_ilist_t *)cbm_ht_get(ix->fqn_ents, fqn);
-    if (!l) {
-        return 0;
-    }
-    return arity_filter(ix, l->items, l->count, arity, out, cap);
-}
-
-/* Types nested directly in entity `ent` named `name` (all arities). */
-static int nested_of(const cs_index_t *ix, int ent, const char *name, int *out, int cap) {
-    int k = 0;
-    const cs_entity_t *e = &ix->ents[ent];
-    for (int d = 0; d < e->ndecls; d++) {
-        const cs_file_t *f = &ix->files[e->decls[d].file];
-        const cs_type_t *t = &f->types[e->decls[d].type];
-        char path[CS_KEY_BUF];
-        if (snprintf(path, sizeof(path), "%s.%s", t->path, name) >= (int)sizeof(path)) {
-            continue;
-        }
-        int lo = 0;
-        int hi = f->ntypes;
-        while (lo < hi) {
-            int mid = lo + ((hi - lo) / PAIR_LEN);
-            if (strcmp(f->types[f->types_by_path[mid]].path, path) < 0) {
-                lo = mid + SKIP_ONE;
-            } else {
-                hi = mid;
-            }
-        }
-        for (int i = lo; i < f->ntypes && strcmp(f->types[f->types_by_path[i]].path, path) == 0;
-             i++) {
-            int id = f->types[f->types_by_path[i]].entity;
-            bool dup = false;
-            for (int j = 0; j < k; j++) {
-                dup = dup || out[j] == id;
-            }
-            if (!dup && id >= 0 && k < cap) {
-                out[k++] = id;
-            }
-        }
-    }
-    return k;
-}
-
+/* An entity and the shared trees' declaration that belongs to it: what a
+ * reference sees of one type is in at most these two. */
 typedef struct {
-    int file;
-    const cs_member_t *m;
-} cs_mref_t;
+    int ent[PAIR_LEN];
+    int n;
+} cs_view_t;
 
-/* Which members a lookup may select. */
-enum {
-    CS_SEL_CALLABLES = 1, /* a parameter or type-argument list was written */
-    CS_SEL_CTORS = 2,     /* constructors count: the type itself was named with a
-                           * parameter list, or qualified by its own name */
-};
-
-static int member_sel(bool callables_only, bool ctors) {
-    return (callables_only ? CS_SEL_CALLABLES : 0) | (ctors ? CS_SEL_CTORS : 0);
+static cs_view_t view_of(const cs_index_t *ix, int ent) {
+    int twin = ix->ents[ent].twin;
+    return (cs_view_t){.ent = {ent, twin}, .n = twin >= 0 ? PAIR_LEN : SKIP_ONE};
 }
 
-/* Members named `name` declared by the entity (every declaration). Explicit
- * interface implementations are not addressable by simple name; a parameter
- * list selects callables only; a type-argument list (`arity` > 0) selects the
- * generic methods of that arity -- constructors and other non-generic members
- * are no candidates then (R3). A constructor is not a member name lookup
- * finds: it is selected only where `sel` says so, and never inherited. */
-static int members_of(const cs_index_t *ix, int ent, const char *name, int sel, int arity,
-                      cs_mref_t *out, int cap) {
-    int k = 0;
-    const cs_entity_t *e = &ix->ents[ent];
-    bool callables_only = (sel & CS_SEL_CALLABLES) != 0;
-    if (!(sel & CS_SEL_CTORS) && strcmp(name, e->name) == 0) {
-        return 0; /* only its constructors carry the type's own name */
-    }
-    for (int d = 0; d < e->ndecls; d++) {
-        const cs_file_t *f = &ix->files[e->decls[d].file];
-        const char *owner = f->types[e->decls[d].type].path;
-        int lo = 0;
-        int hi = f->nmembers;
-        while (lo < hi) {
-            int mid = lo + ((hi - lo) / PAIR_LEN);
-            const cs_member_t *m = &f->members[mid];
-            int c = strcmp(m->owner, owner);
-            if (c == 0) {
-                c = strcmp(m->name, name);
-            }
-            if (c < 0) {
-                lo = mid + SKIP_ONE;
-            } else {
-                hi = mid;
-            }
+/* The node of the nearest of `e`'s own declarations of one class -- an
+ * implementation's, or (`stub`) a reference assembly's stub's -- that has
+ * one; never a test declaration's for product code. NULL when none has. */
+static const cbm_gbuf_node_t *class_node(const cs_ctx_t *c, const cs_entity_t *e, bool stub) {
+    const cs_index_t *ix = c->ix;
+    const cs_bind_t *best = NULL;
+    for (int test = 0; test <= (c->prod ? 0 : SKIP_ONE); test++) {
+        int b = 0;
+        int a =
+            class_range(e->binds, e->ndecls,
+                        (unsigned char)((stub ? CS_CLS_REF : 0) | (test ? CS_CLS_TEST : 0)), &b);
+        if (a >= b) {
+            continue;
         }
-        for (int i = lo; i < f->nmembers; i++) {
-            const cs_member_t *m = &f->members[i];
-            if (strcmp(m->owner, owner) != 0 || strcmp(m->name, name) != 0) {
-                break;
-            }
-            if (m->type_idx != e->decls[d].type) {
-                continue; /* a same-path declaration of another arity owns it */
-            }
-            if (m->explicit_impl || (callables_only && m->kind != 'c')) {
-                continue;
-            }
-            if (arity > 0 && (m->kind != 'c' || m->arity != arity)) {
-                continue;
-            }
-            if (k < cap) {
-                out[k++] = (cs_mref_t){.file = e->decls[d].file, .m = m};
-            }
+        const cs_bind_t *at = &e->binds[nearest_bind(ix, e->binds, a, b, c->file)];
+        if (!best || file_nearer(ix, at->file, best->file, c->file)) {
+            best = at;
         }
     }
-    return k;
+    return best ? ix->files[best->file].types[best->type].node : NULL;
 }
 
-static int super_bfs(const cs_index_t *ix, int ent, int *out, int cap) {
-    int n = 0;
-    int head = 0;
-    int depth_end = 0;
-    int depth = 0;
-    out[n++] = ent;
-    depth_end = n;
-    while (head < n && depth < CS_BFS_DEPTH) {
-        int cur = out[head++];
-        const cs_entity_t *e = &ix->ents[cur];
-        for (int b = 0; b < e->nbases; b++) {
-            bool seen = false;
-            for (int j = 0; j < n; j++) {
-                seen = seen || out[j] == e->bases[b];
-            }
-            if (!seen && n < cap) {
-                out[n++] = e->bases[b];
-            }
-        }
-        if (head == depth_end) {
-            depth++;
-            depth_end = n;
-        }
-    }
-    /* drop `ent` itself: callers want the supertypes */
-    memmove(out, out + SKIP_ONE, (size_t)(n - SKIP_ONE) * sizeof(int));
-    return n - SKIP_ONE;
-}
-
-static bool open_hierarchy(const cs_index_t *ix, int ent) {
-    if (ix->ents[ent].open) {
-        return true;
-    }
-    int sup[CS_MAX_BFS];
-    int n = super_bfs(ix, ent, sup, CS_MAX_BFS);
-    for (int i = 0; i < n; i++) {
-        if (ix->ents[sup[i]].open) {
+/* True when one of `e`'s own declarations is in view, with a node or
+ * without: for product code one that is not test code. */
+static bool declared_in_view(const cs_ctx_t *c, const cs_entity_t *e) {
+    for (int cls = 0; cls < CS_CLS_COUNT; cls++) {
+        int b = 0;
+        if (!(c->prod && (cls & CS_CLS_TEST)) &&
+            class_range(e->binds, e->ndecls, (unsigned char)cls, &b) < b) {
             return true;
         }
     }
     return false;
 }
 
-/* ── Visibility ──────────────────────────────────────────────────── */
+/* ── Visibility and candidates ───────────────────────────────────── */
 
 static bool ent_visible(const cs_ctx_t *c, int ent) {
-    const cs_entity_t *e = &c->ix->ents[ent];
+    const cs_index_t *ix = c->ix;
+    const cs_entity_t *e = &ix->ents[ent];
     if (c->prod) {
         return e->any_prod;
     }
-    /* test code: a global-namespace test type is local to its own program */
-    if (e->all_test && (!e->ns || !e->ns[0])) {
-        for (int d = 0; d < e->ndecls; d++) {
-            if (c->ix->files[e->decls[d].file].unit == c->unit) {
-                return true;
-            }
-        }
-        return false;
+    /* test code: a global-namespace test type (and what it holds) is local
+     * to its own program */
+    int top = ent;
+    while (ix->ents[top].parent >= 0) {
+        top = ix->ents[top].parent;
+    }
+    if (ix->ents[top].all_test && ix->ents[top].ns == 0) {
+        return ent_in_unit(&ix->ents[top], c->unit);
     }
     return true;
 }
 
-static bool cand_visible(const cs_ctx_t *c, const cs_cand_t *cd) {
-    return (cd->kind == 'T' || cd->kind == 'M') ? ent_visible(c, cd->ent) : true;
+/* What a name was found to be at one scope level. */
+typedef struct {
+    char kind; /* T type, M member(s) of entity `id`, N namespace, L type parameter, X outside */
+    int id;
+} cs_cand_t;
+
+typedef struct {
+    cs_cand_t first;
+    int n;             /* distinct candidates of the deciding level; > 1 is ambiguous */
+    bool invisible;    /* a level had only what this code may not bind (test code) */
+    bool exact;        /* decided by an alias */
+    bool in_namespace; /* decided by an enclosing namespace's own types and namespaces */
+    bool joined;       /* one type only because a contract is joined to its implementation */
+    cs_why_t why;      /* what made several of them, when it was not the scope's rules */
+} cs_found_t;
+
+/* The result for a name with several candidates. */
+static cs_res_t found_ambiguous(const cs_found_t *fd) {
+    return res_ambiguous(fd->why);
+}
+
+static void found_add(cs_found_t *fd, char kind, int id) {
+    if (fd->n > 0 && fd->first.kind == kind && fd->first.id == id) {
+        return;
+    }
+    if (fd->n == 0) {
+        fd->first = (cs_cand_t){.kind = kind, .id = id};
+    }
+    fd->n++;
+}
+
+static void found_add_type(const cs_ctx_t *c, cs_found_t *fd, int ent) {
+    if (ent_visible(c, ent)) {
+        found_add(fd, 'T', ent);
+    } else {
+        fd->invisible = true;
+    }
+}
+
+/* The namespace `seg` under `parent` as this context sees it. For product
+ * code a namespace that only test code declares does not exist: it is of no
+ * program product code is compiled with, so its name neither stands in the
+ * way of what the scope has further out nor makes a name under it the
+ * repository's. CS_NONE when none is in view. That one was passed over is
+ * noted in the context (what the reference names may then be test code's:
+ * resolve_ref asks). */
+static int ns_in_view(const cs_ctx_t *c, int parent, const char *seg, size_t len) {
+    int child = ns_find(c->ix, parent, seg, len);
+    if (child >= 0 && c->prod && !c->ix->nss[child].prod) {
+        if (c->passed_over) {
+            *c->passed_over = true;
+        }
+        return CS_NONE;
+    }
+    return child;
+}
+
+/* Every type among tops[lo, hi) -- other owners' types of one name -- is a
+ * candidate: one binds, several are ambiguous (`why`). Nothing chooses
+ * between two of them. */
+static void add_owners(const cs_ctx_t *c, int lo, int hi, cs_why_t why, cs_found_t *fd) {
+    if (hi - lo > CS_MAX_FOREIGN) {
+        fd->n += PAIR_LEN; /* more of them than one lookup compares: ambiguous */
+        fd->why = CS_WHY_LIMIT;
+        return;
+    }
+    int before = fd->n;
+    for (int i = lo; i < hi; i++) {
+        found_add_type(c, fd, c->ix->tops[i].ent);
+    }
+    if (fd->n - before > SKIP_ONE) {
+        fd->why = why;
+    }
+}
+
+/* The entry among tops[lo, split) -- the shared trees' declarations of one
+ * name -- that is the context's own: what its own tree declares (a complete
+ * type, or a part of the shared trees' partial one). CS_NONE for a file of a
+ * project, and when the tree declares none. */
+static int own_shared(const cs_ctx_t *c, int lo, int split) {
+    const cs_index_t *ix = c->ix;
+    if (c->group >= 0 || c->unit < 0 || lo >= split) {
+        return CS_NONE;
+    }
+    int mine = named_of_owner(ix->tops, lo, split, shared_owner(c->unit));
+    int last = split - SKIP_ONE; /* the parts stand last among the shared trees' */
+    if (mine < 0 && ix->tops[last].owner == CS_POOL &&
+        ent_in_unit(&ix->ents[ix->tops[last].ent], c->unit)) {
+        mine = last;
+    }
+    return mine;
+}
+
+/* The top-level types of one namespace, name and arity a reference from this
+ * context can mean: its own assembly's type (for a file of a shared tree:
+ * what its own tree declares). Else every shared tree's and every other
+ * assembly's type of that name alike: one binds, several are ambiguous. An
+ * assembly's type that has the shared trees' declaration as its twin is that
+ * declaration seen from the assembly, and no second type. */
+static void add_top_types(const cs_ctx_t *c, int ns, const char *name, int arity, cs_found_t *fd) {
+    const cs_named_t *arr = c->ix->tops;
+    int hi = 0;
+    int lo = named_range(arr, c->ix->ntops, ns, name, arity, &hi);
+    if (lo >= hi) {
+        return;
+    }
+    int split = named_first_assembly(arr, lo, hi);
+    int mine = c->group >= 0 ? named_of_owner(arr, split, hi, c->group) : own_shared(c, lo, split);
+    if (mine >= 0) {
+        found_add_type(c, fd, arr[mine].ent);
+        return;
+    }
+    int before = fd->n;
+    add_owners(c, lo, split, CS_WHY_SHARED, fd);
+    int shared = fd->n - before;
+    if (hi - split > CS_MAX_FOREIGN) {
+        fd->n += PAIR_LEN; /* more of them than one lookup compares: ambiguous */
+        fd->why = CS_WHY_LIMIT;
+        return;
+    }
+    bool joined = false;
+    for (int i = split; i < hi; i++) {
+        const cs_entity_t *e = &c->ix->ents[arr[i].ent];
+        if (e->twin < 0 || !ent_visible(c, e->twin)) {
+            found_add_type(c, fd, arr[i].ent);
+        } else {
+            joined = joined || e->joined;
+        }
+    }
+    if (fd->n - before > SKIP_ONE && shared < PAIR_LEN) {
+        fd->why = CS_WHY_ASSEMBLIES;
+    }
+    /* the name is one type only because a stub was joined to it */
+    fd->joined = fd->joined || (joined && fd->n - before == SKIP_ONE);
+}
+
+/* The type of this name and arity nested in `outer`: declared in that type
+ * itself, or in the shared trees' declaration that belongs to it. */
+static void add_nested_types(const cs_ctx_t *c, int outer, const char *name, int arity,
+                             cs_found_t *fd) {
+    const cs_index_t *ix = c->ix;
+    cs_view_t v = view_of(ix, outer);
+    for (int k = 0; k < v.n; k++) {
+        int hi = 0;
+        int lo = named_range(ix->kids, ix->nkids, v.ent[k], name, arity, &hi);
+        if (lo < hi) {
+            /* one entity per outer type; the one of the type itself has the
+             * twin's as its own twin */
+            found_add_type(c, fd, ix->kids[lo].ent);
+            /* a contract's nested type that only the joined implementation has */
+            fd->joined = fd->joined || (k > 0 && ix->ents[outer].joined);
+            return;
+        }
+    }
+}
+
+static void add_types(const cs_ctx_t *c, bool top, int scope, const char *name, int arity,
+                      cs_found_t *fd) {
+    if (top) {
+        add_top_types(c, scope, name, arity, fd);
+    } else {
+        add_nested_types(c, scope, name, arity, fd);
+    }
+}
+
+/* What a lookup asks one scope for. A parameter list is no part of it: the
+ * compiler finds the name first and matches the overloads afterwards. */
+typedef struct {
+    const char *name;
+    int arity;       /* written type arguments; CS_ARITY_NONE when none */
+    bool types_only; /* a qualifier: a namespace or a type */
+    bool statics;    /* through `using static`: static members only */
+    bool ctors;      /* the type's own name: its constructors (`statics`: the static one) */
+    char kind;       /* 0, or the only member kind a doc ID names: c v p e */
+} cs_query_t;
+
+static int type_arity(int written) {
+    return written > 0 ? written : 0;
+}
+
+/* Members of one type under one key: those the entity declares and those the
+ * shared trees' parts that belong to it declare -- at most two ranges of the
+ * member table. */
+typedef struct {
+    int lo[PAIR_LEN];
+    int hi[PAIR_LEN];
+    int n;
+    int total;
+} cs_mspans_t;
+
+/* The members of `ent` named `name`; with `group` >= 0 only those of that
+ * group with exactly the signature `sig`. */
+static cs_mspans_t mref_spans(const cs_index_t *ix, int ent, const char *name, int group,
+                              const char *sig) {
+    cs_mspans_t sp = {0};
+    cs_view_t v = view_of(ix, ent);
+    for (int k = 0; k < v.n; k++) {
+        int hi = 0;
+        int lo = mref_range(ix, v.ent[k], name, group, sig, &hi);
+        if (lo < hi) {
+            sp.lo[sp.n] = lo;
+            sp.hi[sp.n] = hi;
+            sp.n++;
+            sp.total += hi - lo;
+        }
+    }
+    return sp;
+}
+
+/* The members `ent` declares under the query's name. A type's own name names
+ * its constructors, which no lookup by name finds. */
+static cs_mspans_t member_spans(const cs_ctx_t *c, int ent, const cs_query_t *q) {
+    if (!q->ctors && strcmp(q->name, c->ix->ents[ent].name) == 0) {
+        return (cs_mspans_t){0};
+    }
+    return mref_spans(c->ix, ent, q->name, CS_NONE, NULL);
+}
+
+/* True when the member takes part in a lookup of this query: methods of any
+ * arity for a name without type arguments, of that arity with them; every
+ * other member only without them. */
+static bool member_viable(const cs_ctx_t *c, const cs_mref_t *r, const cs_query_t *q) {
+    const cs_member_t *m = mref_member(c->ix, r);
+    if (r->group == PAIR_LEN || (q->kind && m->kind != q->kind)) {
+        return false; /* an operator or indexer has no identifier */
+    }
+    if (q->ctors) {
+        return m->kind == 'c' && m->is_static == q->statics;
+    }
+    if (q->statics && !m->is_static) {
+        return false;
+    }
+    return m->kind == 'c' ? (q->arity <= 0 || m->arity == q->arity) : q->arity <= 0;
+}
+
+static bool mref_visible(const cs_ctx_t *c, const cs_mref_t *r) {
+    return !(c->prod && (r->cls & CS_CLS_TEST));
+}
+
+enum { CS_HAS_NONE = 0, CS_HAS_VISIBLE, CS_HAS_INVISIBLE };
+
+/* Does `ent` itself declare a member the query finds? A group larger than a
+ * lookup compares counts as there (and comes out ambiguous). */
+static int members_named(const cs_ctx_t *c, int ent, const cs_query_t *q) {
+    const cs_index_t *ix = c->ix;
+    cs_mspans_t sp = member_spans(c, ent, q);
+    if (sp.total > CS_MAX_OVERLOADS) {
+        return CS_HAS_VISIBLE;
+    }
+    int state = CS_HAS_NONE;
+    for (int s = 0; s < sp.n; s++) {
+        for (int i = sp.lo[s]; i < sp.hi[s]; i++) {
+            cs_work(SKIP_ONE);
+            if (!member_viable(c, &ix->mrefs[i], q)) {
+                continue;
+            }
+            if (mref_visible(c, &ix->mrefs[i])) {
+                return CS_HAS_VISIBLE;
+            }
+            state = CS_HAS_INVISIBLE;
+        }
+    }
+    return state;
+}
+
+/* True when `ent` -- or the shared trees' declaration that belongs to it --
+ * declares an operator or an indexer by this name (its token, or `this`)
+ * that the context may see: asked of what was noted when the members were
+ * listed (special_mark), whatever the number of such members. */
+static bool special_declared(const cs_ctx_t *c, int ent, const char *name) {
+    const cs_index_t *ix = c->ix;
+    cs_view_t v = view_of(ix, ent);
+    char key[CS_NAME_BUF + CBM_SZ_64];
+    for (int k = 0; k < v.n; k++) {
+        cs_work(SKIP_ONE);
+        if (special_key(key, sizeof(key), c->prod, v.ent[k], name) &&
+            cbm_ht_get(ix->specials, key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The supertypes of `ent`, nearest first: a class's base classes, an
+ * interface's base interfaces. At most CS_MAX_SUPERS; *more when the
+ * hierarchy goes on behind them. (The compiler's cref lookup never comes
+ * here: see CS_BIND_INHERITED.) */
+static int supers_of(const cs_index_t *ix, int ent, int *out, bool *more) {
+    int n = 0;
+    *more = false;
+    bool iface = ix->ents[ent].kind == 'i';
+    int cur = ent;
+    for (int head = -SKIP_ONE; head < n; head++) {
+        if (head >= 0) {
+            cur = out[head];
+        }
+        /* the bases its own declarations write, and those the shared trees'
+         * parts of it write */
+        cs_view_t v = view_of(ix, cur);
+        for (int k = 0; k < v.n; k++) {
+            const cs_entity_t *e = &ix->ents[v.ent[k]];
+            for (int b = 0; b < e->nbases; b++) {
+                char bk = ix->ents[e->bases[b]].kind;
+                if (iface ? bk != 'i' : !(bk == 'c' || bk == 'r')) {
+                    continue;
+                }
+                bool seen = e->bases[b] == ent;
+                for (int j = 0; !seen && j < n; j++) {
+                    seen = out[j] == e->bases[b];
+                }
+                if (seen) {
+                    continue;
+                }
+                if (n >= CS_MAX_SUPERS) {
+                    *more = true;
+                    return n;
+                }
+                out[n++] = e->bases[b];
+            }
+        }
+    }
+    return n;
 }
 
 /* ── Reference syntax ────────────────────────────────────────────── */
 
 typedef struct {
-    char name[CBM_SZ_256];
-    int arity; /* CS_ARITY_NONE: no type arguments written */
+    char name[CS_NAME_BUF];
+    int arity;         /* CS_ARITY_NONE: no type arguments written */
+    const char *targs; /* the type arguments as written, between the brackets; NULL: none */
+    size_t targs_len;
 } cs_seg_t;
 
+enum { CS_OP_NAME = 16 };
+
 typedef struct {
+    char text[CS_REF_BUF]; /* the reference, trimmed: the segments' type arguments are in it */
     cs_seg_t segs[CS_MAX_SEGS];
     int nsegs;
     bool has_params;
     char params[CS_MAX_PARAMS][CS_PARAM_BUF];
     int nparams;
-    char docid; /* 0, or T M P F E N */
-    bool glob;
-    bool op;              /* operator / indexer / conversion */
-    bool keyword_rewrite; /* first segment was a keyword alias (int -> System.Int32) */
+    char sig[CS_MAX_PARAMS * CS_PARAM_BUF]; /* the parameters as a declaration's signature */
+    bool sig_unknown;                       /* a parameter type nothing is known about */
+    char docid;                             /* 0, or T M P F E N; O: DocFX's overload group */
+    bool glob;                              /* starts at the global namespace */
+    bool op;                                /* an operator, a conversion or an indexer */
+    char op_name[CS_OP_NAME];               /* the name the scope records it under */
+    bool maybe_indexer; /* `Item(...)`: a method of that name, else the indexer */
+    bool keyword;       /* a keyword alias, rewritten to its System type */
 } cs_ref_t;
+
+static bool is_open_bracket(char c) {
+    return c == '<' || c == '{' || c == '[' || c == '(';
+}
+
+static bool is_close_bracket(char c) {
+    return c == '>' || c == '}' || c == ']' || c == ')';
+}
 
 /* Index just past the bracket group opened at s[i] (< { [ ( nest together). */
 static size_t group_end(const char *s, size_t n, size_t i) {
     int depth = 0;
     for (size_t k = i; k < n; k++) {
-        char c = s[k];
-        if (c == '<' || c == '{' || c == '[' || c == '(') {
+        if (is_open_bracket(s[k])) {
             depth++;
-        } else if (c == '>' || c == '}' || c == ']' || c == ')') {
-            depth--;
-            if (depth == 0) {
-                return k + SKIP_ONE;
-            }
+        } else if (is_close_bracket(s[k]) && --depth == 0) {
+            return k + SKIP_ONE;
         }
     }
     return n;
@@ -1373,29 +3217,31 @@ static int count_top(const char *s, size_t n) {
     int depth = 0;
     for (size_t i = 0; i < n; i++) {
         char c = s[i];
-        if (c == '<' || c == '{' || c == '[' || c == '(') {
+        if (is_open_bracket(c)) {
             depth++;
-        } else if (c == '>' || c == '}' || c == ']' || c == ')') {
+        } else if (is_close_bracket(c)) {
             depth--;
         } else if (c == ',' && depth == 0) {
             items++;
         }
-        if (!isspace((unsigned char)c)) {
-            any = true;
-        }
+        any = any || !isspace((unsigned char)c);
     }
     return any ? items : 0;
 }
 
+/* An identifier as the scanner takes one: a letter of any script, a digit
+ * after the first position, an underscore. */
 static bool ident_ok(const char *s) {
     if (strcmp(s, "#ctor") == 0 || strcmp(s, "#cctor") == 0) {
         return true;
     }
-    if (!s[0] || !(isalpha((unsigned char)s[0]) || s[0] == '_')) {
+    unsigned char first = (unsigned char)s[0];
+    if (!(isalpha(first) || first == '_' || first >= CBM_SZ_128)) {
         return false;
     }
     for (const char *p = s + SKIP_ONE; *p; p++) {
-        if (!(isalnum((unsigned char)*p) || *p == '_')) {
+        unsigned char ch = (unsigned char)*p;
+        if (!(isalnum(ch) || ch == '_' || ch >= CBM_SZ_128)) {
             return false;
         }
     }
@@ -1412,6 +3258,8 @@ static bool parse_seg(const char *s, size_t n, cs_seg_t *out) {
         n--;
     }
     out->arity = CS_ARITY_NONE;
+    out->targs = NULL;
+    out->targs_len = 0;
     size_t name_end = n;
     for (size_t i = 0; i < n; i++) {
         if (s[i] == '`') {
@@ -1426,7 +3274,10 @@ static bool parse_seg(const char *s, size_t n, cs_seg_t *out) {
         if (s[i] == '{' || s[i] == '<') {
             name_end = i;
             size_t e = group_end(s, n, i);
-            out->arity = count_top(s + i + SKIP_ONE, e > i + PAIR_LEN ? e - i - PAIR_LEN : 0);
+            size_t inner = e > i + PAIR_LEN ? e - i - PAIR_LEN : 0;
+            out->arity = count_top(s + i + SKIP_ONE, inner);
+            out->targs = s + i + SKIP_ONE;
+            out->targs_len = inner;
             break;
         }
     }
@@ -1450,9 +3301,9 @@ static bool parse_path(const char *s, size_t n, cs_seg_t *segs, int *nsegs) {
     int depth = 0;
     for (size_t i = 0; i <= n; i++) {
         char c = i < n ? s[i] : '.';
-        if (c == '<' || c == '{' || c == '[' || c == '(') {
+        if (is_open_bracket(c)) {
             depth++;
-        } else if (c == '>' || c == '}' || c == ']' || c == ')') {
+        } else if (is_close_bracket(c)) {
             depth--;
         } else if (c == '.' && depth == 0) {
             if (*nsegs >= CS_MAX_SEGS || !parse_seg(s + start, i - start, &segs[*nsegs])) {
@@ -1482,97 +3333,262 @@ static const char *keyword_type(const char *s) {
     return NULL;
 }
 
-/* An operator / indexer / conversion reference: `operator +`, `this[int]`,
- * `op_Addition`, `Item(int)` (optionally after a qualifier and a dot).
- * Returns the qualifier length, or -1 when `v` is not one. */
-static int operator_qualifier(const char *v) {
-    for (const char *p = v; *p; p++) {
-        if (p != v && p[-1] != '.') {
-            continue;
-        }
-        const char *q = p;
-        while (*q == ' ') {
-            q++;
-        }
-        if (strncmp(q, "implicit ", 9) == 0 || strncmp(q, "explicit ", 9) == 0) {
-            q += 9;
-            while (*q == ' ') {
-                q++;
-            }
-        }
-        bool hit =
-            (strncmp(q, "operator", 8) == 0 && !isalnum((unsigned char)q[8]) && q[8] != '_') ||
-            (strncmp(q, "this", 4) == 0 && (q[4] == '[' || q[4] == ' ')) ||
-            (strncmp(q, "op_", 3) == 0 && isupper((unsigned char)q[3])) ||
-            (strncmp(q, "Item", 4) == 0 && (q[4] == '(' || q[4] == ' '));
-        if (hit) {
-            if (strncmp(q, "this", 4) == 0 && q[4] == ' ') {
-                const char *r = q + 4;
-                while (*r == ' ') {
-                    r++;
-                }
-                hit = *r == '[';
-            }
-            if (strncmp(q, "Item", 4) == 0 && q[4] == ' ') {
-                const char *r = q + 4;
-                while (*r == ' ') {
-                    r++;
-                }
-                hit = *r == '(';
-            }
-        }
-        if (hit) {
-            return p == v ? 0 : (int)(p - v - SKIP_ONE);
+/* The token a metadata operator name stands for (`op_Addition` -> `+`): the
+ * name the scope records an operator under. NULL for a name that is none. */
+static const char *operator_token(const char *name, size_t len) {
+    static const struct {
+        const char *meta;
+        const char *token;
+    } ops[] = {
+        {"Addition", "+"},
+        {"UnaryPlus", "+"},
+        {"Subtraction", "-"},
+        {"UnaryNegation", "-"},
+        {"Multiply", "*"},
+        {"Division", "/"},
+        {"Modulus", "%"},
+        {"BitwiseAnd", "&"},
+        {"BitwiseOr", "|"},
+        {"ExclusiveOr", "^"},
+        {"LeftShift", "<<"},
+        {"RightShift", ">>"},
+        {"UnsignedRightShift", ">>>"},
+        {"Equality", "=="},
+        {"Inequality", "!="},
+        {"LessThan", "<"},
+        {"GreaterThan", ">"},
+        {"LessThanOrEqual", "<="},
+        {"GreaterThanOrEqual", ">="},
+        {"LogicalNot", "!"},
+        {"OnesComplement", "~"},
+        {"Increment", "++"},
+        {"Decrement", "--"},
+        {"True", "true"},
+        {"False", "false"},
+        {"Implicit", "implicit"},
+        {"Explicit", "explicit"},
+        {"CheckedAddition", "+"},
+        {"CheckedSubtraction", "-"},
+        {"CheckedMultiply", "*"},
+        {"CheckedDivision", "/"},
+        {"CheckedUnaryNegation", "-"},
+        {"CheckedIncrement", "++"},
+        {"CheckedDecrement", "--"},
+        {"CheckedExplicit", "explicit"},
+    };
+    for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+        if (strlen(ops[i].meta) == len && memcmp(ops[i].meta, name, len) == 0) {
+            return ops[i].token;
         }
     }
-    return CBM_NOT_FOUND;
+    return NULL;
 }
 
-static bool parse_cref(const char *raw, cs_ref_t *r) {
-    memset(r, 0, sizeof(*r));
-    char v[CS_REF_BUF];
-    snprintf(v, sizeof(v), "%s", raw ? raw : "");
-    char *s = v;
-    while (isspace((unsigned char)*s)) {
+static bool starts_word(const char *s, const char *word) {
+    size_t n = strlen(word);
+    return strncmp(s, word, n) == 0 && !isalnum((unsigned char)s[n]) && s[n] != '_';
+}
+
+static const char *skip_blanks(const char *s) {
+    while (*s == ' ') {
         s++;
     }
-    size_t n = strlen(s);
-    while (n > 0 && isspace((unsigned char)s[n - SKIP_ONE])) {
-        s[--n] = '\0';
+    return s;
+}
+
+/* The operator, conversion or indexer written at `q` (the start of a
+ * segment): its recorded name into `name`. false when `q` starts none. */
+static bool operator_at(const char *q, char name[CS_OP_NAME]) {
+    static const char op_prefix[] = "op_";
+    q = skip_blanks(q);
+    bool implicit = starts_word(q, "implicit");
+    if (implicit || starts_word(q, "explicit")) {
+        if (!starts_word(skip_blanks(q + strlen("implicit")), "operator")) {
+            return false;
+        }
+        snprintf(name, CS_OP_NAME, "%s", implicit ? "implicit" : "explicit");
+        return true;
     }
-    if (n == 0) {
+    if (starts_word(q, "operator")) {
+        const char *t = skip_blanks(q + strlen("operator"));
+        if (starts_word(t, "checked")) {
+            t = skip_blanks(t + strlen("checked"));
+        }
+        size_t n = 0;
+        while (t[n] && t[n] != '(' && t[n] != ' ' && n + SKIP_ONE < CS_OP_NAME) {
+            n++;
+        }
+        snprintf(name, CS_OP_NAME, "%.*s", (int)n, n > 0 ? t : "?");
+        return true;
+    }
+    if (starts_word(q, "this")) {
+        const char *t = skip_blanks(q + strlen("this"));
+        if (*t != '[' && *t != '\0') {
+            return false;
+        }
+        snprintf(name, CS_OP_NAME, "this");
+        return true;
+    }
+    size_t pl = sizeof(op_prefix) - SKIP_ONE;
+    if (strncmp(q, op_prefix, pl) == 0 && isupper((unsigned char)q[pl])) {
+        size_t n = 0;
+        while (isalnum((unsigned char)q[pl + n])) {
+            n++;
+        }
+        const char *token = operator_token(q + pl, n);
+        if (!token) {
+            return false; /* `op_Custom`: an identifier like any other */
+        }
+        snprintf(name, CS_OP_NAME, "%s", token);
+        return true;
+    }
+    return false;
+}
+
+/* Where the reference's last segment starts an operator, a conversion or an
+ * indexer: its offset in `s`, or CS_NONE. */
+static int operator_start(const char *s, char name[CS_OP_NAME]) {
+    int depth = 0;
+    for (size_t i = 0; s[i]; i++) {
+        if ((i == 0 || (s[i - SKIP_ONE] == '.' && depth == 0)) && operator_at(s + i, name)) {
+            return (int)i;
+        }
+        if (is_open_bracket(s[i])) {
+            depth++;
+        } else if (is_close_bracket(s[i])) {
+            depth--;
+        }
+    }
+    return CS_NONE;
+}
+
+/* A doc ID writes a type parameter by its position: `0 (of the type and the
+ * types around it), ``0 (of the method). Such a parameter is kept as it
+ * stands (without a by-reference mark): its position is what is compared. */
+static bool slot_param(const char *s, size_t n, char *out, size_t cap) {
+    while (n > 0 && isspace((unsigned char)*s)) {
+        s++;
+        n--;
+    }
+    while (n > 0 && (isspace((unsigned char)s[n - SKIP_ONE]) || s[n - SKIP_ONE] == '@')) {
+        n--;
+    }
+    size_t ticks = 0;
+    while (ticks < n && s[ticks] == '`') {
+        ticks++;
+    }
+    if (ticks == 0 || ticks > PAIR_LEN || ticks >= n || !isdigit((unsigned char)s[ticks])) {
         return false;
     }
+    size_t d = ticks;
+    while (d < n && isdigit((unsigned char)s[d])) {
+        d++;
+    }
+    for (size_t k = d; k < n; k++) {
+        if (!strchr("[],*", s[k])) {
+            return false;
+        }
+    }
+    if (n >= cap) {
+        return false;
+    }
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return true;
+}
+
+/* The written parameter list s[from, to) into the reference: every parameter
+ * normalized, and all of them as one signature. false for more parameters
+ * than a reference may have. */
+static bool parse_params(cs_ref_t *r, const char *s, size_t from, size_t to) {
+    bool any = false;
+    for (size_t i = from; i < to && !any; i++) {
+        any = !isspace((unsigned char)s[i]);
+    }
+    size_t start = from;
+    int depth = 0;
+    size_t w = 0;
+    for (size_t i = from; any && i <= to; i++) {
+        char c = i < to ? s[i] : ',';
+        if (is_open_bracket(c)) {
+            depth++;
+        } else if (is_close_bracket(c)) {
+            depth--;
+        } else if (c == ',' && depth == 0) {
+            if (r->nparams >= CS_MAX_PARAMS) {
+                return false;
+            }
+            char *p = r->params[r->nparams++];
+            if (!slot_param(s + start, i - start, p, CS_PARAM_BUF)) {
+                (void)cbm_doclink_cs_norm_type(s + start, i - start, p, CS_PARAM_BUF);
+            }
+            size_t pl = strlen(p);
+            r->sig_unknown = r->sig_unknown || strchr(p, '?') != NULL;
+            if (w > 0) {
+                r->sig[w++] = '|';
+            }
+            memcpy(r->sig + w, p, pl);
+            w += pl;
+            start = i + SKIP_ONE;
+        }
+    }
+    r->sig[w] = '\0';
+    return true;
+}
+
+/* A written reference into its parts. false for one this code does not
+ * understand -- and for one longer than CS_REF_BUF, which is never cut and
+ * resolved by what is left of it. */
+static bool parse_cref(const char *raw, cs_ref_t *r) {
+    static const char global_prefix[] = "global::";
+    r->nsegs = 0;
+    r->nparams = 0;
+    r->has_params = r->sig_unknown = r->glob = r->op = r->maybe_indexer = r->keyword = false;
+    r->docid = 0;
+    r->sig[0] = '\0';
+    r->op_name[0] = '\0';
+    const char *in = raw ? raw : "";
+    while (isspace((unsigned char)*in)) {
+        in++;
+    }
+    size_t n = strlen(in);
+    while (n > 0 && isspace((unsigned char)in[n - SKIP_ONE])) {
+        n--;
+    }
+    if (n == 0 || n >= sizeof(r->text)) {
+        return false;
+    }
+    memcpy(r->text, in, n);
+    r->text[n] = '\0';
+    char *s = r->text;
     if (n > PAIR_LEN && s[1] == ':' && strchr("TMPFENO!", s[0])) {
         char k = s[0];
         if (k == '!') {
-            return false; /* compiler error marker: the compiler could not bind it */
+            return false; /* the compiler's error marker: it could not bind the reference */
         }
         s += PAIR_LEN;
         while (isspace((unsigned char)*s)) {
             s++;
         }
-        if (k == 'O') { /* DocFX overload-group id: a member without a signature */
-            k = 'M';
+        if (k == 'O') { /* DocFX's overload group: a member without a signature */
             char *paren = strchr(s, '(');
             if (paren) {
                 *paren = '\0';
             }
         }
         r->docid = k;
+        r->glob = true; /* a doc ID is a full name */
     }
-    if (strncmp(s, "global::", 8) == 0) {
+    size_t gl = sizeof(global_prefix) - SKIP_ONE;
+    if (strncmp(s, global_prefix, gl) == 0) {
         r->glob = true;
-        s += 8;
+        s += gl;
     }
     n = strlen(s);
-    int opq = operator_qualifier(s);
-    if (opq >= 0) {
+    int op = operator_start(s, r->op_name);
+    if (op >= 0) {
         r->op = true;
-        if (opq > 0) {
-            return parse_path(s, (size_t)opq, r->segs, &r->nsegs);
-        }
-        return true;
+        return op == 0 || parse_path(s, (size_t)op - SKIP_ONE, r->segs, &r->nsegs);
     }
     /* `Path(params)`: the first top-level parenthesis starts the list. */
     size_t paren = n;
@@ -1594,1122 +3610,1618 @@ static bool parse_cref(const char *raw, cs_ref_t *r) {
     if (paren < n) {
         r->has_params = true;
         size_t close = group_end(s, n, paren);
-        size_t inner_s = paren + SKIP_ONE;
-        size_t inner_e = close > inner_s ? close - SKIP_ONE : inner_s;
-        if (close > n || s[close - SKIP_ONE] != ')') {
-            inner_e = n;
-        }
-        size_t start = inner_s;
-        int d = 0;
-        bool any = false;
-        for (size_t i = inner_s; i < inner_e; i++) {
-            if (!isspace((unsigned char)s[i])) {
-                any = true;
-                break;
-            }
-        }
-        for (size_t i = inner_s; any && i <= inner_e; i++) {
-            char c = i < inner_e ? s[i] : ',';
-            if (c == '<' || c == '{' || c == '[' || c == '(') {
-                d++;
-            } else if (c == '>' || c == '}' || c == ']' || c == ')') {
-                d--;
-            } else if (c == ',' && d == 0) {
-                if (r->nparams >= CS_MAX_PARAMS) {
-                    return false;
-                }
-                cbm_doclink_cs_norm_type(s + start, i - start, r->params[r->nparams],
-                                         sizeof(r->params[0]));
-                r->nparams++;
-                start = i + SKIP_ONE;
-            }
+        bool closed = close > paren && s[close - SKIP_ONE] == ')';
+        if (!parse_params(r, s, paren + SKIP_ONE, closed ? close - SKIP_ONE : n)) {
+            return false;
         }
     }
+    r->maybe_indexer = r->has_params && strcmp(r->segs[r->nsegs - SKIP_ONE].name, "Item") == 0;
     return true;
-}
-
-/* ── Scope levels ────────────────────────────────────────────────── */
-
-static bool has_members(const cs_index_t *ix, int ent, const char *name, int sel, int arity) {
-    cs_mref_t tmp[SKIP_ONE];
-    return members_of(ix, ent, name, sel, arity, tmp, SKIP_ONE) > 0;
-}
-
-/* The types of `list` a scope level offers for the written arity. Type
- * arguments select that arity. Without them the name is the arity-0 type
- * (R2); only a lookup that found no such type at ANY level runs again
- * `relaxed`, where a generic type of the name is taken as meant. */
-static void push_types(const cs_index_t *ix, cs_cands_t *c, const int *list, int n, int arity,
-                       bool relaxed) {
-    for (int i = 0; i < n; i++) {
-        int a = ix->ents[list[i]].arity;
-        bool take = arity == CS_ARITY_NONE ? (relaxed || a == 0) : a == arity;
-        if (take) {
-            cands_push(c, 'T', list[i], NULL);
-        }
-    }
-}
-
-/* What one scope level is asked for. */
-typedef struct {
-    const char *name;
-    int arity; /* written type arguments; CS_ARITY_NONE when none */
-    int want;
-    int sel; /* CS_SEL_* for the members of the enclosing types */
-    bool relaxed;
-} cs_query_t;
-
-static void chain_level(const cs_ctx_t *c, int ent, const cs_query_t *q, cs_cands_t *out) {
-    const cs_index_t *ix = c->ix;
-    if (q->want != CS_WANT_MEMBER) {
-        if (strcmp(ix->ents[ent].name, q->name) == 0) {
-            push_types(ix, out, &ent, SKIP_ONE, q->arity, q->relaxed);
-        }
-        int nested[CS_MAX_CANDS];
-        int nn = nested_of(ix, ent, q->name, nested, CS_MAX_CANDS);
-        push_types(ix, out, nested, nn, q->arity, q->relaxed);
-    }
-    if (q->want != CS_WANT_TYPE && has_members(ix, ent, q->name, q->sel, q->arity)) {
-        cands_push(out, 'M', ent, q->name);
-    }
-}
-
-static void inherited_level(const cs_ctx_t *c, int ent, const cs_query_t *q, cs_cands_t *out) {
-    const cs_index_t *ix = c->ix;
-    int sup[CS_MAX_BFS];
-    int n = super_bfs(ix, ent, sup, CS_MAX_BFS);
-    for (int i = 0; i < n && out->count == 0; i++) {
-        if (q->want != CS_WANT_MEMBER) {
-            int nested[CS_MAX_CANDS];
-            int nn = nested_of(ix, sup[i], q->name, nested, CS_MAX_CANDS);
-            push_types(ix, out, nested, nn, q->arity, q->relaxed);
-        }
-        if (q->want != CS_WANT_TYPE &&
-            has_members(ix, sup[i], q->name, q->sel & ~CS_SEL_CTORS, q->arity)) {
-            cands_push(out, 'M', sup[i], q->name);
-        }
-    }
-}
-
-static void ns_level(const cs_ctx_t *c, const char *ns, const cs_query_t *q, cs_cands_t *out) {
-    char key[CS_KEY_BUF];
-    if (snprintf(key, sizeof(key), "%s\x1f%s", ns, q->name) >= (int)sizeof(key)) {
-        return;
-    }
-    const cs_ilist_t *l = (const cs_ilist_t *)cbm_ht_get(c->ix->ns_types, key);
-    if (l) {
-        push_types(c->ix, out, l->items, l->count, q->arity, q->relaxed);
-    }
-}
-
-static bool external_prefix(const char *fqn) {
-    static const char *const prefixes[] = {
-        "Xunit.",
-        "Microsoft.CodeAnalysis.",
-        "Microsoft.Build.",
-        "Microsoft.DotNet.XUnitExtensions.",
-        "Microsoft.DotNet.RemoteExecutor.",
-        "Microsoft.VisualStudio.",
-        "NuGet.",
-        "Moq.",
-        "NUnit.",
-        "Mono.Cecil.",
-        "Newtonsoft.",
-        "Windows.",
-        "Microsoft.Diagnostics.Runtime.",
-        "BenchmarkDotNet.",
-        "FsCheck.",
-        "Azure.",
-        "Microsoft.Cci.",
-        "Microsoft.Win32.TaskScheduler.",
-        "Microsoft.Office.",
-        "Microsoft.Web.",
-        "Microsoft.Extensions.DependencyModel.Tests.",
-        "Microsoft.SqlServer.",
-    };
-    char probe[CS_KEY_BUF];
-    snprintf(probe, sizeof(probe), "%s.", fqn);
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-        if (strncmp(probe, prefixes[i], strlen(prefixes[i])) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Strip a type-argument list off a written type name (`A.B<int>` -> `A.B`),
- * returning the arity written there (CS_ARITY_NONE when none). */
-static int strip_type_args(const char *in, char *out, size_t cap) {
-    snprintf(out, cap, "%s", in);
-    char *lt = strchr(out, '<');
-    if (!lt) {
-        return CS_ARITY_NONE;
-    }
-    size_t n = strlen(out);
-    size_t e = group_end(out, n, (size_t)(lt - out));
-    int arity = count_top(
-        lt + SKIP_ONE, e > (size_t)(lt - out) + PAIR_LEN ? e - (size_t)(lt - out) - PAIR_LEN : 0);
-    *lt = '\0';
-    return arity;
-}
-
-/* The target of a using alias (C# aliases name a namespace or a type): the
- * type, a graph gap for a corpus namespace (no node) or a type without one,
- * else an outside name. */
-static void fqn_cand(const cs_ctx_t *c, const char *fqn, int arity, cs_cands_t *out) {
-    const cs_index_t *ix = c->ix;
-    int sel[CS_MAX_CANDS];
-    int k = fqn_lookup(ix, fqn, arity, sel, CS_MAX_CANDS);
-    if (k > 0) {
-        for (int i = 0; i < k; i++) {
-            cands_push(out, 'T', sel[i], NULL);
-        }
-        return;
-    }
-    if (!external_prefix(fqn) && cbm_ht_get(ix->namespaces, fqn)) {
-        cands_push(out, 'G', CBM_NOT_FOUND, NULL);
-        return;
-    }
-    cands_push(out, 'X', CBM_NOT_FOUND, NULL);
-}
-
-/* Candidates of level `lvl` for a simple name. Levels: 2k chain(k), 2k+1
- * inherited(k) for every chain type, then the namespace chain (innermost
- * first, global last), the alias, the usings. Returns false past the last
- * level; *exact is set for the levels that bind exactly (alias). */
-static bool level_cands(const cs_ctx_t *c, int lvl, const cs_query_t *q, cs_cands_t *out,
-                        bool *exact) {
-    out->count = 0;
-    *exact = false;
-    int chain_levels = c->nchain * PAIR_LEN;
-    if (lvl < chain_levels) {
-        int ent = c->chain[lvl / PAIR_LEN];
-        if (lvl % PAIR_LEN == 0) {
-            chain_level(c, ent, q, out);
-        } else if (c->inherit) {
-            inherited_level(c, ent, q, out);
-        }
-        return true;
-    }
-    lvl -= chain_levels;
-    /* namespace chain: c->ns, its prefixes, then "" */
-    char ns[CS_KEY_BUF];
-    snprintf(ns, sizeof(ns), "%s", c->ns ? c->ns : "");
-    int ns_levels = ns[0] ? SKIP_ONE : 0;
-    for (const char *p = ns; *p; p++) {
-        ns_levels += *p == '.';
-    }
-    ns_levels += SKIP_ONE; /* the global namespace */
-    if (lvl < ns_levels) {
-        for (int i = 0; i < lvl; i++) {
-            char *dot = strrchr(ns, '.');
-            if (dot) {
-                *dot = '\0';
-            } else {
-                ns[0] = '\0';
-            }
-        }
-        if (q->want != CS_WANT_MEMBER) {
-            ns_level(c, ns, q, out);
-        }
-        return true;
-    }
-    lvl -= ns_levels;
-    if (lvl == 0) {
-        /* an alias names a type or a namespace: no candidate for `Name{T}` */
-        for (int i = 0; q->arity <= 0 && i < c->naliases; i++) {
-            if (strcmp(c->aliases[i]->alias, q->name) == 0) {
-                char base[CS_KEY_BUF];
-                int a = strip_type_args(c->aliases[i]->target, base, sizeof(base));
-                fqn_cand(c, base, a > 0 ? a : CS_ARITY_NONE, out);
-                *exact = true;
-                break;
-            }
-        }
-        return true;
-    }
-    if (lvl == SKIP_ONE) {
-        if (q->want != CS_WANT_MEMBER) {
-            for (int i = 0; i < c->nusings; i++) {
-                ns_level(c, c->usings[i], q, out);
-            }
-        }
-        if (q->want == CS_WANT_ANY) {
-            for (int i = 0; i < c->nstatics; i++) {
-                char base[CS_KEY_BUF];
-                (void)strip_type_args(c->statics[i], base, sizeof(base));
-                int sel[CS_MAX_CANDS];
-                int k = fqn_lookup(c->ix, base, CS_ARITY_NONE, sel, CS_MAX_CANDS);
-                for (int j = 0; j < k; j++) {
-                    if (has_members(c->ix, sel[j], q->name, q->sel & ~CS_SEL_CTORS, q->arity)) {
-                        cands_push(out, 'M', sel[j], q->name);
-                    }
-                }
-            }
-        }
-        return true;
-    }
-    return false;
-}
-
-typedef enum { CS_LOOKUP_NONE = 0, CS_LOOKUP_FOUND, CS_LOOKUP_INVISIBLE } cs_lookup_t;
-
-/* The first scope level with a visible candidate. A level whose candidates
- * are all invisible (product code naming test-only code) does not bind: when
- * no later level has a visible candidate either, the result is INVISIBLE. */
-static cs_lookup_t lookup_pass(const cs_ctx_t *c, const cs_query_t *q, cs_cands_t *out,
-                               bool *exact) {
-    cs_cands_t lv;
-    bool invisible = false;
-    for (int lvl = 0;; lvl++) {
-        bool lvl_exact = false;
-        if (!level_cands(c, lvl, q, &lv, &lvl_exact)) {
-            break;
-        }
-        if (lv.count == 0) {
-            continue;
-        }
-        out->count = 0;
-        for (int i = 0; i < lv.count; i++) {
-            if (cand_visible(c, &lv.items[i])) {
-                cands_push(out, lv.items[i].kind, lv.items[i].ent, lv.items[i].name);
-            }
-        }
-        if (out->count > 0) {
-            *exact = lvl_exact;
-            return CS_LOOKUP_FOUND;
-        }
-        invisible = true;
-    }
-    out->count = 0;
-    return invisible ? CS_LOOKUP_INVISIBLE : CS_LOOKUP_NONE;
-}
-
-/* Scope lookup of a simple name. A name written without type arguments is
- * looked up as the arity-0 type first, through every level (R2: a generic
- * type of the same name never stands in for a declared arity-0 one); only
- * when no level has anything by that name does a second pass accept a
- * generic type. */
-static cs_lookup_t lookup(const cs_ctx_t *c, const char *N, int arity, int want, int sel,
-                          cs_cands_t *out, bool *exact) {
-    cs_query_t q = {.name = N, .arity = arity, .want = want, .sel = sel, .relaxed = false};
-    cs_lookup_t r = lookup_pass(c, &q, out, exact);
-    if (r == CS_LOOKUP_NONE && arity == CS_ARITY_NONE) {
-        q.relaxed = true;
-        r = lookup_pass(c, &q, out, exact);
-    }
-    return r;
 }
 
 /* ── Results ─────────────────────────────────────────────────────── */
 
-/* The entity's representative node: never a test declaration for product
- * code; then the representative ordering. A visible entity whose eligible
- * declarations all lack a node is a graph gap. */
+/* Where the complete declarations of `e` in units before `unit` end. */
+static int fulls_before(const cs_entity_t *e, int unit) {
+    int lo = 0;
+    int hi = e->nfulls;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (e->fulls[mid].unit < unit) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* The complete declaration of `e` that stands in the referencing file's own
+ * project (or shared tree) and that it may bind: one with a node when
+ * there is one, the nearest of several. NULL when there is none -- and when
+ * that unit holds more of them than one lookup compares (*too_many). */
+static const cs_full_t *own_full(const cs_ctx_t *c, const cs_entity_t *e, bool *too_many) {
+    const cs_index_t *ix = c->ix;
+    int lo = fulls_before(e, c->unit);
+    int hi = fulls_before(e, c->unit + SKIP_ONE);
+    if (hi - lo > CS_MAX_OVERLOADS) {
+        *too_many = true;
+        return NULL;
+    }
+    const cs_full_t *best = NULL;
+    bool best_node = false;
+    for (int i = lo; i < hi; i++) {
+        const cs_full_t *d = &e->fulls[i];
+        if (c->prod && ix->files[d->file].is_test) {
+            continue;
+        }
+        bool node = ix->files[d->file].types[d->type].node != NULL;
+        if (!best || (node && !best_node) ||
+            (node == best_node && file_nearer(ix, d->file, best->file, c->file))) {
+            best = d;
+            best_node = node;
+        }
+    }
+    return best;
+}
+
+/* The one assembly that has only stubs of the type and takes the shared
+ * trees' declaration `ent` as its implementation; CS_NONE when there is
+ * none, or more than one. Its stubs are the type's stubs: where the
+ * implementation has no node, or a parse error hides a member of it, the
+ * stub's stands in -- as it does inside one assembly. */
+static int stub_user(const cs_index_t *ix, int ent) {
+    int stub = ix->ents[ent].stub;
+    return stub >= 0 ? stub : CS_NONE;
+}
+
+/* The implementation's node among one entity's own declarations. What is an
+ * alternative is not chosen between:
+ *   - complete declarations of the type in two or more projects (the
+ *     flavours of one assembly's type): the one of the referencing file's own
+ *     project is meant -- and when that one has no node, no other flavour's
+ *     stands in for it;
+ *   - parts in two or more shared trees, which may or may not be compiled
+ *     together: the ones of the referencing file's own tree.
+ * From anywhere else the type is AMBIGUOUS (*why). GAP when no
+ * implementation in view has a node. */
+static cs_pick_t impl_node(const cs_ctx_t *c, const cs_entity_t *e, const cbm_gbuf_node_t **node,
+                           cs_why_t *why) {
+    if ((c->prod ? e->full_units_prod : e->full_units) >= PAIR_LEN) {
+        bool too_many = false;
+        const cs_full_t *own = own_full(c, e, &too_many);
+        if (!own) {
+            *why = too_many ? CS_WHY_LIMIT : CS_WHY_FLAVOURS;
+            return CS_PICK_AMBIGUOUS;
+        }
+        *node = c->ix->files[own->file].types[own->type].node;
+        return *node ? CS_PICK_NODE : CS_PICK_GAP;
+    }
+    if (e->shared_parts && e->nunits >= PAIR_LEN && !ent_in_unit(e, c->unit)) {
+        *why = CS_WHY_SHARED;
+        return CS_PICK_AMBIGUOUS;
+    }
+    *node = class_node(c, e, false);
+    return *node ? CS_PICK_NODE : CS_PICK_GAP;
+}
+
+/* The type's node for a reference from this context: an implementation's --
+ * of the type's own declarations, then of the shared trees' declaration that
+ * belongs to it -- and a reference assembly's stub's only when no
+ * implementation has one. Never a test declaration for product code. A
+ * visible type whose eligible declarations all lack a node is a graph gap. A
+ * node that is the type's only because a contract is joined to its
+ * implementation is never an exact binding. */
 static cs_res_t type_result(const cs_ctx_t *c, int ent, bool exact) {
     const cs_index_t *ix = c->ix;
-    const cs_entity_t *e = &ix->ents[ent];
-    const cbm_gbuf_node_t *best = NULL;
-    int bf = 0;
-    int bl = 0;
-    for (int d = 0; d < e->ndecls; d++) {
-        int file = e->decls[d].file;
-        if (c->prod && ix->files[file].is_test) {
-            continue;
+    cs_view_t v = view_of(ix, ent);
+    const cbm_gbuf_node_t *node = NULL;
+    bool in_view = false;
+    for (int k = 0; k < v.n; k++) {
+        const cs_entity_t *e = &ix->ents[v.ent[k]];
+        cs_why_t why = CS_WHY_SCOPE;
+        cs_pick_t p = impl_node(c, e, &node, &why);
+        if (p == CS_PICK_NODE) {
+            return res_edge(node, exact && !(k > 0 && ix->ents[ent].joined));
         }
-        const cbm_gbuf_node_t *n = decl_node(ix, c->g, e->decls[d]);
-        if (!n) {
-            continue;
+        if (p == CS_PICK_AMBIGUOUS) {
+            return res_ambiguous(why);
         }
-        int order = e->decls[d].type;
-        if (!best || decl_better(ix, file, order, bf, bl, c->f->rel_path)) {
-            best = n;
-            bf = file;
-            bl = order;
+        in_view = in_view || declared_in_view(c, e);
+    }
+    for (int k = 0; k < v.n; k++) {
+        node = class_node(c, &ix->ents[v.ent[k]], true);
+        if (node) {
+            return res_edge(node, exact);
         }
     }
-    return best ? res_edge(best, exact) : res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
-}
-
-static bool tparam_listed(const char *list, const char *name, size_t nl) {
-    for (const char *p = list; p && *p;) {
-        const char *e = strchr(p, ',');
-        size_t n = e ? (size_t)(e - p) : strlen(p);
-        if (n == nl && memcmp(p, name, n) == 0) {
-            return true;
-        }
-        p = e ? e + SKIP_ONE : NULL;
+    int stubs = stub_user(ix, ent);
+    node = stubs >= 0 ? class_node(c, &ix->ents[stubs], true) : NULL;
+    if (node) {
+        return res_edge(node, false);
     }
-    return false;
+    return res_unres(in_view ? CBM_DOCLINK_REASON_GRAPH_GAP : CBM_DOCLINK_REASON_TEST_ONLY);
 }
 
-static bool looks_like_tvar(const char *s, size_t n) {
-    /* `T`, `T1`: the prototype's fallback for undeclared type variables */
-    return (n == 1 && isupper((unsigned char)s[0])) ||
-           (n == PAIR_LEN && isupper((unsigned char)s[0]) && isdigit((unsigned char)s[1]));
+/* Bind the members in `sp` -- one name, group and signature: the
+ * declarations of one member. An implementation's node before a reference
+ * assembly's stub's; never a test declaration for product code; the nearest
+ * of several. Declarations of the member in two or more projects (or shared
+ * trees) are alternatives: the one of the referencing file's own is meant,
+ * and from anywhere else none can be chosen. More declarations than
+ * one lookup compares are ambiguous as well. `view`: the type the members
+ * were looked up in (CS_NONE: none to speak of) -- a member a contract has
+ * only through the implementation joined to it is never an exact binding. */
+static cs_res_t bind_members(const cs_ctx_t *c, const cs_mspans_t *sp, bool exact, int view) {
+    const cs_index_t *ix = c->ix;
+    if (sp->total > CS_MAX_OVERLOADS) {
+        return res_ambiguous(CS_WHY_LIMIT);
+    }
+    int first_unit = CS_NONE;
+    bool several = false;
+    bool own = false;
+    bool visible = false;
+    for (int s = 0; s < sp->n; s++) {
+        for (int i = sp->lo[s]; i < sp->hi[s]; i++) {
+            const cs_mref_t *r = &ix->mrefs[i];
+            if (!mref_visible(c, r)) {
+                continue;
+            }
+            visible = true;
+            if (r->cls & CS_CLS_REF) {
+                continue;
+            }
+            int unit = ix->files[r->file].unit;
+            own = own || unit == c->unit;
+            several = several || (first_unit >= 0 && unit != first_unit);
+            first_unit = first_unit >= 0 ? first_unit : unit;
+        }
+    }
+    if (!visible) {
+        return res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
+    }
+    if (several && !own) {
+        return res_ambiguous(CS_WHY_FLAVOURS);
+    }
+    /* an implementation's node (the own one of alternatives), else a stub's */
+    const cs_mref_t *best[PAIR_LEN] = {NULL, NULL};
+    for (int s = 0; s < sp->n; s++) {
+        for (int i = sp->lo[s]; i < sp->hi[s]; i++) {
+            const cs_mref_t *r = &ix->mrefs[i];
+            bool stub = (r->cls & CS_CLS_REF) != 0;
+            if (!mref_visible(c, r) || (r->cls & CS_CLS_NO_NODE) ||
+                (!stub && several && ix->files[r->file].unit != c->unit)) {
+                continue;
+            }
+            if (!best[stub] || file_nearer(ix, r->file, best[stub]->file, c->file)) {
+                best[stub] = r;
+            }
+        }
+    }
+    const cs_mref_t *pick = best[0] ? best[0] : best[SKIP_ONE];
+    if (!pick) {
+        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
+    }
+    bool through_join = view >= 0 && ix->ents[view].joined && pick->ent != view;
+    return res_edge(mref_member(ix, pick)->node, exact && !through_join);
 }
+
+/* Bind the type's members of one name, group and signature. A member whose
+ * implementation has no node is its stub's, where one assembly's stubs stand
+ * for this declaration (stub_user): never an exact binding. */
+static cs_res_t bind_signature(const cs_ctx_t *c, int ent, const char *name, int group,
+                               const char *sig, bool exact) {
+    cs_mspans_t sp = mref_spans(c->ix, ent, name, group, sig);
+    cs_res_t res = bind_members(c, &sp, exact, ent);
+    int stubs = res_is(&res, CBM_DOCLINK_REASON_GRAPH_GAP) ? stub_user(c->ix, ent) : CS_NONE;
+    if (stubs >= 0) {
+        cs_mspans_t of_stubs = mref_spans(c->ix, stubs, name, group, sig);
+        cs_res_t stub = bind_members(c, &of_stubs, false, CS_NONE);
+        if (stub.st == CS_OK) {
+            return stub;
+        }
+    }
+    return res;
+}
+
+/* Which written segments name the declaring type and the member: a written
+ * type argument stands for the type parameter at its position there. */
+typedef struct {
+    int type_seg;   /* CS_NONE: the type is not written (a simple name in scope) */
+    int member_seg; /* CS_NONE: the member is not written (a constructor by its type) */
+} cs_where_t;
+
+/* How a found name is used. */
+typedef struct {
+    const cs_ref_t *r;
+    bool has_params; /* a parameter list follows the name */
+    cs_where_t where;
+    bool exact;      /* tier of a member bound through the written path */
+    bool exact_type; /* ... and of a type the whole path names */
+} cs_use_t;
 
 static size_t suffix_start(const char *s, size_t n) {
     size_t e = n;
-    while (e > 0 && (s[e - SKIP_ONE] == ']' || s[e - SKIP_ONE] == '[' || s[e - SKIP_ONE] == ',' ||
-                     s[e - SKIP_ONE] == '*')) {
+    while (e > 0 && strchr("[],*", s[e - SKIP_ONE])) {
         e--;
     }
     return e;
 }
 
-/* The written parameter types match a declaration's normalized signature;
- * the declaring type's and the method's type variables accept any type. */
-static bool sig_match(const cs_ref_t *r, const char *decl_sig, const char *tv_type,
-                      const char *tv_method) {
-    int nd = (decl_sig && decl_sig[0]) ? count_list(decl_sig, '|') : 0;
-    if (nd != r->nparams) {
-        return false;
+/* Position of `name` among the ','-separated type arguments of a segment. */
+static int targ_position(const cs_seg_t *seg, const char *name, size_t len) {
+    int pos = 0;
+    int depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; seg->targs && i <= seg->targs_len; i++) {
+        char ch = i < seg->targs_len ? seg->targs[i] : ',';
+        if (is_open_bracket(ch)) {
+            depth++;
+        } else if (is_close_bracket(ch)) {
+            depth--;
+        } else if (ch == ',' && depth == 0) {
+            const char *a = seg->targs + start;
+            size_t al = i - start;
+            while (al > 0 && isspace((unsigned char)*a)) {
+                a++;
+                al--;
+            }
+            while (al > 0 && isspace((unsigned char)a[al - SKIP_ONE])) {
+                al--;
+            }
+            if (al == len && memcmp(a, name, len) == 0) {
+                return pos;
+            }
+            pos++;
+            start = i + SKIP_ONE;
+        }
     }
-    const char *p = decl_sig;
+    return CS_NONE;
+}
+
+/* The position a doc ID's `N (*method false) or ``N (*method true) names;
+ * CS_NONE for any other text. */
+static int slot_of(const char *s, size_t n, bool *method) {
+    size_t ticks = 0;
+    while (ticks < n && s[ticks] == '`') {
+        ticks++;
+    }
+    if (ticks == 0 || ticks > PAIR_LEN || ticks == n) {
+        return CS_NONE;
+    }
+    int pos = 0;
+    for (size_t i = ticks; i < n; i++) {
+        if (!isdigit((unsigned char)s[i]) || pos > CBM_SZ_4K) {
+            return CS_NONE;
+        }
+        pos = (pos * CBM_DECIMAL_BASE) + (s[i] - '0');
+    }
+    *method = ticks == PAIR_LEN;
+    return pos;
+}
+
+/* A written type variable and a declared one are the same when they stand at
+ * the same position of the same list: the method's own list, the declaring
+ * type's, its outer type's, and so on. A doc ID writes the position itself;
+ * there the positions of a type's list count on from its outer types'. */
+static bool same_type_variable(const cs_ctx_t *c, const cs_ref_t *r, cs_where_t w,
+                               const cs_mref_t *mr, const char *written, size_t wl,
+                               const char *declared, size_t dl) {
+    const cs_file_t *f = &c->ix->files[mr->file];
+    bool slot_method = false;
+    int slot = slot_of(written, wl, &slot_method);
+    int pos = tparam_find(f, f->ntypes + mr->midx, declared, dl);
+    if (pos >= 0) {
+        if (slot >= 0) {
+            return slot_method && slot == pos;
+        }
+        return w.member_seg >= 0 && targ_position(&r->segs[w.member_seg], written, wl) == pos;
+    }
+    int seg = w.type_seg;
+    for (int t = f->members[mr->midx].type; t >= 0; t = f->types[t].outer, seg--) {
+        pos = tparam_find(f, t, declared, dl);
+        if (pos < 0) {
+            continue;
+        }
+        if (slot >= 0) {
+            int before = 0;
+            for (int o = f->types[t].outer; o >= 0; o = f->types[o].outer) {
+                before += f->types[o].arity;
+            }
+            return !slot_method && slot == before + pos;
+        }
+        return seg >= 0 && targ_position(&r->segs[seg], written, wl) == pos;
+    }
+    return false;
+}
+
+enum { CS_FIT_NO = 0, CS_FIT_UNKNOWN, CS_FIT_EXACT };
+
+/* How the written parameter list fits a declared signature: EXACT when every
+ * parameter type is the declared one (the same text, or the same type
+ * variable), UNKNOWN when the rest are types nothing is known about on
+ * either side ("?"), NO otherwise. */
+static int sig_fit(const cs_ctx_t *c, const cs_ref_t *r, cs_where_t w, const cs_mref_t *mr) {
+    const char *sig = mref_member(c->ix, mr)->sig;
+    /* counted when the declaration was read: a declared signature is not
+     * walked for every reference that cannot mean it */
+    int nd = mref_member(c->ix, mr)->nparams;
+    if (nd != r->nparams) {
+        return CS_FIT_NO;
+    }
+    cs_work((uint64_t)nd);
+    int fit = CS_FIT_EXACT;
+    const char *p = sig;
     for (int i = 0; i < nd; i++) {
         const char *e = strchr(p, '|');
-        size_t bn = e ? (size_t)(e - p) : strlen(p);
+        size_t dn = e ? (size_t)(e - p) : strlen(p);
         const char *a = r->params[i];
         size_t an = strlen(a);
-        bool ok = (an == SKIP_ONE && a[0] == '?') || (bn == SKIP_ONE && p[0] == '?') ||
-                  (an == bn && memcmp(a, p, an) == 0);
-        if (!ok) {
+        if (!(an == dn && memcmp(a, p, an) == 0)) {
             size_t ab = suffix_start(a, an);
-            size_t bb = suffix_start(p, bn);
-            bool tv = tparam_listed(tv_type, p, bb) || tparam_listed(tv_method, p, bb) ||
-                      looks_like_tvar(p, bb);
-            ok = tv && (an - ab) == (bn - bb) && memcmp(a + ab, p + bb, an - ab) == 0;
-        }
-        if (!ok) {
-            return false;
-        }
-        p = e ? e + SKIP_ONE : p + bn;
-    }
-    return true;
-}
-
-/* Type variables of the entity's declaration in `file`. */
-static const char *decl_tparams(const cs_index_t *ix, int ent, int file) {
-    const cs_entity_t *e = &ix->ents[ent];
-    for (int d = 0; d < e->ndecls; d++) {
-        if (e->decls[d].file == file) {
-            return ix->files[file].types[e->decls[d].type].tparams;
-        }
-    }
-    return "";
-}
-
-enum { CS_MAX_MREFS = 64 };
-
-/* Bind the selected members' node: the representative declaration among the
- * ones with a node (never a test declaration for product code); a graph gap
- * when none has one. Overloads of one declaration share their node. */
-static cs_res_t bind_members(const cs_ctx_t *c, const cs_mref_t *m, int n, bool exact) {
-    const cbm_gbuf_node_t *best = NULL;
-    int bf = 0;
-    int bl = 0;
-    for (int i = 0; i < n; i++) {
-        if (c->prod && c->ix->files[m[i].file].is_test) {
-            continue;
-        }
-        const cbm_gbuf_node_t *node = member_node(c->ix, c->g, m[i].file, m[i].m);
-        if (node &&
-            (!best || decl_better(c->ix, m[i].file, m[i].m->order, bf, bl, c->f->rel_path))) {
-            best = node;
-            bf = m[i].file;
-            bl = m[i].m->order;
-        }
-    }
-    return best ? res_edge(best, exact) : res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
-}
-
-/* Member `name` of entity `ent` (its own declarations): the kind rule, the
- * overload rule and signature selection. `marity` > 0 (a written type-
- * argument list) keeps the generic methods of that arity only. sig_mismatch
- * marks "no overload has the written signature" so the caller can continue in
- * the supertypes. */
-static cs_res_t member_result(const cs_ctx_t *c, int ent, const char *name, const cs_ref_t *r,
-                              bool has_params, int marity, bool exact, bool ctors) {
-    cs_mref_t ms[CS_MAX_MREFS];
-    int msel = member_sel(has_params || marity > 0, ctors);
-    int n = members_of(c->ix, ent, name, msel, marity, ms, CS_MAX_MREFS);
-    int ncall = 0;
-    int nval = 0;
-    for (int i = 0; i < n; i++) {
-        ncall += ms[i].m->kind == 'c';
-        nval += ms[i].m->kind != 'c';
-    }
-    if (n == 0) {
-        return res_unres(CBM_DOCLINK_REASON_MISSING);
-    }
-    if (!has_params && ncall > 0 && nval > 0) {
-        return res_unres(CBM_DOCLINK_REASON_AMBIGUOUS); /* property and method of one name */
-    }
-    if (ncall == 0) {
-        return bind_members(c, ms, n, exact);
-    }
-    /* distinct overload signatures across the declarations */
-    const char *sigs[CS_MAX_MREFS];
-    int nsig = 0;
-    for (int i = 0; i < n; i++) {
-        if (ms[i].m->kind != 'c') {
-            continue;
-        }
-        bool seen = false;
-        for (int k = 0; k < nsig; k++) {
-            seen = seen || strcmp(sigs[k], ms[i].m->sig ? ms[i].m->sig : "") == 0;
-        }
-        if (!seen) {
-            sigs[nsig++] = ms[i].m->sig ? ms[i].m->sig : "";
-        }
-    }
-    if (!has_params) {
-        if (nsig > SKIP_ONE) {
-            return res_unres(CBM_DOCLINK_REASON_AMBIGUOUS); /* an overload group */
-        }
-        return bind_members(c, ms, n, exact);
-    }
-    cs_mref_t sel[CS_MAX_MREFS];
-    int ns = 0;
-    for (int i = 0; i < n; i++) {
-        if (ms[i].m->kind != 'c') {
-            continue;
-        }
-        const char *tv_type = decl_tparams(c->ix, ent, ms[i].file);
-        if (sig_match(r, ms[i].m->sig, tv_type, ms[i].m->tparams)) {
-            sel[ns++] = ms[i];
-        }
-    }
-    if (ns == 0) {
-        cs_res_t res = res_unres(CBM_DOCLINK_REASON_MISSING);
-        res.sig_mismatch = true;
-        return res;
-    }
-    return bind_members(c, sel, ns, exact);
-}
-
-/* A member the entity's parsed declarations do not have. When a parse error
- * hides some of its members the missing one may be among them: that is a
- * graph gap, and nothing further away may take its place. */
-static bool hidden_member(const cs_index_t *ix, int ent) {
-    return ix->ents[ent].incomplete;
-}
-
-/* A written signature none of the type's own overloads has: cref binding
- * continues in the supertypes. */
-static cs_res_t sig_fallback(const cs_ctx_t *c, int ent, const char *name, const cs_ref_t *r,
-                             int marity, bool exact, cs_res_t first) {
-    if (hidden_member(c->ix, ent)) {
-        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
-    }
-    int sup[CS_MAX_BFS];
-    int n = super_bfs(c->ix, ent, sup, CS_MAX_BFS);
-    for (int i = 0; i < n; i++) {
-        if (has_members(c->ix, sup[i], name, CS_SEL_CALLABLES, marity)) {
-            cs_res_t r2 = member_result(c, sup[i], name, r, true, marity, exact, false);
-            if (!(r2.st == CS_UNRES && r2.reason == CBM_DOCLINK_REASON_MISSING)) {
-                return r2;
+            size_t db = suffix_start(p, dn);
+            bool same_suffix = (an - ab) == (dn - db) && memcmp(a + ab, p + db, an - ab) == 0;
+            if (same_suffix && same_type_variable(c, r, w, mr, a, ab, p, db)) {
+                /* the same type variable */
+            } else if ((an == SKIP_ONE && a[0] == '?') || (dn == SKIP_ONE && p[0] == '?')) {
+                fit = CS_FIT_UNKNOWN;
+            } else {
+                return CS_FIT_NO;
             }
         }
-        if (hidden_member(c->ix, sup[i])) {
-            return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
-        }
+        p = e ? e + SKIP_ONE : p + dn;
     }
-    if (open_hierarchy(c->ix, ent)) {
-        return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
-    }
-    first.sig_mismatch = false;
-    return first;
+    return fit;
 }
 
-/* Implicit roots every type inherits from without naming them. */
-static int implicit_roots(const cs_index_t *ix, char kind, int *out) {
-    const char *roots[3];
-    int n = 0;
-    if (kind == 'e') {
-        roots[n++] = "System.Enum";
-    }
-    if (kind == 's' || kind == 'r') {
-        roots[n++] = "System.ValueType";
-    }
-    if (kind == 'c' || kind == 's' || kind == 'r' || kind == 'i') {
-        roots[n++] = "System.Object";
-    }
-    int k = 0;
-    for (int i = 0; i < n; i++) {
-        int sel[CS_MAX_CANDS];
-        int m = fqn_lookup(ix, roots[i], 0, sel, CS_MAX_CANDS);
-        if (m == SKIP_ONE) {
-            out[k++] = sel[0];
-        }
-    }
-    return k;
-}
+typedef enum {
+    CS_MB_NONE = 0,  /* the entity declares no such member */
+    CS_MB_INVISIBLE, /* only its test declarations do, and the reference is product code */
+    CS_MB_MISMATCH,  /* it declares the name; nothing of it takes the written parameters */
+    CS_MB_RES,       /* *res is the answer */
+} cs_mb_t;
 
-/* `name` as a member (or nested type) declared by `ent` itself. `ctors`:
- * the type was named, so its constructors count. *found is false when the
- * entity declares nothing by that name. */
-static cs_res_t own_member(const cs_ctx_t *c, int ent, const char *name, int marity,
-                           const cs_ref_t *r, bool has_params, bool exact, bool ctors,
-                           bool *found) {
-    const cs_index_t *ix = c->ix;
-    *found = true;
-    if (has_members(ix, ent, name, member_sel(has_params || marity > 0, ctors), marity)) {
-        cs_res_t res = member_result(c, ent, name, r, has_params, marity, exact, ctors);
-        if (res.sig_mismatch) {
-            return sig_fallback(c, ent, name, r, marity, exact, res);
-        }
-        return res;
-    }
-    int nested[CS_MAX_CANDS];
-    int sel[CS_MAX_CANDS];
-    int nn = nested_of(ix, ent, name, nested, CS_MAX_CANDS);
-    int k = arity_filter(ix, nested, nn, marity, sel, CS_MAX_CANDS);
-    if (k > 0 && !has_params) {
-        return k > SKIP_ONE ? res_unres(CBM_DOCLINK_REASON_AMBIGUOUS)
-                            : type_result(c, sel[0], exact);
-    }
-    *found = false;
-    return res_unres(CBM_DOCLINK_REASON_MISSING);
-}
-
-static cs_res_t resolve_member_in(const cs_ctx_t *c, int ent, const char *name0, int marity,
-                                  const cs_ref_t *r, bool has_params, bool exact) {
-    const cs_index_t *ix = c->ix;
-    const char *name = name0;
-    if (strcmp(name, "#ctor") == 0 || strcmp(name, "#cctor") == 0) {
-        name = ix->ents[ent].name;
-    }
-    int inherited_sel = member_sel(has_params || marity > 0, false);
-    bool found = false;
-    cs_res_t own = own_member(c, ent, name, marity, r, has_params, exact, true, &found);
-    if (found) {
-        return own;
-    }
-    if (hidden_member(ix, ent)) {
-        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
-    }
-    int sup[CS_MAX_BFS];
-    int ns = super_bfs(ix, ent, sup, CS_MAX_BFS);
-    for (int i = 0; i < ns; i++) {
-        cs_res_t inh = own_member(c, sup[i], name, marity, r, has_params, exact, false, &found);
-        if (found) {
-            return inh;
-        }
-        if (hidden_member(ix, sup[i])) {
-            return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
-        }
-    }
-    int roots[3];
-    int nr = implicit_roots(ix, ix->ents[ent].kind, roots);
-    for (int i = 0; i < nr; i++) {
-        int chain[CS_MAX_BFS];
-        chain[0] = roots[i];
-        int nc = SKIP_ONE + super_bfs(ix, roots[i], chain + SKIP_ONE, CS_MAX_BFS - SKIP_ONE);
-        for (int j = 0; j < nc; j++) {
-            if (has_members(ix, chain[j], name, inherited_sel, marity)) {
-                cs_res_t res =
-                    member_result(c, chain[j], name, r, has_params, marity, exact, false);
-                if (res.sig_mismatch) {
-                    return sig_fallback(c, ent, name, r, marity, exact, res);
-                }
-                return res;
-            }
-        }
-    }
-    /* accessor names: get_X / set_X / add_X / remove_X */
-    static const char *const acc[] = {"get_", "set_", "add_", "remove_"};
-    for (size_t a = 0; a < sizeof(acc) / sizeof(acc[0]); a++) {
-        size_t al = strlen(acc[a]);
-        if (strncmp(name, acc[a], al) == 0 && name[al] &&
-            has_members(ix, ent, name + al, 0, CS_ARITY_NONE)) {
-            return member_result(c, ent, name + al, r, false, CS_ARITY_NONE, exact, false);
-        }
-    }
-    if (open_hierarchy(ix, ent)) {
-        return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
-    }
-    return res_unres(CBM_DOCLINK_REASON_MISSING);
-}
-
-/* ── Type paths ──────────────────────────────────────────────────── */
-
-typedef enum { TP_OK = 0, TP_PARTIAL, TP_RES } cs_tp_kind_t;
-
+/* The selected members of one side (generic callables, non-generic ones,
+ * values): how many, and whether they are one declaration's worth -- one
+ * signature and arity. */
 typedef struct {
-    cs_tp_kind_t st;
-    int ent;        /* OK: the type; PARTIAL: the last type reached */
-    int failed_seg; /* PARTIAL: index of the segment not found */
-    bool exact;
-    cs_res_t res; /* RES */
-} cs_tp_t;
+    int n;
+    const char *sig;
+    int arity;
+    bool many;
+} cs_side_t;
 
-static cs_tp_t tp_res(cs_res_t r) {
-    return (cs_tp_t){.st = TP_RES, .res = r};
+static void side_add(cs_side_t *s, const cs_member_t *m) {
+    const char *sig = m->sig ? m->sig : "";
+    if (s->n == 0) {
+        s->sig = sig;
+        s->arity = m->arity;
+    } else if (strcmp(s->sig, sig) != 0 || s->arity != m->arity) {
+        s->many = true;
+    }
+    s->n++;
 }
 
-static bool join_segs(const cs_seg_t *segs, int from, int to, const char *prefix, char *out,
-                      size_t cap) {
-    size_t w = 0;
-    out[0] = '\0';
-    if (prefix && prefix[0]) {
-        int k = snprintf(out, cap, "%s", prefix);
-        if (k < 0 || (size_t)k >= cap) {
-            return false;
-        }
-        w = (size_t)k;
+/* The members the query finds in `ent`, for a reference without a parameter
+ * list: one member binds; a method name without type arguments means the
+ * non-generic methods when there are any; an overload group, and a method
+ * beside a value of the same name, are ambiguous. */
+static cs_mb_t members_plain(const cs_ctx_t *c, int ent, const cs_query_t *q, bool exact,
+                             cs_res_t *res) {
+    const cs_index_t *ix = c->ix;
+    cs_mspans_t sp = member_spans(c, ent, q);
+    if (sp.total == 0) {
+        return CS_MB_NONE;
     }
-    for (int i = from; i < to; i++) {
-        int k = snprintf(out + w, cap - w, "%s%s", w ? "." : "", segs[i].name);
-        if (k < 0 || (size_t)k >= cap - w) {
-            return false;
-        }
-        w += (size_t)k;
+    if (sp.total > CS_MAX_OVERLOADS) {
+        *res = res_ambiguous(CS_WHY_LIMIT); /* more than one lookup compares */
+        return CS_MB_RES;
     }
+    cs_side_t plain = {0};
+    cs_side_t generic = {0};
+    cs_side_t values = {0};
+    bool invisible = false;
+    for (int s = 0; s < sp.n; s++) {
+        for (int i = sp.lo[s]; i < sp.hi[s]; i++) {
+            cs_work(SKIP_ONE);
+            const cs_mref_t *mr = &ix->mrefs[i];
+            if (!member_viable(c, mr, q)) {
+                continue;
+            }
+            if (!mref_visible(c, mr)) {
+                invisible = true;
+                continue;
+            }
+            const cs_member_t *m = mref_member(ix, mr);
+            side_add(m->kind != 'c' ? &values : (m->arity > 0 ? &generic : &plain), m);
+        }
+    }
+    const cs_side_t *calls = plain.n > 0 ? &plain : &generic;
+    if (calls->n + values.n == 0) {
+        return invisible ? CS_MB_INVISIBLE : CS_MB_NONE;
+    }
+    if ((calls->n > 0 && values.n > 0) || calls->many) {
+        *res = res_ambiguous(CS_WHY_SCOPE);
+    } else if (values.n > 0) {
+        *res = bind_signature(c, ent, q->name, 0, "", exact);
+    } else {
+        *res = bind_signature(c, ent, q->name, SKIP_ONE, calls->sig, exact);
+    }
+    return CS_MB_RES;
+}
+
+/* The same for a reference WITH a parameter list: the overload with exactly
+ * the written parameter types (the same text, or the same type variables);
+ * only when there is none, one whose difference is a type nothing is known
+ * about. A non-generic match stands before a generic one; several distinct
+ * matches are ambiguous. A value never takes a parameter list. */
+static cs_mb_t members_signed(const cs_ctx_t *c, int ent, const cs_query_t *q, const cs_use_t *u,
+                              cs_res_t *res) {
+    const cs_index_t *ix = c->ix;
+    cs_mspans_t sp = member_spans(c, ent, q);
+    if (sp.total == 0) {
+        return CS_MB_NONE;
+    }
+    if (sp.total > CS_MAX_OVERLOADS) {
+        /* too many to compare one by one: the written text itself can still
+         * be looked up */
+        cs_mspans_t written = mref_spans(ix, ent, q->name, SKIP_ONE, u->r->sig);
+        *res = (written.total > 0 && !u->r->sig_unknown) ? bind_members(c, &written, u->exact, ent)
+                                                         : res_ambiguous(CS_WHY_LIMIT);
+        return CS_MB_RES;
+    }
+    bool named = false;
+    bool invisible = false;
+    for (int pass = CS_FIT_EXACT; pass >= CS_FIT_UNKNOWN; pass--) {
+        cs_side_t plain = {0};
+        cs_side_t generic = {0};
+        for (int s = 0; s < sp.n; s++) {
+            for (int i = sp.lo[s]; i < sp.hi[s]; i++) {
+                cs_work(SKIP_ONE);
+                const cs_mref_t *mr = &ix->mrefs[i];
+                if (!member_viable(c, mr, q)) {
+                    continue;
+                }
+                if (!mref_visible(c, mr)) {
+                    invisible = true;
+                    continue;
+                }
+                named = true;
+                const cs_member_t *m = mref_member(ix, mr);
+                if (m->kind == 'c' && sig_fit(c, u->r, u->where, mr) == pass) {
+                    side_add(m->arity > 0 ? &generic : &plain, m);
+                }
+            }
+        }
+        const cs_side_t *s = plain.n > 0 ? &plain : &generic;
+        if (s->n > 0) {
+            *res = s->many ? res_ambiguous(CS_WHY_SCOPE)
+                           : bind_signature(c, ent, q->name, SKIP_ONE, s->sig, u->exact);
+            return CS_MB_RES;
+        }
+    }
+    if (named) {
+        return CS_MB_MISMATCH;
+    }
+    return invisible ? CS_MB_INVISIBLE : CS_MB_NONE;
+}
+
+static cs_mb_t members_result(const cs_ctx_t *c, int ent, const cs_query_t *q, const cs_use_t *u,
+                              cs_res_t *res) {
+    return u->has_params ? members_signed(c, ent, q, u, res)
+                         : members_plain(c, ent, q, u->exact, res);
+}
+
+/* True when a part of the type `ent` that this reference does not see
+ * declares `name`. `ent` is a shared trees' declaration that assemblies have
+ * as a part of their type, seen here without one of them: the reference
+ * stands in a shared tree, or in an assembly that has no part of its own.
+ * One of those assemblies' own parts declares an implementation of that name
+ * -- a nested type that the shared trees do not have, or (`types_only`
+ * unset) a member. Which assembly the reference is compiled into is not
+ * known, so the name is neither bound nor missing. A stub does not count: it
+ * declares what the implementation declares. The assemblies are not walked:
+ * what their parts add is looked up by the name (build_extras). *why: when
+ * more assemblies declare a nested type of the name than one lookup compares
+ * (and none of those compared is in view), that is said. */
+static bool unseen_part_declares(const cs_ctx_t *c, int ent, const char *name, int arity,
+                                 bool types_only, cs_why_t *why) {
+    const cs_index_t *ix = c->ix;
+    int hi = 0;
+    int lo = extra_range(ix, ent, name, type_arity(arity), &hi);
+    for (int i = lo; i < hi; i++) {
+        if (i - lo >= CS_MAX_FOREIGN) {
+            *why = CS_WHY_LIMIT;
+            return true;
+        }
+        cs_work(SKIP_ONE);
+        if (ent_visible(c, ix->extras[i].ent)) {
+            return true;
+        }
+    }
+    if (types_only) {
+        return false;
+    }
+    lo = extra_range(ix, ent, name, CS_NONE, &hi);
+    return lo < hi && (ix->extras[lo].prod || !c->prod);
+}
+
+/* The reason for a member a type does not show (`name`, when it has one). */
+static cs_res_t member_unfound(const cs_ctx_t *c, int ent, const char *name, int arity) {
+    const cs_entity_t *e = &c->ix->ents[ent];
+    cs_why_t why = CS_WHY_PARTS;
+    if (name && unseen_part_declares(c, ent, name, arity, false, &why)) {
+        return res_ambiguous(why);
+    }
+    if (e->incomplete) {
+        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP); /* a parse error hides members */
+    }
+    return res_unres(e->open_any ? CBM_DOCLINK_REASON_EXTERNAL : CBM_DOCLINK_REASON_MISSING);
+}
+
+/* A member the implementation does not show because a parse error hides it,
+ * looked up in the stubs that stand for this declaration (stub_user). true
+ * when a stub binds it: never an exact binding. */
+static bool stub_member(const cs_ctx_t *c, int ent, const cs_query_t *q, const cs_use_t *u,
+                        cs_res_t *res) {
+    int stubs = c->ix->ents[ent].incomplete ? stub_user(c->ix, ent) : CS_NONE;
+    cs_res_t of_stubs = res_unres(CBM_DOCLINK_REASON_MISSING);
+    cs_use_t via = *u;
+    via.exact = false;
+    via.exact_type = false;
+    if (stubs < 0 || members_result(c, stubs, q, &via, &of_stubs) != CS_MB_RES ||
+        of_stubs.st != CS_OK) {
+        return false;
+    }
+    of_stubs.exact = false;
+    *res = of_stubs;
     return true;
 }
 
-/* Walk segs[from..to) as nested types of `cur` (own, then inherited). */
-static cs_tp_t walk_nested(const cs_ctx_t *c, int cur, const cs_seg_t *segs, int from, int to,
-                           bool exact) {
+/* True when `ent` declares an instance constructor without parameters. */
+static bool declares_default_ctor(const cs_ctx_t *c, int ent) {
     const cs_index_t *ix = c->ix;
-    for (int i = from; i < to; i++) {
-        int nested[CS_MAX_CANDS];
-        int sel[CS_MAX_CANDS];
-        int nn = nested_of(ix, cur, segs[i].name, nested, CS_MAX_CANDS);
-        int k = arity_filter(ix, nested, nn, segs[i].arity, sel, CS_MAX_CANDS);
-        if (k == 0) {
-            int sup[CS_MAX_BFS];
-            int ns = super_bfs(ix, cur, sup, CS_MAX_BFS);
-            for (int s = 0; s < ns && k == 0; s++) {
-                nn = nested_of(ix, sup[s], segs[i].name, nested, CS_MAX_CANDS);
-                k = arity_filter(ix, nested, nn, segs[i].arity, sel, CS_MAX_CANDS);
+    cs_mspans_t sp = mref_spans(ix, ent, ix->ents[ent].name, SKIP_ONE, "");
+    for (int s = 0; s < sp.n; s++) {
+        for (int i = sp.lo[s]; i < sp.hi[s]; i++) {
+            if (!mref_member(ix, &ix->mrefs[i])->is_static) {
+                return true;
             }
-        }
-        if (k == 0) {
-            return (cs_tp_t){.st = TP_PARTIAL, .ent = cur, .failed_seg = i, .exact = exact};
-        }
-        if (k > SKIP_ONE) {
-            return tp_res(res_unres(CBM_DOCLINK_REASON_AMBIGUOUS));
-        }
-        cur = sel[0];
-    }
-    return (cs_tp_t){.st = TP_OK, .ent = cur, .exact = exact};
-}
-
-static bool tparam_in_scope(const cs_ctx_t *c, const char *name) {
-    for (int i = 0; i < c->ntparams; i++) {
-        if (tparam_listed(c->tparams[i], name, strlen(name))) {
-            return true;
         }
     }
     return false;
 }
 
-static bool scope_open(const cs_ctx_t *c) {
-    for (int i = 0; i < c->nusings; i++) {
-        if (!cbm_ht_get(c->ix->namespaces, c->usings[i]) || external_prefix(c->usings[i])) {
-            return true;
-        }
+/* A constructor of `ent`. A type has the instance constructors its source
+ * writes (a primary constructor among them: the scope records it), and ones
+ * no source writes: the parameterless one of a struct, and of a class or
+ * record that writes none; a record's copy constructor. Those are declared
+ * and have no node. No constructor is inherited. */
+static cs_res_t ctor_result(const cs_ctx_t *c, int ent, const cs_use_t *u) {
+    const cs_entity_t *e = &c->ix->ents[ent];
+    cs_query_t q = {.name = e->name, .arity = CS_ARITY_NONE, .ctors = true, .kind = 'c'};
+    cs_res_t res = res_unres(CBM_DOCLINK_REASON_MISSING);
+    cs_mb_t st = members_result(c, ent, &q, u, &res);
+    bool value_type = e->kind == 's' || e->kind == 't';
+    bool record = e->kind == 'r' || e->kind == 't';
+    if (st == CS_MB_RES) {
+        /* a struct has its parameterless constructor beside the one it writes */
+        bool second =
+            !u->has_params && value_type && res.st == CS_OK && !declares_default_ctor(c, ent);
+        return second ? res_ambiguous(CS_WHY_SCOPE) : res;
     }
-    return c->nstatics > 0; /* the prototype's rule: a static import keeps the scope open */
-}
-
-/* Why a type path was not found. */
-static cs_res_t classify_unfound_type(const cs_ctx_t *c, const cs_seg_t *segs, int n) {
-    const cs_index_t *ix = c->ix;
-    char full[CS_KEY_BUF];
-    if (!join_segs(segs, 0, n, NULL, full, sizeof(full))) {
-        return res_unres(CBM_DOCLINK_REASON_UNPARSEABLE);
+    if (st == CS_MB_INVISIBLE) {
+        return res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
     }
-    int arity = segs[n - SKIP_ONE].arity;
-    if (cbm_ht_get(ix->namespaces, full) && arity <= 0) {
-        cs_res_t ns = res_unres(CBM_DOCLINK_REASON_GRAPH_GAP); /* a namespace: no node */
-        ns.is_namespace = true;
-        return ns;
+    if (e->incomplete) {
+        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
     }
-    if (n > SKIP_ONE) {
-        if (external_prefix(full)) {
-            return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
-        }
-        char ns[CS_KEY_BUF];
-        if (join_segs(segs, 0, n - SKIP_ONE, NULL, ns, sizeof(ns)) &&
-            cbm_ht_get(ix->namespaces, ns)) {
-            return res_unres(CBM_DOCLINK_REASON_MISSING);
-        }
-        if (!cbm_ht_get(ix->namespaces, segs[0].name) &&
-            !cbm_ht_get(ix->type_names, segs[0].name)) {
-            return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
-        }
-        return res_unres(CBM_DOCLINK_REASON_MISSING);
+    bool supplied = value_type || (st == CS_MB_NONE && (e->kind == 'c' || e->kind == 'r'));
+    if (supplied && (!u->has_params || u->r->nparams == 0)) {
+        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
     }
-    if (tparam_in_scope(c, segs[0].name)) {
-        return (cs_res_t){.st = CS_LOCAL};
-    }
-    if (scope_open(c)) {
-        return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
-    }
-    for (int i = 0; i < c->nchain; i++) {
-        if (open_hierarchy(ix, c->chain[i])) {
-            return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
-        }
+    if (record && u->has_params && u->r->nparams == SKIP_ONE &&
+        strcmp(u->r->params[0], e->name) == 0) {
+        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
     }
     return res_unres(CBM_DOCLINK_REASON_MISSING);
 }
 
-/* Namespace ancestors of the context, innermost first, without the global
- * namespace. Returns the count; names are written into `out`. */
-static int ns_ancestors(const cs_ctx_t *c, char out[][CS_KEY_BUF / CBM_SZ_4], int cap) {
-    int n = 0;
-    char ns[CS_KEY_BUF];
-    snprintf(ns, sizeof(ns), "%s", c->ns ? c->ns : "");
-    while (ns[0] && n < cap) {
-        snprintf(out[n++], CS_KEY_BUF / CBM_SZ_4, "%s", ns);
-        char *dot = strrchr(ns, '.');
-        if (!dot) {
+/* The static constructor of `ent` (a doc ID's `#cctor`). */
+static cs_res_t static_ctor_result(const cs_ctx_t *c, int ent, bool exact) {
+    cs_query_t q = {.name = c->ix->ents[ent].name,
+                    .arity = CS_ARITY_NONE,
+                    .statics = true,
+                    .ctors = true,
+                    .kind = 'c'};
+    cs_res_t res = res_unres(CBM_DOCLINK_REASON_MISSING);
+    cs_mb_t st = members_plain(c, ent, &q, exact, &res);
+    if (st == CS_MB_RES) {
+        return res;
+    }
+    return st == CS_MB_INVISIBLE ? res_unres(CBM_DOCLINK_REASON_TEST_ONLY)
+                                 : member_unfound(c, ent, NULL, CS_ARITY_NONE);
+}
+
+/* ── Scope lookup ────────────────────────────────────────────────── */
+
+/* The types nested in `ent` and the members it declares itself, by the
+ * query. A doc ID's member kind names a member, never a nested type. */
+static void level_entity(const cs_ctx_t *c, int ent, const cs_query_t *q, cs_found_t *fd) {
+    /* the shared trees' declaration seen without an assembly's own parts of
+     * the type: a name those parts declare is not told from what is here */
+    cs_why_t why = CS_WHY_PARTS;
+    if (c->ix->ents[ent].used &&
+        unseen_part_declares(c, ent, q->name, q->arity, q->types_only, &why)) {
+        fd->n += PAIR_LEN;
+        fd->why = why;
+        return;
+    }
+    if (!q->kind) {
+        add_types(c, false, ent, q->name, type_arity(q->arity), fd);
+    }
+    if (q->types_only) {
+        return;
+    }
+    int has = members_named(c, ent, q);
+    if (has == CS_HAS_VISIBLE) {
+        found_add(fd, 'M', ent);
+    } else if (has == CS_HAS_INVISIBLE) {
+        fd->invisible = true;
+    }
+}
+
+/* What an alias was resolved to, as a candidate. */
+static void add_alias_target(const cs_ctx_t *c, const cs_using_t *u, cs_found_t *fd) {
+    if (u->ent >= 0) {
+        found_add_type(c, fd, u->ent);
+        fd->joined = fd->joined || u->joined;
+    } else if (u->ent == CS_AMBIGUOUS) {
+        fd->n += PAIR_LEN;
+    } else if (u->ns >= 0) {
+        found_add(fd, 'N', u->ns);
+    } else {
+        found_add(fd, 'X', CS_NONE);
+    }
+}
+
+static void level_aliases(const cs_ctx_t *c, const cs_using_t *us, int n,
+                          const cs_using_index_t *index, const cs_query_t *q, cs_found_t *fd) {
+    /* an alias names a type or a namespace: no candidate for `Name{T}` */
+    if (q->arity > 0) {
+        return;
+    }
+    if (!index || !index->ready) {
+        for (int i = 0; i < n; i++) {
+            cs_work(SKIP_ONE);
+            if (us[i].kind == 'a' && strcmp(us[i].alias, q->name) == 0) {
+                add_alias_target(c, &us[i], fd);
+            }
+        }
+        return;
+    }
+    size_t lo = 0;
+    size_t hi = index->naliases;
+    while (lo < hi) {
+        cs_work(SKIP_ONE);
+        size_t mid = lo + (hi - lo) / PAIR_LEN;
+        if (strcmp(index->aliases[mid].name, q->name) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    for (size_t i = lo; i < index->naliases; i++) {
+        cs_work(SKIP_ONE);
+        if (strcmp(index->aliases[i].name, q->name)) {
             break;
         }
-        *dot = '\0';
+        add_alias_target(c, &us[index->aliases[i].id], fd);
+    }
+}
+
+/* The original resolver is shared by the full scan and candidate path. */
+static void level_using(const cs_ctx_t *c, const cs_using_t *u, const cs_query_t *q,
+                        bool a_type_name, cs_found_t *fd) {
+    cs_work(SKIP_ONE);
+    if (u->kind == 'n' && u->ns >= 0 && a_type_name) {
+        /* a using brings a namespace's types, not the namespaces in it */
+        add_types(c, true, u->ns, q->name, type_arity(q->arity), fd);
+    } else if (u->kind == 's' && u->ent >= 0) {
+        cs_query_t statics = *q;
+        statics.statics = true;
+        level_entity(c, u->ent, &statics, fd);
+    }
+}
+
+static size_t name_scope_range(const cs_index_t *ix, const char *name, size_t *end) {
+    size_t lo = 0;
+    size_t hi = ix->nname_scopes;
+    while (lo < hi) {
+        cs_work(SKIP_ONE);
+        size_t mid = lo + (hi - lo) / PAIR_LEN;
+        if (strcmp(ix->name_scopes[mid].name, name) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    size_t first = lo;
+    hi = ix->nname_scopes;
+    while (lo < hi) {
+        cs_work(SKIP_ONE);
+        size_t mid = lo + (hi - lo) / PAIR_LEN;
+        if (strcmp(ix->name_scopes[mid].name, name) <= 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    *end = lo;
+    return first;
+}
+
+/* IDs are accumulated before any result is added: if growth fails, a full
+ * scan can retry without duplicating a partially resolved candidate set. */
+enum { CS_CANDIDATE_STACK = 32 };
+typedef struct {
+    int local[CS_CANDIDATE_STACK];
+    int *ids;
+    size_t n;
+    size_t cap;
+} cs_candidate_ids_t;
+
+static bool candidate_add(cs_candidate_ids_t *ids, int id) {
+    if (ids->n == ids->cap) {
+        if (ids->cap > SIZE_MAX / PAIR_LEN / sizeof(int)) {
+            return false;
+        }
+        size_t cap = ids->cap * PAIR_LEN;
+        int *grown = NULL;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        bool fail = atomic_exchange(&cs_fail_candidate_alloc, false);
+        if (fail) {
+            atomic_store(&cs_candidate_alloc_failed, true);
+        } else
+#endif
+        {
+            grown = (int *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap * sizeof(int));
+        }
+        if (!grown) {
+            return false;
+        }
+        memcpy(grown, ids->ids, ids->n * sizeof(int));
+        cs_work(ids->n);
+        if (ids->ids != ids->local) {
+            cbm_free(CBM_MEM_CLASS_OTHER, ids->ids);
+        }
+        ids->ids = grown;
+        ids->cap = cap;
+    }
+    ids->ids[ids->n++] = id;
+    return true;
+}
+
+static bool candidate_scope(const cs_using_id_t *rows, size_t n, int scope,
+                            cs_candidate_ids_t *ids) {
+    size_t lo = 0;
+    size_t hi = n;
+    while (lo < hi) {
+        cs_work(SKIP_ONE);
+        size_t mid = lo + (hi - lo) / PAIR_LEN;
+        if (rows[mid].scope < scope) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    for (size_t i = lo; i < n; i++) {
+        cs_work(SKIP_ONE);
+        if (rows[i].scope != scope) {
+            break;
+        }
+        if (!candidate_add(ids, rows[i].id)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int candidate_id_cmp(const void *a, const void *b) {
+    cs_work(SKIP_ONE);
+    return int_cmp(a, b);
+}
+
+static void level_usings(const cs_ctx_t *c, const cs_using_t *us, int n,
+                         const cs_using_index_t *index, const cs_query_t *q, cs_found_t *fd) {
+    if (!n) {
+        return;
+    }
+    bool a_type_name = cbm_ht_get(c->ix->type_names, q->name) != NULL;
+    bool indexed = index && index->ready && c->ix->name_scopes_ready;
+    if (indexed && !index->nentities && (!index->nnamespaces || !a_type_name)) {
+        return; /* no static candidates, and no namespace can contribute this name */
+    }
+    size_t hi = 0;
+    size_t lo = indexed ? name_scope_range(c->ix, q->name, &hi) : 0;
+    /* A common name in a large repository must not make a small scope walk
+     * more postings than it has directives. The baseline scan stays cheap. */
+    if (!indexed || hi - lo >= (size_t)n) {
+        for (int i = 0; i < n; i++) {
+            level_using(c, &us[i], q, a_type_name, fd);
+        }
+        return;
+    }
+    cs_candidate_ids_t ids = {.cap = CS_CANDIDATE_STACK};
+    ids.ids = ids.local;
+    bool complete = true;
+    for (size_t i = lo; complete && i < hi; i++) {
+        cs_work(SKIP_ONE);
+        const cs_name_scope_t *row = &c->ix->name_scopes[i];
+        complete = row->top
+                       ? candidate_scope(index->namespaces, index->nnamespaces, row->scope, &ids)
+                       : candidate_scope(index->entities, index->nentities, row->scope, &ids);
+    }
+    if (complete) {
+        if (ids.n > 1) {
+            qsort(ids.ids, ids.n, sizeof(int), candidate_id_cmp);
+        }
+        for (size_t i = 0; i < ids.n; i++) {
+            cs_work(SKIP_ONE);
+            /* Own and twin postings may select the SAME directive twice.
+             * Distinct directive IDs must still be resolved separately. */
+            if (!i || ids.ids[i] != ids.ids[i - SKIP_ONE]) {
+                level_using(c, &us[ids.ids[i]], q, a_type_name, fd);
+            }
+        }
+    }
+    if (ids.ids != ids.local) {
+        cbm_free(CBM_MEM_CLASS_OTHER, ids.ids);
+    }
+    if (!complete) {
+        for (int i = 0; i < n; i++) {
+            level_using(c, &us[i], q, a_type_name, fd);
+        }
+    }
+}
+
+/* True when the lookup is settled by what the last level added. A level that
+ * had only invisible candidates does not bind: the lookup goes on, and
+ * remembers. */
+static bool settled(cs_found_t *fd, bool *invisible) {
+    *invisible = *invisible || fd->invisible;
+    fd->invisible = false;
+    return fd->n > 0;
+}
+
+/* Look a simple name up the way the compiler does in a cref: the documented
+ * method's type parameters; for every enclosing type its type parameters and
+ * what it declares itself; for every enclosing namespace its types and
+ * namespaces, and where a namespace declaration of the file stands, that
+ * declaration's aliases and then its usings. The first level that has the
+ * name decides. One step per enclosing type and per enclosing namespace: the
+ * scanner bounds both nestings. *statics: the name came through a `using
+ * static`. */
+static void lookup(const cs_ctx_t *c, const cs_query_t *q, cs_found_t *fd, bool *statics) {
+    const cs_index_t *ix = c->ix;
+    const cs_file_t *f = c->f;
+    size_t nl = strlen(q->name);
+    bool invisible = false;
+    memset(fd, 0, sizeof(*fd));
+    *statics = false;
+    if (q->arity <= 0 && c->member >= 0 &&
+        tparam_find(f, f->ntypes + c->member, q->name, nl) >= 0) {
+        found_add(fd, 'L', CS_NONE);
+        return;
+    }
+    for (int t = c->type; t >= 0; t = f->types[t].outer) {
+        cs_work(SKIP_ONE);
+        if (q->arity <= 0 && tparam_find(f, t, q->name, nl) >= 0) {
+            found_add(fd, 'L', CS_NONE);
+            return;
+        }
+        level_entity(c, f->types[t].entity, q, fd);
+        if (settled(fd, &invisible)) {
+            return;
+        }
+    }
+    int reg = c->region;
+    for (int ns = f->regions[reg].ns;; ns = ix->nss[ns].parent) {
+        cs_work(SKIP_ONE);
+        add_types(c, true, ns, q->name, type_arity(q->arity), fd);
+        int child = q->arity > 0 ? CS_NONE : ns_in_view(c, ns, q->name, nl);
+        if (child >= 0) {
+            found_add(fd, 'N', child);
+        }
+        /* a declaration of this namespace stands here: its directives are
+         * asked, unless they are the peers of the directive being resolved */
+        bool here = reg >= 0 && f->regions[reg].ns == ns;
+        bool asked = here && reg != c->skip_region;
+        const cs_using_t *us = asked ? f->usings + f->regions[reg].u_lo : NULL;
+        int nus = asked ? f->regions[reg].u_hi - f->regions[reg].u_lo : 0;
+        const cs_using_index_t *usi = asked ? &f->regions[reg].using_index : NULL;
+        const cs_unit_t *unit = (ns == 0 && c->unit >= 0) ? &ix->units[c->unit] : NULL;
+        if (fd->n > 0) {
+            /* C# rejects an alias beside a type or namespace of its name */
+            cs_found_t alias = {0};
+            level_aliases(c, us, nus, usi, q, &alias);
+            if (unit) {
+                level_aliases(c, unit->usings, unit->nusings, &unit->using_index, q, &alias);
+            }
+            fd->n += alias.n > 0;
+            fd->in_namespace = true;
+        }
+        if (settled(fd, &invisible)) {
+            return;
+        }
+        level_aliases(c, us, nus, usi, q, fd);
+        if (unit) {
+            level_aliases(c, unit->usings, unit->nusings, &unit->using_index, q, fd);
+        }
+        if (settled(fd, &invisible)) {
+            fd->exact = true;
+            return;
+        }
+        level_usings(c, us, nus, usi, q, fd);
+        if (unit) {
+            level_usings(c, unit->usings, unit->nusings, &unit->using_index, q, fd);
+        }
+        if (settled(fd, &invisible)) {
+            *statics = fd->first.kind == 'M';
+            return;
+        }
+        if (here) {
+            reg = f->regions[reg].parent;
+        }
+        if (ns == 0) {
+            break;
+        }
+    }
+    fd->invisible = invisible;
+}
+
+/* ── Paths ───────────────────────────────────────────────────────── */
+
+typedef enum {
+    CS_TP_TYPE = 0, /* the path names the type `ent` */
+    CS_TP_NS,       /* ... the namespace `ns` */
+    CS_TP_PARTIAL,  /* the type `ent` was reached; it has no type by the next segment */
+    CS_TP_NSFAIL,   /* the namespace `ns` was reached; it has nothing by the next segment */
+    CS_TP_RES,      /* `res` is the answer */
+} cs_tp_kind_t;
+
+typedef struct {
+    cs_tp_kind_t st;
+    int ent;
+    int ns;
+    bool exact;           /* the path itself is a qualified name (or an alias, or absolute) */
+    bool in_ns;           /* its first segment is of an enclosing namespace (or absolute): one
+                           * more segment makes a qualified name of it */
+    const cs_seg_t *next; /* CS_TP_PARTIAL: the segment the type has nothing by */
+    bool joined;          /* a segment is one type only because a contract is joined to its
+                           * implementation: nothing bound through the path is exact */
+    cs_res_t res;
+} cs_tp_t;
+
+static cs_tp_t tp_res(cs_res_t r) {
+    return (cs_tp_t){.st = CS_TP_RES, .res = r};
+}
+
+/* Follow segs[from, n) from where `cur` stands: each is a member of what the
+ * one before named -- a namespace or type of a namespace, a type nested in a
+ * type. There is no second try from anywhere else. */
+static cs_tp_t path_from(const cs_ctx_t *c, cs_tp_t cur, const cs_seg_t *segs, int from, int n) {
+    for (int i = from; i < n; i++) {
+        cs_found_t fd = {0};
+        if (cur.st == CS_TP_NS) {
+            int child = segs[i].arity > 0
+                            ? CS_NONE
+                            : ns_in_view(c, cur.ns, segs[i].name, strlen(segs[i].name));
+            add_types(c, true, cur.ns, segs[i].name, type_arity(segs[i].arity), &fd);
+            if (child >= 0 && fd.n == 0 && !fd.invisible) {
+                cur.ns = child;
+                continue;
+            }
+            fd.n += child >= 0;
+        } else {
+            add_types(c, false, cur.ent, segs[i].name, type_arity(segs[i].arity), &fd);
+        }
+        if (fd.n > SKIP_ONE) {
+            return tp_res(found_ambiguous(&fd));
+        }
+        if (fd.n == 0) {
+            if (fd.invisible) {
+                return tp_res(res_unres(CBM_DOCLINK_REASON_TEST_ONLY));
+            }
+            cur.st = cur.st == CS_TP_NS ? CS_TP_NSFAIL : CS_TP_PARTIAL;
+            cur.next = &segs[i];
+            return cur;
+        }
+        cur.st = CS_TP_TYPE;
+        cur.ent = fd.first.id;
+        if (fd.joined) {
+            cur.joined = true;
+            cur.exact = false;
+            cur.in_ns = false;
+        }
+    }
+    return cur;
+}
+
+/* An open scope: a using in view names a namespace or type the repository
+ * does not declare, or the project's global usings could not be evaluated.
+ * A name found nowhere may come from there. */
+static bool scope_open(const cs_ctx_t *c) {
+    if (c->unit >= 0 && c->ix->units[c->unit].open) {
+        return true;
+    }
+    return c->f->regions[c->region].open;
+}
+
+/* Why a simple name was found at no scope level. */
+static cs_res_t simple_unfound(const cs_ctx_t *c) {
+    const cs_index_t *ix = c->ix;
+    if (scope_open(c)) {
+        return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
+    }
+    bool hidden = false;
+    for (int t = c->type; t >= 0; t = c->f->types[t].outer) {
+        const cs_entity_t *e = &ix->ents[c->f->types[t].entity];
+        if (e->open_any) {
+            return res_unres(CBM_DOCLINK_REASON_EXTERNAL); /* a base outside the repository */
+        }
+        hidden = hidden || e->incomplete;
+    }
+    /* An enclosing type with members a parse error hides: the name may be
+     * one of them. */
+    return res_unres(hidden ? CBM_DOCLINK_REASON_GRAPH_GAP : CBM_DOCLINK_REASON_MISSING);
+}
+
+/* The path segs[0, n): a type, a namespace, or how far it got. The first
+ * segment is a simple name that names a type or a namespace in scope;
+ * `global::` and a doc ID start at the global namespace instead. `qualifier`:
+ * the path qualifies a name that follows it. */
+static cs_tp_t resolve_path(const cs_ctx_t *c, const cs_seg_t *segs, int n, bool qualifier) {
+    if (c->glob) {
+        return path_from(c, (cs_tp_t){.st = CS_TP_NS, .ns = 0, .exact = true, .in_ns = true}, segs,
+                         0, n);
+    }
+    if (n <= 0) {
+        return tp_res(res_unres(CBM_DOCLINK_REASON_UNPARSEABLE));
+    }
+    cs_query_t q = {.name = segs[0].name, .arity = segs[0].arity, .types_only = true};
+    cs_found_t fd;
+    bool statics = false;
+    lookup(c, &q, &fd, &statics);
+    if (fd.n > SKIP_ONE) {
+        return tp_res(found_ambiguous(&fd));
+    }
+    if (fd.n == 0) {
+        if (fd.invisible) {
+            return tp_res(res_unres(CBM_DOCLINK_REASON_TEST_ONLY));
+        }
+        if (n == SKIP_ONE && !qualifier) {
+            return tp_res(simple_unfound(c));
+        }
+        /* a qualifier that is no namespace and no type in scope: a type of
+         * the repository that is not in scope here, or a namespace the
+         * repository does not declare */
+        return tp_res(res_unres(cbm_ht_get(c->ix->type_names, segs[0].name)
+                                    ? CBM_DOCLINK_REASON_MISSING
+                                    : CBM_DOCLINK_REASON_EXTERNAL));
+    }
+    /* exact: a name through an alias, and a qualified name -- two segments
+     * or more, the first found among an enclosing namespace's own types and
+     * namespaces. A name found by its simple name alone, or through a using,
+     * is what the scope makes of it. */
+    bool exact = (fd.exact || (n > SKIP_ONE && fd.in_namespace)) && !fd.joined;
+    bool in_ns = (fd.exact || fd.in_namespace) && !fd.joined;
+    switch (fd.first.kind) {
+    case 'T':
+        return path_from(c,
+                         (cs_tp_t){.st = CS_TP_TYPE,
+                                   .ent = fd.first.id,
+                                   .exact = exact,
+                                   .in_ns = in_ns,
+                                   .joined = fd.joined},
+                         segs, SKIP_ONE, n);
+    case 'N':
+        return path_from(
+            c, (cs_tp_t){.st = CS_TP_NS, .ns = fd.first.id, .exact = exact, .in_ns = in_ns}, segs,
+            SKIP_ONE, n);
+    case 'L':
+        /* a type parameter: nothing is a member of one */
+        return tp_res(n == SKIP_ONE ? (cs_res_t){.st = CS_LOCAL}
+                                    : res_unres(CBM_DOCLINK_REASON_MISSING));
+    default:
+        return tp_res(res_unres(CBM_DOCLINK_REASON_EXTERNAL));
+    }
+}
+
+/* A namespace as a reference's target: declared, and without a node. */
+static cs_res_t namespace_result(void) {
+    return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
+}
+
+/* The reason for a path that ended at a namespace without the next name: a
+ * namespace the repository declares has no such type (missing); one it only
+ * has namespaces under, and the global one, hold nothing of the repository
+ * (the name is outside) -- and so is what a standard-library namespace lacks,
+ * declared or not. */
+static cs_res_t namespace_unfound(const cs_ctx_t *c, int ns) {
+    const cs_ns_t *n = &c->ix->nss[ns];
+    return res_unres((n->declared && !n->standard) ? CBM_DOCLINK_REASON_MISSING
+                                                   : CBM_DOCLINK_REASON_EXTERNAL);
+}
+
+/* The reason for a path that did not come to a type or a namespace. */
+static cs_res_t path_unfound(const cs_ctx_t *c, const cs_tp_t *tp) {
+    if (tp->st == CS_TP_RES) {
+        return tp->res;
+    }
+    if (tp->st == CS_TP_NSFAIL) {
+        return namespace_unfound(c, tp->ns);
+    }
+    return member_unfound(c, tp->ent, tp->next ? tp->next->name : NULL,
+                          tp->next ? tp->next->arity : CS_ARITY_NONE);
+}
+
+/* ── Members of a type ───────────────────────────────────────────── */
+
+/* The implicit roots a type of this kind derives from without naming them,
+ * as far as the repository declares them. */
+static int implicit_roots(const cs_ctx_t *c, char kind, int *out) {
+    static const char *const enum_roots[] = {"Enum", "ValueType", "Object", NULL};
+    static const char *const value_roots[] = {"ValueType", "Object", NULL};
+    static const char *const object_root[] = {"Object", NULL};
+    static const char system_ns[] = "System";
+    const char *const *roots = object_root;
+    if (kind == 'e') {
+        roots = enum_roots;
+    } else if (kind == 's' || kind == 't') {
+        roots = value_roots;
+    } else if (kind == 'i' || kind == 'd') {
+        return 0;
+    }
+    int sys = ns_find(c->ix, 0, system_ns, sizeof(system_ns) - SKIP_ONE);
+    int n = 0;
+    for (int i = 0; sys >= 0 && roots[i]; i++) {
+        cs_found_t fd = {0};
+        add_types(c, true, sys, roots[i], 0, &fd);
+        if (fd.n == SKIP_ONE) {
+            out[n++] = fd.first.id;
+        }
     }
     return n;
 }
 
-enum { CS_MAX_NS_DEPTH = 16 };
-
-static cs_tp_t resolve_type_path(const cs_ctx_t *c, const cs_seg_t *segs, int n) {
+/* NOT the compiler's rule (see CS_BIND_INHERITED): where the compiler's
+ * lookup has bound nothing, the member `seg` of the nearest supertype of
+ * `ent` that has one. false when the index does not bind inherited members,
+ * and when no supertype in view has the name. */
+static bool inherited_result(const cs_ctx_t *c, int ent, const cs_seg_t *seg, const cs_use_t *u,
+                             char kind, cs_res_t *res) {
     const cs_index_t *ix = c->ix;
-    if (n <= 0) {
-        return tp_res(res_unres(CBM_DOCLINK_REASON_UNPARSEABLE));
+    if (!ix->bind_inherited) {
+        return false;
     }
-    char full[CS_KEY_BUF];
-    if (!join_segs(segs, 0, n, NULL, full, sizeof(full))) {
-        return tp_res(res_unres(CBM_DOCLINK_REASON_UNPARSEABLE));
-    }
-    int arity_last = segs[n - SKIP_ONE].arity;
-    int sel[CS_MAX_CANDS];
-    char anc[CS_MAX_NS_DEPTH][CS_KEY_BUF / CBM_SZ_4];
-    int nanc = ns_ancestors(c, anc, CS_MAX_NS_DEPTH);
-    /* A single segment is a simple name: never a fully-qualified shortcut. */
-    if (n > SKIP_ONE || c->glob) {
-        int k = fqn_lookup(ix, full, arity_last, sel, CS_MAX_CANDS);
-        if (k > SKIP_ONE) {
-            return tp_res(res_unres(CBM_DOCLINK_REASON_AMBIGUOUS));
+    int sup[CS_MAX_SUPERS + CS_MAX_ROOTS];
+    bool more = false;
+    int n = supers_of(ix, ent, sup, &more);
+    n += implicit_roots(c, ix->ents[ent].kind, sup + n);
+    cs_query_t q = {.name = seg->name, .arity = seg->arity, .kind = kind};
+    for (int i = 0; i < n; i++) {
+        cs_work(SKIP_ONE);
+        cs_found_t fd = {0};
+        level_entity(c, sup[i], &q, &fd);
+        if (fd.n > SKIP_ONE) {
+            *res = found_ambiguous(&fd);
+            return true;
         }
-        if (k == SKIP_ONE) {
-            return (cs_tp_t){.st = TP_OK, .ent = sel[0], .exact = true};
+        if (fd.n == SKIP_ONE && fd.first.kind == 'T' && !u->has_params) {
+            *res = type_result(c, fd.first.id, u->exact);
+            return true;
         }
-    }
-    if (n > SKIP_ONE && !c->glob) {
-        for (int a = 0; a < nanc; a++) {
-            char rel[CS_KEY_BUF];
-            if (!join_segs(segs, 0, n, anc[a], rel, sizeof(rel))) {
-                continue;
-            }
-            int k = fqn_lookup(ix, rel, arity_last, sel, CS_MAX_CANDS);
-            if (k > SKIP_ONE) {
-                return tp_res(res_unres(CBM_DOCLINK_REASON_AMBIGUOUS));
-            }
-            if (k == SKIP_ONE) {
-                return (cs_tp_t){.st = TP_OK, .ent = sel[0], .exact = true};
-            }
+        cs_mb_t st = fd.n == SKIP_ONE && fd.first.kind == 'M'
+                         ? members_result(c, sup[i], &q, u, res)
+                         : CS_MB_NONE;
+        if (st == CS_MB_RES) {
+            return true;
+        }
+        if (st == CS_MB_INVISIBLE || fd.invisible) {
+            *res = res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
+            return true;
         }
     }
-    if (n > SKIP_ONE) {
-        /* the longest qualified type prefix (>= 2 segments unless global::),
-         * namespace-relative innermost first, then absolute; the rest walks
-         * nested types */
-        for (int i = n - SKIP_ONE; i >= SKIP_ONE; i--) {
-            if (i < PAIR_LEN && !c->glob) {
-                continue;
-            }
-            for (int a = 0; a <= (c->glob ? 0 : nanc); a++) {
-                bool absolute = c->glob || a == nanc;
-                char pfx[CS_KEY_BUF];
-                if (!join_segs(segs, 0, i, absolute ? NULL : anc[a], pfx, sizeof(pfx))) {
-                    continue;
-                }
-                int k = fqn_lookup(ix, pfx, segs[i - SKIP_ONE].arity, sel, CS_MAX_CANDS);
-                if (k != SKIP_ONE) {
-                    continue;
-                }
-                return walk_nested(c, sel[0], segs, i, n, true);
-            }
-        }
+    if (more) {
+        *res = res_unres(CBM_DOCLINK_REASON_GRAPH_GAP); /* a hierarchy past CS_MAX_SUPERS */
+        return true;
     }
-    if (c->glob) {
-        return tp_res(classify_unfound_type(c, segs, n));
-    }
-    int head_ar = n > SKIP_ONE ? segs[0].arity : arity_last;
-    cs_cands_t cands;
-    bool exact = false;
-    cs_lookup_t lr = lookup(c, segs[0].name, head_ar, CS_WANT_TYPE, 0, &cands, &exact);
-    if (lr == CS_LOOKUP_FOUND) {
-        if (cands.count > SKIP_ONE) {
-            return tp_res(res_unres(CBM_DOCLINK_REASON_AMBIGUOUS));
-        }
-        const cs_cand_t *cd = &cands.items[0];
-        if (cd->kind == 'G') {
-            return tp_res(res_unres(CBM_DOCLINK_REASON_GRAPH_GAP));
-        }
-        if (cd->kind == 'X') {
-            return tp_res(res_unres(CBM_DOCLINK_REASON_EXTERNAL));
-        }
-        if (cd->kind != 'T') {
-            return tp_res(res_unres(CBM_DOCLINK_REASON_UNPARSEABLE));
-        }
-        return walk_nested(c, cd->ent, segs, SKIP_ONE, n, exact);
-    }
-    if (lr == CS_LOOKUP_INVISIBLE) {
-        return tp_res(res_unres(CBM_DOCLINK_REASON_TEST_ONLY));
-    }
-    return tp_res(classify_unfound_type(c, segs, n));
+    return false;
 }
 
-/* ── Simple names in scope ───────────────────────────────────────── */
+/* A property or an event by its accessor's name (get_X, set_X; add_X,
+ * remove_X). The compiler binds the accessor; the graph keeps an accessor in
+ * its property or event, so that is the node. An indexer's accessors
+ * (get_Item, set_Item) have none. */
+static bool accessor_result(const cs_ctx_t *c, int ent, const cs_seg_t *seg, bool exact,
+                            cs_res_t *res) {
+    static const struct {
+        const char *prefix;
+        char kind;
+    } acc[] = {{"get_", 'p'}, {"set_", 'p'}, {"add_", 'e'}, {"remove_", 'e'}};
+    for (size_t a = 0; seg->arity <= 0 && a < sizeof(acc) / sizeof(acc[0]); a++) {
+        size_t al = strlen(acc[a].prefix);
+        if (strncmp(seg->name, acc[a].prefix, al) != 0 || !seg->name[al]) {
+            continue;
+        }
+        cs_query_t q = {.name = seg->name + al, .arity = CS_ARITY_NONE, .kind = acc[a].kind};
+        cs_mb_t st = members_plain(c, ent, &q, exact, res);
+        if (st == CS_MB_INVISIBLE) {
+            *res = res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
+        } else if (st != CS_MB_RES && acc[a].kind == 'p' && strcmp(q.name, "Item") == 0 &&
+                   special_declared(c, ent, "this")) {
+            *res = res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
+        } else if (st != CS_MB_RES) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
 
-static cs_res_t resolve_in_scope(const cs_ctx_t *c, const cs_ref_t *r) {
-    const cs_index_t *ix = c->ix;
+/* `seg` as a member of the type `ent`, looked up in `ent` itself: a member
+ * it declares, a type nested in it (with a parameter list: that type's
+ * constructor), its own name (`Foo.Foo`: its constructor), a property or
+ * event by its accessor's name. `kind` is the member kind a doc ID names. */
+static cs_res_t member_in(const cs_ctx_t *c, int ent, const cs_seg_t *seg, const cs_use_t *u,
+                          char kind) {
+    const cs_entity_t *e = &c->ix->ents[ent];
+    cs_res_t res = res_unres(CBM_DOCLINK_REASON_MISSING);
+    cs_use_t ctor_use = *u;
+    ctor_use.where.member_seg = CS_NONE;
+    if (strcmp(seg->name, "#ctor") == 0) {
+        return ctor_result(c, ent, &ctor_use);
+    }
+    if (strcmp(seg->name, "#cctor") == 0) {
+        return static_ctor_result(c, ent, u->exact);
+    }
+    cs_query_t q = {.name = seg->name, .arity = seg->arity, .kind = kind};
+    cs_found_t fd = {0};
+    level_entity(c, ent, &q, &fd);
+    if (fd.n > SKIP_ONE) {
+        return found_ambiguous(&fd);
+    }
+    if (fd.n == SKIP_ONE && fd.first.kind == 'T') {
+        if (!u->has_params) {
+            return type_result(c, fd.first.id, u->exact_type && !fd.joined);
+        }
+        ctor_use.where.type_seg = u->where.member_seg; /* the nested type is the last segment */
+        ctor_use.exact = u->exact_type && !fd.joined;
+        return ctor_result(c, fd.first.id, &ctor_use);
+    }
+    if (fd.n == SKIP_ONE) {
+        cs_mb_t st = members_result(c, ent, &q, u, &res);
+        if (st == CS_MB_RES) {
+            return res;
+        }
+        if (st == CS_MB_INVISIBLE) {
+            return res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
+        }
+        /* it has the name, and nothing of it takes the written parameters */
+    } else {
+        if (fd.invisible) {
+            return res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
+        }
+        /* `Foo.Foo`: the constructor -- unless it is a bare `Foo{T}.Foo`
+         * written on that generic type itself, which the compiler leaves
+         * unbound */
+        bool own_name = !kind && seg->arity <= 0 && strcmp(seg->name, e->name) == 0;
+        bool on_type = c->type >= 0 && c->f->types[c->type].entity == ent;
+        if (own_name && (u->has_params || e->arity == 0 || !on_type)) {
+            return ctor_result(c, ent, &ctor_use);
+        }
+        if (!kind && accessor_result(c, ent, seg, u->exact, &res)) {
+            return res;
+        }
+        if (u->r->maybe_indexer && (!kind || kind == 'p') && special_declared(c, ent, "this")) {
+            return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP); /* `Item(int)`: the indexer */
+        }
+    }
+    if (stub_member(c, ent, &q, u, &res) || inherited_result(c, ent, seg, u, kind, &res)) {
+        return res;
+    }
+    return member_unfound(c, ent, seg->name, seg->arity);
+}
+
+/* ── Simple names, qualified names, operators, doc IDs ───────────── */
+
+/* A simple name no scope level has. */
+static cs_res_t simple_fallback(const cs_ctx_t *c, const cs_ref_t *r, const cs_use_t *u) {
+    const cs_file_t *f = c->f;
     const cs_seg_t *seg = &r->segs[0];
-    int arity = seg->arity;
-    /* R3: a type-argument list selects the generic types and generic methods
-     * of that arity; a constructor or another non-generic member named like
-     * the type is no candidate (members_of filters them). */
-    /* a constructor is named by a parameter list: `Foo` alone is the type */
-    int sel = member_sel(r->has_params || arity > 0, r->has_params);
-    cs_cands_t cands;
-    bool exact = false;
-    cs_lookup_t lr = lookup(c, seg->name, arity, CS_WANT_ANY, sel, &cands, &exact);
-    if (lr == CS_LOOKUP_INVISIBLE) {
-        return res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
+    cs_res_t res = res_unres(CBM_DOCLINK_REASON_MISSING);
+    /* `Foo(int)` written in a generic `Foo<T>`: no type `Foo` is in scope,
+     * and the compiler takes the constructor of the type the reference
+     * stands in */
+    if (r->has_params && seg->arity <= 0 && c->type >= 0 &&
+        strcmp(f->types[c->type].name, seg->name) == 0) {
+        cs_use_t ctor_use = *u;
+        ctor_use.where = (cs_where_t){.type_seg = CS_NONE, .member_seg = CS_NONE};
+        return ctor_result(c, f->types[c->type].entity, &ctor_use);
     }
-    if (lr == CS_LOOKUP_NONE) {
-        if (tparam_in_scope(c, seg->name)) {
-            return (cs_res_t){.st = CS_LOCAL};
+    cs_query_t q = {.name = seg->name, .arity = seg->arity};
+    for (int t = c->type; t >= 0; t = f->types[t].outer) {
+        int ent = f->types[t].entity;
+        if (accessor_result(c, ent, seg, u->exact, &res)) {
+            return res;
         }
-        cs_res_t unfound = classify_unfound_type(c, r->segs, SKIP_ONE);
-        /* An enclosing type with members a parse error hides: a name that
-         * would be reported missing may be one of them, so it is a gap. What
-         * the scope explains otherwise (an open scope or hierarchy: external)
-         * keeps its reason. */
-        for (int i = 0; unfound.st == CS_UNRES && unfound.reason == CBM_DOCLINK_REASON_MISSING &&
-                        i < c->nchain;
-             i++) {
-            if (hidden_member(ix, c->chain[i])) {
-                return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
-            }
+        if (r->maybe_indexer && special_declared(c, ent, "this")) {
+            return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP); /* `Item(int)`: the indexer */
         }
-        return unfound;
-    }
-    if (cands.count > SKIP_ONE && r->has_params) {
-        /* a parameter list selects a member: a type stands for its constructors */
-        cs_cands_t conv = {.count = 0};
-        for (int i = 0; i < cands.count; i++) {
-            const cs_cand_t *cd = &cands.items[i];
-            if (cd->kind == 'T' && has_members(ix, cd->ent, ix->ents[cd->ent].name,
-                                               member_sel(true, true), CS_ARITY_NONE)) {
-                cands_push(&conv, 'M', cd->ent, ix->ents[cd->ent].name);
-            } else {
-                cands_push(&conv, cd->kind, cd->ent, cd->name);
-            }
+        if (stub_member(c, ent, &q, u, &res) || inherited_result(c, ent, seg, u, 0, &res)) {
+            return res;
         }
-        cands = conv;
     }
-    if (cands.count > SKIP_ONE) {
-        return res_unres(CBM_DOCLINK_REASON_AMBIGUOUS);
+    return simple_unfound(c);
+}
+
+static cs_res_t resolve_simple(const cs_ctx_t *c, const cs_ref_t *r) {
+    const cs_seg_t *seg = &r->segs[0];
+    cs_query_t q = {.name = seg->name, .arity = seg->arity};
+    cs_found_t fd;
+    bool statics = false;
+    lookup(c, &q, &fd, &statics);
+    if (fd.n > SKIP_ONE) {
+        return found_ambiguous(&fd);
     }
-    const cs_cand_t *cd = &cands.items[0];
-    if (cd->kind == 'G') {
-        return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
+    q.statics = statics; /* through a `using static`: its static members are meant */
+    bool exact = fd.exact && !fd.joined;
+    cs_use_t u = {.r = r,
+                  .has_params = r->has_params,
+                  .where = {.type_seg = CS_NONE, .member_seg = 0},
+                  .exact = exact};
+    if (fd.n == 0) {
+        return fd.invisible ? res_unres(CBM_DOCLINK_REASON_TEST_ONLY) : simple_fallback(c, r, &u);
     }
-    if (cd->kind == 'X') {
+    cs_res_t res = res_unres(CBM_DOCLINK_REASON_MISSING);
+    switch (fd.first.kind) {
+    case 'L':
+        /* a type parameter of the definition: no reference to code elsewhere */
+        return r->has_params ? res : (cs_res_t){.st = CS_LOCAL};
+    case 'N':
+        return r->has_params ? res : namespace_result();
+    case 'T':
+        if (!r->has_params) {
+            return type_result(c, fd.first.id, exact);
+        }
+        if (fd.exact) {
+            return res; /* the compiler matches no parameter list against an alias */
+        }
+        /* a parameter list on a type's name: its constructor */
+        u.where = (cs_where_t){.type_seg = 0, .member_seg = CS_NONE};
+        return ctor_result(c, fd.first.id, &u);
+    case 'M': {
+        cs_mb_t st = members_result(c, fd.first.id, &q, &u, &res);
+        if (st == CS_MB_RES) {
+            return res;
+        }
+        if (st == CS_MB_INVISIBLE) {
+            return res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
+        }
+        /* the level that has the name decides: nothing further out is asked */
+        if (stub_member(c, fd.first.id, &q, &u, &res) ||
+            inherited_result(c, fd.first.id, seg, &u, 0, &res)) {
+            return res;
+        }
+        return member_unfound(c, fd.first.id, seg->name, seg->arity);
+    }
+    default:
         return res_unres(CBM_DOCLINK_REASON_EXTERNAL);
     }
-    if (cd->kind == 'T') {
-        if (r->has_params) {
-            return resolve_member_in(c, cd->ent, ix->ents[cd->ent].name, CS_ARITY_NONE, r, true,
-                                     exact);
-        }
-        return type_result(c, cd->ent, exact);
-    }
-    cs_res_t res =
-        member_result(c, cd->ent, cd->name, r, r->has_params, arity, exact, r->has_params);
-    if (res.sig_mismatch) {
-        return sig_fallback(c, cd->ent, cd->name, r, arity, exact, res);
-    }
-    return res;
 }
 
-/* ── Doc IDs and the top level ───────────────────────────────────── */
+/* `Path.Last`: the last segment is a member of what the path before it
+ * names. Of a type: member_in. Of a namespace: a type (with a parameter
+ * list: its constructor) or a namespace. */
+static cs_res_t resolve_qualified(const cs_ctx_t *c, const cs_ref_t *r, char kind,
+                                  bool has_params) {
+    int n = r->nsegs;
+    const cs_seg_t *last = &r->segs[n - SKIP_ONE];
+    cs_tp_t tp = resolve_path(c, r->segs, n - SKIP_ONE, true);
+    cs_use_t u = {.r = r,
+                  .has_params = has_params,
+                  .where = {.type_seg = n - PAIR_LEN, .member_seg = n - SKIP_ONE},
+                  .exact = tp.exact,
+                  .exact_type = tp.exact || tp.in_ns};
+    if (tp.st == CS_TP_TYPE) {
+        return member_in(c, tp.ent, last, &u, kind);
+    }
+    if (tp.st != CS_TP_NS) {
+        return path_unfound(c, &tp);
+    }
+    cs_found_t fd = {0};
+    if (!kind) {
+        add_types(c, true, tp.ns, last->name, type_arity(last->arity), &fd);
+    }
+    bool is_ns =
+        !kind && last->arity <= 0 && ns_in_view(c, tp.ns, last->name, strlen(last->name)) >= 0;
+    if (fd.n + (is_ns ? SKIP_ONE : 0) > SKIP_ONE) {
+        return found_ambiguous(&fd);
+    }
+    if (is_ns) {
+        return has_params ? res_unres(CBM_DOCLINK_REASON_MISSING) : namespace_result();
+    }
+    if (fd.n == 0) {
+        return fd.invisible ? res_unres(CBM_DOCLINK_REASON_TEST_ONLY) : namespace_unfound(c, tp.ns);
+    }
+    u.exact_type = u.exact_type && !fd.joined;
+    if (!has_params) {
+        return type_result(c, fd.first.id, u.exact_type);
+    }
+    u.where = (cs_where_t){.type_seg = n - SKIP_ONE, .member_seg = CS_NONE};
+    u.exact = u.exact_type;
+    return ctor_result(c, fd.first.id, &u);
+}
 
+/* An operator, a conversion or an indexer: of the type the path before it
+ * names, or of the nearest enclosing type that declares one. None has a
+ * node: one that is declared is a graph gap. */
+static cs_res_t resolve_operator(const cs_ctx_t *c, const cs_ref_t *r) {
+    if (r->nsegs > 0) {
+        cs_tp_t tp = resolve_path(c, r->segs, r->nsegs, true);
+        if (tp.st == CS_TP_NS) {
+            return namespace_unfound(c, tp.ns);
+        }
+        if (tp.st != CS_TP_TYPE) {
+            return path_unfound(c, &tp);
+        }
+        return special_declared(c, tp.ent, r->op_name)
+                   ? res_unres(CBM_DOCLINK_REASON_GRAPH_GAP)
+                   : member_unfound(c, tp.ent, r->op_name, CS_ARITY_NONE);
+    }
+    for (int t = c->type; t >= 0; t = c->f->types[t].outer) {
+        if (special_declared(c, c->f->types[t].entity, r->op_name)) {
+            return res_unres(CBM_DOCLINK_REASON_GRAPH_GAP);
+        }
+    }
+    return c->type >= 0 ? member_unfound(c, c->f->types[c->type].entity, r->op_name, CS_ARITY_NONE)
+                        : res_unres(CBM_DOCLINK_REASON_MISSING);
+}
+
+/* A doc ID names its target by its full name, from the global namespace:
+ * `T:` a type, `N:` a namespace, `M:` `P:` `F:` `E:` a member of the kind
+ * the letter says. An `M:` without parentheses is the overload without
+ * parameters; DocFX's `O:` is the whole group. */
 static cs_res_t resolve_docid(const cs_ctx_t *c, const cs_ref_t *r) {
-    const cs_index_t *ix = c->ix;
-    char full[CS_KEY_BUF];
-    if (!join_segs(r->segs, 0, r->nsegs, NULL, full, sizeof(full))) {
-        return res_unres(CBM_DOCLINK_REASON_UNPARSEABLE);
-    }
-    int sel[CS_MAX_CANDS];
-    if (r->docid == 'N') {
-        return res_unres(cbm_ht_get(ix->namespaces, full) ? CBM_DOCLINK_REASON_GRAPH_GAP
-                                                          : CBM_DOCLINK_REASON_EXTERNAL);
-    }
-    if (r->docid == 'T') {
-        int a = r->segs[r->nsegs - SKIP_ONE].arity;
-        int k = fqn_lookup(ix, full, a > 0 ? a : 0, sel, CS_MAX_CANDS);
-        if (k == SKIP_ONE) {
-            return type_result(c, sel[0], true);
+    cs_ctx_t abs = *c; /* what stands around the reference is no part of the name */
+    abs.type = CS_NONE;
+    abs.member = CS_NONE;
+    if (r->docid == 'T' || r->docid == 'N') {
+        cs_tp_t tp = resolve_path(&abs, r->segs, r->nsegs, false);
+        if (tp.st == CS_TP_RES) {
+            return tp.res;
         }
-        if (k > SKIP_ONE) {
-            return res_unres(CBM_DOCLINK_REASON_AMBIGUOUS);
+        if (r->docid == 'N') {
+            if (tp.st == CS_TP_NS) {
+                return namespace_result();
+            }
+            /* a type, or a namespace the repository does not have */
+            return res_unres(tp.st == CS_TP_NSFAIL ? CBM_DOCLINK_REASON_EXTERNAL
+                                                   : CBM_DOCLINK_REASON_MISSING);
         }
-        return classify_unfound_type(c, r->segs, r->nsegs);
+        if (tp.st == CS_TP_TYPE) {
+            return type_result(&abs, tp.ent, !tp.joined);
+        }
+        return tp.st == CS_TP_NS ? res_unres(CBM_DOCLINK_REASON_MISSING) : path_unfound(&abs, &tp);
     }
     if (r->nsegs < PAIR_LEN) {
         return res_unres(CBM_DOCLINK_REASON_UNPARSEABLE);
     }
-    char type[CS_KEY_BUF];
-    if (!join_segs(r->segs, 0, r->nsegs - SKIP_ONE, NULL, type, sizeof(type))) {
-        return res_unres(CBM_DOCLINK_REASON_UNPARSEABLE);
+    switch (r->docid) {
+    case 'M':
+        return resolve_qualified(&abs, r, 'c', true);
+    case 'O':
+        return resolve_qualified(&abs, r, 'c', false);
+    case 'P':
+        return resolve_qualified(&abs, r, 'p', r->has_params);
+    case 'E':
+        return resolve_qualified(&abs, r, 'e', false);
+    default:
+        return resolve_qualified(&abs, r, 'v', false);
     }
-    int ta = r->segs[r->nsegs - PAIR_LEN].arity;
-    int k = fqn_lookup(ix, type, ta > 0 ? ta : 0, sel, CS_MAX_CANDS);
-    if (k == 0) {
-        return classify_unfound_type(c, r->segs, r->nsegs - SKIP_ONE);
-    }
-    const cs_seg_t *last = &r->segs[r->nsegs - SKIP_ONE];
-    return resolve_member_in(c, sel[0], last->name, last->arity, r, r->has_params, true);
 }
 
-static int res_order(const cs_res_t *r) {
-    if (r->st != CS_UNRES) {
-        return CBM_SZ_8;
+static cs_res_t resolve_form(const cs_ctx_t *c, const cs_ref_t *r) {
+    if (r->op) {
+        return resolve_operator(c, r);
     }
-    static const int order[CBM_DOCLINK_REASON_COUNT] = {
-        [CBM_DOCLINK_REASON_AMBIGUOUS] = 0,   [CBM_DOCLINK_REASON_EXTERNAL] = 1,
-        [CBM_DOCLINK_REASON_GRAPH_GAP] = 2,   [CBM_DOCLINK_REASON_TEST_ONLY] = 3,
-        [CBM_DOCLINK_REASON_NOT_INDEXED] = 4, [CBM_DOCLINK_REASON_MISSING] = 5,
-        [CBM_DOCLINK_REASON_UNPARSEABLE] = 6,
-    };
-    return order[r->reason];
-}
-
-static cs_res_t resolve_ref(const cs_ctx_t *c, const cs_ref_t *r) {
     if (r->docid) {
         return resolve_docid(c, r);
     }
-    if (r->op) {
-        /* operators, indexers and conversions have no nodes */
-        if (r->nsegs > 0) {
-            cs_tp_t tp = resolve_type_path(c, r->segs, r->nsegs);
-            if (tp.st == TP_RES) {
-                return tp.res;
-            }
-            return res_unres(tp.st == TP_OK ? CBM_DOCLINK_REASON_GRAPH_GAP
-                                            : CBM_DOCLINK_REASON_MISSING);
-        }
-        return res_unres(c->nchain > 0 ? CBM_DOCLINK_REASON_GRAPH_GAP : CBM_DOCLINK_REASON_MISSING);
+    if (r->nsegs == SKIP_ONE && !c->glob) {
+        return resolve_simple(c, r);
     }
-    if (r->nsegs == SKIP_ONE) {
-        return resolve_in_scope(c, r);
+    return resolve_qualified(c, r, 0, r->has_params);
+}
+
+static bool reason_is_nothing(const cs_res_t *res) {
+    return res->st == CS_UNRES && (res->reason == CBM_DOCLINK_REASON_MISSING ||
+                                   res->reason == CBM_DOCLINK_REASON_EXTERNAL);
+}
+
+/* A reference in this context. For product code a namespace that only test
+ * code declares does not exist. When the reference came to nothing and such
+ * a namespace was passed over on the way, what it names may be a test
+ * declaration: asked once more the way test code sees it, a name that is
+ * there is test_only_target; one that is not there either keeps the reason
+ * it has without that namespace. */
+static cs_res_t resolve_ref(const cs_ctx_t *c, const cs_ref_t *r) {
+    bool passed_over = false;
+    cs_ctx_t seen = *c;
+    seen.passed_over = &passed_over;
+    cs_res_t res = resolve_form(&seen, r);
+    if (!passed_over || !reason_is_nothing(&res)) {
+        return res;
     }
-    const cs_seg_t *last = &r->segs[r->nsegs - SKIP_ONE];
-    bool have_first = false;
-    cs_res_t first = res_unres(CBM_DOCLINK_REASON_MISSING);
-    if (!r->has_params) {
-        cs_tp_t tp = resolve_type_path(c, r->segs, r->nsegs);
-        if (tp.st == TP_OK) {
-            return type_result(c, tp.ent, tp.exact);
-        }
-        if (tp.st == TP_PARTIAL) {
-            if (tp.failed_seg == r->nsegs - SKIP_ONE) {
-                return resolve_member_in(c, tp.ent, last->name, last->arity, r, false, tp.exact);
-            }
-            return res_unres(CBM_DOCLINK_REASON_MISSING);
-        }
-        first = tp.res;
-        have_first = true;
-    }
-    cs_tp_t tp2 = resolve_type_path(c, r->segs, r->nsegs - SKIP_ONE);
-    if (tp2.st == TP_OK) {
-        return resolve_member_in(c, tp2.ent, last->name, last->arity, r, r->has_params, tp2.exact);
-    }
-    if (tp2.st == TP_PARTIAL) {
-        return res_unres(CBM_DOCLINK_REASON_MISSING);
-    }
-    cs_res_t second = tp2.res;
-    if (second.st == CS_UNRES && second.is_namespace) {
-        /* The qualifier is one of the repository's namespaces, not a type: the
-         * reference names a type OF that namespace, and that reading is the
-         * first one (the namespace declares no such type: missing, or the
-         * BCL's by R4). Only a reference to the namespace itself is the gap. */
-        return have_first ? first : classify_unfound_type(c, r->segs, r->nsegs);
-    }
-    if (have_first && res_order(&first) < res_order(&second)) {
-        return first;
-    }
-    return second;
+    cs_ctx_t as_test = *c;
+    as_test.prod = false;
+    as_test.passed_over = NULL;
+    cs_res_t there = resolve_form(&as_test, r);
+    bool nothing = reason_is_nothing(&there) ||
+                   (there.st == CS_UNRES && there.reason == CBM_DOCLINK_REASON_UNPARSEABLE);
+    return nothing ? res : res_unres(CBM_DOCLINK_REASON_TEST_ONLY);
 }
 
 /* ── Context ─────────────────────────────────────────────────────── */
 
-typedef struct {
-    uint32_t start;
-    uint32_t end;
-    int type;
-} cs_span_t;
-
-static int span_inner_first(const void *a, const void *b) {
-    const cs_span_t *x = (const cs_span_t *)a;
-    const cs_span_t *y = (const cs_span_t *)b;
-    if (x->start != y->start) {
-        return x->start > y->start ? -1 : 1;
+/* The innermost type of `f` around `line`, or CS_NONE: the last type that
+ * starts at or before the line, or the nearest of its outer types that
+ * reaches the line (the types are in document order). */
+static int type_at(const cs_file_t *f, uint32_t line) {
+    int lo = 0;
+    int hi = f->ntypes;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (f->types[mid].start <= line) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
     }
-    if (x->end != y->end) {
-        return x->end < y->end ? -1 : 1;
+    for (int t = lo - SKIP_ONE; t >= 0; t = f->types[t].outer) {
+        if (f->types[t].end >= line) {
+            return t;
+        }
     }
-    return x->type > y->type ? -1 : (x->type < y->type);
+    return CS_NONE;
 }
 
-/* Scope of a definition starting at `line` in `file`: its namespace region,
- * the types enclosing it (the documented type itself first), their and the
- * documented method's type parameters, the usings in scope. `skip_type`
- * (>= 0) leaves that declaration out of the chain (base-type resolution). */
-static void ctx_init(cs_ctx_t *c, const cs_index_t *ix, const cbm_gbuf_t *g, int file,
-                     uint32_t line, int skip_type) {
-    memset(c, 0, sizeof(*c));
-    c->ix = ix;
-    c->g = g;
-    c->file = file;
-    c->f = &ix->files[file];
-    const cs_file_t *f = c->f;
-    int region = region_at(f, line);
-    c->ns = f->regions[region].ns;
-    c->prod = !f->is_test;
-    c->unit = f->unit;
-    c->inherit = true;
-    cs_span_t spans[CS_MAX_CHAIN * CBM_SZ_4];
-    int ns = 0;
-    for (int t = 0; t < f->ntypes && ns < (int)(sizeof(spans) / sizeof(spans[0])); t++) {
-        if (t == skip_type || f->types[t].start > line || f->types[t].end < line ||
-            f->types[t].entity < 0) {
-            continue;
+/* The innermost namespace declaration around `line` (0: the file itself). */
+static int region_at(const cs_file_t *f, uint32_t line) {
+    int lo = SKIP_ONE;
+    int hi = f->nregions;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (f->regions[mid].start <= line) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
         }
-        spans[ns++] = (cs_span_t){.start = f->types[t].start, .end = f->types[t].end, .type = t};
     }
-    qsort(spans, (size_t)ns, sizeof(spans[0]), span_inner_first);
-    for (int i = 0; i < ns && c->nchain < CS_MAX_CHAIN; i++) {
-        const cs_type_t *t = &f->types[spans[i].type];
-        bool dup = false;
-        for (int j = 0; j < c->nchain; j++) {
-            dup = dup || c->chain[j] == t->entity;
+    for (int r = lo - SKIP_ONE; r > 0; r = f->regions[r].parent) {
+        if (f->regions[r].end >= line) {
+            return r;
         }
-        if (dup) {
-            continue;
-        }
-        c->chain[c->nchain++] = t->entity;
-        c->tparams[c->ntparams++] = t->tparams;
     }
-    /* the documented method's own type parameters */
+    return 0;
+}
+
+/* The generic method declared at `line`, or CS_NONE: its type parameters are
+ * in scope in its documentation. Of the members that start at one line the
+ * generic methods stand first (finish_lookups), so the first one tells --
+ * however many members a line holds. */
+static int generic_method_at(const cs_file_t *f, uint32_t line) {
     int lo = 0;
     int hi = f->nmembers;
     while (lo < hi) {
@@ -2720,146 +5232,310 @@ static void ctx_init(cs_ctx_t *c, const cs_index_t *ix, const cbm_gbuf_t *g, int
             hi = mid;
         }
     }
-    for (int i = lo; i < f->nmembers; i++) {
-        const cs_member_t *m = &f->members[f->members_by_start[i]];
-        if (m->start != line) {
-            break;
-        }
-        if (m->kind == 'c' && m->tparams && m->tparams[0] && c->ntparams <= CS_MAX_CHAIN) {
-            c->tparams[c->ntparams++] = m->tparams;
-            break;
+    if (lo < f->nmembers) {
+        cs_work(SKIP_ONE);
+        int mi = f->members_by_start[lo];
+        const cs_member_t *m = &f->members[mi];
+        if (m->start == line && m->kind == 'c' && m->arity > 0) {
+            return mi;
         }
     }
-    ctx_collect_usings(c, region);
+    return CS_NONE;
 }
 
-/* ── Base types ──────────────────────────────────────────────────── */
+/* A scope of file `file`: the namespace declaration `region`, the type
+ * `type` and the ones around it. */
+static void ctx_at(cs_ctx_t *c, const cs_index_t *ix, int file, int region, int type) {
+    memset(c, 0, sizeof(*c));
+    c->ix = ix;
+    c->file = file;
+    c->f = &ix->files[file];
+    c->unit = c->f->unit;
+    c->group = c->unit >= 0 ? ix->units[c->unit].group : CS_NONE;
+    c->prod = !c->f->is_test;
+    c->region = region;
+    c->type = type;
+    c->member = CS_NONE;
+    c->skip_region = CS_NONE;
+}
 
-/* The type declared last with exactly `path` in `f` (its node owner), or -1. */
-static int type_with_path(const cs_file_t *f, const char *path) {
+/* The scope of the definition that starts at `line` (the documented type is
+ * itself the innermost one: its members and type parameters are in scope in
+ * its own documentation). A file's own doc stands outside every declaration. */
+static void ctx_init(cs_ctx_t *c, const cs_index_t *ix, int file, uint32_t line, bool file_doc) {
+    const cs_file_t *f = &ix->files[file];
+    int type = file_doc ? CS_NONE : type_at(f, line);
+    int region = file_doc ? 0 : (type >= 0 ? f->types[type].region : region_at(f, line));
+    ctx_at(c, ix, file, region, type);
+    c->member = (type >= 0 && f->nmembers > 0) ? generic_method_at(f, line) : CS_NONE;
+}
+
+/* True when `line` is in a part of the file whose declarations could not be
+ * placed (the ranges are sorted and disjoint). */
+static bool line_unplaced(const cs_file_t *f, uint32_t line) {
     int lo = 0;
-    int hi = f->ntypes;
+    int hi = f->nunplaced;
     while (lo < hi) {
         int mid = lo + ((hi - lo) / PAIR_LEN);
-        if (strcmp(f->types[f->types_by_path[mid]].path, path) < 0) {
+        if (f->unplaced[mid].to < line) {
             lo = mid + SKIP_ONE;
         } else {
             hi = mid;
         }
     }
-    int found = CBM_NOT_FOUND;
-    for (int i = lo; i < f->ntypes && strcmp(f->types[f->types_by_path[i]].path, path) == 0; i++) {
-        found = f->types_by_path[i];
-    }
-    return found;
+    return lo < f->nunplaced && f->unplaced[lo].from <= line;
 }
 
-/* Scope of a type DECLARATION for its base list, from structure alone (a
- * persisted scope has no lines): the declaring region, the enclosing types by
- * path, the usings in scope. */
-static void ctx_init_decl(cs_ctx_t *c, const cs_index_t *ix, const cbm_gbuf_t *g, int file,
-                          int type) {
-    memset(c, 0, sizeof(*c));
-    c->ix = ix;
-    c->g = g;
-    c->file = file;
-    c->f = &ix->files[file];
-    const cs_file_t *f = c->f;
-    const cs_type_t *t = &f->types[type];
-    int region = (t->region >= 0 && t->region < f->nregions) ? t->region : 0;
-    c->ns = f->regions[region].ns;
-    c->prod = false; /* a declared base is whatever the compiler bound */
-    c->unit = f->unit;
-    c->inherit = false;
-    char path[CS_KEY_BUF];
-    snprintf(path, sizeof(path), "%s", t->path);
-    for (;;) {
-        char *dot = strrchr(path, '.');
-        if (!dot) {
-            break;
-        }
-        *dot = '\0';
-        int outer = type_with_path(f, path);
-        if (outer >= 0 && f->types[outer].entity >= 0 && c->nchain < CS_MAX_CHAIN) {
-            c->chain[c->nchain++] = f->types[outer].entity;
-            c->tparams[c->ntparams++] = f->types[outer].tparams;
-        }
+/* ── Usings and base lists ───────────────────────────────────────── */
+
+static const char CS_GLOBAL_PREFIX[] = "global::";
+
+/* A written type or namespace name into `segs`; *glob when it starts at the
+ * global namespace. false for what is no dotted name (a tuple, an array, a
+ * pointer, a text this code did not understand). */
+static bool parse_name(const char *s, size_t n, cs_seg_t *segs, int *nsegs, bool *glob) {
+    size_t gl = sizeof(CS_GLOBAL_PREFIX) - SKIP_ONE;
+    *glob = n >= gl && strncmp(s, CS_GLOBAL_PREFIX, gl) == 0;
+    if (*glob) {
+        s += gl;
+        n -= gl;
     }
-    ctx_collect_usings(c, region);
+    return parse_path(s, n, segs, nsegs);
 }
 
-static void resolve_bases(cs_index_t *ix, const cbm_gbuf_t *g) {
-    for (int ei = 0; ei < ix->nents; ei++) {
-        cs_entity_t *e = &ix->ents[ei];
-        int bases[CS_MAX_CANDS];
-        int nb = 0;
-        for (int d = 0; d < e->ndecls; d++) {
-            const cs_file_t *f = &ix->files[e->decls[d].file];
-            const cs_type_t *t = &f->types[e->decls[d].type];
-            if (!t->bases || !t->bases[0]) {
-                continue;
+/* What a using directive names: a namespace into u->ns, a type into u->ent
+ * (CS_AMBIGUOUS for several). Both stay CS_NONE for what the repository does
+ * not have. `c` is the scope the directive is resolved in. */
+static void resolve_using(cs_using_t *u, const cs_ctx_t *c) {
+    cs_seg_t segs[CS_MAX_SEGS];
+    int n = 0;
+    cs_ctx_t at = *c;
+    bool glob = false;
+    u->ns = CS_NONE;
+    u->ent = CS_NONE;
+    if (!parse_name(u->target, strlen(u->target), segs, &n, &glob)) {
+        return;
+    }
+    at.glob = at.glob || glob;
+    cs_tp_t tp = resolve_path(&at, segs, n, false);
+    if (tp.st == CS_TP_NS && u->kind != 's') {
+        u->ns = tp.ns;
+    } else if (tp.st == CS_TP_TYPE && u->kind != 'n') {
+        u->ent = tp.ent;
+        u->joined = tp.joined;
+    } else if (tp.st == CS_TP_RES && res_is(&tp.res, CBM_DOCLINK_REASON_AMBIGUOUS) &&
+               u->kind != 'n') {
+        u->ent = CS_AMBIGUOUS;
+    }
+}
+
+/* True when the directive brings in names the repository does not declare:
+ * a namespace it has no declaration of (or a standard-library one, which it
+ * never has all of), a type it does not have. (An alias brings one name, and
+ * says so itself where it is used.) */
+static bool using_opens(const cs_index_t *ix, const cs_using_t *u) {
+    if (u->kind == 'n') {
+        return u->ns < 0 || !ix->nss[u->ns].declared || ix->nss[u->ns].standard;
+    }
+    return u->kind == 's' && u->ent == CS_NONE;
+}
+
+/* What every using directive names, and which scopes are open. A directive
+ * at the top of a file, a `global using` and a project file's <Using> are
+ * resolved from the global namespace: nothing else is in scope there (the
+ * directives beside it are not). A directive inside a namespace declaration
+ * is resolved in that namespace, without that declaration's own directives. */
+static bool resolve_usings(cs_index_t *ix) {
+    for (int ui = 0; ui < ix->nunits; ui++) {
+        cs_unit_t *unit = &ix->units[ui];
+        cs_ctx_t c = {.ix = ix,
+                      .type = CS_NONE,
+                      .member = CS_NONE,
+                      .unit = ui,
+                      .group = unit->group,
+                      .glob = true,
+                      .skip_region = CS_NONE};
+        for (int i = 0; i < unit->nusings; i++) {
+            resolve_using(&unit->usings[i], &c);
+            unit->open = unit->open || using_opens(ix, &unit->usings[i]);
+        }
+        if (!build_using_index(ix, unit->usings, unit->nusings, &unit->using_index)) {
+            return false;
+        }
+    }
+    for (int fi = 0; fi < ix->nfiles; fi++) {
+        cs_file_t *f = &ix->files[fi];
+        /* Regions are in ancestor order. Publish an outer region's index
+         * before resolving its children's targets; a region's own imports
+         * remain excluded by skip_region during their resolution. */
+        for (int r = 0; r < f->nregions; r++) {
+            cs_region_t *reg = &f->regions[r];
+            for (int i = reg->u_lo; i < reg->u_hi; i++) {
+                cs_ctx_t c;
+                ctx_at(&c, ix, fi, r, CS_NONE);
+                c.prod = false; /* a directive names whatever the compiler bound */
+                c.glob = r == 0;
+                c.skip_region = r;
+                resolve_using(&f->usings[i], &c);
             }
+            const cs_using_t *us = reg->u_hi > reg->u_lo ? f->usings + reg->u_lo : NULL;
+            if (!build_using_index(ix, us, reg->u_hi - reg->u_lo, &reg->using_index)) {
+                return false;
+            }
+        }
+        for (int r = 0; r < f->nregions; r++) {
+            cs_region_t *reg = &f->regions[r];
+            reg->open = r > 0 && f->regions[reg->parent].open;
+            for (int i = reg->u_lo; !reg->open && i < reg->u_hi; i++) {
+                reg->open = using_opens(ix, &f->usings[i]);
+            }
+        }
+    }
+    return true;
+}
+
+/* The entity a written base type names in the scope of its declaration, or
+ * CS_NONE. */
+static int base_entity(const cs_ctx_t *c, const char *s, size_t n) {
+    cs_seg_t segs[CS_MAX_SEGS];
+    int nsegs = 0;
+    cs_ctx_t at = *c;
+    bool glob = false;
+    if (!parse_name(s, n, segs, &nsegs, &glob)) {
+        return CS_NONE;
+    }
+    at.glob = glob;
+    cs_tp_t tp = resolve_path(&at, segs, nsegs, false);
+    return tp.st == CS_TP_TYPE ? tp.ent : CS_NONE;
+}
+
+/* The base types of every entity, from the base lists of all its
+ * declarations. A base that names nothing of the repository leaves the
+ * hierarchy open. false when memory ran out. */
+static bool resolve_bases(cs_index_t *ix) {
+    /* listed[b] == e + 1: b is in e's base list already (a partial type's
+     * declarations may each write the same base) */
+    int *listed =
+        (int *)cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)ix->nents + SKIP_ONE) * sizeof(int));
+    bool ok = listed != NULL;
+    for (int ei = 0; ok && ei < ix->nents; ei++) {
+        cs_entity_t *e = &ix->ents[ei];
+        int written = 0;
+        for (int d = 0; d < e->ndecls; d++) {
+            written += count_list(ix->files[e->decls[d].file].types[e->decls[d].type].bases, '|');
+        }
+        if (written == 0) {
+            continue;
+        }
+        e->bases = (int *)ix_alloc(ix, (size_t)written * sizeof(int));
+        ok = e->bases != NULL;
+        for (int d = 0; ok && d < e->ndecls; d++) {
+            const cs_type_t *t = &ix->files[e->decls[d].file].types[e->decls[d].type];
             cs_ctx_t c;
-            ctx_init_decl(&c, ix, g, e->decls[d].file, e->decls[d].type);
+            /* a base list is written outside the type it belongs to */
+            ctx_at(&c, ix, e->decls[d].file, t->region, t->outer);
+            c.prod = false; /* a declared base is whatever the compiler bound */
             for (const char *p = t->bases; p && *p;) {
                 const char *bar = strchr(p, '|');
                 size_t n = bar ? (size_t)(bar - p) : strlen(p);
-                cs_seg_t segs[CS_MAX_SEGS];
-                int nsegs = 0;
-                bool parsed = parse_path(p, n, segs, &nsegs);
-                bool bound = false;
-                if (parsed) {
-                    cs_tp_t tp = resolve_type_path(&c, segs, nsegs);
-                    if (tp.st == TP_OK && tp.ent != ei) {
-                        bool dup = false;
-                        for (int k = 0; k < nb; k++) {
-                            dup = dup || bases[k] == tp.ent;
-                        }
-                        if (!dup && nb < CS_MAX_CANDS) {
-                            bases[nb++] = tp.ent;
-                        }
-                        bound = true;
-                    }
-                }
-                if (!bound) {
-                    e->open = true; /* the hierarchy continues outside the corpus */
+                int base = base_entity(&c, p, n);
+                if (base < 0) {
+                    e->open = true; /* the hierarchy goes on outside the repository */
+                } else if (base != ei && listed[base] != ei + SKIP_ONE) {
+                    listed[base] = ei + SKIP_ONE;
+                    e->bases[e->nbases++] = base;
                 }
                 p = bar ? bar + SKIP_ONE : NULL;
             }
         }
-        if (nb > 0) {
-            e->bases = (int *)ix_alloc(ix, (size_t)nb * sizeof(int));
-            if (e->bases) {
-                memcpy(e->bases, bases, (size_t)nb * sizeof(int));
-                e->nbases = nb;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, listed);
+    ix->oom = ix->oom || !ok;
+    return ok;
+}
+
+/* How many entities `e` takes its openness from: its bases, and the shared
+ * trees' parts that belong to it (what they derive from, it derives from). */
+static int upper_count(const cs_entity_t *e) {
+    return e->nbases + (e->twin >= 0 ? SKIP_ONE : 0);
+}
+
+static int upper_at(const cs_entity_t *e, int k) {
+    return k < e->nbases ? e->bases[k] : e->twin;
+}
+
+/* open_any: a type whose own base, or a base of one of its supertypes, is
+ * outside the repository. Spread from the open types to everything derived
+ * from them, breadth first over the reversed base lists (a base list that
+ * goes round in a circle ends at the types already marked). false when
+ * memory ran out. */
+static bool spread_open(cs_index_t *ix) {
+    size_t n = (size_t)ix->nents;
+    int *first = (int *)cbm_calloc(CBM_MEM_CLASS_OTHER, (n + PAIR_LEN) * sizeof(int));
+    int *queue = (int *)cbm_alloc(CBM_MEM_CLASS_OTHER, (n + SKIP_ONE) * sizeof(int));
+    size_t edges = 0;
+    for (int i = 0; i < ix->nents; i++) {
+        edges += (size_t)upper_count(&ix->ents[i]);
+    }
+    int *derived = (int *)cbm_alloc(CBM_MEM_CLASS_OTHER, (edges + SKIP_ONE) * sizeof(int));
+    bool ok = first && queue && derived;
+    if (ok) {
+        int qn = 0;
+        /* first[b + 2] counts the types derived from b; after the running
+         * sum first[b + 1] is where b's list starts, and filling the lists
+         * moves it to where the list ends: first[b] .. first[b + 1] */
+        for (int i = 0; i < ix->nents; i++) {
+            for (int b = 0; b < upper_count(&ix->ents[i]); b++) {
+                first[upper_at(&ix->ents[i], b) + PAIR_LEN]++;
+            }
+        }
+        for (size_t i = PAIR_LEN; i < n + PAIR_LEN; i++) {
+            first[i] += first[i - SKIP_ONE];
+        }
+        for (int i = 0; i < ix->nents; i++) {
+            for (int b = 0; b < upper_count(&ix->ents[i]); b++) {
+                derived[first[upper_at(&ix->ents[i], b) + SKIP_ONE]++] = i;
+            }
+            if (ix->ents[i].open) {
+                ix->ents[i].open_any = true;
+                queue[qn++] = i;
+            }
+        }
+        for (int head = 0; head < qn; head++) {
+            int b = queue[head];
+            for (int k = first[b]; k < first[b + SKIP_ONE]; k++) {
+                if (!ix->ents[derived[k]].open_any) {
+                    ix->ents[derived[k]].open_any = true;
+                    queue[qn++] = derived[k];
+                }
             }
         }
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, first);
+    cbm_free(CBM_MEM_CLASS_OTHER, queue);
+    cbm_free(CBM_MEM_CLASS_OTHER, derived);
+    ix->oom = ix->oom || !ok;
+    return ok;
 }
 
 /* ── Index lifecycle and the resolver hooks ──────────────────────── */
 
-static int decl_order_cmp(const void *a, const void *b, const cs_index_t *ix) {
-    const cs_decl_t *x = (const cs_decl_t *)a;
-    const cs_decl_t *y = (const cs_decl_t *)b;
-    int c = strcmp(ix->files[x->file].rel_path, ix->files[y->file].rel_path);
-    if (c) {
-        return c;
+/* What made the run's ambiguous references ambiguous, by kind: the rows all
+ * say `ambiguous`, and only the scope's rules and the limits are the same in
+ * every repository. Nothing is logged for a run without one. */
+static void log_ambiguous(const cs_stats_t *st) {
+    char b[CS_WHY_COUNT][CBM_SZ_32];
+    uint64_t total = 0;
+    for (int i = 0; i < CS_WHY_COUNT; i++) {
+        uint64_t n = atomic_load(&st->ambiguous[i]);
+        total += n;
+        snprintf(b[i], sizeof(b[i]), "%llu", (unsigned long long)n);
     }
-    return x->type < y->type ? -1 : (x->type > y->type);
-}
-
-/* Insertion sort: decl lists are tiny (partial types). Files were added in
- * rel_path order already, so this only orders same-file declarations. */
-static void sort_decls(const cs_index_t *ix, cs_entity_t *e) {
-    for (int i = SKIP_ONE; i < e->ndecls; i++) {
-        cs_decl_t v = e->decls[i];
-        int j = i - SKIP_ONE;
-        while (j >= 0 && decl_order_cmp(&e->decls[j], &v, ix) > 0) {
-            e->decls[j + SKIP_ONE] = e->decls[j];
-            j--;
-        }
-        e->decls[j + SKIP_ONE] = v;
+    if (total > 0) {
+        cbm_log_info("doc_links.cs.ambiguous", "scope_rules", b[CS_WHY_SCOPE], "shared_trees",
+                     b[CS_WHY_SHARED], "assemblies", b[CS_WHY_ASSEMBLIES], "flavours",
+                     b[CS_WHY_FLAVOURS], "unseen_parts", b[CS_WHY_PARTS], "limits",
+                     b[CS_WHY_LIMIT]);
     }
 }
 
@@ -2868,18 +5544,167 @@ static void cs_destroy(void *index) {
     if (!ix) {
         return;
     }
+    if (ix->stats) {
+        log_ambiguous(ix->stats);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, ix->stats);
+    cbm_ht_free(ix->project_above);
+    cbm_ht_free(ix->ns_by_key);
     cbm_ht_free(ix->ent_by_key);
-    cbm_ht_free(ix->fqn_ents);
-    cbm_ht_free(ix->ns_types);
-    cbm_ht_free(ix->namespaces);
     cbm_ht_free(ix->type_names);
     cbm_ht_free(ix->quarantine);
     cbm_ht_free(ix->quarantine_test);
     cbm_ht_free(ix->unit_by_dir);
+    cbm_ht_free(ix->project_dirs);
+    cbm_ht_free(ix->group_by_stem);
+    cbm_ht_free(ix->specials);
+    cbm_msb_free(ix->msb);
     cbm_free(CBM_MEM_CLASS_OTHER, ix->ents);
     cbm_free(CBM_MEM_CLASS_OTHER, ix->run_to_file);
     cbm_arena_destroy(&ix->arena);
     cbm_free(CBM_MEM_CLASS_OTHER, ix);
+}
+
+/* Log why the index could not be built, and drop it. */
+static void *build_failed(cs_index_t *ix, const char *step, const char *reason, const char *path) {
+    cbm_log_error("doc_links.cs.error", "step", step, "reason", reason, "file", path ? path : "");
+    cs_destroy(ix);
+    return NULL;
+}
+
+/* The index's tables and the project files. false when memory ran out. */
+static bool build_tables(cs_index_t *ix, const cbm_doclink_build_in_t *in) {
+    cbm_arena_init(&ix->arena);
+    ix->project = in->ctx->project_name;
+    ix->bind_inherited = CS_BIND_INHERITED;
+    ix->ns_by_key = cbm_ht_create(CBM_SZ_1K);
+    ix->ent_by_key = cbm_ht_create(CBM_SZ_4K);
+    ix->type_names = cbm_ht_create(CBM_SZ_4K);
+    ix->quarantine = cbm_ht_create(CBM_SZ_64);
+    ix->quarantine_test = cbm_ht_create(CBM_SZ_64);
+    ix->unit_by_dir = cbm_ht_create(CBM_SZ_256);
+    ix->project_dirs = cbm_ht_create(CBM_SZ_256);
+    ix->project_above = cbm_ht_create(CBM_SZ_256);
+    ix->group_by_stem = cbm_ht_create(CBM_SZ_256);
+    ix->specials = cbm_ht_create(CBM_SZ_256);
+    ix->stats = (cs_stats_t *)cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(cs_stats_t));
+    ix->msb = cbm_msb_new();
+    ix->nfiles = in->file_count;
+    ix->files = (cs_file_t *)ix_zalloc(ix, (size_t)in->file_count * sizeof(cs_file_t));
+    ix->run_count = in->run_file_count;
+    ix->run_to_file = (int *)cbm_alloc(CBM_MEM_CLASS_OTHER,
+                                       ((size_t)in->run_file_count + SKIP_ONE) * sizeof(int));
+    if (!ix->ns_by_key || !ix->ent_by_key || !ix->type_names || !ix->quarantine ||
+        !ix->quarantine_test || !ix->unit_by_dir || !ix->project_dirs || !ix->project_above ||
+        !ix->group_by_stem || !ix->specials || !ix->stats || !ix->msb || !ix->files ||
+        !ix->run_to_file) {
+        return false;
+    }
+    for (int i = 0; i < in->run_file_count; i++) {
+        ix->run_to_file[i] = CS_NONE;
+    }
+    /* namespace 0: the global one */
+    ix->nss = (cs_ns_t *)ix_zalloc(ix, CBM_SZ_256 * sizeof(cs_ns_t));
+    if (!ix->nss) {
+        return false;
+    }
+    ix->nscap = CBM_SZ_256;
+    ix->nnss = SKIP_ONE;
+    ix->nss[0] = (cs_ns_t){.parent = CS_NONE, .name = ""};
+    return collect_projects(ix, in);
+}
+
+/* Every file of the index with what its scope declares. Returns the path of
+ * a file whose scope is not one this code wrote (the index is not built over
+ * such a scope: nothing may be resolved around a declaration that is not
+ * known), "" when memory ran out, NULL when all is well. */
+static const char *build_files(cs_index_t *ix, const cbm_doclink_build_in_t *in) {
+    CBMHashTable *dir_unit = cbm_ht_create(CBM_SZ_1K);
+    const char *bad = dir_unit ? NULL : "";
+    for (int i = 0; !bad && i < in->file_count; i++) {
+        const cbm_doclink_file_t *src = &in->files[i];
+        cs_file_t *f = &ix->files[i];
+        f->rel_path = src->rel_path;
+        f->module_qn =
+            cbm_fqn_module_source_lang(&ix->arena, ix->project, src->rel_path, CBM_LANG_CSHARP);
+        f->is_test = cs_is_test_path(src->rel_path);
+        /* a project file declares nothing: its blob went to the evaluator */
+        const char *scope = cbm_msb_is_project_scope(src->scope) ? NULL : src->scope;
+        if (scope && !parse_scope(ix, f, scope)) {
+            bad = ix->oom ? "" : src->rel_path;
+            break;
+        }
+        if (!scope) {
+            /* no scope: an empty file (only its own region) */
+            f->regions = (cs_region_t *)ix_zalloc(ix, sizeof(cs_region_t));
+            f->nregions = SKIP_ONE;
+            if (f->regions) {
+                f->regions[0].parent = CS_NONE;
+            }
+        }
+        f->unit = unit_of(ix, dir_unit, src->rel_path);
+        f->is_ref = f->unit >= 0 && ix->units[f->unit].is_ref;
+        if (src->run_file >= 0 && src->run_file < in->run_file_count) {
+            ix->run_to_file[src->run_file] = i;
+        }
+        if (!f->module_qn || ix->oom) {
+            bad = "";
+        }
+    }
+    cbm_ht_free(dir_unit);
+    /* which namespaces are the standard library's: a namespace is made after
+     * the one above it, so one pass in order sees every parent first */
+    for (int i = SKIP_ONE; i < ix->nnss; i++) {
+        cs_ns_t *n = &ix->nss[i];
+        n->standard =
+            n->parent == 0 ? strcmp(n->name, CS_STANDARD_ROOT) == 0 : ix->nss[n->parent].standard;
+    }
+    return bad;
+}
+
+/* The graph node of every declaration. false when memory ran out. */
+static bool build_nodes(cs_index_t *ix, const cbm_gbuf_t *g) {
+    cs_node_pass_t np = {.names = cbm_ht_create(CBM_SZ_256)};
+    cbm_arena_init(&np.keys);
+    bool ok = np.names != NULL;
+    for (int i = 0; ok && i < ix->nfiles; i++) {
+        ok = bind_nodes(ix, &ix->files[i], g, &np);
+    }
+    cbm_ht_free(np.names);
+    cbm_arena_destroy(&np.keys);
+    cbm_free(CBM_MEM_CLASS_OTHER, np.last);
+    return ok;
+}
+
+static void log_index(const cs_index_t *ix, const cs_msb_totals_t *msb) {
+    int incomplete = 0;
+    int open_units = 0;
+    for (int i = 0; i < ix->nents; i++) {
+        incomplete += ix->ents[i].incomplete;
+    }
+    for (int i = 0; i < ix->nunits; i++) {
+        open_units += ix->units[i].open;
+    }
+    char b[CBM_SZ_7][CBM_SZ_32];
+    snprintf(b[0], sizeof(b[0]), "%d", ix->nfiles);
+    snprintf(b[1], sizeof(b[1]), "%d", ix->nents);
+    snprintf(b[2], sizeof(b[2]), "%d", ix->nunits - ix->nshared);
+    snprintf(b[3], sizeof(b[3]), "%d", incomplete);
+    snprintf(b[4], sizeof(b[4]), "%u",
+             (unsigned)(cbm_ht_count(ix->quarantine) + cbm_ht_count(ix->quarantine_test)));
+    snprintf(b[5], sizeof(b[5]), "%d", ix->ngroups);
+    snprintf(b[6], sizeof(b[6]), "%d", ix->nshared);
+    cbm_log_info("doc_links.cs.index", "files", b[0], "types", b[1], "projects", b[2], "assemblies",
+                 b[5], "shared_trees", b[6], "incomplete_types", b[3], "quarantined_names", b[4]);
+    /* what the MSBuild project files could not tell: conditions, values and
+     * constructs that were not evaluated, and imports of files the index
+     * does not hold */
+    snprintf(b[0], sizeof(b[0]), "%d", ix->nprojects);
+    snprintf(b[1], sizeof(b[1]), "%d", msb->unevaluable);
+    snprintf(b[2], sizeof(b[2]), "%d", msb->outside);
+    snprintf(b[3], sizeof(b[3]), "%d", open_units);
+    cbm_log_info("doc_links.cs.msbuild", "project_files", b[0], "unevaluable", b[1],
+                 "imports_outside", b[2], "open_projects", b[3]);
 }
 
 static void *cs_build(const cbm_doclink_build_in_t *in) {
@@ -2887,139 +5712,88 @@ static void *cs_build(const cbm_doclink_build_in_t *in) {
     if (!ix) {
         return NULL;
     }
-    cbm_arena_init(&ix->arena);
-    ix->project = in->ctx->project_name;
-    ix->repo_path = in->ctx->repo_path;
-    ix->ent_by_key = cbm_ht_create(CBM_SZ_4K);
-    ix->fqn_ents = cbm_ht_create(CBM_SZ_4K);
-    ix->ns_types = cbm_ht_create(CBM_SZ_4K);
-    ix->namespaces = cbm_ht_create(CBM_SZ_1K);
-    ix->type_names = cbm_ht_create(CBM_SZ_4K);
-    ix->quarantine = cbm_ht_create(CBM_SZ_64);
-    ix->quarantine_test = cbm_ht_create(CBM_SZ_64);
-    ix->unit_by_dir = cbm_ht_create(CBM_SZ_256);
-    CBMHashTable *dir_unit = cbm_ht_create(CBM_SZ_1K);
-    ix->nfiles = in->file_count;
-    ix->files = (cs_file_t *)ix_alloc(ix, (size_t)(in->file_count ? in->file_count : 1) *
-                                              sizeof(cs_file_t));
-    ix->run_count = in->run_file_count;
-    ix->run_to_file = (int *)cbm_alloc(
-        CBM_MEM_CLASS_OTHER, (size_t)(in->run_file_count ? in->run_file_count : 1) * sizeof(int));
-    if (!ix->ent_by_key || !ix->fqn_ents || !ix->ns_types || !ix->namespaces || !ix->type_names ||
-        !ix->quarantine || !ix->quarantine_test || !ix->unit_by_dir || !dir_unit || !ix->files ||
-        !ix->run_to_file) {
-        cbm_log_error("doc_links.cs.error", "step", "tables", "reason", "alloc");
-        cbm_ht_free(dir_unit);
-        cs_destroy(ix);
-        return NULL;
+    if (!build_tables(ix, in)) {
+        return build_failed(ix, "tables", "alloc", NULL);
     }
-    for (int i = 0; i < in->run_file_count; i++) {
-        ix->run_to_file[i] = CBM_NOT_FOUND;
+    const char *bad = build_files(ix, in);
+    if (bad) {
+        return build_failed(ix, "scopes", bad[0] ? "bad_scope" : "alloc", bad);
     }
-    int bad_scopes = 0;
-    for (int i = 0; i < in->file_count; i++) {
-        const cbm_doclink_file_t *src = &in->files[i];
-        cs_file_t *f = &ix->files[i];
-        memset(f, 0, sizeof(*f));
-        f->rel_path = ix_strdup(ix, src->rel_path);
-        f->module_qn =
-            cbm_fqn_module_source_lang(&ix->arena, ix->project, src->rel_path, CBM_LANG_CSHARP);
-        f->is_test = cs_is_test_path(src->rel_path);
-        if (!src->scope || !parse_scope(ix, f, src->scope)) {
-            bad_scopes += src->scope != NULL;
-            /* no scope: an empty file (only the root region) */
-            f->regions = (cs_region_t *)ix_alloc(ix, sizeof(cs_region_t));
-            if (!f->regions) {
-                cbm_log_error("doc_links.cs.error", "step", "files", "reason", "alloc");
-                cbm_ht_free(dir_unit);
-                cs_destroy(ix);
-                return NULL;
-            }
-            f->regions[0] = (cs_region_t){.parent = CBM_NOT_FOUND, .end = UINT32_MAX, .ns = ""};
-            f->nregions = SKIP_ONE;
-            f->nusings = f->ntypes = f->nmembers = f->nunplaced = 0;
-        }
-        f->unit = unit_of(ix, dir_unit, src->rel_path);
-        if (src->run_file >= 0 && src->run_file < in->run_file_count) {
-            ix->run_to_file[src->run_file] = i;
-        }
+    cs_msb_totals_t msb = {0};
+    if (!units_collect_usings(ix, &msb)) {
+        return build_failed(ix, "projects", "alloc", NULL);
     }
-    cbm_ht_free(dir_unit);
-    if (ix->oom) {
-        cbm_log_error("doc_links.cs.error", "step", "scopes", "reason", "alloc");
-        cs_destroy(ix);
-        return NULL;
+    if (!build_entities(ix) || !entity_units(ix) || !entity_fulls(ix) || !build_named(ix)) {
+        return build_failed(ix, "entities", "alloc", NULL);
     }
-    if (bad_scopes > 0) {
-        char b[CBM_SZ_32];
-        snprintf(b, sizeof(b), "%d", bad_scopes);
-        cbm_log_warn("doc_links.cs.bad_scope", "files", b);
+    entity_twins(ix);
+    if (!build_nodes(ix, in->graph) || !build_binds(ix) || !build_mrefs(ix) || !build_extras(ix)) {
+        return build_failed(ix, "nodes", "alloc", NULL);
     }
-    units_collect_usings(ix);
-    int skipped = 0;
-    if (!build_entities(ix, &skipped) || ix->oom) {
-        cbm_log_error("doc_links.cs.error", "step", "entities", "reason", "alloc");
-        cs_destroy(ix);
-        return NULL;
+    if (!build_name_scopes(ix) || !resolve_usings(ix)) {
+        return build_failed(ix, "usings", "alloc", NULL);
     }
-    for (int i = 0; i < ix->nents; i++) {
-        sort_decls(ix, &ix->ents[i]);
+    if (!resolve_bases(ix) || !spread_open(ix) || ix->oom) {
+        return build_failed(ix, "bases", "alloc", NULL);
     }
-    resolve_bases(ix, in->graph);
-    if (ix->oom) {
-        cbm_log_error("doc_links.cs.error", "step", "bases", "reason", "alloc");
-        cs_destroy(ix);
-        return NULL;
-    }
-    int incomplete = 0;
-    for (int i = 0; i < ix->nents; i++) {
-        incomplete += ix->ents[i].incomplete;
-    }
-    char b[6][CBM_SZ_32];
-    snprintf(b[0], sizeof(b[0]), "%d", ix->nfiles);
-    snprintf(b[1], sizeof(b[1]), "%d", ix->nents);
-    snprintf(b[2], sizeof(b[2]), "%d", ix->nunits);
-    snprintf(b[3], sizeof(b[3]), "%d", skipped);
-    snprintf(b[4], sizeof(b[4]), "%d", incomplete);
-    snprintf(b[5], sizeof(b[5]), "%u",
-             (unsigned)(cbm_ht_count(ix->quarantine) + cbm_ht_count(ix->quarantine_test)));
-    cbm_log_info("doc_links.cs.index", "files", b[0], "types", b[1], "projects", b[2],
-                 "skipped_types", b[3], "incomplete_types", b[4], "quarantined_names", b[5]);
+    log_index(ix, &msb);
     return ix;
 }
 
-/* R4: a keyword alias (int, string ...) or a qualified System.* name that the
- * corpus does not declare is the BCL's, not missing. (An unknown qualified
- * head that is neither a corpus namespace nor a corpus type is already
- * external through classify_unfound_type.) */
-static int r4_reason(const cs_ref_t *r, bool parsed, const char *raw, int reason) {
-    if (reason != CBM_DOCLINK_REASON_MISSING && reason != CBM_DOCLINK_REASON_UNPARSEABLE) {
-        return reason;
+/* The reason for a reference this code does not understand: one that names a
+ * keyword type in a form that is no name (`int[]`, `string?`) is the BCL's;
+ * one too long to be read is never judged by its beginning. */
+static int unparsed_reason(const char *raw) {
+    const char *s = raw ? raw : "";
+    while (isspace((unsigned char)*s)) {
+        s++;
     }
-    if (parsed && r->keyword_rewrite) {
-        return CBM_DOCLINK_REASON_EXTERNAL;
+    char head[CBM_SZ_32];
+    size_t n = strcspn(s, "({<.[?* \t");
+    if (strlen(s) >= CS_REF_BUF || n == 0 || n >= sizeof(head)) {
+        return CBM_DOCLINK_REASON_UNPARSEABLE;
     }
-    if (!parsed) {
-        /* the head of the raw text before any parameter / type-argument list */
-        char head[CBM_SZ_256];
-        const char *s = raw;
-        if (s[0] && s[1] == ':') {
-            s += PAIR_LEN;
+    memcpy(head, s, n);
+    head[n] = '\0';
+    return keyword_type(head) ? CBM_DOCLINK_REASON_EXTERNAL : CBM_DOCLINK_REASON_UNPARSEABLE;
+}
+
+/* A keyword alias (`int`, `string.Empty`) names its System type whatever
+ * stands around the reference. */
+static void rewrite_keyword(cs_ref_t *r) {
+    static const char system_ns[] = "System";
+    if (r->docid || r->nsegs == 0 || r->nsegs >= CS_MAX_SEGS || r->segs[0].arity > 0) {
+        return;
+    }
+    const char *bcl = keyword_type(r->segs[0].name);
+    if (!bcl) {
+        return;
+    }
+    memmove(&r->segs[1], &r->segs[0], (size_t)r->nsegs * sizeof(cs_seg_t));
+    r->segs[0] = (cs_seg_t){.arity = CS_ARITY_NONE};
+    snprintf(r->segs[0].name, sizeof(r->segs[0].name), "%s", system_ns);
+    snprintf(r->segs[1].name, sizeof(r->segs[1].name), "%s", bcl);
+    r->nsegs++;
+    r->keyword = true;
+    r->glob = true;
+}
+
+/* True when the reference names a type some file declares at a place no
+ * scope could be established for: it could be that declaration. */
+static bool names_quarantined(const cs_index_t *ix, const cs_file_t *f, const cs_ref_t *r) {
+    for (int i = 0; i < r->nsegs; i++) {
+        if (cbm_ht_get(ix->quarantine, r->segs[i].name) ||
+            (f->is_test && cbm_ht_get(ix->quarantine_test, r->segs[i].name))) {
+            return true;
         }
-        size_t n = strcspn(s, "({<.");
-        snprintf(head, sizeof(head), "%.*s", (int)n, s);
-        return keyword_type(head) ? CBM_DOCLINK_REASON_EXTERNAL : reason;
     }
-    if (reason == CBM_DOCLINK_REASON_MISSING && r->nsegs > SKIP_ONE &&
-        strcmp(r->segs[0].name, "System") == 0) {
-        return CBM_DOCLINK_REASON_EXTERNAL;
-    }
-    return reason;
+    return false;
 }
 
 static void cs_resolve(const void *index, int run_file, const CBMDocLink *link,
                        const cbm_gbuf_t *graph, cbm_doclink_outcome_t *out) {
     const cs_index_t *ix = (const cs_index_t *)index;
+    (void)graph; /* every node was looked up when the index was built */
     out->kind = CBM_DOCLINK_UNRESOLVED;
     out->reason = CBM_DOCLINK_REASON_MISSING;
     out->target = NULL;
@@ -3029,81 +5803,47 @@ static void cs_resolve(const void *index, int run_file, const CBMDocLink *link,
     }
     cs_ref_t r;
     if (!parse_cref(link->raw, &r)) {
-        out->reason =
-            r4_reason(&r, false, link->raw ? link->raw : "", CBM_DOCLINK_REASON_UNPARSEABLE);
+        out->reason = unparsed_reason(link->raw);
         return;
     }
-    if (!r.docid && r.nsegs > 0 && r.nsegs < CS_MAX_SEGS) {
-        const char *bcl = keyword_type(r.segs[0].name);
-        if (bcl) {
-            memmove(&r.segs[1], &r.segs[0], (size_t)r.nsegs * sizeof(cs_seg_t));
-            snprintf(r.segs[0].name, sizeof(r.segs[0].name), "System");
-            r.segs[0].arity = CS_ARITY_NONE;
-            snprintf(r.segs[1].name, sizeof(r.segs[1].name), "%s", bcl);
-            r.nsegs++;
-            r.keyword_rewrite = true;
-        }
-    }
+    rewrite_keyword(&r);
     /* What could not be placed is not resolved around: a definition in the
      * part of its file where the braces stop pairing has no known scope, and
      * a name some file declares without a known namespace could be that
      * declaration. Both are declared-but-unplaced, i.e. graph gaps. */
-    const cs_file_t *f = &ix->files[ix->run_to_file[run_file]];
-    bool unplaced = false;
-    for (int i = 0; !unplaced && i < f->nunplaced; i++) {
-        unplaced = link->def_line >= f->unplaced[i].from && link->def_line <= f->unplaced[i].to;
-    }
-    for (int i = 0; !unplaced && i < r.nsegs; i++) {
-        unplaced = cbm_ht_get(ix->quarantine, r.segs[i].name) != NULL ||
-                   (f->is_test && cbm_ht_get(ix->quarantine_test, r.segs[i].name) != NULL);
-    }
-    if (unplaced) {
+    int file = ix->run_to_file[run_file];
+    const cs_file_t *f = &ix->files[file];
+    bool file_doc = (link->flags & CBM_DOCLINK_FLAG_FILE) != 0;
+    if ((!file_doc && line_unplaced(f, link->def_line)) || names_quarantined(ix, f, &r)) {
         out->reason = CBM_DOCLINK_REASON_GRAPH_GAP;
         return;
     }
     cs_ctx_t c;
-    ctx_init(&c, ix, graph, ix->run_to_file[run_file], link->def_line, CBM_NOT_FOUND);
+    ctx_init(&c, ix, file, link->def_line, file_doc);
     c.glob = r.glob;
     cs_res_t res = resolve_ref(&c, &r);
     if (res.st == CS_LOCAL) {
         out->kind = CBM_DOCLINK_LOCAL;
-        return;
-    }
-    if (res.st == CS_OK && res.node) {
+    } else if (res.st == CS_OK && res.node) {
         out->kind = CBM_DOCLINK_EDGE;
         out->target = res.node;
         out->exact = res.exact;
-        return;
+    } else if (r.keyword && res.reason == CBM_DOCLINK_REASON_MISSING) {
+        out->reason = CBM_DOCLINK_REASON_EXTERNAL; /* the repository does not declare it */
+    } else {
+        out->reason = res.reason;
+        if (res.reason == CBM_DOCLINK_REASON_AMBIGUOUS && res.why < CS_WHY_COUNT) {
+            atomic_fetch_add_explicit(&ix->stats->ambiguous[res.why], 1, memory_order_relaxed);
+        }
     }
-    out->reason = r4_reason(&r, true, link->raw, res.reason);
 }
 
 /* ── Incremental scope rules ─────────────────────────────────────── */
 
-static bool cs_ci_suffix(const char *s, const char *sfx) {
-    size_t n = strlen(s);
-    size_t sl = strlen(sfx);
-    if (n < sl) {
-        return false;
-    }
-    for (size_t i = 0; i < sl; i++) {
-        if (tolower((unsigned char)s[n - sl + i]) != sfx[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/* MSBuild project files set the global usings of every C# file of their
- * project (R1), so a change to one is never repairable file by file. */
-static bool cs_scope_input(const char *rel_path) {
-    return cs_ci_suffix(rel_path, ".csproj") || cs_ci_suffix(rel_path, ".props") ||
-           cs_ci_suffix(rel_path, ".targets");
-}
-
 /* Scope line fields (0-based, the tag is field 0; internal/cbm/doclink_cs.c):
- * `U region kind alias target` and `M start kind explicit path tparams sig`. */
-enum { CS_SCOPE_U_KIND = 2, CS_SCOPE_M_PATH = 4 };
+ * `U region kind alias target`, `T region start end kind outer name tparams
+ * bases` and `M start kind explicit type name tparams sig`. */
+enum { CS_SCOPE_U_KIND = 2, CS_SCOPE_M_NAME = 5, CS_SCOPE_T_BASES = 8 };
 
 static const char *delta_field(const char *line, size_t len, int idx, size_t *flen) {
     int f = 0;
@@ -3122,26 +5862,25 @@ static const char *delta_field(const char *line, size_t len, int idx, size_t *fl
     return NULL;
 }
 
-/* A using directive only its own file sees: kind n (namespace), s (static) or
- * a (alias). A `global using` namespace (g) is in scope in every file of the
- * project. */
+/* A using directive only its own file sees: one that is not `global`. */
 static bool delta_local_using(const char *line, size_t len) {
     if (line[0] != 'U') {
         return false;
     }
     size_t klen = 0;
     const char *kind = delta_field(line, len, CS_SCOPE_U_KIND, &klen);
-    return kind && klen == SKIP_ONE && kind[0] != 'g';
+    return kind && klen > 0 && !memchr(kind, 'g', klen);
 }
 
-/* The next scope line that concerns other files (the file's own usings are
- * skipped); false at the end. */
-static bool delta_next_line(const char **cursor, const char **line, size_t *len) {
+/* The next scope line -- with `local_usings` only the file's own using
+ * directives, without it every other line; false at the end. */
+static bool delta_next_line(const char **cursor, bool local_usings, const char **line,
+                            size_t *len) {
     for (const char *p = *cursor; p && *p;) {
         const char *nl = strchr(p, '\n');
         size_t n = nl ? (size_t)(nl - p) : strlen(p);
         const char *next = nl ? nl + SKIP_ONE : p + n;
-        if (n > 0 && !delta_local_using(p, n)) {
+        if (n > 0 && delta_local_using(p, n) == local_usings) {
             *line = p;
             *len = n;
             *cursor = next;
@@ -3153,63 +5892,104 @@ static bool delta_next_line(const char **cursor, const char **line, size_t *len)
     return false;
 }
 
+/* True when the two scopes have the same own using directives, in order. */
+static bool delta_same_usings(const char *stored, const char *fresh) {
+    const char *sl = NULL;
+    const char *fl = NULL;
+    size_t slen = 0;
+    size_t flen = 0;
+    for (;;) {
+        bool hs = delta_next_line(&stored, true, &sl, &slen);
+        bool hf = delta_next_line(&fresh, true, &fl, &flen);
+        if (!hs || !hf) {
+            return hs == hf;
+        }
+        if (slen != flen || memcmp(sl, fl, slen) != 0) {
+            return false;
+        }
+    }
+}
+
+/* True when the scope declares a type that has a base list. */
+static bool delta_has_bases(const char *scope) {
+    for (const char *p = scope; p && *p;) {
+        const char *nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        size_t blen = 0;
+        if (p[0] == 'T' && delta_field(p, n, CS_SCOPE_T_BASES, &blen) && blen > 0) {
+            return true;
+        }
+        p = nl ? nl + SKIP_ONE : NULL;
+    }
+    return false;
+}
+
 /* Compare a changed file's stored and fresh scopes line by line, in order.
  * Two differences leave every other file's resolution alone:
- *   - the file's own using directives (namespace, static, alias): they scope
- *     the file itself, and it is re-extracted anyway;
+ *   - the file's own using directives (namespace, static, alias), as long as
+ *     the file declares no type with a base list: they scope the file
+ *     itself, and it is re-extracted anyway. A base list is resolved through
+ *     them, and what a type derives from decides how OTHER files' references
+ *     to its members come out;
  *   - a member the fresh scope no longer has. Every member line is a method,
- *     constructor, property, field, event or enum member, so a reference that
- *     depended on it either bound it (an edge into this file) or names it in
- *     its unresolved row: the name is reported.
+ *     constructor, property, field, event, operator, indexer or enum member,
+ *     so a reference that depended on it either bound it (an edge into this
+ *     file) or names it in its unresolved row: the name is reported.
  * Everything else is GLOBAL: a new or changed line (a type, a member, a
  * signature, a namespace, a global using), a removed type (it may be another
  * type's base or an alias target, which changes how references THROUGH those
  * classify), a removed namespace, global using, quarantined name or unplaced
  * range, and a changed order (same-path declarations own their node by
- * order). */
+ * order, and a record names its type by its position).
+ *
+ * An MSBuild project file's blob sets the global usings of every C# file of
+ * its project: any difference between two of those is GLOBAL. An edit that
+ * leaves the blob as it is -- a target, a package reference -- changes
+ * nobody's scope. */
 static int cs_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
                           void *ud) {
+    if (cbm_msb_is_project_scope(stored) || cbm_msb_is_project_scope(fresh)) {
+        return strcmp(stored, fresh) == 0 ? CBM_DOCLINK_DELTA_LOCAL : CBM_DOCLINK_DELTA_GLOBAL;
+    }
+    if (!delta_same_usings(stored, fresh) && (delta_has_bases(stored) || delta_has_bases(fresh))) {
+        return CBM_DOCLINK_DELTA_GLOBAL;
+    }
     const char *sp = stored;
     const char *fp = fresh;
     const char *sl = NULL;
     const char *fl = NULL;
     size_t slen = 0;
     size_t flen = 0;
-    bool hs = delta_next_line(&sp, &sl, &slen);
-    bool hf = delta_next_line(&fp, &fl, &flen);
+    bool hs = delta_next_line(&sp, false, &sl, &slen);
+    bool hf = delta_next_line(&fp, false, &fl, &flen);
     while (hs || hf) {
         if (hs && hf && slen == flen && memcmp(sl, fl, slen) == 0) {
-            hs = delta_next_line(&sp, &sl, &slen);
-            hf = delta_next_line(&fp, &fl, &flen);
+            hs = delta_next_line(&sp, false, &sl, &slen);
+            hf = delta_next_line(&fp, false, &fl, &flen);
             continue;
         }
         if (!hs || sl[0] != 'M') {
             return CBM_DOCLINK_DELTA_GLOBAL;
         }
-        size_t plen = 0;
-        const char *path = delta_field(sl, slen, CS_SCOPE_M_PATH, &plen);
-        if (!path || plen == 0) {
-            return CBM_NOT_FOUND; /* not a member line this code wrote */
+        size_t nlen = 0;
+        const char *name = delta_field(sl, slen, CS_SCOPE_M_NAME, &nlen);
+        if (!name || nlen == 0 || !removed || !removed(ud, name, nlen)) {
+            return CBM_NOT_FOUND; /* not a member line this code wrote, or not recordable */
         }
-        size_t s = plen;
-        while (s > 0 && path[s - SKIP_ONE] != '.') {
-            s--;
-        }
-        if (!removed || !removed(ud, path + s, plen - s)) {
-            return CBM_NOT_FOUND;
-        }
-        hs = delta_next_line(&sp, &sl, &slen);
+        hs = delta_next_line(&sp, false, &sl, &slen);
     }
     return CBM_DOCLINK_DELTA_LOCAL;
 }
 
+/* XML is listed for the MSBuild project files: their scope blobs carry the C#
+ * tag, and the index needs the ones of this run as it needs the stored ones.
+ * An XML file that is no project file has no blob and no references. */
 const cbm_doclink_resolver_t cbm_doclink_cs_resolver = {
-    .langs = {CBM_LANG_CSHARP},
-    .lang_count = 1,
+    .langs = {CBM_LANG_CSHARP, CBM_LANG_XML},
+    .lang_count = 2,
     .scope_tag = CBM_DOCLINK_CS_SCOPE_TAG,
     .build = cs_build,
     .destroy = cs_destroy,
     .resolve = cs_resolve,
-    .scope_input = cs_scope_input,
     .scope_delta = cs_scope_delta,
 };

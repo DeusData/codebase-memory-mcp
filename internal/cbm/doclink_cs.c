@@ -8,38 +8,48 @@
  *
  * Scope blob (one record per line, tab-separated, first line "cs1"; records
  * in document order, so a member follows its type):
- *   X  from  to                                lines whose declarations could
- *                                              not be placed (the braces stop
- *                                              pairing, a namespace cannot be
- *                                              named): a definition there has
- *                                              no known scope
- *   R  id  parent  start  end  namespace        namespace region (0 = file)
- *   U  region  kind  alias  target             using: n namespace, s static,
- *                                              a alias, g global
- *   T  region  start  end  kind  path  tparams  bases
- *                                              type: c s i e r d (class,
- *                                              struct, interface, enum,
- *                                              record, delegate), followed by
- *                                              '!' when a parse error hides
- *                                              some of its members; path is
- *                                              the dotted local path
- *                                              (Outer.Inner), tparams
- *                                              ','-joined, bases '|'-joined as
- *                                              written
- *   M  start  kind  explicit  path  tparams  sig
- *                                              member: c callable (method,
- *                                              constructor), v value
- *                                              (property, field, constant,
- *                                              enum member, record parameter),
- *                                              e event; sig '|'-joined
- *                                              normalized parameter types, '-'
- *                                              for a non-callable
- *   Q  name                                    a type that is declared, but
- *                                              whose namespace or outer type
- *                                              could not be established
- * Everything is derived from the tree alone, so the blob is a pure function
- * of the file's bytes. Nesting is the tree's while the tree has no parse
- * error, and the braces' otherwise (see "Braces" below).
+ *   X  from  to                    lines whose declarations could not be
+ *                                  placed (the braces stop pairing, a
+ *                                  namespace cannot be named, a block nests
+ *                                  past a limit): a definition there has no
+ *                                  known scope
+ *   R  id  parent  start  end  name
+ *                                  namespace region: `name` as its
+ *                                  declaration writes it (`A.B`), inside the
+ *                                  region `parent` (0 = the file)
+ *   U  region  kind  alias  target
+ *                                  using: n namespace, s static, a alias;
+ *                                  a `g` after it for a `global using`
+ *   T  region  start  end  kind  outer  name  tparams  bases
+ *                                  type: c class, s struct, i interface, e
+ *                                  enum, r record class, t record struct, d
+ *                                  delegate; then `p` when it is declared
+ *                                  partial, then `!` when a parse error hides
+ *                                  some of its members. `outer` is the ordinal
+ *                                  of the enclosing type's T record (its
+ *                                  position among the file's T records), `-`
+ *                                  for none. tparams ','-joined, bases
+ *                                  '|'-joined as written
+ *   M  start  kind  explicit  type  name  tparams  sig
+ *                                  member of the type with ordinal `type`: c
+ *                                  callable (method, constructor, primary
+ *                                  constructor), v field (constant, enum
+ *                                  member), p property (record parameter), e
+ *                                  event, o operator (name: its token, or
+ *                                  `implicit` / `explicit`), x indexer (name
+ *                                  `this`); then `s` for what `using static`
+ *                                  brings in (static or const, an enum's
+ *                                  member, no extension method; a static
+ *                                  constructor too). sig: '|'-joined normalized
+ *                                  parameter types, '-' for v, p and e
+ *   Q  name                        a type that is declared, but whose
+ *                                  namespace or outer type could not be
+ *                                  established
+ * A record names its outer type and its owner by ordinal, never by a path, so
+ * the blob grows with the file and not with the nesting. Everything is
+ * derived from the tree alone, so the blob is a pure function of the file's
+ * bytes. Nesting is the tree's while the tree has no parse error, and the
+ * braces' otherwise (see "Braces" below).
  */
 #include "doclink.h"
 
@@ -64,7 +74,7 @@ typedef struct {
     bool failed;
 } cs_sb_t;
 
-enum { CS_SB_INIT = 1024, CS_SCAN_MAX_DEPTH = 256, CS_UINT_DIGITS = 16, CS_NAME_MAX = 512 };
+enum { CS_SB_INIT = 1024, CS_UINT_DIGITS = 16, CS_NAME_MAX = 512 };
 
 static void sb_reserve(cs_sb_t *sb, size_t extra) {
     if (sb->failed || sb->len + extra + SKIP_ONE <= sb->cap) {
@@ -139,7 +149,20 @@ static bool cs_attr_name_char(char c) {
 /* Decode the five XML entities, drop the comment prefix (`///`, ` * `) that
  * follows a line break inside a value, collapse whitespace, trim. */
 static const char *cs_clean_value(CBMArena *a, const char *v, size_t n) {
-    char *out = (char *)cbm_arena_alloc(a, n + SKIP_ONE);
+    char *out;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_VALUE)) {
+        out = NULL;
+    } else
+#endif
+    {
+        out = (char *)cbm_arena_alloc(a, n + SKIP_ONE);
+    }
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (out) {
+        cbm_doclink_test_note_doc_work(0, 0, n + SKIP_ONE);
+    }
+#endif
     if (!out) {
         return NULL;
     }
@@ -198,12 +221,29 @@ static const char *cs_clean_value(CBMArena *a, const char *v, size_t n) {
     return out;
 }
 
-void cbm_doclink_cs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
-                              uint32_t doc_line) {
+bool cbm_doclink_cs_parse_doc_checked(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                      uint32_t doc_line) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    cbm_doclink_test_note_doc_work(0, strlen(doc), 0);
+#endif
+    bool complete = true;
     const char *p = doc;
     const char *counted = doc;
     uint32_t line = doc_line;
     while ((p = strchr(p, '<')) != NULL) {
+        /* what stands in an XML comment or a CDATA section is text, not
+         * markup: a cref written there is no reference */
+        static const char comment_open[] = "<!--";
+        static const char cdata_open[] = "<![CDATA[";
+        bool comment = strncmp(p, comment_open, sizeof(comment_open) - SKIP_ONE) == 0;
+        if (comment || strncmp(p, cdata_open, sizeof(cdata_open) - SKIP_ONE) == 0) {
+            const char *end = strstr(p, comment ? "-->" : "]]>");
+            if (!end) {
+                break; /* it does not end: the rest of the text is inside it */
+            }
+            p = end + 3;
+            continue;
+        }
         const char *tag = p;
         const char *q = p + SKIP_ONE;
         while (*q == ' ' || *q == '\t') {
@@ -298,6 +338,9 @@ void cbm_doclink_cs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, cons
             raw = cs_clean_value(ctx->arena, href, href_len);
             tok_syntax = CBM_DOCLINK_HREF;
         }
+        if (tok_syntax != CBM_DOCLINK_NONE && !raw) {
+            complete = false;
+        }
         if (raw && raw[0]) {
             CBMDocLink link = {
                 .source_qn = def->qualified_name,
@@ -306,10 +349,20 @@ void cbm_doclink_cs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, cons
                 .def_line = def->start_line,
                 .syntax = (uint16_t)tok_syntax,
             };
+            int before = ctx->result->doc_links.count;
             cbm_doclinks_push(&ctx->result->doc_links, ctx->arena, link);
+            if (ctx->result->doc_links.count == before) {
+                complete = false;
+            }
         }
         p = q;
     }
+    return complete;
+}
+
+void cbm_doclink_cs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                              uint32_t doc_line) {
+    (void)cbm_doclink_cs_parse_doc_checked(ctx, def, doc, doc_line);
 }
 
 /* ── Parameter type normalization ────────────────────────────────── */
@@ -629,7 +682,12 @@ size_t cbm_doclink_cs_norm_type(const char *in, size_t len, char *out, size_t ca
     int n = kw ? snprintf(out, cap, "%s%.*s", kw, (int)(t.len - suf), t.s + suf)
                : snprintf(out, cap, "%.*s%.*s", (int)blen, t.s + base_start, (int)(t.len - suf),
                           t.s + suf);
-    return n > 0 ? strlen(out) : 0;
+    if (n < 0 || (size_t)n >= cap) {
+        /* it does not fit: an unknown type, never a cut one (two long names
+         * cut to one prefix would compare equal) */
+        snprintf(out, cap, "?");
+    }
+    return strlen(out);
 }
 
 /* ── Scope scan ──────────────────────────────────────────────────── */
@@ -650,6 +708,7 @@ typedef struct {
     uint32_t end; /* first byte after the keyword */
     uint32_t row; /* 0-based */
     char kind;    /* N namespace; c s i e r as for types */
+    bool partial; /* the word before it is `partial` */
 } cs_head_t;
 
 /* An open brace while the braces are paired. The open braces form a stack
@@ -667,6 +726,7 @@ typedef struct {
     int n_if;
     int end1; /* ... and where its first branch ended; valid once has_end1 */
     int n_end1;
+    int first_open; /* first open-brace entry allocated in the current branch */
     bool has_end1; /* an #else was seen */
     int mark;      /* its entry in the brace list */
 } cs_pp_t;
@@ -682,6 +742,13 @@ enum {
     CS_CHAR_LITERAL_MAX = 12, /* '\U0010FFFF' */
     CS_RAW_QUOTES = 3,        /* """ */
     CS_LEX_MAX_NEST = 64,     /* interpolated strings inside interpolation holes */
+    /* How deep a file may nest what the scope records. A block past either
+     * limit is not placed: its types are named in Q records, what is
+     * documented inside has no scope (an X range). Deeper than any program;
+     * the limits keep a lookup's walk over the enclosing types and namespaces
+     * bounded. */
+    CS_MAX_TYPE_NEST = 64,   /* types inside types */
+    CS_MAX_NS_SEGMENTS = 64, /* segments of a namespace's full name */
 };
 
 /* One declaration of the file. `node` is the declaration (a field's
@@ -692,7 +759,7 @@ typedef struct {
     TSNode name;
     TSNode tparams;
     TSNode params;
-    const char *text_name;    /* text declarations */
+    const char *text_name;    /* text declarations; M: an operator's or indexer's name */
     const char *text_tparams; /* text declarations: "T,U" */
     uint32_t start;           /* byte offset: document order */
     uint32_t line;            /* 1-based */
@@ -701,8 +768,10 @@ typedef struct {
     int owner;                /* M: tree_idx of the type the tree nests it in, or CS_OWNER_* */
     char tag;                 /* N namespace block, F file-scoped namespace, U using, T type,
                                  M member */
-    char kind;                /* T: c s i e r d;  M: c v e */
+    char kind;                /* T: c s i e r t d;  M: c v p e o x */
     bool explicit_impl;
+    bool is_static; /* M: what `using static` brings in */
+    bool partial;   /* T: declared `partial` */
     bool broken;    /* T: a parse error sits among its members */
     bool from_text; /* read from the text, not from a declaration node */
 } cs_item_t;
@@ -729,13 +798,14 @@ typedef struct {
     int npp;
     uint32_t row_pos; /* row cursor: the row of byte row_pos is `row` */
     uint32_t row;
-    uint64_t cost_steps;    /* source positions the text readers looked at */
+    uint64_t cost_steps;    /* text positions and brace-stack entries visited */
     uint64_t cost_bytes;    /* bytes taken from the scratch arena */
     bool failed;            /* out of memory */
     bool lexical;           /* the tree has parse errors: nesting is read from the braces */
     uint32_t untrusted;     /* byte offset from which the braces do not pair up */
     uint32_t untrusted_row; /* its 0-based row */
     int next_region;
+    int types_out; /* T records written: a type's ordinal is its position among them */
     uint32_t root_end_byte;
     uint32_t root_end_line;
 } cs_scan_t;
@@ -751,25 +821,42 @@ enum {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 static _Atomic uint64_t cs_cost_text_steps;
 static _Atomic uint64_t cs_cost_scratch_bytes;
+static _Atomic uint64_t cs_cost_scope_bytes;
 
 void cbm_doclink_cs_test_cost_reset(void) {
     atomic_store(&cs_cost_text_steps, 0);
     atomic_store(&cs_cost_scratch_bytes, 0);
+    atomic_store(&cs_cost_scope_bytes, 0);
 }
 
 void cbm_doclink_cs_test_cost(uint64_t *text_steps, uint64_t *scratch_bytes) {
     *text_steps = atomic_load(&cs_cost_text_steps);
     *scratch_bytes = atomic_load(&cs_cost_scratch_bytes);
 }
+
+uint64_t cbm_doclink_cs_test_scope_bytes(void) {
+    return atomic_load(&cs_cost_scope_bytes);
+}
 #endif
 
-/* Hand a finished scan's cost to the test seam (nothing in a product build). */
-static void cs_cost_publish(const cs_scan_t *s) {
+/* Hand a cost to the test seam (nothing in a product build). */
+static void cs_cost_add(uint64_t steps, uint64_t bytes) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-    atomic_fetch_add(&cs_cost_text_steps, s->cost_steps);
-    atomic_fetch_add(&cs_cost_scratch_bytes, s->cost_bytes);
+    atomic_fetch_add(&cs_cost_text_steps, steps);
+    atomic_fetch_add(&cs_cost_scratch_bytes, bytes);
 #else
-    (void)s;
+    (void)steps;
+    (void)bytes;
+#endif
+}
+
+/* Hand a finished scan's cost to the test seam. */
+static void cs_cost_publish(const cs_scan_t *s) {
+    cs_cost_add(s->cost_steps, s->cost_bytes);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (!s->failed && !s->sb.failed && s->sb.buf) {
+        atomic_fetch_add(&cs_cost_scope_bytes, s->sb.len);
+    }
 #endif
 }
 
@@ -852,8 +939,9 @@ static TSNode cs_type_params(TSNode decl) {
 
 /* Node text without whitespace and without verbatim '@' markers, appended to
  * sb. `global::` prefixes are dropped. Text that is too long to be a type
- * name, or that holds a scope separator, is written as "?" (an unresolvable
- * name: the declaring type then counts as having an open hierarchy). */
+ * name, or that holds a scope separator or non-whitespace control byte, is
+ * written as "?" (an unresolvable name: the declaring type then counts as
+ * having an open hierarchy). The whole field is replaced before any copy. */
 static void cs_put_text_nows(cs_scan_t *s, TSNode n) {
     const char *src = s->ctx->source;
     uint32_t a = ts_node_start_byte(n);
@@ -863,7 +951,9 @@ static void cs_put_text_nows(cs_scan_t *s, TSNode n) {
     }
     bool ok = b >= a && b - a <= CS_NAME_MAX;
     for (uint32_t i = a; ok && i < b; i++) {
-        ok = src[i] != '|' && src[i] != ';' && src[i] != '{' && src[i] != '}';
+        unsigned char c = (unsigned char)src[i];
+        ok = c != '|' && c != ';' && c != '{' && c != '}' &&
+             !((c < 0x20 && !isspace(c)) || c == 0x7f);
     }
     if (!ok) {
         sb_putc(&s->sb, '?');
@@ -927,22 +1017,6 @@ static uint32_t cs_line(TSNode n) {
 
 static uint32_t cs_end_line(TSNode n) {
     return ts_node_end_point(n).row + TS_LINE_OFFSET;
-}
-
-static const char *cs_join_path(cs_scan_t *s, const char *outer, const char *name) {
-    if (!outer || !outer[0]) {
-        return name;
-    }
-    size_t ol = strlen(outer);
-    size_t nl = strlen(name);
-    char *out = (char *)cs_tmp_alloc(s, ol + nl + PAIR_LEN);
-    if (!out) {
-        return NULL;
-    }
-    memcpy(out, outer, ol);
-    out[ol] = '.';
-    memcpy(out + ol + SKIP_ONE, name, nl + SKIP_ONE);
-    return out;
 }
 
 /* type_parameter_list -> "T,U" into sb (nothing when absent). */
@@ -1026,13 +1100,44 @@ static char cs_type_kind(const char *k) {
     if (strcmp(k, "enum_declaration") == 0) {
         return 'e';
     }
-    if (strcmp(k, "record_declaration") == 0 || strcmp(k, "record_struct_declaration") == 0) {
-        return 'r';
+    if (strcmp(k, "record_declaration") == 0) {
+        return 'r'; /* a record class; cs_decl_kind tells a `record struct` apart */
+    }
+    if (strcmp(k, "record_struct_declaration") == 0) {
+        return 't';
     }
     if (strcmp(k, "delegate_declaration") == 0) {
         return 'd';
     }
     return 0;
+}
+
+/* True when the anonymous token `word` is a direct child of `n`, or sits in
+ * one of its `modifier` children (`partial`, `static`). */
+static bool cs_has_word(TSNode n, const char *word) {
+    bool found = false;
+    uint64_t steps = 0;
+    cs_kids_t k = cs_kids(n);
+    TSNode c;
+    while (!found && cs_kids_next(&k, &c)) {
+        steps++;
+        const char *t = ts_node_type(c);
+        if (!ts_node_is_named(c)) {
+            found = strcmp(t, word) == 0;
+        } else if (strcmp(t, "modifier") == 0 && ts_node_child_count(c) > 0) {
+            found = strcmp(ts_node_type(ts_node_child(c, 0)), word) == 0;
+        }
+    }
+    cs_kids_end(&k);
+    cs_cost_add(steps, 0);
+    return found;
+}
+
+/* The kind of a type declaration node: c class, s struct, i interface, e
+ * enum, r record class, t record struct, d delegate; 0 for any other node. */
+static char cs_decl_kind(TSNode decl) {
+    char kind = cs_type_kind(ts_node_type(decl));
+    return (kind == 'r' && cs_has_word(decl, "struct")) ? 't' : kind;
 }
 
 /* ── Tokens: the block structure the tree lost ───────────────────────
@@ -1153,15 +1258,17 @@ static void cs_lex_brace(void *ud, uint32_t pos, bool open) {
  * can balance per configuration only (`#if A {` ... `#if A }`), and the
  * braces left over at the end say whether this one does.
  *
- * The two stacks share everything below the first entry they have in common,
- * so only the braces the branches opened themselves are walked. */
+ * Only entries opened in the current branch may acquire aliases. The first
+ * branch can replace a deep pre-existing stack; every empty later branch
+ * starts from that old stack. Walking it again would cost depth per branch. */
 static void cs_branch_merge(cs_scan_t *s, const cs_pp_t *f) {
     if (s->sp != f->n_end1) {
         return;
     }
     int a = s->top;
     int b = f->end1;
-    while (a != b && a >= 0 && b >= 0) {
+    while (a != b && a >= f->first_open && b >= 0) {
+        s->cost_steps++;
         s->braces[s->open[a].brace].alias = s->open[b].brace;
         a = s->open[a].below;
         b = s->open[b].below;
@@ -1181,7 +1288,8 @@ static void cs_lex_branch(void *ud, uint32_t pos, int what) {
         if (s->npp >= CS_PP_MAX) {
             cs_mark_untrusted(s, mark);
         } else {
-            s->pp[s->npp++] = (cs_pp_t){.at_if = s->top, .n_if = s->sp, .mark = mark};
+            s->pp[s->npp++] =
+                (cs_pp_t){.at_if = s->top, .n_if = s->sp, .first_open = s->nopen, .mark = mark};
         }
     } else if (s->npp > 0) {
         cs_pp_t *f = &s->pp[s->npp - SKIP_ONE];
@@ -1195,6 +1303,7 @@ static void cs_lex_branch(void *ud, uint32_t pos, int what) {
         if (what == CS_PP_ELSE) {
             s->top = f->at_if;
             s->sp = f->n_if;
+            f->first_open = s->nopen;
         } else if (what == CS_PP_ENDIF) {
             if (f->has_end1) {
                 s->top = f->end1;
@@ -1206,8 +1315,9 @@ static void cs_lex_branch(void *ud, uint32_t pos, int what) {
     s->braces[mark].depth = s->sp;
 }
 
-/* The scanner reports a declaration keyword. */
-static void cs_lex_keyword(void *ud, uint32_t kw_end, char kind) {
+/* The scanner reports a declaration keyword; `partial` when the word before
+ * it is that modifier. */
+static void cs_lex_keyword(void *ud, uint32_t kw_end, char kind, bool partial) {
     cs_scan_t *s = (cs_scan_t *)ud;
     if (s->failed) {
         return;
@@ -1224,7 +1334,8 @@ static void cs_lex_keyword(void *ud, uint32_t kw_end, char kind) {
         s->heads = grown;
         s->cap_heads = ncap;
     }
-    s->heads[s->nheads++] = (cs_head_t){.end = kw_end, .row = cs_row_of(s, kw_end), .kind = kind};
+    s->heads[s->nheads++] =
+        (cs_head_t){.end = kw_end, .row = cs_row_of(s, kw_end), .kind = kind, .partial = partial};
 }
 
 /* --- the scanner ---------------------------------------------------- */
@@ -1238,6 +1349,7 @@ typedef struct {
     uint32_t stop_pos; /* where the scan gave up (`stopped`) */
     bool stopped;      /* holes nested deeper than CS_LEX_MAX_NEST: the rest is not read */
     bool prev_sep;     /* the previous token was ':' or ',' */
+    bool prev_partial; /* the previous token was `partial` (or `partial record`) */
 } cs_lex_t;
 
 static bool cs_lex_word(unsigned char c) {
@@ -1465,8 +1577,12 @@ static uint32_t cs_lex_directive(cs_lex_t *lx, uint32_t i, bool hole) {
 }
 
 /* A word at src[i] (an identifier, keyword or number, with an optional `@`):
- * reports a declaration keyword and returns its end; i when there is none. */
-static uint32_t cs_lex_identifier(cs_lex_t *lx, uint32_t i, bool hole) {
+ * reports a declaration keyword and returns its end; i when there is none.
+ * *partial is set when the word leaves the `partial` modifier standing for
+ * the next keyword: `partial` itself, or `record` after it (`partial record
+ * struct`). */
+static uint32_t cs_lex_identifier(cs_lex_t *lx, uint32_t i, bool hole, bool *partial) {
+    static const char modifier[] = "partial";
     const char *src = lx->src;
     bool verbatim = src[i] == '@';
     uint32_t a = verbatim ? i + SKIP_ONE : i;
@@ -1479,8 +1595,11 @@ static uint32_t cs_lex_identifier(cs_lex_t *lx, uint32_t i, bool hole) {
     }
     char kind = (verbatim || hole) ? 0 : cs_keyword_kind(src + a, b - a);
     if (kind && !lx->prev_sep) {
-        cs_lex_keyword(lx->ud, b, kind);
+        cs_lex_keyword(lx->ud, b, kind, lx->prev_partial);
     }
+    *partial = !verbatim && !hole &&
+               ((kind == 'r' && lx->prev_partial) ||
+                (b - a == sizeof(modifier) - SKIP_ONE && memcmp(src + a, modifier, b - a) == 0));
     return b;
 }
 
@@ -1533,6 +1652,7 @@ static uint32_t cs_lex_code(cs_lex_t *lx, uint32_t i, bool hole) {
             continue;
         }
         bool sep = c == ':' || c == ',';
+        bool partial = false;
         if (c == '\'') {
             e = cs_lex_char(lx, i);
         } else if (c == '{' || c == '}') {
@@ -1548,13 +1668,14 @@ static uint32_t cs_lex_code(cs_lex_t *lx, uint32_t i, bool hole) {
         } else {
             e = (c == '"' || c == '$' || c == '@') ? cs_lex_literal(lx, i) : i;
             if (e == i && (cs_lex_word(c) || c == '@')) {
-                e = cs_lex_identifier(lx, i, hole);
+                e = cs_lex_identifier(lx, i, hole, &partial);
             }
             if (e == i) {
                 e = i + SKIP_ONE;
             }
         }
         lx->prev_sep = sep;
+        lx->prev_partial = partial;
         i = e;
     }
     return n;
@@ -1664,6 +1785,82 @@ static bool cs_word_char(unsigned char c) {
     return isalnum(c) || c == '_' || c >= 0x80;
 }
 
+/* Recovery may omit punctuation before the name node. Start at the actual
+ * namespace header, not at that recovered node's first byte. */
+static uint32_t cs_namespace_name_start(const cs_scan_t *s, TSNode node) {
+    static const char keyword[] = "namespace";
+    const uint32_t width = (uint32_t)(sizeof(keyword) - SKIP_ONE);
+    uint32_t a = ts_node_start_byte(node);
+    uint32_t n = s->root_end_byte;
+    const char *src = s->ctx->source;
+    if (a > n || n - a < width || memcmp(src + a, keyword, width) != 0) {
+        return n;
+    }
+    a += width;
+    uint32_t start = cs_skip_space(src, a, n);
+    return start > a || (a < n && src[a] == '@') ? start : n;
+}
+
+/* Namespace names have nonempty identifier segments. Keep the scanner's
+ * existing Unicode-byte support, while allowing trivia between tokens and
+ * verbatim markers only at segment starts. NULL names remain unplaced items. */
+static char *cs_namespace_name_dup(cs_scan_t *s, uint32_t a, uint32_t b) {
+    if (b <= a || b > s->root_end_byte || b - a > CS_NAME_MAX) {
+        return NULL;
+    }
+    const char *src = s->ctx->source;
+    char *out = (char *)cs_tmp_alloc(s, (size_t)(b - a) + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    uint32_t i = a;
+    for (;;) {
+        i = cs_skip_space(src, i, b);
+        if (i < b && src[i] == '@') {
+            i++;
+        }
+        if (i == b || !cs_word_char((unsigned char)src[i]) || isdigit((unsigned char)src[i])) {
+            return NULL;
+        }
+        while (i < b && cs_word_char((unsigned char)src[i])) {
+            out[w++] = src[i++];
+        }
+        i = cs_skip_space(src, i, b);
+        if (i == b) {
+            out[w] = '\0';
+            return out;
+        }
+        if (src[i] != '.') {
+            return NULL;
+        }
+        out[w++] = '.';
+        i++;
+    }
+}
+
+/* Keep malformed dotted candidates until their known delimiter. Dropping an
+ * invalid file-scoped header would place its declarations in the root. The
+ * next recorded declaration bounds this scan even when no delimiter exists. */
+static uint32_t cs_namespace_header_end(cs_scan_t *s, uint32_t a, uint32_t stop) {
+    const char *src = s->ctx->source;
+    uint32_t i = a;
+    while (i < stop) {
+        uint32_t next = cs_skip_space(src, i, stop);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        unsigned char c = (unsigned char)src[i];
+        if (!cs_word_char(c) && c != '@' && c != '.') {
+            break;
+        }
+        s->cost_steps++;
+        i++;
+    }
+    return i;
+}
+
 /* End of the identifier starting at src[i] (i itself when there is none);
  * `dotted` accepts a qualified name. */
 static uint32_t cs_ident_end(const char *src, uint32_t i, uint32_t n, bool dotted) {
@@ -1706,10 +1903,10 @@ static const char *cs_text_tparams(cs_scan_t *s, uint32_t *pos, uint32_t stop) {
     if (i >= n || src[i] != '<') {
         return "";
     }
-    uint32_t limit = i + CS_TPARAMS_SCAN_MAX < stop ? i + CS_TPARAMS_SCAN_MAX : stop;
-    if (limit <= i) {
-        return NULL;
+    if (i >= stop) {
+        return NULL; /* the list is the next declaration's */
     }
+    uint32_t limit = stop - i > CS_TPARAMS_SCAN_MAX ? i + CS_TPARAMS_SCAN_MAX : stop;
     char *out = (char *)cs_tmp_alloc(s, (size_t)(limit - i) + SKIP_ONE);
     if (!out) {
         return NULL;
@@ -1834,8 +2031,47 @@ static int cs_item_of_node(cs_scan_t *s, char tag, TSNode node) {
     return i;
 }
 
-static void cs_member_new(cs_scan_t *s, TSNode decl, char kind, bool explicit_impl, int owner,
-                          TSNode name, TSNode tparams, TSNode params) {
+/* True when the first parameter of `params` is written with `this`: an
+ * extension method. The text before the parameter's type says so, whatever
+ * shape the grammar gives the modifier. */
+static bool cs_first_param_this(const cs_scan_t *s, TSNode params) {
+    static const char word[] = "this";
+    if (ts_node_is_null(params)) {
+        return false;
+    }
+    TSNode p = cs_child_of_kind(params, "parameter");
+    if (ts_node_is_null(p)) {
+        return false;
+    }
+    TSNode ty = cs_field(p, "type");
+    const char *src = s->ctx->source;
+    uint32_t a = ts_node_start_byte(p);
+    uint32_t b = ts_node_is_null(ty) ? ts_node_end_byte(p) : ts_node_start_byte(ty);
+    uint32_t wl = (uint32_t)(sizeof(word) - SKIP_ONE);
+    for (uint32_t i = a; i + wl <= b; i++) {
+        if (memcmp(src + i, word, wl) == 0 &&
+            (i == a || !cs_word_char((unsigned char)src[i - SKIP_ONE])) &&
+            (i + wl == b || !cs_word_char((unsigned char)src[i + wl]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True for a member `using static` brings in: one declared `static` or
+ * `const`, an enum's member -- and no extension method. */
+static bool cs_member_static(const cs_scan_t *s, TSNode decl, TSNode params) {
+    if (cs_kind_is(decl, "enum_member_declaration")) {
+        return true;
+    }
+    if (!cs_has_word(decl, "static") && !cs_has_word(decl, "const")) {
+        return false;
+    }
+    return !cs_first_param_this(s, params);
+}
+
+static void cs_member_new(cs_scan_t *s, TSNode decl, char kind, bool explicit_impl, bool is_static,
+                          int owner, TSNode name, TSNode tparams, TSNode params) {
     if (ts_node_is_null(name)) {
         return;
     }
@@ -1846,15 +2082,34 @@ static void cs_member_new(cs_scan_t *s, TSNode decl, char kind, bool explicit_im
     cs_item_t *it = &s->items[i];
     it->kind = kind;
     it->explicit_impl = explicit_impl;
+    it->is_static = is_static;
     it->owner = owner;
     it->name = name;
     it->tparams = tparams;
     it->params = params;
 }
 
+/* A member that has no identifier for a name: an operator (`name` is its
+ * token: +, ==, true, implicit ...) or an indexer (`this`). The graph has no
+ * node for either; the record says that the type declares one. */
+static void cs_member_unnamed(cs_scan_t *s, TSNode decl, char kind, int owner, const char *name,
+                              TSNode params) {
+    int i = cs_item_of_node(s, 'M', decl);
+    if (i < 0) {
+        return;
+    }
+    cs_item_t *it = &s->items[i];
+    it->kind = kind;
+    it->owner = owner;
+    it->text_name = name;
+    it->params = params;
+}
+
 /* Every variable_declarator name under a field / event field declaration. */
 static void cs_collect_declarators(cs_scan_t *s, TSNode decl, char kind, int owner) {
     TSNode null_node = {0};
+    /* Modifiers belong to this declaration and are shared by all its names. */
+    bool is_static = cs_member_static(s, decl, null_node);
     cs_kids_t outer = cs_kids(decl);
     TSNode vd;
     while (cs_kids_next_named(&outer, &vd)) {
@@ -1865,8 +2120,8 @@ static void cs_collect_declarators(cs_scan_t *s, TSNode decl, char kind, int own
         TSNode d;
         while (cs_kids_next_named(&inner, &d)) {
             if (cs_kind_is(d, "variable_declarator")) {
-                cs_member_new(s, decl, kind, false, owner, cs_field(d, "name"), null_node,
-                              null_node);
+                cs_member_new(s, decl, kind, false, is_static, owner, cs_field(d, "name"),
+                              null_node, null_node);
             }
         }
         cs_kids_end(&inner);
@@ -1896,9 +2151,12 @@ static bool cs_header_broken(TSNode decl, bool callable) {
 
 static void cs_collect_member(cs_scan_t *s, TSNode c, const char *k, int owner) {
     TSNode null_node = {0};
-    bool callable =
-        strcmp(k, "method_declaration") == 0 || strcmp(k, "constructor_declaration") == 0;
-    bool member = callable || strcmp(k, "property_declaration") == 0 ||
+    bool is_operator = strcmp(k, "operator_declaration") == 0;
+    bool is_conversion = strcmp(k, "conversion_operator_declaration") == 0;
+    bool is_indexer = strcmp(k, "indexer_declaration") == 0;
+    bool callable = strcmp(k, "method_declaration") == 0 ||
+                    strcmp(k, "constructor_declaration") == 0 || is_operator || is_conversion;
+    bool member = callable || is_indexer || strcmp(k, "property_declaration") == 0 ||
                   strcmp(k, "field_declaration") == 0 ||
                   strcmp(k, "event_field_declaration") == 0 ||
                   strcmp(k, "event_declaration") == 0 || strcmp(k, "enum_member_declaration") == 0;
@@ -1909,23 +2167,40 @@ static void cs_collect_member(cs_scan_t *s, TSNode c, const char *k, int owner) 
         return;
     }
     if (strcmp(k, "method_declaration") == 0) {
-        cs_member_new(s, c, 'c', cs_has_child_kind(c, "explicit_interface_specifier"), owner,
-                      cs_field(c, "name"), cs_type_params(c), cs_field(c, "parameters"));
+        TSNode params = cs_field(c, "parameters");
+        cs_member_new(s, c, 'c', cs_has_child_kind(c, "explicit_interface_specifier"),
+                      cs_member_static(s, c, params), owner, cs_field(c, "name"), cs_type_params(c),
+                      params);
     } else if (strcmp(k, "constructor_declaration") == 0) {
-        cs_member_new(s, c, 'c', false, owner, cs_field(c, "name"), null_node,
-                      cs_field(c, "parameters"));
+        TSNode params = cs_field(c, "parameters");
+        cs_member_new(s, c, 'c', false, cs_member_static(s, c, params), owner, cs_field(c, "name"),
+                      null_node, params);
     } else if (strcmp(k, "property_declaration") == 0) {
-        cs_member_new(s, c, 'v', cs_has_child_kind(c, "explicit_interface_specifier"), owner,
-                      cs_field(c, "name"), null_node, null_node);
+        cs_member_new(s, c, 'p', cs_has_child_kind(c, "explicit_interface_specifier"),
+                      cs_member_static(s, c, null_node), owner, cs_field(c, "name"), null_node,
+                      null_node);
     } else if (strcmp(k, "field_declaration") == 0) {
         cs_collect_declarators(s, c, 'v', owner);
     } else if (strcmp(k, "event_field_declaration") == 0) {
         cs_collect_declarators(s, c, 'e', owner);
     } else if (strcmp(k, "event_declaration") == 0) {
-        cs_member_new(s, c, 'e', cs_has_child_kind(c, "explicit_interface_specifier"), owner,
-                      cs_field(c, "name"), null_node, null_node);
+        cs_member_new(s, c, 'e', cs_has_child_kind(c, "explicit_interface_specifier"),
+                      cs_member_static(s, c, null_node), owner, cs_field(c, "name"), null_node,
+                      null_node);
     } else if (strcmp(k, "enum_member_declaration") == 0) {
-        cs_member_new(s, c, 'v', false, owner, cs_field(c, "name"), null_node, null_node);
+        cs_member_new(s, c, 'v', false, cs_member_static(s, c, null_node), owner,
+                      cs_field(c, "name"), null_node, null_node);
+    } else if (is_operator) {
+        /* an anonymous token's type is its text */
+        TSNode op = cs_field(c, "operator");
+        if (!ts_node_is_null(op)) {
+            cs_member_unnamed(s, c, 'o', owner, ts_node_type(op), cs_field(c, "parameters"));
+        }
+    } else if (is_conversion) {
+        cs_member_unnamed(s, c, 'o', owner, cs_has_word(c, "implicit") ? "implicit" : "explicit",
+                          cs_field(c, "parameters"));
+    } else if (is_indexer) {
+        cs_member_unnamed(s, c, 'x', owner, "this", cs_field(c, "parameters"));
     }
 }
 
@@ -1993,13 +2268,14 @@ static bool cs_collect_child(cs_scan_t *s, cs_walk_stack_t *w, TSNode c, int own
         TSNode body = file_scoped ? (TSNode){0} : cs_field(c, "body");
         return cs_walk_push(s, w, ts_node_is_null(body) ? c : body, CS_OWNER_NONE);
     }
-    char tk = cs_type_kind(k);
+    char tk = cs_decl_kind(c);
     if (tk) {
         int ti = cs_item_of_node(s, 'T', c);
         if (ti < 0) {
             return false;
         }
         s->items[ti].kind = tk;
+        s->items[ti].partial = cs_has_word(c, "partial");
         s->items[ti].name = cs_field(c, "name");
         s->items[ti].tparams = cs_type_params(c);
         return tk == 'd' || cs_walk_push(s, w, cs_field(c, "body"), ti);
@@ -2067,19 +2343,19 @@ static void cs_text_item(cs_scan_t *s, const cs_head_t *h, uint32_t stop, const 
         return; /* the keyword runs into something: not a declaration */
     }
     bool is_ns = h->kind == 'N';
-    uint32_t b = cs_ident_end(src, a, n, is_ns);
-    if (b == a || bsearch(&a, parsed, (size_t)nparsed, sizeof(uint32_t), cs_u32_cmp)) {
+    if (bsearch(&a, parsed, (size_t)nparsed, sizeof(uint32_t), cs_u32_cmp)) {
         return;
     }
-    char *name = cs_ident_dup(s, a, b);
-    if (!name || cs_not_a_name(name)) {
-        return;
-    }
+    char *name = NULL;
     int brace = CBM_NOT_FOUND;
     const char *tparams = "";
     char tag = 'T';
     if (is_ns) {
-        uint32_t after = cs_skip_space(src, b, n);
+        uint32_t after = cs_namespace_header_end(s, a, stop);
+        name = cs_namespace_name_dup(s, a, after);
+        if (name && src[a] != '@' && cs_not_a_name(name)) {
+            name = NULL; /* bare keywords stay unplaced; verbatim identifiers are names */
+        }
         if (after < n && src[after] == '{') {
             brace = cs_open_brace_at(s, after);
             tag = 'N';
@@ -2091,7 +2367,13 @@ static void cs_text_item(cs_scan_t *s, const cs_head_t *h, uint32_t stop, const 
         if (tag == 'N' && brace < 0) {
             return;
         }
+        /* An invalid name must still push an unplaced namespace frame. */
     } else {
+        uint32_t b = cs_ident_end(src, a, n, false);
+        name = cs_ident_dup(s, a, b);
+        if (!name || cs_not_a_name(name)) {
+            return;
+        }
         uint32_t pos = b;
         tparams = cs_text_tparams(s, &pos, stop);
         bool bodyless = false;
@@ -2107,6 +2389,7 @@ static void cs_text_item(cs_scan_t *s, const cs_head_t *h, uint32_t stop, const 
     cs_item_t *it = &s->items[i];
     it->from_text = true;
     it->tree_idx = CS_ITEM_TEXT;
+    it->partial = h->partial;
     it->kind = is_ns ? 0 : h->kind;
     it->text_name = name;
     it->text_tparams = tparams;
@@ -2131,7 +2414,9 @@ static void cs_add_text_items(cs_scan_t *s) {
     int nparsed = 0;
     for (int i = 0; i < tree_items; i++) {
         const cs_item_t *it = &s->items[i];
-        if ((it->tag == 'N' || it->tag == 'F' || it->tag == 'T') && !ts_node_is_null(it->name)) {
+        if (it->tag == 'N' || it->tag == 'F') {
+            parsed[nparsed++] = cs_namespace_name_start(s, it->node);
+        } else if (it->tag == 'T' && !ts_node_is_null(it->name)) {
             parsed[nparsed++] = ts_node_start_byte(it->name);
         }
     }
@@ -2180,26 +2465,39 @@ static void cs_put_bases(cs_scan_t *s, TSNode type_decl, char kind) {
     cs_kids_end(&k);
 }
 
-static void cs_emit_member(cs_scan_t *s, TSNode decl, char kind, bool explicit_impl,
-                           const char *type_path, TSNode name, TSNode tparams, TSNode params) {
-    char *nm = cs_name_dup(s, name);
-    if (!nm) {
+/* What an M record says of its member. */
+typedef struct {
+    uint32_t line;
+    char kind;
+    bool explicit_impl;
+    bool is_static;
+    int type; /* the ordinal of the T record it belongs to */
+    const char *name;
+} cs_member_rec_t;
+
+/* A member record. A callable, an operator and an indexer carry their
+ * parameter types; every other member a '-'. */
+static void cs_emit_member(cs_scan_t *s, const cs_member_rec_t *m, TSNode tparams, TSNode params) {
+    if (!m->name || m->type < 0) {
         return;
     }
     sb_puts(&s->sb, "M\t");
-    sb_putu(&s->sb, cs_line(decl));
+    sb_putu(&s->sb, m->line);
     sb_putc(&s->sb, '\t');
-    sb_putc(&s->sb, kind);
+    sb_putc(&s->sb, m->kind);
+    if (m->is_static) {
+        sb_putc(&s->sb, 's');
+    }
     sb_putc(&s->sb, '\t');
-    sb_putc(&s->sb, explicit_impl ? '1' : '0');
+    sb_putc(&s->sb, m->explicit_impl ? '1' : '0');
     sb_putc(&s->sb, '\t');
-    sb_puts(&s->sb, type_path);
-    sb_putc(&s->sb, '.');
-    sb_puts(&s->sb, nm);
+    sb_putu(&s->sb, (uint32_t)m->type);
+    sb_putc(&s->sb, '\t');
+    sb_puts(&s->sb, m->name);
     sb_putc(&s->sb, '\t');
     cs_put_tparams(s, tparams);
     sb_putc(&s->sb, '\t');
-    if (kind == 'c') {
+    if (m->kind == 'c' || m->kind == 'o' || m->kind == 'x') {
         cs_put_sig(s, params);
     } else {
         sb_putc(&s->sb, '-');
@@ -2243,14 +2541,16 @@ static void cs_emit_using(cs_scan_t *s, TSNode u, int region) {
     if (ts_node_is_null(target)) {
         return;
     }
-    char kind = is_alias ? 'a' : (is_static ? 's' : 'n');
-    if (is_global && kind == 'n') {
-        kind = 'g';
-    }
+    /* what the directive brings in, and whom it serves: `global using` (of a
+     * namespace, of a type's static members, of an alias alike) is in scope in
+     * every file of the project */
     sb_puts(&s->sb, "U\t");
     sb_putu(&s->sb, (uint32_t)region);
     sb_putc(&s->sb, '\t');
-    sb_putc(&s->sb, kind);
+    sb_putc(&s->sb, is_alias ? 'a' : (is_static ? 's' : 'n'));
+    if (is_global) {
+        sb_putc(&s->sb, 'g');
+    }
     sb_putc(&s->sb, '\t');
     if (is_alias && !ts_node_is_null(alias)) {
         cs_put_text_nows(s, alias);
@@ -2271,9 +2571,10 @@ static void cs_emit_unplaced(cs_scan_t *s, uint32_t from, uint32_t to) {
     sb_putc(&s->sb, '\n');
 }
 
-/* A namespace region record; returns the new region id. */
+/* A namespace region record: the name as its declaration writes it (`A.B`),
+ * under the region `parent`. Returns the new region id. */
 static int cs_emit_region(cs_scan_t *s, int parent, uint32_t start, uint32_t end,
-                          const char *full_ns) {
+                          const char *name) {
     int id = s->next_region++;
     sb_puts(&s->sb, "R\t");
     sb_putu(&s->sb, (uint32_t)id);
@@ -2284,13 +2585,16 @@ static int cs_emit_region(cs_scan_t *s, int parent, uint32_t start, uint32_t end
     sb_putc(&s->sb, '\t');
     sb_putu(&s->sb, end);
     sb_putc(&s->sb, '\t');
-    sb_puts(&s->sb, full_ns);
+    sb_puts(&s->sb, name);
     sb_putc(&s->sb, '\n');
     return id;
 }
 
+/* A type record, the type's ordinal being `ord`. Its outer type is named by
+ * that type's ordinal, never by a path: a record's size does not grow with
+ * the nesting. */
 static void cs_emit_type(cs_scan_t *s, const cs_item_t *it, int region, uint32_t end_line,
-                         const char *path, bool incomplete) {
+                         int outer, const char *name, bool incomplete, int ord) {
     sb_puts(&s->sb, "T\t");
     sb_putu(&s->sb, (uint32_t)region);
     sb_putc(&s->sb, '\t');
@@ -2299,11 +2603,20 @@ static void cs_emit_type(cs_scan_t *s, const cs_item_t *it, int region, uint32_t
     sb_putu(&s->sb, end_line);
     sb_putc(&s->sb, '\t');
     sb_putc(&s->sb, it->kind);
+    if (it->partial) {
+        sb_putc(&s->sb, 'p');
+    }
     if (incomplete) {
         sb_putc(&s->sb, '!');
     }
     sb_putc(&s->sb, '\t');
-    sb_puts(&s->sb, path);
+    if (outer >= 0) {
+        sb_putu(&s->sb, (uint32_t)outer);
+    } else {
+        sb_putc(&s->sb, '-');
+    }
+    sb_putc(&s->sb, '\t');
+    sb_puts(&s->sb, name);
     sb_putc(&s->sb, '\t');
     if (it->from_text) {
         /* its header did not parse: the bases are unknown, which the "?"
@@ -2316,52 +2629,73 @@ static void cs_emit_type(cs_scan_t *s, const cs_item_t *it, int region, uint32_t
     sb_putc(&s->sb, '\t');
     cs_put_bases(s, it->node, it->kind);
     sb_putc(&s->sb, '\n');
-    /* Positional record parameters are properties. */
-    if (it->kind != 'r') {
+    /* A parameter list on the type itself is its primary constructor
+     * (`record R(int X)`, `class C(int x)`): a constructor the graph has no
+     * node for. A record's parameters are properties as well. */
+    bool record = it->kind == 'r' || it->kind == 't';
+    if (!(record || it->kind == 'c' || it->kind == 's')) {
+        return;
+    }
+    TSNode pl = cs_child_of_kind(it->node, "parameter_list");
+    if (ts_node_is_null(pl)) {
         return;
     }
     TSNode null_node = {0};
-    cs_kids_t lists = cs_kids(it->node);
-    TSNode pl;
-    while (cs_kids_next_named(&lists, &pl)) {
-        if (!cs_kind_is(pl, "parameter_list")) {
-            continue;
+    cs_member_rec_t ctor = {.line = it->line, .kind = 'c', .type = ord, .name = name};
+    cs_emit_member(s, &ctor, null_node, pl);
+    cs_kids_t params = cs_kids(pl);
+    TSNode p;
+    while (record && cs_kids_next_named(&params, &p)) {
+        if (cs_kind_is(p, "parameter")) {
+            cs_member_rec_t prop = {.line = cs_line(p),
+                                    .kind = 'p',
+                                    .type = ord,
+                                    .name = cs_name_dup(s, cs_field(p, "name"))};
+            cs_emit_member(s, &prop, null_node, null_node);
         }
-        cs_kids_t params = cs_kids(pl);
-        TSNode p;
-        while (cs_kids_next_named(&params, &p)) {
-            if (cs_kind_is(p, "parameter")) {
-                cs_emit_member(s, p, 'v', false, path, cs_field(p, "name"), null_node, null_node);
-            }
-        }
-        cs_kids_end(&params);
     }
-    cs_kids_end(&lists);
+    cs_kids_end(&params);
 }
 
 /* An open block while the items are placed. */
 typedef struct {
-    int item;         /* tree_idx of its declaration; CBM_NOT_FOUND for the file itself */
-    uint32_t end;     /* first byte after it */
-    int inner_depth;  /* brace depth of what it holds (files with parse errors) */
-    int region;       /* namespace region in effect inside */
-    const char *ns;   /* namespace in effect inside */
-    const char *path; /* type path ("" outside a type) */
+    int item;        /* tree_idx of its declaration; CBM_NOT_FOUND for the file itself */
+    uint32_t end;    /* first byte after it */
+    int inner_depth; /* brace depth of what it holds (files with parse errors) */
+    int region;      /* namespace region in effect inside */
+    int ns_segments; /* segments of the namespace in effect inside */
+    int type;        /* a type's block: the ordinal of its T record (CBM_NOT_FOUND: none) */
+    int type_depth;  /* types that enclose what it holds */
     bool is_type;
     bool bad; /* its own place or name is unknown: so is everything inside */
 } cs_frame_t;
 
+/* The open blocks. A block is pushed only on a placed one, and a placed
+ * block adds a type level or at least one namespace segment, so the two
+ * nesting limits bound the stack: the root, the placed blocks, and one
+ * unplaced block on top. */
+enum { CS_FRAMES = CS_MAX_TYPE_NEST + CS_MAX_NS_SEGMENTS + PAIR_LEN };
+
 typedef struct {
-    cs_frame_t frames[CS_SCAN_MAX_DEPTH + SKIP_ONE];
+    cs_frame_t frames[CS_FRAMES];
     int sp;
 } cs_stack_t;
 
 static void cs_frame_push(cs_scan_t *s, cs_stack_t *st, cs_frame_t f) {
-    if (st->sp > CS_SCAN_MAX_DEPTH) {
-        s->failed = true; /* deeper than any real program: no scope for the file */
+    if (st->sp >= CS_FRAMES) {
+        s->failed = true; /* cannot happen (see CS_FRAMES); no scope rather than a wrong one */
         return;
     }
     st->frames[st->sp++] = f;
+}
+
+/* Segments of a dotted name. */
+static int cs_segments(const char *name) {
+    int n = SKIP_ONE;
+    for (const char *p = name; *p; p++) {
+        n += *p == '.';
+    }
+    return n;
 }
 
 /* What follows a namespace's name in a file with parse errors: the brace
@@ -2379,7 +2713,14 @@ static int cs_namespace_brace(const cs_scan_t *s, TSNode name, bool *file_scoped
 
 static void cs_place_namespace(cs_scan_t *s, cs_stack_t *st, const cs_item_t *it, bool trusted) {
     const cs_frame_t top = st->frames[st->sp - SKIP_ONE];
-    const char *name = it->from_text ? it->text_name : cs_name_dup(s, it->name);
+    if (top.bad) {
+        return; /* inside a block that is not placed: nothing is, and nothing nests */
+    }
+    const char *name = it->from_text ? it->text_name : NULL;
+    if (!it->from_text && !ts_node_is_null(it->name)) {
+        name = cs_namespace_name_dup(s, cs_namespace_name_start(s, it->node),
+                                     ts_node_end_byte(it->name));
+    }
     int brace = it->brace;
     bool file_scoped = it->tag == 'F';
     if (!it->from_text && s->lexical) {
@@ -2407,26 +2748,42 @@ static void cs_place_namespace(cs_scan_t *s, cs_stack_t *st, const cs_item_t *it
             end = UINT32_MAX; /* where it ends is unknown: nothing after it is placed */
         }
     }
-    const char *full = ok ? cs_join_path(s, top.ns, name) : NULL;
-    ok = ok && full;
-    if (!ok && !top.bad && it->start < s->untrusted) {
+    /* a namespace nested past the limit is not placed */
+    int segments = name ? top.ns_segments + cs_segments(name) : 0;
+    ok = ok && segments <= CS_MAX_NS_SEGMENTS;
+    if (!ok && it->start < s->untrusted) {
         cs_emit_unplaced(s, it->line, end == UINT32_MAX ? s->root_end_line : end_line);
     }
-    int region = ok ? cs_emit_region(s, top.region, it->line, end_line, full) : top.region;
+    int region = ok ? cs_emit_region(s, top.region, it->line, end_line, name) : top.region;
     cs_frame_push(s, st,
                   (cs_frame_t){.item = it->tree_idx,
                                .end = end,
                                .inner_depth = inner,
                                .region = region,
-                               .ns = ok ? full : top.ns,
-                               .path = "",
+                               .ns_segments = ok ? segments : top.ns_segments,
+                               .type = CBM_NOT_FOUND,
+                               .type_depth = 0,
                                .is_type = false,
                                .bad = !ok});
+}
+
+static void cs_put_quarantine(cs_scan_t *s, const char *name) {
+    sb_puts(&s->sb, "Q\t");
+    sb_puts(&s->sb, name);
+    sb_putc(&s->sb, '\n');
 }
 
 static void cs_place_type(cs_scan_t *s, cs_stack_t *st, const cs_item_t *it, bool trusted) {
     const cs_frame_t top = st->frames[st->sp - SKIP_ONE];
     const char *name = it->from_text ? it->text_name : cs_name_dup(s, it->name);
+    if (top.bad) {
+        /* declared inside a block that is not placed: its name must not
+         * resolve to anything else; nothing nests under it */
+        if (name) {
+            cs_put_quarantine(s, name);
+        }
+        return;
+    }
     bool block = it->brace >= 0;
     uint32_t end = it->start;
     uint32_t end_line = it->line;
@@ -2448,18 +2805,18 @@ static void cs_place_type(cs_scan_t *s, cs_stack_t *st, const cs_item_t *it, boo
             whole = paired && end == node_end;
         }
     }
-    const char *path = name ? cs_join_path(s, top.path, name) : NULL;
-    bool ok = trusted && paired && path;
+    /* a type nested past the limit is not placed */
+    bool ok = trusted && paired && name && top.type_depth < CS_MAX_TYPE_NEST;
+    int ord = CBM_NOT_FOUND;
     if (ok) {
-        cs_emit_type(s, it, top.region, end_line, path, it->broken || !whole);
+        ord = s->types_out++;
+        cs_emit_type(s, it, top.region, end_line, top.type, name, it->broken || !whole, ord);
     } else if (name) {
         /* declared, but where is unknown: its name must not resolve to
          * anything else either */
-        sb_puts(&s->sb, "Q\t");
-        sb_puts(&s->sb, name);
-        sb_putc(&s->sb, '\n');
+        cs_put_quarantine(s, name);
     }
-    if (!ok && !top.bad && block && it->start < s->untrusted) {
+    if (!ok && block && it->start < s->untrusted) {
         cs_emit_unplaced(s, it->line, paired ? end_line : s->root_end_line);
     }
     if (block) {
@@ -2468,8 +2825,9 @@ static void cs_place_type(cs_scan_t *s, cs_stack_t *st, const cs_item_t *it, boo
                                    .end = paired ? end : UINT32_MAX,
                                    .inner_depth = inner,
                                    .region = top.region,
-                                   .ns = top.ns,
-                                   .path = path ? path : "",
+                                   .ns_segments = top.ns_segments,
+                                   .type = ord,
+                                   .type_depth = top.type_depth + SKIP_ONE,
                                    .is_type = true,
                                    .bad = !ok});
     }
@@ -2487,8 +2845,9 @@ static void cs_emit_items(cs_scan_t *s) {
                                         .end = UINT32_MAX,
                                         .inner_depth = 0,
                                         .region = 0,
-                                        .ns = "",
-                                        .path = "",
+                                        .ns_segments = 0,
+                                        .type = CBM_NOT_FOUND,
+                                        .type_depth = 0,
                                         .is_type = false,
                                         .bad = false};
     for (int i = 0; i < s->nitems && !s->failed && !s->sb.failed; i++) {
@@ -2523,8 +2882,14 @@ static void cs_emit_items(cs_scan_t *s) {
         case 'M':
             /* the braces decide whose member it is when the tree has errors */
             if (trusted && top.is_type && (s->lexical || it->owner == top.item)) {
-                cs_emit_member(s, it->node, it->kind, it->explicit_impl, top.path, it->name,
-                               it->tparams, it->params);
+                cs_member_rec_t rec = {.line = cs_line(it->node),
+                                       .kind = it->kind,
+                                       .explicit_impl = it->explicit_impl,
+                                       .is_static = it->is_static,
+                                       .type = top.type,
+                                       .name = it->text_name ? it->text_name
+                                                             : cs_name_dup(s, it->name)};
+                cs_emit_member(s, &rec, it->tparams, it->params);
             }
             break;
         default:
@@ -2621,4 +2986,668 @@ const char *cbm_doclink_cs_scan_scope(CBMExtractCtx *ctx) {
         return NULL;
     }
     return s.sb.buf;
+}
+
+/* ── MSBuild project files ───────────────────────────────────────────
+ *
+ * A C# project's global usings come from its MSBuild files: the project
+ * file, the Directory.Build.props / .targets above it, and what those import
+ * (R1). The resolver must not open any of them: what it would read is a path
+ * the index never looked at (a symbolic link out of the repository, a named
+ * pipe), and it would read it again on every run. So a project file has a
+ * scope blob like a source file, and the resolver evaluates blobs.
+ *
+ * Project blob: the tag line "cs1", then one record per line. A field is
+ * empty for an attribute that is not there, else '=' and its text, XML
+ * entities decoded, with \\ \t \n \r escaped.
+ *   P  sdk  state                     the first record. state '-': read;
+ *                                     '!': a project file that could not be
+ *                                     read; '>': one larger than a project
+ *                                     file is (CSX_MAX_PROJECT_BYTES), not
+ *                                     read. Nothing follows the last two
+ *   I  group-cond  cond  project  sdk  <Import>; old blobs repeat a group's
+ *                                     condition in the first field
+ *   B  cond                           start of an <ImportGroup>, condition once
+ *   J  (empty)  cond  project  sdk     a child import; shares the B condition
+ *   E                                 end of the import group
+ *   G  cond                           <PropertyGroup>; its properties follow
+ *   V  cond  name  value              a property; value '?' when it is not
+ *                                     plain text
+ *   H  cond                           <ItemGroup> that has <Using> items;
+ *                                     they follow
+ *   N  cond  include  remove  static  alias    <Using>
+ *   K  name                           a property set inside a construct that
+ *                                     is not evaluated (<Choose>)
+ *   Y                                 a <Using> that is not evaluated (in a
+ *                                     <Choose>, with Update, with metadata
+ *                                     elements)
+ *   C  what                           another construct that is not evaluated
+ * Document order is evaluation order. Nothing else of the file is in the
+ * blob (targets, other items), so an edit there leaves it as it is. */
+
+enum { CSX_EOF = 0, CSX_OPEN, CSX_EMPTY, CSX_CLOSE, CSX_TEXT, CSX_BAD };
+
+/* The size past which a file is no project file to this reader. */
+enum { CSX_MAX_PROJECT_BYTES = 1000000 };
+
+enum {
+    CSX_A_CONDITION = 0,
+    CSX_A_PROJECT,
+    CSX_A_SDK,
+    CSX_A_INCLUDE,
+    CSX_A_REMOVE,
+    CSX_A_UPDATE,
+    CSX_A_STATIC,
+    CSX_A_ALIAS,
+    CSX_A_COUNT
+};
+
+typedef struct {
+    uint32_t s;
+    uint32_t e;
+    bool has;
+} csx_span_t;
+
+typedef struct {
+    int kind;
+    csx_span_t name; /* element name without a namespace prefix */
+    csx_span_t text; /* CSX_TEXT */
+    bool raw;        /* CSX_TEXT of a CDATA section: no entities in it */
+    csx_span_t attr[CSX_A_COUNT];
+} csx_tok_t;
+
+typedef struct {
+    const char *src;
+    uint32_t n;
+    uint32_t i;
+} csx_t;
+
+/* Index of `lit` in src[from, limit), or `limit`. */
+static uint32_t csx_find(const csx_t *x, uint32_t from, uint32_t limit, const char *lit) {
+    size_t ll = strlen(lit);
+    for (uint32_t k = from; k + ll <= limit; k++) {
+        if (x->src[k] == lit[0] && memcmp(x->src + k, lit, ll) == 0) {
+            return k;
+        }
+    }
+    return limit;
+}
+
+static bool csx_name_char(unsigned char c) {
+    return isalnum(c) || c == '_' || c == ':' || c == '.' || c == '-' || c >= 0x80;
+}
+
+static csx_span_t csx_local(const csx_t *x, uint32_t s, uint32_t e) {
+    for (uint32_t k = e; k > s; k--) {
+        if (x->src[k - SKIP_ONE] == ':') {
+            s = k;
+            break;
+        }
+    }
+    return (csx_span_t){.s = s, .e = e, .has = true};
+}
+
+static bool csx_is(const csx_t *x, csx_span_t v, const char *word) {
+    return v.has && strlen(word) == v.e - v.s && memcmp(x->src + v.s, word, v.e - v.s) == 0;
+}
+
+/* The attributes the blob keeps. MSBuild reads attribute names without
+ * regard to case. */
+static int csx_attr_index(const char *name, size_t len) {
+    static const char *const names[CSX_A_COUNT] = {"condition", "project", "sdk",    "include",
+                                                   "remove",    "update",  "static", "alias"};
+    for (int a = 0; a < CSX_A_COUNT; a++) {
+        if (strlen(names[a]) != len) {
+            continue;
+        }
+        size_t k = 0;
+        while (k < len && tolower((unsigned char)name[k]) == names[a][k]) {
+            k++;
+        }
+        if (k == len) {
+            return a;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+/* Past markup that is no element at src[x->i] ('<' stands there): a comment,
+ * a processing instruction, a declaration. false when it does not end. A
+ * CDATA section is text: *cdata, and the cursor stays. */
+static bool csx_skip_markup(csx_t *x, bool *skipped, bool *cdata) {
+    const char *s = x->src;
+    uint32_t rest = x->n - x->i;
+    *skipped = true;
+    *cdata = false;
+    if (rest >= 4 && memcmp(s + x->i, "<!--", 4) == 0) {
+        uint32_t e = csx_find(x, x->i + 4, x->n, "-->");
+        x->i = e + 3;
+        return e < x->n;
+    }
+    if (rest >= 9 && memcmp(s + x->i, "<![CDATA[", 9) == 0) {
+        *cdata = true;
+        return true;
+    }
+    if (rest >= PAIR_LEN && s[x->i + SKIP_ONE] == '?') {
+        uint32_t e = csx_find(x, x->i + PAIR_LEN, x->n, "?>");
+        x->i = e + PAIR_LEN;
+        return e < x->n;
+    }
+    if (rest >= PAIR_LEN && s[x->i + SKIP_ONE] == '!') {
+        /* <!DOCTYPE ...>, with an internal subset up to "]>" */
+        uint32_t e = csx_find(x, x->i + PAIR_LEN, x->n, ">");
+        uint32_t sub = csx_find(x, x->i + PAIR_LEN, e, "[");
+        if (sub < e) {
+            uint32_t close = csx_find(x, sub, x->n, "]>");
+            e = close < x->n ? close + SKIP_ONE : x->n;
+        }
+        x->i = e + SKIP_ONE;
+        return e < x->n;
+    }
+    *skipped = false;
+    return true;
+}
+
+/* The attributes of a start tag from src[p]; the tag's kind (CSX_OPEN,
+ * CSX_EMPTY) or CSX_BAD. Moves the cursor past the tag. */
+static int csx_attributes(csx_t *x, uint32_t p, csx_tok_t *t) {
+    const char *s = x->src;
+    for (;;) {
+        while (p < x->n && isspace((unsigned char)s[p])) {
+            p++;
+        }
+        if (p >= x->n) {
+            return CSX_BAD;
+        }
+        if (s[p] == '>') {
+            x->i = p + SKIP_ONE;
+            return CSX_OPEN;
+        }
+        if (s[p] == '/' && p + SKIP_ONE < x->n && s[p + SKIP_ONE] == '>') {
+            x->i = p + PAIR_LEN;
+            return CSX_EMPTY;
+        }
+        uint32_t as = p;
+        while (p < x->n && csx_name_char((unsigned char)s[p])) {
+            p++;
+        }
+        if (p == as) {
+            return CSX_BAD;
+        }
+        csx_span_t an = csx_local(x, as, p);
+        while (p < x->n && isspace((unsigned char)s[p])) {
+            p++;
+        }
+        if (p >= x->n || s[p] != '=') {
+            return CSX_BAD;
+        }
+        p++;
+        while (p < x->n && isspace((unsigned char)s[p])) {
+            p++;
+        }
+        if (p >= x->n || (s[p] != '"' && s[p] != '\'')) {
+            return CSX_BAD;
+        }
+        char quote = s[p++];
+        uint32_t vs = p;
+        while (p < x->n && s[p] != quote) {
+            p++;
+        }
+        if (p >= x->n) {
+            return CSX_BAD;
+        }
+        int ai = csx_attr_index(s + an.s, an.e - an.s);
+        if (ai >= 0) {
+            t->attr[ai] = (csx_span_t){.s = vs, .e = p, .has = true};
+        }
+        p++;
+    }
+}
+
+/* The next token of the document. Every byte is passed once. */
+static void csx_next(csx_t *x, csx_tok_t *t) {
+    memset(t, 0, sizeof(*t));
+    const char *s = x->src;
+    for (;;) {
+        if (x->i >= x->n) {
+            t->kind = CSX_EOF;
+            return;
+        }
+        if (s[x->i] != '<') {
+            uint32_t a = x->i;
+            while (x->i < x->n && s[x->i] != '<') {
+                x->i++;
+            }
+            t->kind = CSX_TEXT;
+            t->text = (csx_span_t){.s = a, .e = x->i, .has = true};
+            return;
+        }
+        bool skipped = false;
+        bool cdata = false;
+        if (!csx_skip_markup(x, &skipped, &cdata)) {
+            t->kind = CSX_BAD;
+            return;
+        }
+        if (cdata) {
+            uint32_t e = csx_find(x, x->i + 9, x->n, "]]>");
+            if (e >= x->n) {
+                t->kind = CSX_BAD;
+                return;
+            }
+            t->kind = CSX_TEXT;
+            t->raw = true;
+            t->text = (csx_span_t){.s = x->i + 9, .e = e, .has = true};
+            x->i = e + 3;
+            return;
+        }
+        if (!skipped) {
+            break;
+        }
+    }
+    uint32_t p = x->i + SKIP_ONE;
+    bool close = p < x->n && s[p] == '/';
+    if (close) {
+        p++;
+    }
+    uint32_t ns = p;
+    while (p < x->n && csx_name_char((unsigned char)s[p])) {
+        p++;
+    }
+    if (p == ns) {
+        t->kind = CSX_BAD;
+        return;
+    }
+    t->name = csx_local(x, ns, p);
+    if (!close) {
+        t->kind = csx_attributes(x, p, t);
+        return;
+    }
+    while (p < x->n && isspace((unsigned char)s[p])) {
+        p++;
+    }
+    if (p >= x->n || s[p] != '>') {
+        t->kind = CSX_BAD;
+        return;
+    }
+    x->i = p + SKIP_ONE;
+    t->kind = CSX_CLOSE;
+}
+
+/* One character of a field: escaped where it would break the line format. A
+ * control character has no place in XML text; it is written as a space. */
+static void csx_put_char(cs_sb_t *sb, unsigned char c) {
+    if (c == '\\') {
+        sb_puts(sb, "\\\\");
+    } else if (c == '\t') {
+        sb_puts(sb, "\\t");
+    } else if (c == '\n') {
+        sb_puts(sb, "\\n");
+    } else if (c == '\r') {
+        sb_puts(sb, "\\r");
+    } else {
+        sb_putc(sb, c < 0x20 ? ' ' : (char)c);
+    }
+}
+
+/* A code point as UTF-8. */
+static void csx_put_codepoint(cs_sb_t *sb, uint32_t cp) {
+    if (cp < 0x80) {
+        csx_put_char(sb, (unsigned char)cp);
+    } else if (cp < 0x800) {
+        sb_putc(sb, (char)(0xC0 | (cp >> 6)));
+        sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        sb_putc(sb, (char)(0xE0 | (cp >> 12)));
+        sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+    } else {
+        sb_putc(sb, (char)(0xF0 | ((cp >> 18) & 0x07)));
+        sb_putc(sb, (char)(0x80 | ((cp >> 12) & 0x3F)));
+        sb_putc(sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
+        sb_putc(sb, (char)(0x80 | (cp & 0x3F)));
+    }
+}
+
+/* The entity at src[i] ('&' stands there): its code point and the index past
+ * it; 0 when there is none. */
+static uint32_t csx_entity(const csx_t *x, uint32_t i, uint32_t end, uint32_t *cp) {
+    static const struct {
+        const char *ent;
+        char ch;
+    } ents[] = {{"&lt;", '<'}, {"&gt;", '>'}, {"&amp;", '&'}, {"&quot;", '"'}, {"&apos;", '\''}};
+    const char *s = x->src;
+    for (size_t e = 0; e < sizeof(ents) / sizeof(ents[0]); e++) {
+        size_t el = strlen(ents[e].ent);
+        if (i + el <= end && memcmp(s + i, ents[e].ent, el) == 0) {
+            *cp = (unsigned char)ents[e].ch;
+            return i + (uint32_t)el;
+        }
+    }
+    if (i + PAIR_LEN < end && s[i + SKIP_ONE] == '#') {
+        bool hex = s[i + PAIR_LEN] == 'x' || s[i + PAIR_LEN] == 'X';
+        uint32_t k = i + PAIR_LEN + (hex ? SKIP_ONE : 0);
+        uint32_t v = 0;
+        uint32_t digits = 0;
+        while (k < end && digits < CBM_SZ_8 &&
+               (hex ? isxdigit((unsigned char)s[k]) : isdigit((unsigned char)s[k]))) {
+            unsigned char d = (unsigned char)s[k];
+            uint32_t dv = isdigit(d) ? (uint32_t)(d - '0') : (uint32_t)(tolower(d) - 'a') + 10U;
+            v = (v * (hex ? 16U : 10U)) + dv;
+            k++;
+            digits++;
+        }
+        if (digits > 0 && k < end && s[k] == ';' && v > 0 && v <= 0x10FFFF) {
+            *cp = v;
+            return k + SKIP_ONE;
+        }
+    }
+    return 0;
+}
+
+/* The text of `v`, entities decoded (unless `raw`), escaped. */
+static void csx_put_text(cs_sb_t *sb, const csx_t *x, csx_span_t v, bool raw) {
+    for (uint32_t i = v.s; i < v.e;) {
+        uint32_t cp = 0;
+        uint32_t past = (!raw && x->src[i] == '&') ? csx_entity(x, i, v.e, &cp) : 0;
+        if (past) {
+            csx_put_codepoint(sb, cp);
+            i = past;
+        } else {
+            csx_put_char(sb, (unsigned char)x->src[i]);
+            i++;
+        }
+    }
+}
+
+/* A field: a tab, then nothing for an absent attribute, else '=' and its text. */
+static void csx_put_field(cs_sb_t *sb, const csx_t *x, csx_span_t v) {
+    sb_putc(sb, '\t');
+    if (v.has) {
+        sb_putc(sb, '=');
+        csx_put_text(sb, x, v, false);
+    }
+}
+
+/* What a project file's scan keeps between tokens. */
+typedef struct {
+    csx_t x;
+    cs_sb_t out;
+    cs_sb_t value;      /* a property's text so far */
+    int depth;          /* open elements */
+    char group;         /* the child of <Project> the cursor is in: G H i c, or 0 */
+    csx_span_t gcond;   /* its Condition */
+    bool h_written;     /* the ItemGroup's H record is out */
+    bool i_written;     /* the ImportGroup's B record is out */
+    bool prop_open;     /* a property element is open ... */
+    bool prop_complex;  /* ... and holds elements, not just text */
+    bool using_open;    /* a <Using> with content is open ... */
+    bool using_complex; /* ... and holds metadata elements */
+    csx_tok_t pending;  /* the open property's or <Using>'s start tag */
+    int choose_props;   /* in a <Choose>: the depth of a <PropertyGroup>'s children, or -1 */
+} csx_scan_t;
+
+static void csx_put_using(csx_scan_t *p, const csx_tok_t *t) {
+    if (!p->h_written) {
+        sb_putc(&p->out, 'H');
+        csx_put_field(&p->out, &p->x, p->gcond);
+        sb_putc(&p->out, '\n');
+        p->h_written = true;
+    }
+    sb_putc(&p->out, 'N');
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_CONDITION]);
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_INCLUDE]);
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_REMOVE]);
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_STATIC]);
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_ALIAS]);
+    sb_putc(&p->out, '\n');
+}
+
+static void csx_put_import(csx_scan_t *p, const csx_tok_t *t, bool grouped) {
+    if (grouped && !p->i_written) {
+        sb_putc(&p->out, 'B');
+        csx_put_field(&p->out, &p->x, p->gcond);
+        sb_putc(&p->out, '\n');
+        p->i_written = true;
+    }
+    sb_putc(&p->out, grouped ? 'J' : 'I');
+    csx_put_field(&p->out, &p->x, (csx_span_t){0});
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_CONDITION]);
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_PROJECT]);
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_SDK]);
+    sb_putc(&p->out, '\n');
+}
+
+/* The open property ends: its record. */
+static void csx_put_property(csx_scan_t *p) {
+    const csx_tok_t *t = &p->pending;
+    sb_putc(&p->out, 'V');
+    csx_put_field(&p->out, &p->x, t->attr[CSX_A_CONDITION]);
+    sb_putc(&p->out, '\t');
+    sb_putn(&p->out, p->x.src + t->name.s, t->name.e - t->name.s);
+    sb_putc(&p->out, '\t');
+    if (p->prop_complex) {
+        sb_putc(&p->out, '?');
+    } else {
+        sb_putc(&p->out, '=');
+        if (p->value.len > 0) {
+            sb_putn(&p->out, p->value.buf, p->value.len);
+        }
+    }
+    sb_putc(&p->out, '\n');
+}
+
+/* An element inside a <Choose>: what it could set is named, not evaluated. */
+static void csx_choose_child(csx_scan_t *p, const csx_tok_t *t) {
+    if (p->choose_props >= 0 && p->depth == p->choose_props) {
+        sb_puts(&p->out, "K\t");
+        sb_putn(&p->out, p->x.src + t->name.s, t->name.e - t->name.s);
+        sb_putc(&p->out, '\n');
+    } else if (csx_is(&p->x, t->name, "PropertyGroup") && p->choose_props < 0 &&
+               t->kind == CSX_OPEN) {
+        p->choose_props = p->depth + SKIP_ONE;
+    } else if (csx_is(&p->x, t->name, "Using")) {
+        sb_puts(&p->out, "Y\n");
+    } else if (csx_is(&p->x, t->name, "Import")) {
+        sb_puts(&p->out, "C\tImport\n");
+    }
+}
+
+/* A child of <Project> starts. */
+static void csx_project_child(csx_scan_t *p, const csx_tok_t *t) {
+    p->group = 0;
+    p->gcond = t->attr[CSX_A_CONDITION];
+    if (csx_is(&p->x, t->name, "Import")) {
+        csx_put_import(p, t, false);
+    } else if (csx_is(&p->x, t->name, "PropertyGroup")) {
+        sb_putc(&p->out, 'G');
+        csx_put_field(&p->out, &p->x, p->gcond);
+        sb_putc(&p->out, '\n');
+        p->group = 'G';
+    } else if (csx_is(&p->x, t->name, "ItemGroup")) {
+        p->group = 'H';
+        p->h_written = false;
+    } else if (csx_is(&p->x, t->name, "ImportGroup")) {
+        p->group = 'i';
+        p->i_written = false;
+    } else if (csx_is(&p->x, t->name, "Choose")) {
+        sb_puts(&p->out, "C\tChoose\n");
+        p->group = 'c';
+        p->choose_props = CBM_NOT_FOUND;
+    }
+    if (t->kind == CSX_EMPTY) {
+        p->group = 0;
+    }
+}
+
+/* A grandchild of <Project> starts. */
+static void csx_group_child(csx_scan_t *p, const csx_tok_t *t) {
+    if (p->group == 'G') {
+        p->pending = *t;
+        p->value.len = 0;
+        p->prop_complex = false;
+        if (t->kind == CSX_EMPTY) {
+            csx_put_property(p);
+        } else {
+            p->prop_open = true;
+        }
+    } else if (p->group == 'H' && csx_is(&p->x, t->name, "Using")) {
+        if (t->attr[CSX_A_UPDATE].has) {
+            sb_puts(&p->out, "Y\n");
+        } else if (t->kind == CSX_EMPTY) {
+            csx_put_using(p, t);
+        } else {
+            p->pending = *t;
+            p->using_open = true;
+            p->using_complex = false;
+        }
+    } else if (p->group == 'i' && csx_is(&p->x, t->name, "Import")) {
+        csx_put_import(p, t, true);
+    }
+}
+
+/* A start tag below the root. */
+static void csx_element(csx_scan_t *p, const csx_tok_t *t) {
+    if (p->depth == SKIP_ONE) {
+        csx_project_child(p, t);
+    } else if (p->group == 'c') {
+        csx_choose_child(p, t);
+    } else if (p->depth == PAIR_LEN) {
+        csx_group_child(p, t);
+    } else {
+        p->prop_complex = p->prop_complex || p->prop_open;
+        p->using_complex = p->using_complex || p->using_open;
+    }
+    if (t->kind == CSX_OPEN) {
+        p->depth++;
+    }
+}
+
+/* An end tag: `depth` is already the depth outside the element. */
+static void csx_element_end(csx_scan_t *p) {
+    if (p->depth == PAIR_LEN && p->prop_open) {
+        csx_put_property(p);
+        p->prop_open = false;
+    } else if (p->depth == PAIR_LEN && p->using_open) {
+        if (p->using_complex) {
+            sb_puts(&p->out, "Y\n");
+        } else {
+            csx_put_using(p, &p->pending);
+        }
+        p->using_open = false;
+    }
+    if (p->depth == SKIP_ONE) {
+        if (p->group == 'i' && p->i_written) {
+            sb_puts(&p->out, "E\n");
+        }
+        p->group = 0;
+    }
+    if (p->group == 'c' && p->choose_props == p->depth + SKIP_ONE) {
+        p->choose_props = CBM_NOT_FOUND;
+    }
+}
+
+static bool csx_ci_suffix(const char *s, const char *sfx) {
+    size_t n = s ? strlen(s) : 0;
+    size_t sl = strlen(sfx);
+    if (n < sl) {
+        return false;
+    }
+    for (size_t i = 0; i < sl; i++) {
+        if (tolower((unsigned char)s[n - sl + i]) != sfx[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void cbm_doclink_cs_project_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                      uint32_t doc_line) {
+    /* a project file's comments hold no references to code */
+    (void)ctx;
+    (void)def;
+    (void)doc;
+    (void)doc_line;
+}
+
+const char *cbm_doclink_cs_project_scan_scope(CBMExtractCtx *ctx) {
+    /* The gate is the file's name, before a byte of it is looked at: only a
+     * *.csproj, *.props or *.targets file can be an MSBuild project file of a
+     * C# project. Every other XML file -- there are many, and large ones --
+     * costs nothing here. */
+    bool named_project = csx_ci_suffix(ctx->rel_path, ".csproj");
+    if (!ctx->source || !(named_project || csx_ci_suffix(ctx->rel_path, ".props") ||
+                          csx_ci_suffix(ctx->rel_path, ".targets"))) {
+        return NULL;
+    }
+    /* A project file past the size a project file has is not read either,
+     * and its blob says so: what it holds is unknown, not absent. */
+    if (ctx->source_len > CSX_MAX_PROJECT_BYTES) {
+        return cbm_arena_strdup(ctx->arena, CBM_DOCLINK_CS_SCOPE_TAG "\nP\t\t>\n");
+    }
+    /* a *.csproj marks its directory as a C# project even when it cannot be
+     * read; a *.props or *.targets file has a blob only as an MSBuild
+     * <Project> */
+    csx_scan_t p = {
+        .x = {.src = ctx->source, .n = ctx->source_len > 0 ? (uint32_t)ctx->source_len : 0},
+        .out = {.a = ctx->arena},
+        .value = {.a = ctx->scratch ? ctx->scratch : ctx->arena},
+        .choose_props = CBM_NOT_FOUND};
+    static const char bom[] = "\xEF\xBB\xBF";
+    if (p.x.n >= 3 && memcmp(p.x.src, bom, 3) == 0) {
+        p.x.i = 3;
+    }
+    bool is_project = false;
+    bool bad = false;
+    csx_tok_t t;
+    for (;;) {
+        csx_next(&p.x, &t);
+        if (t.kind == CSX_EOF || t.kind == CSX_BAD) {
+            bad = t.kind == CSX_BAD || p.depth != 0;
+            break;
+        }
+        if (t.kind == CSX_TEXT) {
+            if (p.prop_open && p.depth == 3) {
+                csx_put_text(&p.value, &p.x, t.text, t.raw);
+            }
+            continue;
+        }
+        if (t.kind == CSX_CLOSE) {
+            if (p.depth == 0) {
+                bad = true;
+                break;
+            }
+            p.depth--;
+            csx_element_end(&p);
+            continue;
+        }
+        if (p.depth > 0) {
+            csx_element(&p, &t);
+            continue;
+        }
+        if (is_project) {
+            bad = true; /* a second root element */
+            break;
+        }
+        if (!csx_is(&p.x, t.name, "Project")) {
+            break; /* XML, but no MSBuild file */
+        }
+        is_project = true;
+        sb_puts(&p.out, CBM_DOCLINK_CS_SCOPE_TAG "\nP");
+        csx_put_field(&p.out, &p.x, t.attr[CSX_A_SDK]);
+        sb_puts(&p.out, "\t-\n");
+        if (t.kind == CSX_OPEN) {
+            p.depth++;
+        }
+    }
+    cs_cost_add(p.x.i, 0);
+    if ((bad && (is_project || named_project)) || (!is_project && named_project)) {
+        p.out.len = 0;
+        sb_puts(&p.out, CBM_DOCLINK_CS_SCOPE_TAG "\nP\t\t!\n");
+    } else if (!is_project) {
+        return NULL;
+    }
+    if (p.out.failed || p.value.failed || !p.out.buf) {
+        return NULL;
+    }
+    return p.out.buf;
 }

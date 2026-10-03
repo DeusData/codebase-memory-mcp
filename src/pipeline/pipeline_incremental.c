@@ -1224,11 +1224,14 @@ static int surface_added_names(const char *stored_json, const char *fresh_json, 
  * file rewrites its own edges and doc_link_unresolved rows, and the files
  * with edges INTO a changed file are dependents. What the edge set cannot
  * see is decided by the language's resolver hooks (doc_links.h), never here:
- *   - a scope input (C#: an MSBuild project file sets the global usings of
- *     every file of its project): a change declines to FULL;
+ *   - a scope input (a file without a scope of its own that sets the scope of
+ *     a language's files; no language has one today): a change declines to
+ *     FULL;
  *   - a scope delta ("dl" surface key) the language calls GLOBAL can re-route
  *     or re-classify references in files with no edge into the changed file:
- *     FULL, exactly like an added name. A deleted file with a scope is GLOBAL;
+ *     FULL, exactly like an added name. A deleted file with a scope is GLOBAL.
+ *     C#'s MSBuild project files come in here: each has a scope blob, and any
+ *     change to it is GLOBAL (it sets the global usings of a whole project);
  *   - a REMOVED name can make another file's unresolved reference resolve (an
  *     overload group shrinks) or change its reason: the files whose rows
  *     mention it re-resolve with the closure. */
@@ -2006,8 +2009,8 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         decline = "no_file_delta";
         goto done;
     }
-    /* A doc-link scope input scopes files other than itself (C#: a project
-     * file sets the global usings of every file of the project). */
+    /* A doc-link scope input scopes files other than itself and has no scope
+     * blob the surface comparison below could judge. */
     for (int i = 0; i < n_changed + n_deleted; i++) {
         if (cbm_doclinks_is_scope_input(changed_paths[i])) {
             decline = "doc_scope_input_changed";

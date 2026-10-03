@@ -142,29 +142,71 @@ void cbm_doclinks_push(CBMDocLinkArray *arr, CBMArena *a, CBMDocLink link);
  * allocation failure. */
 char *cbm_doclink_portable_scope(const char *scope);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Fail one selected allocation attempt, then automatically disarm. */
+enum {
+    CBM_DOCLINK_ALLOC_SPAN,
+    CBM_DOCLINK_ALLOC_TEXT,
+    CBM_DOCLINK_ALLOC_VALUE,
+    CBM_DOCLINK_ALLOC_TOKENS,
+    CBM_DOCLINK_ALLOC_KINDS,
+};
+void cbm_doclink_test_fail_alloc_after(int kind, int nth);
+bool cbm_doclink_test_fail_alloc(int kind);
+void cbm_doclink_test_reset_alloc(void);
+
+/* Actual comment memcpy bytes, input bytes submitted to the C# lexical parser,
+ * and bytes allocated for cleaned reference values; separate from token output. */
+void cbm_doclink_test_doc_work_reset(void);
+void cbm_doclink_test_doc_work(uint64_t *copied, uint64_t *parse_input, uint64_t *cleaned);
+void cbm_doclink_test_note_doc_work(uint64_t copied, uint64_t parse_input, uint64_t cleaned);
+#endif
+
 /* ── C# (doclink_cs.c) ─────────────────────────────────────────────── */
 
 void cbm_doclink_cs_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
                               uint32_t doc_line);
+/* False if allocating a value or appending a token failed. Only a complete
+ * lexical result can be shared with another definition. */
+bool cbm_doclink_cs_parse_doc_checked(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                      uint32_t doc_line);
 const char *cbm_doclink_cs_scan_scope(CBMExtractCtx *ctx);
 char *cbm_doclink_cs_portable_scope(const char *scope);
 
+/* MSBuild project files (*.csproj, *.props, *.targets) set the global usings
+ * of a C# project, so they have a scope blob too: the C# resolver evaluates
+ * those blobs and never opens a file. The blob carries the C# tag. The scan
+ * is gated by the file's name: any other XML file costs nothing and has no
+ * blob. A project file holds no doc references: its parse_doc does nothing. */
+void cbm_doclink_cs_project_parse_doc(CBMExtractCtx *ctx, const CBMDefinition *def, const char *doc,
+                                      uint32_t doc_line);
+const char *cbm_doclink_cs_project_scan_scope(CBMExtractCtx *ctx);
+
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
-/* Test seam: what the C# scope scans since the last reset cost -- the source
- * positions their text readers looked at, and the bytes they took from the
- * scratch arena. A test holds these against the size of its input, so that a
+/* Test seam: what the C# scope scans since the last reset cost -- the text
+ * positions, brace-stack entries and modifier children visited, and the bytes
+ * they took from the scratch arena. A test holds these against the size of its input, so that a
  * scan whose cost grows faster than its input fails without a clock. Test
  * builds only. */
 void cbm_doclink_cs_test_cost_reset(void);
 void cbm_doclink_cs_test_cost(uint64_t *text_steps, uint64_t *scratch_bytes);
+/* Completed C# scope-builder bytes since the cost reset, including any embedded
+ * terminator. A direct-extraction test compares this with the returned C string. */
+uint64_t cbm_doclink_cs_test_scope_bytes(void);
+/* Import-index construction and a one-shot candidate-buffer failure. Query
+ * visits remain in the pipeline's existing test_work counter. */
+uint64_t cbm_doclink_cs_test_index_work(void);
+void cbm_doclink_cs_test_fail_candidate_alloc(bool enabled);
+bool cbm_doclink_cs_test_candidate_alloc_failed(void);
 #endif
 
 /* Normalize one C# parameter type as written in a declaration or a cref
  * parameter list: attributes, ref/out/in/params/this/scoped modifiers, type
  * arguments, namespaces, nullable markers and a trailing parameter name are
  * dropped, BCL names map to their keyword (Int32 -> int), array and pointer
- * suffixes stay. "?" when nothing is left. Writes a NUL-terminated string into
- * `out` (truncated at cap) and returns its length. */
+ * suffixes stay. "?" (a type nothing is known about) when nothing is left, when
+ * the text is too long to be a type, or when the result does not fit `out`:
+ * never a cut name. Writes a NUL-terminated string and returns its length. */
 size_t cbm_doclink_cs_norm_type(const char *in, size_t len, char *out, size_t cap);
 
 /* The C# scope blob starts with this tag line. */

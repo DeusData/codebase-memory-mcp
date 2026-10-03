@@ -4457,6 +4457,86 @@ int cbm_store_doc_links_replace(cbm_store_t *s, const char *project, const cbm_d
     return exec_sql(s, "COMMIT;");
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_uint_fast64_t doc_links_sample_field_copies = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t doc_links_sample_copied_bytes = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t doc_links_sample_requested_bytes = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t doc_links_sample_max_request_bytes = ATOMIC_VAR_INIT(0);
+static atomic_int doc_links_sample_alloc_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+static atomic_bool doc_links_sample_alloc_failed = ATOMIC_VAR_INIT(false);
+
+void cbm_store_doc_links_test_sample_stats_reset(void) {
+    atomic_store_explicit(&doc_links_sample_field_copies, 0, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_copied_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_requested_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_max_request_bytes, 0, memory_order_relaxed);
+}
+
+void cbm_store_doc_links_test_sample_stats(cbm_doc_links_sample_test_stats_t *out) {
+    if (!out) {
+        return;
+    }
+    out->field_copies = atomic_load_explicit(&doc_links_sample_field_copies, memory_order_relaxed);
+    out->copied_bytes = atomic_load_explicit(&doc_links_sample_copied_bytes, memory_order_relaxed);
+    out->requested_bytes =
+        atomic_load_explicit(&doc_links_sample_requested_bytes, memory_order_relaxed);
+    out->max_request_bytes =
+        atomic_load_explicit(&doc_links_sample_max_request_bytes, memory_order_relaxed);
+}
+
+void cbm_store_doc_links_test_fail_sample_alloc_after(int successful_copies) {
+    atomic_store_explicit(&doc_links_sample_alloc_failed, false, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_alloc_countdown,
+                          successful_copies < 0 ? CBM_NOT_FOUND : successful_copies,
+                          memory_order_relaxed);
+}
+
+bool cbm_store_doc_links_test_sample_alloc_failed(void) {
+    return atomic_load_explicit(&doc_links_sample_alloc_failed, memory_order_relaxed);
+}
+#endif
+
+/* Copy the exact bytes requested by the sample query, including embedded NUL.
+ * Counters observe this allocation and copy, never the original column length. */
+static char *doc_links_sample_copy(const void *source, size_t length) {
+    if (length == SIZE_MAX || (length && !source)) {
+        return NULL;
+    }
+    size_t bytes = length + SKIP_ONE;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add_explicit(&doc_links_sample_requested_bytes, bytes, memory_order_relaxed);
+    uint_fast64_t maximum =
+        atomic_load_explicit(&doc_links_sample_max_request_bytes, memory_order_relaxed);
+    while (maximum < bytes && !atomic_compare_exchange_weak_explicit(
+                                  &doc_links_sample_max_request_bytes, &maximum, bytes,
+                                  memory_order_relaxed, memory_order_relaxed)) {}
+    if (graph_compare_test_countdown_fires(&doc_links_sample_alloc_countdown)) {
+        atomic_store_explicit(&doc_links_sample_alloc_failed, true, memory_order_relaxed);
+        return NULL;
+    }
+#endif
+    char *copy = cbm_alloc(CBM_MEM_CLASS_STORE, bytes);
+    if (copy) {
+        if (length) {
+            memcpy(copy, source, length);
+        }
+        copy[length] = '\0';
+#ifdef CBM_ENABLE_TEST_SEAMS
+        atomic_fetch_add_explicit(&doc_links_sample_field_copies, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&doc_links_sample_copied_bytes, bytes, memory_order_relaxed);
+#endif
+    }
+    return copy;
+}
+
+/* Full getters and the original summary API retain their C-string behavior. */
+static char *doc_links_field_copy(const char *source, bool sample) {
+    if (!sample || !source) {
+        return cbm_mem_strdup(CBM_MEM_CLASS_STORE, source);
+    }
+    return doc_links_sample_copy(source, strlen(source));
+}
+
 /* Run a row query (columns rel_path, line, syntax, raw, reason) with the
  * project bound to ?1 and an optional integer limit bound to ?2. */
 static int doc_links_query(cbm_store_t *s, const char *sql, const char *project, int limit,
@@ -4491,15 +4571,14 @@ static int doc_links_query(cbm_store_t *s, const char *sql, const char *project,
             cap *= ST_GROWTH;
         }
         cbm_doc_link_row_t *r = &arr[n];
-        r->rel_path =
-            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, 0));
+        r->rel_path = doc_links_field_copy((const char *)sqlite3_column_text(stmt, 0), limit >= 0);
         r->line = sqlite3_column_int(stmt, SKIP_ONE);
         r->syntax =
-            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, ST_COL_2));
+            doc_links_field_copy((const char *)sqlite3_column_text(stmt, ST_COL_2), limit >= 0);
         r->raw =
-            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, ST_COL_3));
+            doc_links_field_copy((const char *)sqlite3_column_text(stmt, ST_COL_3), limit >= 0);
         r->reason =
-            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, CBM_SZ_4));
+            doc_links_field_copy((const char *)sqlite3_column_text(stmt, CBM_SZ_4), limit >= 0);
         n++;
         if (!r->rel_path || !r->syntax || !r->raw || !r->reason) {
             sqlite3_finalize(stmt);
@@ -4630,6 +4709,136 @@ int cbm_store_doc_links_summary(cbm_store_t *s, const char *project,
     *reasons = arr;
     *reason_count = n;
     return CBM_STORE_OK;
+}
+
+/* Both substr and length operate on bytes; ORDER BY retains the original
+ * columns, so projection cannot change which fifty source rows are sampled. */
+static bool doc_links_preview_field(sqlite3_stmt *stmt, int column, size_t cap,
+                                    cbm_doc_link_preview_text_t *out) {
+    /* SQLite's BLOB substr returns SQL NULL for a zero-byte BLOB. Its
+     * separately computed integer length distinguishes that from a NULL
+     * source or a failed nonempty projection. */
+    if (sqlite3_column_type(stmt, column + SKIP_ONE) != SQLITE_INTEGER) {
+        return false;
+    }
+    sqlite3_int64 original = sqlite3_column_int64(stmt, column + SKIP_ONE);
+    int projection_type = sqlite3_column_type(stmt, column);
+    if (original < 0 ||
+        (projection_type != SQLITE_BLOB && (projection_type != SQLITE_NULL || original != 0))) {
+        return false;
+    }
+    const void *source = sqlite3_column_blob(stmt, column);
+    int bytes = sqlite3_column_bytes(stmt, column);
+    if (bytes < 0 || (size_t)bytes > cap || (bytes && !source)) {
+        return false;
+    }
+    uint64_t expected = (uint64_t)original < cap ? (uint64_t)original : cap;
+    if ((uint64_t)bytes != expected) {
+        return false;
+    }
+    out->text = doc_links_sample_copy(source, (size_t)bytes);
+    if (!out->text) {
+        return false;
+    }
+    out->length = (size_t)bytes;
+    out->original_bytes = (uint64_t)original;
+    return true;
+}
+
+int cbm_store_doc_links_preview(cbm_store_t *s, const char *project,
+                                cbm_doc_link_preview_row_t **out, int *count, bool *table_present) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (table_present) {
+        *table_present = false;
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    int state = doc_links_table_state(s);
+    if (state < 0) {
+        return CBM_STORE_ERR;
+    }
+    if (!state) {
+        return CBM_STORE_OK;
+    }
+    if (table_present) {
+        *table_present = true;
+    }
+    sqlite3_stmt *stmt = NULL;
+    static const char sql[] =
+        "SELECT substr(CAST(d.rel_path AS BLOB),1,?2),length(CAST(d.rel_path AS BLOB)),"
+        "d.line,substr(CAST(d.syntax AS BLOB),1,?3),length(CAST(d.syntax AS BLOB)),"
+        "substr(CAST(d.raw AS BLOB),1,?2),length(CAST(d.raw AS BLOB)),"
+        "substr(CAST(d.reason AS BLOB),1,?3),length(CAST(d.reason AS BLOB)) "
+        "FROM doc_link_unresolved AS d WHERE d.project=?1 "
+        "ORDER BY d.reason,d.rel_path,d.line,d.raw LIMIT ?4;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links preview prepare");
+        return CBM_STORE_ERR;
+    }
+    const int long_cap = CBM_DOC_LINK_PREVIEW_LONG_BYTES + CBM_DOC_LINK_PREVIEW_LOOKAHEAD;
+    const int short_cap = CBM_DOC_LINK_PREVIEW_SHORT_BYTES + CBM_DOC_LINK_PREVIEW_LOOKAHEAD;
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, ST_COL_2, long_cap) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, ST_COL_3, short_cap) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, ST_COL_4, CBM_DOC_LINK_PREVIEW_ROWS) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links preview bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    cbm_doc_link_preview_row_t *rows =
+        cbm_calloc(CBM_MEM_CLASS_STORE, CBM_DOC_LINK_PREVIEW_ROWS * sizeof(*rows));
+    if (!rows) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int n = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n == CBM_DOC_LINK_PREVIEW_ROWS) {
+            store_set_error(s, "doc_links preview row limit");
+            sqlite3_finalize(stmt);
+            cbm_store_free_doc_link_previews(rows, n);
+            return CBM_STORE_ERR;
+        }
+        cbm_doc_link_preview_row_t *row = &rows[n++];
+        row->line = sqlite3_column_int(stmt, ST_COL_2);
+        if (!doc_links_preview_field(stmt, 0, (size_t)long_cap, &row->rel_path) ||
+            !doc_links_preview_field(stmt, ST_COL_3, (size_t)short_cap, &row->syntax) ||
+            !doc_links_preview_field(stmt, ST_COL_5, (size_t)long_cap, &row->raw) ||
+            !doc_links_preview_field(stmt, ST_COL_7, (size_t)short_cap, &row->reason)) {
+            store_set_error(s, "doc_links preview copy failed");
+            sqlite3_finalize(stmt);
+            cbm_store_free_doc_link_previews(rows, n);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "doc_links preview scan");
+        cbm_store_free_doc_link_previews(rows, n);
+        return CBM_STORE_ERR;
+    }
+    *out = rows;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_free_doc_link_previews(cbm_doc_link_preview_row_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].rel_path.text);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].syntax.text);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].raw.text);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].reason.text);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, rows);
 }
 
 void cbm_store_free_doc_links(cbm_doc_link_row_t *rows, int count) {

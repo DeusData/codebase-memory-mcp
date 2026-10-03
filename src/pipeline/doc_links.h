@@ -194,9 +194,10 @@ typedef struct {
     void (*resolve)(const void *index, int run_file, const CBMDocLink *link,
                     const cbm_gbuf_t *graph, cbm_doclink_outcome_t *out);
     /* Incremental runs; both optional.
-     * scope_input  true for a file that is no source of the language but sets
-     *              the scope of its files (C#: MSBuild project files). A
-     *              change to one is GLOBAL.
+     * scope_input  true for a file that is no source of the language and has
+     *              no scope blob, but sets the scope of its files. A change
+     *              to one is GLOBAL. (C# needs none: its MSBuild project
+     *              files have scope blobs of their own.)
      * scope_delta  compare a changed file's stored and fresh scope blobs (both
      *              of this language) and report the names it no longer
      *              declares through `removed`. Returns a cbm_doclink_delta_t,
@@ -208,6 +209,15 @@ typedef struct {
 
 extern const cbm_doclink_resolver_t cbm_doclink_cs_resolver;
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam (doc_links_cs.c): the scope levels and overloads the C# resolver
+ * looked at since the last reset. A test holds it against the size of its
+ * input, so that a lookup whose cost grows faster than its input fails
+ * without a clock. Test builds only. */
+void cbm_doclink_cs_test_work_reset(void);
+uint64_t cbm_doclink_cs_test_work(void);
+#endif
+
 /* True when `rel_path` is a scope input of some language (scope_input). */
 bool cbm_doclinks_is_scope_input(const char *rel_path);
 
@@ -217,13 +227,5 @@ bool cbm_doclinks_is_scope_input(const char *rel_path);
  * language is GLOBAL; otherwise the language's scope_delta hook decides. */
 int cbm_doclinks_scope_delta(const char *stored, const char *fresh, cbm_doclink_name_fn removed,
                              void *ud);
-
-/* MSBuild global usings of the C# project file `csproj_rel` (doc_links_cs.c,
- * exposed for tests): Directory.Build.props -> project -> Directory.Build.
- * targets, <Using Include/Remove> items and the ImplicitUsings SDK sets.
- * Fills a NULL-terminated, heap-owned array; free with
- * cbm_doclinks_free_strv. Returns the count. */
-int cbm_doclinks_msbuild_usings(const char *repo_path, const char *csproj_rel, char ***out);
-void cbm_doclinks_free_strv(char **v);
 
 #endif /* CBM_PIPELINE_DOC_LINKS_H */

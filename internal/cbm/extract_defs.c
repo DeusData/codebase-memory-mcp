@@ -1351,6 +1351,7 @@ typedef struct {
     doc_span_t *items; /* trivia directly before the anchor, in source order */
     int count;
     int cap;
+    bool failed;           /* a missing span must not become shared documentation */
     bool code_before;      /* a non-trivia sibling precedes items[0] */
     uint32_t code_erow;    /* ... its effective end row */
     uint32_t code_eb;      /* ... its end byte (Kotlin gap scan) */
@@ -1478,8 +1479,17 @@ static doc_span_t doc_span_of(TSNode n, const char *src, uint8_t kind) {
 static void doc_push_span(CBMArena *a, doc_trivia_t *t, const doc_span_t *sp) {
     if (t->count == t->cap) {
         int ncap = t->cap ? t->cap * DOC_SPAN_GROW : DOC_SPAN_INIT_CAP;
-        doc_span_t *grown = (doc_span_t *)cbm_arena_alloc(a, (size_t)ncap * sizeof(doc_span_t));
+        doc_span_t *grown;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_SPAN)) {
+            grown = NULL;
+        } else
+#endif
+        {
+            grown = (doc_span_t *)cbm_arena_alloc(a, (size_t)ncap * sizeof(doc_span_t));
+        }
         if (!grown) {
+            t->failed = true;
             return;
         }
         if (t->count > 0) {
@@ -2035,7 +2045,15 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
     if (kept == 0 || !words) {
         return NULL;
     }
-    char *buf = (char *)cbm_arena_alloc(ctx->arena, total + SKIP_ONE);
+    char *buf;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_TEXT)) {
+        buf = NULL;
+    } else
+#endif
+    {
+        buf = (char *)cbm_arena_alloc(ctx->arena, total + SKIP_ONE);
+    }
     if (!buf) {
         return NULL;
     }
@@ -2054,6 +2072,9 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
             buf[w++] = '\n';
         }
         memcpy(buf + w, src + sp->sb, eb - sp->sb);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        cbm_doclink_test_note_doc_work(eb - sp->sb, 0, 0);
+#endif
         w += eb - sp->sb;
     }
     buf[w] = '\0';
@@ -2142,10 +2163,17 @@ static const char *doc_from_trivia(CBMExtractCtx *ctx, const doc_trivia_t *t,
     return doc_run_text(ctx, t, doc_run_first(lang, t, near), near, lang == CBM_LANG_GO);
 }
 
-static const char *doc_for_anchor(CBMExtractCtx *ctx, TSNode anchor) {
+static const char *doc_for_anchor_status(CBMExtractCtx *ctx, TSNode anchor, bool *complete) {
     doc_trivia_t t;
     doc_collect_trivia(ctx, anchor, &t);
+    if (complete) {
+        *complete = !t.failed;
+    }
     return doc_from_trivia(ctx, &t, ts_node_start_point(anchor).row);
+}
+
+static const char *doc_for_anchor(CBMExtractCtx *ctx, TSNode anchor) {
+    return doc_for_anchor_status(ctx, anchor, NULL);
 }
 
 static bool doc_kind_is(TSNode n, const char *kind) {
@@ -2634,11 +2662,19 @@ static const char *extract_docstring(CBMExtractCtx *ctx, TSNode node, const char
 }
 
 /* Doc of a Field, Variable, enum member or Macro (code languages only). */
-static const char *extract_member_docstring(CBMExtractCtx *ctx, TSNode node) {
+static const char *extract_member_docstring_status(CBMExtractCtx *ctx, TSNode node,
+                                                   bool *complete) {
     if (!doc_lang_member_docs(ctx->language)) {
+        if (complete) {
+            *complete = true;
+        }
         return NULL;
     }
-    return doc_for_anchor(ctx, doc_anchor(ctx, node));
+    return doc_for_anchor_status(ctx, doc_anchor(ctx, node), complete);
+}
+
+static const char *extract_member_docstring(CBMExtractCtx *ctx, TSNode node) {
+    return extract_member_docstring_status(ctx, node, NULL);
 }
 
 /* Go package comment: the comment group touching `package`, directives
@@ -7068,8 +7104,8 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
  * from `name` only where a language scopes a variable below the module — Nix,
  * whose binding names are attrpaths (`a.b.c = …` is name `c`, QN suffix `a.b.c`).
  * Pass NULL to use `name` for both. */
-static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
-                            TSNode node) {
+static void push_var_def_qn_doc(CBMExtractCtx *ctx, const char *name, const char *qn_name,
+                                TSNode node, const char *doc) {
     if (!name || !name[0] || strcmp(name, "_") == 0) {
         return;
     }
@@ -7091,8 +7127,16 @@ static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = cbm_is_exported(name, ctx->language);
-    def.docstring = extract_member_docstring(ctx, node);
+    def.docstring = doc;
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
+                            TSNode node) {
+    if (!name || !name[0] || strcmp(name, "_") == 0) {
+        return;
+    }
+    push_var_def_qn_doc(ctx, name, qn_name, node, extract_member_docstring(ctx, node));
 }
 
 static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
@@ -7164,6 +7208,14 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
         push_var_def(ctx, fname, node);
         return;
     }
+    /* All declarators have this field as their documentation anchor. Keep one
+     * immutable arena string, while each variable retains its own identity.
+     * Failed or absent collection keeps the original per-variable lookup. */
+    bool complete = false;
+    const char *doc = extract_member_docstring_status(ctx, node, &complete);
+    if (!complete) {
+        doc = NULL;
+    }
     uint32_t n = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < n; i++) {
         TSNode child = ts_node_named_child(node, i);
@@ -7179,7 +7231,12 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                     id = cbm_find_child_by_kind(decl, "identifier");
                 }
                 if (!ts_node_is_null(id)) {
-                    push_var_def(ctx, cbm_node_text(a, id, ctx->source), decl);
+                    const char *name = cbm_node_text(a, id, ctx->source);
+                    if (doc) {
+                        push_var_def_qn_doc(ctx, name, NULL, decl, doc);
+                    } else {
+                        push_var_def(ctx, name, decl);
+                    }
                 }
             }
         }

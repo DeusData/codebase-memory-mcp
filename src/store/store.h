@@ -752,6 +752,53 @@ int cbm_store_doc_links_summary(cbm_store_t *s, const char *project,
                                 cbm_doc_link_row_t **samples, int *sample_count, int sample_limit,
                                 bool *table_present);
 
+/* Diagnostic display budgets; the query copies three extra bytes per field
+ * so a formatter can inspect a complete UTF-8 scalar at the display boundary. */
+enum {
+    CBM_DOC_LINK_PREVIEW_ROWS = 50,
+    CBM_DOC_LINK_PREVIEW_LONG_BYTES = 1024,
+    CBM_DOC_LINK_PREVIEW_SHORT_BYTES = 128,
+    CBM_DOC_LINK_PREVIEW_LOOKAHEAD = 3,
+};
+typedef struct {
+    const char *text;
+    size_t length; /* copied prefix bytes, excluding the added NUL */
+    uint64_t original_bytes;
+} cbm_doc_link_preview_text_t;
+typedef struct {
+    cbm_doc_link_preview_text_t rel_path;
+    int line;
+    cbm_doc_link_preview_text_t syntax;
+    cbm_doc_link_preview_text_t raw;
+    cbm_doc_link_preview_text_t reason;
+} cbm_doc_link_preview_row_t;
+/* Up to fifty rows ordered by original (reason, rel_path, line, raw), before
+ * empty-path marker filtering. Text is an explicit-length byte prefix and may
+ * contain NUL or invalid UTF-8. Missing-table semantics match the full getter.
+ * On failure, no rows are returned. All allocations belong to STORE. */
+int cbm_store_doc_links_preview(cbm_store_t *s, const char *project,
+                                cbm_doc_link_preview_row_t **out, int *count, bool *table_present);
+void cbm_store_free_doc_link_previews(cbm_doc_link_preview_row_t *rows, int count);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Sample-field copies only: exclude full getters, row arrays and reason keys.
+ * Byte counts include the trailing NUL. Requests include failed allocations;
+ * field_copies/copied_bytes count only successful copies. Reset leaves fault
+ * controls and their consumed flag unchanged. */
+typedef struct {
+    uint64_t field_copies;
+    uint64_t copied_bytes;
+    uint64_t requested_bytes;
+    uint64_t max_request_bytes;
+} cbm_doc_links_sample_test_stats_t;
+void cbm_store_doc_links_test_sample_stats_reset(void);
+void cbm_store_doc_links_test_sample_stats(cbm_doc_links_sample_test_stats_t *out);
+/* One-shot field-copy allocation failure: 0 is next, 4 is fifth, -1 disables.
+ * Setting the control clears its consumed flag. */
+void cbm_store_doc_links_test_fail_sample_alloc_after(int successful_copies);
+bool cbm_store_doc_links_test_sample_alloc_failed(void);
+#endif
+
 void cbm_store_free_doc_links(cbm_doc_link_row_t *rows, int count);
 void cbm_store_free_doc_link_reasons(cbm_doc_link_reason_count_t *reasons, int count);
 

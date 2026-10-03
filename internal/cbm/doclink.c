@@ -12,6 +12,57 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static _Atomic int doc_alloc_fail_after[CBM_DOCLINK_ALLOC_KINDS];
+
+void cbm_doclink_test_fail_alloc_after(int kind, int nth) {
+    if (kind >= 0 && kind < CBM_DOCLINK_ALLOC_KINDS) {
+        atomic_store(&doc_alloc_fail_after[kind], nth);
+    }
+}
+
+bool cbm_doclink_test_fail_alloc(int kind) {
+    if (kind < 0 || kind >= CBM_DOCLINK_ALLOC_KINDS) {
+        return false;
+    }
+    int n = atomic_load(&doc_alloc_fail_after[kind]);
+    while (n > 0) {
+        if (atomic_compare_exchange_weak(&doc_alloc_fail_after[kind], &n, n - 1)) {
+            return n == 1;
+        }
+    }
+    return false;
+}
+
+void cbm_doclink_test_reset_alloc(void) {
+    for (int i = 0; i < CBM_DOCLINK_ALLOC_KINDS; i++) {
+        atomic_store(&doc_alloc_fail_after[i], 0);
+    }
+}
+
+static _Atomic uint64_t doc_work_copied;
+static _Atomic uint64_t doc_work_parse_input;
+static _Atomic uint64_t doc_work_cleaned;
+
+void cbm_doclink_test_doc_work_reset(void) {
+    atomic_store(&doc_work_copied, 0);
+    atomic_store(&doc_work_parse_input, 0);
+    atomic_store(&doc_work_cleaned, 0);
+}
+
+void cbm_doclink_test_doc_work(uint64_t *copied, uint64_t *parse_input, uint64_t *cleaned) {
+    *copied = atomic_load(&doc_work_copied);
+    *parse_input = atomic_load(&doc_work_parse_input);
+    *cleaned = atomic_load(&doc_work_cleaned);
+}
+
+void cbm_doclink_test_note_doc_work(uint64_t copied, uint64_t parse_input, uint64_t cleaned) {
+    atomic_fetch_add(&doc_work_copied, copied);
+    atomic_fetch_add(&doc_work_parse_input, parse_input);
+    atomic_fetch_add(&doc_work_cleaned, cleaned);
+}
+#endif
+
 /* ── Link families ───────────────────────────────────────────────────
  *
  * One row per CBMDocLinkSyntax value, generated from the family list in
@@ -102,6 +153,12 @@ static const doclink_lang_t DOCLINK_LANGS[] = {
      .portable_scope = cbm_doclink_cs_portable_scope,
      .twin_label = "Variable",
      .twin_of = "Field"},
+    /* MSBuild project files: no references, but a scope the C# resolver reads */
+    {.lang = CBM_LANG_XML,
+     .parse_doc = cbm_doclink_cs_project_parse_doc,
+     .scan_scope = cbm_doclink_cs_project_scan_scope,
+     .scope_tag = CBM_DOCLINK_CS_SCOPE_TAG,
+     .portable_scope = cbm_doclink_cs_portable_scope},
 };
 
 static const doclink_lang_t *doclink_lang(CBMLanguage lang) {
@@ -122,6 +179,9 @@ bool cbm_doclink_lang_supported(CBMLanguage lang) {
 typedef struct {
     const char *doc;
     uint32_t line;
+    int token_first;
+    int token_count;
+    bool parsed;
 } doc_line_ent_t;
 
 typedef struct {
@@ -163,9 +223,7 @@ void cbm_doclink_note_doc_line(CBMExtractCtx *ctx, const char *doc, uint32_t lin
         m->items = grown;
         m->cap = ncap;
     }
-    m->items[m->count].doc = doc;
-    m->items[m->count].line = line;
-    m->count++;
+    m->items[m->count++] = (doc_line_ent_t){.doc = doc, .line = line};
     m->sorted = false;
 }
 
@@ -175,12 +233,11 @@ static int doc_line_cmp(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-/* Start line of `doc`, or 0 when it was not built by doc_run_text (then the
- * caller falls back to the definition's own line). */
-static uint32_t doc_line_of(CBMExtractCtx *ctx, const char *doc) {
+/* Per-file metadata for this exact immutable doc pointer, never for a line. */
+static doc_line_ent_t *doc_info_of(CBMExtractCtx *ctx, const char *doc) {
     doc_line_map_t *m = (doc_line_map_t *)ctx->doc_lines;
     if (!m || m->count == 0) {
-        return 0;
+        return NULL;
     }
     if (!m->sorted) {
         qsort(m->items, (size_t)m->count, sizeof(m->items[0]), doc_line_cmp);
@@ -193,7 +250,7 @@ static uint32_t doc_line_of(CBMExtractCtx *ctx, const char *doc) {
         int mid = lo + ((hi - lo) / PAIR_LEN);
         uintptr_t v = (uintptr_t)m->items[mid].doc;
         if (v == key) {
-            return m->items[mid].line;
+            return &m->items[mid];
         }
         if (v < key) {
             lo = mid + SKIP_ONE;
@@ -201,7 +258,13 @@ static uint32_t doc_line_of(CBMExtractCtx *ctx, const char *doc) {
             hi = mid - SKIP_ONE;
         }
     }
-    return 0;
+    return NULL;
+}
+
+/* A doc not built by doc_run_text keeps the definition's own line. */
+static uint32_t doc_line_of(CBMExtractCtx *ctx, const char *doc) {
+    const doc_line_ent_t *info = doc_info_of(ctx, doc);
+    return info ? info->line : 0;
 }
 
 /* ── Persisted scope ─────────────────────────────────────────────── */
@@ -230,7 +293,15 @@ enum { DOCLINK_INIT_CAP = 16 };
 void cbm_doclinks_push(CBMDocLinkArray *arr, CBMArena *a, CBMDocLink link) {
     if (arr->count >= arr->cap) {
         int ncap = arr->cap ? arr->cap * PAIR_LEN : DOCLINK_INIT_CAP;
-        CBMDocLink *grown = (CBMDocLink *)cbm_arena_alloc(a, (size_t)ncap * sizeof(*grown));
+        CBMDocLink *grown;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_TOKENS)) {
+            grown = NULL;
+        } else
+#endif
+        {
+            grown = (CBMDocLink *)cbm_arena_alloc(a, (size_t)ncap * sizeof(*grown));
+        }
         if (!grown) {
             return;
         }
@@ -313,8 +384,34 @@ void cbm_doclinks_extract(CBMExtractCtx *ctx) {
                 continue; /* the Field twin carries these references */
             }
         }
-        uint32_t doc_line = doc_line_of(ctx, d->docstring);
-        L->parse_doc(ctx, d, d->docstring, doc_line ? doc_line : d->start_line);
+        doc_line_ent_t *info = doc_info_of(ctx, d->docstring);
+        uint32_t doc_line = info ? info->line : 0;
+        bool reusable = ctx->language == CBM_LANG_CSHARP && info && info->line > 0;
+        CBMDocLinkArray *links = &ctx->result->doc_links;
+        if (reusable && info->parsed) {
+            /* C# lexical tokens depend only on the shared text and its line.
+             * Bind each replay to this definition. Indices survive array
+             * growth; no token pointer is kept across a push. */
+            for (int k = 0; k < info->token_count; k++) {
+                CBMDocLink link = links->items[info->token_first + k];
+                link.source_qn = d->qualified_name;
+                link.def_line = d->start_line;
+                cbm_doclinks_push(links, ctx->arena, link);
+            }
+        } else {
+            int first = links->count;
+            bool complete = false;
+            if (reusable) {
+                complete = cbm_doclink_cs_parse_doc_checked(ctx, d, d->docstring, doc_line);
+            } else {
+                L->parse_doc(ctx, d, d->docstring, doc_line ? doc_line : d->start_line);
+            }
+            if (reusable && complete) {
+                info->token_first = first;
+                info->token_count = links->count - first;
+                info->parsed = true;
+            }
+        }
     }
     /* The file's own doc: its references belong to the file. The parser gets
      * a definition-shaped stand-in for the file; what it pushes is marked, and
