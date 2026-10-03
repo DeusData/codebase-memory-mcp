@@ -2213,8 +2213,7 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     pxc_mark_module_defs(idx, selected, all_defs, caller_lang, own_module, &total);
     for (int i = 0; i < imp_count; i++) {
         if (!pxc_mark_import_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total)) {
-            free(selected);
-            return NULL; /* out_success remains false: dispatcher uses all_defs */
+            goto failed; /* out_success remains false: dispatcher uses all_defs */
         }
     }
     if (pxc_is_jvm_lang(caller_lang) && idx->namespace_ht) {
@@ -2231,8 +2230,7 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
 
     CBMLSPDef *out = (CBMLSPDef *)malloc((size_t)total * sizeof(CBMLSPDef));
     if (!out) {
-        free(selected);
-        return NULL;
+        goto failed;
     }
 
     int n = 0;
@@ -2245,4 +2243,7 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     *out_success = true;
     free(selected);
     return out;
+failed:
+    free(selected);
+    return NULL;
 }
