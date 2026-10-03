@@ -474,6 +474,7 @@ typedef enum {
     CBM_LSP_COMPLETE = 0,
     CBM_LSP_MEMO_FAILED,
     CBM_LSP_DEPTH_EXCEEDED,
+    CBM_LSP_SCOPE_FAILED,
 } CBMLSPStatus;
 
 // Growable arrays used during extraction.
@@ -1009,5 +1010,10 @@ bool cbm_label_is_relation(const char *label);
 // all seed through this predicate so their registries never diverge.
 // `label` may be NULL (returns false). Defined in helpers.c.
 bool cbm_label_is_registry_symbol(const char *label);
+
+/* Python symbol scope only: callers must establish the language explicitly.
+ * A trailing .__init__ is omitted when a nonempty prefix precedes it; raw
+ * Module/file identity is unchanged. NULL returns zero. */
+size_t cbm_fqn_symbol_scope_len(const char *module_qn);
 
 #endif // CBM_H

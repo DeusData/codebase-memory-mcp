@@ -228,11 +228,12 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
  * stdlib and third-party bases land here and keep their raw spelling. */
 static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *raw,
                                        const char *module_qn, const char **imp_keys,
-                                       const char **imp_vals, int imp_count) {
+                                       const char **imp_vals, int imp_count, CBMLanguage lang) {
     if (!reg || !raw || !raw[0]) {
         return NULL;
     }
-    cbm_resolution_t res = cbm_registry_resolve(reg, raw, module_qn, imp_keys, imp_vals, imp_count);
+    cbm_resolution_t res =
+        cbm_registry_resolve_lang(reg, raw, module_qn, imp_keys, imp_vals, imp_count, lang);
     if (!res.qualified_name || !res.qualified_name[0]) {
         return NULL;
     }
@@ -250,7 +251,8 @@ static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *ra
  * registry does not know keeps working exactly as before. */
 static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
                                      const cbm_registry_t *reg, const char *module_qn,
-                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+                                     const char **imp_keys, const char **imp_vals, int imp_count,
+                                     CBMLanguage lang) {
     if (!bases || !bases[0]) {
         return NULL;
     }
@@ -265,7 +267,7 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
     }
     for (int i = 0; i < count; i++) {
         const char *qn =
-            pxc_resolve_base_qn(reg, bases[i], module_qn, imp_keys, imp_vals, imp_count);
+            pxc_resolve_base_qn(reg, bases[i], module_qn, imp_keys, imp_vals, imp_count, lang);
         resolved[i] = qn ? qn : bases[i];
     }
     resolved[count] = NULL;
@@ -430,7 +432,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
      * raw source spelling their own registrar already knows how to handle. */
     dst->embedded_types = (reg && pxc_lang_resolves_base_qns(lang))
                               ? pxc_join_base_qns(arena, src->base_classes, reg, module_qn,
-                                                  imp_keys, imp_vals, imp_count)
+                                                  imp_keys, imp_vals, imp_count, lang)
                               : pxc_join_pipe(arena, src->base_classes);
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
@@ -633,8 +635,9 @@ static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result
         fields[f].type_qn = NULL;
         CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
         const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
-        const char *qn =
-            name ? pxc_resolve_base_qn(reg, name, module_qn, imp_keys, imp_vals, imp_count) : NULL;
+        const char *qn = name ? pxc_resolve_base_qn(reg, name, module_qn, imp_keys, imp_vals,
+                                                    imp_count, CBM_LANG_PYTHON)
+                              : NULL;
         if (!qn || !ft->field_name || !ft->field_name[0]) {
             continue;
         }
@@ -2048,16 +2051,33 @@ static void pxc_mark_module_defs(const CBMModuleDefIndex *idx, bool *selected,
  * (`project.module`). Select the nearest materialized module prefix; the
  * language registry still has to prove the full target QN before an edge is
  * emitted, so this broadens the candidate set without weakening precision. */
-static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int pxc_import_probe_allocations_left = -1;
+void cbm_pxc_test_import_probe_fail_after(int successful_allocations) {
+    pxc_import_probe_allocations_left = successful_allocations;
+}
+#endif
+
+static bool pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
                                  const CBMLSPDef *all_defs, CBMLanguage caller_lang,
                                  const char *import_qn, int *total) {
     if (!idx || !idx->ht || !import_qn || !import_qn[0]) {
-        return;
+        return true;
     }
-    char *candidate = strdup(import_qn);
-    if (!candidate) {
-        return;
-    }
+    static const char init_seg[] = ".__init__";
+    size_t import_len = strlen(import_qn);
+    if (import_len > SIZE_MAX - sizeof(init_seg))
+        return false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (pxc_import_probe_allocations_left == 0)
+        return false;
+    if (pxc_import_probe_allocations_left > 0)
+        pxc_import_probe_allocations_left--;
+#endif
+    char *candidate = (char *)malloc(import_len + sizeof(init_seg));
+    if (!candidate)
+        return false;
+    memcpy(candidate, import_qn, import_len + 1);
     bool matched = false;
     for (;;) {
         pxc_module_entry_t *entry = (pxc_module_entry_t *)cbm_ht_get(idx->ht, candidate);
@@ -2068,6 +2088,31 @@ static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
             }
             matched = true;
             break;
+        }
+        if (caller_lang == CBM_LANG_PYTHON) {
+            size_t cand_len = strlen(candidate);
+            memcpy(candidate + cand_len, init_seg, sizeof(init_seg));
+            entry = (pxc_module_entry_t *)cbm_ht_get(idx->ht, candidate);
+            candidate[cand_len] = '\0';
+            /* A suffixed module may be a non-Python directory named __init__.
+             * Only this new probe filters strictly; normal-entry precedence
+             * above remains unchanged. Eligibility is independent of dedup. */
+            bool eligible = false;
+            for (int j = 0; entry && j < entry->count; j++) {
+                int di = entry->indices[j];
+                if (all_defs[di].lang != CBM_LANG_PYTHON)
+                    continue;
+                eligible = true;
+                if (!selected[di]) {
+                    selected[di] = true;
+                    if (total)
+                        (*total)++;
+                }
+            }
+            if (eligible) {
+                matched = true;
+                break;
+            }
         }
         char *dot = strrchr(candidate, '.');
         if (!dot) {
@@ -2099,6 +2144,7 @@ static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
         }
     }
     free(candidate);
+    return true;
 }
 
 CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_count) {
@@ -2177,7 +2223,10 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     int total = 0;
     pxc_mark_module_defs(idx, selected, all_defs, caller_lang, own_module, &total);
     for (int i = 0; i < imp_count; i++) {
-        pxc_mark_import_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total);
+        if (!pxc_mark_import_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total)) {
+            free(selected);
+            return NULL; /* out_success remains false: dispatcher uses all_defs */
+        }
     }
     if (pxc_is_jvm_lang(caller_lang) && idx->namespace_ht) {
         const char *namespace_key = pxc_namespace_index_key(caller_namespace);

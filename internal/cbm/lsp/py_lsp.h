@@ -61,7 +61,8 @@ typedef struct {
     // caller QNs.
     const char *enclosing_func_qn;
     const char *enclosing_class_qn;
-    const char *module_qn;
+    const char *module_qn;      // Python symbol scope (package __init__ omitted)
+    const char *file_module_qn; // raw file identity; borrowed for this API call
 
     // Output: resolved calls accumulate here.
     CBMResolvedCallArray *resolved_calls;
@@ -102,7 +103,7 @@ typedef struct {
     uint32_t type_cache_gen;         // bumped on every scope mutation (O(1) flush)
     int eval_depth;                  // evaluator recursion depth (PY_LSP_MAX_EVAL_DEPTH)
     uint32_t eval_truncations;       // depth-cap cutoff count — gates memo inserts
-    CBMLSPStatus eval_failure;       // sticky: memo/depth failure makes this walk incomplete
+    CBMLSPStatus eval_failure;       // sticky: explicit failure makes this walk incomplete
     // Pending links of the left-associative chains being evaluated
     // iteratively (operator, receiver, subscript, conditional and
     // parenthesis chains): one stack shared by nested evaluations.
@@ -173,10 +174,14 @@ void cbm_python_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 
 #define CBM_PY_LSP_DEPTH_ERROR "Python expression recursion depth limit exceeded"
 #define CBM_PY_LSP_MEMO_ERROR "Python expression memo allocation or capacity failure"
+#define CBM_PY_LSP_SCOPE_ERROR "Python symbol scope allocation failure"
 void cbm_py_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_py_lsp_test_memo_fail_after(int successful_allocations);
 void cbm_py_lsp_test_depth_fail(bool enabled);
+void cbm_py_lsp_test_scope_fail_after(int successful_allocations);
+bool cbm_py_lsp_test_register_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
+                                   int def_count);
 const CBMType *cbm_py_lsp_test_eval(PyLSPContext *ctx, TSNode node);
 void cbm_py_lsp_test_bind_external_classes(PyLSPContext *ctx, TSNode root);
 #endif

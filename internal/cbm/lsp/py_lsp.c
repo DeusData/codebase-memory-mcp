@@ -43,6 +43,10 @@
 #ifdef CBM_ENABLE_TEST_SEAMS
 static _Thread_local int py_test_memo_allocations_left = -1;
 static _Thread_local bool py_test_depth_failure;
+static _Thread_local int py_test_scope_allocations_left = -1;
+void cbm_py_lsp_test_scope_fail_after(int successful_allocations) {
+    py_test_scope_allocations_left = successful_allocations;
+}
 void cbm_py_lsp_test_depth_fail(bool enabled) {
     py_test_depth_failure = enabled;
 }
@@ -69,8 +73,9 @@ void cbm_py_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status) {
     result->has_error = true;
     result->lsp_skipped = true;
     /* Static lifetime also works when the result arena cannot allocate. */
-    result->error_msg =
-        status == CBM_LSP_DEPTH_EXCEEDED ? CBM_PY_LSP_DEPTH_ERROR : CBM_PY_LSP_MEMO_ERROR;
+    result->error_msg = status == CBM_LSP_SCOPE_FAILED     ? CBM_PY_LSP_SCOPE_ERROR
+                        : status == CBM_LSP_DEPTH_EXCEEDED ? CBM_PY_LSP_DEPTH_ERROR
+                                                           : CBM_PY_LSP_MEMO_ERROR;
 }
 
 // Forward decls
@@ -294,9 +299,34 @@ static void py_scope_restore(PyLSPContext *ctx, CBMScope *saved) {
     ctx->current_scope = saved;
 }
 
-void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
-                 const CBMTypeRegistry *registry, const char *module_qn,
-                 CBMResolvedCallArray *out) {
+/* Only a changed Python scope needs storage. Failure is explicit: never
+ * register or walk a package using the raw file scope as an OOM fallback. */
+static bool py_symbol_scope(CBMArena *arena, const char *module_qn, const char *stage,
+                            const char **out) {
+    *out = module_qn;
+    size_t len = cbm_fqn_symbol_scope_len(module_qn);
+    if (!module_qn || module_qn[len] == '\0')
+        return true;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    const char *fail_stage = getenv("CBM_TEST_PY_LSP_SCOPE_FAIL_STAGE");
+    if ((fail_stage && strcmp(fail_stage, stage) == 0) || py_test_scope_allocations_left == 0)
+        return false;
+    if (py_test_scope_allocations_left > 0)
+        py_test_scope_allocations_left--;
+#else
+    (void)stage;
+#endif
+    char *scope = cbm_arena_strndup(arena, module_qn, len);
+    if (!scope)
+        return false;
+    *out = scope;
+    return true;
+}
+
+static void py_lsp_init_for_stage(PyLSPContext *ctx, CBMArena *arena, const char *source,
+                                  int source_len, const CBMTypeRegistry *registry,
+                                  const char *module_qn, CBMResolvedCallArray *out,
+                                  const char *stage) {
     if (!ctx)
         return;
     memset(ctx, 0, sizeof(PyLSPContext));
@@ -310,11 +340,21 @@ void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->source_len = source_len;
     ctx->registry = registry;
     ctx->registry_head = (CBMTypeRegistry *)registry;
-    ctx->module_qn = module_qn;
+    ctx->file_module_qn = module_qn;
     ctx->resolved_calls = out;
+    if (!py_symbol_scope(arena, module_qn, stage, &ctx->module_qn)) {
+        ctx->eval_failure = CBM_LSP_SCOPE_FAILED;
+        return;
+    }
     ctx->current_scope = py_scope_push_checked(ctx);
     const char *dbg = getenv("CBM_LSP_DEBUG");
     ctx->debug = dbg && dbg[0] && dbg[0] != '0';
+}
+
+void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
+                 const CBMTypeRegistry *registry, const char *module_qn,
+                 CBMResolvedCallArray *out) {
+    py_lsp_init_for_stage(ctx, arena, source, source_len, registry, module_qn, out, "context");
 }
 
 void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *module_qn) {
@@ -2952,17 +2992,18 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             // segment) and look up "<root>.<mod>". A genuinely-external module
             // (requests, os) has no such project def, so it correctly stays
             // lsp_module_attr_unresolved.
-            if (mod && ctx->module_qn) {
-                const char *last_dot = strrchr(ctx->module_qn, '.');
-                if (last_dot && last_dot > ctx->module_qn) {
-                    size_t root_len = (size_t)(last_dot - ctx->module_qn);
+            if (mod && ctx->file_module_qn) {
+                const char *last_dot = strrchr(ctx->file_module_qn, '.');
+                if (last_dot && last_dot > ctx->file_module_qn) {
+                    size_t root_len = (size_t)(last_dot - ctx->file_module_qn);
                     // Skip if mod is already rooted under the project to avoid
                     // "<root>.<root>.mod".
-                    if (!(strncmp(mod, ctx->module_qn, root_len) == 0 && mod[root_len] == '.')) {
+                    if (!(strncmp(mod, ctx->file_module_qn, root_len) == 0 &&
+                          mod[root_len] == '.')) {
                         char *qual_mod =
                             (char *)cbm_arena_alloc(ctx->arena, root_len + 1 + strlen(mod) + 1);
                         if (qual_mod) {
-                            memcpy(qual_mod, ctx->module_qn, root_len);
+                            memcpy(qual_mod, ctx->file_module_qn, root_len);
                             qual_mod[root_len] = '.';
                             strcpy(qual_mod + root_len + 1, mod);
                             const CBMRegisteredFunc *qf =
@@ -4421,6 +4462,7 @@ static void py_bind_external_module_classes(PyLSPContext *ctx, const PyKids *rk)
         return;
     }
     size_t prefix_len = strlen(ctx->module_qn);
+    bool package_scope = ctx->file_module_qn && strcmp(ctx->file_module_qn, ctx->module_qn) != 0;
     CBMTypeShortIter all_types;
     cbm_registry_all_types_chain(ctx->registry, &all_types);
     for (int i = -1; (i = cbm_type_short_iter_next(&all_types)) >= 0;) {
@@ -4431,6 +4473,8 @@ static void py_bind_external_module_classes(PyLSPContext *ctx, const PyKids *rk)
             cbm_scope_lookup_local(defined, name)) {
             continue;
         }
+        if (package_scope && strchr(qn + prefix_len + 1, '.'))
+            continue; /* submodule/nested classes are not package globals */
         py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
     }
 }
@@ -4935,7 +4979,7 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
     const char *prev_func = ctx->enclosing_func_qn;
     /* Extraction uses the file's Module QN at top level. Keep the caller
      * arena-owned for cross-file APIs whose module_qn input may be temporary. */
-    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s", ctx->module_qn);
+    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s", ctx->file_module_qn);
     // Pass 1: execute top-level binding effects in source order. Function
     // bodies remain deferred until the final module scope has been assembled.
     for (uint32_t i = 0; i < nc && !ctx->eval_failure; i++) {
@@ -5169,6 +5213,16 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     if (!arena || !result || result->lsp_skipped)
         return;
 
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, arena);
+    PyLSPContext ctx;
+    py_lsp_init_for_stage(&ctx, arena, source, source_len, &reg, result->module_qn,
+                          &result->resolved_calls, "raw");
+    if (ctx.eval_failure) {
+        cbm_py_lsp_record_failure(result, ctx.eval_failure);
+        return;
+    }
+
     /* Inject minimal builtin definitions as real graph nodes (builtins.len,
      * builtins.str, builtins.str.upper, ...). The typeshed registry already
      * RESOLVES builtin calls (emitting the strategy + a "builtins.*" callee_qn),
@@ -5178,12 +5232,9 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
      * builtin/constructor/method edges point at. Upsert dedups by QN. */
     py_builtins_inject_defs(result, arena);
 
-    CBMTypeRegistry reg;
-    cbm_registry_init(&reg, arena);
-
     cbm_python_stdlib_register(&reg, arena);
 
-    const char *module_qn = result->module_qn;
+    const char *module_qn = ctx.module_qn;
 
     // Register the file's own definitions so calls inside this file can
     // resolve via the registry.
@@ -5204,8 +5255,6 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     reg.index_first_registered = true;
     cbm_registry_finalize_into(&reg, &idx_arena);
 
-    PyLSPContext ctx;
-    py_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
     /* Let the resolver inject synthetic syntactic calls for operator/subscript
      * dunder desugaring so those recovered calls reach the CALLS-edge pipeline. */
     ctx.syn_calls = &result->calls;
@@ -5303,7 +5352,7 @@ static void py_split_field_defs(CBMArena *arena, const char *field_defs, const c
 
 /* Build a registry from CBMLSPDef[] supplied by the caller — covers both
  * the source file's own defs and cross-file referenced defs. */
-static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
+static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
                                  CBMLSPDef *defs, int def_count) {
     /* Pass 1: types only — the method pass probes the registry per Method def
      * (receiver auto-registration), which is a LINEAR scan pre-finalize:
@@ -5367,7 +5416,13 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
                     ret_types[n] = NULL;
                 }
             }
-            PySignatureParamParserContext parser_ctx = {.module_qn = d->def_module_qn};
+            const char *symbol_scope = d->def_module_qn;
+            /* Fallback definitions can be mixed-language. Only authoritative
+             * Python metadata opts into package scope normalization. */
+            if (d->lang == CBM_LANG_PYTHON &&
+                !py_symbol_scope(arena, d->def_module_qn, "register", &symbol_scope))
+                return false;
+            PySignatureParamParserContext parser_ctx = {.module_qn = symbol_scope};
             const CBMType **param_types = cbm_type_materialize_signature_params(
                 arena, d->signature_param_types, d->signature_param_count,
                 py_signature_param_type_adapter, &parser_ctx);
@@ -5387,7 +5442,15 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             cbm_registry_add_func(reg, rf);
         }
     }
+    return true;
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_py_lsp_test_register_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
+                                   int def_count) {
+    return py_register_lsp_defs(arena, NULL, reg, defs, def_count);
+}
+#endif
 
 bool cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           const char *module_qn, CBMLSPDef *defs, int def_count,
@@ -5431,15 +5494,20 @@ CBMLSPStatus cbm_run_py_lsp_cross_status(CBMArena *arena, const char *source, in
     /* Index allocations go to a per-call scratch arena (see php_lsp_cross). */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
-    py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count);
+    PyLSPContext ctx;
+    py_lsp_init_for_stage(&ctx, arena, source, source_len, &reg, module_qn, out, "cross");
+    if (ctx.eval_failure)
+        goto cross_cleanup;
+    if (!py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count)) {
+        ctx.eval_failure = CBM_LSP_SCOPE_FAILED;
+        goto cross_cleanup;
+    }
     py_mark_ambiguous_callable_bindings(&reg);
 
     /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
      * comment for the rationale. */
     cbm_registry_finalize_into(&reg, &idx_arena);
 
-    PyLSPContext ctx;
-    py_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
     ctx.syn_calls = synthetic_calls;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
@@ -5448,6 +5516,7 @@ CBMLSPStatus cbm_run_py_lsp_cross_status(CBMArena *arena, const char *source, in
     }
     py_memo_test_stage(&ctx, "cross");
     py_lsp_process_file(&ctx, root);
+cross_cleanup:
     cbm_arena_destroy(&idx_arena);
 
     if (owns_tree && tree)
@@ -5473,7 +5542,8 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
         if (d->lang != CBM_LANG_PYTHON)
             continue;
         /* Reuse the existing register fn on a single-def slice (n=1 inline). */
-        py_register_lsp_defs(arena, NULL, reg, d, 1);
+        if (!py_register_lsp_defs(arena, NULL, reg, d, 1))
+            return NULL; /* caller owns the shared arena and other registries */
     }
 
     py_mark_ambiguous_callable_bindings(reg);
@@ -5517,7 +5587,9 @@ CBMLSPStatus cbm_run_py_lsp_cross_with_registry_status(
     TSNode root = ts_tree_root_node(tree);
 
     PyLSPContext ctx;
-    py_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
+    py_lsp_init_for_stage(&ctx, arena, source, source_len, reg, module_qn, out, "cross");
+    if (ctx.eval_failure)
+        goto prebuilt_cleanup;
     ctx.syn_calls = synthetic_calls;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
@@ -5526,7 +5598,7 @@ CBMLSPStatus cbm_run_py_lsp_cross_with_registry_status(
     }
     py_memo_test_stage(&ctx, "cross");
     py_lsp_process_file(&ctx, root);
-
+prebuilt_cleanup:
     if (owns_tree && tree)
         ts_tree_delete(tree);
     if (parser)
