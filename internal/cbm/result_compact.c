@@ -291,6 +291,7 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         for (int i = 0; i < argc && call->args; i++) {
             cr_str(c, &call->args[i].expr);
             cr_str(c, &call->args[i].value);
+            cr_str(c, &call->args[i].url_value);
             cr_str(c, &call->args[i].keyword);
         }
     } else if (c->phase == CR_COPY) {
