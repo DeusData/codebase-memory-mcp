@@ -1776,6 +1776,7 @@ struct cbm_mcp_server {
 #endif
     size_t search_output_limit_override;
     const char *search_scan_command_override;
+    const char *search_scratch_dir_override; /* NULL = cbm_tmpdir() */
     uint64_t search_scan_timeout_override_ms;
     bool search_scan_timeout_override_set;
     cbm_thread_t autoindex_tid;
@@ -2112,6 +2113,12 @@ void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint
     if (srv) {
         srv->search_scan_timeout_override_ms = timeout_ms;
         srv->search_scan_timeout_override_set = override_set;
+    }
+}
+
+void cbm_mcp_server_set_search_scratch_dir_for_test(cbm_mcp_server_t *srv, const char *dir) {
+    if (srv) {
+        srv->search_scratch_dir_override = dir;
     }
 }
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -5344,12 +5351,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (semantic_only && vcount == 0) {
         diagnostic_hint = "No semantic matches; use a moderate/full index or broader keywords.";
     } else if (!semantic_only && out.total == 0) {
-        if (name_pattern && label) {
-            diagnostic_hint = "No results; remove label or broaden name_pattern.";
-        } else if (name_pattern) {
-            diagnostic_hint = "No nodes match; check spelling or broaden the regex.";
-        } else if (label) {
-            diagnostic_hint = "No nodes have this label; inspect get_graph_schema.";
+        if (has_filters) {
+            diagnostic_hint =
+                "No results match the current filters; broaden or remove filters and retry.";
         }
     } else if (core_fields_requested) {
         diagnostic_hint = "Core qn/name/label/file/lines fields are already present.";
@@ -14786,14 +14790,14 @@ static void search_scratch_close(search_scratch_t *scratch) {
 /* Open the scratch directory, write `pattern` to the grep -f file, and leave the
  * file list open for write_scoped_filelist. Returns true on success; on failure
  * everything already created is removed before returning. */
-static bool search_scratch_open(search_scratch_t *scratch, const char *pattern) {
+static bool search_scratch_open(search_scratch_t *scratch, const char *parent,
+                                const char *pattern) {
     scratch->dir[0] = '\0';
     scratch->pattern_path[0] = '\0';
     scratch->filelist_path[0] = '\0';
     scratch->filelist = NULL;
 
-    int written =
-        snprintf(scratch->dir, sizeof(scratch->dir), "%s/cbm-search-XXXXXX", cbm_tmpdir());
+    int written = snprintf(scratch->dir, sizeof(scratch->dir), "%s/cbm-search-XXXXXX", parent);
     if (written <= 0 || (size_t)written >= sizeof(scratch->dir) || !cbm_mkdtemp(scratch->dir)) {
         scratch->dir[0] = '\0';
         return false;
@@ -14984,6 +14988,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     path_filter = NULL;
 
     if (!pattern) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(project);
         free(file_pattern);
         return cbm_mcp_text_result("pattern is required", true);
@@ -14991,6 +14998,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* Project is required */
     if (!project) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(file_pattern);
         char *_err = build_project_list_error("project is required");
@@ -15001,6 +15011,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(pattern);
         free(project);
         free(file_pattern);
@@ -15088,12 +15101,17 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                     : scan_started_ms + scan_budget_ms;
     bool scan_deadline_latched = false;
     search_scratch_t scratch;
-    if (!search_scratch_open(&scratch, pattern)) {
+    const char *scratch_parent =
+        srv->search_scratch_dir_override ? srv->search_scratch_dir_override : cbm_tmpdir();
+    if (!search_scratch_open(&scratch, scratch_parent, pattern)) {
         bool scan_cancelled = mcp_request_cancelled(srv);
         bool scan_timed_out = cbm_now_ms() >= scan_deadline_ms;
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
                  strerror(errno));
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
         free(root_path);
         free(pattern);
         free(project);
