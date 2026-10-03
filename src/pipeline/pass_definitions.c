@@ -284,6 +284,11 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    if (def->qn_sig_off && bufsize - pos > 80) {
+        pos += (size_t)snprintf(
+            buf + pos, bufsize - pos, ",\"swift_defaults\":\"%016llx\",\"swift_params\":%u",
+            (unsigned long long)def->swift_default_mask, (unsigned)def->swift_param_count);
+    }
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
@@ -338,6 +343,10 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * through the same predicate, so the three registries cannot diverge. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        if (def->qn_sig_off) {
+            cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
+                                             def->swift_default_mask, def->swift_param_count);
+        }
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);

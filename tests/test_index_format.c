@@ -243,7 +243,45 @@ TEST(index_format_legacy_index_rebuilds_and_repairs) {
     PASS();
 }
 
+TEST(index_format_version_one_rebuilds) {
+    RProj lp;
+    cbm_store_t *initial = rh_index_files(&lp, k_files, k_nfiles);
+    ASSERT_NOT_NULL(initial);
+    cbm_store_close(initial);
+
+    cbm_store_t *writer = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_set_format_version(writer, 1), CBM_STORE_OK);
+    cbm_store_close(writer);
+
+    char *resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(g_log_buf, "format_change_reindex"));
+    ASSERT_NOT_NULL(strstr(resp, "\"format_migration\":true"));
+    free(resp);
+
+    cbm_store_t *after_migration = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(after_migration);
+    int format = -1;
+    ASSERT_EQ(cbm_store_get_format_version(after_migration, &format), CBM_STORE_OK);
+    ASSERT_EQ(format, CBM_INDEX_FORMAT_VERSION);
+    ASSERT_EQ(rh_count_label(after_migration, lp.project, "File"), k_nfiles);
+    cbm_store_close(after_migration);
+
+    resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(g_log_buf, "format_change_reindex"));
+    ASSERT_NULL(strstr(resp, "format_migration"));
+    free(resp);
+    cbm_store_t *settled = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(settled);
+    ASSERT_EQ(rh_count_label(settled, lp.project, "File"), k_nfiles);
+    rh_cleanup(&lp, settled);
+    PASS();
+}
+
 SUITE(index_format) {
     RUN_TEST(index_format_siblings_distinct_and_searchable);
     RUN_TEST(index_format_legacy_index_rebuilds_and_repairs);
+    RUN_TEST(index_format_version_one_rebuilds);
 }

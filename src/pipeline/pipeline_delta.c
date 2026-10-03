@@ -287,12 +287,8 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * UNIQUE violation the pre-remap patch would have raised. A resolver that
      * only LOOKS UP still needs its target resident, which is why the list
      * mirrors the registry's own membership rule instead of guessing. */
-    /* The one property a resolver READS off a proxy: an axios instance
-     * binding's client + baseURL (#1916). A caller re-resolved alone must
-     * compose `api.get('/p')` against its unchanged wrapper exactly as a full
-     * build does. Only the two keys, only on the rare Module/Variable rows
-     * that carry them; every other proxy stays "{}". Proxies are never
-     * written back (cbm_delta_patch skips id <= max_db_id). */
+    /* Preserve the resolver-visible HTTP and Swift signature properties on
+     * proxies; proxy nodes are never written back to the store. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -300,7 +296,10 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " CASE WHEN label IN ('Module','Variable')"
             " AND instr(properties, '\"http_client\"') > 0"
             " THEN json_object('http_client', json_extract(properties, '$.http_client'),"
-            " 'http_base_url', json_extract(properties, '$.http_base_url')) END"
+            " 'http_base_url', json_extract(properties, '$.http_base_url'))"
+            " WHEN instr(properties, '\"swift_defaults\"') > 0"
+            " THEN json_object('swift_defaults', json_extract(properties, '$.swift_defaults'),"
+            " 'swift_params', json_extract(properties, '$.swift_params')) END"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"

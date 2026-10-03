@@ -11,6 +11,8 @@
  *   2. Method suffix → determines HTTP method (get→GET, post→POST)
  */
 #include "service_patterns.h"
+#include "callable_sig.h"
+
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -928,25 +930,38 @@ cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn) {
         }
     }
 
+    size_t base_len = cbm_qn_callable_base_len(resolved_qn);
+    char *base_qn = NULL;
+    const char *match_qn_text = resolved_qn;
+    if (base_len < strlen(resolved_qn)) {
+        base_qn = malloc(base_len + 1);
+        if (!base_qn) {
+            return CBM_SVC_NONE;
+        }
+        memcpy(base_qn, resolved_qn, base_len);
+        base_qn[base_len] = '\0';
+        match_qn_text = base_qn;
+    }
     cbm_svc_kind_t result = CBM_SVC_NONE;
     const lib_pattern_t *p;
 
     /* Route registration checked first — prevents gin/echo from matching
      * as HTTP clients (both have .get/.post suffixes). */
-    if ((p = match_qn(resolved_qn, route_reg_libraries)))
+    if ((p = match_qn(match_qn_text, route_reg_libraries)))
         result = p->kind;
-    else if ((p = match_qn(resolved_qn, http_libraries)))
+    else if ((p = match_qn(match_qn_text, http_libraries)))
         result = p->kind;
-    else if ((p = match_qn(resolved_qn, async_libraries)))
+    else if ((p = match_qn(match_qn_text, async_libraries)))
         result = p->kind;
-    else if ((p = match_qn(resolved_qn, config_libraries)))
+    else if ((p = match_qn(match_qn_text, config_libraries)))
         result = p->kind;
-    else if ((p = match_qn(resolved_qn, grpc_libraries)))
+    else if ((p = match_qn(match_qn_text, grpc_libraries)))
         result = p->kind;
-    else if ((p = match_qn(resolved_qn, graphql_libraries)))
+    else if ((p = match_qn(match_qn_text, graphql_libraries)))
         result = p->kind;
-    else if ((p = match_qn(resolved_qn, trpc_libraries)))
+    else if ((p = match_qn(match_qn_text, trpc_libraries)))
         result = p->kind;
+    free(base_qn);
 
     if (_svc_cache) {
         char *kdup = strdup(resolved_qn);

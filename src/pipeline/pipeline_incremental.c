@@ -1042,6 +1042,23 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
         return;
     }
     cbm_registry_add(r, node->name, node->qualified_name, node->label);
+    if (node->properties_json) {
+        const char *mask = strstr(node->properties_json, "\"swift_defaults\":\"");
+        const char *count = strstr(node->properties_json, "\"swift_params\":");
+        if (mask && count) {
+            mask += strlen("\"swift_defaults\":\"");
+            count += strlen("\"swift_params\":");
+            char *mask_end = NULL;
+            char *count_end = NULL;
+            unsigned long long defaults = strtoull(mask, &mask_end, 16);
+            unsigned long params = strtoul(count, &count_end, 10);
+            if (mask_end == mask + 16 && *mask_end == '"' && count_end != count &&
+                params <= UINT8_MAX) {
+                cbm_registry_set_swift_signature(r, node->qualified_name, (uint64_t)defaults,
+                                                 (uint8_t)params);
+            }
+        }
+    }
 }
 
 static void free_incremental_result_cache(CBMFileResult **cache, int count) {

@@ -38,6 +38,7 @@
 #include "arena.h"
 #include "tree_sitter/api.h"
 #include <stddef.h>
+#include <stdint.h>
 
 typedef enum {
     CBM_CALLABLE_ID_NONE = 0,      /* historical base QN, no suffix */
@@ -49,20 +50,24 @@ typedef enum {
 
 enum { CBM_CALLABLE_SIG_MAX = 200 };
 
-/* The identity mode a language uses for callable QNs. Every language is
- * CBM_CALLABLE_ID_NONE until its enable change lands (with its index-format
- * bump). Kept as a side table, like cbm_string_dispatch_suffixes, rather than
- * a CBMLangSpec field: the ~160 positional lang_specs rows would all have to
- * spell the new member under -Wmissing-field-initializers. */
+/* The identity mode a language uses for callable QNs. Languages remain
+ * CBM_CALLABLE_ID_NONE until their enable change lands with an index-format
+ * bump; Swift is enabled by #2061. Kept as a side table, like
+ * cbm_string_dispatch_suffixes, rather than a CBMLangSpec field: the ~160
+ * positional lang_specs rows would all have to spell the new member under
+ * -Wmissing-field-initializers. */
 CBMCallableIdentity cbm_callable_identity(CBMLanguage lang);
 
+/* Swift parameter defaults are call-resolution metadata, not graph identity.
+ * Returns a bit per parameter; count > 64 is reported as 255. */
+uint64_t cbm_swift_default_mask(TSNode func_node, const char *source, uint8_t *count);
 /* The identity suffix for the callable at `func_node` in the language's own
  * mode, or NULL when that mode is NONE (or the node carries no parameter
  * information the mode can use). Arena-owned. */
 const char *cbm_callable_sig(CBMArena *a, TSNode func_node, const char *source, CBMLanguage lang);
 
-/* Same, with an explicit mode — the builder the enable changes and the golden
- * tables exercise before a language is switched on. */
+/* Same, with an explicit mode — the builder's golden tables exercise modes
+ * independently of each language's production enablement. */
 const char *cbm_callable_sig_mode(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang, CBMCallableIdentity mode);
 

@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 
 #include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
+#include "cbm.h"                  /* CBMCall for Swift overload selection */
 #include "foundation/constants.h" /* CBM_SZ_512 */
 
 /* Forward declarations */
@@ -238,6 +239,15 @@ void cbm_registry_free(cbm_registry_t *r);
 /* Register a function/method/class. All strings are copied. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
+
+/* Swift-only metadata and label-compatible overload selection. The returned
+ * QNs are borrowed from the registry and all belong to one base callable.
+ * -1 means this name has Swift definitions but no compatible overload. */
+void cbm_registry_set_swift_signature(cbm_registry_t *r, const char *qualified_name,
+                                      uint64_t default_mask, uint8_t param_count);
+int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.

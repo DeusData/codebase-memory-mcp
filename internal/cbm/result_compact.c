@@ -297,6 +297,12 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         call->args = NULL;
         call->arg_count = 0;
     }
+    /* Swift trailing-closure labels are a bounded counted string list. */
+    int labels = call->swift_trailing_count;
+    if (labels > CBM_MAX_TRAILING_CLOSURES) {
+        labels = CBM_MAX_TRAILING_CLOSURES;
+    }
+    cr_counted_list(c, &call->swift_trailing_labels, labels);
 }
 
 static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
