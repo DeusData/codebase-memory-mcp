@@ -15350,6 +15350,10 @@ TEST(registry_overlay_chain_iterates_and_copies_on_write) {
     memset(&t, 0, sizeof(t));
     t.qualified_name = "pkg.T";
     t.short_name = "T";
+    const char *field_names[] = {"untyped", "typed", NULL};
+    const CBMType *field_types[] = {NULL, cbm_type_named(&arena, "pkg.Value"), NULL};
+    t.field_names = field_names;
+    t.field_types = field_types;
     cbm_registry_add_type(&base, t);
     cbm_registry_finalize(&base);
     base.read_only = true;
@@ -15414,6 +15418,10 @@ TEST(registry_overlay_chain_iterates_and_copies_on_write) {
     CBMRegisteredType *wt = cbm_registry_type_for_update(&overlay, "pkg.T");
     ASSERT_NOT_NULL(wt);
     ASSERT_EQ(overlay.type_count, 1);
+    /* A missing type for an earlier named field must not truncate the copy. */
+    bool field_slots_preserved = wt->field_types && wt->field_types != field_types &&
+                                 wt->field_types[0] == NULL &&
+                                 wt->field_types[1] == field_types[1] && wt->field_types[2] == NULL;
     cbm_registry_all_types_chain(&overlay, &ti);
     seen = 0;
     while (cbm_type_short_iter_next(&ti) >= 0) {
@@ -15430,6 +15438,7 @@ TEST(registry_overlay_chain_iterates_and_copies_on_write) {
 
     cbm_arena_destroy(&scratch);
     cbm_arena_destroy(&arena);
+    ASSERT_TRUE(field_slots_preserved);
     PASS();
 }
 
@@ -15801,6 +15810,111 @@ TEST(seal_py_shared_registry_readonly_fields) {
     ASSERT_TRUE(rt->field_names == names_before);
 
     cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* #1277: the production resolver receives a writable overlay, so refining an
+ * existing field must detach its pointer array from the sealed fallback. */
+TEST(seal_py_overlay_existing_field_keeps_shared_type) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[4] = {0};
+    defs[0].qualified_name = "test.mod.Foo";
+    defs[0].short_name = "Foo";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.mod";
+    defs[0].field_defs = "x:test.contracts.Contract";
+    defs[1].qualified_name = "test.mod.Foo.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.mod.Foo";
+    defs[1].def_module_qn = "test.mod";
+    defs[2].qualified_name = "test.contracts.Contract";
+    defs[2].short_name = "Contract";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "test.contracts";
+    defs[3].qualified_name = "test.contracts.Contract.process_batch";
+    defs[3].short_name = "process_batch";
+    defs[3].label = "Method";
+    defs[3].receiver_type = "test.contracts.Contract";
+    defs[3].def_module_qn = "test.contracts";
+    for (int i = 0; i < 4; i++) {
+        defs[i].lang = CBM_LANG_PYTHON;
+    }
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 4);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+    const CBMRegisteredType *base = cbm_registry_lookup_type(reg, "test.mod.Foo");
+    ASSERT_NOT_NULL(base);
+    ASSERT_NOT_NULL(base->field_names);
+    ASSERT_NOT_NULL(base->field_types);
+    const char **names_before = base->field_names;
+    const CBMType **types_before = base->field_types;
+    const CBMType *type_before = base->field_types[0];
+    ASSERT_NOT_NULL(type_before);
+    ASSERT_NULL(base->field_types[1]);
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = reg;
+    const char *writer = "class Foo:\n"
+                         "    def m(self):\n"
+                         "        self.x = 1\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&scratch, writer, (int)strlen(writer), "test.mod", &overlay,
+                                       NULL, NULL, 0, NULL, &out, NULL);
+
+    /* Observe while scratch is live, then release both arenas before any
+     * failure assertion so the regression also fails cleanly under LSan. */
+    bool shared_names_unchanged = base->field_names == names_before;
+    bool shared_types_unchanged = base->field_types == types_before;
+    bool shared_element_unchanged = base->field_types[0] == type_before;
+    bool shared_terminator_unchanged = base->field_types[1] == NULL;
+    const CBMRegisteredType *refined = cbm_registry_lookup_type(&overlay, "test.mod.Foo");
+    bool local_refined = refined && refined != base && refined->field_types &&
+                         refined->field_types != types_before && refined->field_types[0] &&
+                         refined->field_types[0] != type_before &&
+                         refined->field_types[0]->kind == CBM_TYPE_BUILTIN &&
+                         refined->field_types[1] == NULL;
+    cbm_arena_destroy(&scratch);
+
+    /* Never read a corrupted shared pointer after scratch destruction. When
+     * intact, a later file must still see the original Contract field. */
+    int hits = 0;
+    if (shared_names_unchanged && shared_types_unchanged && shared_element_unchanged &&
+        shared_terminator_unchanged && local_refined) {
+        cbm_arena_init(&scratch);
+        cbm_registry_init(&overlay, &scratch);
+        overlay.fallback = reg;
+        const char *reader = "from mod import Foo\n\n"
+                             "def run(foo: Foo):\n"
+                             "    foo.x.process_batch()\n";
+        const char *import_names[] = {"Foo"};
+        const char *import_qns[] = {"test.mod.Foo"};
+        memset(&out, 0, sizeof(out));
+        cbm_run_py_lsp_cross_with_registry(&scratch, reader, (int)strlen(reader), "test.reader",
+                                           &overlay, import_names, import_qns, 1, NULL, &out, NULL);
+        for (int i = 0; i < out.count; i++) {
+            const CBMResolvedCall *call = &out.items[i];
+            if (call->caller_qn && call->callee_qn &&
+                strcmp(call->caller_qn, "test.reader.run") == 0 &&
+                strcmp(call->callee_qn, "test.contracts.Contract.process_batch") == 0 &&
+                call->kind == CBM_RESOLVED_INVOCATION &&
+                call->confidence >= CBM_LSP_CONFIDENCE_FLOOR) {
+                hits++;
+            }
+        }
+        cbm_arena_destroy(&scratch);
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(shared_names_unchanged);
+    ASSERT_TRUE(shared_types_unchanged);
+    ASSERT_TRUE(shared_element_unchanged);
+    ASSERT_TRUE(shared_terminator_unchanged);
+    ASSERT_TRUE(local_refined);
+    ASSERT_EQ(hits, 1);
     PASS();
 }
 
@@ -16402,6 +16516,7 @@ SUITE(c_lsp) {
     RUN_TEST(registry_overlay_chain_iterates_and_copies_on_write);
     RUN_TEST(clsp_method_return_refinement_is_copy_on_write);
     RUN_TEST(seal_py_shared_registry_readonly_fields);
+    RUN_TEST(seal_py_overlay_existing_field_keeps_shared_type);
     RUN_TEST(seal_cs_shared_registry_readonly);
     RUN_TEST(seal_ts_shared_registry_readonly);
     RUN_TEST(seal_go_shared_registry_readonly);

@@ -1676,6 +1676,11 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
             /* `import a.b` binds the ROOT package `a`: the callee already
              * spells its own full dotted path (`a.b.f()`). */
             snprintf(full, sizeof(full), "%s", callee_name);
+        } else if (!as && !path_leaf_seg && full[0] != '.' && strcmp(full, imp->local_name) != 0) {
+            /* `import m as y` (the extractor stores module_path `m`, local
+             * `y`; a from-import always spells a dotted path): `y` IS module
+             * `m`, so `y.T` spells `m.T`. */
+            snprintf(full, sizeof(full), "%s%s", imp->module_path, callee_name + root_len);
         }
         /* Otherwise (`from m import x [as y]`) only the import's own module
          * chain is evidence: members reached THROUGH x (`x.objects.create`)
@@ -1689,6 +1694,27 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
         bound = true;
     }
     return bound;
+}
+
+/* Base-class twin of the #2127 call gate. `class SimpleTestCase(
+ * unittest.TestCase)` under `import unittest` names the STDLIB base; the
+ * registry's same-module suffix fallback (`unittest.TestCase` -> module's
+ * `TestCase`) or a short-name strategy bound it to a same-named PROJECT class
+ * (django: an inheritance cycle SimpleTestCase -> TestCase ->
+ * TransactionTestCase -> SimpleTestCase, plus fabricated OVERRIDEs). An
+ * external import binding (never materialized as an IMPORTS edge) whose
+ * module chain the target does not spell can never be that target, whatever
+ * the registry strategy. Exact metadata import maps remain valid when the
+ * target spells the imported module chain. Every base resolver (sequential
+ * + parallel semantic, cross-LSP pxc) calls this ONE
+ * gate so the venues cannot diverge. Python only. */
+bool cbm_python_external_base_contradicts(CBMLanguage lang, const CBMImportArray *imports,
+                                          const char *base_spelling, const char *base_qn,
+                                          const cbm_gbuf_t *gbuf, const char *project_name,
+                                          const char *rel_path) {
+    return lang == CBM_LANG_PYTHON &&
+           cbm_python_import_binding_contradicts(imports, base_spelling, base_qn, gbuf,
+                                                 project_name, rel_path);
 }
 
 /* #2127: whether a Python import's module lives in this project. Relative

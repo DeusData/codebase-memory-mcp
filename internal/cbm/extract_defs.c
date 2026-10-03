@@ -4584,6 +4584,169 @@ static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const cha
     return true;
 }
 
+/* ── Python annotated instance fields (#1277) ─────────────────────
+ * Exported as result->field_types (never graph nodes) so the cross-file LSP
+ * can type `obj.x` when obj's class lives in another file. Only DECLARED
+ * types count: a class-body annotation, a `self.x: T = v` annotation in
+ * __init__, or `self.x = p` where p is an annotated __init__ parameter. An
+ * unannotated right-hand side is never guessed at. */
+
+static void py_push_field_type(CBMExtractCtx *ctx, const char *class_qn, TSNode name_node,
+                               const char *type_text) {
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0] || !type_text || !type_text[0]) {
+        return;
+    }
+    CBMFieldType ft = {.class_qn = class_qn, .field_name = name, .type_text = type_text};
+    cbm_fieldtype_push(&ctx->result->field_types, ctx->arena, ft);
+}
+
+/* The assignment inside an expression_statement, or a null node. */
+static TSNode py_statement_assignment(TSNode stmt) {
+    TSNode null_node = {0};
+    if (strcmp(ts_node_type(stmt), "expression_statement") != 0 ||
+        ts_node_named_child_count(stmt) == 0) {
+        return null_node;
+    }
+    TSNode inner = ts_node_named_child(stmt, 0);
+    return strcmp(ts_node_type(inner), "assignment") == 0 ? inner : null_node;
+}
+
+/* Annotation text of the __init__ parameter called `name`, or NULL. */
+static const char *py_init_param_annotation(CBMExtractCtx *ctx, TSNode params, const char *name) {
+    uint32_t n = ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode p = ts_node_named_child(params, i);
+        const char *pk = ts_node_type(p);
+        TSNode pname = {0};
+        if (strcmp(pk, "typed_default_parameter") == 0) {
+            pname = ts_node_child_by_field_name(p, TS_FIELD("name"));
+        } else if (strcmp(pk, "typed_parameter") == 0 && ts_node_named_child_count(p) > 0) {
+            pname = ts_node_named_child(p, 0);
+        } else {
+            continue;
+        }
+        TSNode ptype = ts_node_child_by_field_name(p, TS_FIELD("type"));
+        if (ts_node_is_null(pname) || ts_node_is_null(ptype) ||
+            strcmp(ts_node_type(pname), "identifier") != 0) {
+            continue;
+        }
+        char *pn = cbm_node_text(ctx->arena, pname, ctx->source);
+        if (pn && strcmp(pn, name) == 0) {
+            return cbm_node_text(ctx->arena, ptype, ctx->source);
+        }
+    }
+    return NULL;
+}
+
+/* `self.x: T = v` / `self.x = p` inside __init__ (self = its first parameter). */
+static void py_init_field_assignment(CBMExtractCtx *ctx, const char *class_qn, TSNode assign,
+                                     TSNode params, const char *self_name) {
+    TSNode left = ts_node_child_by_field_name(assign, TS_FIELD("left"));
+    if (ts_node_is_null(left) || strcmp(ts_node_type(left), "attribute") != 0) {
+        return;
+    }
+    TSNode obj = ts_node_child_by_field_name(left, TS_FIELD("object"));
+    TSNode attr = ts_node_child_by_field_name(left, TS_FIELD("attribute"));
+    if (ts_node_is_null(obj) || ts_node_is_null(attr) ||
+        strcmp(ts_node_type(obj), "identifier") != 0) {
+        return;
+    }
+    char *obj_name = cbm_node_text(ctx->arena, obj, ctx->source);
+    if (!obj_name || strcmp(obj_name, self_name) != 0) {
+        return;
+    }
+    TSNode ann = ts_node_child_by_field_name(assign, TS_FIELD("type"));
+    if (!ts_node_is_null(ann)) {
+        py_push_field_type(ctx, class_qn, attr, cbm_node_text(ctx->arena, ann, ctx->source));
+        return;
+    }
+    TSNode right = ts_node_child_by_field_name(assign, TS_FIELD("right"));
+    if (ts_node_is_null(right) || strcmp(ts_node_type(right), "identifier") != 0) {
+        return;
+    }
+    char *rhs = cbm_node_text(ctx->arena, right, ctx->source);
+    if (rhs && strcmp(rhs, self_name) != 0) {
+        py_push_field_type(ctx, class_qn, attr, py_init_param_annotation(ctx, params, rhs));
+    }
+}
+
+/* Every `self.x` field assignment in one __init__ body, nested blocks
+ * included; nested functions, lambdas and classes have their own `self`. */
+static void py_extract_init_fields(CBMExtractCtx *ctx, const char *class_qn, TSNode fn) {
+    TSNode params = ts_node_child_by_field_name(fn, TS_FIELD("parameters"));
+    TSNode body = ts_node_child_by_field_name(fn, TS_FIELD("body"));
+    if (ts_node_is_null(params) || ts_node_is_null(body) ||
+        ts_node_named_child_count(params) == 0) {
+        return;
+    }
+    TSNode self_node = ts_node_named_child(params, 0);
+    if (strcmp(ts_node_type(self_node), "identifier") != 0) {
+        return;
+    }
+    char *self_name = cbm_node_text(ctx->arena, self_node, ctx->source);
+    if (!self_name || !self_name[0]) {
+        return;
+    }
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CBM_SZ_32);
+    ts_nstack_push(&stack, body);
+    while (stack.count > 0) {
+        TSNode n = ts_nstack_pop(&stack);
+        const char *k = ts_node_type(n);
+        if (strcmp(k, "function_definition") == 0 || strcmp(k, "class_definition") == 0 ||
+            strcmp(k, "lambda") == 0) {
+            continue;
+        }
+        TSNode assign = py_statement_assignment(n);
+        if (!ts_node_is_null(assign)) {
+            py_init_field_assignment(ctx, class_qn, assign, params, self_name);
+            continue;
+        }
+        /* Reverse push keeps source order on pop. */
+        for (uint32_t i = ts_node_named_child_count(n); i > 0; i--) {
+            ts_nstack_push(&stack, ts_node_named_child(n, i - 1));
+        }
+    }
+}
+
+static void extract_py_field_types(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn) {
+    TSNode body = ts_node_child_by_field_name(class_node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(body);
+    /* Class-body annotations first: `x: T` / `x: T = v`. */
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode assign = py_statement_assignment(ts_node_named_child(body, i));
+        if (ts_node_is_null(assign)) {
+            continue;
+        }
+        TSNode left = ts_node_child_by_field_name(assign, TS_FIELD("left"));
+        TSNode ann = ts_node_child_by_field_name(assign, TS_FIELD("type"));
+        if (!ts_node_is_null(left) && !ts_node_is_null(ann) &&
+            strcmp(ts_node_type(left), "identifier") == 0) {
+            py_push_field_type(ctx, class_qn, left, cbm_node_text(ctx->arena, ann, ctx->source));
+        }
+    }
+    /* Then __init__. */
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode fn = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(fn), "decorated_definition") == 0) {
+            fn = ts_node_child_by_field_name(fn, TS_FIELD("definition"));
+        }
+        if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "function_definition") != 0) {
+            continue;
+        }
+        TSNode fname = ts_node_child_by_field_name(fn, TS_FIELD("name"));
+        char *fn_name =
+            ts_node_is_null(fname) ? NULL : cbm_node_text(ctx->arena, fname, ctx->source);
+        if (fn_name && strcmp(fn_name, "__init__") == 0) {
+            py_extract_init_fields(ctx, class_qn, fn);
+        }
+    }
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
@@ -4969,6 +5132,10 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
     // Extract class-level variables (field declarations)
     extract_class_variables(ctx, node, class_qn, spec);
+
+    if (ctx->language == CBM_LANG_PYTHON) {
+        extract_py_field_types(ctx, node, class_qn);
+    }
 
     // C# 12 primary-constructor parameters: declared on the class line
     // (`class Foo(IBar bar, IBaz baz) : Base { ... }`) and bound to implicit

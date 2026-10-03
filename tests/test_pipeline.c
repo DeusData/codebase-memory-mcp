@@ -8166,6 +8166,455 @@ static void teardown_usages_repo(void) {
     g_usages_tmpdir[0] = '\0';
 }
 
+/* #1277: typed instance fields of a Python class imported from another file.
+ * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
+ * LSP strategy. */
+static int count_lsp_calls(cbm_store_t *s, const char *project, const char *caller_suffix,
+                           const char *callee_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    int hits = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            size_t cs = strlen(caller_suffix);
+            size_t ts = strlen(callee_suffix);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0 &&
+                edges[i].properties_json && strstr(edges[i].properties_json, "lsp")) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return hits;
+}
+
+static int check_python_crossfile_typed_field_calls_issue1277(bool parallel) {
+    const char *contracts = "class Contract:\n"
+                            "    def process_batch(self) -> None:\n"
+                            "        ...\n";
+    const char *trainer = "from contracts import Contract\n\n"
+                          "def make():\n"
+                          "    return None\n\n"
+                          "class Trainer:\n"
+                          "    engine: Contract\n\n"
+                          "    def __init__(self, strategies: Contract) -> None:\n"
+                          "        self.strategies = strategies\n"
+                          "        self.typed: Contract = strategies\n"
+                          "        self.plain = make()\n";
+    const char *loop = "from trainer import Trainer\n\n"
+                       "def run(trainer: Trainer) -> None:\n"
+                       "    strategies = trainer.strategies\n"
+                       "    strategies.process_batch()\n\n"
+                       "def run_typed(trainer: Trainer) -> None:\n"
+                       "    trainer.typed.process_batch()\n\n"
+                       "def run_classlevel(trainer: Trainer) -> None:\n"
+                       "    trainer.engine.process_batch()\n\n"
+                       "def run_untyped(trainer: Trainer) -> None:\n"
+                       "    trainer.plain.process_batch()\n";
+    if (setup_usages_repo("contracts.py", contracts, "trainer.py", trainer) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/loop.py", g_usages_tmpdir);
+    if (th_write_file(path, loop) != 0) {
+        teardown_usages_repo();
+        FAIL("failed to write loop.py");
+    }
+    if (parallel) {
+        /* Three semantic files plus 50 inert files exceed the production
+         * threshold for the fused parallel pipeline. */
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/field_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "field_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_1277.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int via_alias = -1, via_typed = -1, via_class = -1, via_untyped = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        via_alias = count_lsp_calls(s, project, "loop.run", "contracts.Contract.process_batch");
+        via_typed =
+            count_lsp_calls(s, project, "loop.run_typed", "contracts.Contract.process_batch");
+        via_class =
+            count_lsp_calls(s, project, "loop.run_classlevel", "contracts.Contract.process_batch");
+        via_untyped = count_lsp_calls(s, project, "loop.run_untyped", "process_batch");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(via_alias, 1);   /* self.x = <annotated __init__ parameter> */
+    ASSERT_EQ(via_typed, 1);   /* self.x: T = ... */
+    ASSERT_EQ(via_class, 1);   /* class-level x: T */
+    ASSERT_EQ(via_untyped, 0); /* control: no annotation, no guess */
+    PASS();
+}
+
+TEST(python_crossfile_typed_field_calls_issue1277) {
+    return check_python_crossfile_typed_field_calls_issue1277(false);
+}
+
+TEST(python_crossfile_typed_field_calls_issue1277_parallel) {
+    return check_python_crossfile_typed_field_calls_issue1277(true);
+}
+
+/* Bind the external-import veto specifically to #1277's typed-field fold.
+ * No base classes or CALLS edges participate: a name-only call fallback
+ * cannot turn this metadata assertion into a false positive. The unguarded
+ * registry deliberately has a same-module TestCase candidate in both cases. */
+static int python_typed_field_scope_case(bool external) {
+    char source[512];
+    snprintf(source, sizeof(source),
+             "import unittest\n\n"
+             "class TestCase:\n    pass\n\n"
+             "class Holder:\n    field: %s\n",
+             external ? "unittest.TestCase" : "TestCase");
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
+                                             "proj", "models.py", 0, NULL, NULL);
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("proj", "/unused");
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs = NULL;
+    char *modules[1] = {NULL};
+    int ok = 0;
+    if (result && reg && gbuf && result->field_types.count == 1) {
+        for (int i = 0; i < result->defs.count; i++) {
+            const CBMDefinition *def = &result->defs.items[i];
+            cbm_registry_add(reg, def->name, def->qualified_name, def->label);
+        }
+        const char **keys = NULL;
+        const char **vals = NULL;
+        int import_count = 0;
+        cbm_pxc_build_import_map(gbuf, "proj", "models.py", CBM_LANG_PYTHON, result, &keys,
+                                 &vals, &import_count);
+        cbm_resolution_t raw = cbm_registry_resolve(
+            reg, external ? "unittest.TestCase" : "TestCase", "proj.models", keys, vals,
+            import_count);
+        bool candidate = raw.qualified_name && raw.strategy &&
+                         strcmp(raw.qualified_name, "proj.models.TestCase") == 0 &&
+                         strcmp(raw.strategy, "same_module") == 0;
+        cbm_pxc_free_import_map(keys, vals, import_count);
+        cbm_pipeline_ctx_t ctx = {.project_name = "proj", .gbuf = gbuf, .registry = reg};
+        cbm_file_info_t files[1] = {{.rel_path = "models.py", .language = CBM_LANG_PYTHON}};
+        CBMFileResult *cache[1] = {result};
+        int count = 0;
+        defs = cbm_pxc_collect_all_defs(&ctx, &arena, cache, files, 1, "proj", modules, &count,
+                                        NULL);
+        int holders = 0;
+        bool field_ok = false;
+        for (int i = 0; defs && i < count; i++) {
+            if (defs[i].qualified_name &&
+                strcmp(defs[i].qualified_name, "proj.models.Holder") == 0) {
+                holders++;
+                field_ok = external ? !defs[i].field_defs
+                                    : defs[i].field_defs &&
+                                          strcmp(defs[i].field_defs,
+                                                 "field:proj.models.TestCase") == 0;
+            }
+        }
+        ok = candidate && holders == 1 && field_ok;
+        if (!ok) {
+            fprintf(stderr, "  [py-field-scope external=%d] candidate=%d holders=%d field_ok=%d\n",
+                    external, candidate, holders, field_ok);
+        }
+    }
+    free(defs);
+    free(modules[0]);
+    cbm_arena_destroy(&arena);
+    cbm_gbuf_free(gbuf);
+    cbm_registry_free(reg);
+    cbm_free_result(result);
+    return ok;
+}
+
+TEST(python_typed_field_external_import_stays_unresolved) {
+    ASSERT_TRUE(python_typed_field_scope_case(true));
+    PASS();
+}
+
+TEST(python_typed_field_project_class_resolves) {
+    ASSERT_TRUE(python_typed_field_scope_case(false));
+    PASS();
+}
+
+/* ── Explicit OVERRIDE through non-redeclaring ancestors (#1278) ── */
+
+static int64_t ovr_class(cbm_gbuf_t *gb, const char *name) {
+    char qn[128];
+    snprintf(qn, sizeof(qn), "m.%s", name);
+    return cbm_gbuf_upsert_node(gb, "Class", name, qn, "m.py", 1, 50, "{}");
+}
+
+static int64_t ovr_method(cbm_gbuf_t *gb, int64_t cls, const char *cls_name, const char *name) {
+    char qn[128];
+    snprintf(qn, sizeof(qn), "m.%s.%s", cls_name, name);
+    int64_t id = cbm_gbuf_upsert_node(gb, "Method", name, qn, "m.py", 2, 3, "{}");
+    cbm_gbuf_insert_edge(gb, cls, id, "DEFINES_METHOD", "{}");
+    return id;
+}
+
+/* OVERRIDE edges leaving `method`; *only_target receives the single target (or 0). */
+static int ovr_out(cbm_gbuf_t *gb, int64_t method, int64_t *only_target) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, method, "OVERRIDE", &edges, &count);
+    *only_target = count == 1 ? edges[0]->target_id : 0;
+    return count;
+}
+
+/* Exactly two different targets, each once, independent of edge order. */
+static bool ovr_two_targets(cbm_gbuf_t *gb, int64_t method, int64_t first, int64_t second) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, method, "OVERRIDE", &edges, &count);
+    int first_count = 0;
+    int second_count = 0;
+    for (int i = 0; i < count; i++) {
+        first_count += edges[i]->target_id == first;
+        second_count += edges[i]->target_id == second;
+    }
+    return first != second && count == 2 && first_count == 1 && second_count == 1;
+}
+
+TEST(override_explicit_walks_to_nearest_declaring_ancestor) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    /* Contract: Processor.process */
+    int64_t processor = ovr_class(gb, "Processor");
+    int64_t proc_process = ovr_method(gb, processor, "Processor", "process");
+
+    /* Direct control: DirectProcessor(Processor) */
+    int64_t direct = ovr_class(gb, "DirectProcessor");
+    int64_t direct_process = ovr_method(gb, direct, "DirectProcessor", "process");
+    cbm_gbuf_insert_edge(gb, direct, processor, "INHERITS", "{}");
+
+    /* The #1278 shape: LeafProcessor(IntermediateProcessor(Processor)), the
+     * intermediate declares nothing. `extra` exists on no ancestor. */
+    int64_t mid = ovr_class(gb, "IntermediateProcessor");
+    int64_t leaf = ovr_class(gb, "LeafProcessor");
+    int64_t leaf_process = ovr_method(gb, leaf, "LeafProcessor", "process");
+    int64_t leaf_extra = ovr_method(gb, leaf, "LeafProcessor", "extra");
+    cbm_gbuf_insert_edge(gb, mid, processor, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, leaf, mid, "INHERITS", "{}");
+
+    /* Nearest wins: Deep(Redeclaring(Processor)), Redeclaring declares process. */
+    int64_t redecl = ovr_class(gb, "Redeclaring");
+    int64_t redecl_process = ovr_method(gb, redecl, "Redeclaring", "process");
+    int64_t deep = ovr_class(gb, "Deep");
+    int64_t deep_process = ovr_method(gb, deep, "Deep", "process");
+    cbm_gbuf_insert_edge(gb, redecl, processor, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, deep, redecl, "INHERITS", "{}");
+
+    /* Diamond: Both(Left, Right), Left and Right each inherit Processor
+     * without redeclaring -> exactly one edge, no duplicate. */
+    int64_t left = ovr_class(gb, "Left");
+    int64_t right = ovr_class(gb, "Right");
+    int64_t both = ovr_class(gb, "Both");
+    int64_t both_process = ovr_method(gb, both, "Both", "process");
+    cbm_gbuf_insert_edge(gb, left, processor, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, right, processor, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, both, left, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, both, right, "INHERITS", "{}");
+
+    /* Equal nearest depth: two declaring ancestors behind empty direct
+     * parents. Both declarations bind, while the deeper Processor does not.
+     * Both explicit graph relationships share the nearest declaring depth. */
+    int64_t tie_left = ovr_class(gb, "TieLeft");
+    int64_t tie_right = ovr_class(gb, "TieRight");
+    int64_t tie_left_process = ovr_method(gb, tie_left, "TieLeft", "process");
+    int64_t tie_right_process = ovr_method(gb, tie_right, "TieRight", "process");
+    int64_t tie_left_mid = ovr_class(gb, "TieLeftMid");
+    int64_t tie_right_mid = ovr_class(gb, "TieRightMid");
+    int64_t tied = ovr_class(gb, "Tied");
+    int64_t tied_process = ovr_method(gb, tied, "Tied", "process");
+    cbm_gbuf_insert_edge(gb, tie_left, processor, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, tie_right, processor, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, tie_left_mid, tie_left, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, tie_right_mid, tie_right, "IMPLEMENTS", "{}");
+    cbm_gbuf_insert_edge(gb, tied, tie_right_mid, "IMPLEMENTS", "{}");
+    cbm_gbuf_insert_edge(gb, tied, tie_left_mid, "INHERITS", "{}");
+
+    /* The separate Go implicit-satisfaction pass owns .go classes. */
+    int64_t go_type =
+        cbm_gbuf_upsert_node(gb, "Struct", "GoType", "m.GoType", "m.go", 1, 5, "{}");
+    int64_t go_process = ovr_method(gb, go_type, "GoType", "process");
+    cbm_gbuf_insert_edge(gb, go_type, processor, "IMPLEMENTS", "{}");
+
+    /* Malformed hierarchy: CycA <-> CycB plus a self-loop, CycLeaf(CycA).
+     * The walk must terminate and bind nothing. */
+    int64_t cyc_a = ovr_class(gb, "CycA");
+    int64_t cyc_b = ovr_class(gb, "CycB");
+    int64_t cyc_leaf = ovr_class(gb, "CycLeaf");
+    int64_t cyc_process = ovr_method(gb, cyc_leaf, "CycLeaf", "process");
+    cbm_gbuf_insert_edge(gb, cyc_a, cyc_b, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, cyc_b, cyc_a, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, cyc_a, cyc_a, "INHERITS", "{}");
+    cbm_gbuf_insert_edge(gb, cyc_leaf, cyc_a, "INHERITS", "{}");
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+    (void)cbm_pipeline_override_explicit(&ctx);
+
+    int64_t target = 0;
+    bool direct_ok = ovr_out(gb, direct_process, &target) == 1 && target == proc_process;
+    bool indirect_ok = ovr_out(gb, leaf_process, &target) == 1 && target == proc_process;
+    bool extra_absent = ovr_out(gb, leaf_extra, &target) == 0;
+    bool nearest_ok = ovr_out(gb, deep_process, &target) == 1 && target == redecl_process;
+    bool redecl_ok = ovr_out(gb, redecl_process, &target) == 1 && target == proc_process;
+    bool diamond_ok = ovr_out(gb, both_process, &target) == 1 && target == proc_process;
+    bool ties_ok = ovr_two_targets(gb, tied_process, tie_left_process, tie_right_process);
+    bool go_absent = ovr_out(gb, go_process, &target) == 0;
+    bool cycle_absent = ovr_out(gb, cyc_process, &target) == 0;
+    int first_count = cbm_gbuf_edge_count_by_type(gb, "OVERRIDE");
+
+    /* Idempotent: a second run adds no edges. */
+    (void)cbm_pipeline_override_explicit(&ctx);
+    int second_count = cbm_gbuf_edge_count_by_type(gb, "OVERRIDE");
+    bool second_ties_ok = ovr_two_targets(gb, tied_process, tie_left_process, tie_right_process);
+
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(direct_ok);
+    ASSERT_TRUE(indirect_ok);
+    ASSERT_TRUE(extra_absent);
+    ASSERT_TRUE(nearest_ok);
+    ASSERT_TRUE(redecl_ok);
+    ASSERT_TRUE(diamond_ok);
+    ASSERT_TRUE(ties_ok);
+    ASSERT_TRUE(go_absent);
+    ASSERT_TRUE(cycle_absent);
+    ASSERT_EQ(first_count, 9);
+    ASSERT_EQ(second_count, 9);
+    ASSERT_TRUE(second_ties_ok);
+    PASS();
+}
+
+/* OVERRIDE edges from a method whose QN ends with src_suffix to one whose QN
+ * ends with tgt_suffix, in the stored graph. */
+static int count_override_edges(cbm_store_t *s, const char *project, const char *src_suffix,
+                                const char *tgt_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "OVERRIDE", &edges, &edge_count);
+    int hits = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            size_t ss = strlen(src_suffix);
+            size_t ts = strlen(tgt_suffix);
+            if (sl >= ss && tl >= ts && strcmp(src.qualified_name + sl - ss, src_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, tgt_suffix) == 0) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return hits;
+}
+
+TEST(override_python_through_intermediate_class) {
+    /* The #1278 reproduction, end to end through the full pipeline. */
+    const char *py = "from abc import ABC, abstractmethod\n\n"
+                     "class Processor(ABC):\n"
+                     "    @abstractmethod\n"
+                     "    def process(self) -> str:\n"
+                     "        raise NotImplementedError\n\n"
+                     "class IntermediateProcessor(Processor):\n"
+                     "    pass\n\n"
+                     "class LeafProcessor(IntermediateProcessor):\n"
+                     "    def process(self) -> str:\n"
+                     "        return \"leaf\"\n\n"
+                     "class DirectProcessor(Processor):\n"
+                     "    def process(self) -> str:\n"
+                     "        return \"direct\"\n\n"
+                     "def run(processor: Processor) -> str:\n"
+                     "    return processor.process()\n";
+    if (setup_usages_repo("procs.py", py, NULL, NULL) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_override.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    int direct = count_override_edges(s, project, "DirectProcessor.process", ".Processor.process");
+    int leaf = count_override_edges(s, project, "LeafProcessor.process", ".Processor.process");
+    int all = count_override_edges(s, project, "", "");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+
+    ASSERT_EQ(direct, 1); /* control */
+    ASSERT_EQ(leaf, 1);   /* #1278 */
+    ASSERT_EQ(all, 2);    /* nothing else, no duplicates */
+    PASS();
+}
+
 TEST(usages_creates_edges) {
     /* Port of TestPassUsagesCreatesEdges.
      * Go source with callback reference → USAGE edge. */
@@ -16378,6 +16827,12 @@ SUITE(pipeline) {
     RUN_TEST(implements_creates_override);
     RUN_TEST(implements_no_match);
     /* Usages pass (full pipeline integration) */
+    RUN_TEST(override_explicit_walks_to_nearest_declaring_ancestor);
+    RUN_TEST(override_python_through_intermediate_class);
+    RUN_TEST(python_crossfile_typed_field_calls_issue1277);
+    RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
+    RUN_TEST(python_typed_field_external_import_stays_unresolved);
+    RUN_TEST(python_typed_field_project_class_resolves);
     RUN_TEST(usages_creates_edges);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);

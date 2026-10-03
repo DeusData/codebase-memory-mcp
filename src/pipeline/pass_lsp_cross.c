@@ -220,25 +220,47 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
 }
 
+/* One file's base-resolution scope: the registry + import map pass_semantic
+ * uses, plus the facts the external-base gate reads. NULL (the surface-probe
+ * path) keeps every base at its raw spelling. */
+typedef struct {
+    const cbm_registry_t *reg;
+    const char **imp_keys;
+    const char **imp_vals;
+    int imp_count;
+    const CBMImportArray *imports;
+    const cbm_gbuf_t *gbuf;
+    const char *project_name;
+    const char *rel;
+    CBMLanguage lang;
+} pxc_base_scope_t;
+
 /* Resolve one base-class spelling to a project QN. Mirrors
  * pass_semantic.c::resolve_as_class — same registry, same type-like veto —
  * then additionally rejects weak short-name strategies (see above).
  * Returns NULL when the base is not a confidently-known project type;
  * stdlib and third-party bases land here and keep their raw spelling. */
-static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *raw,
-                                       const char *module_qn, const char **imp_keys,
-                                       const char **imp_vals, int imp_count) {
-    if (!reg || !raw || !raw[0]) {
+static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *raw,
+                                       const char *module_qn) {
+    if (!bs || !bs->reg || !raw || !raw[0]) {
         return NULL;
     }
-    cbm_resolution_t res = cbm_registry_resolve(reg, raw, module_qn, imp_keys, imp_vals, imp_count);
+    cbm_resolution_t res =
+        cbm_registry_resolve(bs->reg, raw, module_qn, bs->imp_keys, bs->imp_vals, bs->imp_count);
     if (!res.qualified_name || !res.qualified_name[0]) {
         return NULL;
     }
     if (pxc_base_strategy_is_weak(res.strategy)) {
         return NULL;
     }
-    if (!cbm_label_is_type_like(cbm_registry_label_of(reg, res.qualified_name))) {
+    if (!cbm_label_is_type_like(cbm_registry_label_of(bs->reg, res.qualified_name))) {
+        return NULL;
+    }
+    /* `unittest.TestCase` under an external `import unittest` survives the
+     * weak-strategy veto through the same-module suffix fallback; the shared
+     * external-base gate keeps it at its source spelling. */
+    if (cbm_python_external_base_contradicts(bs->lang, bs->imports, raw, res.qualified_name,
+                                             bs->gbuf, bs->project_name, bs->rel)) {
         return NULL;
     }
     return res.qualified_name;
@@ -248,8 +270,7 @@ static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *ra
  * source spelling. Unresolved entries pass through verbatim so a base the
  * registry does not know keeps working exactly as before. */
 static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
-                                     const cbm_registry_t *reg, const char *module_qn,
-                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+                                     const pxc_base_scope_t *bs, const char *module_qn) {
     if (!bases || !bases[0]) {
         return NULL;
     }
@@ -263,8 +284,7 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
         return pxc_join_pipe(arena, bases);
     }
     for (int i = 0; i < count; i++) {
-        const char *qn =
-            pxc_resolve_base_qn(reg, bases[i], module_qn, imp_keys, imp_vals, imp_count);
+        const char *qn = pxc_resolve_base_qn(bs, bases[i], module_qn);
         resolved[i] = qn ? qn : bases[i];
     }
     resolved[count] = NULL;
@@ -390,8 +410,7 @@ static const char *pxc_qn_leaf(const char *name) {
  * pointers into src and into `arena` for synthesised composites. */
 static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const char *module_qn,
                              const char *namespace_name, CBMLanguage lang, CBMLSPDef *dst,
-                             const cbm_registry_t *reg, const char **imp_keys,
-                             const char **imp_vals, int imp_count) {
+                             const pxc_base_scope_t *bs) {
     const char *label = pxc_map_label(arena, src->label);
     if (!label || !src->qualified_name || !src->name)
         return -1;
@@ -417,9 +436,8 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
-    dst->embedded_types = (reg && pxc_lang_resolves_base_qns(lang))
-                              ? pxc_join_base_qns(arena, src->base_classes, reg, module_qn,
-                                                  imp_keys, imp_vals, imp_count)
+    dst->embedded_types = (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
+                              ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn)
                               : pxc_join_pipe(arena, src->base_classes);
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
@@ -529,6 +547,130 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
     }
 }
 
+/* Python annotation text -> the one type name it declares, or NULL. Strips a
+ * string-literal forward reference and unwraps `Optional[X]`, `X | None` and
+ * `None | X`; anything else with brackets, commas or a real union (generics,
+ * Callable, Union[A, B]) names no single receiver type and is dropped. */
+static const char *pxc_py_annotation_type_name(CBMArena *arena, const char *text) {
+    if (!text) {
+        return NULL;
+    }
+    while (*text == ' ') {
+        text++;
+    }
+    size_t n = strlen(text);
+    while (n > 0 && text[n - 1] == ' ') {
+        n--;
+    }
+    if (n >= 2 && (text[0] == '"' || text[0] == '\'') && text[n - 1] == text[0]) {
+        text++;
+        n -= 2;
+    }
+    static const char *const optional_prefixes[] = {"Optional[", "typing.Optional["};
+    for (size_t i = 0; i < sizeof(optional_prefixes) / sizeof(optional_prefixes[0]); i++) {
+        size_t plen = strlen(optional_prefixes[i]);
+        if (n > plen + 1 && strncmp(text, optional_prefixes[i], plen) == 0 && text[n - 1] == ']') {
+            text += plen;
+            n -= plen + 1;
+            break;
+        }
+    }
+    static const char none_tail[] = " | None";
+    static const char none_head[] = "None | ";
+    const size_t none_len = sizeof(none_tail) - 1;
+    if (n > none_len && strncmp(text + n - none_len, none_tail, none_len) == 0) {
+        n -= none_len;
+    } else if (n > none_len && strncmp(text, none_head, none_len) == 0) {
+        text += none_len;
+        n -= none_len;
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = text[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.';
+        if (!ok) {
+            return NULL;
+        }
+    }
+    return cbm_arena_strndup(arena, text, n);
+}
+
+/* Python: fold the file's annotated instance fields (result->field_types,
+ * #1277) into their class defs' field_defs as "name:QN|name:QN", the format
+ * py_register_lsp_defs reads. Each annotation resolves through the same
+ * registry + import map, and the same weak-strategy and type-like vetoes, as
+ * the file's base classes (pxc_resolve_base_qn): a field whose type is not a
+ * confidently-known project type is left out rather than guessed. Linear in
+ * the file: one hash of the file's class defs, one pass over its fields. */
+typedef struct {
+    int owner; /* index into defs[], or -1 */
+    const char *type_qn;
+} pxc_py_field_t;
+
+static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                    int start, int end, const pxc_base_scope_t *bs,
+                                    const char *module_qn) {
+    int nf = result ? result->field_types.count : 0;
+    if (!arena || nf == 0 || !defs || start >= end || !bs || !bs->reg) {
+        return;
+    }
+    CBMHashTable *by_qn = cbm_ht_create((uint32_t)(end - start));
+    pxc_py_field_t *fields = (pxc_py_field_t *)cbm_arena_alloc(arena, (size_t)nf * sizeof(*fields));
+    /* Per class def: exact buffer size, then the write cursor into it. */
+    size_t *lens = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    size_t *used = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    if (!by_qn || !fields || !lens || !used) {
+        cbm_ht_free(by_qn); /* NULL-safe */
+        return;
+    }
+    memset(lens, 0, (size_t)(end - start) * sizeof(size_t));
+    memset(used, 0, (size_t)(end - start) * sizeof(size_t));
+    for (int si = start; si < end; si++) {
+        if (defs[si].label && strcmp(defs[si].label, "Class") == 0 && defs[si].qualified_name) {
+            cbm_ht_set(by_qn, defs[si].qualified_name, &defs[si]);
+        }
+    }
+    for (int f = 0; f < nf; f++) {
+        const CBMFieldType *ft = &result->field_types.items[f];
+        fields[f].owner = -1;
+        fields[f].type_qn = NULL;
+        CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
+        const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
+        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn) : NULL;
+        if (!qn || !ft->field_name || !ft->field_name[0]) {
+            continue;
+        }
+        fields[f].owner = (int)(owner - defs);
+        fields[f].type_qn = qn;
+        /* "name:QN" plus one byte for the '|' or the NUL after it. */
+        lens[fields[f].owner - start] += strlen(ft->field_name) + 1 + strlen(qn) + 1;
+    }
+    cbm_ht_free(by_qn);
+    for (int si = start; si < end; si++) {
+        char *buf = lens[si - start] ? (char *)cbm_arena_alloc(arena, lens[si - start]) : NULL;
+        if (buf) {
+            buf[0] = '\0';
+        }
+        defs[si].field_defs = buf;
+    }
+    for (int f = 0; f < nf; f++) {
+        char *buf = fields[f].owner >= 0 ? (char *)defs[fields[f].owner].field_defs : NULL;
+        if (!buf) {
+            continue;
+        }
+        int slot = fields[f].owner - start;
+        int wrote =
+            snprintf(buf + used[slot], lens[slot] - used[slot], "%s%s:%s", used[slot] ? "|" : "",
+                     result->field_types.items[f].field_name, fields[f].type_qn);
+        if (wrote > 0) {
+            used[slot] += (size_t)wrote;
+        }
+    }
+}
+
 /* Carry one Rust type-level impl independently of any method definition.
  * `impl Trait for Type {}` is semantically meaningful even when the block is
  * empty (the trait may provide defaults), so attaching the relation only to
@@ -618,23 +760,27 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
          * that consume resolved base QNs, and only when a caller supplied the
          * pipeline context (the surface-probe path passes NULL and keeps the
          * raw spelling). */
-        const cbm_registry_t *base_reg = NULL;
-        const char **imp_keys = NULL;
-        const char **imp_vals = NULL;
-        int imp_count = 0;
+        pxc_base_scope_t bs = {.imports = &fr->imports,
+                               .project_name = project_name,
+                               .rel = files[fi].rel_path,
+                               .lang = files[fi].language};
         if (ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language)) {
-            base_reg = ctx->registry;
+            bs.reg = ctx->registry;
+            bs.gbuf = ctx->gbuf;
             cbm_pxc_build_import_map(ctx->gbuf, project_name, files[fi].rel_path,
-                                     files[fi].language, fr, &imp_keys, &imp_vals, &imp_count);
+                                     files[fi].language, fr, &bs.imp_keys, &bs.imp_vals,
+                                     &bs.imp_count);
         }
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
-                                  files[fi].language, &defs[idx], base_reg, imp_keys, imp_vals,
-                                  imp_count) == 0) {
+                                  files[fi].language, &defs[idx], bs.reg ? &bs : NULL) == 0) {
                 idx++;
             }
         }
-        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
+        if (files[fi].language == CBM_LANG_PYTHON) {
+            pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
+        }
+        cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
             pxc_fold_go_struct_fields(arena, fr, defs, file_start, idx);
         }
