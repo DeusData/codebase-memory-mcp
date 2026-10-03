@@ -3983,6 +3983,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return 0;
     }
 
+    if (file_count < 0 || (size_t)file_count > SIZE_MAX / sizeof(const char *)) {
+        return CBM_NOT_FOUND;
+    }
+
     cbm_log_info("parallel.resolve.start", "files", itoa_log(file_count), "workers",
                  itoa_log(worker_count));
 
@@ -3992,7 +3996,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return CBM_NOT_FOUND;
     }
     memset(workers, 0, (size_t)worker_count * sizeof(resolve_worker_state_t));
-    const char **lsp_failures = calloc((size_t)file_count, sizeof(*lsp_failures));
+    const char **lsp_failures =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(*lsp_failures));
     if (!lsp_failures) {
         cbm_aligned_free(workers);
         return CBM_NOT_FOUND;
@@ -4060,7 +4065,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
             cbm_pipeline_add_file_error(ctx->pipeline, files[i].rel_path, lsp_failures[i],
                                         "lsp_skipped");
     }
-    free(lsp_failures);
+    cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
      * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
      * all QNs, so freeing all_defs afterward is safe). */
