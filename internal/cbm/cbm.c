@@ -20,6 +20,7 @@
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
 #include "lsp/rust_lsp.h"
+#include "lsp/lsp_work.h"
 #include "preprocessor.h"
 #include "sql_values.h" // #1735: literal INSERT rows kept out of the SQL parse
 #include "foundation/compat.h"
@@ -107,6 +108,190 @@ void cbm_reset_profile(void) {
     atomic_store(&total_preprocess_ns, 0);
     atomic_store(&total_files_preprocessed, 0);
     atomic_store(&total_files, 0);
+}
+
+/* New facts use checked allocation and atomic publication; legacy extraction
+ * arrays retain their existing contracts. */
+static bool py_namespace_nonempty(const char *s) {
+    return s && s[0];
+}
+
+static bool py_namespace_fact_valid(const CBMPyNamespaceFact *f) {
+    if (!f || f->name_count < 0 || (size_t)f->name_count > SIZE_MAX / sizeof(*f->names) ||
+        (f->name_count == 0 ? f->names != NULL : f->names == NULL))
+        return false;
+    bool literal = f->kind == CBM_PY_NS_ALL_SET || f->kind == CBM_PY_NS_ALL_APPEND;
+    if (!literal && (f->names || f->name_count || f->sequence_kind != CBM_PY_NS_SEQUENCE_NONE))
+        return false;
+    if (f->kind != CBM_PY_NS_OWN_DEF && f->def_kind != CBM_PY_NS_DEF_NONE)
+        return false;
+    if (f->kind != CBM_PY_NS_IMPORT_MODULE && f->flags)
+        return false;
+    if (f->kind != CBM_PY_NS_IMPORT_NAME && f->kind != CBM_PY_NS_IMPORT_STAR && f->relative_level)
+        return false;
+    bool unknown = f->kind == CBM_PY_NS_SHADOW || f->kind == CBM_PY_NS_UNKNOWN ||
+                   f->kind == CBM_PY_NS_ALL_UNKNOWN;
+    if (!unknown && f->reason != CBM_PY_NS_REASON_NONE)
+        return false;
+    switch (f->kind) {
+    case CBM_PY_NS_OWN_DEF:
+        return py_namespace_nonempty(f->local_name) && !f->module_name && !f->member_name &&
+               (f->def_kind == CBM_PY_NS_DEF_FUNCTION || f->def_kind == CBM_PY_NS_DEF_CLASS);
+    case CBM_PY_NS_IMPORT_MODULE:
+        return py_namespace_nonempty(f->local_name) && py_namespace_nonempty(f->module_name) &&
+               !f->member_name && !(f->flags & ~CBM_PY_NS_IMPORT_BINDS_ROOT);
+    case CBM_PY_NS_IMPORT_NAME:
+    case CBM_PY_NS_IMPORT_STAR:
+        if (!f->module_name || (!f->module_name[0] && !f->relative_level))
+            return false;
+        return f->kind == CBM_PY_NS_IMPORT_NAME
+                   ? py_namespace_nonempty(f->local_name) && py_namespace_nonempty(f->member_name)
+                   : !f->local_name && !f->member_name;
+    case CBM_PY_NS_SHADOW:
+        return py_namespace_nonempty(f->local_name) && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_VALUE || f->reason == CBM_PY_NS_REASON_DECORATED ||
+                f->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED);
+    case CBM_PY_NS_DELETE:
+        return py_namespace_nonempty(f->local_name) && strcmp(f->local_name, "__all__") != 0 &&
+               !f->module_name && !f->member_name;
+    case CBM_PY_NS_UNKNOWN:
+        return !f->local_name && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_COMPOUND || f->reason == CBM_PY_NS_REASON_EFFECT ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED || f->reason == CBM_PY_NS_REASON_PARSE);
+    case CBM_PY_NS_ALL_UNKNOWN:
+        return !f->local_name && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_VALUE || f->reason == CBM_PY_NS_REASON_EFFECT ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED || f->reason == CBM_PY_NS_REASON_PARSE);
+    case CBM_PY_NS_ALL_SET:
+    case CBM_PY_NS_ALL_APPEND:
+        if (f->local_name || f->module_name || f->member_name ||
+            (f->sequence_kind != CBM_PY_NS_SEQUENCE_LIST &&
+             f->sequence_kind != CBM_PY_NS_SEQUENCE_TUPLE))
+            return false;
+        for (int i = 0; i < f->name_count; i++) {
+            if (!f->names[i])
+                return false;
+        }
+        return true;
+    case CBM_PY_NS_ALL_DELETE:
+        return !f->local_name && !f->module_name && !f->member_name;
+    default:
+        return false;
+    }
+}
+
+bool cbm_py_namespace_facts_valid(const CBMPyNamespaceFacts *f) {
+    if (!f)
+        return false;
+    bool empty = !f->items && f->count == 0 && f->cap == 0;
+    if (f->version == 0)
+        return f->status == CBM_PY_NS_NOT_CAPTURED && f->failure == CBM_PY_NS_FAILURE_NONE && empty;
+    if (f->version != CBM_PY_NAMESPACE_FACTS_VERSION || f->language < 0 ||
+        f->language >= CBM_LANG_COUNT)
+        return false;
+    switch (f->status) {
+    case CBM_PY_NS_NOT_CAPTURED:
+        return empty && f->failure == CBM_PY_NS_FAILURE_NONE;
+    case CBM_PY_NS_NOT_APPLICABLE:
+        return empty && f->language != CBM_LANG_PYTHON && f->failure == CBM_PY_NS_FAILURE_NONE;
+    case CBM_PY_NS_INCOMPLETE:
+        return empty && f->failure >= CBM_PY_NS_FAILURE_INVALID_INPUT &&
+               f->failure <= CBM_PY_NS_FAILURE_LIMIT;
+    case CBM_PY_NS_COMPLETE:
+        if (f->language != CBM_LANG_PYTHON || f->failure != CBM_PY_NS_FAILURE_NONE ||
+            f->count < 0 || f->cap < f->count || (size_t)f->cap > SIZE_MAX / sizeof(*f->items) ||
+            (f->count == 0 ? !empty : f->items == NULL))
+            return false;
+        for (int i = 0; i < f->count; i++) {
+            if (!py_namespace_fact_valid(&f->items[i]))
+                return false;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static CBM_TLS int py_namespace_copy_left = -1;
+void cbm_py_namespace_test_copy_fail_after(int successful_allocations) {
+    py_namespace_copy_left = successful_allocations;
+}
+#endif
+
+static void *py_namespace_copy_alloc(CBMArena *arena, size_t size) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_namespace_copy_left == 0)
+        return NULL;
+    if (py_namespace_copy_left > 0)
+        py_namespace_copy_left--;
+#endif
+    return cbm_arena_alloc(arena, size);
+}
+
+static bool py_namespace_copy_string(CBMArena *arena, const char *source, const char **out) {
+    *out = NULL;
+    if (!source)
+        return true;
+    size_t len = strlen(source);
+    if (len == SIZE_MAX)
+        return false;
+    char *copy = py_namespace_copy_alloc(arena, len + 1);
+    if (!copy)
+        return false;
+    memcpy(copy, source, len + 1);
+    *out = copy;
+    return true;
+}
+
+bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *source,
+                                 CBMPyNamespaceFacts *out) {
+    if (!out || source == out)
+        return false;
+    CBMPyNamespaceFacts failure = {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                   .language = CBM_LANG_PYTHON,
+                                   .status = CBM_PY_NS_INCOMPLETE,
+                                   .failure = CBM_PY_NS_FAILURE_INVALID_INPUT};
+    if (!arena || !cbm_py_namespace_facts_valid(source)) {
+        *out = failure;
+        return false;
+    }
+    failure.language = source->language;
+    failure.failure = CBM_PY_NS_FAILURE_ALLOCATION;
+    CBMPyNamespaceFacts copy = *source;
+    copy.items = NULL;
+    copy.cap = copy.count;
+    if (copy.count) {
+        copy.items = py_namespace_copy_alloc(arena, (size_t)copy.count * sizeof(*copy.items));
+        if (!copy.items)
+            goto failed;
+        memcpy(copy.items, source->items, (size_t)copy.count * sizeof(*copy.items));
+    }
+    for (int i = 0; i < copy.count; i++) {
+        const CBMPyNamespaceFact *src = &source->items[i];
+        CBMPyNamespaceFact *dst = &copy.items[i];
+        if (!py_namespace_copy_string(arena, src->local_name, &dst->local_name) ||
+            !py_namespace_copy_string(arena, src->module_name, &dst->module_name) ||
+            !py_namespace_copy_string(arena, src->member_name, &dst->member_name))
+            goto failed;
+        dst->names = NULL;
+        if (src->name_count) {
+            dst->names =
+                py_namespace_copy_alloc(arena, (size_t)src->name_count * sizeof(*dst->names));
+            if (!dst->names)
+                goto failed;
+            for (int j = 0; j < src->name_count; j++) {
+                if (!py_namespace_copy_string(arena, src->names[j], &dst->names[j]))
+                    goto failed;
+            }
+        }
+    }
+    *out = copy;
+    return true;
+failed:
+    *out = failure;
+    return false;
 }
 
 // --- Growable array push functions ---
@@ -241,6 +426,11 @@ void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea) {
 void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = ta;
+}
+
+void cbm_fieldtype_push(CBMFieldTypeArray *arr, CBMArena *a, CBMFieldType ft) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = ft;
 }
 
 void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr) {
@@ -2141,6 +2331,183 @@ static bool cbm_sql_values_exclusion_on(const char *rel_path) {
     return true;
 }
 
+/* ── Innermost enclosing Function/Method per call (#1527) ──────────────
+ * The call-context metrics attribute each call to the Function/Method def with
+ * the SMALLEST line span containing the call's line, ties to the lowest def
+ * index. Scanning every def for every call made that O(calls x defs) per file
+ * -- quadratic in file size, the largest single cost on a module with
+ * thousands of methods. The sweep below gives the identical answer in
+ * O((calls + defs) log defs): calls in line order, candidates entering a
+ * min-heap keyed (span, index) once their start line is reached and leaving it
+ * lazily once their end line has passed -- lines only grow, so a def that has
+ * ended never contains a later call. The heap top is then the smallest
+ * (span, index) among the defs that contain the line. */
+static bool enclosing_is_callable(const CBMDefinition *d) {
+    return d->name && d->label &&
+           (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0);
+}
+
+/* The reference answer for one line (and the path when the sweep's arrays
+ * cannot be allocated). */
+static int cbm_enclosing_callable_scan(const CBMFileResult *result, int line) {
+    int best = -1;
+    int best_span = -1;
+    for (int di = 0; di < result->defs.count; di++) {
+        const CBMDefinition *d = &result->defs.items[di];
+        CBM_LSP_WORK(1);
+        if (!enclosing_is_callable(d)) {
+            continue;
+        }
+        if ((int)d->start_line <= line && line <= (int)d->end_line) {
+            int span = (int)d->end_line - (int)d->start_line;
+            if (best < 0 || span < best_span) {
+                best_span = span;
+                best = di;
+            }
+        }
+    }
+    return best;
+}
+
+static CBM_TLS const CBMFileResult *tl_enclosing_result;
+
+static int enclosing_def_by_start(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    uint32_t la = tl_enclosing_result->defs.items[ia].start_line;
+    uint32_t lb = tl_enclosing_result->defs.items[ib].start_line;
+    return la < lb ? -1 : la > lb ? 1 : ia - ib;
+}
+
+static int enclosing_call_by_line(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    int la = tl_enclosing_result->calls.items[ia].start_line;
+    int lb = tl_enclosing_result->calls.items[ib].start_line;
+    return la < lb ? -1 : la > lb ? 1 : ia - ib;
+}
+
+/* Heap order: smaller span first, then smaller def index. */
+static bool enclosing_heap_less(const CBMFileResult *r, int a, int b) {
+    const CBMDefinition *da = &r->defs.items[a];
+    const CBMDefinition *db = &r->defs.items[b];
+    int sa = (int)da->end_line - (int)da->start_line;
+    int sb = (int)db->end_line - (int)db->start_line;
+    return sa != sb ? sa < sb : a < b;
+}
+
+static void enclosing_heap_push(const CBMFileResult *r, int *heap, int *n, int di) {
+    int i = (*n)++;
+    heap[i] = di;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        CBM_LSP_WORK(1);
+        if (!enclosing_heap_less(r, heap[i], heap[parent])) {
+            break;
+        }
+        int t = heap[i];
+        heap[i] = heap[parent];
+        heap[parent] = t;
+        i = parent;
+    }
+}
+
+static void enclosing_heap_pop(const CBMFileResult *r, int *heap, int *n) {
+    heap[0] = heap[--(*n)];
+    int i = 0;
+    for (;;) {
+        int l = (2 * i) + 1;
+        int m = i;
+        CBM_LSP_WORK(1);
+        if (l < *n && enclosing_heap_less(r, heap[l], heap[m])) {
+            m = l;
+        }
+        if (l + 1 < *n && enclosing_heap_less(r, heap[l + 1], heap[m])) {
+            m = l + 1;
+        }
+        if (m == i) {
+            break;
+        }
+        int t = heap[i];
+        heap[i] = heap[m];
+        heap[m] = t;
+        i = m;
+    }
+}
+
+/* enclosing[ci] = innermost Function/Method def index for call ci, or -1.
+ * Returns NULL when the working arrays cannot be allocated; the caller then
+ * asks cbm_enclosing_callable_scan per call (same answer, old cost). */
+static int *cbm_enclosing_callables(const CBMFileResult *result, int call_count) {
+    int def_count = result->defs.count;
+    if (call_count <= 0) {
+        return NULL;
+    }
+    size_t call_bytes = (size_t)call_count * sizeof(int);
+    size_t def_bytes = (size_t)(def_count > 0 ? def_count : 1) * sizeof(int);
+    int *enclosing = cbm_alloc(CBM_MEM_CLASS_OTHER, call_bytes);
+    int *call_order = cbm_alloc(CBM_MEM_CLASS_OTHER, call_bytes);
+    int *cands = cbm_alloc(CBM_MEM_CLASS_OTHER, def_bytes);
+    int *heap = cbm_alloc(CBM_MEM_CLASS_OTHER, def_bytes);
+    if (!enclosing || !call_order || !cands || !heap) {
+        cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
+        cbm_free(CBM_MEM_CLASS_OTHER, call_order);
+        cbm_free(CBM_MEM_CLASS_OTHER, cands);
+        cbm_free(CBM_MEM_CLASS_OTHER, heap);
+        return NULL;
+    }
+    int ncand = 0;
+    for (int di = 0; di < def_count; di++) {
+        if (enclosing_is_callable(&result->defs.items[di])) {
+            cands[ncand++] = di;
+        }
+    }
+    for (int ci = 0; ci < call_count; ci++) {
+        call_order[ci] = ci;
+        enclosing[ci] = -1;
+    }
+    tl_enclosing_result = result;
+    qsort(cands, (size_t)ncand, sizeof(int), enclosing_def_by_start);
+    qsort(call_order, (size_t)call_count, sizeof(int), enclosing_call_by_line);
+    tl_enclosing_result = NULL;
+
+    int heap_n = 0;
+    int next = 0;
+    for (int k = 0; k < call_count; k++) {
+        int ci = call_order[k];
+        int line = result->calls.items[ci].start_line;
+        while (next < ncand && (int)result->defs.items[cands[next]].start_line <= line) {
+            enclosing_heap_push(result, heap, &heap_n, cands[next++]);
+        }
+        while (heap_n > 0 && (int)result->defs.items[heap[0]].end_line < line) {
+            enclosing_heap_pop(result, heap, &heap_n);
+        }
+        enclosing[ci] = heap_n > 0 ? heap[0] : -1;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, call_order);
+    cbm_free(CBM_MEM_CLASS_OTHER, cands);
+    cbm_free(CBM_MEM_CLASS_OTHER, heap);
+    return enclosing;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
+    int *enclosing = cbm_enclosing_callables(result, result->calls.count);
+    if (!enclosing) {
+        return result->calls.count > 0 ? -1 : 0;
+    }
+    int mismatches = 0;
+    for (int ci = 0; ci < result->calls.count; ci++) {
+        int line = result->calls.items[ci].start_line;
+        if (line > 0 && enclosing[ci] != cbm_enclosing_callable_scan(result, line)) {
+            mismatches++;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
+    return mismatches;
+}
+#endif
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -2154,6 +2521,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return NULL;
     }
 
+    result->py_namespace.version = CBM_PY_NAMESPACE_FACTS_VERSION;
+    result->py_namespace.language = language;
+    result->py_namespace.status =
+        language == CBM_LANG_PYTHON ? CBM_PY_NS_NOT_CAPTURED : CBM_PY_NS_NOT_APPLICABLE;
     cbm_work_arena_take(&result->arena);
     CBMArena *a = &result->arena;
 
@@ -2340,6 +2711,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // then a single unified cursor walk handles the remaining 7 extractors.
     cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
+    cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
     result->tree_nodes = ts_node_descendant_count(root);
     result->walk_nodes_visited = ctx.walk_nodes_visited;
@@ -2504,8 +2876,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
-                    cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+                    if (!result->lsp_skipped) {
+                        cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
+                                      language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+                    }
 
                     /* All C-LSP emitters stamp origin directly so rewrite-time
                      * comparisons are already safe. Keep this boundary sweep as
@@ -2828,28 +3202,14 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         d->param_count = pc;
     }
 
+    int *enclosing = cbm_enclosing_callables(result, orig_calls_count);
     for (int ci = 0; ci < orig_calls_count; ci++) {
         const CBMCall *c = &result->calls.items[ci];
         if (!c->callee_name || c->start_line <= 0) {
             continue;
         }
         // Innermost enclosing Function/Method def by line range (smallest span).
-        int best = -1;
-        int best_span = -1;
-        for (int di = 0; di < def_count; di++) {
-            const CBMDefinition *d = &result->defs.items[di];
-            if (!d->name || !d->label ||
-                (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)) {
-                continue;
-            }
-            if ((int)d->start_line <= c->start_line && c->start_line <= (int)d->end_line) {
-                int span = (int)d->end_line - (int)d->start_line;
-                if (best < 0 || span < best_span) {
-                    best_span = span;
-                    best = di;
-                }
-            }
-        }
+        int best = enclosing ? enclosing[ci] : cbm_enclosing_callable_scan(result, c->start_line);
         if (best < 0) {
             continue;
         }
@@ -2894,6 +3254,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
     free(has_self);
     free(has_guarded);
+    cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
 
     uint64_t t2 = now_ns();
 
@@ -3057,6 +3418,35 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     CBMFileResult *result = extract_file_ex_body(source, source_len, language, project, rel_path,
                                                  timeout_micros, extra_defines, include_paths,
                                                  macro_table, return_type_table, &scratch);
+    /* Even early parse/quarantine exits publish conservative Python metadata.
+     * No tree is reparsed, and existing best-effort extraction flags stay intact. */
+    if (result && language == CBM_LANG_PYTHON &&
+        result->py_namespace.status == CBM_PY_NS_NOT_CAPTURED) {
+        CBMPyNamespaceFailure failure = CBM_PY_NS_FAILURE_NONE;
+        if (!result->module_qn || !result->module_qn[0]) {
+            if (!project || !project[0] || !rel_path || !rel_path[0]) {
+                failure = CBM_PY_NS_FAILURE_INVALID_INPUT;
+            } else {
+                result->module_qn =
+                    cbm_fqn_module_source_lang(&result->arena, project, rel_path, language);
+                if (!result->module_qn || !result->module_qn[0])
+                    failure = CBM_PY_NS_FAILURE_ALLOCATION;
+            }
+        }
+        if (failure) {
+            result->py_namespace = (CBMPyNamespaceFacts){.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                                         .language = language,
+                                                         .status = CBM_PY_NS_INCOMPLETE,
+                                                         .failure = failure};
+        } else {
+            CBMExtractCtx facts_ctx = {.arena = &result->arena,
+                                       .result = result,
+                                       .source = source,
+                                       .source_len = source_len,
+                                       .language = language};
+            cbm_extract_python_namespace_facts(&facts_ctx);
+        }
+    }
     /* !tl_scratch_live: a nested extraction (an embedded language inside this
      * file) may already have parked its own; never overwrite it. */
     /* Kept up to CBM_EXTRACT_SCRATCH_KEEP_BYTES, grown blocks included: the
