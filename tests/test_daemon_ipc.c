@@ -3393,6 +3393,222 @@ TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance) {
     PASS();
 }
 
+static bool ipc_test_lifetime_lock_path(char out[TEST_PATH_CAP], const char *runtime_dir,
+                                        const char *key) {
+    int written = runtime_dir && key
+                      ? snprintf(out, TEST_PATH_CAP, "%s/cbm-%s.lifetime.lock", runtime_dir, key)
+                      : -1;
+    return written > 0 && written < TEST_PATH_CAP;
+}
+
+/* Child-process verdict on whether the lifetime lock at lock_path is held by
+ * someone else, going straight through open()/fcntl() rather than any of
+ * this codebase's APIs, so a genuinely separate process cannot inherit the
+ * parent's in-process claim registry. Distinguishes three outcomes instead
+ * of collapsing "held" and "could not even check" into the same value:
+ * IPC_TEST_LOCK_HELD only when open() succeeded and F_SETLK failed with
+ * EACCES or EAGAIN (the lock is held by another process, as expected);
+ * IPC_TEST_LOCK_TAKEN when F_SETLK succeeded (the lock was free, a bug);
+ * IPC_TEST_LOCK_ERROR for anything else (open() failed, e.g. a wrong path,
+ * or F_SETLK failed with an errno that says nothing about the lock's
+ * state), which must never be mistaken for IPC_TEST_LOCK_HELD. */
+enum {
+    IPC_TEST_LOCK_HELD = 0,
+    IPC_TEST_LOCK_TAKEN = 1,
+    IPC_TEST_LOCK_ERROR = 3,
+};
+
+static uint8_t ipc_test_lock_child_verdict(const char *lock_path) {
+    int fd = open(lock_path, O_RDWR);
+    if (fd < 0) {
+        return IPC_TEST_LOCK_ERROR;
+    }
+    struct flock record_lock = {
+        .l_type = F_WRLCK,
+        .l_whence = SEEK_SET,
+        .l_start = 0,
+        .l_len = 0,
+    };
+    int lock_result;
+    do {
+        lock_result = fcntl(fd, F_SETLK, &record_lock);
+    } while (lock_result != 0 && errno == EINTR);
+    int lock_errno = errno;
+    (void)close(fd);
+    if (lock_result == 0) {
+        return IPC_TEST_LOCK_TAKEN;
+    }
+    return lock_errno == EACCES || lock_errno == EAGAIN ? IPC_TEST_LOCK_HELD : IPC_TEST_LOCK_ERROR;
+}
+
+TEST(daemon_ipc_posix_lifetime_reservation_probe_does_not_drop_held_lock) {
+    static const char key[] = "c1c1d2d2e3e3f4f4";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char lock_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_lifetime_reservation_t *reservation = NULL;
+    int result_pipe[2] = {-1, -1};
+    pid_t child = -1;
+    uint8_t child_result = 0;
+    int child_status = -1;
+    int acquired = -1;
+    int held_after_first_probe = -1;
+    int held_after_second_probe = -1;
+    int free_after_release = -1;
+    bool lock_path_ok = false;
+
+    if (ipc_test_parent_new(parent, "probe-holds-lock")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        lock_path_ok = ipc_test_lifetime_lock_path(lock_path, runtime_dir, key);
+        acquired = cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &reservation);
+    }
+    if (reservation) {
+        /* Two probes, matching how a real daemon polls its own reservation
+         * repeatedly while running. Each probe of an already-held lock used
+         * to open a throwaway fd on the lock file and close it. Since
+         * fcntl(2) record locks are scoped to (process, inode), that close
+         * silently released the real lock every time, regardless of the
+         * still-open fd the reservation itself is holding. */
+        held_after_first_probe = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+        held_after_second_probe = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+    }
+    if (reservation && lock_path_ok && pipe(result_pipe) == 0) {
+        child = fork();
+    }
+    if (child == 0) {
+        /* A genuinely independent process, not going through any of this
+         * codebase's APIs so it cannot inherit the parent's in-process
+         * claim registry: try to take the real OS-level lock directly. If
+         * the parent's fcntl lock survived the probes above, this fails. */
+        (void)close(result_pipe[0]);
+        child_result = ipc_test_lock_child_verdict(lock_path);
+        bool reported = ipc_test_fd_write_all(result_pipe[1], &child_result, sizeof(child_result));
+        (void)close(result_pipe[1]);
+        _exit(reported ? 0 : 1);
+    }
+    if (child > 0) {
+        (void)close(result_pipe[1]);
+        result_pipe[1] = -1;
+        bool received = ipc_test_fd_read_all(result_pipe[0], &child_result, sizeof(child_result));
+        (void)close(result_pipe[0]);
+        result_pipe[0] = -1;
+        if (!received) {
+            child_result = 2;
+        }
+        while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+    }
+    cbm_daemon_ipc_lifetime_reservation_release(reservation);
+    if (endpoint) {
+        free_after_release = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+    }
+    for (size_t index = 0; index < 2; index++) {
+        if (result_pipe[index] >= 0) {
+            (void)close(result_pipe[index]);
+        }
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_EQ(acquired, 1);
+    ASSERT_TRUE(lock_path_ok);
+    ASSERT_EQ(held_after_first_probe, 1);
+    ASSERT_EQ(held_after_second_probe, 1);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+    ASSERT_EQ(child_result, IPC_TEST_LOCK_HELD);
+    ASSERT_EQ(free_after_release, 0);
+    PASS();
+}
+
+TEST(daemon_ipc_posix_lifetime_reservation_try_acquire_again_does_not_drop_held_lock) {
+    static const char key[] = "a1a1b2b2c3c3d4d4";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char lock_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_lifetime_reservation_t *reservation = NULL;
+    cbm_daemon_ipc_lifetime_reservation_t *second_reservation =
+        (cbm_daemon_ipc_lifetime_reservation_t *)(uintptr_t)1;
+    int result_pipe[2] = {-1, -1};
+    pid_t child = -1;
+    uint8_t child_result = 0;
+    int child_status = -1;
+    int acquired = -1;
+    int reacquired = -1;
+    int free_after_release = -1;
+    bool lock_path_ok = false;
+
+    if (ipc_test_parent_new(parent, "try-acquire-again-holds-lock")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        lock_path_ok = ipc_test_lifetime_lock_path(lock_path, runtime_dir, key);
+        acquired = cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &reservation);
+    }
+    if (reservation) {
+        /* This process already holds the lifetime lock. Calling try_acquire
+         * again, still in this process, must trust the in-process registry
+         * alone and return 0 (already held, nothing new to hand back)
+         * without touching the lock file: opening and closing a second fd
+         * on it would drop the fcntl(2) record lock this process already
+         * holds, exactly the way the probe's own fast path used to. */
+        reacquired = cbm_daemon_ipc_lifetime_reservation_try_acquire(endpoint, &second_reservation);
+    }
+    if (reservation && lock_path_ok && pipe(result_pipe) == 0) {
+        child = fork();
+    }
+    if (child == 0) {
+        /* A genuinely independent process, not going through any of this
+         * codebase's APIs so it cannot inherit the parent's in-process
+         * claim registry: try to take the real OS-level lock directly. If
+         * the repeated try_acquire above survived, this fails. */
+        (void)close(result_pipe[0]);
+        child_result = ipc_test_lock_child_verdict(lock_path);
+        bool reported = ipc_test_fd_write_all(result_pipe[1], &child_result, sizeof(child_result));
+        (void)close(result_pipe[1]);
+        _exit(reported ? 0 : 1);
+    }
+    if (child > 0) {
+        (void)close(result_pipe[1]);
+        result_pipe[1] = -1;
+        bool received = ipc_test_fd_read_all(result_pipe[0], &child_result, sizeof(child_result));
+        (void)close(result_pipe[0]);
+        result_pipe[0] = -1;
+        if (!received) {
+            child_result = 2;
+        }
+        while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
+    }
+    cbm_daemon_ipc_lifetime_reservation_release(reservation);
+    if (endpoint) {
+        free_after_release = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
+    }
+    for (size_t index = 0; index < 2; index++) {
+        if (result_pipe[index] >= 0) {
+            (void)close(result_pipe[index]);
+        }
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_EQ(acquired, 1);
+    ASSERT_TRUE(lock_path_ok);
+    ASSERT_EQ(reacquired, 0);
+    ASSERT_TRUE(second_reservation == NULL);
+    ASSERT_GT(child, 0);
+    ASSERT_TRUE(WIFEXITED(child_status));
+    ASSERT_EQ(WEXITSTATUS(child_status), 0);
+    ASSERT_EQ(child_result, IPC_TEST_LOCK_HELD);
+    ASSERT_EQ(free_after_release, 0);
+    PASS();
+}
+
 TEST(daemon_ipc_posix_child_participant_handoff_retains_legacy_bridge) {
 #ifdef _WIN32
     PASS();
@@ -5606,6 +5822,8 @@ SUITE(daemon_ipc) {
 #endif
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);
     RUN_TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance);
+    RUN_TEST(daemon_ipc_posix_lifetime_reservation_probe_does_not_drop_held_lock);
+    RUN_TEST(daemon_ipc_posix_lifetime_reservation_try_acquire_again_does_not_drop_held_lock);
     RUN_TEST(daemon_ipc_posix_child_participant_handoff_retains_legacy_bridge);
     RUN_TEST(daemon_ipc_posix_publication_boundaries_recover_from_crash);
     RUN_TEST(daemon_ipc_posix_record_publication_windows_recover_from_crash);
