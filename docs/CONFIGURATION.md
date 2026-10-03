@@ -159,6 +159,7 @@ These environment variables affect runtime behavior:
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the cache directory used for indexes, `_config.db`, and UI `config.json`. |
 | `CBM_DIAGNOSTICS` | `false` | Enable periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. The daemon records the randomized paths in the `diagnostics.start` discovery record (a single JSON line) in `${CBM_CACHE_DIR}/logs/cbm-daemon.log`; that one record is emitted even when `CBM_LOG_LEVEL` suppresses ordinary logging, so the paths always remain discoverable. |
 | `CBM_DOWNLOAD_URL` | GitHub releases | Override the update download URL. |
+| `CBM_IN_PROCESS` | *(unset)* | Set to `1` (or `true`) to serve MCP sessions read-only from their own process, without the coordination daemon. Only for hosts that cannot reach the daemon — see below. |
 | `CBM_LOG_LEVEL` | role-aware | Set the log level to `debug`, `info`, `warn`, `error`, or `none` (or `0`-`4`). Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and supervised index workers default to `info`. Physical workers retain INFO liveness records because their private logs drive the supervisor's no-progress timeout. Frontend messages use that session's stderr; detached daemon events use `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. |
 | `CBM_RUNTIME_DIR` | `%LOCALAPPDATA%` (Windows), `/private/tmp` (macOS), `/tmp` (other) | Parent directory for the daemon/CLI rendezvous directory, which CBM creates inside it as `cbm-daemon-<uid>` (`cbm-daemon-<key>` on Windows). Set it when the default ancestry cannot pass the private-directory check — see below. `CBM_CACHE_DIR` does **not** move the rendezvous. |
 | `CBM_WORKERS` | auto-detected | Override the indexing worker count. |
@@ -216,6 +217,47 @@ which is also much faster than a 9p-mounted Windows drive.
 
 Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running, so its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon — joining an already-running daemon, it inherits that daemon's already-captured values instead.
 
+### Running without the daemon
+
+`CBM_IN_PROCESS=1` is for MCP hosts whose sandbox denies socket system calls, so
+the daemon can never be reached — for example a macOS seatbelt profile with
+`(deny network*)`, under which even `AF_UNIX` `bind()` and `connect()` fail with
+`EPERM`. Only `1` or `true` turn it on. It affects MCP server sessions only;
+`cli`, hooks and `daemon` commands ignore it. Set it in the MCP server entry's
+`env` rather than exporting it globally: some clients forward only selected
+variables to MCP servers, and a global export would make every MCP session
+read-only.
+
+Such a session opts out of the shared daemon entirely:
+
+- **Nothing is shared between clients.** Each client that sets it runs its own
+  standalone server process, which opens the indexes under `CBM_CACHE_DIR`
+  itself. There are no shared indexing jobs, no watcher or auto-indexing, no
+  UI, and no cross-session lease. It is also outside exact-build admission:
+  nothing checks that it runs the same build or uses the same `CBM_CACHE_DIR`
+  as the daemon, and `update` does not drain it — point it at the cache the
+  indexing sessions use, and restart it after updating.
+- **Read-only.** It serves the `analysis` tool set (or `scout`, if that profile
+  was requested), so `index_repository`, `delete_project`, `manage_adr` and
+  `ingest_traces` are not offered. It never builds or refreshes an index: do
+  that from a daemon-backed session, or with
+  `codebase-memory-mcp cli index_repository` outside the sandbox.
+- **No shared state is written.** It creates no rendezvous, takes no cohort,
+  lifetime or project lock, and writes neither `_config.db` nor any index page,
+  so it cannot disturb a daemon running alongside it. The one exception is
+  SQLite's own reader protocol: on an index in WAL mode, like any reader it
+  creates `<project>.db-shm` and an empty `<project>.db-wal` if they are absent.
+
+It still needs a `CBM_CACHE_DIR` it can write: like every CBM process it sets
+that directory to `0700` at startup, so a read-only mount or a sandbox that
+denies writes there stops it before it starts. `search_code` and
+`detect_changes` also stage short-lived scratch files in `${CBM_CACHE_DIR}/logs`
+(creating it if needed), and `search_code` in `/tmp`.
+
+Leave it unset whenever the daemon is reachable, when a session must index,
+re-index, read or edit ADRs, or delete projects, or when you need the UI or
+indexes that refresh themselves. It is not a fix for a rendezvous directory that
+fails its checks — that is what `CBM_RUNTIME_DIR` is for.
 
 ### Roots that are always refused
 
