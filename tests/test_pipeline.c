@@ -7761,6 +7761,251 @@ TEST(pipeline_local_fetch_shadow_not_classified_as_http) {
     PASS();
 }
 
+/* #706 / #1147 end to end: a URL composed from module constants reaches the
+ * HTTP classifier, so the client call forms an HTTP_CALLS edge. Python
+ * `API_URL = API_BASE_URL + "/orders/create"` (env-derived base, literal path
+ * kept) and a TS object-literal endpoint map over a base constant. The
+ * unresolvable control (`requests.get(u)` on a computed value) adds none. */
+TEST(pipeline_url_constant_folding_http_calls_issue706_1147) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_urlfold_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "svc/client.py",
+                    "import os\n"
+                    "import requests\n"
+                    "API_BASE_URL = os.environ[\"API_BASE_URL\"]\n"
+                    "API_URL = API_BASE_URL + \"/orders/create\"\n"
+                    "def send(payload):\n"
+                    "    return requests.post(API_URL, json=payload)\n"
+                    "def dyn():\n"
+                    "    u = os.environ.get(\"X\")\n"
+                    "    return requests.get(u)\n");
+    write_temp_file(tmp, "web/api.ts",
+                    "const BASE = '/api'\n"
+                    "export const API_ENDPOINTS = {\n"
+                    "  USER: `${BASE}/users/me`,\n"
+                    "}\n"
+                    "export function loadUser(): unknown {\n"
+                    "  return fetch(API_ENDPOINTS.USER);\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/urlfold.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Asserted per edge, not by count: a client call may also carry a second,
+     * arg_url-sourced HTTP_CALLS edge for the same path. */
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, project, "HTTP_CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    int py_edges = 0;
+    int ts_edges = 0;
+    int control_edges = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        cbm_node_t src = {0};
+        cbm_store_find_node_by_id(s, edges[i].source_id, &src);
+        if (src.name && strcmp(src.name, "dyn") == 0) {
+            control_edges++;
+        } else if (src.name && strcmp(src.name, "send") == 0 &&
+                   strstr(props, "\"url_path\":\"/orders/create\"")) {
+            py_edges++;
+        } else if (src.name && strcmp(src.name, "loadUser") == 0 &&
+                   strstr(props, "\"url_path\":\"/api/users/me\"")) {
+            ts_edges++;
+        }
+        cbm_node_free_fields(&src);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ASSERT_GTE(py_edges, 1);
+    ASSERT_GTE(ts_edges, 1);
+    ASSERT_EQ(control_edges, 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Run the same identities through both service resolvers. An import alias is
+ * deliberately absent from the callee-name pattern table until resolution. */
+TEST(pipeline_folded_topics_preserve_identity_sequential_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_topicfold_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "src/topics.ts",
+                    "const TENANT = 'tenant';\n"
+                    "const TOPIC = `${TENANT}/events`;\n"
+                    "const TOPICS = { EVENTS: `${TENANT}/events` };\n"
+                    "const PREFIX = 'tenant/';\n"
+                    "const DOUBLE = `${PREFIX}/events`;\n"
+                    "const UNKNOWN = `${tenant}/events`;\n"
+                    "export function literal() { mqtt.publish('tenant/events', 'payload'); }\n"
+                    "export function direct() { mqtt.publish(`${TENANT}/events`, 'payload'); }\n"
+                    "export function constant() { mqtt.publish(TOPIC, 'payload'); }\n"
+                    "export function member() { mqtt.publish(TOPICS.EVENTS, 'payload'); }\n"
+                    "export function doubled() { mqtt.publish(DOUBLE, 'payload'); }\n"
+                    "export function unknown() { mqtt.publish(UNKNOWN, 'payload'); }\n");
+    write_temp_file(tmp, "src/aliases.py",
+                    "from paho.mqtt import publish as send\n"
+                    "TENANT = 'tenant'\n"
+                    "TOPIC = f'{TENANT}/events'\n"
+                    "ABS = f'/{TENANT}/events'\n"
+                    "def alias():\n    send(TOPIC, 'payload')\n"
+                    "def keyword():\n    send(topic=TOPIC, payload='x')\n"
+                    "def slash_topic():\n    send(ABS, 'payload')\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/padding%d.ts", i);
+        snprintf(body, sizeof(body), "export function padding%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    int run_rc[2] = {-1, -1};
+    bool opened[2] = {false, false};
+    int matches[2][9] = {{0}};
+    int http_edges[2] = {-1, -1};
+    int invented[2] = {-1, -1};
+    const char *functions[] = {"literal", "direct", "constant", "member",     "doubled",
+                               "unknown", "alias",  "keyword",  "slash_topic"};
+    const char *topics[] = {"tenant/events", "tenant/events",  "tenant/events",
+                            "tenant/events", "tenant//events", "{}/events",
+                            "tenant/events", "tenant/events",  "/tenant/events"};
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode == 0) {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+            cbm_setenv("CBM_WORKERS", "4", 1);
+        }
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/topics_%d.db", tmp, mode);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc[mode] = p ? cbm_pipeline_run(p) : -1;
+        const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        opened[mode] = s != NULL;
+        if (s && project) {
+            for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+                matches[mode][i] =
+                    named_edge_count(s, project, "ASYNC_CALLS", functions[i], topics[i]);
+            }
+            http_edges[mode] = cbm_store_count_edges_by_type(s, project, "HTTP_CALLS");
+            invented[mode] = count_nodes_named(s, project, "/events");
+            /* Only slash_topic really contains a leading slash. */
+            for (size_t i = 0; i < 8; i++) {
+                invented[mode] +=
+                    named_edge_count(s, project, "ASYNC_CALLS", functions[i], "/tenant/events");
+            }
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p);
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(opened[mode]);
+        for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+            ASSERT_GTE(matches[mode][i], 1);
+        }
+        ASSERT_EQ(http_edges[mode], 0);
+        ASSERT_EQ(invented[mode], 0);
+    }
+    PASS();
+}
+
+/* Relative endpoint maps still supply the parallel wrapper-client heuristic
+ * through their URL candidate, including the request-config slot from #2235. */
+TEST(pipeline_relative_folded_wrapper_url_candidates) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_relativefold_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(
+        tmp, "src/wrapper.ts",
+        "const REL = 'api';\n"
+        "const API_ENDPOINTS = { GAME_LAUNCH_URL: `${REL}/games/launch` };\n"
+        "function client(url: string) { return url; }\n"
+        "function http(config: {url: string}) { return config; }\n"
+        "export function launch() { return client(API_ENDPOINTS.GAME_LAUNCH_URL); }\n"
+        "export function config() { return http({url: API_ENDPOINTS.GAME_LAUNCH_URL}); }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/padding%d.ts", i);
+        snprintf(body, sizeof(body), "export function padding%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/wrappers.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    bool opened = s != NULL;
+    int launch_edges = 0;
+    int config_edges = 0;
+    if (s && project) {
+        launch_edges = named_edge_count(s, project, "HTTP_CALLS", "launch", "/api/games/launch");
+        config_edges = named_edge_count(s, project, "HTTP_CALLS", "config", "/api/games/launch");
+    }
+    if (s) {
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_GTE(launch_edges, 1);
+    ASSERT_GTE(config_edges, 1);
+    PASS();
+}
+
 /* ── Git history pass tests ─────────────────────────────────────── */
 
 TEST(githistory_is_trackable) {
@@ -16365,6 +16610,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
+    RUN_TEST(pipeline_url_constant_folding_http_calls_issue706_1147);
+    RUN_TEST(pipeline_folded_topics_preserve_identity_sequential_parallel);
+    RUN_TEST(pipeline_relative_folded_wrapper_url_candidates);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);

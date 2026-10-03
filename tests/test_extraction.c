@@ -11,6 +11,7 @@
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
+#include <stdint.h>
 #include <time.h>
 #include "macro_table.h"
 #include "result_spill.h"
@@ -5304,6 +5305,439 @@ TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
     PASS();
 }
 
+/* Issue #2291: the JS/TS twin of #1249. A BFF that builds its backend URL as
+ * `${process.env.BACKEND_URL}/wallet/topup` from a configurable base must
+ * index the literal path after the base, exactly as `BACKEND_URL + "/x"`
+ * already does. The flattened "{}/wallet/topup" was dropped because it
+ * neither starts with '/' nor carries a scheme, so no HTTP_CALLS edge formed
+ * and the call could never be matched to the backend's route. */
+TEST(extract_ts_template_base_url_issue2291) {
+    CBMFileResult *r = extract("const BACKEND_URL = process.env.BACKEND_URL;\n"
+                               "export async function topup(body: string) {\n"
+                               "  return fetch(`${process.env.BACKEND_URL}/wallet/topup/zibal`, {\n"
+                               "    method: 'POST', body });\n"
+                               "}\n"
+                               "export async function tickets() {\n"
+                               "  return axios.get(`${BACKEND_URL}/tickets/mine`);\n"
+                               "}\n"
+                               "export async function items(id: string) {\n"
+                               "  return got(`${BACKEND_URL}/orders/${id}/items`);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "route.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *f = find_call_by_callee(r, "fetch");
+    ASSERT_NOT_NULL(f);
+    ASSERT_NOT_NULL(f->first_string_arg);
+    ASSERT_STR_EQ(f->first_string_arg, "/wallet/topup/zibal");
+
+    const CBMCall *g = find_call_by_callee(r, "axios.get");
+    ASSERT_NOT_NULL(g);
+    ASSERT_NOT_NULL(g->first_string_arg);
+    ASSERT_STR_EQ(g->first_string_arg, "/tickets/mine");
+
+    const CBMCall *h = find_call_by_callee(r, "got");
+    ASSERT_NOT_NULL(h);
+    ASSERT_NOT_NULL(h->first_string_arg);
+    /* `got` has no service-table entry: preserve the raw first argument and
+     * carry the recovered path as an explicit candidate for HTTP detection. */
+    ASSERT_STR_EQ(h->first_string_arg, "{}/orders/{}/items");
+    ASSERT_GTE(h->arg_count, 1);
+    ASSERT_NOT_NULL(h->args[0].url_value);
+    ASSERT_STR_EQ(h->args[0].url_value, "/orders/{}/items");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue: with no literal path after the base (`${BASE}${path}`,
+ * `${BASE}/`) there is no route to recover, so none may be fabricated. */
+TEST(extract_ts_template_base_url_no_literal_path_issue2291) {
+    CBMFileResult *r = extract("export async function proxy(path: string) {\n"
+                               "  return fetch(`${process.env.BACKEND_URL}${path}`);\n"
+                               "}\n"
+                               "export async function root() {\n"
+                               "  return axios.get(`${process.env.BACKEND_URL}/`);\n"
+                               "}\n"
+                               "export function tail(tail: string) {\n"
+                               "  return axios.post(`${BASE}/${tail}`);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "proxy.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *f = find_call_by_callee(r, "fetch");
+    ASSERT_NOT_NULL(f);
+    ASSERT(f->first_string_arg == NULL || f->first_string_arg[0] != '/');
+
+    const CBMCall *g = find_call_by_callee(r, "axios.get");
+    ASSERT_NOT_NULL(g);
+    ASSERT(g->first_string_arg == NULL || g->first_string_arg[0] != '/');
+
+    const CBMCall *h = find_call_by_callee(r, "axios.post");
+    ASSERT_NOT_NULL(h);
+    ASSERT(h->first_string_arg == NULL || h->first_string_arg[0] != '/');
+    ASSERT_GTE(h->arg_count, 1);
+    ASSERT_NULL(h->args[0].url_value);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The call `callee` made inside function `func` (its enclosing QN ends in
+ * ".func"), so one file can hold several calls to the same client. */
+static const CBMCall *find_call_in_func(CBMFileResult *r, const char *callee, const char *func) {
+    size_t fl = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        const char *q = c->enclosing_func_qn;
+        if (!c->callee_name || strcmp(c->callee_name, callee) != 0 || !q) {
+            continue;
+        }
+        size_t ql = strlen(q);
+        if (ql > fl && q[ql - fl - 1] == '.' && strcmp(q + ql - fl, func) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* The URL a call hands to its client: first_string_arg, or "" when none. */
+static const char *url_in(CBMFileResult *r, const char *callee, const char *func) {
+    const CBMCall *c = find_call_in_func(r, callee, func);
+    return (c && c->first_string_arg) ? c->first_string_arg : "";
+}
+
+/* True when the URL is not presented as a path or an absolute URL. */
+static bool url_not_claimed(CBMFileResult *r, const char *callee, const char *func) {
+    const CBMCall *call = find_call_in_func(r, callee, func);
+    if (!call) {
+        return false;
+    }
+    const char *u = call->first_string_arg;
+    return !u || (u[0] != '/' && strstr(u, "://") == NULL);
+}
+
+/* Issue #706: a Python caller that centralises its endpoint URLs in module
+ * constants -- `API_URL = API_BASE_URL + "some/path"` -- lost the URL, so no
+ * HTTP_CALLS edge formed and cross-repo-intelligence reported 0 links. The
+ * concatenation must be folded: resolved parts inline, and an unresolvable
+ * base (an env var) leaves the literal path after it. */
+TEST(extract_py_concat_const_url_issue706) {
+    CBMFileResult *r = extract("import os\n"
+                               "import requests\n"
+                               "API_BASE_URL = os.environ[\"API_BASE_URL\"]\n"
+                               "HOST = \"http://provider:8000\"\n"
+                               "PREFIX = \"/v2\"\n"
+                               "API_URL = API_BASE_URL + \"some/path\"\n"
+                               "URL = API_BASE_URL + \"/foo\"\n"
+                               "ORDERS_URL = HOST + \"/orders\"\n"
+                               "REPORTS_URL = PREFIX + \"/reports\"\n"
+                               "ITEMS_URL = f\"{API_BASE_URL}/items\"\n"
+                               "DAILY_URL = REPORTS_URL + \"/daily\"\n"
+                               "def send(p):\n"
+                               "    requests.post(API_URL, json=p)\n"
+                               "def send_foo(p):\n"
+                               "    requests.post(URL, json=p)\n"
+                               "def orders():\n"
+                               "    return requests.get(ORDERS_URL)\n"
+                               "def reports():\n"
+                               "    return requests.get(REPORTS_URL)\n"
+                               "def items():\n"
+                               "    return requests.get(ITEMS_URL)\n"
+                               "def daily():\n"
+                               "    return requests.get(DAILY_URL)\n"
+                               "def direct(p):\n"
+                               "    return requests.post(API_BASE_URL + \"/direct\", json=p)\n"
+                               "def inline():\n"
+                               "    return requests.get(PREFIX + \"/inline\")\n"
+                               "def kw(p):\n"
+                               "    return requests.post(url=API_URL, json=p)\n",
+                               CBM_LANG_PYTHON, "t", "client.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.post", "send"), "/some/path");
+    ASSERT_STR_EQ(url_in(r, "requests.post", "send_foo"), "/foo");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "orders"), "http://provider:8000/orders");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "reports"), "/v2/reports");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "items"), "/items");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "daily"), "/v2/reports/daily");
+    ASSERT_STR_EQ(url_in(r, "requests.post", "direct"), "/direct");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "inline"), "/v2/inline");
+    ASSERT_STR_EQ(url_in(r, "requests.post", "kw"), "/some/path");
+
+    /* A fully resolved fold is an exact argument value; a path left behind by
+     * an unresolvable base is not, so it never reaches the exact-URL slot. */
+    const CBMCall *rep = find_call_in_func(r, "requests.get", "reports");
+    ASSERT_NOT_NULL(rep);
+    ASSERT_GTE(rep->arg_count, 1);
+    ASSERT_NOT_NULL(rep->args[0].value);
+    ASSERT_STR_EQ(rep->args[0].value, "/v2/reports");
+    const CBMCall *snd = find_call_in_func(r, "requests.post", "send");
+    ASSERT_NOT_NULL(snd);
+    ASSERT_GTE(snd->arg_count, 1);
+    ASSERT(snd->args[0].value == NULL || snd->args[0].value[0] != '/');
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a URL with nothing literal to recover -- a local
+ * computed value, a bare env-derived base, a base plus "/" or plus another
+ * variable -- must not be turned into a path or an exact URL. */
+TEST(extract_py_url_fold_no_fabrication_issue706) {
+    CBMFileResult *r = extract("import os\n"
+                               "import requests\n"
+                               "API_BASE_URL = os.environ[\"API_BASE_URL\"]\n"
+                               "EMPTY = API_BASE_URL + \"/\"\n"
+                               "def compute():\n"
+                               "    return os.environ.get(\"X\")\n"
+                               "def dyn():\n"
+                               "    u = compute()\n"
+                               "    return requests.get(u)\n"
+                               "def bare():\n"
+                               "    return requests.get(API_BASE_URL)\n"
+                               "def slash():\n"
+                               "    return requests.get(API_BASE_URL + \"/\")\n"
+                               "def empty():\n"
+                               "    return requests.get(EMPTY)\n"
+                               "def two(p):\n"
+                               "    return requests.get(API_BASE_URL + p)\n",
+                               CBM_LANG_PYTHON, "t", "ctl.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "dyn"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "bare"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "slash"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "empty"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "two"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #1147: a frontend that composes every endpoint from module constants
+ * -- a base constant, template literals over it, and an object-literal map of
+ * endpoints -- extracted none of its API calls. Each template / concatenation
+ * over a resolvable constant must fold to the full path, `OBJ.KEY` of an
+ * object-literal const must resolve, and a base that stays unresolvable
+ * (`${getApiBaseUrl()}`) leaves the path after it. A relative base ('api')
+ * joined to a path is a path under the client's base URL. */
+TEST(extract_ts_const_template_url_issue1147) {
+    CBMFileResult *r = extract(
+        "const BASE = '/api'\n"
+        "const REL = 'api'\n"
+        "const GAMES = '/games'\n"
+        "export const API_ENDPOINTS = {\n"
+        "  LOGIN: `${BASE}/users/login`,\n"
+        "  USER: `${REL}/users/me`,\n"
+        "  GAME_LAUNCH_URL: `${REL}/games/launch`,\n"
+        "  NESTED: { DEEP: BASE + '/deep' },\n"
+        "} as const\n"
+        "export const getApiBaseUrl = () => `${API_PROTOCOL}://${process.env.API_DOMAIN}/`\n"
+        "export async function launch() { return fetch(`${BASE}/games/launch`) }\n"
+        "export async function list() { return fetch(`${GAMES}/list`) }\n"
+        "export async function login() { return fetch(API_ENDPOINTS.LOGIN) }\n"
+        "export async function user() {\n"
+        "  return fetch(`${getApiBaseUrl()}/${API_ENDPOINTS.USER}`, { method: 'GET' })\n"
+        "}\n"
+        "export async function game(p: unknown) {\n"
+        "  return apiClient.post(API_ENDPOINTS.GAME_LAUNCH_URL, p)\n"
+        "}\n"
+        "export async function deep() { return fetch(API_ENDPOINTS.NESTED.DEEP) }\n"
+        "export async function me() { return axios.get(BASE + '/users/me') }\n",
+        CBM_LANG_TYPESCRIPT, "t", "client.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "fetch", "launch"), "/api/games/launch");
+    ASSERT_STR_EQ(url_in(r, "fetch", "list"), "/games/list");
+    ASSERT_STR_EQ(url_in(r, "fetch", "login"), "/api/users/login");
+    ASSERT_STR_EQ(url_in(r, "fetch", "user"), "/api/users/me");
+    ASSERT_STR_EQ(url_in(r, "apiClient.post", "game"), "api/games/launch");
+    ASSERT_STR_EQ(url_in(r, "fetch", "deep"), "/api/deep");
+    ASSERT_STR_EQ(url_in(r, "axios.get", "me"), "/api/users/me");
+
+    /* A wrapper client has raw string identity plus an explicit URL candidate.
+     * Only HTTP detection may select the normalized relative path. */
+    const CBMCall *g = find_call_in_func(r, "apiClient.post", "game");
+    ASSERT_NOT_NULL(g);
+    ASSERT_GTE(g->arg_count, 1);
+    ASSERT_NOT_NULL(g->args[0].value);
+    ASSERT_STR_EQ(g->args[0].value, "api/games/launch");
+    ASSERT_NOT_NULL(g->args[0].url_value);
+    ASSERT_STR_EQ(g->args[0].url_value, "/api/games/launch");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a parameter, a bare substitution, a member of an
+ * unknown object, an env-only base, and an unresolvable base followed only by
+ * an unresolvable tail carry no literal path, so none may be fabricated (the
+ * last one used to come out as "/{}"). */
+TEST(extract_ts_url_fold_no_fabrication_issue1147) {
+    CBMFileResult *r =
+        extract("const HEALTH_BASE = process.env.HEALTH_BASE\n"
+                "export async function dynamic(path: string) { return fetch(path) }\n"
+                "export async function dynTpl(x: string) { return fetch(`${x}`) }\n"
+                "export async function missing() { return fetch(API_ENDPOINTS.MISSING) }\n"
+                "export async function tail(t: string) { return fetch(`${getBase()}/${t}`) }\n"
+                "export async function envOnly() { return fetch(HEALTH_BASE) }\n",
+                CBM_LANG_TYPESCRIPT, "t", "ctl.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "dynamic"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "dynTpl"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "missing"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "tail"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "envOnly"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Shared folding must preserve topic/string identity before service resolution. */
+TEST(extract_ts_folded_topics_keep_raw_identity) {
+    CBMFileResult *r = extract(
+        "const TENANT = 'tenant';\n"
+        "const TOPIC = `${TENANT}/events`;\n"
+        "const TOPICS = { EVENTS: `${TENANT}/events` };\n"
+        "const PREFIX = 'tenant/';\n"
+        "const DOUBLE = `${PREFIX}/events`;\n"
+        "const UNKNOWN = `${tenant}/events`;\n"
+        "const UNKNOWN_TOPICS = { EVENTS: `${tenant}/events` };\n"
+        "const PLAIN = 'tenant/events';\n"
+        "export function direct() { mqtt.publish(`${TENANT}/events`, 'payload'); }\n"
+        "export function constant() { mqtt.publish(TOPIC, 'payload'); }\n"
+        "export function member() { mqtt.publish(TOPICS.EVENTS, 'payload'); }\n"
+        "export function literal() { mqtt.publish('tenant/events', 'payload'); }\n"
+        "export function plain() { mqtt.publish(PLAIN, 'payload'); }\n"
+        "export function doubled() { mqtt.publish(`${PREFIX}/events`, 'payload'); }\n"
+        "export function doubledConstant() { mqtt.publish(DOUBLE, 'payload'); }\n"
+        "export function unknown() { mqtt.publish(`${tenant}/events`, 'payload'); }\n"
+        "export function unknownConstant() { mqtt.publish(UNKNOWN, 'payload'); }\n"
+        "export function unknownMember() { mqtt.publish(UNKNOWN_TOPICS.EVENTS, 'payload'); }\n"
+        "export function alias() { bus.publish(TOPICS.EVENTS, 'payload'); }\n",
+        CBM_LANG_TYPESCRIPT, "t", "topics.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *functions[] = {"direct", "constant", "member",         "literal",
+                               "plain",  "doubled",  "doubledConstant"};
+    for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+        const CBMCall *c = find_call_in_func(r, "mqtt.publish", functions[i]);
+        const char *expected = i < 5 ? "tenant/events" : "tenant//events";
+        ASSERT_NOT_NULL(c);
+        ASSERT_NOT_NULL(c->first_string_arg);
+        ASSERT_STR_EQ(c->first_string_arg, expected);
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT_NOT_NULL(c->args[0].value);
+        ASSERT_STR_EQ(c->args[0].value, expected);
+    }
+    const char *unknowns[] = {"unknown", "unknownConstant", "unknownMember"};
+    for (size_t i = 0; i < sizeof(unknowns) / sizeof(unknowns[0]); i++) {
+        const CBMCall *c = find_call_in_func(r, "mqtt.publish", unknowns[i]);
+        ASSERT_NOT_NULL(c);
+        ASSERT_NOT_NULL(c->first_string_arg);
+        ASSERT_STR_EQ(c->first_string_arg, "{}/events");
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT(c->args[0].value == NULL || c->args[0].value[0] != '/');
+    }
+    const CBMCall *alias = find_call_in_func(r, "bus.publish", "alias");
+    ASSERT_NOT_NULL(alias);
+    ASSERT_STR_EQ(alias->first_string_arg, "tenant/events");
+    ASSERT_GTE(alias->arg_count, 1);
+    ASSERT_STR_EQ(alias->args[0].value, "tenant/events");
+    /* Classification has not happened yet: raw and URL views stay distinct. */
+    ASSERT_NOT_NULL(alias->args[0].url_value);
+    ASSERT_STR_EQ(alias->args[0].url_value, "/tenant/events");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_py_folded_topic_keywords_keep_raw_identity) {
+    CBMFileResult *r = extract("TENANT = 'tenant'\n"
+                               "TOPIC = f'{TENANT}/events'\n"
+                               "PREFIX = 'tenant/'\n"
+                               "DOUBLE = PREFIX + '/events'\n"
+                               "UNKNOWN = f'{tenant}/events'\n"
+                               "def direct():\n    mqtt.publish(f'{TENANT}/events', 'payload')\n"
+                               "def topic():\n    mqtt.publish(topic=TOPIC, payload='x')\n"
+                               "def queue():\n    mqtt.publish(queue=TOPIC, payload='x')\n"
+                               "def channel():\n    mqtt.publish(channel=TOPIC, payload='x')\n"
+                               "def subject():\n    mqtt.publish(subject=TOPIC, payload='x')\n"
+                               "def unknown():\n    mqtt.publish(topic=UNKNOWN, payload='x')\n"
+                               "def doubled():\n    mqtt.publish(topic=DOUBLE, payload='x')\n"
+                               "def unknown_callee():\n    send(topic=TOPIC, payload='x')\n",
+                               CBM_LANG_PYTHON, "t", "topics.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *functions[] = {"direct", "topic", "queue", "channel", "subject"};
+    for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+        const CBMCall *c = find_call_in_func(r, "mqtt.publish", functions[i]);
+        ASSERT_NOT_NULL(c);
+        ASSERT_STR_EQ(c->first_string_arg, "tenant/events");
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT_STR_EQ(c->args[0].value, "tenant/events");
+        if (i > 0) {
+            ASSERT_NULL(c->args[0].url_value);
+        }
+    }
+    ASSERT_STR_EQ(url_in(r, "mqtt.publish", "unknown"), "{}/events");
+    ASSERT_STR_EQ(url_in(r, "mqtt.publish", "doubled"), "tenant//events");
+    const CBMCall *c = find_call_in_func(r, "send", "unknown_callee");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR_EQ(c->first_string_arg, "tenant/events");
+    ASSERT_GTE(c->arg_count, 1);
+    ASSERT_STR_EQ(c->args[0].value, "tenant/events");
+    ASSERT_NULL(c->args[0].url_value);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2235's URL slot carries the projection separately; unknown callees stay raw. */
+TEST(extract_ts_folded_config_url_and_exclusions) {
+    CBMFileResult *r =
+        extract("const REL = 'api';\n"
+                "const API_ENDPOINTS = { USER: `${REL}/users/me` };\n"
+                "export function config() { return http({url: API_ENDPOINTS.USER}); }\n"
+                "export function format() { return axios.getUri({url: API_ENDPOINTS.USER}); }\n"
+                "export function register() { app.route({url: API_ENDPOINTS.USER, handler}); }\n"
+                "export function relative() { return fetch(`${REL}/users/me`); }\n",
+                CBM_LANG_TYPESCRIPT, "t", "config.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_in_func(r, "http", "config");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR_EQ(c->first_string_arg, "api/users/me");
+    ASSERT_GTE(c->arg_count, 1);
+    ASSERT_STR_EQ(c->args[0].value, "api/users/me");
+    ASSERT_NOT_NULL(c->args[0].url_value);
+    ASSERT_STR_EQ(c->args[0].url_value, "/api/users/me");
+    const char *callees[] = {"axios.getUri", "app.route"};
+    const char *functions[] = {"format", "register"};
+    for (size_t i = 0; i < sizeof(callees) / sizeof(callees[0]); i++) {
+        c = find_call_in_func(r, callees[i], functions[i]);
+        ASSERT_NOT_NULL(c);
+        ASSERT_NULL(c->first_string_arg);
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT_NULL(c->args[0].value);
+        ASSERT_NULL(c->args[0].url_value);
+    }
+    c = find_call_in_func(r, "fetch", "relative");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/users/me");
+    ASSERT_GTE(c->arg_count, 1);
+    ASSERT_STR_EQ(c->args[0].value, "api/users/me");
+    ASSERT_STR_EQ(c->args[0].url_value, "/api/users/me");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
  * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
  * NOT the doubled `t.Outer.Outer`. The nested method def QN must also equal the
@@ -8464,6 +8898,10 @@ TEST(non_config_language_module_has_no_promoted_description_issue519) {
 /* ── Result compaction (cbm_result_compact) ────────────────────────────── */
 
 static const char *COMPACT_PY_SRC = "import os\n"
+                                    "BASE = 'api'\n"
+                                    "URL = f'{BASE}/users/me'\n"
+                                    "def url_candidate():\n"
+                                    "    return client(URL)\n"
                                     "from typing import List\n"
                                     "\n"
                                     "@app.route(\"/items\")\n"
@@ -8531,6 +8969,16 @@ TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
     size_t cap_before = arena_capacity(&r->arena);
     cbm_result_compact(r);
 
+    const CBMCall *candidate = find_call_in_func(r, "client", "url_candidate");
+    ASSERT_NOT_NULL(candidate);
+    ASSERT_GTE(candidate->arg_count, 1);
+    ASSERT_STR_EQ(candidate->args[0].value, "api/users/me");
+    ASSERT_STR_EQ(candidate->args[0].url_value, "/api/users/me");
+    uintptr_t candidate_addr = (uintptr_t)candidate->args[0].url_value;
+    uintptr_t arena_addr = (uintptr_t)r->arena.blocks[0];
+    ASSERT(candidate_addr >= arena_addr);
+    ASSERT(candidate_addr - arena_addr < r->arena.used);
+
     /* One exact block: capacity == bytes used, no dead headroom. */
     ASSERT_EQ(r->arena.nblocks, 1);
     ASSERT_EQ(arena_capacity(&r->arena), cbm_arena_total(&r->arena));
@@ -8592,6 +9040,7 @@ TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
         for (int k = 0; k < a->arg_count; k++) {
             ASSERT(cmp_str_eq(a->args[k].expr, b->args[k].expr));
             ASSERT(cmp_str_eq(a->args[k].value, b->args[k].value));
+            ASSERT(cmp_str_eq(a->args[k].url_value, b->args[k].url_value));
             ASSERT(cmp_str_eq(a->args[k].keyword, b->args[k].keyword));
             ASSERT_EQ(a->args[k].index, b->args[k].index);
         }
@@ -8755,6 +9204,16 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     }
     ASSERT(cmp_str_eq(back->module_qn, ref->module_qn));
     ASSERT(cmp_list_eq(back->exports, ref->exports));
+
+    const CBMCall *candidate = find_call_in_func(back, "client", "url_candidate");
+    ASSERT_NOT_NULL(candidate);
+    ASSERT_GTE(candidate->arg_count, 1);
+    ASSERT_STR_EQ(candidate->args[0].value, "api/users/me");
+    ASSERT_STR_EQ(candidate->args[0].url_value, "/api/users/me");
+    uintptr_t candidate_addr = (uintptr_t)candidate->args[0].url_value;
+    uintptr_t arena_addr = (uintptr_t)back->arena.blocks[0];
+    ASSERT(candidate_addr >= arena_addr);
+    ASSERT(candidate_addr - arena_addr < back->arena.used);
 
     /* Loading twice yields two independent copies. */
     CBMFileResult *again = cbm_result_spill_load(sp, 1);
@@ -9230,6 +9689,15 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
+    RUN_TEST(extract_ts_template_base_url_issue2291);
+    RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
+    RUN_TEST(extract_py_concat_const_url_issue706);
+    RUN_TEST(extract_py_url_fold_no_fabrication_issue706);
+    RUN_TEST(extract_ts_const_template_url_issue1147);
+    RUN_TEST(extract_ts_url_fold_no_fabrication_issue1147);
+    RUN_TEST(extract_ts_folded_topics_keep_raw_identity);
+    RUN_TEST(extract_py_folded_topic_keywords_keep_raw_identity);
+    RUN_TEST(extract_ts_folded_config_url_and_exclusions);
     RUN_TEST(extract_ts_url_builder_issue1009);
     RUN_TEST(extract_ts_await_generic_call_issue2210);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
