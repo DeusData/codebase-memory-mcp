@@ -1929,16 +1929,77 @@ TEST(tslsp_class_multi_inheritance_chain) {
     PASS();
 }
 
+/* #514 probes bind both positive and negative claims to one parser-backed
+ * occurrence. Same-named methods on other classes cannot satisfy them. */
+static const CBMCall *ts514_call_site(const CBMFileResult *r, const char *source,
+                                      const char *expression, const char *caller,
+                                      const char *callee) {
+    const char *site = strstr(source, expression);
+    if (!r || r->has_error || !site || strstr(site + 1, expression))
+        return NULL;
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen(expression);
+    const CBMCall *found = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->enclosing_func_qn && strcmp(call->enclosing_func_qn, caller) == 0 &&
+            call->callee_name && strcmp(call->callee_name, callee) == 0 &&
+            call->site_start_byte == start && call->site_end_byte == end && call->start_line > 0) {
+            if (found)
+                return NULL;
+            found = call;
+        }
+    }
+    return found;
+}
+
+static int ts514_resolved_count(const CBMResolvedCallArray *resolved, const CBMCall *call,
+                                const char *target, const char *strategy) {
+    if (!call)
+        return -1;
+    int count = 0;
+    for (int i = 0; i < resolved->count; i++) {
+        const CBMResolvedCall *rc = &resolved->items[i];
+        if (rc->kind == CBM_RESOLVED_INVOCATION && rc->confidence > 0 && rc->caller_qn &&
+            strcmp(rc->caller_qn, call->enclosing_func_qn) == 0 && rc->callee_qn &&
+            (!target || strcmp(rc->callee_qn, target) == 0) &&
+            rc->site_start_byte == call->site_start_byte &&
+            rc->site_end_byte == call->site_end_byte &&
+            (!strategy || (rc->strategy && strcmp(rc->strategy, strategy) == 0)))
+            count++;
+    }
+    return count;
+}
+
+static int ts514_definition_count(const CBMFileResult *r, const char *qn) {
+    int count = 0;
+    for (int i = 0; r && i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name && strcmp(r->defs.items[i].qualified_name, qn) == 0)
+            count++;
+    }
+    return count;
+}
+
 TEST(tslsp_class_constructor_param_property) {
-    /* TS shorthand: constructor params with access modifiers become fields. */
-    CBMFileResult *r = extract_ts("class Tool { fire(): void {} }\n"
-                                  "class Box {\n"
-                                  "    constructor(public tool: Tool) {}\n"
-                                  "}\n"
-                                  "function go(b: Box) { b.tool.fire(); }\n");
+    const char *source = "class Tool { fire(): void {} }\n"
+                         "class Box { constructor(public tool: Tool) {} }\n"
+                         "function direct(directTool: Tool) { directTool.fire(); }\n"
+                         "function throughBox(b: Box) { b.tool.fire(); }\n";
+    CBMFileResult *r = extract_ts(source);
     ASSERT_NOT_NULL(r);
-    /* Constructor parameter property — accept smoke pass for v1 */
+    const CBMCall *direct =
+        ts514_call_site(r, source, "directTool.fire()", "test.main.direct", "directTool.fire");
+    const CBMCall *field =
+        ts514_call_site(r, source, "b.tool.fire()", "test.main.throughBox", "b.tool.fire");
+    int target = ts514_definition_count(r, "test.main.Tool.fire");
+    int positive =
+        ts514_resolved_count(&r->resolved_calls, direct, "test.main.Tool.fire", "lsp_ts_method");
+    int property =
+        ts514_resolved_count(&r->resolved_calls, field, "test.main.Tool.fire", "lsp_ts_method");
     cbm_free_result(r);
+    ASSERT_EQ(target, 1);
+    ASSERT_EQ(positive, 1);
+    ASSERT_EQ(property, 1);
     PASS();
 }
 
@@ -2243,6 +2304,253 @@ TEST(tslsp_crossfile_same_name_file_receiver_issue1354) {
         has_exact_resolved(&out, "test.main.viaQualified", "test.conn.Link.open", "lsp_ts_method"));
 
     cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* #514: parameter properties participate in this-dispatch for each modifier
+ * form, while an unmarked constructor parameter remains a local parameter. */
+TEST(tslsp_param_property_this_dispatch_issue514) {
+    const char *source =
+        "class ServiceBase { findAll(): string[] { return []; } }\n"
+        "class CatService extends ServiceBase { findAll(): string[] { return []; } }\n"
+        "class Parent { inherited: ServiceBase; }\n"
+        "class CatController extends Parent {\n"
+        "  constructor(private readonly catService: CatService, private a: CatService,\n"
+        "    protected b: CatService, public c: CatService, readonly d: CatService,\n"
+        "    public override inherited: CatService, plain: CatService,\n"
+        "    private optional?: CatService) { super(); }\n"
+        "  findAll() { return this.catService.findAll(); }\n"
+        "  viaPrivate() { this.a.findAll(); }\n"
+        "  viaProtected() { this.b.findAll(); }\n"
+        "  viaPublic() { this.c.findAll(); }\n"
+        "  viaReadonly() { this.d.findAll(); }\n"
+        "  viaOverride() { this.inherited.findAll(); }\n"
+        "  viaOptional() { this.optional.findAll(); }\n"
+        "  viaPlain() { this.plain.findAll(); }\n"
+        "}\n"
+        "function direct(control: CatService) { control.findAll(); }\n";
+    static const struct {
+        const char *expression;
+        const char *caller;
+        const char *callee;
+    } sites[] = {
+        {"control.findAll()", "test.main.direct", "control.findAll"},
+        {"this.catService.findAll()", "test.main.CatController.findAll", "this.catService.findAll"},
+        {"this.a.findAll()", "test.main.CatController.viaPrivate", "this.a.findAll"},
+        {"this.b.findAll()", "test.main.CatController.viaProtected", "this.b.findAll"},
+        {"this.c.findAll()", "test.main.CatController.viaPublic", "this.c.findAll"},
+        {"this.d.findAll()", "test.main.CatController.viaReadonly", "this.d.findAll"},
+        {"this.inherited.findAll()", "test.main.CatController.viaOverride",
+         "this.inherited.findAll"},
+        {"this.optional.findAll()", "test.main.CatController.viaOptional", "this.optional.findAll"},
+        {"this.plain.findAll()", "test.main.CatController.viaPlain", "this.plain.findAll"},
+    };
+    CBMFileResult *r = extract_ts(source);
+    ASSERT_NOT_NULL(r);
+    int target = ts514_definition_count(r, "test.main.CatService.findAll");
+    int controller = ts514_definition_count(r, "test.main.CatController.findAll");
+    int base = ts514_definition_count(r, "test.main.ServiceBase.findAll");
+    int resolved[9], self_loop = -1, wrong_override = -1;
+    bool extracted[9];
+    for (size_t i = 0; i < 9; i++) {
+        const CBMCall *call =
+            ts514_call_site(r, source, sites[i].expression, sites[i].caller, sites[i].callee);
+        extracted[i] = call != NULL;
+        resolved[i] = ts514_resolved_count(&r->resolved_calls, call,
+                                           i == 8 ? NULL : "test.main.CatService.findAll",
+                                           i == 8 ? NULL : "lsp_ts_method");
+        if (i == 6)
+            wrong_override = ts514_resolved_count(&r->resolved_calls, call,
+                                                  "test.main.ServiceBase.findAll", NULL);
+        if (i == 1)
+            self_loop = ts514_resolved_count(&r->resolved_calls, call,
+                                             "test.main.CatController.findAll", NULL);
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(target, 1);
+    ASSERT_EQ(controller, 1);
+    ASSERT_EQ(base, 1);
+    for (size_t i = 0; i < 9; i++)
+        ASSERT_TRUE(extracted[i]);
+    for (size_t i = 0; i < 8; i++)
+        ASSERT_EQ(resolved[i], 1);
+    ASSERT_EQ(resolved[8], 0);
+    ASSERT_EQ(self_loop, 0);
+    ASSERT_EQ(wrong_override, 0);
+    PASS();
+}
+
+/* Only direct new-expression initializers infer a field type. An annotation
+ * wins even when unknown, and a factory call is outside this inference. */
+TEST(tslsp_field_new_initializer_issue514) {
+    const char *source = "class Tool { fire(): void {} }\n"
+                         "class Base { run(): void {} }\n"
+                         "class Derived extends Base { run(): void {} }\n"
+                         "function makeTool(): Tool { return new Tool(); }\n"
+                         "class Holder {\n"
+                         "  private fresh = new Tool();\n"
+                         "  private annotated: Base = new Derived();\n"
+                         "  private opaque: unknown = new Tool();\n"
+                         "  private factory = makeTool();\n"
+                         "  viaNew() { this.fresh.fire(); }\n"
+                         "  viaAnnotated() { this.annotated.run(); }\n"
+                         "  viaOpaque() { this.opaque.fire(); }\n"
+                         "  viaFactory() { this.factory.fire(); }\n"
+                         "}\n"
+                         "function direct(control: Tool) { control.fire(); }\n";
+    CBMFileResult *r = extract_ts(source);
+    ASSERT_NOT_NULL(r);
+    const CBMCall *direct =
+        ts514_call_site(r, source, "control.fire()", "test.main.direct", "control.fire");
+    const CBMCall *fresh = ts514_call_site(r, source, "this.fresh.fire()",
+                                           "test.main.Holder.viaNew", "this.fresh.fire");
+    const CBMCall *annotated = ts514_call_site(
+        r, source, "this.annotated.run()", "test.main.Holder.viaAnnotated", "this.annotated.run");
+    const CBMCall *opaque = ts514_call_site(r, source, "this.opaque.fire()",
+                                            "test.main.Holder.viaOpaque", "this.opaque.fire");
+    const CBMCall *factory = ts514_call_site(r, source, "this.factory.fire()",
+                                             "test.main.Holder.viaFactory", "this.factory.fire");
+    bool extracted = direct && fresh && annotated && opaque && factory;
+    int tool = ts514_definition_count(r, "test.main.Tool.fire");
+    int base = ts514_definition_count(r, "test.main.Base.run");
+    int derived = ts514_definition_count(r, "test.main.Derived.run");
+    int control =
+        ts514_resolved_count(&r->resolved_calls, direct, "test.main.Tool.fire", "lsp_ts_method");
+    int inferred =
+        ts514_resolved_count(&r->resolved_calls, fresh, "test.main.Tool.fire", "lsp_ts_method");
+    int declared =
+        ts514_resolved_count(&r->resolved_calls, annotated, "test.main.Base.run", "lsp_ts_method");
+    int wrong = ts514_resolved_count(&r->resolved_calls, annotated, "test.main.Derived.run", NULL);
+    int unknown = ts514_resolved_count(&r->resolved_calls, opaque, NULL, NULL);
+    int arbitrary = ts514_resolved_count(&r->resolved_calls, factory, NULL, NULL);
+    cbm_free_result(r);
+    ASSERT_TRUE(extracted);
+    ASSERT_EQ(tool, 1);
+    ASSERT_EQ(base, 1);
+    ASSERT_EQ(derived, 1);
+    ASSERT_EQ(control, 1);
+    ASSERT_EQ(inferred, 1);
+    ASSERT_EQ(declared, 1);
+    ASSERT_EQ(wrong, 0);
+    ASSERT_EQ(unknown, 0);
+    ASSERT_EQ(arbitrary, 0);
+    PASS();
+}
+
+/* Both cross-file entry points refine only their owned registry. The shared
+ * sealed registry must not acquire field arrays owned by a per-file arena. */
+TEST(tslsp_crossfile_param_property_issue514) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.cat_service.CatService",
+         .short_name = "CatService",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.cat_service",
+         .method_names_str = "findAll"},
+        {.qualified_name = "test.cat_service.CatService.findAll",
+         .short_name = "findAll",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.cat_service",
+         .receiver_type = "test.cat_service.CatService"},
+        {.qualified_name = "test.cat_controller.CatController",
+         .short_name = "CatController",
+         .label = "Class",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.cat_controller",
+         .method_names_str = "findAll|viaNew|direct"},
+        {.qualified_name = "test.cat_controller.CatController.findAll",
+         .short_name = "findAll",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.cat_controller",
+         .receiver_type = "test.cat_controller.CatController"},
+        {.qualified_name = "test.cat_controller.CatController.viaNew",
+         .short_name = "viaNew",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.cat_controller",
+         .receiver_type = "test.cat_controller.CatController"},
+        {.qualified_name = "test.cat_controller.CatController.direct",
+         .short_name = "direct",
+         .label = "Method",
+         .lang = CBM_LANG_TYPESCRIPT,
+         .def_module_qn = "test.cat_controller",
+         .receiver_type = "test.cat_controller.CatController"},
+    };
+    enum { NDEFS = (int)(sizeof(defs) / sizeof(defs[0])) };
+    const char *imp_names[] = {"CatService"};
+    const char *imp_qns[] = {"test.cat_service"};
+    const char *source = "import { CatService } from './cat.service';\n"
+                         "export class CatController {\n"
+                         "  private fresh = new CatService();\n"
+                         "  constructor(private readonly catService: CatService) {}\n"
+                         "  findAll() { return this.catService.findAll(); }\n"
+                         "  viaNew() { return this.fresh.findAll(); }\n"
+                         "  direct(control: CatService) { return control.findAll(); }\n"
+                         "}\n";
+    CBMFileResult *r = extract_with(source, CBM_LANG_TYPESCRIPT, "cat_controller.ts");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *injected =
+        ts514_call_site(r, source, "this.catService.findAll()",
+                        "test.cat_controller.CatController.findAll", "this.catService.findAll");
+    const CBMCall *fresh =
+        ts514_call_site(r, source, "this.fresh.findAll()",
+                        "test.cat_controller.CatController.viaNew", "this.fresh.findAll");
+    const CBMCall *direct =
+        ts514_call_site(r, source, "control.findAll()", "test.cat_controller.CatController.direct",
+                        "control.findAll");
+    bool extracted = injected && fresh && direct;
+    CBMArena shared_arena;
+    cbm_arena_init(&shared_arena);
+    CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&shared_arena, defs, NDEFS);
+    int counts[2][4] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}};
+    bool untouched = false;
+    if (reg) {
+        const CBMRegisteredType *before =
+            cbm_registry_lookup_type(reg, "test.cat_controller.CatController");
+        const char **fields = before ? before->field_names : NULL;
+        const CBMType **types = before ? before->field_types : NULL;
+        int type_count = reg->type_count;
+        untouched = before && reg->read_only;
+        for (int mode = 0; mode < 2; mode++) {
+            CBMArena file_arena;
+            cbm_arena_init(&file_arena);
+            CBMResolvedCallArray out = {0};
+            if (mode == 0)
+                cbm_run_ts_lsp_cross_with_registry(&file_arena, source, (int)strlen(source),
+                                                   "test.cat_controller", false, false, false, reg,
+                                                   defs, NDEFS, imp_names, imp_qns, 1, NULL, &out);
+            else
+                cbm_run_ts_lsp_cross(&file_arena, source, (int)strlen(source),
+                                     "test.cat_controller", false, false, false, defs, NDEFS,
+                                     imp_names, imp_qns, 1, NULL, &out);
+            counts[mode][0] = ts514_resolved_count(
+                &out, direct, "test.cat_service.CatService.findAll", "lsp_ts_method");
+            counts[mode][1] = ts514_resolved_count(
+                &out, injected, "test.cat_service.CatService.findAll", "lsp_ts_method");
+            counts[mode][2] = ts514_resolved_count(
+                &out, fresh, "test.cat_service.CatService.findAll", "lsp_ts_method");
+            counts[mode][3] = ts514_resolved_count(
+                &out, injected, "test.cat_controller.CatController.findAll", NULL);
+            cbm_arena_destroy(&file_arena);
+            const CBMRegisteredType *after =
+                cbm_registry_lookup_type(reg, "test.cat_controller.CatController");
+            untouched = untouched && after == before && after->field_names == fields &&
+                        after->field_types == types && reg->type_count == type_count &&
+                        reg->read_only;
+        }
+    }
+    cbm_arena_destroy(&shared_arena);
+    cbm_free_result(r);
+    ASSERT_TRUE(extracted);
+    ASSERT_TRUE(untouched);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(counts[mode][0], 1);
+        ASSERT_EQ(counts[mode][1], 1);
+        ASSERT_EQ(counts[mode][2], 1);
+        ASSERT_EQ(counts[mode][3], 0);
+    }
     PASS();
 }
 
@@ -4679,6 +4987,9 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_crossfile_method_dispatch);
     RUN_TEST(tslsp_crossfile_new_expression_receiver_issue1354);
     RUN_TEST(tslsp_crossfile_same_name_file_receiver_issue1354);
+    RUN_TEST(tslsp_param_property_this_dispatch_issue514);
+    RUN_TEST(tslsp_field_new_initializer_issue514);
+    RUN_TEST(tslsp_crossfile_param_property_issue514);
     RUN_TEST(tslsp_scale_many_defs_no_crash_issue344);
     RUN_TEST(tslsp_crossfile_function_call);
     RUN_TEST(tslsp_crossfile_chain_through_return);

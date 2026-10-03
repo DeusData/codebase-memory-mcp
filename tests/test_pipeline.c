@@ -6205,6 +6205,254 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
     PASS();
 }
 
+/* A query failure is distinct from a valid zero-edge result. */
+static int ts514_pipeline_count(cbm_store_t *store, const char *sql, const char **values,
+                                int value_count) {
+    sqlite3_stmt *stmt = NULL;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    bool bound = sqlite3_bind_parameter_count(stmt) == value_count;
+    for (int i = 0; bound && i < value_count; i++)
+        bound = values[i] &&
+                sqlite3_bind_text(stmt, i + 1, values[i], -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    int count = -1;
+    if (bound && sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            count = -1;
+    }
+    if (sqlite3_finalize(stmt) != SQLITE_OK)
+        count = -1;
+    return count;
+}
+
+/* #514: constructor injection and new-initialized fields resolve through both
+ * drivers. Same-named methods make wrong-owner and self-loop claims meaningful.
+ * Every negative has a real extracted call, source and target, plus successful
+ * queries and typed positive controls in the same run. */
+TEST(pipeline_ts_param_property_injection_issue514) {
+    static const char *paths[] = {"cats/service.ts", "cats/controller.ts", "cats/reporter.ts"};
+    static const char *sources[] = {
+        "export class BaseService { findAll(): string[] { return []; } }\n"
+        "export class CatService extends BaseService { findAll(): string[] { return ['cat']; } }\n",
+        "import { CatService } from './service';\n"
+        "export class CatController {\n"
+        "  constructor(private readonly catService: CatService, plain: CatService) {}\n"
+        "  findAll() { return this.catService.findAll(); }\n"
+        "  direct(control: CatService) { return control.findAll(); }\n"
+        "  viaPlain() { return this.plain.findAll(); }\n"
+        "}\n",
+        "import { CatService, BaseService } from './service';\n"
+        "function makeService(): CatService { return new CatService(); }\n"
+        "export class CatReporter {\n"
+        "  private fresh = new CatService();\n"
+        "  private annotated: BaseService = new CatService();\n"
+        "  private factory = makeService();\n"
+        "  constructor(protected cats: CatService) {}\n"
+        "  reportInjected() { return this.cats.findAll(); }\n"
+        "  reportLocal() { return this.fresh.findAll(); }\n"
+        "  reportAnnotated() { return this.annotated.findAll(); }\n"
+        "  reportFactory() { return this.factory.findAll(); }\n"
+        "}\n",
+    };
+    static const struct {
+        int file;
+        const char *symbol;
+        const char *expression;
+        const char *callee;
+        const char *target;
+        int want;
+    } cases[] = {
+        {1, "CatController.direct", "control.findAll()", "control.findAll", "CatService.findAll",
+         1},
+        {1, "CatController.findAll", "this.catService.findAll()", "this.catService.findAll",
+         "CatService.findAll", 1},
+        {2, "CatReporter.reportInjected", "this.cats.findAll()", "this.cats.findAll",
+         "CatService.findAll", 1},
+        {2, "CatReporter.reportLocal", "this.fresh.findAll()", "this.fresh.findAll",
+         "CatService.findAll", 1},
+        {2, "CatReporter.reportAnnotated", "this.annotated.findAll()", "this.annotated.findAll",
+         "BaseService.findAll", 1},
+        {1, "CatController.viaPlain", "this.plain.findAll()", "this.plain.findAll",
+         "CatService.findAll", 0},
+        {2, "CatReporter.reportFactory", "this.factory.findAll()", "this.factory.findAll",
+         "CatService.findAll", 0},
+    };
+    enum { NCASES = (int)(sizeof(cases) / sizeof(cases[0])) };
+    static const char node_sql[] = "SELECT count(*) FROM nodes WHERE project=?1 AND "
+                                   "qualified_name=?2 AND file_path=?3 AND label='Method'";
+    static const char edge_sql[] =
+        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id "
+        "WHERE e.project=?1 AND e.type='CALLS' AND s.qualified_name=?2 AND s.file_path=?3 "
+        "AND t.qualified_name=?4 AND t.file_path=?5 "
+        "AND (?6='' OR json_extract(e.properties,'$.strategy')=?6)";
+
+    CBMFileResult *fr[3] = {0};
+    bool extraction_ok = true;
+    for (int i = 0; i < 3; i++) {
+        fr[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_TYPESCRIPT,
+                                 "ts514_probe", paths[i], 0, NULL, NULL);
+        extraction_ok = extraction_ok && fr[i] && !fr[i]->has_error;
+    }
+    int occurrences[NCASES] = {0};
+    if (extraction_ok) {
+        for (int i = 0; i < NCASES; i++) {
+            int file = cases[i].file;
+            const char *site = strstr(sources[file], cases[i].expression);
+            char *caller = cbm_pipeline_fqn_compute("ts514_probe", paths[file], cases[i].symbol);
+            for (int c = 0; site && caller && c < fr[file]->calls.count; c++) {
+                const CBMCall *call = &fr[file]->calls.items[c];
+                uint32_t start = (uint32_t)(site - sources[file]);
+                if (call->enclosing_func_qn && strcmp(call->enclosing_func_qn, caller) == 0 &&
+                    call->callee_name && strcmp(call->callee_name, cases[i].callee) == 0 &&
+                    call->site_start_byte == start &&
+                    call->site_end_byte == start + strlen(cases[i].expression) &&
+                    call->start_line > 0)
+                    occurrences[i]++;
+            }
+            free(caller);
+        }
+    }
+    for (int i = 0; i < 3; i++)
+        cbm_free_result(fr[i]);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        FAIL("save environment");
+    }
+    char tmp[256] = "/tmp/cbm_ts_514_XXXXXX";
+    if (!cbm_mkdtemp(tmp)) {
+        free(saved_workers);
+        free(saved_single);
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < 3; i++)
+        write_temp_file(tmp, paths[i], sources[i]);
+    for (int i = 0; i < 52; i++) {
+        char name[64], body[128];
+        snprintf(name, sizeof(name), "cats/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    int run_rc[2] = {-1, -1}, files[2] = {-1, -1};
+    int edges[2][NCASES], source_nodes[2][NCASES], target_nodes[2][NCASES];
+    int unresolved_calls[2][2] = {{-1, -1}, {-1, -1}};
+    int self_loop[2] = {-1, -1}, annotation_wrong[2] = {-1, -1};
+    bool configured[2] = {false, false}, opened[2] = {false, false};
+    for (int mode = 0; mode < 2; mode++) {
+        for (int i = 0; i < NCASES; i++)
+            edges[mode][i] = source_nodes[mode][i] = target_nodes[mode][i] = -1;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+        if (mode == 0)
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        else
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        const char *workers = getenv("CBM_WORKERS");
+        const char *single = getenv("CBM_INDEX_SINGLE_THREAD");
+        configured[mode] = workers && strcmp(workers, "4") == 0 &&
+                           (mode == 0 ? single && strcmp(single, "1") == 0 : !single);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/ts514_%d.db", tmp, mode);
+        cbm_pipeline_t *pipeline =
+            configured[mode] ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+        run_rc[mode] = pipeline ? cbm_pipeline_run(pipeline) : -1;
+        cbm_store_t *store = run_rc[mode] == 0 ? cbm_store_open_path(db_path) : NULL;
+        opened[mode] = store != NULL;
+        if (store) {
+            const char *project = cbm_pipeline_project_name(pipeline);
+            const char *file_values[] = {project};
+            files[mode] = ts514_pipeline_count(
+                store, "SELECT count(*) FROM nodes WHERE project=?1 AND label='File'", file_values,
+                1);
+            for (int i = 0; i < NCASES; i++) {
+                char *src =
+                    cbm_pipeline_fqn_compute(project, paths[cases[i].file], cases[i].symbol);
+                char *tgt = cbm_pipeline_fqn_compute(project, paths[0], cases[i].target);
+                const char *src_values[] = {project, src, paths[cases[i].file]};
+                const char *tgt_values[] = {project, tgt, paths[0]};
+                source_nodes[mode][i] = ts514_pipeline_count(store, node_sql, src_values, 3);
+                target_nodes[mode][i] = ts514_pipeline_count(store, node_sql, tgt_values, 3);
+                const char *edge_values[] = {
+                    project, src,      paths[cases[i].file],
+                    tgt,     paths[0], cases[i].want ? "lsp_ts_method" : ""};
+                edges[mode][i] = ts514_pipeline_count(store, edge_sql, edge_values, 6);
+                if (!cases[i].want)
+                    unresolved_calls[mode][i - 5] = ts514_pipeline_count(
+                        store,
+                        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                        "WHERE e.project=?1 AND e.type='CALLS' "
+                        "AND s.qualified_name=?2 AND s.file_path=?3",
+                        src_values, 3);
+                if (i == 1) {
+                    edge_values[3] = src;
+                    edge_values[4] = paths[cases[i].file];
+                    edge_values[5] = "";
+                    self_loop[mode] = ts514_pipeline_count(store, edge_sql, edge_values, 6);
+                }
+                if (i == 4) {
+                    char *wrong = cbm_pipeline_fqn_compute(project, paths[0], "CatService.findAll");
+                    edge_values[3] = wrong;
+                    edge_values[5] = "";
+                    annotation_wrong[mode] = ts514_pipeline_count(store, edge_sql, edge_values, 6);
+                    free(wrong);
+                }
+                free(src);
+                free(tgt);
+            }
+            cbm_store_close(store);
+        }
+        cbm_pipeline_free(pipeline);
+    }
+    if (saved_workers)
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    else
+        cbm_unsetenv("CBM_WORKERS");
+    if (saved_single)
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+    else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    const char *restored_workers = getenv("CBM_WORKERS");
+    const char *restored_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    bool restored =
+        (saved_workers ? restored_workers && strcmp(saved_workers, restored_workers) == 0
+                       : !restored_workers) &&
+        (saved_single ? restored_single && strcmp(saved_single, restored_single) == 0
+                      : !restored_single);
+    free(saved_workers);
+    free(saved_single);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(extraction_ok);
+    ASSERT_TRUE(restored);
+    for (int i = 0; i < NCASES; i++)
+        ASSERT_EQ(occurrences[i], 1);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_TRUE(configured[mode]);
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(opened[mode]);
+        ASSERT_GTE(files[mode], 55);
+        for (int i = 0; i < NCASES; i++) {
+            ASSERT_EQ(source_nodes[mode][i], 1);
+            ASSERT_EQ(target_nodes[mode][i], 1);
+            ASSERT_EQ(edges[mode][i], cases[i].want);
+        }
+        ASSERT_EQ(unresolved_calls[mode][0], 0);
+        ASSERT_EQ(unresolved_calls[mode][1], 0);
+        ASSERT_EQ(self_loop[mode], 0);
+        ASSERT_EQ(annotation_wrong[mode], 0);
+    }
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_recv_XXXXXX");
@@ -16343,6 +16591,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916);
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
+    RUN_TEST(pipeline_ts_param_property_injection_issue514);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
