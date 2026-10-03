@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "2c3befeb-d2d9-4eab-9ae9-c241fd8233e9",
+  "status": "current",
+  "command": "deliver",
+  "type": "workflow",
+  "input": "C:\\AI\\Source\\storm\\Diagrams\\specs\\workflow.json",
+  "output": "C:\\AI\\Source\\storm\\Diagrams\\workflow-indexing-pipeline.html",
+  "specification": {
+    "sha256": "0b51722015c5f561f5081e42bac5ea44ada2aaf5ce782da4fe4e206e880676c8",
+    "bytes": 4678
+  },
+  "artifact": {
+    "sha256": "3e5d17461dc53e08702d1504f97aad77f4a6809ee8dc5761c10eb08530514f7c",
+    "bytes": 763325
+  }
+}

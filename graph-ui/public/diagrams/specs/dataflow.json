@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Codebase Memory Knowledge Graph Data Flow",
+    "output": "Diagrams/dataflow-code-to-graph.html",
+    "viewBox": [1080, 520],
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "stages": [
+    { "label": "Sources" },
+    { "label": "Ingestion" },
+    { "label": "Modeling" },
+    { "label": "Storage" },
+    { "label": "Consumers" }
+  ],
+  "nodes": [
+    { "id": "src_files", "type": "external", "label": "Source Files", "sublabel": "162 languages", "stage": 0, "row": 0 },
+    { "id": "git_repo", "type": "external", "label": "Git Context", "sublabel": "HEAD & commits", "stage": 0, "row": 2 },
+    { "id": "source_lz4", "type": "backend", "label": "LZ4 Source Cache", "sublabel": "compressed blocks", "stage": 1, "row": 0 },
+    { "id": "tree_sitter", "type": "backend", "label": "Tree-Sitter AST", "sublabel": "C grammar parser", "stage": 1, "row": 1 },
+    { "id": "infra_scan", "type": "cloud", "label": "Infra Scanner", "sublabel": "K8s & Dockerfiles", "stage": 1, "row": 2 },
+    { "id": "symbols_fqn", "type": "backend", "label": "Symbol Registry", "sublabel": "functions & classes", "stage": 2, "row": 0 },
+    { "id": "hybrid_lsp", "type": "backend", "label": "Hybrid LSP", "sublabel": "type resolution", "stage": 2, "row": 1 },
+    { "id": "graph_buffer", "type": "backend", "label": "Graph Buffer", "sublabel": "staged node ring", "stage": 2, "row": 2 },
+    { "id": "mem_cache", "type": "database", "label": "In-Memory Cache", "sublabel": "FQN hash table", "stage": 3, "row": 0 },
+    { "id": "sqlite_db", "type": "database", "label": "SQLite Store", "sublabel": "WAL graph tables", "stage": 3, "row": 1 },
+    { "id": "layout_store", "type": "database", "label": "3D Layout Store", "sublabel": "octree coordinates", "stage": 3, "row": 2 },
+    { "id": "agent_mcp", "type": "frontend", "label": "Agent Tools API", "sublabel": "17 tools over stdio", "stage": 4, "row": 0 },
+    { "id": "cypher_engine", "type": "backend", "label": "Cypher Engine", "sublabel": "graph traversal", "stage": 4, "row": 1 },
+    { "id": "visualizer_3d", "type": "frontend", "label": "3D Visualizer", "sublabel": "localhost:9749 UI", "stage": 4, "row": 2 }
+  ],
+  "flows": [
+    { "id": "f1", "from": "src_files", "to": "source_lz4", "label": "bulk read", "classification": "raw bytes", "variant": "default", "route": "straight", "labelDy": -18 },
+    { "id": "f2", "from": "src_files", "to": "tree_sitter", "label": "parse code", "classification": "source lines", "variant": "emphasis", "labelDy": 24 },
+    { "id": "f3", "from": "git_repo", "to": "infra_scan", "label": "manifests", "classification": "config", "variant": "default", "route": "straight" },
+    { "id": "f4", "from": "source_lz4", "to": "symbols_fqn", "label": "token stream", "classification": "tokens", "variant": "default", "route": "straight" },
+    { "id": "f5", "from": "tree_sitter", "to": "hybrid_lsp", "label": "call sites", "classification": "syntax", "variant": "emphasis", "route": "straight" },
+    { "id": "f6", "from": "infra_scan", "to": "graph_buffer", "label": "infra edges", "classification": "IaC nodes", "variant": "default", "route": "straight" },
+    { "id": "f7", "from": "symbols_fqn", "to": "mem_cache", "label": "index FQN", "classification": "in-memory", "variant": "default", "route": "straight" },
+    { "id": "f8", "from": "hybrid_lsp", "to": "sqlite_db", "label": "type edges", "classification": "relational rows", "variant": "emphasis", "route": "straight" },
+    { "id": "f9", "from": "graph_buffer", "to": "layout_store", "label": "3D coords", "classification": "spatial", "variant": "default", "route": "straight" },
+    { "id": "f10", "from": "mem_cache", "to": "agent_mcp", "label": "symbol lookup", "classification": "sub-ms", "variant": "emphasis", "route": "straight" },
+    { "id": "f11", "from": "sqlite_db", "to": "cypher_engine", "label": "pattern query", "classification": "SQL match", "variant": "emphasis", "route": "straight" },
+    { "id": "f12", "from": "layout_store", "to": "visualizer_3d", "label": "3D graph stream", "classification": "WebGL payload", "variant": "default", "route": "straight" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Ingestion Pipeline",
+      "items": [
+        "Raw disk files are transformed into LZ4 compressed in-memory blocks",
+        "Tree-Sitter C runtime converts text into concrete syntax trees without external processes",
+        "AST symbol table registers functions, classes, interfaces, and packages"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Knowledge Graph Model",
+      "items": [
+        "Nodes represent semantic code constructs and infrastructure entities",
+        "Edges represent CALLS, IMPORTS, DEFINES, and TYPE_OF relationships",
+        "Hybrid LSP enriches raw AST edges with true cross-file semantic typing"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Consumer Distribution",
+      "items": [
+        "AI Agents receive token-compressed tool responses over stdio",
+        "Cypher engine answers ad-hoc multi-hop pattern queries in under 1 millisecond",
+        "Embedded HTTP daemon serves 3D force-directed graph to developer browsers"
+      ]
+    }
+  ]
+}

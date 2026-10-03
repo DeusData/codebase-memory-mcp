@@ -90,3 +90,8 @@ soak-results-query-leak/
 # Nix build symlinks (nix build → ./result, ./result-1, …)
 /result
 /result-*
+
+# Scratch diagram screenshots & local archives
+/diagrams_*.png
+graph-ui/src/diagrams.7z
+

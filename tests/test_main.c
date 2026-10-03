@@ -954,6 +954,7 @@ extern void suite_java_lsp_coverage(void);
 extern void suite_kotlin_lsp(void);
 extern void suite_rust_lsp(void);
 extern void suite_store_arch(void);
+extern void suite_diagram(void);
 extern void suite_store_bulk(void);
 extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
@@ -1309,8 +1310,9 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(java_lsp);
     RUN_SELECTED_SUITE(java_lsp_coverage);
 
-    /* Architecture + ADR + Louvain */
+    /* Architecture + ADR + Louvain + Diagrams */
     RUN_SELECTED_SUITE(store_arch);
+    RUN_SELECTED_SUITE(diagram);
 
     /* HTTP link */
 

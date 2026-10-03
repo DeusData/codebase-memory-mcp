@@ -1,7 +1,30 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ProcessInfo } from "../lib/types";
 import { useUiMessages } from "../lib/i18n";
+
+/* ── Elapsed parser ────────────────────────────────────── */
+
+export function parseElapsedSeconds(elapsed: string): number {
+  if (!elapsed) return 0;
+  // Windows format: "0-03:55:04" (days-hh:mm:ss)
+  // Linux format: "[[dd-]hh:]mm:ss"
+  const dashParts = elapsed.split("-");
+  let days = 0;
+  let timePart = elapsed;
+  if (dashParts.length === 2) {
+    days = parseInt(dashParts[0], 10) || 0;
+    timePart = dashParts[1];
+  }
+  const timeSegments = timePart.split(":").map((s) => parseInt(s, 10) || 0);
+  if (timeSegments.length === 3) {
+    return days * 86400 + timeSegments[0] * 3600 + timeSegments[1] * 60 + timeSegments[2];
+  }
+  if (timeSegments.length === 2) {
+    return days * 86400 + timeSegments[0] * 60 + timeSegments[1];
+  }
+  return 0;
+}
 
 /* ── Gauge component ────────────────────────────────────── */
 
@@ -57,6 +80,11 @@ function ProcessCard({ proc, selected, onSelect }: {
         <div>
           <p className="text-[9px] text-foreground/20 uppercase">CPU</p>
           <p className="text-[13px] font-semibold tabular-nums text-foreground/70">{proc.cpu.toFixed(1)}%</p>
+          {proc.cpu_time_s !== undefined && (
+            <p className="text-[9px] text-foreground/25 font-mono" title="Cumulative CPU execution time">
+              {proc.cpu_time_s.toFixed(1)}s total
+            </p>
+          )}
         </div>
         <div>
           <p className="text-[9px] text-foreground/20 uppercase">RAM</p>
@@ -131,12 +159,50 @@ export function ControlTab() {
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
   const [selfMetrics, setSelfMetrics] = useState({ rss_mb: 0, user_cpu: 0, sys_cpu: 0 });
   const [selectedPid, setSelectedPid] = useState<number | null>(null);
+  const prevSamplesRef = useRef<Map<number, { cpuTime: number; timestamp: number }>>(new Map());
 
   const fetchProcesses = useCallback(async () => {
     try {
       const res = await fetch("/api/processes");
       const data = await res.json();
-      setProcesses(data.processes ?? []);
+      const rawProcesses: ProcessInfo[] = data.processes ?? [];
+      const now = performance.now();
+
+      const normalized: ProcessInfo[] = rawProcesses.map((raw) => {
+        const elapsedSec = parseElapsedSeconds(raw.elapsed);
+        let cpuTime = raw.cpu_time_s;
+        if (cpuTime === undefined) {
+          // If raw.cpu is cumulative seconds (e.g. Windows backend before restart)
+          if (elapsedSec > 0 && (raw.cpu > 100 || raw.elapsed.includes("-"))) {
+            cpuTime = raw.cpu;
+          }
+        }
+
+        let computedCpu = raw.cpu;
+
+        if (cpuTime !== undefined) {
+          const prev = prevSamplesRef.current.get(raw.pid);
+          if (prev && now > prev.timestamp) {
+            const dt = (now - prev.timestamp) / 1000;
+            const dCpu = cpuTime - prev.cpuTime;
+            if (dt >= 0.5 && dCpu >= 0) {
+              computedCpu = (dCpu / dt) * 100;
+            }
+          } else if (elapsedSec > 0) {
+            // First sample fallback: average lifetime CPU percentage
+            computedCpu = (cpuTime / elapsedSec) * 100;
+          }
+          prevSamplesRef.current.set(raw.pid, { cpuTime, timestamp: now });
+        }
+
+        return {
+          ...raw,
+          cpu: Math.max(0, computedCpu),
+          cpu_time_s: cpuTime,
+        };
+      });
+
+      setProcesses(normalized);
       setSelfMetrics({
         rss_mb: data.self_rss_mb ?? 0,
         user_cpu: data.self_user_cpu_s ?? 0,

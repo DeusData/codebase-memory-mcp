@@ -1,0 +1,74 @@
+{
+  "schema_version": 2,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Repository Indexing & Daemon Lifecycle",
+    "output": "Diagrams/lifecycle-indexing-state.html",
+    "animation": "trace",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    { "id": "main", "label": "Indexing Phases" },
+    { "id": "waiting", "label": "Watching & Lock Probe" },
+    { "id": "recovery", "label": "Delta & Store Recovery" },
+    { "id": "terminal", "label": "Terminal Exits" }
+  ],
+  "states": [
+    { "id": "unindexed", "type": "start", "label": "Unindexed", "sublabel": "new workspace detected", "lane": "main", "col": 0, "step": "01", "tag": "initial" },
+    { "id": "parsing", "type": "active", "label": "AST Parsing", "sublabel": "162 Tree-Sitter grammars", "lane": "main", "col": 1, "step": "02", "tag": "worker" },
+    { "id": "resolving", "type": "active", "label": "Resolving LSP", "sublabel": "cross-file type links", "lane": "main", "col": 2, "step": "03", "tag": "semantic" },
+    { "id": "ready", "type": "decision", "label": "Index Ready", "sublabel": "SQLite WAL committed", "lane": "main", "col": 3, "step": "04", "tag": "active" },
+    { "id": "serving", "type": "success", "label": "Serving Queries", "sublabel": "sub-ms MCP responses", "lane": "main", "col": 4, "step": "05", "tag": "ready" },
+    { "id": "watching", "type": "waiting", "label": "Watching VCS", "sublabel": "poll HEAD & dirty hash", "lane": "waiting", "col": 3, "tag": "idle" },
+    { "id": "lock_probe", "type": "waiting", "label": "Lock Probe", "sublabel": "reclaim dead holder", "lane": "waiting", "col": 1, "tag": "contention" },
+    { "id": "delta_indexing", "type": "active", "label": "Delta Updating", "sublabel": "changed files worker", "lane": "recovery", "col": 2, "tag": "delta" },
+    { "id": "corrupt_reset", "type": "active", "label": "Store Rebuild", "sublabel": "clean database fallback", "lane": "recovery", "col": 0, "tag": "recovery" },
+    { "id": "shutdown", "type": "success", "label": "Idle Exit", "sublabel": "quiet timeout heartbeat", "lane": "terminal", "col": 4, "tag": "graceful" },
+    { "id": "failed", "type": "failure", "label": "Lock Timeout", "sublabel": "unresolved conflict", "lane": "terminal", "col": 1, "tag": "failed" }
+  ],
+  "transitions": [
+    { "from": "unindexed", "to": "parsing" },
+    { "from": "parsing", "to": "resolving" },
+    { "from": "resolving", "to": "ready" },
+    { "from": "ready", "to": "serving" },
+    { "from": "parsing", "to": "lock_probe", "variant": "security", "label": "lock contention" },
+    { "from": "lock_probe", "to": "parsing", "label": "lock acquired" },
+    { "from": "lock_probe", "to": "failed", "variant": "security", "label": "ceiling exceeded" },
+    { "from": "serving", "to": "watching", "variant": "dashed" },
+    { "from": "watching", "to": "delta_indexing", "label": "dirty detected", "variant": "emphasis" },
+    { "from": "delta_indexing", "to": "ready", "label": "delta committed" },
+    { "from": "delta_indexing", "to": "corrupt_reset", "variant": "security", "label": "WAL error" },
+    { "from": "corrupt_reset", "to": "unindexed", "label": "clean reindex" },
+    { "from": "watching", "to": "shutdown", "label": "idle timeout", "variant": "default" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "State Progression",
+      "items": [
+        "Unindexed workspaces progress linearly through parallel AST parsing and LSP enrichment",
+        "Successful commit transitions directly into active query serving",
+        "Background watcher monitors VCS state without blocking concurrent queries"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Incremental Delta Updates",
+      "items": [
+        "Dirty tree detection triggers lightweight delta re-indexing instead of full scans",
+        "Adaptive polling interval balances responsiveness and CPU usage",
+        "Failed delta passes leave stable baselines untouched for safe retries"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Crash Recovery & Contention",
+      "items": [
+        "Daemon probes and reclaims orphaned locks from killed processes automatically",
+        "Startup lock contention is bounded by a safe ceiling to prevent indefinite hangs",
+        "Corrupted database files trigger a clean rebuild from source files"
+      ]
+    }
+  ]
+}

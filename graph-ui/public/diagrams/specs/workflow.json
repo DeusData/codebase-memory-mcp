@@ -1,0 +1,77 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Codebase Memory Indexing Pipeline Workflow",
+    "animation": "trace",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "output": "Diagrams/workflow-indexing-pipeline.html"
+  },
+  "lanes": [
+    { "id": "fs", "label": "Workspace Filesystem" },
+    { "id": "orch", "label": "Pipeline Supervisor" },
+    { "id": "ast", "label": "Tree-Sitter & Hybrid LSP" },
+    { "id": "store", "label": "Knowledge Graph Persistence" }
+  ],
+  "phases": [
+    { "id": "intake", "label": "1. Discovery & Load", "fromCol": 0, "toCol": 1 },
+    { "id": "parsing", "label": "2. Parallel AST Extraction", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "persist", "label": "3. LSP Enrichment & Commit", "fromCol": 4, "toCol": 5, "variant": "emphasis" }
+  ],
+  "groups": [
+    { "id": "ast_group", "label": "162-Language AST Extraction", "lane": "ast", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "store_group", "label": "RAM-first to SQLite WAL", "lane": "store", "fromCol": 4, "toCol": 5, "variant": "emphasis" }
+  ],
+  "mainPath": ["discover", "compress", "orchestrator", "pass_defs", "pass_calls", "hybrid_lsp", "graph_buffer", "sqlite_wal", "ready"],
+  "nodes": [
+    { "id": "discover", "lane": "fs", "col": 0, "type": "external", "label": "File Discovery", "sublabel": "walk repo & filter", "width": 124 },
+    { "id": "compress", "lane": "fs", "col": 1, "type": "backend", "label": "Source Reader", "sublabel": "LZ4 HC compress", "width": 124 },
+    { "id": "orchestrator", "lane": "orch", "col": 1, "type": "backend", "label": "Supervisor Pool", "sublabel": "worker pool jobs", "tag": "worker pool", "width": 124 },
+    { "id": "pass_defs", "lane": "ast", "col": 2, "type": "backend", "label": "Definitions Pass", "sublabel": "functions & types", "tag": "Tree-Sitter", "width": 124 },
+    { "id": "pass_calls", "lane": "ast", "col": 3, "type": "backend", "label": "Call Graph Pass", "sublabel": "call site edges", "width": 124 },
+    { "id": "hybrid_lsp", "lane": "ast", "col": 4, "type": "backend", "label": "Hybrid LSP", "sublabel": "cross-file types", "tag": "10 languages", "width": 124 },
+    { "id": "graph_buffer", "lane": "store", "col": 4, "type": "database", "label": "Graph Buffer", "sublabel": "fused graph buffer", "width": 124 },
+    { "id": "sqlite_wal", "lane": "store", "col": 5, "type": "database", "label": "SQLite Commit", "sublabel": "atomic WAL dump", "width": 124 },
+    { "id": "ready", "lane": "orch", "col": 5, "type": "frontend", "label": "Index Ready", "sublabel": "daemon notified", "width": 124 }
+  ],
+  "edges": [
+    { "id": "e-discover-compress", "from": "discover", "to": "compress", "label": "file list", "variant": "default" },
+    { "id": "e-compress-orch", "from": "compress", "to": "orchestrator", "label": "source blocks", "variant": "default" },
+    { "id": "e-orch-defs", "from": "orchestrator", "to": "pass_defs", "label": "dispatch chunk", "variant": "emphasis" },
+    { "id": "e-defs-calls", "from": "pass_defs", "to": "pass_calls", "label": "symbol registry", "variant": "default" },
+    { "id": "e-calls-lsp", "from": "pass_calls", "to": "hybrid_lsp", "label": "call sites", "variant": "emphasis" },
+    { "id": "e-lsp-buf", "from": "hybrid_lsp", "to": "graph_buffer", "label": "semantic edges", "variant": "default" },
+    { "id": "e-buf-wal", "from": "graph_buffer", "to": "sqlite_wal", "label": "batch dump", "variant": "emphasis" },
+    { "id": "e-wal-ready", "from": "sqlite_wal", "to": "ready", "label": "index committed", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Discovery & Ingestion",
+      "items": [
+        "Fast directory traversal honors .gitignore and excludes binary artifacts",
+        "Raw file contents are bulk-loaded and compressed using LZ4 HC in memory",
+        "Memory allocated during source loading is released immediately after AST passes"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "AST & LSP Pipeline",
+      "items": [
+        "162 vendored Tree-Sitter grammars compiled directly into the binary",
+        "Multi-pass execution extracts definitions before resolving call targets",
+        "Hybrid LSP resolves cross-file types for TypeScript, Python, Go, Rust, C/C++"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Atomic Graph Dump",
+      "items": [
+        "In-memory graph buffer stages all nodes and edges before disk I/O",
+        "Single atomic transaction writes to SQLite WAL journal",
+        "Daemon publishes index generation change to unlock concurrent reader queries"
+      ]
+    }
+  ]
+}

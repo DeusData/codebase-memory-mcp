@@ -189,6 +189,12 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
             }
             return CBM_DAEMON_PROCESS_LOCAL_CLI;
         }
+        if (bootstrap_arg_is(argv[arg], "diagram")) {
+            if (bootstrap_has_help_after(argc, argv, arg + 1)) {
+                return CBM_DAEMON_PROCESS_STATELESS;
+            }
+            return CBM_DAEMON_PROCESS_LOCAL_CLI;
+        }
         if (bootstrap_arg_is(argv[arg], "hook-augment")) {
             return CBM_DAEMON_PROCESS_HOOK_CLIENT;
         }

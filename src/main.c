@@ -35,6 +35,7 @@
 #include "mcp/index_supervisor.h"
 #include "cli/cli.h"
 #include "cli/progress_sink.h"
+#include "diagram/diagram.h"
 #include "foundation/constants.h"
 
 enum {
@@ -1110,6 +1111,8 @@ static void print_help(void) {
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp diagram <type> [options]\n");
+    printf("                                      Generate architecture, sequence, or dataflow diagrams\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
     printf("\nCLI output options:\n");
@@ -1250,6 +1253,221 @@ static int main_run_allow_root(int argc, char **argv) {
     return 0;
 }
 
+static void print_diagram_help(void) {
+    printf("Usage: codebase-memory-mcp diagram <type> [options]\n\n"
+           "Generate architecture, sequence, dataflow, and dependency diagrams directly from the knowledge graph.\n\n"
+           "Diagram types:\n"
+           "  architecture    High-level component, boundary, and subsystem dependency map\n"
+           "  sequence        Chronological caller-to-callee trace from an entry point\n"
+           "  dataflow        Data ingestion from routes through handlers to storage\n"
+           "  dependencies    Module and package dependency DAG\n\n"
+           "Options:\n"
+           "  -e, --entry <name>        Target symbol or route for sequence/dataflow diagrams\n"
+           "  -d, --depth <num>         Maximum traversal depth (default: 3)\n"
+           "  -f, --format <format>     Output format: mermaid (default), dot, svg\n"
+           "  -s, --scope <path>        Constrain diagram scope to subfolder\n"
+           "  -p, --project <name>      Target indexed project (default: auto-detected)\n"
+           "  -o, --output <file>       Write output to file instead of stdout\n"
+           "  -h, --help                Show this help message\n");
+}
+
+static cbm_store_t *diagram_open_project_store(const char *project_flag, char *name_out, size_t name_sz) {
+    if (project_flag && project_flag[0]) {
+        if (strstr(project_flag, ".db") || strchr(project_flag, '/') || strchr(project_flag, '\\')) {
+            cbm_store_t *st = cbm_store_open_path_query(project_flag);
+            if (st) {
+                if (name_out && name_sz > 0) {
+                    snprintf(name_out, name_sz, "%s", project_flag);
+                }
+                return st;
+            }
+        }
+        cbm_store_t *st = cbm_store_open(project_flag);
+        if (st) {
+            if (name_out && name_sz > 0) {
+                snprintf(name_out, name_sz, "%s", project_flag);
+            }
+            return st;
+        }
+        return NULL;
+    }
+
+    const char *cdir = cbm_resolve_cache_dir();
+    if (!cdir) {
+        cdir = cbm_tmpdir();
+    }
+    cbm_dir_t *d = cbm_opendir(cdir);
+    if (!d) {
+        return NULL;
+    }
+    char single_proj[CBM_SZ_256] = {0};
+    int proj_count = 0;
+    cbm_dirent_t *ent = NULL;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (!cbm_is_project_index_db(ent->name)) {
+            continue;
+        }
+        size_t len = strlen(ent->name);
+        if (len > 3) {
+            proj_count++;
+            if (proj_count == 1) {
+                snprintf(single_proj, sizeof(single_proj), "%.*s", (int)(len - 3), ent->name);
+            }
+        }
+    }
+    cbm_closedir(d);
+
+    if (proj_count == 1 && single_proj[0]) {
+        if (name_out && name_sz > 0) {
+            snprintf(name_out, name_sz, "%s", single_proj);
+        }
+        return cbm_store_open(single_proj);
+    }
+
+    char cwd[CBM_PATH_MAX];
+    if (cbm_getcwd(cwd, sizeof(cwd))) {
+        const char *base = cwd;
+        for (const char *s = cwd; *s; s++) {
+            if (*s == '/' || *s == '\\') {
+                base = s + 1;
+            }
+        }
+        if (base && base[0]) {
+            cbm_store_t *st = cbm_store_open(base);
+            if (st) {
+                if (name_out && name_sz > 0) {
+                    snprintf(name_out, name_sz, "%s", base);
+                }
+                return st;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static int run_diagram(int argc, char **argv) {
+    if (argc < 1) {
+        print_diagram_help();
+        return 0;
+    }
+
+    const char *type_str = NULL;
+    const char *entry_point = NULL;
+    int max_depth = 3;
+    const char *format_str = "mermaid";
+    const char *scope_path = NULL;
+    const char *project_flag = NULL;
+    const char *output_file = NULL;
+
+    for (int i = 0; i < argc; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            print_diagram_help();
+            return 0;
+        }
+        if (strncmp(arg, "--entry=", 8) == 0) {
+            entry_point = arg + 8;
+        } else if (strncmp(arg, "--entry_point=", 14) == 0) {
+            entry_point = arg + 14;
+        } else if ((strcmp(arg, "-e") == 0 || strcmp(arg, "--entry") == 0) && i + 1 < argc) {
+            entry_point = argv[++i];
+        } else if (strncmp(arg, "--depth=", 8) == 0) {
+            max_depth = atoi(arg + 8);
+        } else if (strncmp(arg, "--max_depth=", 12) == 0) {
+            max_depth = atoi(arg + 12);
+        } else if ((strcmp(arg, "-d") == 0 || strcmp(arg, "--depth") == 0) && i + 1 < argc) {
+            max_depth = atoi(argv[++i]);
+        } else if (strncmp(arg, "--format=", 9) == 0) {
+            format_str = arg + 9;
+        } else if ((strcmp(arg, "-f") == 0 || strcmp(arg, "--format") == 0) && i + 1 < argc) {
+            format_str = argv[++i];
+        } else if (strncmp(arg, "--scope=", 8) == 0) {
+            scope_path = arg + 8;
+        } else if (strncmp(arg, "--scope_path=", 13) == 0) {
+            scope_path = arg + 13;
+        } else if ((strcmp(arg, "-s") == 0 || strcmp(arg, "--scope") == 0) && i + 1 < argc) {
+            scope_path = argv[++i];
+        } else if (strncmp(arg, "--project=", 10) == 0) {
+            project_flag = arg + 10;
+        } else if ((strcmp(arg, "-p") == 0 || strcmp(arg, "--project") == 0) && i + 1 < argc) {
+            project_flag = argv[++i];
+        } else if (strncmp(arg, "--output=", 9) == 0) {
+            output_file = arg + 9;
+        } else if (strcmp(arg, "-o") == 0 && i + 1 < argc) {
+            output_file = argv[++i];
+        } else if (arg[0] != '-') {
+            if (!type_str) {
+                type_str = arg;
+            } else if (!entry_point) {
+                entry_point = arg;
+            }
+        }
+    }
+
+    if (!type_str) {
+        print_diagram_help();
+        return 0;
+    }
+
+    cbm_diagram_type_t diag_type;
+    if (!cbm_diagram_type_from_string(type_str, &diag_type)) {
+        fprintf(stderr, "error: invalid diagram type '%s'. Supported: architecture, sequence, dataflow, dependencies\n", type_str);
+        return 1;
+    }
+
+    cbm_diagram_format_t diag_format;
+    if (!cbm_diagram_format_from_string(format_str, &diag_format)) {
+        fprintf(stderr, "error: invalid format '%s'. Supported: mermaid, dot, svg\n", format_str);
+        return 1;
+    }
+
+    char resolved_project[CBM_SZ_256] = {0};
+    cbm_store_t *store = diagram_open_project_store(project_flag, resolved_project, sizeof(resolved_project));
+    if (!store) {
+        fprintf(stderr, "error: unable to open project store. Specify --project=<name>\n");
+        return 1;
+    }
+
+    cbm_diagram_options_t opts = {
+        .type = diag_type,
+        .format = diag_format,
+        .entry_point = entry_point,
+        .scope_path = scope_path,
+        .max_depth = max_depth,
+        .project = resolved_project[0] ? resolved_project : NULL,
+    };
+
+    cbm_diagram_result_t result = {0};
+    int rc = cbm_diagram_generate(store, &opts, &result);
+    cbm_store_close(store);
+
+    if (rc != 0 || !result.content) {
+        fprintf(stderr, "error: failed to generate diagram\n");
+        cbm_diagram_result_free(&result);
+        return 1;
+    }
+
+    if (output_file) {
+        FILE *fp = cbm_fopen(output_file, "w");
+        if (!fp) {
+            fprintf(stderr, "error: cannot open output file '%s': %s\n", output_file, strerror(errno));
+            cbm_diagram_result_free(&result);
+            return 1;
+        }
+        fputs(result.content, fp);
+        fclose(fp);
+    } else {
+        fputs(result.content, stdout);
+        if (result.content[0] && result.content[strlen(result.content) - 1] != '\n') {
+            putchar('\n');
+        }
+    }
+
+    cbm_diagram_result_free(&result);
+    return 0;
+}
+
 static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
                              main_local_maintenance_context_t *maintenance_context) {
     /* First scan: global flags */
@@ -1275,6 +1493,10 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
                                   cbm_index_worker_memory_budget_bytes());
             return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE, project_locks,
                            maintenance_context);
+        }
+        if (strcmp(argv[i], "diagram") == 0) {
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+            return run_diagram(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));

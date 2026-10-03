@@ -80,11 +80,12 @@ export interface SchemaInfo {
   total_edges: number;
 }
 
-export type TabId = "graph" | "stats" | "control";
+export type TabId = "graph" | "stats" | "control" | "diagrams";
 
 export interface ProcessInfo {
   pid: number;
   cpu: number;
+  cpu_time_s?: number;
   rss_mb: number;
   elapsed: string;
   command: string;

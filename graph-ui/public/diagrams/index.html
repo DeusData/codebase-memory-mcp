@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codebase Memory MCP — Archify Diagrams Suite</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: rgba(18, 25, 38, 0.75);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --card-hover-border: rgba(99, 102, 241, 0.4);
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent: #6366f1;
+      --accent-glow: rgba(99, 102, 241, 0.25);
+      --cyan: #06b6d4;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --purple: #a855f7;
+      --rose: #f43f5e;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(6, 182, 212, 0.1) 0%, transparent 40%),
+        radial-gradient(circle at 50% 50%, rgba(168, 85, 247, 0.05) 0%, transparent 60%);
+    }
+
+    header {
+      padding: 50px 32px 30px;
+      max-width: 1200px;
+      margin: 0 auto;
+      width: 100%;
+      text-align: center;
+    }
+
+    .badge-bar {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 500;
+      color: #c7d2fe;
+      margin-bottom: 18px;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      font-size: 40px;
+      font-weight: 700;
+      letter-spacing: -0.8px;
+      margin-bottom: 12px;
+      background: linear-gradient(135deg, #ffffff 30%, #94a3b8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .subtitle {
+      font-size: 16px;
+      color: var(--text-muted);
+      max-width: 680px;
+      margin: 0 auto 36px;
+      line-height: 1.6;
+    }
+
+    .meta-metrics {
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .metric-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .metric-val {
+      font-size: 20px;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      color: #38bdf8;
+    }
+
+    .metric-lbl {
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+
+    main {
+      flex: 1;
+      max-width: 1200px;
+      margin: 0 auto 60px;
+      padding: 0 24px;
+      width: 100%;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+      gap: 24px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 28px;
+      backdrop-filter: blur(16px);
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: transparent;
+      transition: background 0.25s ease;
+    }
+
+    .card:hover {
+      transform: translateY(-4px);
+      border-color: var(--card-hover-border);
+      box-shadow: 0 20px 35px -10px rgba(0, 0, 0, 0.5), 0 0 25px -5px var(--accent-glow);
+    }
+
+    .card.arch:hover::before { background: linear-gradient(90deg, #6366f1, #06b6d4); }
+    .card.work:hover::before { background: linear-gradient(90deg, #10b981, #06b6d4); }
+    .card.seq:hover::before { background: linear-gradient(90deg, #f59e0b, #f43f5e); }
+    .card.flow:hover::before { background: linear-gradient(90deg, #06b6d4, #a855f7); }
+    .card.life:hover::before { background: linear-gradient(90deg, #a855f7, #6366f1); }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .type-pill {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .pill-arch { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); }
+    .pill-work { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .pill-seq { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .pill-flow { background: rgba(6, 182, 212, 0.15); color: #38bdf8; border: 1px solid rgba(6, 182, 212, 0.3); }
+    .pill-life { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+
+    .status-tag {
+      font-size: 11px;
+      color: #34d399;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-weight: 500;
+    }
+
+    .status-tag::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
+    }
+
+    .card-title {
+      font-size: 20px;
+      font-weight: 600;
+      color: #ffffff;
+      margin-bottom: 8px;
+      line-height: 1.3;
+    }
+
+    .card-desc {
+      font-size: 13.5px;
+      color: var(--text-muted);
+      line-height: 1.55;
+      margin-bottom: 20px;
+      flex: 1;
+    }
+
+    .source-list {
+      background: rgba(0, 0, 0, 0.25);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 20px;
+      font-size: 11.5px;
+      font-family: 'JetBrains Mono', monospace;
+      color: #94a3b8;
+    }
+
+    .source-list span {
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 4px;
+    }
+    .source-list span:last-child { margin-bottom: 0; }
+    .source-list b { color: #e2e8f0; }
+
+    .card-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .btn-launch {
+      flex: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+      color: white;
+      text-decoration: none;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-weight: 500;
+      font-size: 13px;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
+    }
+
+    .btn-launch:hover {
+      background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
+      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.4);
+      transform: translateY(-1px);
+    }
+
+    .btn-spec {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: var(--text-muted);
+      text-decoration: none;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      transition: all 0.2s ease;
+    }
+
+    .btn-spec:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--text-main);
+    }
+
+    footer {
+      border-top: 1px solid var(--card-border);
+      padding: 24px;
+      text-align: center;
+      font-size: 13px;
+      color: #64748b;
+    }
+
+    footer a {
+      color: #818cf8;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="badge-bar">
+      <span>Archify v3.0.1</span>
+      <span>•</span>
+      <span>Interactive Diagrams</span>
+    </div>
+    <h1>Codebase Memory MCP Visualizations</h1>
+    <p class="subtitle">
+      Explorable system maps generated from verified repository source evidence in <code>codebase-memory-mcp</code>. Click any diagram below to launch the standalone interactive viewer.
+    </p>
+    <div class="meta-metrics">
+      <div class="metric-item">
+        <span class="metric-val">5 / 5</span>
+        <span class="metric-lbl">Diagram Types</span>
+      </div>
+      <div class="metric-item">
+        <span class="metric-val">100%</span>
+        <span class="metric-lbl">Gates Passed</span>
+      </div>
+      <div class="metric-item">
+        <span class="metric-val">162</span>
+        <span class="metric-lbl">Languages Modeled</span>
+      </div>
+      <div class="metric-item">
+        <span class="metric-val">&lt; 1 ms</span>
+        <span class="metric-lbl">Query Latency</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="grid">
+
+      <!-- Architecture -->
+      <div class="card arch">
+        <div class="card-top">
+          <span class="type-pill pill-arch">Architecture</span>
+          <span class="status-tag">Showcase Pass</span>
+        </div>
+        <h2 class="card-title">System Architecture</h2>
+        <p class="card-desc">
+          High-level topology showing AI agent client surfaces, stdio MCP protocol frontend, authenticated daemon IPC, Tree-Sitter AST worker pool, Hybrid LSP, and in-memory SQLite WAL graph store.
+        </p>
+        <div class="source-list">
+          <span><b>src/main.c</b> : L2748 (entry point)</span>
+          <span><b>src/mcp/mcp.c</b> : L17893 (tools/call)</span>
+          <span><b>src/daemon/ipc.c</b> : L1 (daemon IPC)</span>
+          <span><b>src/store/store.c</b> : L2 (SQLite store)</span>
+        </div>
+        <div class="card-actions">
+          <a href="architecture.html" class="btn-launch" target="_blank">Open Interactive Viewer ↗</a>
+          <a href="specs/architecture.json" class="btn-spec" target="_blank">JSON</a>
+        </div>
+      </div>
+
+      <!-- Workflow -->
+      <div class="card work">
+        <div class="card-top">
+          <span class="type-pill pill-work">Workflow</span>
+          <span class="status-tag">Showcase Pass</span>
+        </div>
+        <h2 class="card-title">Multi-Pass Indexing Pipeline</h2>
+        <p class="card-desc">
+          End-to-end multi-lane workflow from initial filesystem discovery, bulk LZ4 HC source reading, parallel definition extraction, call graph resolution, Hybrid LSP cross-file links, to atomic SQLite dump.
+        </p>
+        <div class="source-list">
+          <span><b>src/pipeline/pipeline.c</b> : L2 (orchestration)</span>
+          <span><b>src/pipeline/pass_definitions.c</b> (AST pass)</span>
+          <span><b>src/pipeline/pass_lsp_cross.c</b> (LSP links)</span>
+        </div>
+        <div class="card-actions">
+          <a href="workflow-indexing-pipeline.html" class="btn-launch" target="_blank">Open Interactive Viewer ↗</a>
+          <a href="specs/workflow.json" class="btn-spec" target="_blank">JSON</a>
+        </div>
+      </div>
+
+      <!-- Sequence -->
+      <div class="card seq">
+        <div class="card-top">
+          <span class="type-pill pill-seq">Sequence</span>
+          <span class="status-tag">Showcase Pass</span>
+        </div>
+        <h2 class="card-title">Tool Call Request Sequence</h2>
+        <p class="card-desc">
+          Step-by-step chronological trace of an AI Agent invoking <code>trace_path(OrderHandler)</code> through stdio, validating daemon lock generation, Cypher query planning, BFS traversal, and sub-ms response formatting.
+        </p>
+        <div class="source-list">
+          <span><b>src/mcp/mcp.c</b> : L17893 (JSON-RPC dispatch)</span>
+          <span><b>src/cypher/cypher.c</b> : L2 (Cypher planner)</span>
+          <span><b>src/daemon/ipc.c</b> : L1 (lock validation)</span>
+        </div>
+        <div class="card-actions">
+          <a href="sequence-tool-call.html" class="btn-launch" target="_blank">Open Interactive Viewer ↗</a>
+          <a href="specs/sequence.json" class="btn-spec" target="_blank">JSON</a>
+        </div>
+      </div>
+
+      <!-- Data Flow -->
+      <div class="card flow">
+        <div class="card-top">
+          <span class="type-pill pill-flow">Data Flow</span>
+          <span class="status-tag">Showcase Pass</span>
+        </div>
+        <h2 class="card-title">Knowledge Graph Data Flow</h2>
+        <p class="card-desc">
+          Traces data transformations across 5 stages: raw files & git context &rarr; Tree-Sitter AST & LZ4 HC cache &rarr; FQN registry & Hybrid LSP &rarr; SQLite relational tables &rarr; MCP clients, Cypher engine, and 3D UI.
+        </p>
+        <div class="source-list">
+          <span><b>src/store/store.c</b> : L2 (relational tables)</span>
+          <span><b>src/ui/layout3d.c</b> (3D spatial layout)</span>
+          <span><b>src/ui/http_server.c</b> (localhost:9749)</span>
+        </div>
+        <div class="card-actions">
+          <a href="dataflow-code-to-graph.html" class="btn-launch" target="_blank">Open Interactive Viewer ↗</a>
+          <a href="specs/dataflow.json" class="btn-spec" target="_blank">JSON</a>
+        </div>
+      </div>
+
+      <!-- Lifecycle -->
+      <div class="card life">
+        <div class="card-top">
+          <span class="type-pill pill-life">Lifecycle</span>
+          <span class="status-tag">Showcase Pass</span>
+        </div>
+        <h2 class="card-title">Indexing & Daemon Lifecycle</h2>
+        <p class="card-desc">
+          State transition diagram modeling initial indexing, daemon lock contention probe, active query serving, Git change watcher dirty detection, lightweight delta re-indexing, and store corruption recovery.
+        </p>
+        <div class="source-list">
+          <span><b>src/watcher/watcher.c</b> : L2 (git watcher)</span>
+          <span><b>src/daemon/bootstrap.c</b> : L1 (daemon startup)</span>
+          <span><b>src/pipeline/pipeline_delta.c</b> (delta updates)</span>
+        </div>
+        <div class="card-actions">
+          <a href="lifecycle-indexing-state.html" class="btn-launch" target="_blank">Open Interactive Viewer ↗</a>
+          <a href="specs/lifecycle.json" class="btn-spec" target="_blank">JSON</a>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <footer>
+    Generated with <a href="https://github.com/tt-a1i/archify" target="_blank">Archify</a> · Codebase Memory MCP Architecture Documentation Suite
+  </footer>
+
+</body>
+</html>

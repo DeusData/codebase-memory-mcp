@@ -1,0 +1,359 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Codebase Memory Architecture",
+    "subtitle": "DeusData/codebase-memory-mcp · 162 languages · RAM-first AST pipeline · SQLite WAL graph",
+    "output": "Diagrams/architecture.html",
+    "quality_profile": "showcase",
+    "locale": "en",
+    "repository": {
+      "url": "https://github.com/DeusData/codebase-memory-mcp",
+      "revision": "b81ced4215f3dccee275ce67b3a6437c7fc6ed2e",
+      "provider": "github",
+      "link_mode": "local-only"
+    }
+  },
+  "components": [
+    {
+      "id": "agents",
+      "type": "external",
+      "label": "AI Coding Agents",
+      "sublabel": "Cursor · Claude Code · Codex · Copilot",
+      "pos": [50, 230],
+      "size": [150, 64]
+    },
+    {
+      "id": "mcp_frontend",
+      "type": "frontend",
+      "label": "MCP Protocol Server",
+      "sublabel": "stdio · JSON-RPC 2.0 · 18 tools",
+      "pos": [310, 230],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/mcp/mcp.c",
+          "line": 8184,
+          "label": "export_diagram dispatch"
+        },
+        {
+          "path": "src/mcp/mcp.c",
+          "line": 17893,
+          "label": "tools/call dispatch"
+        },
+        {
+          "path": "src/main.c",
+          "line": 2748,
+          "label": "main entry point"
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "Background Daemon",
+      "sublabel": "per-account IPC · project lock",
+      "pos": [580, 230],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/daemon/ipc.c",
+          "line": 1,
+          "label": "authenticated IPC"
+        }
+      ]
+    },
+    {
+      "id": "graph_engine",
+      "type": "backend",
+      "label": "Knowledge Graph",
+      "sublabel": "Cypher engine · sub-ms queries",
+      "pos": [850, 230],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/cypher/cypher.c",
+          "line": 2,
+          "label": "Cypher planner & executor"
+        }
+      ]
+    },
+    {
+      "id": "sqlite_store",
+      "type": "database",
+      "label": "Embedded Store",
+      "sublabel": "in-memory SQLite · WAL · LZ4",
+      "pos": [1120, 230],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/store/store.c",
+          "line": 2,
+          "label": "SQLite store implementation"
+        }
+      ]
+    },
+    {
+      "id": "pipeline",
+      "type": "backend",
+      "label": "Indexing Pipeline",
+      "sublabel": "multi-pass worker pool",
+      "pos": [580, 70],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/pipeline/pipeline.c",
+          "line": 2,
+          "label": "pipeline orchestrator"
+        }
+      ]
+    },
+    {
+      "id": "tree_sitter",
+      "type": "backend",
+      "label": "Tree-Sitter AST",
+      "sublabel": "162 grammars compiled-in",
+      "pos": [850, 70],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/pipeline/pass_definitions.c",
+          "line": 1,
+          "label": "definition extraction pass"
+        }
+      ]
+    },
+    {
+      "id": "hybrid_lsp",
+      "type": "backend",
+      "label": "Hybrid LSP Engine",
+      "sublabel": "cross-file type resolution",
+      "pos": [1120, 70],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/pipeline/pass_lsp_cross.c",
+          "line": 1,
+          "label": "LSP cross-file enrichment"
+        }
+      ]
+    },
+    {
+      "id": "browser_user",
+      "type": "external",
+      "label": "Developer Browser",
+      "sublabel": "interactive 3D graph exploration",
+      "pos": [50, 390],
+      "size": [150, 64]
+    },
+    {
+      "id": "web_ui",
+      "type": "frontend",
+      "label": "3D Visualizer HTTP",
+      "sublabel": "localhost:9749 · embedded UI",
+      "pos": [310, 390],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/ui/http_server.c",
+          "line": 2,
+          "label": "embedded HTTP server"
+        }
+      ]
+    },
+    {
+      "id": "file_watcher",
+      "type": "backend",
+      "label": "Git Change Watcher",
+      "sublabel": "HEAD & dirty status polling",
+      "pos": [580, 390],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/watcher/watcher.c",
+          "line": 2,
+          "label": "git change watcher"
+        }
+      ]
+    },
+    {
+      "id": "diagram_engine",
+      "type": "backend",
+      "label": "Diagram Synthesis Engine",
+      "sublabel": "export_diagram · C99 Mermaid/SVG",
+      "pos": [850, 390],
+      "size": [160, 64],
+      "sources": [
+        {
+          "path": "src/mcp/mcp.c",
+          "line": 8184,
+          "label": "handle_export_diagram"
+        },
+        {
+          "path": "src/diagram/diagram.c",
+          "line": 243,
+          "label": "cbm_diagram_generate"
+        },
+        {
+          "path": "src/diagram/query_arch.c",
+          "line": 1,
+          "label": "architecture query planner"
+        },
+        {
+          "path": "src/diagram/emit_mermaid.c",
+          "line": 1,
+          "label": "Mermaid & vector emitter"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Codebase Memory Runtime (Pure C)",
+      "wraps": [
+        "mcp_frontend",
+        "daemon",
+        "graph_engine",
+        "sqlite_store",
+        "pipeline",
+        "tree_sitter",
+        "hybrid_lsp",
+        "file_watcher",
+        "diagram_engine",
+        "web_ui"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "Indexing & AST Pipeline",
+      "wraps": [
+        "pipeline",
+        "tree_sitter",
+        "hybrid_lsp"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "agents-to-mcp",
+      "from": "agents",
+      "to": "mcp_frontend",
+      "label": "JSON-RPC stdio",
+      "variant": "emphasis"
+    },
+    {
+      "id": "mcp-to-daemon",
+      "from": "mcp_frontend",
+      "to": "daemon",
+      "label": "IPC socket"
+    },
+    {
+      "id": "daemon-to-graph",
+      "from": "daemon",
+      "to": "graph_engine",
+      "label": "Cypher & search"
+    },
+    {
+      "id": "graph-to-store",
+      "from": "graph_engine",
+      "to": "sqlite_store",
+      "label": "read WAL cache"
+    },
+    {
+      "id": "daemon-to-pipeline",
+      "from": "daemon",
+      "to": "pipeline",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "label": "trigger index"
+    },
+    {
+      "id": "pipeline-to-treesitter",
+      "from": "pipeline",
+      "to": "tree_sitter",
+      "label": "162 grammars"
+    },
+    {
+      "id": "treesitter-to-lsp",
+      "from": "tree_sitter",
+      "to": "hybrid_lsp",
+      "label": "type resolution"
+    },
+    {
+      "id": "lsp-to-store",
+      "from": "hybrid_lsp",
+      "to": "sqlite_store",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "label": "persist nodes"
+    },
+    {
+      "id": "browser-to-ui",
+      "from": "browser_user",
+      "to": "web_ui",
+      "label": "HTTP :9749"
+    },
+    {
+      "id": "ui-to-mcp",
+      "from": "web_ui",
+      "to": "mcp_frontend",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "label": "JSON-RPC"
+    },
+    {
+      "id": "watcher-to-daemon",
+      "from": "file_watcher",
+      "to": "daemon",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "label": "dirty status"
+    },
+    {
+      "id": "graph-to-diagram",
+      "from": "graph_engine",
+      "to": "diagram_engine",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "label": "export_diagram"
+    },
+    {
+      "id": "diagram-to-store",
+      "from": "diagram_engine",
+      "to": "sqlite_store",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "label": "read AST graph"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "AI Agent Frontends",
+      "items": [
+        "JSON-RPC 2.0 stdio transport exposing 18 MCP tools including export_diagram",
+        "Thin client frontends communicate with background daemon via authenticated IPC",
+        "Zero-overhead CLI mode for one-shot tool executions"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "AST Indexing & Hybrid LSP",
+      "items": [
+        "162 tree-sitter grammars compiled directly into native C binary",
+        "Hybrid LSP semantic type and cross-file reference resolution",
+        "RAM-first multi-pass parallel worker pool with LZ4 HC compression"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Graph Query & Diagram Synthesis",
+      "items": [
+        "Cypher query engine with AST-to-SQL translation and BFS traversal",
+        "In-memory SQLite with WAL mode delivering sub-millisecond query latency",
+        "Native export_diagram engine synthesizing Mermaid, SVG, and DOT directly from the AST graph without external runtimes"
+      ]
+    }
+  ]
+}

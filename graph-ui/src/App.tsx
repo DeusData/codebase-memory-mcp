@@ -2,31 +2,35 @@ import { useCallback, useEffect, useState } from "react";
 import { GraphTab } from "./components/GraphTab";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
+import { DiagramsTab } from "./components/DiagramsTab";
 import type { TabId } from "./lib/types";
 import { useUiMessages } from "./lib/i18n";
 
-const TAB_IDS: TabId[] = ["graph", "stats", "control"];
+const TAB_IDS: TabId[] = ["graph", "stats", "control", "diagrams"];
 
 interface RouteState {
   tab: TabId;
   project: string | null;
+  diagram: string | null;
 }
 
-/* Read the active tab + selected project from the URL query string so the
+/* Read the active tab + selected project + diagram from the URL query string so the
  * current view survives refreshes and can be bookmarked or shared. */
 function readRoute(): RouteState {
   const params = new URLSearchParams(window.location.search);
   const rawTab = params.get("tab");
   const tab = TAB_IDS.includes(rawTab as TabId) ? (rawTab as TabId) : "stats";
   const project = params.get("project");
-  return { tab, project: project ? project : null };
+  const diagram = params.get("diagram");
+  return { tab, project: project ? project : null, diagram: diagram ? diagram : null };
 }
 
 /* Build the canonical URL for a route, preserving the path and hash. */
-function routeUrl(tab: TabId, project: string | null): string {
+function routeUrl(tab: TabId, project: string | null, diagram: string | null = null): string {
   const params = new URLSearchParams();
   params.set("tab", tab);
   if (project) params.set("project", project);
+  if (diagram && tab === "diagrams") params.set("diagram", diagram);
   return `${window.location.pathname}?${params.toString()}${window.location.hash}`;
 }
 
@@ -34,7 +38,7 @@ export function App() {
   const t = useUiMessages();
   const [route, setRoute] = useState<RouteState>(readRoute);
   const [version, setVersion] = useState<string | null>(null);
-  const { tab: activeTab, project: selectedProject } = route;
+  const { tab: activeTab, project: selectedProject, diagram: activeDiagram } = route;
 
   useEffect(() => {
     let cancelled = false;
@@ -54,7 +58,7 @@ export function App() {
   /* Normalize the URL on first load so it always carries the current route. */
   useEffect(() => {
     const initial = readRoute();
-    window.history.replaceState(null, "", routeUrl(initial.tab, initial.project));
+    window.history.replaceState(null, "", routeUrl(initial.tab, initial.project, initial.diagram));
   }, []);
 
   /* Sync state when the user navigates with the browser back/forward buttons. */
@@ -65,18 +69,22 @@ export function App() {
   }, []);
 
   /* Change the route and push a history entry (skips no-op navigations). */
-  const navigate = useCallback((tab: TabId, project: string | null) => {
-    const url = routeUrl(tab, project);
-    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    if (url === current) return;
-    window.history.pushState(null, "", url);
-    setRoute({ tab, project });
-  }, []);
+  const navigate = useCallback(
+    (tab: TabId, project: string | null, diagram: string | null = null) => {
+      const url = routeUrl(tab, project, diagram);
+      const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      if (url === current) return;
+      window.history.pushState(null, "", url);
+      setRoute({ tab, project, diagram });
+    },
+    []
+  );
 
   const tabs: { id: TabId; label: string }[] = [
-    { id: "graph", label: t.tabs.graph },
-    { id: "stats", label: t.tabs.projects },
     { id: "control", label: t.tabs.control },
+    { id: "stats", label: t.tabs.projects },
+    { id: "diagrams", label: t.tabs.diagrams },
+    { id: "graph", label: t.tabs.graph },
   ];
 
   return (
@@ -106,7 +114,13 @@ export function App() {
               return (
                 <button
                   key={tab.id}
-                  onClick={() => navigate(tab.id, tab.id === "stats" ? null : selectedProject)}
+                  onClick={() =>
+                    navigate(
+                      tab.id,
+                      tab.id === "stats" ? null : selectedProject,
+                      tab.id === "diagrams" ? activeDiagram : null
+                    )
+                  }
                   disabled={disabled}
                   title={disabled ? "Select a project first" : undefined}
                   className={`px-3 py-1 rounded-md text-[12px] font-medium transition-all ${
@@ -148,6 +162,11 @@ export function App() {
           <GraphTab project={selectedProject} />
         ) : activeTab === "control" ? (
           <ControlTab />
+        ) : activeTab === "diagrams" ? (
+          <DiagramsTab
+            initialDiagram={activeDiagram}
+            onSelectDiagram={(d) => navigate("diagrams", selectedProject, d)}
+          />
         ) : (
           <StatsTab
             onSelectProject={(p) => navigate("graph", p)}

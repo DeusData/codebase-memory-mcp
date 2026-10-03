@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "MCP Tool Call Request Sequence (export_diagram)",
+    "output": "Diagrams/sequence-export-diagram.html",
+    "viewBox": [1080, 600],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    { "id": "agent", "type": "external", "label": "AI Agent", "sublabel": "Cursor / Claude Code" },
+    { "id": "mcp", "type": "frontend", "label": "MCP Server", "sublabel": "stdio JSON-RPC 2.0" },
+    { "id": "store", "type": "database", "label": "SQLite Store", "sublabel": "in-memory WAL cache" },
+    { "id": "dispatcher", "type": "backend", "label": "Diagram Engine", "sublabel": "diagram.c dispatcher" },
+    { "id": "planner", "type": "backend", "label": "Sequence Planner", "sublabel": "query_sequence.c" },
+    { "id": "emitter", "type": "backend", "label": "Mermaid Emitter", "sublabel": "emit_mermaid.c" }
+  ],
+  "segments": [
+    { "from": 140, "to": 240, "label": "Request & Store Validation" },
+    { "from": 250, "to": 375, "label": "AST Call-Graph Traversal" },
+    { "from": 385, "to": 465, "label": "Mermaid & Vector Synthesis" }
+  ],
+  "messages": [
+    { "id": "m1", "from": "agent", "to": "mcp", "y": 160, "label": "tools/call: export_diagram(type=\"sequence\", format=\"mermaid\")", "variant": "emphasis" },
+    { "id": "m2", "from": "mcp", "to": "store", "y": 190, "label": "verify_project_indexed(store, project)", "variant": "security" },
+    { "id": "m3", "from": "store", "to": "mcp", "y": 218, "label": "indexed & verified (nodes > 0, WAL ready)", "variant": "return" },
+    { "id": "m4", "from": "mcp", "to": "dispatcher", "y": 260, "label": "cbm_diagram_generate(store, &opts, &res)", "variant": "default" },
+    { "id": "m5", "from": "dispatcher", "to": "planner", "y": 288, "label": "cbm_diagram_query_sequence(store, opts, &trace)", "variant": "emphasis" },
+    { "id": "m6", "from": "planner", "to": "store", "y": 316, "label": "SELECT caller, callee FROM call_edges WHERE depth <= 3", "variant": "default" },
+    { "id": "m7", "from": "store", "to": "planner", "y": 342, "label": "indexed call graph rows (<0.5ms)", "variant": "return" },
+    { "id": "m8", "from": "planner", "to": "dispatcher", "y": 366, "label": "cbm_seq_trace_t trace populated", "variant": "return" },
+    { "id": "m9", "from": "dispatcher", "to": "emitter", "y": 395, "label": "cbm_diagram_emit_mermaid_sequence(&trace)", "variant": "emphasis" },
+    { "id": "m10", "from": "emitter", "to": "mcp", "y": 420, "label": "serialized Mermaid DSL / SVG buffer", "variant": "return" },
+    { "id": "m11", "from": "mcp", "to": "agent", "y": 445, "label": "JSON-RPC result (nodes_analyzed, content, <1ms)", "variant": "emphasis" }
+  ],
+  "activations": [
+    { "participant": "mcp", "from": 160, "to": 450, "type": "frontend" },
+    { "participant": "store", "from": 190, "to": 224, "type": "database" },
+    { "participant": "dispatcher", "from": 260, "to": 425, "type": "backend" },
+    { "participant": "planner", "from": 288, "to": 370, "type": "backend" },
+    { "participant": "store", "from": 316, "to": 346, "type": "database" },
+    { "participant": "emitter", "from": 395, "to": 424, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Sub-millisecond Synthesis",
+      "items": [
+        "In-memory SQLite WAL store evaluates recursive call graph queries in <1ms without disk I/O",
+        "Direct AST traversal resolves multi-hop caller/callee relationships with deterministic cycle bounds",
+        "Zero external CLI dependencies or shell execution required during diagram generation"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Multi-Format Vector Emission",
+      "items": [
+        "Synthesizes standard Mermaid sequence DSL, Graphviz DOT, or standalone SVG vectors natively in C99",
+        "Automatic layout calculation computes lifelines, message coordinates, and activation blocks",
+        "Result payload includes nodes_analyzed and edges_traversed metrics for token-optimized LLM consumption"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Zero-Copy State Verification",
+      "items": [
+        "Verifies project index coverage and cohort generation locks before initiating diagram generation",
+        "Protects against synthesizing diagrams from half-indexed tables during background Git watcher updates",
+        "Robust error boundaries report detailed diagnostics if entry point symbols cannot be resolved"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "b736ba81-ef57-429c-9980-41ba3c7fb891",
+  "status": "current",
+  "command": "deliver",
+  "type": "dataflow",
+  "input": "C:\\AI\\Source\\storm\\Diagrams\\specs\\dataflow.json",
+  "output": "C:\\AI\\Source\\storm\\Diagrams\\dataflow-code-to-graph.html",
+  "specification": {
+    "sha256": "ccdfd400897278c2859255dfbb47b3241cc32155e26ee5a09e7313e1dc35441c",
+    "bytes": 5271
+  },
+  "artifact": {
+    "sha256": "39aa067b5d4d2895d03e59894b0a6ab8796e2d498753fd0b9ef9dc380faf190a",
+    "bytes": 768602
+  }
+}

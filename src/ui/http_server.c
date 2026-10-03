@@ -637,14 +637,19 @@ static void handle_processes(cbm_http_conn_t *c) {
                         }
                     }
 
+                    double cpu_pct = 0.0;
+                    if (elapsed_sec > 0) {
+                        cpu_pct = ((cpu_user + cpu_sys) / (double)elapsed_sec) * 100.0;
+                    }
+
                     if (proc_count > 0)
                         buf[pos++] = ',';
                     http_appendf(buf, sizeof(buf), &pos,
-                                 "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
+                                 "{\"pid\":%lu,\"cpu\":%.1f,\"cpu_time_s\":%.1f,\"rss_mb\":%.1f,"
                                  "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
                                  "\"command\":\"codebase-memory-mcp\","
                                  "\"is_self\":%s}",
-                                 pe.th32ProcessID, cpu_user + cpu_sys,
+                                 pe.th32ProcessID, cpu_pct, cpu_user + cpu_sys,
                                  (double)proc_rss / (1024.0 * 1024.0),
                                  elapsed_sec / 86400,
                                  (elapsed_sec % 86400) / 3600,

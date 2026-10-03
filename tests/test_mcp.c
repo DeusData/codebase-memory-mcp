@@ -1362,7 +1362,7 @@ TEST(mcp_metadata_byte_budget) {
     /* 15 KiB covered the lean surface at the branch point; get_file_outline,
      * compare_graphs, manage_adr set_sections, and the search_code debug and
      * list_projects include_details parameters landed on main since. */
-    ASSERT_LT((int)strlen(json), 18 * 1024);
+    ASSERT_LT((int)strlen(json), 20 * 1024);
 
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(doc);
@@ -1418,6 +1418,7 @@ TEST(mcp_tools_have_behavior_annotations) {
          * nothing, so it is read-only and idempotent until edge creation
          * actually lands (#2118). */
         {"ingest_traces", true, false, true, false},
+        {"export_diagram", true, false, true, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -2065,7 +2066,7 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
         "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
         "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
         "search_code",      "list_projects",    "index_status",   "check_index_coverage",
-        "detect_changes",
+        "detect_changes",   "export_diagram",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
     for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {

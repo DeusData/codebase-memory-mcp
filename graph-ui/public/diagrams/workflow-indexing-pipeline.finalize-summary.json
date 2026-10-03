@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "workflow",
+  "quality": "showcase",
+  "specification": {
+    "path": "C:\\AI\\Source\\storm\\Diagrams\\specs\\workflow.json",
+    "sha256": "0b51722015c5f561f5081e42bac5ea44ada2aaf5ce782da4fe4e206e880676c8",
+    "bytes": 4678
+  },
+  "artifact": {
+    "path": "C:\\AI\\Source\\storm\\Diagrams\\workflow-indexing-pipeline.html",
+    "sha256": "3e5d17461dc53e08702d1504f97aad77f4a6809ee8dc5761c10eb08530514f7c",
+    "bytes": 763325
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "C:\\AI\\Source\\storm\\Diagrams\\workflow-indexing-pipeline.finalize.json",
+    "summaryReceipt": "C:\\AI\\Source\\storm\\Diagrams\\workflow-indexing-pipeline.finalize-summary.json",
+    "browserCheckReceipt": "C:\\AI\\Source\\storm\\Diagrams\\workflow-indexing-pipeline.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.0.1",
+    "availableVersion": "3.0.1",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-01T08:48:49.371Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 6488,
+  "visualReviewRecommendation": {
+    "action": "inspect-route-readability",
+    "signals": {
+      "routesOverSuggestedBends": 1,
+      "routesOverSuggestedStretch": 1
+    },
+    "reason": "Automated gates passed, but crossings or detours still need perceptual review before claiming visual quality.",
+    "affectedRoutes": {
+      "crossings": [],
+      "detours": [
+        {
+          "relationship": {
+            "id": "e-lsp-buf",
+            "from": "hybrid_lsp",
+            "to": "graph_buffer",
+            "label": "semantic edges",
+            "collectionIndex": 5,
+            "artifactIndex": 6
+          },
+          "bends": 3,
+          "stretch": 1.433
+        }
+      ],
+      "truncated": false
+    },
+    "hints": [
+      "hybrid_lsp → graph_buffer needs 3 bends: move node hybrid_lsp or graph_buffer so they share a row or column with matching centers, or sit diagonally with a clear corner."
+    ],
+    "repair": "Trace these relationships at the desktop viewport. For Architecture, use references/architecture-layout-repair.md: reflow a blocked main path or tangled connected scene, and repair an isolated defect locally only when the surrounding composition is accepted. Preserve all semantic content and user-fixed geometry. Rerun finalize once after the edit."
+  }
+}

@@ -8,6 +8,7 @@ export const messages = {
       graph: "Graph",
       projects: "Projects",
       control: "Control",
+      diagrams: "Diagrams",
     },
     common: {
       cancel: "Cancel",
@@ -79,6 +80,7 @@ export const messages = {
       graph: "图谱",
       projects: "项目",
       control: "控制",
+      diagrams: "架构图",
     },
     common: {
       cancel: "取消",

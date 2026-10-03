@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "c05bf8cc-abdc-41c5-b2a7-84b2e74aace9",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\AI\\Source\\storm\\Diagrams\\specs\\architecture.json",
+  "output": "C:\\AI\\Source\\storm\\Diagrams\\architecture.html",
+  "specification": {
+    "sha256": "dda8074f3138e5495d5e92510d681c7e69cecb0e16d6955d48f0e49f366a71ce",
+    "bytes": 7439
+  },
+  "artifact": {
+    "sha256": "22e9f81c3e5e2c32e10e944e1181b6eccc663a79c7548eed5d67a416a6bb38b2",
+    "bytes": 769751
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "1ab58899-ca52-44d0-9548-03a0393ec3f8",
+  "status": "current",
+  "command": "deliver",
+  "type": "lifecycle",
+  "input": "C:\\AI\\Source\\storm\\Diagrams\\specs\\lifecycle.json",
+  "output": "C:\\AI\\Source\\storm\\Diagrams\\lifecycle-indexing-state.html",
+  "specification": {
+    "sha256": "7b449e28f1826d2bfeeeec61270d6600d2182ee4326214ad6bf4c333670e86f4",
+    "bytes": 4366
+  },
+  "artifact": {
+    "sha256": "3f0cc78bc46bbbc2e4792c27d896b2984886544a839f30cbc6bcec0195e99bc1",
+    "bytes": 770533
+  }
+}

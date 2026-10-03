@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "MCP Tool Call Request Sequence (trace_path)",
+    "output": "Diagrams/sequence-tool-call.html",
+    "viewBox": [1080, 600],
+    "column_fit": "spread",
+    "animation": "trace",
+    "quality_profile": "showcase"
+  },
+  "participants": [
+    { "id": "agent", "type": "external", "label": "AI Agent", "sublabel": "Cursor / Claude Code" },
+    { "id": "mcp", "type": "frontend", "label": "MCP Server", "sublabel": "stdio JSON-RPC 2.0" },
+    { "id": "daemon", "type": "backend", "label": "Daemon", "sublabel": "per-account IPC" },
+    { "id": "cypher", "type": "backend", "label": "Cypher Planner", "sublabel": "AST to SQL translator" },
+    { "id": "store", "type": "database", "label": "SQLite Store", "sublabel": "in-memory WAL cache" },
+    { "id": "ui", "type": "frontend", "label": "3D Visualizer", "sublabel": "localhost:9749" }
+  ],
+  "segments": [
+    { "from": 140, "to": 240, "label": "Request & Lock Check" },
+    { "from": 250, "to": 370, "label": "Cypher Planning & BFS Traversal" },
+    { "from": 380, "to": 470, "label": "UI Broadcast & Agent Return" }
+  ],
+  "messages": [
+    { "id": "m1", "from": "agent", "to": "mcp", "y": 160, "label": "tools/call: trace_path(OrderHandler)", "variant": "emphasis" },
+    { "id": "m2", "from": "mcp", "to": "daemon", "y": 190, "label": "check project lock & cohort generation", "variant": "security" },
+    { "id": "m3", "from": "daemon", "to": "mcp", "y": 218, "label": "lock active (cohort v0.11)", "variant": "return" },
+    { "id": "m4", "from": "mcp", "to": "cypher", "y": 260, "label": "MATCH (n)-[r:CALLS*1..3]->(target) ...", "variant": "default" },
+    { "id": "m5", "from": "cypher", "to": "store", "y": 290, "label": "SELECT edges, nodes WHERE target_id=...", "variant": "emphasis" },
+    { "id": "m6", "from": "store", "to": "cypher", "y": 320, "label": "indexed rows (<0.4ms)", "variant": "return" },
+    { "id": "m7", "from": "cypher", "to": "mcp", "y": 348, "label": "structured call graph", "variant": "return" },
+    { "id": "m8", "from": "mcp", "to": "ui", "y": 385, "label": "POST /rpc: highlight active path", "variant": "dashed" },
+    { "id": "m9", "from": "mcp", "to": "agent", "y": 420, "label": "JSON-RPC result (~350 tokens)", "variant": "emphasis" }
+  ],
+  "activations": [
+    { "participant": "mcp", "from": 160, "to": 425, "type": "frontend" },
+    { "participant": "daemon", "from": 190, "to": 224, "type": "backend" },
+    { "participant": "cypher", "from": 260, "to": 354, "type": "backend" },
+    { "participant": "store", "from": 290, "to": 326, "type": "database" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Sub-millisecond Queries",
+      "items": [
+        "In-memory SQLite with prepared statement caching returns graph traversals in <1ms",
+        "Cypher queries are parsed and translated directly into optimized recursive SQL",
+        "Zero disk seek penalty during active query evaluation"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Token Optimization",
+      "items": [
+        "Replaces dozens of multi-file grep and cat calls with one focused graph query",
+        "Output is formatted with compact JSON schemas designed specifically for LLM context windows",
+        "Average 99% reduction in tokens consumed during codebase navigation"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Daemon Concurrency Guard",
+      "items": [
+        "Daemon verifies project lock generation before running query",
+        "Ensures reader queries never read half-written tables during active index passes",
+        "Recovers transparently from crashed or dead peer process locks"
+      ]
+    }
+  ]
+}

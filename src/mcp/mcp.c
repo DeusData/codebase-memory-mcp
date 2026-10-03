@@ -80,6 +80,7 @@ enum {
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "diagram/diagram.h"
 
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
@@ -679,6 +680,17 @@ static const tool_def_t TOOLS[] = {
      "\"default\":2000000}},\"required\":[\"base_project\",\"target_project\"],"
      "\"additionalProperties\":false}"},
 
+    {"export_diagram",
+     "Generate deterministic architecture, sequence, dataflow, or package dependency diagrams directly from the knowledge graph. Returns Mermaid syntax, DOT, or SVG.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"type\":{\"type\":\"string\",\"enum\":[\"architecture\",\"sequence\",\"dataflow\",\"dependencies\"],\"description\":\"The category of diagram to construct.\"},"
+     "\"project\":{\"type\":\"string\",\"description\":\"Target project name.\"},"
+     "\"entry_point\":{\"type\":\"string\",\"description\":\"Target symbol or route for sequence/dataflow diagrams.\"},"
+     "\"scope_path\":{\"type\":\"string\",\"description\":\"Optional folder prefix to constrain scope.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"mermaid\",\"dot\",\"svg\"],\"default\":\"mermaid\",\"description\":\"Output syntax format.\"},"
+     "\"max_depth\":{\"type\":\"integer\",\"default\":3,\"minimum\":1,\"maximum\":8,\"description\":\"Maximum call stack traversal depth for sequence diagrams.\"}"
+     "},\"required\":[\"type\"]}"},
+
     {"get_architecture",
      "Compact counts, languages, packages, entry points. Request structure, dependencies, "
      "routes, hotspots, boundaries, layers, clusters, cycles, or file_tree; path scopes a "
@@ -850,6 +862,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"get_graph_schema", true, false, true, false},
     {"compare_graphs", true, false, true, false},
     {"get_architecture", true, false, true, false},
+    {"export_diagram", true, false, true, false},
     {"search_code", true, false, true, false},
     {"list_projects", true, false, true, false},
     {"delete_project", false, true, true, false},
@@ -915,7 +928,7 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
         "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
         "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
         "search_code",      "list_projects",    "index_status",   "check_index_coverage",
-        "detect_changes",
+        "detect_changes",   "export_diagram",
     };
     static const char *const scout_tools[] = {
         "search_graph",     "trace_path",    "get_code_snippet", "get_file_outline",
@@ -8148,6 +8161,100 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *result = cbm_mcp_text_result(json, false);
     free(json);
     return result;
+}
+
+static char *handle_export_diagram(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store && srv && srv->store) {
+        store = srv->store;
+    }
+    REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed && srv && srv->store == store && cbm_store_count_nodes(store, project) > 0) {
+        free(not_indexed);
+        not_indexed = NULL;
+    }
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
+    char *type_str = cbm_mcp_get_string_arg(args, "type");
+    if (!type_str || type_str[0] == '\0') {
+        free(project);
+        free(type_str);
+        return cbm_mcp_text_result("missing required argument: type (architecture, sequence, dataflow, dependencies)", true);
+    }
+
+    cbm_diagram_type_t diag_type = cbm_diagram_parse_type(type_str);
+    if (diag_type == CBM_DIAGRAM_UNKNOWN) {
+        char err[CBM_SZ_256];
+        snprintf(err, sizeof(err), "invalid diagram type '%s'. Expected architecture, sequence, dataflow, or dependencies", type_str);
+        free(project);
+        free(type_str);
+        return cbm_mcp_text_result(err, true);
+    }
+
+    char *entry_point = cbm_mcp_get_string_arg(args, "entry_point");
+    char *scope_path = cbm_mcp_get_string_arg(args, "scope_path");
+    char *format_str = cbm_mcp_get_string_arg(args, "format");
+    int max_depth = cbm_mcp_get_int_arg(args, "max_depth", 3);
+
+    cbm_diagram_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.type = diag_type;
+    opts.format = cbm_diagram_parse_format(format_str);
+    opts.project = project;
+    opts.entry_point = entry_point;
+    opts.scope_path = scope_path;
+    opts.max_depth = max_depth;
+    opts.max_participants = 8;
+
+    cbm_diagram_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    int rc = cbm_diagram_generate(store, &opts, &res);
+    if (rc != 0 || !res.content) {
+        char err[CBM_SZ_512];
+        snprintf(err, sizeof(err), "diagram generation failed: %s",
+                 res.errbuf[0] ? res.errbuf : "unknown error");
+        cbm_diagram_result_free(&res);
+        free(project);
+        free(type_str);
+        free(entry_point);
+        free(scope_path);
+        free(format_str);
+        return cbm_mcp_text_result(err, true);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_str(doc, root, "diagram_type", cbm_diagram_type_name(opts.type));
+    yyjson_mut_obj_add_str(doc, root, "format", cbm_diagram_format_name(opts.format));
+    if (entry_point && entry_point[0] != '\0') {
+        yyjson_mut_obj_add_str(doc, root, "entry_point", entry_point);
+    }
+    yyjson_mut_obj_add_int(doc, root, "nodes_analyzed", res.nodes_analyzed);
+    yyjson_mut_obj_add_int(doc, root, "edges_traversed", res.edges_traversed);
+    yyjson_mut_obj_add_str(doc, root, "content", res.content);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    cbm_diagram_result_free(&res);
+    free(project);
+    free(type_str);
+    free(entry_point);
+    free(scope_path);
+    free(format_str);
+
+    char *mcp_res = cbm_mcp_text_result(json, false);
+    free(json);
+    return mcp_res;
 }
 
 /* Resolve edge types from args: explicit array > mode-based > default ("CALLS").
@@ -17767,6 +17874,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+    if (strcmp(tool_name, "export_diagram") == 0) {
+        return handle_export_diagram(srv, args_json);
     }
 
     /* Pipeline-dependent tools */

@@ -776,8 +776,15 @@ TEST(daemon_application_mcp_notification_has_no_response) {
         encoded ? app_test_request(&callbacks, session, context, context_length, &response,
                                    &response_length)
                 : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
     free(response);
     response = (uint8_t *)(uintptr_t)1;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     response_length = UINT32_MAX;
     cbm_daemon_runtime_application_status_t notification_status =
         encoded ? app_test_request(&callbacks, session, notification, notification_length,

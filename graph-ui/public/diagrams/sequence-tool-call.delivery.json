@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "a31f15c8-c564-4a15-a888-95a4da4f72bd",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "C:\\AI\\Source\\storm\\Diagrams\\specs\\sequence.json",
+  "output": "C:\\AI\\Source\\storm\\Diagrams\\sequence-tool-call.html",
+  "specification": {
+    "sha256": "e8d3e406c7a98e8a724cb67fc4097c811a1287b3a6272836d389c6143cc4f8b6",
+    "bytes": 3713
+  },
+  "artifact": {
+    "sha256": "38bc41b64a66c35b5d1cca741805287372b07c617f9b33602b08aba7b13ff655",
+    "bytes": 758479
+  }
+}
