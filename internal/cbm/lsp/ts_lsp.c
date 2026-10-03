@@ -1391,12 +1391,8 @@ static const CBMScope *ts_scope_binding_owner(const CBMScope *scope, const char 
         return NULL;
     }
     for (const CBMScope *s = scope; s; s = s->parent) {
-        for (const CBMScopeChunk *chunk = s->chunks; chunk; chunk = chunk->next) {
-            for (int i = 0; i < chunk->used; i++) {
-                if (chunk->bindings[i].name && strcmp(chunk->bindings[i].name, name) == 0) {
-                    return s;
-                }
-            }
+        if (cbm_scope_lookup_local(s, name)) {
+            return s;
         }
     }
     return NULL;

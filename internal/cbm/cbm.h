@@ -310,6 +310,79 @@ typedef struct {
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
 } CBMImport;
 
+/* Content-only ordered Python namespace facts; no resolved target identities. */
+#define CBM_PY_NAMESPACE_FACTS_VERSION 1u
+
+typedef enum {
+    CBM_PY_NS_NOT_CAPTURED = 0,
+    CBM_PY_NS_NOT_APPLICABLE = 1,
+    CBM_PY_NS_COMPLETE = 2,
+    CBM_PY_NS_INCOMPLETE = 3
+} CBMPyNamespaceStatus;
+typedef enum {
+    CBM_PY_NS_FAILURE_NONE = 0,
+    CBM_PY_NS_FAILURE_INVALID_INPUT = 1,
+    CBM_PY_NS_FAILURE_ALLOCATION = 2,
+    CBM_PY_NS_FAILURE_LIMIT = 3
+} CBMPyNamespaceFailure;
+typedef enum {
+    CBM_PY_NS_OWN_DEF = 1,
+    CBM_PY_NS_IMPORT_MODULE = 2,
+    CBM_PY_NS_IMPORT_NAME = 3,
+    CBM_PY_NS_IMPORT_STAR = 4,
+    CBM_PY_NS_SHADOW = 5,
+    CBM_PY_NS_DELETE = 6,
+    CBM_PY_NS_UNKNOWN = 7,
+    CBM_PY_NS_ALL_SET = 8,
+    CBM_PY_NS_ALL_APPEND = 9,
+    CBM_PY_NS_ALL_UNKNOWN = 10,
+    CBM_PY_NS_ALL_DELETE = 11
+} CBMPyNamespaceFactKind;
+typedef enum {
+    CBM_PY_NS_DEF_NONE = 0,
+    CBM_PY_NS_DEF_FUNCTION = 1,
+    CBM_PY_NS_DEF_CLASS = 2
+} CBMPyNamespaceDefKind;
+typedef enum {
+    CBM_PY_NS_SEQUENCE_NONE = 0,
+    CBM_PY_NS_SEQUENCE_LIST = 1,
+    CBM_PY_NS_SEQUENCE_TUPLE = 2
+} CBMPyNamespaceSequenceKind;
+typedef enum {
+    CBM_PY_NS_REASON_NONE = 0,
+    CBM_PY_NS_REASON_VALUE = 1,
+    CBM_PY_NS_REASON_DECORATED = 2,
+    CBM_PY_NS_REASON_UNPROVEN_CLASS = 3,
+    CBM_PY_NS_REASON_COMPOUND = 4,
+    CBM_PY_NS_REASON_EFFECT = 5,
+    CBM_PY_NS_REASON_UNSUPPORTED = 6,
+    CBM_PY_NS_REASON_PARSE = 7
+} CBMPyNamespaceUnknownReason;
+enum { CBM_PY_NS_IMPORT_BINDS_ROOT = 1u << 0 };
+
+typedef struct {
+    CBMPyNamespaceFactKind kind;
+    CBMPyNamespaceDefKind def_kind;
+    CBMPyNamespaceSequenceKind sequence_kind;
+    CBMPyNamespaceUnknownReason reason;
+    uint32_t flags;
+    uint32_t relative_level;
+    const char *local_name;
+    const char *module_name;
+    const char *member_name;
+    const char **names;
+    int name_count;
+} CBMPyNamespaceFact;
+typedef struct {
+    uint32_t version;
+    CBMLanguage language;
+    CBMPyNamespaceStatus status;
+    CBMPyNamespaceFailure failure;
+    CBMPyNamespaceFact *items;
+    int count;
+    int cap;
+} CBMPyNamespaceFacts;
+
 typedef enum {
     CBM_USAGE_VALUE = 0,
     CBM_USAGE_CALL_REFERENCE,
@@ -405,6 +478,17 @@ typedef struct {
     CBMChannelDirection direction;
 } CBMChannel;
 
+/* Python: one annotated instance field of a class -- `x: T` or `x: T = v` in
+ * the class body, `self.x: T = v` in __init__, or `self.x = p` where `p` is an
+ * annotated __init__ parameter. Not a graph node: it only carries the field's
+ * declared type to the cross-file LSP, so `obj.x.m()` on a class imported
+ * from another file can be typed (#1277). */
+typedef struct {
+    const char *class_qn;   // QN of the owning class
+    const char *field_name; // attribute name
+    const char *type_text;  // raw annotation text, resolved later per file
+} CBMFieldType;
+
 // Rust: impl Trait for Struct
 typedef struct {
     const char *trait_name;  // trait name (raw text)
@@ -438,6 +522,15 @@ typedef struct {
     int count;
     int cap;
 } CBMResolvedCallArray;
+
+/* Refinement status: existing parser/no-op exits are separate from these
+ * explicit evaluator failures. The caller retains prior completed output. */
+typedef enum {
+    CBM_LSP_COMPLETE = 0,
+    CBM_LSP_MEMO_FAILED,
+    CBM_LSP_DEPTH_EXCEEDED,
+    CBM_LSP_SCOPE_FAILED,
+} CBMLSPStatus;
 
 // Growable arrays used during extraction.
 typedef struct {
@@ -518,6 +611,12 @@ typedef struct {
     int cap;
 } CBMChannelArray;
 
+typedef struct {
+    CBMFieldType *items;
+    int count;
+    int cap;
+} CBMFieldTypeArray;
+
 // Full extraction result for one file.
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
@@ -525,6 +624,7 @@ typedef struct CBMFileResult {
     CBMDefArray defs;
     CBMCallArray calls;
     CBMImportArray imports;
+    CBMPyNamespaceFacts py_namespace;
     CBMUsageArray usages;
     CBMThrowArray throws;
     CBMRWArray rw;
@@ -536,6 +636,7 @@ typedef struct CBMFileResult {
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
+    CBMFieldTypeArray field_types;       // Python: annotated instance fields (#1277)
 
     const char *module_qn;      // module qualified name
     const char *namespace_name; // declared namespace/package (Java/Kotlin/C#/PHP), NULL if none
@@ -882,6 +983,15 @@ int cbm_macro_extraction_enabled(void);
 
 // --- Internal helpers used by extractors ---
 
+CBMPyNamespaceStatus cbm_extract_python_namespace_facts(CBMExtractCtx *ctx);
+bool cbm_py_namespace_facts_valid(const CBMPyNamespaceFacts *facts);
+bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *source,
+                                 CBMPyNamespaceFacts *out);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_py_namespace_test_capture_fail_after(int successful_allocations);
+void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
+#endif
+
 // Growable array push functions (arena-allocated, no individual free needed).
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
@@ -892,9 +1002,17 @@ void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
 void cbm_typerefs_push(CBMTypeRefArray *arr, CBMArena *a, CBMTypeRef tr);
 void cbm_envaccess_push(CBMEnvAccessArray *arr, CBMArena *a, CBMEnvAccess ea);
 void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta);
+void cbm_fieldtype_push(CBMFieldTypeArray *arr, CBMArena *a, CBMFieldType ft);
 void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr);
 void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBinding ib);
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1527 seam: how many of result's calls get a different innermost enclosing
+ * Function/Method from the call-context sweep than from the reference
+ * per-call scan (0 = identical), or -1 when the sweep could not allocate. */
+int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result);
+#endif
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 
@@ -947,5 +1065,10 @@ bool cbm_label_is_relation(const char *label);
 // all seed through this predicate so their registries never diverge.
 // `label` may be NULL (returns false). Defined in helpers.c.
 bool cbm_label_is_registry_symbol(const char *label);
+
+/* Python symbol scope only: callers must establish the language explicitly.
+ * A trailing .__init__ is omitted when a nonempty prefix precedes it; raw
+ * Module/file identity is unchanged. NULL returns zero. */
+size_t cbm_fqn_symbol_scope_len(const char *module_qn);
 
 #endif // CBM_H
