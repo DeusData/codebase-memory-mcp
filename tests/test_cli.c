@@ -39,6 +39,9 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -3011,8 +3014,8 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3072,8 +3075,8 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3091,6 +3094,329 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     ASSERT_EQ(fake.mutation_reserve_count, 1);
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+/* Uninstall requires a separate choice before deleting project data. Keep
+ * fixture state and activation coordination independent of the developer's
+ * installation, and validate setup before absence can count as deletion. */
+enum { UNINSTALL_INDEX_COUNT = 3, UNINSTALL_FILES_PER_INDEX = 6 };
+
+typedef struct {
+    char tmpdir[256];
+    char cache_dir[512];
+    char bin_target[640];
+    char internal_store[640];
+    char index_paths[UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX][640];
+    char index_bodies[UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX][64];
+    char *old_home;
+    char *old_cache;
+    char *old_path;
+    bool created;
+} cli_uninstall_index_fixture_t;
+
+static bool cli_uninstall_index_fixture_intact(const cli_uninstall_index_fixture_t *fx) {
+    for (int i = 0; i < UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX; i++) {
+        const char *body = read_test_file(fx->index_paths[i]);
+        if (!body || strcmp(body, fx->index_bodies[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cli_uninstall_test_file_is(const char *path, const char *expected) {
+    const char *body = read_test_file(path);
+    return body && strcmp(body, expected) == 0;
+}
+
+static bool cli_uninstall_test_absent(const char *path) {
+    struct stat st;
+    errno = 0;
+    return stat(path, &st) != 0 && errno == ENOENT;
+}
+
+static bool cli_uninstall_index_fixture_setup(cli_uninstall_index_fixture_t *fx, const char *tag) {
+    memset(fx, 0, sizeof(*fx));
+    snprintf(fx->tmpdir, sizeof(fx->tmpdir), "/tmp/cli-uninstall-%s-XXXXXX", tag);
+    if (!cbm_mkdtemp(fx->tmpdir)) {
+        return false;
+    }
+    fx->created = true;
+    cli_activation_save_env(&fx->old_home, &fx->old_cache);
+    fx->old_path = save_test_env("PATH");
+    cbm_setenv("HOME", fx->tmpdir, 1);
+    cbm_setenv("PATH", fx->tmpdir, 1);
+    snprintf(fx->cache_dir, sizeof(fx->cache_dir), "%s/cache", fx->tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", fx->cache_dir, 1);
+    const char *home = getenv("HOME");
+    const char *path = getenv("PATH");
+    const char *cache = getenv("CBM_CACHE_DIR");
+    if (!home || !path || !cache || strcmp(home, fx->tmpdir) != 0 ||
+        strcmp(path, fx->tmpdir) != 0 || strcmp(cache, fx->cache_dir) != 0) {
+        return false;
+    }
+    test_mkdirp(fx->cache_dir);
+    static const char *const suffixes[UNINSTALL_FILES_PER_INDEX] = {
+        ".db", ".db-wal", ".db-shm", ".db-journal", ".db.tmp", ".db.tmp-wal"};
+    for (int i = 0; i < UNINSTALL_INDEX_COUNT; i++) {
+        for (int j = 0; j < UNINSTALL_FILES_PER_INDEX; j++) {
+            int k = i * UNINSTALL_FILES_PER_INDEX + j;
+            snprintf(fx->index_paths[k], sizeof(fx->index_paths[k]), "%s/project-%d%s",
+                     fx->cache_dir, i, suffixes[j]);
+            snprintf(fx->index_bodies[k], sizeof(fx->index_bodies[k]), "index %d file %d %s", i, j,
+                     tag);
+            write_test_file(fx->index_paths[k], fx->index_bodies[k]);
+        }
+    }
+    snprintf(fx->internal_store, sizeof(fx->internal_store), "%s/_config.db", fx->cache_dir);
+    write_test_file(fx->internal_store, "internal store sentinel");
+    char bin_dir[512];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", fx->tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(fx->bin_target, sizeof(fx->bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(fx->bin_target, sizeof(fx->bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(fx->bin_target, "uninstall fixture binary");
+    return cli_uninstall_index_fixture_intact(fx) &&
+           cli_uninstall_test_file_is(fx->internal_store, "internal store sentinel") &&
+           cli_uninstall_test_file_is(fx->bin_target, "uninstall fixture binary");
+}
+
+static void cli_uninstall_index_fixture_teardown(cli_uninstall_index_fixture_t *fx) {
+    if (fx->created) {
+        cli_activation_restore_env(fx->old_home, fx->old_cache);
+        restore_test_env("PATH", fx->old_path);
+        test_rmdir_r(fx->tmpdir);
+    }
+}
+
+static int cli_uninstall_index_fixture_run(char **argv, int argc, int *reservations) {
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_set_auto_answer_for_test(0);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    int rc = cli_test_cmd_uninstall(argc, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    if (reservations) {
+        *reservations = fake.mutation_reserve_count;
+    }
+    return rc;
+}
+
+/* These local redirect helpers also exercise the Windows CRT descriptor path;
+ * unlike the older POSIX capture fixture, neither test is compiled out there. */
+static int cli_uninstall_redirect_stream(FILE *stream, FILE *replacement) {
+    if (stream != stdin && fflush(stream) != 0) {
+        return -1;
+    }
+#ifdef _WIN32
+    int target = _fileno(stream);
+    int saved = _dup(target);
+    if (saved >= 0 && _dup2(_fileno(replacement), target) != 0) {
+        _close(saved);
+        return -1;
+    }
+#else
+    int target = fileno(stream);
+    int saved = dup(target);
+    if (saved >= 0 && dup2(fileno(replacement), target) < 0) {
+        close(saved);
+        return -1;
+    }
+#endif
+    clearerr(stream);
+    return saved;
+}
+
+static bool cli_uninstall_restore_stream(FILE *stream, int saved) {
+    if (saved < 0) {
+        return false;
+    }
+    bool flushed = stream == stdin || fflush(stream) == 0;
+#ifdef _WIN32
+    bool restored = _dup2(saved, _fileno(stream)) == 0;
+    _close(saved);
+#else
+    bool restored = dup2(saved, fileno(stream)) >= 0;
+    close(saved);
+#endif
+    clearerr(stream);
+    return flushed && restored;
+}
+
+static bool cli_uninstall_capture_text(FILE *file, char *out, size_t capacity) {
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        return false;
+    }
+    size_t n = fread(out, 1, capacity - 1, file);
+    out[n] = '\0';
+    return !ferror(file);
+}
+
+TEST(cli_uninstall_auto_answers_keep_indexes_without_delete_indexes) {
+    char *answers[] = {"--yes", "-y", "--no", "-n"};
+    for (size_t i = 0; i < sizeof(answers) / sizeof(answers[0]); i++) {
+        cli_uninstall_index_fixture_t fx;
+        if (!cli_uninstall_index_fixture_setup(&fx, "keep")) {
+            cli_uninstall_index_fixture_teardown(&fx);
+            FAIL("uninstall fixture setup failed");
+        }
+        char *argv[] = {answers[i]};
+        int rc = cli_uninstall_index_fixture_run(argv, 1, NULL);
+        bool kept = cli_uninstall_index_fixture_intact(&fx);
+        bool binary_gone = cli_uninstall_test_absent(fx.bin_target);
+        bool internal_kept =
+            cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+        cli_uninstall_index_fixture_teardown(&fx);
+        ASSERT_EQ(rc, 0);
+        ASSERT_TRUE(kept);
+        ASSERT_TRUE(binary_gone);
+        ASSERT_TRUE(internal_kept);
+    }
+    PASS();
+}
+
+TEST(cli_uninstall_delete_indexes_is_explicit_and_overrides_no) {
+    char *argvs[][2] = {{"--delete-indexes", NULL},
+                        {"--yes", "--delete-indexes"},
+                        {"--no", "--delete-indexes"},
+                        {"--delete-indexes", "--no"}};
+    for (size_t i = 0; i < sizeof(argvs) / sizeof(argvs[0]); i++) {
+        cli_uninstall_index_fixture_t fx;
+        if (!cli_uninstall_index_fixture_setup(&fx, "delete")) {
+            cli_uninstall_index_fixture_teardown(&fx);
+            FAIL("uninstall fixture setup failed");
+        }
+        int reservations = 0;
+        int rc = cli_uninstall_index_fixture_run(argvs[i], i == 0 ? 1 : 2, &reservations);
+        bool absent = true;
+        for (int k = 0; k < UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX; k++) {
+            absent = cli_uninstall_test_absent(fx.index_paths[k]) && absent;
+        }
+        bool binary_gone = cli_uninstall_test_absent(fx.bin_target);
+        bool internal_kept =
+            cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+        cli_uninstall_index_fixture_teardown(&fx);
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(reservations, 1);
+        ASSERT_TRUE(absent);
+        ASSERT_TRUE(binary_gone);
+        ASSERT_TRUE(internal_kept);
+    }
+    PASS();
+}
+
+TEST(cli_uninstall_delete_indexes_dry_run_keeps_files) {
+    cli_uninstall_index_fixture_t fx;
+    if (!cli_uninstall_index_fixture_setup(&fx, "dry")) {
+        cli_uninstall_index_fixture_teardown(&fx);
+        FAIL("uninstall fixture setup failed");
+    }
+    FILE *output = tmpfile();
+    int saved = output ? cli_uninstall_redirect_stream(stdout, output) : -1;
+    int rc = -1;
+    int reservations = -1;
+    if (saved >= 0) {
+        char *argv[] = {"--dry-run", "--delete-indexes", "--no"};
+        rc = cli_uninstall_index_fixture_run(argv, 3, &reservations);
+    }
+    bool restored = saved >= 0 && cli_uninstall_restore_stream(stdout, saved);
+    char text[8192] = "";
+    bool captured = output && cli_uninstall_capture_text(output, text, sizeof(text));
+    if (output) {
+        fclose(output);
+    }
+    bool kept = cli_uninstall_index_fixture_intact(&fx) &&
+                cli_uninstall_test_file_is(fx.bin_target, "uninstall fixture binary") &&
+                cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+    bool named = strstr(text, "indexes would be deleted") != NULL;
+    cli_uninstall_index_fixture_teardown(&fx);
+    ASSERT_TRUE(restored && captured);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(reservations, 0);
+    ASSERT_TRUE(kept);
+    ASSERT_TRUE(named);
+    PASS();
+}
+
+TEST(cli_uninstall_non_tty_affirmative_input_keeps_indexes) {
+    cli_uninstall_index_fixture_t fx;
+    if (!cli_uninstall_index_fixture_setup(&fx, "notty")) {
+        cli_uninstall_index_fixture_teardown(&fx);
+        FAIL("uninstall fixture setup failed");
+    }
+    FILE *input = tmpfile();
+    FILE *output = tmpfile();
+    FILE *errors = tmpfile();
+    bool input_ready =
+        input && fputs("y\n", input) >= 0 && fflush(input) == 0 && fseek(input, 0, SEEK_SET) == 0;
+    int saved_in = input_ready ? cli_uninstall_redirect_stream(stdin, input) : -1;
+    int saved_out = output ? cli_uninstall_redirect_stream(stdout, output) : -1;
+    int saved_err = errors ? cli_uninstall_redirect_stream(stderr, errors) : -1;
+    int rc = -1;
+    if (saved_in >= 0 && saved_out >= 0 && saved_err >= 0 && fseek(stdin, 0, SEEK_SET) == 0) {
+        char *argv[] = {"uninstall"};
+        rc = cli_uninstall_index_fixture_run(argv, 1, NULL);
+    }
+    bool restored_err = saved_err >= 0 && cli_uninstall_restore_stream(stderr, saved_err);
+    bool restored_out = saved_out >= 0 && cli_uninstall_restore_stream(stdout, saved_out);
+    bool restored_in = saved_in >= 0 && cli_uninstall_restore_stream(stdin, saved_in);
+    char out_text[8192] = "";
+    char err_text[8192] = "";
+    bool captured = output && errors &&
+                    cli_uninstall_capture_text(output, out_text, sizeof(out_text)) &&
+                    cli_uninstall_capture_text(errors, err_text, sizeof(err_text));
+    bool unread = input && fgetc(input) == 'y';
+    if (input) {
+        fclose(input);
+    }
+    if (output) {
+        fclose(output);
+    }
+    if (errors) {
+        fclose(errors);
+    }
+    bool kept = cli_uninstall_index_fixture_intact(&fx) &&
+                cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+    bool binary_gone = cli_uninstall_test_absent(fx.bin_target);
+    bool explained = strstr(out_text, "--delete-indexes") && strstr(out_text, fx.cache_dir) &&
+                     !strstr(out_text, "Delete these indexes?") &&
+                     !strstr(err_text, "requires a terminal");
+    cli_uninstall_index_fixture_teardown(&fx);
+    ASSERT_TRUE(restored_in && restored_out && restored_err && captured);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(unread);
+    ASSERT_TRUE(kept);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(explained);
+    PASS();
+}
+
+TEST(cli_uninstall_delete_indexes_help_and_invalid_options_preserve_files) {
+    char *argvs[][3] = {{"--yes", "--delete-indexes", "--help"},
+                        {"--delete-indexes", "--unknown", NULL},
+                        {"--delete-indexes", "--dir=", NULL},
+                        {"--delete-indexes", "--dir", NULL}};
+    for (size_t i = 0; i < sizeof(argvs) / sizeof(argvs[0]); i++) {
+        cli_uninstall_index_fixture_t fx;
+        if (!cli_uninstall_index_fixture_setup(&fx, "early")) {
+            cli_uninstall_index_fixture_teardown(&fx);
+            FAIL("uninstall fixture setup failed");
+        }
+        int reservations = -1;
+        int rc = cli_uninstall_index_fixture_run(argvs[i], i == 0 ? 3 : 2, &reservations);
+        bool kept = cli_uninstall_index_fixture_intact(&fx) &&
+                    cli_uninstall_test_file_is(fx.bin_target, "uninstall fixture binary") &&
+                    cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+        cli_uninstall_index_fixture_teardown(&fx);
+        ASSERT_EQ(rc, i == 0 ? 0 : 1);
+        ASSERT_EQ(reservations, 0);
+        ASSERT_TRUE(kept);
+    }
     PASS();
 }
 
@@ -3148,8 +3474,8 @@ TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails) {
     cli_fd_capture_t err_capture;
     cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
     cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *err_text = cli_fd_capture_end(&err_capture);
     char *out_text = cli_fd_capture_end(&out_capture);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -3231,8 +3557,8 @@ TEST(cli_uninstall_cleans_user_owned_symlinked_config) {
     cli_fd_capture_t err_capture;
     cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
     cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *err_text = cli_fd_capture_end(&err_capture);
     char *out_text = cli_fd_capture_end(&out_capture);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -16713,6 +17039,11 @@ SUITE(cli) {
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
+    RUN_TEST(cli_uninstall_auto_answers_keep_indexes_without_delete_indexes);
+    RUN_TEST(cli_uninstall_delete_indexes_is_explicit_and_overrides_no);
+    RUN_TEST(cli_uninstall_delete_indexes_dry_run_keeps_files);
+    RUN_TEST(cli_uninstall_non_tty_affirmative_input_keeps_indexes);
+    RUN_TEST(cli_uninstall_delete_indexes_help_and_invalid_options_preserve_files);
 #ifndef _WIN32
     RUN_TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails);
     RUN_TEST(cli_uninstall_cleans_user_owned_symlinked_config);

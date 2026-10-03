@@ -12856,6 +12856,41 @@ static int cli_uninstall_activate(void *opaque) {
     return CLI_OK;
 }
 
+/* A generic auto-answer is not consent to erase project indexes. An explicit
+ * --delete-indexes takes precedence even over --no; otherwise only a separate
+ * interactive answer can select deletion. This helper decides and reports,
+ * but all deletion remains in the final guarded uninstall activation. */
+static bool uninstall_decide_index_deletion(const char *home, bool requested, bool dry_run) {
+    int index_count = count_db_indexes(home);
+    if (index_count <= 0) {
+        return false;
+    }
+    printf("\nFound %d index(es):\n", index_count);
+    cbm_list_indexes(home);
+    bool delete_indexes = requested;
+    if (!requested) {
+        bool can_ask = g_auto_answer == 0;
+#ifdef _WIN32
+        can_ask = can_ask && _isatty(_fileno(stdin));
+#else
+        can_ask = can_ask && isatty(fileno(stdin));
+#endif
+        delete_indexes = can_ask && prompt_yn("Delete these indexes? (default: no)");
+    }
+    if (!delete_indexes) {
+        const char *cache_dir = get_cache_dir(home);
+        printf("Indexes kept in %s. To remove them, uninstall with --delete-indexes "
+               "or delete the project .db files there.\n",
+               cache_dir ? cache_dir : "the cache directory");
+        return false;
+    }
+    if (dry_run) {
+        printf("(dry-run — indexes would be deleted)\n");
+        return false;
+    }
+    return true;
+}
+
 int cbm_cmd_uninstall(int argc, char **argv) {
     /* `uninstall --help` used to UNINSTALL.
      *
@@ -12869,20 +12904,25 @@ int cbm_cmd_uninstall(int argc, char **argv) {
      * cannot auto-confirm the destruction we are trying to prevent. */
     for (int i = 0; i < argc; i++) {
         if (argv && argv[i] && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
-            printf("Usage: codebase-memory-mcp uninstall [options]\n\n"
-                   "Removes the codebase-memory-mcp binary, its agent configurations and,\n"
-                   "with confirmation, its indexes. THIS IS DESTRUCTIVE.\n\n"
-                   "Options:\n"
-                   "  --dry-run        Show what would be removed, change nothing\n"
-                   "  --dir=PATH       Uninstall from a custom install directory\n"
-                   "  -y, --yes        Do not prompt for confirmation\n"
-                   "  -h, --help       Show this help and exit\n\n"
-                   "Run with --dry-run first if you are unsure.\n");
+            printf(
+                "Usage: codebase-memory-mcp uninstall [options]\n\n"
+                "Removes the codebase-memory-mcp binary and its agent configurations.\n"
+                "THIS IS DESTRUCTIVE. Project indexes are kept by default. An interactive\n"
+                "terminal is asked separately; the default answer is to keep them.\n\n"
+                "Options:\n"
+                "  --dry-run          Show what would be removed, change nothing\n"
+                "  --dir=PATH         Uninstall from a custom install directory\n"
+                "  --delete-indexes   Also delete every project index (overrides --no)\n"
+                "  -y, --yes          Do not prompt; indexes are kept unless explicitly deleted\n"
+                "  -n, --no           Decline prompts; --delete-indexes still takes precedence\n"
+                "  -h, --help         Show this help and exit\n\n"
+                "Run with --dry-run first if you are unsure.\n");
             return CLI_OK;
         }
     }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    bool delete_indexes_requested = false;
     /* An install into a custom --dir must be removable from that same dir:
      * without this, anyone who installed outside ~/.local/bin has no supported
      * uninstall path at all. Mirrors cbm_cmd_install's parsing. */
@@ -12895,6 +12935,8 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strcmp(argv[i], "--delete-indexes") == 0) {
+            delete_indexes_requested = true;
         } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
             requested_bin_dir = argv[i] + SLEN("--dir=");
             if (!requested_bin_dir[0]) {
@@ -12926,23 +12968,9 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     agent_uninstall_failures_reset();
     cbm_detected_agents_t agents = cbm_detect_agents(home);
 
-    /* Confirm index removal outside the startup lock, but defer the mutation
-     * until the final guarded activation. Dry-run never removes indexes. */
-    bool delete_indexes = false;
-    int index_count = count_db_indexes(home);
-    if (index_count > 0) {
-        printf("\nFound %d index(es):\n", index_count);
-        cbm_list_indexes(home);
-        if (prompt_yn("Delete these indexes?")) {
-            if (dry_run) {
-                printf("(dry-run — indexes would be deleted)\n");
-            } else {
-                delete_indexes = true;
-            }
-        } else {
-            printf("Indexes kept.\n");
-        }
-    }
+    /* Decide outside the startup lock; mutate only in the final guarded
+     * activation. Dry-run never authorizes actual index removal. */
+    bool delete_indexes = uninstall_decide_index_deletion(home, delete_indexes_requested, dry_run);
 
     char bin_path_storage[CLI_BUF_1K];
     const char *bin_path = bin_path_storage;
