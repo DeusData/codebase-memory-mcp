@@ -2752,8 +2752,13 @@ static bool php_read_binding_snapshot(const cbm_gbuf_t *gbuf, const cbm_gbuf_nod
         edge_count >= 0 && (edge_count == 0 || edges);
     if (!ok)
         goto done;
-    targets = calloc(count > 0 ? (size_t)count : 1, sizeof(*targets));
-    seen = calloc(count > 0 ? (size_t)count : 1, sizeof(*seen));
+    size_t slots = count > 0 ? (size_t)count : 1;
+    if (slots > SIZE_MAX / sizeof(*targets) || slots > SIZE_MAX / sizeof(*seen)) {
+        ok = false;
+        goto done;
+    }
+    targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
+    seen = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*seen));
     if (!targets || !seen) {
         ok = false;
         goto done;
@@ -2802,7 +2807,7 @@ static bool php_read_binding_snapshot(const cbm_gbuf_t *gbuf, const cbm_gbuf_nod
                     match = i;
                 }
             }
-            if (match < 0 || (match >= 0 && ++seen[match] != 1))
+            if (match < 0 || ++seen[match] != 1)
                 ok = false;
         }
         yyjson_doc_free(edoc);
@@ -2815,8 +2820,8 @@ done:
         out->targets = targets;
         targets = NULL;
     }
-    free(targets);
-    free(seen);
+    cbm_free(CBM_MEM_CLASS_OTHER, targets);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
     yyjson_doc_free(doc);
     return ok;
 }
@@ -2833,7 +2838,10 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     int count = result->imports.count;
     if (count < 0 || (count > 0 && !result->imports.items))
         return 0;
-    const cbm_gbuf_node_t **targets = calloc(count > 0 ? (size_t)count : 1, sizeof(*targets));
+    size_t slots = count > 0 ? (size_t)count : 1;
+    if (slots > SIZE_MAX / sizeof(const cbm_gbuf_node_t *))
+        return 0;
+    const cbm_gbuf_node_t **targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
     yyjson_doc *old = old_json ? yyjson_read(old_json, strlen(old_json), 0) : NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
@@ -2927,7 +2935,7 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
 done:
     yyjson_doc_free(old);
     yyjson_mut_doc_free(doc);
-    free(targets);
+    cbm_free(CBM_MEM_CLASS_OTHER, targets);
     return written;
 }
 
@@ -2946,7 +2954,7 @@ void cbm_pipeline_php_vendor_names_build(const cbm_gbuf_t *gbuf, const char *pro
 
 void cbm_pipeline_php_vendor_names_free(cbm_php_vendor_names_t *value) {
     if (value) {
-        free(value->targets);
+        cbm_free(CBM_MEM_CLASS_OTHER, value->targets);
         memset(value, 0, sizeof(*value));
     }
 }
@@ -3064,19 +3072,21 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
         if (!namespace_name || !namespace_name[0]) {
             continue;
         }
+        char *file_qn = NULL;
+        char *key = NULL;
+        bool ok = false;
         if (!rels[i])
-            goto failed;
-        char *file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
+            goto item_done;
+        file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
         if (!file_qn) {
-            goto failed;
+            goto item_done;
         }
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(namespace_name);
+        key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, namespace_name);
         if (!key) {
-            free(file_qn);
-            goto failed;
+            goto item_done;
         }
         for (char *p = key; *p; p++) {
             if (*p == '\\' || *p == ':' || *p == '/') {
@@ -3085,25 +3095,23 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
         }
         /* Store ALL files declaring a namespace as a '\n'-delimited list so the
          * resolver can pick a non-importer sibling (see resolve loop). The hash
-         * table does not copy keys, so the strdup'd key is owned by the map and
-         * freed in ns_map_free_entry. */
+         * table does not copy keys. The map owns memory-core keys and libc
+         * values from fqn_compute or the combined allocation below. */
         if (!cbm_ht_has(map, key)) {
             cbm_ht_set(map, key, file_qn); /* map owns key + file_qn */
             /* set returns NULL for both insertion and allocation failure.
              * These lookups allocate nothing and verify ownership transfer. */
             const char *stored_key = cbm_ht_get_key(map, key);
             void *stored_value = cbm_ht_get(map, key);
-            if (stored_key != key || stored_value != file_qn) {
-                if (stored_key != key)
-                    free(key);
-                if (stored_value != file_qn)
-                    free(file_qn);
-                goto failed;
-            }
+            ok = stored_key == key && stored_value == file_qn;
+            if (stored_key == key)
+                key = NULL;
+            if (stored_value == file_qn)
+                file_qn = NULL;
         } else {
             /* Append to the existing list. Re-key with the STORED key pointer
-             * (not our fresh strdup) so the map's key pointer never changes —
-             * otherwise Verstable would adopt the new key and our free(key)
+             * (not our fresh copy) so the map's key pointer never changes —
+             * otherwise Verstable would adopt the new key and our cleanup
              * below would free the live key (use-after-free). */
             const char *stored_key = cbm_ht_get_key(map, key);
             const char *cur = (const char *)cbm_ht_get(map, key);
@@ -3111,9 +3119,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
             if (stored_key && cur) {
                 size_t cur_len = strlen(cur), file_len = strlen(file_qn);
                 if (file_len > SIZE_MAX - 2 || cur_len > SIZE_MAX - file_len - 2) {
-                    free(key);
-                    free(file_qn);
-                    goto failed;
+                    goto item_done;
                 }
                 size_t need = cur_len + 1 + file_len + 1;
                 combined = malloc(need);
@@ -3128,16 +3134,17 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
                     }
                 }
             }
-            free(key);     /* our fresh strdup — never stored */
-            free(file_qn); /* content copied into combined */
-            if (!combined)
-                goto failed;
+            ok = combined != NULL;
+        }
+    item_done:
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        free(file_qn);
+        if (!ok) {
+            cbm_pipeline_namespace_map_free(map);
+            return NULL;
         }
     }
     return map;
-failed:
-    cbm_pipeline_namespace_map_free(map);
-    return NULL;
 }
 
 /* Convenience for callers whose results are all in memory (the sequential
@@ -3166,7 +3173,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
 
 static void ns_map_free_entry(const char *key, void *value, void *ud) {
     (void)ud;
-    free((void *)key); /* strdup'd in cbm_pipeline_namespace_map_build */
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
     free(value);
 }
 

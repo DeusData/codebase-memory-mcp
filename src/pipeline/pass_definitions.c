@@ -463,23 +463,22 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
     if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
         count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
                                                      namespace_map);
-        free(file_qn);
-        return count;
-    }
-    for (int j = 0; j < result->imports.count; j++) {
-        const CBMImport *imp = &result->imports.items[j];
-        if (!imp->module_path) {
-            continue;
-        }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        if (target && target->id != source_node->id) {
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-            cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-            count++;
+    } else {
+        for (int j = 0; j < result->imports.count; j++) {
+            const CBMImport *imp = &result->imports.items[j];
+            if (!imp->module_path) {
+                continue;
+            }
+            const cbm_gbuf_node_t *target =
+                cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+            if (target && target->id != source_node->id) {
+                char esc_ln[CBM_SZ_128];
+                cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
+                char imp_props[CBM_SZ_256];
+                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+                cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
+                count++;
+            }
         }
     }
     free(file_qn);
