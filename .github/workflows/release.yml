@@ -247,7 +247,7 @@ jobs:
       # fail if its SBOM cannot be attested. An unattested SBOM is worse than
       # an absent one, because the artifact still ships looking complete.
       - name: Attest SBOM
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         env:
           NODE_OPTIONS: '--max-http-header-size=32768'
         with:
