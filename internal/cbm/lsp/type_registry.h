@@ -74,6 +74,12 @@ typedef struct {
     int slot;          // bucket slot this entry sits in (for resize)
 } CBMRegistryHashEntry;
 
+/* A borrowed immutable QN and stable array index, never a movable func pointer. */
+typedef struct {
+    const char *qualified_name;
+    int func_index;
+} CBMRegistryQNEntry;
+
 // Cross-file type/function registry.
 typedef struct CBMTypeRegistry {
     CBMRegisteredFunc *funcs;
@@ -150,6 +156,13 @@ typedef struct CBMTypeRegistry {
     // hashed chains answer with the LAST registration (the Tier-2 behavior,
     // left unchanged).
     bool index_first_registered;
+
+    /* Additional prefix/duplicate index; exact lookup order is unchanged.
+     * Covers non-NULL QNs in funcs[0..func_qn_sorted_upto), ordered by (QN,index).
+     * Appended functions remain visible through a tail scan. */
+    CBMRegistryQNEntry *func_qn_sorted;
+    int func_qn_sorted_count;
+    int func_qn_sorted_upto;
 } CBMTypeRegistry;
 
 // Initialize a registry.
@@ -197,6 +210,25 @@ const CBMRegisteredFunc *cbm_registry_lookup_func(const CBMTypeRegistry *reg,
 // package_qn is the package prefix (e.g., "proj.pkg").
 const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
                                                     const char *package_qn, const char *name);
+
+/* Build in an arena that outlives every use (owner arena for shared registries,
+ * walk scratch for per-file registries). QN strings and registered identities
+ * must remain immutable while a snapshot is used; end its use before changing
+ * identities, then rebuild before querying again. Appends do not invalidate it.
+ * Never frees caller arenas. Sealed registries are unchanged. A failed rebuild
+ * discards the old order and queries scan the complete registry instead. */
+void cbm_registry_build_func_qn_order(CBMTypeRegistry *reg, CBMArena *arena);
+
+/* Boolean starts-with over all function/method QNs in the fallback chain.
+ * Does not allocate or mutate. NULL prefix is false; empty prefix matches any
+ * non-NULL QN. Optional visits accumulates compared entries, including tail
+ * scans; fully indexed links use a lower bound plus at most one candidate. */
+bool cbm_registry_has_func_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                     uint64_t *visits);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* -1 disables; zero fails this allocation until reset; positive counts down. */
+void cbm_registry_test_qn_order_fail_after(int successful_allocations);
+#endif
 
 // Resolve type alias chain: follow alias_of until concrete type found (max 16 levels).
 const CBMRegisteredType *cbm_registry_resolve_alias(const CBMTypeRegistry *reg,

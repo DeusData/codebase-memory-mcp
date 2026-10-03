@@ -10,7 +10,6 @@ internal/cbm/extract_defs.c	4
 internal/cbm/helpers.c	3
 internal/cbm/lsp/c_lsp.c	4
 internal/cbm/lsp/perl_lsp.c	21
-internal/cbm/lsp/py_lsp.c	2
 internal/cbm/macro_table.c	1
 internal/cbm/service_patterns.c	2
 internal/cbm/sqlite_writer.c	74

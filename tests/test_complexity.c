@@ -50,11 +50,13 @@
 #include "cbm.h"
 #include "discover/discover.h"
 #include "lang_specs.h"
+#include "lsp/py_lsp.h"
 #include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "yyjson/yyjson.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -86,6 +88,9 @@ enum {
      * code path. The sequential path's own per-file registry work is bounded
      * by the 50-file ceiling and is deliberately out of scope here. */
     CX_BIGPKG_FILES_PER_K = 20,
+    CX_PYEXT_FILES_PER_MOD = 20,
+    CX_PYEXT_DEFS_PER_FILE = 120,
+    CX_PYEXT_PROBES_PER_FILE = 3,
 };
 
 /* Linear growth bounds for a 2x input doubling. Fixed structural overhead
@@ -306,6 +311,44 @@ static int cx_build_bigpkg(const char *root, int k) {
     return 0;
 }
 
+/* Every file probes absent external submodules and retains a real local-call
+ * control. Independent module copies grow the shared registry without adding
+ * cross-copy dependencies. Both sizes exceed the parallel-driver threshold. */
+static int cx_build_pyext(const char *root, int k) {
+    char dir[1024];
+    char path[1200];
+    for (int m = 0; m < k; m++) {
+        int n = snprintf(dir, sizeof(dir), "%s/pyext/mod%d", root, m);
+        if (n < 0 || (size_t)n >= sizeof(dir) || th_mkdir_p(dir) != 0)
+            return -1;
+        for (int j = 0; j < CX_PYEXT_FILES_PER_MOD; j++) {
+            n = snprintf(path, sizeof(path), "%s/p%d.py", dir, j);
+            if (n < 0 || (size_t)n >= sizeof(path))
+                return -1;
+            FILE *f = fopen(path, "w");
+            if (!f)
+                return -1;
+            bool written = fprintf(f, "import extlib\n\n") >= 0;
+            for (int d = 0; written && d < CX_PYEXT_DEFS_PER_FILE; d++) {
+                written =
+                    fprintf(f, "def cx_pyext_definition_%d(x):\n    return x + %d\n\n", d, d) >= 0;
+            }
+            if (written)
+                written =
+                    fprintf(f, "def cx_pyext_use():\n    return (cx_pyext_definition_0(0)") >= 0;
+            for (int probe = 0; written && probe < CX_PYEXT_PROBES_PER_FILE; probe++) {
+                written = fprintf(f, " + extlib.sub%d.helper(%d)", probe, probe) >= 0;
+            }
+            if (written)
+                written = fprintf(f, ")\n") >= 0;
+            int closed = fclose(f);
+            if (!written || closed != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 /* ── Metrics ─────────────────────────────────────────────────────────── */
 
 /* Per-pass timing capture: a TEE log sink parses `pass.timing` lines during a
@@ -357,8 +400,79 @@ typedef struct {
     uint64_t fallback_rows;
     uint64_t imp_nodes;       /* symbols scored by the importance pass */
     uint64_t imp_name_visits; /* same-name-group members visited by that pass */
+    uint64_t py_probes;
+    uint64_t py_probe_visits;
+    int pyext_files;
+    int pyext_defs;
+    int pyext_controls;
+    int errors;
     double wall_s;
 } CxMetrics;
+
+/* Count the intended corpus, then prove each use() kept its exact local LSP
+ * call. Query errors are failures, never indistinguishable from zero rows. */
+static bool cx_pyext_control(cbm_store_t *store, const char *project, const cbm_node_t *caller) {
+    if (!caller->qualified_name || !caller->file_path)
+        return false;
+    const char *dot = strrchr(caller->qualified_name, '.');
+    if (!dot || dot - caller->qualified_name > 1000)
+        return false;
+    char target_qn[1200];
+    int n = snprintf(target_qn, sizeof(target_qn), "%.*s.cx_pyext_definition_0",
+                     (int)(dot - caller->qualified_name), caller->qualified_name);
+    if (n < 0 || (size_t)n >= sizeof(target_qn))
+        return false;
+    cbm_node_t target = {0};
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    bool found = false;
+    if (cbm_store_find_node_by_qn(store, project, target_qn, &target) == CBM_STORE_OK &&
+        target.label && strcmp(target.label, "Function") == 0 && target.file_path &&
+        strcmp(target.file_path, caller->file_path) == 0 &&
+        cbm_store_find_edges_by_source_type(store, caller->id, "CALLS", &edges, &count) ==
+            CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            if (edges[i].target_id != target.id || !edges[i].properties_json)
+                continue;
+            yyjson_doc *doc =
+                yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0);
+            const char *source =
+                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "source")) : NULL;
+            found = found || (source && strcmp(source, "lsp") == 0);
+            yyjson_doc_free(doc);
+        }
+    }
+    cbm_store_free_edges(edges, count);
+    cbm_node_free_fields(&target);
+    return found;
+}
+
+static bool cx_pyext_population(cbm_store_t *store, const char *project, CxMetrics *out) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    bool ok = cbm_store_find_nodes_by_label(store, project, "File", &nodes, &count) == CBM_STORE_OK;
+    for (int i = 0; ok && i < count; i++) {
+        if (nodes[i].file_path && strncmp(nodes[i].file_path, "pyext/", 6) == 0)
+            out->pyext_files++;
+    }
+    cbm_store_free_nodes(nodes, count);
+    nodes = NULL;
+    count = 0;
+    ok = ok &&
+         cbm_store_find_nodes_by_label(store, project, "Function", &nodes, &count) == CBM_STORE_OK;
+    for (int i = 0; ok && i < count; i++) {
+        const cbm_node_t *node = &nodes[i];
+        if (!node->file_path || strncmp(node->file_path, "pyext/", 6) != 0 || !node->name)
+            continue;
+        static const char definition_prefix[] = "cx_pyext_definition_";
+        if (strncmp(node->name, definition_prefix, sizeof(definition_prefix) - 1) == 0)
+            out->pyext_defs++;
+        if (strcmp(node->name, "cx_pyext_use") == 0 && cx_pyext_control(store, project, node))
+            out->pyext_controls++;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return ok;
+}
 
 static double cx_now_s(void) {
     struct timespec ts;
@@ -366,7 +480,7 @@ static double cx_now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
+static int cx_run(const char *root, const char *db_path, CxMetrics *out, bool pyext) {
     memset(out, 0, sizeof(*out));
 
     uint64_t d0;
@@ -379,6 +493,8 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     uint64_t fb0 = cbm_pp_lsp_linear_fallback_rows();
     uint64_t in0 = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed);
     uint64_t iv0 = atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed);
+    uint64_t pp0 = atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed);
+    uint64_t pv0 = atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed);
 
     atomic_store_explicit(&g_cx_pass_count, 0, memory_order_relaxed);
     cbm_log_set_sink_ex(cx_pass_sink, CBM_LOG_SINK_TEE);
@@ -390,6 +506,7 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     }
     int rc = cbm_pipeline_run(p);
     out->wall_s = cx_now_s() - t0;
+    cbm_pipeline_get_file_errors(p, NULL, &out->errors);
     cbm_log_set_sink(NULL);
     int captured = atomic_load_explicit(&g_cx_pass_count, memory_order_relaxed);
     out->pass_count = captured < CX_MAX_PASSES ? captured : CX_MAX_PASSES;
@@ -417,6 +534,10 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     out->imp_name_visits =
         atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed) - iv0;
 
+    out->py_probes = atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed) - pp0;
+    out->py_probe_visits =
+        atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed) - pv0;
+
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
         return -1;
@@ -427,8 +548,9 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
         out->lang_nodes[t] = cbm_store_count_nodes_scoped(s, project, CX_TEMPLATES[t].dirname);
         out->lang_edges[t] = cbm_store_count_edges_scoped(s, project, CX_TEMPLATES[t].dirname);
     }
+    bool extra_ok = !pyext || cx_pyext_population(s, project, out);
     cbm_store_close(s);
-    return 0;
+    return extra_ok ? 0 : -1;
 }
 
 static double cx_ratio(double num, double den) {
@@ -463,7 +585,8 @@ static int cx_measure(CxCorpusBuilder build, const char *prefix_a, const char *p
         char db_b[600];
         snprintf(db_a, sizeof(db_a), "%s/cx.db", root_a);
         snprintf(db_b, sizeof(db_b), "%s/cx.db", root_b);
-        if (cx_run(root_a, db_a, out_a) == 0 && cx_run(root_b, db_b, out_b) == 0) {
+        bool pyext = build == cx_build_pyext;
+        if (cx_run(root_a, db_a, out_a, pyext) == 0 && cx_run(root_b, db_b, out_b, pyext) == 0) {
             rc = 0;
         }
     }
@@ -613,6 +736,58 @@ TEST(complexity_shared_package_growth_stays_linear) {
     ASSERT_GT((long long)a->perfile_defs, (long long)CX_MIN_BASE_WORK);
     double defs_r = cx_ratio((double)b->perfile_defs, (double)a->perfile_defs);
     ASSERT_TRUE(defs_r <= CX_RATIO_HI);
+    PASS();
+}
+
+TEST(complexity_py_submodule_probe_avoids_registry_scan) {
+    static const char *const keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {NULL, NULL};
+    bool ready = true;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        if (old && !saved[i])
+            ready = false;
+    }
+    CxMetrics a = {0}, b = {0};
+    int rc = -1, restored = 0;
+    if (ready) {
+        int configured = cbm_setenv(keys[0], "2", 1);
+        configured |= cbm_unsetenv(keys[1]);
+        if (configured == 0)
+            rc = cx_measure(cx_build_pyext, "cbm_cxpy_a", "cbm_cxpy_b", &a, &b);
+        for (int i = 0; i < 2; i++)
+            restored |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+    }
+    for (int i = 0; i < 2; i++)
+        free(saved[i]);
+    /* cx_measure removes both owned corpora before any assertion below. */
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(restored, 0);
+    ASSERT_EQ(rc, 0);
+    int files = CX_K_BASE * CX_PYEXT_FILES_PER_MOD;
+    ASSERT_EQ(a.errors, 0);
+    ASSERT_EQ(b.errors, 0);
+    ASSERT_EQ(a.pyext_files, files);
+    ASSERT_EQ(b.pyext_files, files * 2);
+    ASSERT_EQ(a.pyext_defs, files * CX_PYEXT_DEFS_PER_FILE);
+    ASSERT_EQ(b.pyext_defs, files * 2 * CX_PYEXT_DEFS_PER_FILE);
+    ASSERT_EQ(a.pyext_controls, files);
+    ASSERT_EQ(b.pyext_controls, files * 2);
+    ASSERT_GT((long long)a.py_probes, (long long)CX_MIN_BASE_WORK);
+    ASSERT_GT((long long)b.py_probes, (long long)CX_MIN_BASE_WORK);
+    ASSERT_GT((long long)a.py_probe_visits, 0);
+    ASSERT_GT((long long)b.py_probe_visits, 0);
+    double probes_ratio = cx_ratio((double)b.py_probes, (double)a.py_probes);
+    double visits_ratio = cx_ratio((double)b.py_probe_visits, (double)a.py_probe_visits);
+    printf("    py_probes %llu -> %llu (%.2f), visits %llu -> %llu (%.2f)\n",
+           (unsigned long long)a.py_probes, (unsigned long long)b.py_probes, probes_ratio,
+           (unsigned long long)a.py_probe_visits, (unsigned long long)b.py_probe_visits,
+           visits_ratio);
+    ASSERT_TRUE(probes_ratio >= CX_RATIO_LO && probes_ratio <= CX_RATIO_HI);
+    ASSERT_TRUE(visits_ratio <= CX_RATIO_HI);
+    /* The direct registry test also enforces a logarithmic comparison bound,
+     * independently of fixed stdlib size and this corpus-growth ratio. */
     PASS();
 }
 
@@ -847,5 +1022,6 @@ SUITE(complexity) {
     RUN_TEST(complexity_perfile_registry_work_is_linear);
     RUN_TEST(complexity_importance_scoring_is_linear);
     RUN_TEST(complexity_shared_package_growth_stays_linear);
+    RUN_TEST(complexity_py_submodule_probe_avoids_registry_scan);
     RUN_TEST(complexity_throughput_report_written);
 }

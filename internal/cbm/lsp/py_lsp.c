@@ -37,6 +37,11 @@
 #include "lsp_work.h"
 
 #ifdef CBM_ENABLE_TEST_SEAMS
+_Atomic uint64_t cbm_py_submodule_probes = 0;
+_Atomic uint64_t cbm_py_submodule_probe_visits = 0;
+#endif
+
+#ifdef CBM_ENABLE_TEST_SEAMS
 static _Thread_local int py_test_memo_allocations_left = -1;
 static _Thread_local bool py_test_depth_failure;
 static _Thread_local int py_test_scope_allocations_left = -1;
@@ -163,51 +168,32 @@ static bool py_func_is_exact_callable_value(const CBMRegisteredFunc *func) {
            (!func->decorator_qns || !func->decorator_qns[0]);
 }
 
-static int py_func_qn_pointer_cmp(const void *left, const void *right) {
-    const CBMRegisteredFunc *a = *(CBMRegisteredFunc *const *)left;
-    const CBMRegisteredFunc *b = *(CBMRegisteredFunc *const *)right;
-    const char *aqn = a ? a->qualified_name : NULL;
-    const char *bqn = b ? b->qualified_name : NULL;
-    if (!aqn || !bqn)
-        return aqn ? 1 : bqn ? -1 : 0;
-    return strcmp(aqn, bqn);
-}
-
-/* The graph identifies functions by QN.  When Python source redefines the
- * same QN, the runtime's last binding is knowable but the graph no longer has
- * one occurrence-exact definition target.  Mark the whole duplicate group so
- * callable values fail closed without changing ordinary call overload/rebind
- * behavior. */
-static void py_mark_ambiguous_callable_bindings(CBMTypeRegistry *registry) {
-    if (!registry || registry->func_count <= 1)
+/* Reuse the QN snapshot for duplicate marks and later submodule probes.
+ * The graph cannot identify one exact callable value for a duplicate QN;
+ * ordinary exact lookups retain their original registration-order policy. */
+static void py_mark_ambiguous_callable_bindings(CBMTypeRegistry *registry, CBMArena *idx_arena) {
+    if (!registry)
         return;
-    size_t count = (size_t)registry->func_count;
-    CBMRegisteredFunc **sorted = count <= SIZE_MAX / sizeof(*sorted)
-                                     ? (CBMRegisteredFunc **)malloc(count * sizeof(*sorted))
-                                     : NULL;
-    if (!sorted) {
-        /* Allocation failure must reduce precision, never fabricate it. */
+    cbm_registry_build_func_qn_order(registry, idx_arena);
+    if (registry->func_count <= 1)
+        return;
+    const CBMRegistryQNEntry *sorted = registry->func_qn_sorted;
+    if (!sorted || registry->func_qn_sorted_upto != registry->func_count) {
         for (int i = 0; i < registry->func_count; i++)
             registry->funcs[i].flags |= CBM_FUNC_FLAG_AMBIGUOUS_BINDING;
         return;
     }
-    for (int i = 0; i < registry->func_count; i++)
-        sorted[i] = &registry->funcs[i];
-    qsort(sorted, count, sizeof(*sorted), py_func_qn_pointer_cmp);
-    for (size_t first = 0; first < count;) {
-        size_t end = first + 1;
-        const char *qn = sorted[first]->qualified_name;
-        while (qn && end < count && sorted[end]->qualified_name &&
-               strcmp(qn, sorted[end]->qualified_name) == 0) {
+    int count = registry->func_qn_sorted_count;
+    for (int first = 0; first < count;) {
+        int end = first + 1;
+        while (end < count && strcmp(sorted[first].qualified_name, sorted[end].qualified_name) == 0)
             end++;
-        }
-        if (qn && end - first > 1) {
-            for (size_t i = first; i < end; i++)
-                sorted[i]->flags |= CBM_FUNC_FLAG_AMBIGUOUS_BINDING;
+        if (end - first > 1) {
+            for (int i = first; i < end; i++)
+                registry->funcs[sorted[i].func_index].flags |= CBM_FUNC_FLAG_AMBIGUOUS_BINDING;
         }
         first = end;
     }
-    free(sorted);
 }
 
 /* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
@@ -1584,6 +1570,22 @@ static const CBMType *py_iterable_element_type(PyLSPContext *ctx, const CBMType 
 /* The real recursive-descent evaluator. Never call directly — go through
  * the memoizing, depth-guarded py_eval_expr_type wrapper below
  * (every recursive call inside this body already does). */
+/* Existing function-only submodule predicate, after exact symbol/type misses. */
+static bool py_names_submodule(PyLSPContext *ctx, const char *qn) {
+    const char *prefix = qn ? cbm_arena_sprintf(ctx->arena, "%s.", qn) : NULL;
+    if (!prefix)
+        return false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    uint64_t visits = 0;
+    bool found = cbm_registry_has_func_qn_prefix(ctx->registry, prefix, &visits);
+    atomic_fetch_add_explicit(&cbm_py_submodule_probes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cbm_py_submodule_probe_visits, visits, memory_order_relaxed);
+    return found;
+#else
+    return cbm_registry_has_func_qn_prefix(ctx->registry, prefix, NULL);
+#endif
+}
+
 static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return cbm_type_unknown();
@@ -1704,25 +1706,7 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
             const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
             if (rt)
                 return cbm_type_named(ctx->arena, qn);
-            // Submodule: if any registered function/type has qn starting
-            // with "<mod>.<attr>." then mod.attr is itself a module.
-            // Linear scan over registry funcs is O(R) per access; we
-            // skip it for the common case where mod.attr is already
-            // matched as a function/type above. With ~900 stdlib funcs
-            // and many module-attr accesses per file, this can dominate
-            // — keeping the loop tight and bailing early on first match.
-            const char *prefix = cbm_arena_sprintf(ctx->arena, "%s.", qn);
-            size_t prefix_len = strlen(prefix);
-            bool is_submodule = false;
-            CBMFreeFuncIter all_funcs;
-            cbm_registry_all_funcs_chain(ctx->registry, &all_funcs);
-            for (int i = -1; !is_submodule && (i = cbm_free_func_iter_next(&all_funcs)) >= 0;) {
-                const char *fqn = all_funcs.reg->funcs[i].qualified_name;
-                if (fqn && strncmp(fqn, prefix, prefix_len) == 0) {
-                    is_submodule = true;
-                }
-            }
-            if (is_submodule)
+            if (py_names_submodule(ctx, qn))
                 return cbm_type_module(ctx->arena, qn);
             return cbm_type_unknown();
         }
@@ -5343,7 +5327,6 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     for (int i = 0; i < result->defs.count; i++) {
         py_register_def(arena, &reg, &result->defs.items[i], module_qn);
     }
-    py_mark_ambiguous_callable_bindings(&reg);
 
     /* Hash-index the registry before the walk (#1527). Unfinalized, every
      * lookup scanned the stdlib plus all of this file's definitions, which
@@ -5354,6 +5337,7 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
      * scratch arena that dies with this call, not in the result arena. */
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
+    py_mark_ambiguous_callable_bindings(&reg, &idx_arena);
     reg.index_first_registered = true;
     cbm_registry_finalize_into(&reg, &idx_arena);
 
@@ -5604,7 +5588,7 @@ CBMLSPStatus cbm_run_py_lsp_cross_status(CBMArena *arena, const char *source, in
         ctx.eval_failure = CBM_LSP_SCOPE_FAILED;
         goto cross_cleanup;
     }
-    py_mark_ambiguous_callable_bindings(&reg);
+    py_mark_ambiguous_callable_bindings(&reg, &idx_arena);
 
     /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
      * comment for the rationale. */
@@ -5648,7 +5632,7 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
             return NULL; /* caller owns the shared arena and other registries */
     }
 
-    py_mark_ambiguous_callable_bindings(reg);
+    py_mark_ambiguous_callable_bindings(reg, arena);
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;

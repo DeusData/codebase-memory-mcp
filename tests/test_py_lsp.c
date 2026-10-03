@@ -3768,7 +3768,412 @@ TEST(pylsp_class_frame_failure_rolls_back_raw_and_cross_outputs) {
     PASS();
 }
 
+/* The prefix index is an existence oracle, never an exact-symbol selector. */
+static bool pylsp_prefix_scan(const CBMTypeRegistry *reg, const char *prefix) {
+    if (!reg || !prefix)
+        return false;
+    CBMFreeFuncIter iter;
+    cbm_registry_all_funcs_chain(reg, &iter);
+    size_t length = strlen(prefix);
+    for (int i; (i = cbm_free_func_iter_next(&iter)) >= 0;) {
+        const char *qn = iter.reg->funcs[i].qualified_name;
+        if (qn && strncmp(qn, prefix, length) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool pylsp_prefix_add(CBMTypeRegistry *reg, const char *qn, const char *receiver) {
+    int before = reg->func_count;
+    cbm_registry_add_func(
+        reg,
+        (CBMRegisteredFunc){.qualified_name = qn, .short_name = "call", .receiver_type = receiver});
+    return reg->func_count == before + 1;
+}
+
+static bool pylsp_prefix_oracles(const CBMTypeRegistry *reg) {
+    const char *prefixes[] = {NULL,           "",         "pkg.",           "pkg.sub.",
+                              "pkg.sub.call", "pkg.su.",  "pkg.submarine.", "pkg.Type.",
+                              "only.tail.",   "missing.", "zzzz."};
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        uint64_t visits = 17;
+        bool indexed = cbm_registry_has_func_qn_prefix(reg, prefixes[i], &visits);
+        if (indexed != pylsp_prefix_scan(reg, prefixes[i]) || visits < 17 ||
+            cbm_registry_has_func_qn_prefix(reg, prefixes[i], NULL) != indexed ||
+            (!prefixes[i] && visits != 17))
+            return false;
+    }
+    return true;
+}
+
+TEST(pylsp_prefix_order_matches_iterator_and_chain_shadowing) {
+    CBMArena arena, scratch;
+    cbm_arena_init(&arena);
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry head, middle, tail, empty;
+    cbm_registry_init(&head, &arena);
+    cbm_registry_init(&middle, &arena);
+    cbm_registry_init(&tail, &arena);
+    cbm_registry_init(&empty, &arena);
+    bool ok = pylsp_prefix_add(&head, NULL, NULL) && pylsp_prefix_add(&head, "", NULL) &&
+              pylsp_prefix_add(&head, "pkg.sub.call", NULL) &&
+              pylsp_prefix_add(&head, "pkg.sub.call", NULL) &&
+              pylsp_prefix_add(&head, "pkg.Type.call", "pkg.Type") &&
+              pylsp_prefix_add(&middle, "pkg.sub.call", "different.receiver") &&
+              pylsp_prefix_add(&middle, "pkg.submarine.call", NULL) &&
+              pylsp_prefix_add(&tail, "only.tail.call", NULL);
+    head.fallback = &middle;
+    middle.fallback = &tail;
+    ok = pylsp_prefix_oracles(NULL) && pylsp_prefix_oracles(&empty) &&
+         pylsp_prefix_oracles(&head) && ok;
+    cbm_registry_build_func_qn_order(&head, &scratch);
+    ok = head.func_qn_sorted && head.func_qn_sorted_count == 4 && head.func_qn_sorted_upto == 5 &&
+         pylsp_prefix_oracles(&head) && ok;
+    cbm_registry_build_func_qn_order(&tail, &arena);
+    ok = tail.func_qn_sorted && pylsp_prefix_oracles(&head) && ok;
+    cbm_registry_build_func_qn_order(&middle, &scratch);
+    ok = middle.func_qn_sorted && pylsp_prefix_oracles(&head) && ok;
+    if (head.func_qn_sorted) {
+        int duplicate_count = 0, previous = -1;
+        for (int i = 0; i < head.func_qn_sorted_count; i++) {
+            const CBMRegistryQNEntry *entry = &head.func_qn_sorted[i];
+            ok = entry->func_index >= 0 && entry->func_index < head.func_count &&
+                 entry->qualified_name == head.funcs[entry->func_index].qualified_name && ok;
+            if (strcmp(entry->qualified_name, "pkg.sub.call") == 0) {
+                ok = entry->func_index > previous && ok;
+                previous = entry->func_index;
+                duplicate_count++;
+            }
+        }
+        ok = duplicate_count == 2 && ok;
+    }
+    size_t owned_before = cbm_arena_total(&arena), scratch_before = cbm_arena_total(&scratch);
+    ok = pylsp_prefix_oracles(&head) && cbm_arena_total(&arena) == owned_before &&
+         cbm_arena_total(&scratch) == scratch_before && ok;
+    /* An indexed fallback also works behind an unindexed empty head. */
+    empty.fallback = &head;
+    ok = pylsp_prefix_oracles(&empty) && ok;
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_prefix_order_survives_array_growth_rebuild_and_seal) {
+    CBMArena arena, scratch;
+    cbm_arena_init(&arena);
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry reg, unindexed;
+    cbm_registry_init(&reg, &arena);
+    cbm_registry_init(&unindexed, &arena);
+    bool ok = pylsp_prefix_add(&reg, "pkg.old.call", NULL);
+    cbm_registry_build_func_qn_order(&reg, &scratch);
+    CBMRegisteredFunc *original_array = reg.funcs;
+    const CBMRegistryQNEntry *order = reg.func_qn_sorted;
+    for (int i = 0; i < 140; i++) {
+        const char *qn = cbm_arena_sprintf(&arena, "tail.mod%03d.call", i);
+        ok = qn && pylsp_prefix_add(&reg, qn, NULL) && ok;
+    }
+    ok = reg.func_count == 141 && reg.funcs != original_array && reg.func_qn_sorted == order &&
+         reg.func_qn_sorted_upto == 1 &&
+         cbm_registry_has_func_qn_prefix(&reg, "tail.mod139.", NULL) &&
+         !cbm_registry_has_func_qn_prefix(&reg, "tail.mod140.", NULL) && ok;
+    cbm_registry_build_func_qn_order(&reg, &scratch);
+    ok = reg.func_qn_sorted && reg.func_qn_sorted_upto == reg.func_count &&
+         cbm_registry_has_func_qn_prefix(&reg, "tail.mod139.", NULL) && ok;
+    /* End use of the old snapshot before replacing an identity. No lookup is
+     * permitted until the complete order has been rebuilt. */
+    if (reg.func_count == 141) {
+        reg.funcs[0].qualified_name = "pkg.renamed.call";
+        cbm_registry_build_func_qn_order(&reg, &scratch);
+        ok = !cbm_registry_has_func_qn_prefix(&reg, "pkg.old.", NULL) &&
+             cbm_registry_has_func_qn_prefix(&reg, "pkg.renamed.", NULL) && ok;
+    }
+    order = reg.func_qn_sorted;
+    reg.read_only = true;
+    cbm_registry_test_qn_order_fail_after(0);
+    cbm_registry_build_func_qn_order(&reg, &scratch);
+    cbm_registry_test_qn_order_fail_after(-1);
+    cbm_registry_add_func(&reg, (CBMRegisteredFunc){.qualified_name = "forbidden.call"});
+    ok = reg.func_qn_sorted == order && reg.func_count == 141 &&
+         cbm_registry_has_func_qn_prefix(&reg, "pkg.renamed.", NULL) &&
+         !cbm_registry_has_func_qn_prefix(&reg, "forbidden.", NULL) && ok;
+    ok = pylsp_prefix_add(&unindexed, "sealed.call", NULL) && ok;
+    unindexed.read_only = true;
+    cbm_registry_build_func_qn_order(&unindexed, &scratch);
+    uint64_t visits = 0;
+    ok = !unindexed.func_qn_sorted &&
+         cbm_registry_has_func_qn_prefix(&unindexed, "sealed.", &visits) && visits == 1 && ok;
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_prefix_order_allocation_failure_preserves_oracle) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+    bool ok = pylsp_prefix_add(&reg, "pkg.sub.call", NULL) && pylsp_prefix_add(&reg, NULL, NULL) &&
+              pylsp_prefix_add(&reg, "only.tail.call", NULL);
+    cbm_registry_test_qn_order_fail_after(0);
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    cbm_registry_test_qn_order_fail_after(-1);
+    uint64_t visits = 0;
+    ok = !reg.func_qn_sorted && reg.func_qn_sorted_count == 0 && reg.func_qn_sorted_upto == 0 &&
+         pylsp_prefix_oracles(&reg) && !cbm_registry_has_func_qn_prefix(&reg, "zzzz.", &visits) &&
+         visits == 3 && ok;
+    cbm_registry_test_qn_order_fail_after(1);
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    bool first_built = reg.func_qn_sorted && reg.func_qn_sorted_upto == reg.func_count;
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    cbm_registry_test_qn_order_fail_after(-1);
+    ok = first_built && !reg.func_qn_sorted && reg.func_qn_sorted_count == 0 &&
+         reg.func_qn_sorted_upto == 0 && pylsp_prefix_oracles(&reg) && ok;
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    ok = reg.func_qn_sorted && reg.func_qn_sorted_count == 2 && reg.func_qn_sorted_upto == 3 &&
+         pylsp_prefix_oracles(&reg) && ok;
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_prefix_order_has_absolute_comparison_bound) {
+    enum { FUNCTIONS = 1024, PROBES = 32, BOUND = 12 };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+    bool ok = true;
+    for (int i = FUNCTIONS - 1; i >= 0; i--) {
+        const char *qn = cbm_arena_sprintf(&arena, "project.mod%04d.call", i);
+        ok = qn && pylsp_prefix_add(&reg, qn, NULL) && ok;
+    }
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    ok = reg.func_count == FUNCTIONS && reg.func_qn_sorted_count == FUNCTIONS &&
+         reg.func_qn_sorted_upto == FUNCTIONS && reg.func_qn_sorted && ok;
+    for (int i = 0; i < PROBES; i++) {
+        char hit[64], miss[64];
+        int a = snprintf(hit, sizeof(hit), "project.mod%04d.", i * 31);
+        int b = snprintf(miss, sizeof(miss), "project.mod%04dx.", i * 31);
+        uint64_t positive = 0, negative = 0;
+        bool ready = a > 0 && (size_t)a < sizeof(hit) && b > 0 && (size_t)b < sizeof(miss);
+        ok = ready && cbm_registry_has_func_qn_prefix(&reg, hit, &positive) &&
+             !cbm_registry_has_func_qn_prefix(&reg, miss, &negative) && positive > 0 &&
+             positive <= BOUND && negative > 0 && negative <= BOUND &&
+             pylsp_prefix_scan(&reg, hit) && !pylsp_prefix_scan(&reg, miss) && ok;
+    }
+    /* Failure restores the reference scan, which must inspect every entry on
+     * this absent suffix. This is a deterministic contrast, not a timing ratio. */
+    cbm_registry_test_qn_order_fail_after(0);
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    cbm_registry_test_qn_order_fail_after(-1);
+    uint64_t visits = 0;
+    ok = !reg.func_qn_sorted && !cbm_registry_has_func_qn_prefix(&reg, "zzzz.", &visits) &&
+         visits == FUNCTIONS && visits > BOUND && ok;
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_prefix_order_preserves_exact_selection_and_ambiguity) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    bool ok = true;
+    for (int first = 0; first < 2; first++) {
+        CBMTypeRegistry reg;
+        cbm_registry_init(&reg, &arena);
+        ok = pylsp_prefix_add(&reg, "pkg.duplicate", NULL) &&
+             pylsp_prefix_add(&reg, "pkg.duplicate", NULL) && ok;
+        const CBMRegisteredFunc *linear = cbm_registry_lookup_func(&reg, "pkg.duplicate");
+        ok = reg.func_count == 2 && linear == &reg.funcs[0] && ok;
+        cbm_registry_build_func_qn_order(&reg, &arena);
+        ok = cbm_registry_lookup_func(&reg, "pkg.duplicate") == linear && ok;
+        reg.index_first_registered = first != 0;
+        cbm_registry_finalize(&reg);
+        const CBMRegisteredFunc *selected = cbm_registry_lookup_func(&reg, "pkg.duplicate");
+        ok = reg.func_count == 2 && selected == &reg.funcs[first ? 0 : 1] && ok;
+        cbm_registry_build_func_qn_order(&reg, &arena);
+        ok = cbm_registry_lookup_func(&reg, "pkg.duplicate") == selected && ok;
+    }
+    CBMLSPDef defs[] = {
+        {.qualified_name = "pkg.duplicate",
+         .short_name = "duplicate",
+         .label = "Function",
+         .def_module_qn = "pkg",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "pkg.duplicate",
+         .short_name = "duplicate",
+         .label = "Function",
+         .def_module_qn = "pkg",
+         .return_types = "str",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "pkg.unique",
+         .short_name = "unique",
+         .label = "Function",
+         .def_module_qn = "pkg",
+         .lang = CBM_LANG_PYTHON},
+    };
+    for (int fail = 0; fail < 2; fail++) {
+        cbm_registry_test_qn_order_fail_after(fail ? 0 : -1);
+        CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 3);
+        cbm_registry_test_qn_order_fail_after(-1);
+        ok = reg && reg->read_only && reg->func_count > 3 && ok;
+        if (reg) {
+            int duplicate_count = 0, unique_count = 0;
+            for (int i = 0; i < reg->func_count; i++) {
+                const CBMRegisteredFunc *f = &reg->funcs[i];
+                bool ambiguous = (f->flags & CBM_FUNC_FLAG_AMBIGUOUS_BINDING) != 0;
+                if (fail)
+                    ok = ambiguous && ok;
+                if (f->qualified_name && strcmp(f->qualified_name, "pkg.duplicate") == 0) {
+                    duplicate_count++;
+                    ok = ambiguous && ok;
+                }
+                if (f->qualified_name && strcmp(f->qualified_name, "pkg.unique") == 0) {
+                    unique_count++;
+                    ok = ambiguous == (fail != 0) && ok;
+                }
+            }
+            ok = duplicate_count == 2 && unique_count == 1 &&
+                 (fail ? reg->func_qn_sorted == NULL : reg->func_qn_sorted != NULL) &&
+                 cbm_registry_has_func_qn_prefix(reg, "pkg.", NULL) &&
+                 !cbm_registry_has_func_qn_prefix(reg, "pkg.missing.", NULL) && ok;
+        }
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A negative must have one real extracted source occurrence and no accepted
+ * resolution; a missing carrier cannot make it pass. */
+static bool pylsp_prefix_site_unresolved(const CBMCallArray *calls,
+                                         const CBMResolvedCallArray *resolved, const char *source,
+                                         const char *site_text, const char *caller) {
+    const char *site = strstr(source, site_text);
+    if (!site || strstr(site + 1, site_text))
+        return false;
+    uint32_t start = (uint32_t)(site - source), end = start + (uint32_t)strlen(site_text);
+    const CBMCall *found = NULL;
+    int count = 0;
+    for (int i = 0; i < calls->count; i++) {
+        const CBMCall *call = &calls->items[i];
+        if (call->enclosing_func_qn && strcmp(call->enclosing_func_qn, caller) == 0 &&
+            call->site_start_byte == start && call->site_end_byte == end) {
+            found = call;
+            count++;
+        }
+    }
+    return count == 1 && cbm_pipeline_find_lsp_resolution(resolved, found, false) == NULL;
+}
+
+TEST(pylsp_prefix_raw_per_file_and_shared_keep_exact_calls) {
+    static const char source[] = "import pkg\nimport vendor\n"
+                                 "def ping():\n    return 1\n"
+                                 "def run():\n"
+                                 "    pkg.sub.ping()\n"
+                                 "    pkg.su.ping()\n"
+                                 "    vendor.external.ping()\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "pkg.sub.ping",
+         .short_name = "ping",
+         .label = "Function",
+         .def_module_qn = "pkg.sub",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "pkg.submarine.ping",
+         .short_name = "ping",
+         .label = "Function",
+         .def_module_qn = "pkg.submarine",
+         .return_types = "str",
+         .lang = CBM_LANG_PYTHON},
+    };
+    const char *names[] = {"pkg", "vendor"};
+    const char *qns[] = {"pkg", "vendor"};
+    bool ok = true;
+    for (int fail = 0; fail < 2; fail++) {
+        uint64_t probes_before =
+            atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed);
+        uint64_t visits_before =
+            atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed);
+        cbm_registry_test_qn_order_fail_after(fail ? 0 : -1);
+        CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "pkg",
+                                            "sub.py", 0, NULL, NULL);
+        cbm_registry_test_qn_order_fail_after(-1);
+        bool healthy = r && !r->has_error && !r->parse_incomplete && !r->lsp_skipped &&
+                       pylsp_module_has_def(r, "pkg.sub.ping") &&
+                       pylsp_module_has_def(r, "pkg.sub.run");
+        ok = healthy &&
+             atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed) > probes_before &&
+             atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed) >
+                 visits_before &&
+             ok;
+        if (healthy) {
+            ok = pylsp_module_site_joins(&r->calls, &r->resolved_calls, source, "pkg.sub.ping()",
+                                         "pkg.sub.run", "pkg.sub.ping") &&
+                 pylsp_prefix_site_unresolved(&r->calls, &r->resolved_calls, source,
+                                              "pkg.su.ping()", "pkg.sub.run") &&
+                 pylsp_prefix_site_unresolved(&r->calls, &r->resolved_calls, source,
+                                              "vendor.external.ping()", "pkg.sub.run") &&
+                 ok;
+            for (int shared_mode = 0; shared_mode < 2; shared_mode++) {
+                CBMArena arena, shared;
+                cbm_arena_init(&arena);
+                cbm_arena_init(&shared);
+                CBMTypeRegistry *reg = NULL;
+                cbm_registry_test_qn_order_fail_after(fail ? 0 : -1);
+                if (shared_mode)
+                    reg = cbm_py_build_cross_registry(&shared, defs, 2);
+                CBMResolvedCallArray out = {0};
+                CBMLSPStatus status = CBM_LSP_SCOPE_FAILED;
+                probes_before =
+                    atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed);
+                visits_before =
+                    atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed);
+                if (!shared_mode || reg) {
+                    status = shared_mode
+                                 ? cbm_run_py_lsp_cross_with_registry_status(
+                                       &arena, source, (int)strlen(source), "pkg.sub", reg, names,
+                                       qns, 2, r->cached_tree, &out, NULL)
+                                 : cbm_run_py_lsp_cross_status(&arena, source, (int)strlen(source),
+                                                               "pkg.sub", defs, 2, names, qns, 2,
+                                                               r->cached_tree, &out, NULL);
+                }
+                cbm_registry_test_qn_order_fail_after(-1);
+                ok = status == CBM_LSP_COMPLETE &&
+                     atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed) >
+                         probes_before &&
+                     atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed) >
+                         visits_before &&
+                     pylsp_module_site_joins(&r->calls, &out, source, "pkg.sub.ping()",
+                                             "pkg.sub.run", "pkg.sub.ping") &&
+                     pylsp_prefix_site_unresolved(&r->calls, &out, source, "pkg.su.ping()",
+                                                  "pkg.sub.run") &&
+                     pylsp_prefix_site_unresolved(&r->calls, &out, source, "vendor.external.ping()",
+                                                  "pkg.sub.run") &&
+                     ok;
+                cbm_arena_destroy(&arena);
+                cbm_arena_destroy(&shared);
+            }
+        }
+        if (r)
+            cbm_free_result(r);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(py_lsp) {
+    RUN_TEST(pylsp_prefix_order_matches_iterator_and_chain_shadowing);
+    RUN_TEST(pylsp_prefix_order_survives_array_growth_rebuild_and_seal);
+    RUN_TEST(pylsp_prefix_order_allocation_failure_preserves_oracle);
+    RUN_TEST(pylsp_prefix_order_has_absolute_comparison_bound);
+    RUN_TEST(pylsp_prefix_order_preserves_exact_selection_and_ambiguity);
+    RUN_TEST(pylsp_prefix_raw_per_file_and_shared_keep_exact_calls);
+
     RUN_TEST(pylsp_classbody_calls_join_extracted_caller);
     RUN_TEST(pylsp_classbody_names_visible_to_later_statements_only);
     RUN_TEST(pylsp_decorator_and_base_calls_join_extracted_caller);

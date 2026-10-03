@@ -238,4 +238,12 @@ typedef struct {
 bool cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
                             CBMResolvedCallArray *out);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+#include <stdatomic.h>
+/* Process-wide comparison counts for deterministic resolver operation tests.
+ * Only missing exact symbol/type attributes reach this submodule predicate. */
+extern _Atomic uint64_t cbm_py_submodule_probes;
+extern _Atomic uint64_t cbm_py_submodule_probe_visits;
+#endif
+
 #endif // CBM_LSP_PY_LSP_H

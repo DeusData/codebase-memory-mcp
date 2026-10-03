@@ -985,6 +985,99 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
     return cbm_registry_lookup_func(reg, buf);
 }
 
+/* A stable total order, independent of qsort's treatment of equal keys. */
+static int registry_qn_entry_cmp(const void *left, const void *right) {
+    const CBMRegistryQNEntry *a = left;
+    const CBMRegistryQNEntry *b = right;
+    int cmp = strcmp(a->qualified_name, b->qualified_name);
+    return cmp ? cmp : (a->func_index > b->func_index) - (a->func_index < b->func_index);
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int registry_qn_order_allocations_left = -1;
+void cbm_registry_test_qn_order_fail_after(int successful_allocations) {
+    registry_qn_order_allocations_left = successful_allocations;
+}
+#endif
+
+void cbm_registry_build_func_qn_order(CBMTypeRegistry *reg, CBMArena *arena) {
+    if (!reg || !arena || reg->read_only)
+        return;
+    /* A failed rebuild must not leave an old snapshot authoritative. */
+    reg->func_qn_sorted = NULL;
+    reg->func_qn_sorted_count = 0;
+    reg->func_qn_sorted_upto = 0;
+    if (reg->func_count <= 0 || (size_t)reg->func_count > SIZE_MAX / sizeof(CBMRegistryQNEntry))
+        return;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (registry_qn_order_allocations_left == 0)
+        return;
+    if (registry_qn_order_allocations_left > 0)
+        registry_qn_order_allocations_left--;
+#endif
+    CBMRegistryQNEntry *sorted = cbm_arena_alloc(arena, (size_t)reg->func_count * sizeof(*sorted));
+    if (!sorted)
+        return;
+    int count = 0;
+    for (int i = 0; i < reg->func_count; i++) {
+        if (reg->funcs[i].qualified_name) {
+            sorted[count].qualified_name = reg->funcs[i].qualified_name;
+            sorted[count].func_index = i;
+            count++;
+        }
+    }
+    qsort(sorted, (size_t)count, sizeof(*sorted), registry_qn_entry_cmp);
+    reg->func_qn_sorted = sorted;
+    reg->func_qn_sorted_count = count;
+    reg->func_qn_sorted_upto = reg->func_count;
+}
+
+static bool registry_link_has_func_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                             size_t length, uint64_t *visits) {
+    int scan_from = 0;
+    if (reg->func_qn_sorted && reg->func_qn_sorted_upto <= reg->func_count) {
+        int lo = 0, hi = reg->func_qn_sorted_count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (visits)
+                (*visits)++;
+            if (strcmp(reg->func_qn_sorted[mid].qualified_name, prefix) < 0)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < reg->func_qn_sorted_count) {
+            if (visits)
+                (*visits)++;
+            if (strncmp(reg->func_qn_sorted[lo].qualified_name, prefix, length) == 0)
+                return true;
+        }
+        scan_from = reg->func_qn_sorted_upto;
+    }
+    for (int i = scan_from; i < reg->func_count; i++) {
+        if (visits)
+            (*visits)++;
+        const char *qn = reg->funcs[i].qualified_name;
+        if (qn && strncmp(qn, prefix, length) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool cbm_registry_has_func_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                     uint64_t *visits) {
+    if (!prefix)
+        return false;
+    size_t length = strlen(prefix);
+    /* The old iterator omits shadowed fallback QNs, whose equal head QN has
+     * the same prefix answer. This boolean union needs no winner selection. */
+    for (const CBMTypeRegistry *link = reg; link; link = link->fallback) {
+        if (registry_link_has_func_qn_prefix(link, prefix, length, visits))
+            return true;
+    }
+    return false;
+}
+
 // Count parameters in a FUNC signature.
 static int count_func_params(const CBMRegisteredFunc *f) {
     if (!f || !f->signature || f->signature->kind != CBM_TYPE_FUNC)
