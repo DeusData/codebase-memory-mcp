@@ -50,6 +50,7 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
 #include <foundation/log.h>
 
 #include <string.h>
@@ -1259,18 +1260,32 @@ typedef struct {
     const char *want_path;  /* expected target file_path; NULL = no edge */
 } EIPhpImportExpect;
 
-/* Find the IMPORTS edge of `importer` whose local_name is `local` and write
- * its target's file_path into `out` ("" when there is no such edge). */
-static void ei_import_target_path(cbm_store_t *store, const char *project, const char *importer,
-                                  const char *local, char *out, size_t outsz) {
+/* Return the number of matching IMPORTS edges, or -1 on a setup/query error.
+ * A failed query or missing importer must never look like a valid no-edge result. */
+static int ei_import_target_path(cbm_store_t *store, const char *project, const char *importer,
+                                 const char *local, char *out, size_t outsz) {
     out[0] = '\0';
-    int64_t src_id = ei_node_id_for_file_label(store, project, importer, "File");
+    cbm_node_t *sources = NULL;
+    int source_count = 0;
+    if (cbm_store_find_nodes_by_file(store, project, importer, &sources, &source_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int64_t src_id = 0;
+    for (int i = 0; i < source_count; i++) {
+        if (sources[i].label && strcmp(sources[i].label, "File") == 0) {
+            src_id = sources[i].id;
+            break;
+        }
+    }
+    cbm_store_free_nodes(sources, source_count);
     cbm_edge_t *edges = NULL;
     int n = 0;
     if (src_id <= 0 ||
         cbm_store_find_edges_by_source_type(store, src_id, "IMPORTS", &edges, &n) != CBM_STORE_OK) {
-        return;
+        return -1;
     }
+    int matches = 0;
     char needle[256];
     snprintf(needle, sizeof(needle), "\"local_name\":\"%s\"", local);
     for (int i = 0; i < n; i++) {
@@ -1279,36 +1294,65 @@ static void ei_import_target_path(cbm_store_t *store, const char *project, const
         }
         cbm_node_t target;
         memset(&target, 0, sizeof(target));
-        if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) == CBM_STORE_OK) {
-            snprintf(out, outsz, "%s", target.file_path ? target.file_path : "?");
-            cbm_node_free_fields(&target);
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) != CBM_STORE_OK) {
+            matches = -1;
+            break;
         }
-        break;
+        snprintf(out, outsz, "%s", target.file_path ? target.file_path : "?");
+        cbm_node_free_fields(&target);
+        matches++;
     }
     cbm_store_free_edges(edges, n);
+    return matches;
 }
 
 /* Index `files` and check every expectation for `importer`. Returns 1 when
  * all hold; prints each mismatch so a RED names the fabricated target. */
 static int ei_php_imports_match(const EILangFile *files, int nfiles, const char *importer,
                                 const EIPhpImportExpect *want, int nwant) {
+    const char *source = NULL;
+    for (int i = 0; i < nfiles; i++) {
+        if (strcmp(files[i].name, importer) == 0) {
+            source = files[i].content;
+            break;
+        }
+    }
+    CBMFileResult *extracted = source ? cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP,
+                                                         "php_import_test", importer, 0, NULL, NULL)
+                                      : NULL;
+    if (!extracted) {
+        return 0;
+    }
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
     if (!store) {
+        cbm_free_result(extracted);
         ei_cleanup(&lp, store);
         return 0;
     }
     int ok = 1;
     for (int i = 0; i < nwant; i++) {
+        int import_count = 0;
+        for (int j = 0; j < extracted->imports.count; j++) {
+            const CBMImport *imp = &extracted->imports.items[j];
+            if (imp->local_name && strcmp(imp->local_name, want[i].local_name) == 0 &&
+                imp->module_path && imp->module_path[0] && !imp->is_default) {
+                import_count++;
+            }
+        }
         char got[512];
-        ei_import_target_path(store, lp.project, importer, want[i].local_name, got, sizeof(got));
+        int edge_count = ei_import_target_path(store, lp.project, importer, want[i].local_name, got,
+                                               sizeof(got));
         const char *expect = want[i].want_path ? want[i].want_path : "";
-        if (strcmp(got, expect) != 0) {
+        if (import_count != 1 || edge_count != (want[i].want_path ? 1 : 0) ||
+            strcmp(got, expect) != 0) {
             fprintf(stderr, "  [IMPORTS %s] %s -> got \"%s\", want \"%s\"\n", importer,
                     want[i].local_name, got, expect);
+            fprintf(stderr, "  extracted=%d, matching edges=%d\n", import_count, edge_count);
             ok = 0;
         }
     }
+    cbm_free_result(extracted);
     ei_cleanup(&lp, store);
     return ok;
 }
@@ -1432,6 +1476,228 @@ TEST(ei_php_psr4_missing_class_file_unresolved_issue1186) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * PHP vendor / unmapped namespaces — #1186 follow-up
+ *
+ * A `use` of a namespace that no composer psr-4 prefix covers and no project
+ * file declares (Illuminate\, Spatie\, ...) names a class outside the project.
+ * The name-guess fallbacks bound it to any same-named project symbol, even in
+ * another language (`use Illuminate\Http\JsonResponse` -> a TypeScript class
+ * Http). Such an import must produce no edge. Namespaces that project files
+ * do declare keep resolving, to the file that declares the imported class.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* A vendor class import whose short name matches a project class binds to
+ * nothing; the project's own PSR-4 import of that class still resolves. */
+TEST(ei_php_vendor_use_same_name_no_edge_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Enums/Acl/Role.php", "<?php\nnamespace App\\Enums\\Acl;\n\nenum Role: string {\n"
+                                   "    case ADMIN = 'admin';\n}\n"},
+        {"app/Models/Permission.php", EI_PHP_CLASS("App\\Models", "Permission")},
+        {"app/Models/User.php", "<?php\nnamespace App\\Models;\n\n"
+                                "use Spatie\\Permission\\Models\\Role;\n"
+                                "use Spatie\\Permission\\Models\\Permission as SpatiePermission;\n"
+                                "use App\\Enums\\Acl\\Role as AclRole;\n\n"
+                                "class User {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Role", NULL},
+        {"SpatiePermission", NULL},
+        {"AclRole", "app/Enums/Acl/Role.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 4, "app/Models/User.php", want, 3));
+    PASS();
+}
+
+/* A vendor class import never binds to a non-PHP file: neither through a
+ * namespace segment (`Http` -> a TS class Http) nor through the class name
+ * (`Request` -> a TS class Request). Nor does a global-namespace `use Closure;`
+ * (-> a TS type Closure). */
+TEST(ei_php_vendor_use_cross_language_no_edge_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"resources/js/services/http.ts", "export class Http {\n  get(url: string) {}\n}\n"},
+        {"resources/js/services/request.ts", "export class Request {\n  send() {}\n}\n"},
+        {"resources/js/types.d.ts", "type Closure = () => void\n"},
+        {"app/Http/Controllers/SongController.php",
+         "<?php\nnamespace App\\Http\\Controllers;\n\n"
+         "use Closure;\nuse Illuminate\\Http\\JsonResponse;\nuse Illuminate\\Http\\Request;\n\n"
+         "class SongController {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"JsonResponse", NULL},
+        {"Request", NULL},
+        {"Closure", NULL},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 5, "app/Http/Controllers/SongController.php", want, 3));
+    PASS();
+}
+
+/* Without composer.json the rule is the same: a namespace no project file
+ * declares binds to nothing, while a declared one still resolves. */
+TEST(ei_php_undeclared_namespace_no_composer_no_edge_issue1186) {
+    static const EILangFile f[] = {
+        {"lib/Util/Helper.php", EI_PHP_CLASS("Lib\\Util", "Helper")},
+        {"main.php", "<?php\nnamespace Main;\n\n"
+                     "use Vendor\\Pkg\\Helper as VendorHelper;\nuse Lib\\Util\\Helper;\n\n"
+                     "class Main {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"VendorHelper", NULL},
+        {"Helper", "lib/Util/Helper.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 2, "main.php", want, 2));
+    PASS();
+}
+
+/* Control (no composer.json): a namespace declared by several project files
+ * resolves each class import to the file that declares that class, not to the
+ * first file of the namespace. */
+TEST(ei_php_declared_namespace_per_class_file_issue1186) {
+    static const EILangFile f[] = {
+        {"lib/Util/Aaa.php", EI_PHP_CLASS("Lib\\Util", "Aaa")},
+        {"lib/Util/Helper.php", EI_PHP_CLASS("Lib\\Util", "Helper")},
+        {"lib/Util/Zed.php", EI_PHP_CLASS("Lib\\Util", "Zed")},
+        {"main.php", "<?php\nnamespace Main;\n\n"
+                     "use Lib\\Util\\Helper;\nuse Lib\\Util\\Zed as Z;\nuse Lib\\Util\\Aaa;\n\n"
+                     "class Main {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Helper", "lib/Util/Helper.php"},
+        {"Z", "lib/Util/Zed.php"},
+        {"Aaa", "lib/Util/Aaa.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 4, "main.php", want, 3));
+    PASS();
+}
+
+/* No namespace declarations anywhere: an empty map must still block vendor
+ * name guessing, while an imported global project class remains valid. */
+TEST(ei_php_vendor_use_empty_namespace_map_issue1186) {
+    static const EILangFile f[] = {{"Helper.php", "<?php\nclass Helper {\n}\n"},
+                                   {"Legacy.php", "<?php\nclass LocalHelper {\n}\n"},
+                                   {"main.php",
+                                    "<?php\nuse Vendor\\Pkg\\Helper;\nuse LocalHelper as Local;\n"
+                                    "function run() {}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Helper", NULL},
+        {"Local", "Legacy.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 3, "main.php", want, 2));
+    PASS();
+}
+
+/* Filtering one generic winner would discard Helper when a.ts sorts first.
+ * Filtering candidates must instead preserve the valid global PHP class. */
+TEST(ei_php_global_use_keeps_php_candidate_issue1186) {
+    static const EILangFile f[] = {
+        {"a.ts", "export class Helper {\n}\n"},
+        {"z.php", "<?php\nclass Helper {\n}\n"},
+        {"main.php", "<?php\nnamespace Client;\nuse Helper;\nclass Main {\n}\n"}};
+    static const EIPhpImportExpect want[] = {{"Helper", "z.php"}};
+    ASSERT_TRUE(ei_php_imports_match(f, 3, "main.php", want, 1));
+    PASS();
+}
+
+/* Unmapped project namespaces retain exact member-file targets, mixed grouped
+ * use kinds, aliases, fully qualified names, and imports of a namespace itself. */
+TEST(ei_php_declared_functions_and_alias_issue1186) {
+    static const EILangFile f[] = {
+        {"lib/Util/Aaa.php", EI_PHP_CLASS("Lib\\Util", "Aaa")},
+        {"lib/Util/render.php", "<?php\nnamespace Lib\\Util;\nfunction render() {}\n"},
+        {"lib/Util/encode.php", "<?php\nnamespace Lib\\Util;\nfunction encode() {}\n"},
+        {"lib/Util/Helper.php", EI_PHP_CLASS("Lib\\Util", "Helper")},
+        {"lib/Extra/Extra.php", EI_PHP_CLASS("Lib\\Extra", "Extra")},
+        {"lib/Other/Other.php", EI_PHP_CLASS("Lib\\Other", "Other")},
+        {"main.php",
+         "<?php\nnamespace Main;\n"
+         "use Lib\\Util\\{function render as fmt, function encode as enc, Helper as H};\n"
+         "use Lib\\Extra as Tools;\nuse \\Lib\\Other\\Other as FullyQualified;\n"
+         "class Main {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"fmt", "lib/Util/render.php"},
+        {"enc", "lib/Util/encode.php"},
+        {"H", "lib/Util/Helper.php"},
+        {"Tools", "lib/Extra/Extra.php"},
+        {"FullyQualified", "lib/Other/Other.php"},
+    };
+    CBMFileResult *r = cbm_extract_file(f[6].content, (int)strlen(f[6].content), CBM_LANG_PHP,
+                                        "php_import_test", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    int kinds_ok = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (!imp->local_name || !imp->module_path || imp->is_default) {
+            continue;
+        }
+        if ((strcmp(imp->local_name, "fmt") == 0 &&
+             strcmp(imp->module_path, "Lib\\Util\\render") == 0 &&
+             imp->kind == CBM_IMPORT_KIND_FUNCTION) ||
+            (strcmp(imp->local_name, "enc") == 0 &&
+             strcmp(imp->module_path, "Lib\\Util\\encode") == 0 &&
+             imp->kind == CBM_IMPORT_KIND_FUNCTION) ||
+            (strcmp(imp->local_name, "H") == 0 &&
+             strcmp(imp->module_path, "Lib\\Util\\Helper") == 0 &&
+             imp->kind == CBM_IMPORT_KIND_DEFAULT)) {
+            kinds_ok++;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(kinds_ok, 3);
+    ASSERT_TRUE(ei_php_imports_match(f, 7, "main.php", want, 5));
+    PASS();
+}
+
+/* Exercise the NULL namespace-map contract used by CALLS directly. Try both
+ * a direct module-path collision and an earlier-sorting symbol-name collision. */
+static int ei_php_null_map_candidate(bool direct_collision) {
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("phpimports", "/tmp");
+    if (!gbuf) {
+        return 0;
+    }
+    int64_t decoy = cbm_gbuf_upsert_node(
+        gbuf, "Function", "render",
+        direct_collision ? "phpimports.Lib.render" : "phpimports.a.render", "a.ts", 1, 1, "{}");
+    int64_t valid = cbm_gbuf_upsert_node(gbuf, "Function", "render", "phpimports.z.render", "z.php",
+                                         1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.project_name = "phpimports", .gbuf = gbuf};
+    CBMImport imp = {
+        .local_name = "fmt", .module_path = "Lib\\render", .kind = CBM_IMPORT_KIND_FUNCTION};
+    CBMHashTable *saved_pkgmap = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "main.php", "phpimports.main.__file__", &imp, NULL);
+    int ok = decoy > 0 && valid > 0 && target && target->id == valid;
+    cbm_pipeline_set_pkgmap(saved_pkgmap);
+    cbm_gbuf_free(gbuf);
+    return ok;
+}
+
+TEST(ei_php_null_namespace_map_keeps_php_candidate_issue1186) {
+    ASSERT_TRUE(ei_php_null_map_candidate(false));
+    ASSERT_TRUE(ei_php_null_map_candidate(true));
+    PASS();
+}
+
+/* A require/include path is not a namespace use. Even with an empty namespace
+ * map it retains generic path resolution to the named file. */
+TEST(ei_php_require_path_keeps_generic_resolution_issue1186) {
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("phpimports", "/tmp");
+    ASSERT_NOT_NULL(gbuf);
+    int64_t valid = cbm_gbuf_upsert_node(gbuf, "File", "helper.php", "phpimports.lib.helper",
+                                         "lib/helper.php", 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.project_name = "phpimports", .gbuf = gbuf};
+    CBMImport imp = {.local_name = "helper", .module_path = "lib/helper.php"};
+    CBMHashTable *map = cbm_pipeline_namespace_map_build_names("phpimports", NULL, NULL, 0);
+    CBMHashTable *saved_pkgmap = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "main.php", "phpimports.main.__file__", &imp, map);
+    int ok = map && valid > 0 && target && target->id == valid;
+    cbm_pipeline_set_pkgmap(saved_pkgmap);
+    cbm_pipeline_namespace_map_free(map);
+    cbm_gbuf_free(gbuf);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1519,4 +1785,13 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_psr4_multiple_roots_longest_prefix_issue1186);
     RUN_TEST(ei_php_psr4_use_function_not_class_mapped_issue1186);
     RUN_TEST(ei_php_psr4_missing_class_file_unresolved_issue1186);
+    RUN_TEST(ei_php_vendor_use_same_name_no_edge_issue1186);
+    RUN_TEST(ei_php_vendor_use_cross_language_no_edge_issue1186);
+    RUN_TEST(ei_php_undeclared_namespace_no_composer_no_edge_issue1186);
+    RUN_TEST(ei_php_declared_namespace_per_class_file_issue1186);
+    RUN_TEST(ei_php_vendor_use_empty_namespace_map_issue1186);
+    RUN_TEST(ei_php_global_use_keeps_php_candidate_issue1186);
+    RUN_TEST(ei_php_declared_functions_and_alias_issue1186);
+    RUN_TEST(ei_php_null_namespace_map_keeps_php_candidate_issue1186);
+    RUN_TEST(ei_php_require_path_keeps_generic_resolution_issue1186);
 }
