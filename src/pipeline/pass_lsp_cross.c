@@ -529,6 +529,132 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
     }
 }
 
+/* Python annotation text -> the one type name it declares, or NULL. Strips a
+ * string-literal forward reference and unwraps `Optional[X]`, `X | None` and
+ * `None | X`; anything else with brackets, commas or a real union (generics,
+ * Callable, Union[A, B]) names no single receiver type and is dropped. */
+static const char *pxc_py_annotation_type_name(CBMArena *arena, const char *text) {
+    if (!text) {
+        return NULL;
+    }
+    while (*text == ' ') {
+        text++;
+    }
+    size_t n = strlen(text);
+    while (n > 0 && text[n - 1] == ' ') {
+        n--;
+    }
+    if (n >= 2 && (text[0] == '"' || text[0] == '\'') && text[n - 1] == text[0]) {
+        text++;
+        n -= 2;
+    }
+    static const char *const optional_prefixes[] = {"Optional[", "typing.Optional["};
+    for (size_t i = 0; i < sizeof(optional_prefixes) / sizeof(optional_prefixes[0]); i++) {
+        size_t plen = strlen(optional_prefixes[i]);
+        if (n > plen + 1 && strncmp(text, optional_prefixes[i], plen) == 0 && text[n - 1] == ']') {
+            text += plen;
+            n -= plen + 1;
+            break;
+        }
+    }
+    static const char none_tail[] = " | None";
+    static const char none_head[] = "None | ";
+    const size_t none_len = sizeof(none_tail) - 1;
+    if (n > none_len && strncmp(text + n - none_len, none_tail, none_len) == 0) {
+        n -= none_len;
+    } else if (n > none_len && strncmp(text, none_head, none_len) == 0) {
+        text += none_len;
+        n -= none_len;
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = text[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.';
+        if (!ok) {
+            return NULL;
+        }
+    }
+    return cbm_arena_strndup(arena, text, n);
+}
+
+/* Python: fold the file's annotated instance fields (result->field_types,
+ * #1277) into their class defs' field_defs as "name:QN|name:QN", the format
+ * py_register_lsp_defs reads. Each annotation resolves through the same
+ * registry + import map, and the same weak-strategy and type-like vetoes, as
+ * the file's base classes (pxc_resolve_base_qn): a field whose type is not a
+ * confidently-known project type is left out rather than guessed. Linear in
+ * the file: one hash of the file's class defs, one pass over its fields. */
+typedef struct {
+    int owner; /* index into defs[], or -1 */
+    const char *type_qn;
+} pxc_py_field_t;
+
+static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                    int start, int end, const cbm_registry_t *reg,
+                                    const char *module_qn, const char **imp_keys,
+                                    const char **imp_vals, int imp_count) {
+    int nf = result ? result->field_types.count : 0;
+    if (!arena || nf == 0 || !defs || start >= end || !reg) {
+        return;
+    }
+    CBMHashTable *by_qn = cbm_ht_create((uint32_t)(end - start));
+    pxc_py_field_t *fields = (pxc_py_field_t *)cbm_arena_alloc(arena, (size_t)nf * sizeof(*fields));
+    /* Per class def: exact buffer size, then the write cursor into it. */
+    size_t *lens = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    size_t *used = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    if (!by_qn || !fields || !lens || !used) {
+        cbm_ht_free(by_qn); /* NULL-safe */
+        return;
+    }
+    memset(lens, 0, (size_t)(end - start) * sizeof(size_t));
+    memset(used, 0, (size_t)(end - start) * sizeof(size_t));
+    for (int si = start; si < end; si++) {
+        if (defs[si].label && strcmp(defs[si].label, "Class") == 0 && defs[si].qualified_name) {
+            cbm_ht_set(by_qn, defs[si].qualified_name, &defs[si]);
+        }
+    }
+    for (int f = 0; f < nf; f++) {
+        const CBMFieldType *ft = &result->field_types.items[f];
+        fields[f].owner = -1;
+        fields[f].type_qn = NULL;
+        CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
+        const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
+        const char *qn =
+            name ? pxc_resolve_base_qn(reg, name, module_qn, imp_keys, imp_vals, imp_count) : NULL;
+        if (!qn || !ft->field_name || !ft->field_name[0]) {
+            continue;
+        }
+        fields[f].owner = (int)(owner - defs);
+        fields[f].type_qn = qn;
+        /* "name:QN" plus one byte for the '|' or the NUL after it. */
+        lens[fields[f].owner - start] += strlen(ft->field_name) + 1 + strlen(qn) + 1;
+    }
+    cbm_ht_free(by_qn);
+    for (int si = start; si < end; si++) {
+        char *buf = lens[si - start] ? (char *)cbm_arena_alloc(arena, lens[si - start]) : NULL;
+        if (buf) {
+            buf[0] = '\0';
+        }
+        defs[si].field_defs = buf;
+    }
+    for (int f = 0; f < nf; f++) {
+        char *buf = fields[f].owner >= 0 ? (char *)defs[fields[f].owner].field_defs : NULL;
+        if (!buf) {
+            continue;
+        }
+        int slot = fields[f].owner - start;
+        int wrote =
+            snprintf(buf + used[slot], lens[slot] - used[slot], "%s%s:%s", used[slot] ? "|" : "",
+                     result->field_types.items[f].field_name, fields[f].type_qn);
+        if (wrote > 0) {
+            used[slot] += (size_t)wrote;
+        }
+    }
+}
+
 /* Carry one Rust type-level impl independently of any method definition.
  * `impl Trait for Type {}` is semantically meaningful even when the block is
  * empty (the trait may provide defaults), so attaching the relation only to
@@ -633,6 +759,10 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
                                   imp_count) == 0) {
                 idx++;
             }
+        }
+        if (files[fi].language == CBM_LANG_PYTHON) {
+            pxc_fold_py_field_types(arena, fr, defs, file_start, idx, base_reg, def_modules[fi],
+                                    imp_keys, imp_vals, imp_count);
         }
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {

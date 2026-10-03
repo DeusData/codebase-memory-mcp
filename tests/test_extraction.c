@@ -1182,6 +1182,62 @@ TEST(cpp_method_return_type_preserves_pointer_and_qualifier) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* --- Python --- */
+/* #1277: annotated Python instance fields reach result->field_types (the
+ * cross-file LSP's only source for them); nothing unannotated is guessed and
+ * no graph def is minted for a field. */
+static const char *py_field_type_of(const CBMFileResult *r, const char *cls_suffix,
+                                    const char *field) {
+    for (int i = 0; i < r->field_types.count; i++) {
+        const CBMFieldType *ft = &r->field_types.items[i];
+        size_t cl = strlen(ft->class_qn);
+        size_t sl = strlen(cls_suffix);
+        if (cl >= sl && strcmp(ft->class_qn + cl - sl, cls_suffix) == 0 &&
+            strcmp(ft->field_name, field) == 0) {
+            return ft->type_text;
+        }
+    }
+    return NULL;
+}
+
+TEST(python_annotated_instance_fields_exported_issue1277) {
+    const char *src = "class Trainer(Base):\n"
+                      "    engine: Contract\n"
+                      "    limit: int = 3\n"
+                      "    plain = 5\n\n"
+                      "    def __init__(self, strategies: Contract, n, opt: 'Other' = None):\n"
+                      "        self.strategies = strategies\n"
+                      "        self.typed: Contract = strategies\n"
+                      "        self.count = n\n"
+                      "        self.made = make()\n"
+                      "        self.opt = opt\n"
+                      "        if n:\n"
+                      "            self.nested: Nested = n\n"
+                      "        def inner(other: Inner):\n"
+                      "            self.hidden = other\n\n"
+                      "    def later(self, x: Later):\n"
+                      "        self.late = x\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "trainer.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "engine"), "Contract");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "limit"), "int");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "strategies"), "Contract");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "typed"), "Contract");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "opt"), "'Other'");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "nested"), "Nested");
+    /* Controls: no declared type, a nested function's binding, a non-__init__ method. */
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "plain"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "count"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "made"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "hidden"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "late"));
+    ASSERT_EQ(r->field_types.count, 6);
+    for (int i = 0; i < r->defs.count; i++) {
+        ASSERT_FALSE(r->defs.items[i].label && strcmp(r->defs.items[i].label, "Field") == 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_function) {
     CBMFileResult *r = extract(
         "def greet(name):\n    return f\"Hello {name}\"\n\ndef main():\n    greet(\"World\")\n",
@@ -8991,6 +9047,7 @@ SUITE(extraction) {
     /* Scripting */
     RUN_TEST(python_function);
     RUN_TEST(python_class);
+    RUN_TEST(python_annotated_instance_fields_exported_issue1277);
     RUN_TEST(js_function);
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
