@@ -4843,6 +4843,35 @@ TEST(cypher_exec_deadline_aborts_runaway_query_issue601) {
     PASS();
 }
 
+static uint64_t cypher_frozen_deadline_clock(void) {
+    return 1000;
+}
+
+static _Thread_local unsigned cypher_deadline_clock_reads = 0;
+
+static uint64_t cypher_expiring_deadline_clock(void) {
+    /* Default budget is 30 seconds; expire exactly at the first checkpoint. */
+    return cypher_deadline_clock_reads++ == 0 ? 1000 : 31000;
+}
+
+TEST(cypher_exec_deadline_expires_at_positive_budget_boundary) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    cypher_deadline_clock_reads = 0;
+    cbm_cypher_test_set_deadline_clock(cypher_expiring_deadline_clock);
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN n.name", "test", 0, &r);
+    cbm_cypher_test_set_deadline_clock(NULL);
+
+    ASSERT_TRUE(cypher_deadline_clock_reads >= 2);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_NOT_NULL(strstr(r.error, "time limit"));
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #601 companion: the default (ample) budget must NOT false-positive on a
  * normal small query — it still returns its rows. */
 TEST(cypher_exec_deadline_allows_normal_query_issue601) {
@@ -5200,13 +5229,20 @@ static int union_many_check(void *arg) {
 
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
-    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    /* This exercises stack depth and every result, independently of how
+     * slowly instrumentation runs. Dedicated deadline tests retain expiry. */
+    cbm_cypher_test_set_deadline_clock(cypher_frozen_deadline_clock);
+    /* Request exactly the output this fixture needs: the default 100k ceiling
+     * also reserves 100k binding slots separately for every UNION branch. */
+    int rc = cbm_cypher_execute(s, query, "test", CYPHER_UNION_MANY_BRANCHES, &r);
+    cbm_cypher_test_set_deadline_clock(NULL);
     free(query);
     if (rc != 0) {
         printf("  query error: %s\n", r.error ? r.error : "(none)");
     }
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, CYPHER_UNION_MANY_BRANCHES);
+    ASSERT_TRUE(!r.truncated);
     for (int i = 0; i < r.row_count; i++) {
         ASSERT_STR_EQ(r.rows[i][0], cypher_fixture_nodes[i % CYPHER_FIXTURE_NODE_COUNT]);
     }
@@ -5305,6 +5341,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_error);
     /* Execution */
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
+    RUN_TEST(cypher_exec_deadline_expires_at_positive_budget_boundary);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
     RUN_TEST(cypher_deep_nesting_rejected_not_crash);
     RUN_TEST(cypher_exec_match_all_functions);
