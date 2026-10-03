@@ -76,6 +76,8 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/laravel_routing.h"
 #include "lsp/rust_cargo.h"
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
 #include "foundation/compat.h"
@@ -1317,12 +1319,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             snprintf(how_far, sizeof(how_far), "%u/%u nodes walked", result->walk_nodes_visited,
                      result->tree_nodes);
             pp_err_add(errs, fi->rel_path, how_far, "walk_truncated");
-        } else if (result->lsp_skipped) {
-            /* Indexed, but without the per-file and cross-file LSP refinement:
-             * the same kind of hole from the other direction. Nothing in
-             * production sets this any more except a truncated walk (handled
-             * above) and the test seam — it is reported anyway, so that if
-             * something sets it again the gap arrives named, not silent. */
+        } else if (result->lsp_skipped && !result->has_error) {
+            /* has_error already recorded its precise cause above. Indexed, but without the per-file
+             * and cross-file LSP refinement: the same kind of hole from the other direction.
+             * Nothing in production sets this any more except a truncated walk (handled above) and
+             * the test seam — it is reported anyway, so that if something sets it again the gap
+             * arrives named, not silent. */
             char size_text[CBM_SZ_64];
             snprintf(size_text, sizeof(size_text), "%u nodes", result->tree_nodes);
             pp_err_add(errs, fi->rel_path, size_text, "lsp_skipped");
@@ -1973,6 +1975,9 @@ typedef struct {
     /* Counters for parallel.resolve.lsp_cross_done summary. */
     _Atomic int lsp_cross_processed;
     _Atomic int lsp_cross_skipped_no_source;
+    /* Each file is owned by one worker. The coordinator reports failures
+     * after join, without mutating the pipeline's error list concurrently. */
+    const char **lsp_failures;
 
     /* Per-sub-phase timing (ns aggregated across workers) — surfaces
      * exactly where parallel_resolve's wall time is spent so we stop
@@ -3861,11 +3866,20 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * file around the resolve so a hang HERE is attributed to
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
+                bool had_error = result->has_error;
                 cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
                                       rc->cross_registries, rc->module_def_index, rc->all_defs,
                                       rc->def_count, imp_keys, imp_vals, imp_count,
                                       pp_rust_shared_registry_get, rc);
                 cbm_index_mark_done(rel);
+                if (!had_error && result->has_error && result->error_msg &&
+                    (strcmp(result->error_msg, CBM_C_LSP_MEMO_ERROR) == 0 ||
+                     strcmp(result->error_msg, CBM_PY_LSP_MEMO_ERROR) == 0 ||
+                     strcmp(result->error_msg, CBM_C_LSP_DEPTH_ERROR) == 0 ||
+                     strcmp(result->error_msg, CBM_PY_LSP_DEPTH_ERROR) == 0)) {
+                    rc->lsp_failures[file_idx] = result->error_msg;
+                    ws->errors++;
+                }
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
                 /* Contract: cbm_slab_reclaim() requires the thread parser to be
@@ -3978,6 +3992,11 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return CBM_NOT_FOUND;
     }
     memset(workers, 0, (size_t)worker_count * sizeof(resolve_worker_state_t));
+    const char **lsp_failures = calloc((size_t)file_count, sizeof(*lsp_failures));
+    if (!lsp_failures) {
+        cbm_aligned_free(workers);
+        return CBM_NOT_FOUND;
+    }
 
     bool have_rust = false;
     for (int i = 0; i < file_count; i++) {
@@ -4018,6 +4037,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
         .rust_manifest = rust_manifest_ptr,
+        .lsp_failures = lsp_failures,
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
@@ -4035,6 +4055,12 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_scale_end(&rc.scale);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
+    for (int i = 0; i < file_count; i++) {
+        if (lsp_failures[i] && ctx->pipeline)
+            cbm_pipeline_add_file_error(ctx->pipeline, files[i].rel_path, lsp_failures[i],
+                                        "lsp_skipped");
+    }
+    free(lsp_failures);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
      * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
      * all QNs, so freeing all_defs afterward is safe). */
