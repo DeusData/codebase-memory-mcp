@@ -27,6 +27,12 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#if !defined(SYS_close_range) && (defined(__x86_64__) || defined(__aarch64__))
+#define SYS_close_range 436
+#endif
+#endif
 #else
 #include <windows.h>
 #include "../src/foundation/win_utf8.h"
@@ -1012,6 +1018,94 @@ TEST(subprocess_posix_child_closes_unrelated_descriptors) {
 #endif
 }
 
+/* #1484: the child's close-inherited-descriptors step must not cost
+ * O(RLIMIT_NOFILE) syscalls. The seam runs the exact child routine in this
+ * process against two descriptors parked at the TOP of the descriptor table
+ * (nothing else lives there), and reports which strategy did the work. On
+ * Linux that must be close_range(2) whenever the kernel has it -- the per-fd
+ * loop is the bug. The ENOSYS-injected leg proves the fallback still closes. */
+#ifndef _WIN32
+static bool subprocess_fd_is_closed(int fd) {
+    return fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+}
+
+static cbm_fd_close_strategy_t subprocess_expected_close_strategy(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    /* Probe the kernel on an empty range: an old kernel (< 5.9) or a seccomp
+     * filter without it answers ENOSYS/EPERM, and then the loop is correct. */
+    long probe = syscall(SYS_close_range, ~0U, ~0U, 0U);
+    return (probe == 0 || errno == EINVAL) ? CBM_FD_CLOSE_RANGE : CBM_FD_CLOSE_LOOP;
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    return CBM_FD_CLOSEFROM;
+#else
+    return CBM_FD_CLOSE_LOOP;
+#endif
+}
+
+/* Park two non-CLOEXEC descriptors near the top of the table; returns the lower
+ * of the two and hands back the original (low) descriptor in *keep_low. The
+ * kernel may cap the table below _SC_OPEN_MAX (macOS: kern.maxfilesperproc),
+ * so the start point halves until F_DUPFD accepts it. */
+static int subprocess_park_high_fds(int *keep_low) {
+    char path[] = "/tmp/cbm-subprocess-highfd-XXXXXX";
+    int low = cbm_mkstemp(path);
+    if (low < 0) {
+        return -1;
+    }
+    (void)unlink(path);
+    long top = sysconf(_SC_OPEN_MAX);
+    if (top <= 0 || top > 1048576L) {
+        top = 1048576L;
+    }
+    int high = -1;
+    for (long base = top - 4; high < 0 && base > 64; base /= 2) {
+        high = fcntl(low, F_DUPFD, (int)base);
+    }
+    int higher = high >= 0 ? fcntl(low, F_DUPFD, high + 1) : -1;
+    if (higher != high + 1) {
+        (void)close(low);
+        if (high >= 0) {
+            (void)close(high);
+        }
+        if (higher >= 0) {
+            (void)close(higher);
+        }
+        return -1;
+    }
+    *keep_low = low;
+    return high;
+}
+#endif
+
+TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fork+exec descriptor closing; Windows uses a handle allow-list");
+#else
+    for (int inject_enosys = 0; inject_enosys <= 1; inject_enosys++) {
+        int keep_low = -1;
+        int high = subprocess_park_high_fds(&keep_low);
+        ASSERT_TRUE(high > STDERR_FILENO);
+        cbm_subprocess_force_close_range_enosys_for_testing(inject_enosys != 0);
+        /* The loop bound covers exactly the parked pair; close_range has none. */
+        cbm_fd_close_strategy_t used =
+            cbm_subprocess_close_fds_from_for_testing(high, (long)high + 2);
+        cbm_subprocess_force_close_range_enosys_for_testing(false);
+        bool closed = subprocess_fd_is_closed(high) && subprocess_fd_is_closed(high + 1);
+        bool low_survived = fcntl(keep_low, F_GETFD) >= 0;
+        (void)close(keep_low);
+
+        ASSERT_TRUE(closed);
+        ASSERT_TRUE(low_survived); /* only descriptors >= lowfd are touched */
+        cbm_fd_close_strategy_t expected = subprocess_expected_close_strategy();
+        if (inject_enosys && expected == CBM_FD_CLOSE_RANGE) {
+            expected = CBM_FD_CLOSE_LOOP; /* kernel "lacks" it: the fallback must run */
+        }
+        ASSERT_EQ((int)used, (int)expected);
+    }
+    PASS();
+#endif
+}
+
 TEST(subprocess_root_exit_drains_surviving_descendant) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group descendant probe; native Windows coverage pending");
@@ -1396,6 +1490,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
+    RUN_TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
     RUN_TEST(subprocess_strip_git_repo_env_is_per_child);
     RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);

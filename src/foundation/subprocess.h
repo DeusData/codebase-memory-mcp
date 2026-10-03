@@ -193,4 +193,21 @@ void cbm_subprocess_force_spawn_eagain_for_testing(int attempts);
 int cbm_subprocess_pending_spawn_eagain_for_testing(void);
 #endif
 
+/* How the POSIX fork+exec child closed its inherited descriptors (#1484). */
+typedef enum {
+    CBM_FD_CLOSE_RANGE = 1, /* Linux close_range(2): one syscall */
+    CBM_FD_CLOSEFROM,       /* BSD closefrom(3): one call */
+    CBM_FD_CLOSE_LOOP       /* close() per descriptor up to _SC_OPEN_MAX: O(RLIMIT_NOFILE) */
+} cbm_fd_close_strategy_t;
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+/* Run the child's close-inherited-descriptors step in the CALLING process for
+ * descriptors >= lowfd (callers pick a lowfd above everything they need) and
+ * report which strategy did the work. Test builds only. */
+cbm_fd_close_strategy_t cbm_subprocess_close_fds_from_for_testing(int lowfd, long max_fd);
+/* Make the close_range fast path behave as if the kernel lacked it (ENOSYS),
+ * so the fallback loop is exercised deterministically. Test builds only. */
+void cbm_subprocess_force_close_range_enosys_for_testing(bool force);
+#endif
+
 #endif /* CBM_SUBPROCESS_H */

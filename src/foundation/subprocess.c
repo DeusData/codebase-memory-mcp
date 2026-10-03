@@ -30,6 +30,9 @@
 #include <spawn.h>
 #endif
 extern char **environ;
+#ifdef __linux__
+#include <sys/syscall.h> /* SYS_close_range: raw syscall, see cbm_posix_close_fds_from */
+#endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1069,6 +1072,64 @@ static void cbm_posix_reset_child_signals(void) {
     (void)sigprocmask(SIG_SETMASK, &empty, NULL);
 }
 
+/* Close every descriptor >= lowfd in the fork+exec child (#1484).
+ *
+ * The portable answer is a close() per possible descriptor, which costs
+ * O(RLIMIT_NOFILE) syscalls: at nofile=524288 that is ~0.8 s between fork and
+ * exec for EVERY spawn, independent of how many descriptors are actually open.
+ * The kernel can do the same in one call:
+ *   - Linux >= 5.9: close_range(lowfd, ~0U, 0). Issued as a raw syscall, not
+ *     through the libc wrapper: the static musl release build has no wrapper
+ *     and the glibc wrapper only exists from 2.34, while the syscall number is
+ *     436 on the supported x86-64 and AArch64 targets. Other architectures
+ *     use their header's number, or the loop if no number is available.
+ *     An older kernel answers
+ *     ENOSYS (or EPERM under a seccomp filter that predates it) and we fall back.
+ *   - FreeBSD/OpenBSD/NetBSD/DragonFly: closefrom(lowfd).
+ *   - otherwise (and on fallback): the bounded close() loop.
+ * macOS never reaches this on its primary path: posix_spawn's
+ * CLOEXEC_DEFAULT does the closing (see cbm_posix_spawn_apple).
+ *
+ * Runs between fork and exec, so it is async-signal-safe: raw syscalls and
+ * close() only, no allocation, no stdio. Returns the strategy that did the
+ * work so the test seam can assert which one ran. */
+#if defined(__linux__) && !defined(SYS_close_range) && (defined(__x86_64__) || defined(__aarch64__))
+#define SYS_close_range 436
+#endif
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_force_close_range_enosys = false;
+#endif
+
+static cbm_fd_close_strategy_t cbm_posix_close_fds_from(int lowfd, long max_fd) {
+#if defined(__linux__) && defined(SYS_close_range)
+    bool range_unavailable = false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    range_unavailable = g_force_close_range_enosys;
+#endif
+    if (!range_unavailable && syscall(SYS_close_range, (unsigned int)lowfd, ~0U, 0U) == 0) {
+        return CBM_FD_CLOSE_RANGE;
+    }
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    (void)max_fd;
+    closefrom(lowfd);
+    return CBM_FD_CLOSEFROM;
+#endif
+    for (int fd = lowfd; fd < max_fd; fd++) {
+        (void)close(fd);
+    }
+    return CBM_FD_CLOSE_LOOP;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_subprocess_force_close_range_enosys_for_testing(bool force) {
+    g_force_close_range_enosys = force;
+}
+cbm_fd_close_strategy_t cbm_subprocess_close_fds_from_for_testing(int lowfd, long max_fd) {
+    return cbm_posix_close_fds_from(lowfd, max_fd);
+}
+#endif
+
 /* fork+exec child setup. On Apple this runs ONLY for the exec-failure
  * fallback (see cbm_posix_spawn_apple), which preserves the documented
  * "bogus binary => child exits 127" contract across platforms. */
@@ -1090,9 +1151,7 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     if (output > STDERR_FILENO) {
         (void)close(output);
     }
-    for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
-        (void)close(fd);
-    }
+    (void)cbm_posix_close_fds_from(STDERR_FILENO + 1, max_fd);
     if (process->envp) {
         environ = process->envp; /* execvp passes environ to the new image */
     }
