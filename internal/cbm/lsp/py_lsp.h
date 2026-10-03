@@ -61,8 +61,13 @@ typedef struct {
     // caller QNs.
     const char *enclosing_func_qn;
     const char *enclosing_class_qn;
-    const char *module_qn;      // Python symbol scope (package __init__ omitted)
-    const char *file_module_qn; // raw file identity; borrowed for this API call
+    // Active class execution: nested class bodies skip this class frame.
+    // Local classes have no extracted graph QN, so class_body_qn stays NULL.
+    CBMScope *class_body_outer_scope;
+    const char *class_body_qn;
+    bool class_body_in_comprehension; // retain enclosing comprehension bindings
+    const char *module_qn;            // Python symbol scope (package __init__ omitted)
+    const char *file_module_qn;       // raw file identity; borrowed for this API call
 
     // Output: resolved calls accumulate here.
     CBMResolvedCallArray *resolved_calls;
@@ -174,6 +179,8 @@ void cbm_py_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status);
 void cbm_py_lsp_test_memo_fail_after(int successful_allocations);
 void cbm_py_lsp_test_depth_fail(bool enabled);
 void cbm_py_lsp_test_scope_fail_after(int successful_allocations);
+// Separate from the package symbol-scope seam; only new class execution frames.
+void cbm_py_lsp_test_class_frame_fail_after(int successful_allocations);
 bool cbm_py_lsp_test_register_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
                                    int def_count);
 const CBMType *cbm_py_lsp_test_eval(PyLSPContext *ctx, TSNode node);

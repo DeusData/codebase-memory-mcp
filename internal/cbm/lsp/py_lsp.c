@@ -40,6 +40,10 @@
 static _Thread_local int py_test_memo_allocations_left = -1;
 static _Thread_local bool py_test_depth_failure;
 static _Thread_local int py_test_scope_allocations_left = -1;
+static _Thread_local int py_test_class_frames_left = -1;
+void cbm_py_lsp_test_class_frame_fail_after(int successful_allocations) {
+    py_test_class_frames_left = successful_allocations;
+}
 void cbm_py_lsp_test_scope_fail_after(int successful_allocations) {
     py_test_scope_allocations_left = successful_allocations;
 }
@@ -223,6 +227,7 @@ static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
+static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node);
 static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int depth);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name);
@@ -282,6 +287,25 @@ static CBMScope *py_scope_push_checked(PyLSPContext *ctx) {
     if (!child || child == parent)
         py_disable_callable_value_proof(ctx);
     return child;
+}
+
+/* New class execution frames must never fall back to their parent: body
+ * bindings would escape and subsequent calls could use those stale bindings. */
+static CBMScope *py_class_frame_push(PyLSPContext *ctx, CBMScope *parent) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_test_class_frames_left == 0) {
+        ctx->eval_failure = CBM_LSP_SCOPE_FAILED;
+        return NULL;
+    }
+    if (py_test_class_frames_left > 0)
+        py_test_class_frames_left--;
+#endif
+    CBMScope *frame = cbm_scope_push(ctx->arena, parent);
+    if (!frame || frame == parent) {
+        ctx->eval_failure = CBM_LSP_SCOPE_FAILED;
+        return NULL;
+    }
+    return frame;
 }
 
 static void py_scope_clear_callable(PyLSPContext *ctx, const char *name) {
@@ -2449,13 +2473,16 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
                 } else {
                     py_scope_bind(ctx, name, rhs_type);
                 }
+                // Class attributes must not replace file-wide dispatch entries.
                 // Lambda registry: `fn = lambda x: ...`.
-                if (!ts_node_is_null(right) && strcmp(ts_node_type(right), "lambda") == 0) {
+                if (!ctx->class_body_outer_scope && !ts_node_is_null(right) &&
+                    strcmp(ts_node_type(right), "lambda") == 0) {
                     py_register_lambda(ctx, name, right);
                 }
                 // Dict literal dispatch table: `funcs = {"a": foo, "b": bar}`
                 // with all values being known function QNs.
-                if (!ts_node_is_null(right) && strcmp(ts_node_type(right), "dictionary") == 0) {
+                if (!ctx->class_body_outer_scope && !ts_node_is_null(right) &&
+                    strcmp(ts_node_type(right), "dictionary") == 0) {
                     py_register_dict_literal(ctx, name, right);
                 }
             }
@@ -2663,7 +2690,11 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
         // Walk the lambda body for any nested call sites with the params
         // bound to the call's arg types. Resolved calls get caller_qn
         // set to a synthetic <lambda> child of the enclosing function.
-        TSNode lambda_node = py_lookup_lambda(ctx, fname);
+        /* These legacy entries have no lexical frame identity. During class
+         * execution, leave lambda replay unresolved instead of bypassing a
+         * local shadow or running the lambda against class locals. */
+        TSNode lambda_node =
+            ctx->class_body_outer_scope ? (TSNode){0} : py_lookup_lambda(ctx, fname);
         if (!ts_node_is_null(lambda_node)) {
             TSNode params = ts_node_child_by_field_name(lambda_node, "parameters", 10);
             TSNode body = ts_node_child_by_field_name(lambda_node, "body", 4);
@@ -2774,7 +2805,7 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
 
     // Subscript-as-call: `funcs["a"]()` where funcs is a registered
     // dict-literal dispatch table.
-    if (strcmp(fk, "subscript") == 0) {
+    if (!ctx->class_body_outer_scope && strcmp(fk, "subscript") == 0) {
         TSNode container = ts_node_child_by_field_name(fn, "value", 5);
         TSNode key = ts_node_child_by_field_name(fn, "subscript", 9);
         if (!ts_node_is_null(container) && !ts_node_is_null(key) &&
@@ -3349,6 +3380,65 @@ static void py_emit_dunder_call(PyLSPContext *ctx, const CBMType *recv, const ch
     }
 }
 
+/* A class comprehension evaluates its leftmost iterable in the class frame,
+ * but the implicit body scope skips class locals. Nested comprehensions keep
+ * the surrounding comprehension frame. Keep class execution marked active so
+ * legacy bare-name dispatch cannot bypass either frame's lexical bindings. */
+static void py_resolve_class_comprehension(PyLSPContext *ctx, TSNode node) {
+    if (ctx->eval_failure)
+        return;
+    PyKids kids = py_kids(ctx->arena, node);
+    uint32_t first_for = kids.n;
+    TSNode first_right = {0};
+    for (uint32_t i = 0; i < kids.n && !ctx->eval_failure; i++) {
+        TSNode child = py_kid(&kids, i);
+        if (strcmp(ts_node_type(child), "for_in_clause") == 0) {
+            first_for = i;
+            first_right = ts_node_child_by_field_name(child, "right", 5);
+            break;
+        }
+    }
+    if (first_for == kids.n)
+        return;
+    const CBMType *first_type = py_eval_expr_type(ctx, first_right);
+    py_resolve_calls_in(ctx, first_right);
+    if (ctx->eval_failure)
+        return;
+    const CBMType *first_elem = py_iterable_element_type(ctx, first_type);
+    CBMScope *saved_scope = ctx->current_scope;
+    bool saved_comprehension = ctx->class_body_in_comprehension;
+    CBMScope *parent = saved_comprehension ? saved_scope : ctx->class_body_outer_scope;
+    CBMScope *frame = py_class_frame_push(ctx, parent);
+    if (!frame)
+        return;
+    py_scope_restore(ctx, frame);
+    ctx->class_body_in_comprehension = true;
+    /* Clauses precede the body at evaluation time, although tree-sitter stores
+     * the body first. Walk each iterable/filter only once, before later binds. */
+    for (uint32_t i = first_for; i < kids.n && !ctx->eval_failure; i++) {
+        TSNode child = py_kid(&kids, i);
+        if (strcmp(ts_node_type(child), "for_in_clause") == 0) {
+            TSNode left = ts_node_child_by_field_name(child, "left", 4);
+            const CBMType *elem = first_elem;
+            if (i != first_for) {
+                TSNode right = ts_node_child_by_field_name(child, "right", 5);
+                const CBMType *iter = py_eval_expr_type(ctx, right);
+                py_resolve_calls_in(ctx, right);
+                if (ctx->eval_failure)
+                    break;
+                elem = py_iterable_element_type(ctx, iter);
+            }
+            py_bind_for_target(ctx, left, elem);
+        } else {
+            py_resolve_calls_in(ctx, child);
+        }
+    }
+    for (uint32_t i = 0; i < first_for && !ctx->eval_failure; i++)
+        py_resolve_calls_in(ctx, py_kid(&kids, i));
+    ctx->class_body_in_comprehension = saved_comprehension;
+    py_scope_restore(ctx, saved_scope);
+}
+
 static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node))
         return;
@@ -3551,6 +3641,10 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     // iterable's element type, then walk inner expressions.
     if (strcmp(k, "list_comprehension") == 0 || strcmp(k, "dictionary_comprehension") == 0 ||
         strcmp(k, "set_comprehension") == 0 || strcmp(k, "generator_expression") == 0) {
+        if (ctx->class_body_outer_scope) {
+            py_resolve_class_comprehension(ctx, node);
+            return;
+        }
         CBMScope *saved = ctx->current_scope;
         ctx->current_scope = py_scope_push_checked(ctx);
         uint32_t cnc = ts_node_named_child_count(node);
@@ -3583,15 +3677,19 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     // Recurse: children. We don't push scope for control-flow blocks
     // here (Python scoping is function-level apart from comprehension /
     // lambda / class), but we do for nested function / class / lambda.
-    if (strcmp(k, "function_definition") == 0 || strcmp(k, "class_definition") == 0 ||
-        strcmp(k, "lambda") == 0) {
+    if (strcmp(k, "function_definition") == 0 || strcmp(k, "lambda") == 0) {
         // These are processed by the top-level pass; skip recursion to
         // avoid double-walking their bodies.
         return;
     }
 
+    if (strcmp(k, "class_definition") == 0) {
+        py_exec_class_definition(ctx, node);
+        return;
+    }
+
     PyKids nk = py_kids(ctx->arena, node);
-    for (uint32_t i = 0; i < nk.n; i++) {
+    for (uint32_t i = 0; i < nk.n && !ctx->eval_failure; i++) {
         py_resolve_calls_in(ctx, py_kid(&nk, i));
     }
 }
@@ -4210,6 +4308,120 @@ static bool py_is_init_method(PyLSPContext *ctx, TSNode func_node) {
         return false;
     char *nm = py_node_text(ctx, name);
     return nm && (strcmp(nm, "__init__") == 0 || strcmp(nm, "__post_init__") == 0);
+}
+
+/* Decorator expressions of a decorated definition, in source order. They
+ * evaluate in the scope enclosing the definition, before it is bound. A bare
+ * `@name` is no call and emits nothing; `@name(args)` is one. */
+static void py_resolve_decorators(PyLSPContext *ctx, TSNode decorated) {
+    if (!ctx || ctx->eval_failure)
+        return;
+    PyKids kids = py_kids(ctx->arena, decorated);
+    for (uint32_t i = 0; i < kids.n && !ctx->eval_failure; i++) {
+        TSNode child = py_kid(&kids, i);
+        if (strcmp(ts_node_type(child), "decorator") == 0)
+            py_resolve_calls_in(ctx, child);
+    }
+}
+
+/* Bind the name a class-body `def`/`class` statement defines in the class
+ * frame, so later class-body statements see it (and never the same-named
+ * module symbol). Its value is exact only for an undecorated function or a
+ * registered class whose QN is known; anything else is an UNKNOWN shadow. */
+static void py_bind_class_body_def(PyLSPContext *ctx, TSNode stmt) {
+    if (ctx->eval_failure)
+        return;
+    TSNode def = stmt;
+    bool decorated = strcmp(ts_node_type(stmt), "decorated_definition") == 0;
+    if (decorated) {
+        def = ts_node_child_by_field_name(stmt, "definition", 10);
+        if (ts_node_is_null(def))
+            return;
+    }
+    const char *kind = ts_node_type(def);
+    bool is_class = strcmp(kind, "class_definition") == 0;
+    if (!is_class && strcmp(kind, "function_definition") != 0)
+        return;
+    char *name = py_node_text(ctx, ts_node_child_by_field_name(def, "name", 4));
+    if (!name || !name[0]) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    const char *qn = ctx->class_body_qn
+                         ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->class_body_qn, name)
+                         : NULL;
+    if (is_class) {
+        const CBMRegisteredType *type = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+        py_scope_bind(ctx, name,
+                      type ? cbm_type_named(ctx->arena, type->qualified_name) : cbm_type_unknown());
+        return;
+    }
+    const CBMRegisteredFunc *func = qn ? cbm_registry_lookup_func(ctx->registry, qn) : NULL;
+    if (!decorated && py_func_is_exact_callable_value(func)) {
+        py_scope_bind_callable(ctx, name, cbm_type_unknown(), func->qualified_name);
+    } else {
+        py_scope_bind(ctx, name, cbm_type_unknown());
+    }
+}
+
+/* Execute a class definition where it stands: its bases in the enclosing
+ * scope, then its body statements in source order in a class frame. Calls
+ * keep the caller the extraction gives them: the enclosing function, or the
+ * module QN at module level (enclosing_func_qn is left unchanged).
+ *
+ * Scoping follows Python: a name bound earlier in the body is visible to
+ * later body statements (and to decorators of methods), but the class frame
+ * is not an enclosing scope for anything nested in it. Method bodies are
+ * resolved later by py_process_class against the module scope, and a nested
+ * class body chains to the nearest enclosing non-class scope. Each body
+ * statement is walked exactly once. */
+static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node) {
+    if (!ctx || ctx->eval_failure || ts_node_is_null(class_node))
+        return;
+    TSNode supers = ts_node_child_by_field_name(class_node, "superclasses", 12);
+    if (!ts_node_is_null(supers))
+        py_resolve_calls_in(ctx, supers);
+    TSNode body = ts_node_child_by_field_name(class_node, "body", 4);
+    if (ctx->eval_failure || ts_node_is_null(body))
+        return;
+
+    char *cname = py_node_text(ctx, ts_node_child_by_field_name(class_node, "name", 4));
+    const char *class_qn = NULL;
+    if (cname && cname[0]) {
+        if (ctx->class_body_outer_scope) {
+            class_qn = ctx->class_body_qn
+                           ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->class_body_qn, cname)
+                           : NULL;
+        } else if (ctx->module_qn && ctx->enclosing_func_qn && ctx->file_module_qn &&
+                   strcmp(ctx->enclosing_func_qn, ctx->file_module_qn) == 0) {
+            class_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+        }
+    }
+
+    CBMScope *saved_scope = ctx->current_scope;
+    CBMScope *saved_outer = ctx->class_body_outer_scope;
+    const char *saved_qn = ctx->class_body_qn;
+    bool saved_comprehension = ctx->class_body_in_comprehension;
+    CBMScope *outer = saved_outer ? saved_outer : saved_scope;
+    CBMScope *frame = py_class_frame_push(ctx, outer);
+    if (!frame)
+        return;
+    py_scope_restore(ctx, frame);
+    ctx->class_body_outer_scope = outer;
+    ctx->class_body_qn = class_qn;
+    ctx->class_body_in_comprehension = false;
+
+    PyKids bk = py_kids(ctx->arena, body);
+    for (uint32_t i = 0; i < bk.n && !ctx->eval_failure; i++) {
+        TSNode stmt = py_kid(&bk, i);
+        py_resolve_calls_in(ctx, stmt);
+        py_bind_class_body_def(ctx, stmt);
+    }
+
+    ctx->class_body_outer_scope = saved_outer;
+    ctx->class_body_qn = saved_qn;
+    ctx->class_body_in_comprehension = saved_comprehension;
+    py_scope_restore(ctx, saved_scope);
 }
 
 static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
@@ -4874,15 +5086,21 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
         } else if (strcmp(ck, "function_definition") == 0) {
             py_bind_module_function(ctx, c);
         } else if (strcmp(ck, "class_definition") == 0) {
-            py_bind_module_class(ctx, c);
+            py_exec_class_definition(ctx, c);
+            if (!ctx->eval_failure)
+                py_bind_module_class(ctx, c);
         } else if (strcmp(ck, "decorated_definition") == 0) {
+            py_resolve_decorators(ctx, c);
             TSNode def = ts_node_child_by_field_name(c, "definition", 10);
-            if (!ts_node_is_null(def)) {
+            if (!ctx->eval_failure && !ts_node_is_null(def)) {
                 const char *dk = ts_node_type(def);
-                if (strcmp(dk, "function_definition") == 0)
+                if (strcmp(dk, "function_definition") == 0) {
                     py_bind_module_function(ctx, def);
-                else if (strcmp(dk, "class_definition") == 0)
-                    py_bind_module_class(ctx, def);
+                } else if (strcmp(dk, "class_definition") == 0) {
+                    py_exec_class_definition(ctx, def);
+                    if (!ctx->eval_failure)
+                        py_bind_module_class(ctx, def);
+                }
             }
         } else if (strcmp(ck, "expression_statement") == 0) {
             /* An expression statement is resolved for calls, not scanned as a
