@@ -9045,6 +9045,41 @@ TEST(tool_search_code_no_project) {
     PASS();
 }
 
+/* search_code compiles path_filter into a regex before it checks pattern,
+ * project and the project root. Every one of those early error returns must
+ * release the compiled regex. The leak itself is only visible to a leak
+ * detector such as LeakSanitizer, so this test drives each return with a valid
+ * path_filter and asserts the error taken. */
+TEST(search_code_early_errors_release_path_filter_regex) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* No pattern. */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_code", "{\"project\":\"nonexistent\",\"path_filter\":\"^cbm_leak_probe/\"}");
+    bool pattern_error = resp && strstr(resp, "pattern is required") != NULL;
+    free(resp);
+
+    /* No project. */
+    resp = cbm_mcp_handle_tool(srv, "search_code",
+                               "{\"pattern\":\"main\",\"path_filter\":\"^cbm_leak_probe/\"}");
+    bool project_error = resp && strstr(resp, "project is required") != NULL;
+    free(resp);
+
+    /* Unknown project, with a file_pattern alongside the path filter. */
+    resp = cbm_mcp_handle_tool(srv, "search_code",
+                               "{\"pattern\":\"main\",\"project\":\"nonexistent\","
+                               "\"file_pattern\":\"*.c\",\"path_filter\":\"^cbm_leak_probe/\"}");
+    bool root_error = resp && strstr(resp, "project not found or not indexed") != NULL;
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(pattern_error);
+    ASSERT_TRUE(project_error);
+    ASSERT_TRUE(root_error);
+    PASS();
+}
+
 TEST(search_code_multi_word) {
     char tmp[512];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -21203,6 +21238,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_limit_declares_a_minimum_issue1511);
     RUN_TEST(tool_search_code_declares_independent_result_and_raw_content_paging);
     RUN_TEST(tool_search_code_no_project);
+    RUN_TEST(search_code_early_errors_release_path_filter_regex);
     RUN_TEST(search_code_multi_word);
     RUN_TEST(search_code_full_preserves_utf8_source);
     RUN_TEST(search_code_raw_match_preserves_utf8_content);
