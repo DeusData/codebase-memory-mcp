@@ -1007,7 +1007,8 @@ void cbm_registry_build_func_qn_order(CBMTypeRegistry *reg, CBMArena *arena) {
     reg->func_qn_sorted = NULL;
     reg->func_qn_sorted_count = 0;
     reg->func_qn_sorted_upto = 0;
-    if (reg->func_count <= 0 || (size_t)reg->func_count > SIZE_MAX / sizeof(CBMRegistryQNEntry))
+    if (reg->func_count <= 0 ||
+        (size_t)reg->func_count > (SIZE_MAX - 7) / sizeof(CBMRegistryQNEntry))
         return;
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (registry_qn_order_allocations_left == 0)
@@ -1076,6 +1077,205 @@ bool cbm_registry_has_func_qn_prefix(const CBMTypeRegistry *reg, const char *pre
             return true;
     }
     return false;
+}
+
+static int registry_type_qn_entry_cmp(const void *left, const void *right) {
+    const CBMRegistryTypeQNEntry *a = left;
+    const CBMRegistryTypeQNEntry *b = right;
+    int cmp = strcmp(a->qualified_name, b->qualified_name);
+    return cmp ? cmp : (a->type_index > b->type_index) - (a->type_index < b->type_index);
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int registry_type_qn_order_allocations_left = -1;
+static _Thread_local int registry_qn_prefix_block_allocations_left = -1;
+void cbm_registry_test_type_qn_order_fail_after(int successful_allocations) {
+    registry_type_qn_order_allocations_left = successful_allocations;
+}
+void cbm_registry_test_qn_prefix_block_fail_after(int successful_allocations) {
+    registry_qn_prefix_block_allocations_left = successful_allocations;
+}
+#endif
+
+void cbm_registry_build_type_qn_order(CBMTypeRegistry *reg, CBMArena *arena) {
+    if (!reg || !arena || reg->read_only)
+        return;
+    reg->type_qn_sorted = NULL;
+    reg->type_qn_sorted_count = 0;
+    reg->type_qn_sorted_upto = 0;
+    if (!reg->types || reg->type_count <= 0 ||
+        (size_t)reg->type_count > (SIZE_MAX - 7) / sizeof(CBMRegistryTypeQNEntry))
+        return;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (registry_type_qn_order_allocations_left == 0)
+        return;
+    if (registry_type_qn_order_allocations_left > 0)
+        registry_type_qn_order_allocations_left--;
+#endif
+    CBMRegistryTypeQNEntry *sorted =
+        cbm_arena_alloc(arena, (size_t)reg->type_count * sizeof(*sorted));
+    if (!sorted)
+        return;
+    int count = 0;
+    for (int i = 0; i < reg->type_count; i++) {
+        if (reg->types[i].qualified_name) {
+            sorted[count].qualified_name = reg->types[i].qualified_name;
+            sorted[count].type_index = i;
+            count++;
+        }
+    }
+    qsort(sorted, (size_t)count, sizeof(*sorted), registry_type_qn_entry_cmp);
+    reg->type_qn_sorted = sorted;
+    reg->type_qn_sorted_count = count;
+    reg->type_qn_sorted_upto = reg->type_count;
+}
+
+bool cbm_registry_type_shadowed(const CBMTypeRegistry *head, const CBMTypeRegistry *reg,
+                                int index) {
+    return reg && reg->types && index >= 0 && index < reg->type_count &&
+           type_shadowed(head, reg, index);
+}
+
+static const char *registry_prefix_sorted_qn(const CBMQNPrefixIter *it, int index) {
+    return it->types ? it->reg->type_qn_sorted[index].qualified_name
+                     : it->reg->func_qn_sorted[index].qualified_name;
+}
+
+static int registry_prefix_sorted_index(const CBMQNPrefixIter *it, int index) {
+    return it->types ? it->reg->type_qn_sorted[index].type_index
+                     : it->reg->func_qn_sorted[index].func_index;
+}
+
+static int registry_prefix_index_cmp(const void *left, const void *right) {
+    int a = *(const int *)left, b = *(const int *)right;
+    return (a > b) - (a < b);
+}
+
+/* Count/fill the exact range. For a direct query, jump over dotted subtrees
+ * with a binary upper bound on the prefix INCLUDING its separating dot. The
+ * undotted siblings A-b and AB must remain visible around A.child. */
+static int registry_prefix_collect(CBMQNPrefixIter *it, int start, int sorted_count, int covered,
+                                   int *indices, int capacity) {
+    int count = 0;
+    for (int pos = start; pos < sorted_count;) {
+        const char *qn = registry_prefix_sorted_qn(it, pos);
+        it->visits++;
+        if (!qn)
+            return -1;
+        if (strncmp(qn, it->prefix, it->prefix_len) != 0)
+            break;
+        const char *dot = it->direct_only ? strchr(qn + it->prefix_len, '.') : NULL;
+        if (dot) {
+            size_t subtree_len = (size_t)(dot - qn) + 1;
+            int lo = pos + 1, hi = sorted_count;
+            while (lo < hi) {
+                int mid = lo + (hi - lo) / 2;
+                const char *candidate = registry_prefix_sorted_qn(it, mid);
+                it->visits++;
+                if (!candidate)
+                    return -1;
+                if (strncmp(candidate, qn, subtree_len) <= 0)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            pos = lo;
+            continue;
+        }
+        int index = registry_prefix_sorted_index(it, pos++);
+        if (index < 0 || index >= covered || (indices && count >= capacity))
+            return -1;
+        if (indices)
+            indices[count] = index;
+        count++;
+    }
+    return count;
+}
+
+static bool registry_prefix_open(const CBMTypeRegistry *reg, const char *prefix, bool direct_only,
+                                 bool types, CBMArena *scratch, CBMQNPrefixIter *out) {
+    if (!out)
+        return false;
+    memset(out, 0, sizeof(*out));
+    out->reg = reg;
+    out->prefix = prefix;
+    out->types = types;
+    out->direct_only = direct_only;
+    if (!reg || !prefix || (types ? !reg->types : !reg->funcs))
+        return true;
+    out->prefix_len = strlen(prefix);
+    int total = types ? reg->type_count : reg->func_count;
+    out->tail_end = total > 0 ? total : 0;
+    int covered = types ? reg->type_qn_sorted_upto : reg->func_qn_sorted_upto;
+    int sorted_count = types ? reg->type_qn_sorted_count : reg->func_qn_sorted_count;
+    bool has_order = types ? reg->type_qn_sorted != NULL : reg->func_qn_sorted != NULL;
+    if (!has_order || covered < 0 || covered > total || sorted_count < 0 || sorted_count > covered)
+        return true; /* initialized full-link fallback */
+
+    int lo = 0, hi = sorted_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        const char *qn = registry_prefix_sorted_qn(out, mid);
+        out->visits++;
+        if (!qn)
+            return true;
+        if (strcmp(qn, prefix) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    int count = registry_prefix_collect(out, lo, sorted_count, covered, NULL, 0);
+    if (count < 0)
+        return true;
+    if (count == 0) {
+        out->tail_i = covered;
+        return true;
+    }
+    if (!scratch || (size_t)count > (SIZE_MAX - 7) / sizeof(int))
+        return true;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (registry_qn_prefix_block_allocations_left == 0)
+        return true;
+    if (registry_qn_prefix_block_allocations_left > 0)
+        registry_qn_prefix_block_allocations_left--;
+#endif
+    int *indices = cbm_arena_alloc(scratch, (size_t)count * sizeof(*indices));
+    if (!indices ||
+        registry_prefix_collect(out, lo, sorted_count, covered, indices, count) != count)
+        return true;
+    qsort(indices, (size_t)count, sizeof(*indices), registry_prefix_index_cmp);
+    /* Publish only a complete block; every earlier return scans from zero. */
+    out->indices = indices;
+    out->count = count;
+    out->tail_i = covered;
+    return true;
+}
+
+bool cbm_registry_types_with_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                       bool direct_only, CBMArena *scratch, CBMQNPrefixIter *out) {
+    return registry_prefix_open(reg, prefix, direct_only, true, scratch, out);
+}
+
+bool cbm_registry_funcs_with_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                       bool direct_only, CBMArena *scratch, CBMQNPrefixIter *out) {
+    return registry_prefix_open(reg, prefix, direct_only, false, scratch, out);
+}
+
+int cbm_qn_prefix_iter_next(CBMQNPrefixIter *it) {
+    if (!it || !it->reg || !it->prefix)
+        return -1;
+    if (it->pos < it->count)
+        return it->indices[it->pos++];
+    while (it->tail_i < it->tail_end) {
+        int index = it->tail_i++;
+        const char *qn =
+            it->types ? it->reg->types[index].qualified_name : it->reg->funcs[index].qualified_name;
+        it->visits++;
+        if (qn && strncmp(qn, it->prefix, it->prefix_len) == 0 &&
+            (!it->direct_only || !strchr(qn + it->prefix_len, '.')))
+            return index;
+    }
+    return -1;
 }
 
 // Count parameters in a FUNC signature.

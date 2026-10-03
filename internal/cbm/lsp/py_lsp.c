@@ -39,6 +39,18 @@
 #ifdef CBM_ENABLE_TEST_SEAMS
 _Atomic uint64_t cbm_py_submodule_probes = 0;
 _Atomic uint64_t cbm_py_submodule_probe_visits = 0;
+_Atomic uint64_t cbm_py_module_class_binds = 0;
+_Atomic uint64_t cbm_py_module_class_bind_visits = 0;
+_Atomic uint64_t cbm_py_wildcard_invalidations = 0;
+_Atomic uint64_t cbm_py_wildcard_invalidation_visits = 0;
+static _Thread_local int py_module_scratch_allocations_left = -1;
+static _Thread_local int py_module_prefix_allocations_left = -1;
+void cbm_py_test_module_scratch_fail_after(int successful_allocations) {
+    py_module_scratch_allocations_left = successful_allocations;
+}
+void cbm_py_test_module_prefix_fail_after(int successful_allocations) {
+    py_module_prefix_allocations_left = successful_allocations;
+}
 #endif
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -4527,6 +4539,38 @@ static CBMScope *py_root_class_names(PyLSPContext *ctx, const PyKids *rk) {
     return names;
 }
 
+/* The temporary query owner never supplies a retained binding/name/type.
+ * A disabled/failed optimization leaves the original module-aware scan usable. */
+static bool py_module_scratch_open(CBMArena *scratch) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_module_scratch_allocations_left == 0)
+        return false;
+    if (py_module_scratch_allocations_left > 0)
+        py_module_scratch_allocations_left--;
+#endif
+    cbm_arena_init_lazy(scratch, 4096);
+    return true;
+}
+
+static char *py_module_prefix(CBMArena *scratch, const char *module_qn, size_t length) {
+    /* The arena rounds up by seven bytes after this addition. */
+    if (length > SIZE_MAX - 9)
+        return NULL;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_module_prefix_allocations_left == 0)
+        return NULL;
+    if (py_module_prefix_allocations_left > 0)
+        py_module_prefix_allocations_left--;
+#endif
+    char *prefix = cbm_arena_alloc(scratch, length + 2);
+    if (!prefix)
+        return NULL;
+    memcpy(prefix, module_qn, length);
+    prefix[length] = '.';
+    prefix[length + 1] = '\0';
+    return prefix;
+}
+
 /* A project registry can contain another file's class in the same logical
  * Python module. Keep those cross-file globals available, but do not prebind
  * classes declared by this source: their binding epoch belongs in the ordered
@@ -4543,20 +4587,49 @@ static void py_bind_external_module_classes(PyLSPContext *ctx, const PyKids *rk)
     }
     size_t prefix_len = strlen(ctx->module_qn);
     bool package_scope = ctx->file_module_qn && strcmp(ctx->file_module_qn, ctx->module_qn) != 0;
-    CBMTypeShortIter all_types;
-    cbm_registry_all_types_chain(ctx->registry, &all_types);
-    for (int i = -1; (i = cbm_type_short_iter_next(&all_types)) >= 0;) {
-        const CBMRegisteredType *type = &all_types.reg->types[i];
-        const char *qn = type->qualified_name;
-        const char *name = type->short_name;
-        if (!qn || !name || strncmp(qn, ctx->module_qn, prefix_len) != 0 || qn[prefix_len] != '.' ||
-            cbm_scope_lookup_local(defined, name)) {
-            continue;
+    CBMArena scratch = {0};
+    char *prefix = py_module_scratch_open(&scratch)
+                       ? py_module_prefix(&scratch, ctx->module_qn, prefix_len)
+                       : NULL;
+    uint64_t visits = 0;
+    for (const CBMTypeRegistry *link = ctx->registry; link; link = link->fallback) {
+        CBMQNPrefixIter it;
+        if (prefix)
+            cbm_registry_types_with_qn_prefix(link, prefix, package_scope, &scratch, &it);
+        int linear = 0;
+        for (;;) {
+            int i;
+            if (prefix) {
+                i = cbm_qn_prefix_iter_next(&it);
+            } else {
+                i = linear < link->type_count ? linear++ : -1;
+                if (i >= 0)
+                    visits++;
+            }
+            if (i < 0)
+                break;
+            if (cbm_registry_type_shadowed(ctx->registry, link, i))
+                continue;
+            const CBMRegisteredType *type = &link->types[i];
+            const char *qn = type->qualified_name;
+            const char *name = type->short_name;
+            if (!qn || !name || strncmp(qn, ctx->module_qn, prefix_len) != 0 ||
+                qn[prefix_len] != '.' || cbm_scope_lookup_local(defined, name))
+                continue;
+            if (package_scope && strchr(qn + prefix_len + 1, '.'))
+                continue; /* submodule/nested classes are not package globals */
+            py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
         }
-        if (package_scope && strchr(qn + prefix_len + 1, '.'))
-            continue; /* submodule/nested classes are not package globals */
-        py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
+        if (prefix)
+            visits += it.visits;
     }
+    cbm_arena_destroy(&scratch);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add_explicit(&cbm_py_module_class_binds, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cbm_py_module_class_bind_visits, visits, memory_order_relaxed);
+#else
+    (void)visits;
+#endif
 }
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -4630,19 +4703,47 @@ static void py_invalidate_registry_module_functions(PyLSPContext *ctx,
     if (!ctx || !registry || !ctx->module_qn)
         return;
     size_t prefix_len = strlen(ctx->module_qn);
-    for (int i = 0; i < registry->func_count; i++) {
-        const CBMRegisteredFunc *func = &registry->funcs[i];
-        const char *qn = func->qualified_name;
-        if (!qn || func->receiver_type || strncmp(qn, ctx->module_qn, prefix_len) != 0 ||
-            qn[prefix_len] != '.') {
-            continue;
+    CBMArena scratch = {0};
+    char *prefix = py_module_scratch_open(&scratch)
+                       ? py_module_prefix(&scratch, ctx->module_qn, prefix_len)
+                       : NULL;
+    uint64_t visits = 0;
+    for (const CBMTypeRegistry *link = registry; link; link = link->fallback) {
+        CBMQNPrefixIter it;
+        if (prefix)
+            cbm_registry_funcs_with_qn_prefix(link, prefix, true, &scratch, &it);
+        int linear = 0;
+        for (;;) {
+            int i;
+            if (prefix) {
+                i = cbm_qn_prefix_iter_next(&it);
+            } else {
+                i = linear < link->func_count ? linear++ : -1;
+                if (i >= 0)
+                    visits++;
+            }
+            if (i < 0)
+                break;
+            const CBMRegisteredFunc *func = &link->funcs[i];
+            const char *qn = func->qualified_name;
+            if (!qn || func->receiver_type || strncmp(qn, ctx->module_qn, prefix_len) != 0 ||
+                qn[prefix_len] != '.')
+                continue;
+            const char *suffix = qn + prefix_len + 1;
+            if (!suffix[0] || strchr(suffix, '.'))
+                continue;
+            py_scope_bind(ctx, func->short_name ? func->short_name : suffix, cbm_type_unknown());
         }
-        const char *suffix = qn + prefix_len + 1;
-        if (!suffix[0] || strchr(suffix, '.'))
-            continue;
-        py_scope_bind(ctx, func->short_name ? func->short_name : suffix, cbm_type_unknown());
+        if (prefix)
+            visits += it.visits;
     }
-    py_invalidate_registry_module_functions(ctx, registry->fallback);
+    cbm_arena_destroy(&scratch);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add_explicit(&cbm_py_wildcard_invalidations, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cbm_py_wildcard_invalidation_visits, visits, memory_order_relaxed);
+#else
+    (void)visits;
+#endif
 }
 
 /* `from module import *` may overwrite any module global through `__all__`.
@@ -5633,6 +5734,7 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     }
 
     py_mark_ambiguous_callable_bindings(reg, arena);
+    cbm_registry_build_type_qn_order(reg, arena);
     cbm_registry_finalize(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;

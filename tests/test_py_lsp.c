@@ -4166,7 +4166,467 @@ TEST(pylsp_prefix_raw_per_file_and_shared_keep_exact_calls) {
     PASS();
 }
 
+/* Module-range queries must return the old array sequence, including duplicates. */
+static bool pylsp_range_add_type(CBMTypeRegistry *reg, const char *qn, const char *name) {
+    int before = reg->type_count;
+    cbm_registry_add_type(reg, (CBMRegisteredType){.qualified_name = qn, .short_name = name});
+    return reg->type_count == before + 1;
+}
+
+static bool pylsp_range_member(const char *qn, const char *prefix, bool direct) {
+    if (!qn || !prefix)
+        return false;
+    size_t n = strlen(prefix);
+    return strncmp(qn, prefix, n) == 0 && (!direct || !strchr(qn + n, '.'));
+}
+
+/* No fixed result buffer and no call to the implementation's member predicate. */
+static bool pylsp_range_oracle(const CBMTypeRegistry *reg, bool types, const char *prefix,
+                               bool direct, CBMArena *scratch, uint64_t *visits) {
+    CBMQNPrefixIter it;
+    bool opened = types ? cbm_registry_types_with_qn_prefix(reg, prefix, direct, scratch, &it)
+                        : cbm_registry_funcs_with_qn_prefix(reg, prefix, direct, scratch, &it);
+    if (!opened)
+        return false;
+    int total = reg ? (types ? reg->type_count : reg->func_count) : 0;
+    bool ok = true;
+    for (int i = 0; i < total; i++) {
+        const char *qn = types ? reg->types[i].qualified_name : reg->funcs[i].qualified_name;
+        if (pylsp_range_member(qn, prefix, direct))
+            ok = cbm_qn_prefix_iter_next(&it) == i && ok;
+    }
+    ok = cbm_qn_prefix_iter_next(&it) == -1 && cbm_qn_prefix_iter_next(&it) == -1 && ok;
+    if (visits)
+        *visits = it.visits;
+    return ok;
+}
+
+static void pylsp_range_reset_failures(void) {
+    cbm_registry_test_type_qn_order_fail_after(-1);
+    cbm_registry_test_qn_prefix_block_fail_after(-1);
+    cbm_py_test_module_scratch_fail_after(-1);
+    cbm_py_test_module_prefix_fail_after(-1);
+}
+
+TEST(pylsp_range_order_boundaries_and_null_contract) {
+    static const char *const qns[] = {
+        "p.foo.B",   "p.foo.A.child", NULL, "p.foo.A-b", "p.foobar.C",    "p.foo.AB",
+        "p.foo.A.z", "p.foo.",        "",   "p.foo.B",   "p.foo.C.child", "p.foo.C-plain"};
+    static const char *const prefixes[] = {NULL,       "",        "p.foo.",  "p.foo", "p.foo.A",
+                                           "p.foo.A.", "p.foo.B", "p.foo..", "zzzz."};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg, empty;
+    cbm_registry_init(&reg, &arena);
+    cbm_registry_init(&empty, &arena);
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(qns) / sizeof(qns[0]); i++)
+        ok = pylsp_range_add_type(&reg, qns[i], "Shared") &&
+             pylsp_prefix_add(&reg, qns[i], i == 1 ? "Receiver" : NULL) && ok;
+    for (int indexed = 0; indexed < 2; indexed++) {
+        if (indexed) {
+            cbm_registry_build_type_qn_order(&reg, &arena);
+            cbm_registry_build_func_qn_order(&reg, &arena);
+            ok = reg.type_qn_sorted && reg.func_qn_sorted &&
+                 reg.type_qn_sorted_count == reg.type_count - 1 &&
+                 reg.type_qn_sorted_upto == reg.type_count && ok;
+            if (reg.type_qn_sorted) {
+                for (int i = 0; i < reg.type_qn_sorted_count; i++) {
+                    const CBMRegistryTypeQNEntry *e = &reg.type_qn_sorted[i];
+                    ok = e->type_index >= 0 && e->type_index < reg.type_count &&
+                         e->qualified_name == reg.types[e->type_index].qualified_name && ok;
+                }
+            }
+        }
+        for (int types = 0; types < 2; types++) {
+            for (int direct = 0; direct < 2; direct++) {
+                for (size_t p = 0; p < sizeof(prefixes) / sizeof(prefixes[0]); p++) {
+                    CBMArena scratch;
+                    cbm_arena_init(&scratch);
+                    ok = pylsp_range_oracle(&reg, types != 0, prefixes[p], direct != 0, &scratch,
+                                            NULL) &&
+                         pylsp_range_oracle(&reg, types != 0, prefixes[p], direct != 0, NULL,
+                                            NULL) &&
+                         pylsp_range_oracle(&empty, types != 0, prefixes[p], direct != 0, &scratch,
+                                            NULL) &&
+                         pylsp_range_oracle(NULL, types != 0, prefixes[p], direct != 0, &scratch,
+                                            NULL) &&
+                         ok;
+                    cbm_arena_destroy(&scratch);
+                }
+            }
+        }
+    }
+    ok = !cbm_registry_types_with_qn_prefix(&reg, "p.", true, &arena, NULL) &&
+         !cbm_registry_funcs_with_qn_prefix(&reg, "p.", false, &arena, NULL) &&
+         cbm_qn_prefix_iter_next(NULL) == -1 &&
+         cbm_registry_has_func_qn_prefix(&reg, "p.foo.", NULL) && ok;
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_range_growth_rebuild_seal_and_independent_failure) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg, sealed;
+    cbm_registry_init(&reg, &arena);
+    cbm_registry_init(&sealed, &arena);
+    bool ok = pylsp_range_add_type(&reg, "p.old", "Old") && pylsp_prefix_add(&reg, "p.old", NULL);
+    cbm_registry_build_type_qn_order(&reg, &arena);
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    const CBMRegisteredType *old_types = reg.types;
+    const CBMRegisteredFunc *old_funcs = reg.funcs;
+    for (int i = 0; i < 140; i++) {
+        const char *qn = cbm_arena_sprintf(&arena, "p.tail%03d", i);
+        ok = qn && pylsp_range_add_type(&reg, qn, "Tail") && pylsp_prefix_add(&reg, qn, NULL) && ok;
+    }
+    ok = pylsp_range_add_type(&reg, NULL, "NoQN") && pylsp_prefix_add(&reg, NULL, NULL) &&
+         reg.type_count == 142 && reg.func_count == 142 && reg.types != old_types &&
+         reg.funcs != old_funcs && reg.type_qn_sorted_upto == 1 && reg.func_qn_sorted_upto == 1 &&
+         pylsp_range_oracle(&reg, true, "p.", true, &arena, NULL) &&
+         pylsp_range_oracle(&reg, false, "p.", true, &arena, NULL) && ok;
+    if (reg.type_count == 142 && reg.func_count == 142) {
+        /* The previous queries ended before either registered identity changes. */
+        reg.types[0].qualified_name = "p.renamed";
+        reg.funcs[0].qualified_name = "p.renamed";
+        cbm_registry_build_func_qn_order(&reg, &arena);
+        const CBMRegistryQNEntry *func_order = reg.func_qn_sorted;
+        cbm_registry_test_type_qn_order_fail_after(0);
+        cbm_registry_build_type_qn_order(&reg, &arena);
+        cbm_registry_test_type_qn_order_fail_after(-1);
+        ok = func_order && reg.func_qn_sorted == func_order && !reg.type_qn_sorted &&
+             reg.type_qn_sorted_count == 0 && reg.type_qn_sorted_upto == 0 &&
+             pylsp_range_oracle(&reg, true, "p.", true, &arena, NULL) && ok;
+        cbm_registry_test_type_qn_order_fail_after(1);
+        cbm_registry_build_type_qn_order(&reg, &arena);
+        bool first_built = reg.type_qn_sorted != NULL;
+        cbm_registry_build_type_qn_order(&reg, &arena);
+        cbm_registry_test_type_qn_order_fail_after(-1);
+        ok = first_built && !reg.type_qn_sorted && reg.func_qn_sorted == func_order && ok;
+        cbm_registry_build_type_qn_order(&reg, &arena);
+        const CBMRegistryTypeQNEntry *type_order = reg.type_qn_sorted;
+        cbm_registry_test_qn_order_fail_after(0);
+        cbm_registry_build_func_qn_order(&reg, &arena);
+        cbm_registry_test_qn_order_fail_after(-1);
+        ok = type_order && reg.type_qn_sorted == type_order && !reg.func_qn_sorted &&
+             pylsp_range_oracle(&reg, false, "p.", true, &arena, NULL) && ok;
+        cbm_registry_build_func_qn_order(&reg, &arena);
+        func_order = reg.func_qn_sorted;
+        reg.read_only = true;
+        cbm_registry_test_type_qn_order_fail_after(0);
+        cbm_registry_test_qn_order_fail_after(0);
+        cbm_registry_build_type_qn_order(&reg, &arena);
+        cbm_registry_build_func_qn_order(&reg, &arena);
+        pylsp_range_reset_failures();
+        cbm_registry_test_qn_order_fail_after(-1);
+        cbm_registry_add_type(&reg, (CBMRegisteredType){.qualified_name = "forbidden.Type"});
+        cbm_registry_add_func(&reg, (CBMRegisteredFunc){.qualified_name = "forbidden.call"});
+        ok = reg.type_qn_sorted == type_order && reg.func_qn_sorted == func_order &&
+             reg.type_count == 142 && reg.func_count == 142 &&
+             pylsp_range_oracle(&reg, true, "p.", true, &arena, NULL) &&
+             pylsp_range_oracle(&reg, false, "p.", true, &arena, NULL) && ok;
+    }
+    ok = pylsp_range_add_type(&sealed, "p.sealed", "Sealed") &&
+         pylsp_prefix_add(&sealed, "p.sealed", NULL) && ok;
+    sealed.read_only = true;
+    cbm_registry_build_type_qn_order(&sealed, &arena);
+    cbm_registry_build_func_qn_order(&sealed, &arena);
+    ok = !sealed.type_qn_sorted && !sealed.func_qn_sorted &&
+         pylsp_range_oracle(&sealed, true, "p.", true, &arena, NULL) &&
+         pylsp_range_oracle(&sealed, false, "p.", true, &arena, NULL) && ok;
+    pylsp_range_reset_failures();
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_range_invalid_snapshot_uses_complete_scan) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+    bool ok = pylsp_range_add_type(&reg, "p.Z", "Z") && pylsp_range_add_type(&reg, "p.A", "A") &&
+              pylsp_prefix_add(&reg, "p.Z", NULL) && pylsp_prefix_add(&reg, "p.A", NULL);
+    cbm_registry_build_type_qn_order(&reg, &arena);
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    ok = reg.type_count == 2 && reg.func_count == 2 && reg.type_qn_sorted && reg.func_qn_sorted &&
+         ok;
+    size_t allocated = cbm_arena_total(&arena);
+    for (int types = 0; types < 2; types++) {
+        int *covered = types ? &reg.type_qn_sorted_upto : &reg.func_qn_sorted_upto;
+        int *count = types ? &reg.type_qn_sorted_count : &reg.func_qn_sorted_count;
+        int saved_covered = *covered, saved_count = *count;
+        for (int invalid = 0; invalid < 3; invalid++) {
+            *covered = invalid == 0 ? 3 : saved_covered;
+            *count = invalid == 1 ? -1 : (invalid == 2 ? 3 : saved_count);
+            int expected_covered = *covered, expected_count = *count;
+            uint64_t visits = 0;
+            ok = pylsp_range_oracle(&reg, types != 0, "p.", true, &arena, &visits) && visits >= 2 &&
+                 *covered == expected_covered && *count == expected_count &&
+                 cbm_arena_total(&arena) == allocated && ok;
+            *covered = saved_covered;
+            *count = saved_count;
+        }
+        ok = pylsp_range_oracle(&reg, types != 0, "p.", true, &arena, NULL) && ok;
+        allocated = cbm_arena_total(&arena);
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_range_block_failure_preserves_each_link_and_tail) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry links[3];
+    bool ok = true;
+    for (int j = 0; j < 3; j++) {
+        cbm_registry_init(&links[j], &arena);
+        ok = pylsp_range_add_type(&links[j], "p.Z", "Z") &&
+             pylsp_range_add_type(&links[j], "p.A", "A") &&
+             pylsp_prefix_add(&links[j], "p.Z", NULL) && pylsp_prefix_add(&links[j], "p.A", NULL) &&
+             ok;
+        cbm_registry_build_type_qn_order(&links[j], &arena);
+        cbm_registry_build_func_qn_order(&links[j], &arena);
+        ok = links[j].type_qn_sorted && links[j].func_qn_sorted &&
+             pylsp_range_add_type(&links[j], "p.Tail", "Tail") &&
+             pylsp_prefix_add(&links[j], "p.Tail", NULL) && ok;
+        links[j].fallback = j < 2 ? &links[j + 1] : NULL;
+    }
+    for (int types = 0; types < 2; types++) {
+        for (int fail = 0; fail < 3; fail++) {
+            CBMArena scratch;
+            cbm_arena_init(&scratch);
+            cbm_registry_test_qn_prefix_block_fail_after(fail);
+            for (int j = 0; j < 3; j++) {
+                uint64_t visits = 0;
+                ok = pylsp_range_oracle(&links[j], types != 0, "p.", true, &scratch, &visits) &&
+                     visits > 0 && ok;
+            }
+            cbm_registry_test_qn_prefix_block_fail_after(-1);
+            cbm_arena_destroy(&scratch);
+        }
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_range_direct_subtree_pruning_has_absolute_bound) {
+    enum { NESTED = 1024, BOUND = 100 };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+    bool ok = true;
+    for (int i = NESTED - 1; i >= 0; i--) {
+        const char *qn = cbm_arena_sprintf(&arena, "p.foo.A.n%04d", i);
+        ok = qn && pylsp_range_add_type(&reg, qn, "Nested") &&
+             pylsp_prefix_add(&reg, qn, "p.foo.A") && ok;
+    }
+    static const char *const direct[] = {"p.foo.B", "p.foo.A-b", "p.foo.AB"};
+    for (size_t i = 0; i < sizeof(direct) / sizeof(direct[0]); i++)
+        ok = pylsp_range_add_type(&reg, direct[i], "Direct") &&
+             pylsp_prefix_add(&reg, direct[i], NULL) && ok;
+    cbm_registry_build_type_qn_order(&reg, &arena);
+    cbm_registry_build_func_qn_order(&reg, &arena);
+    ok = reg.type_count == NESTED + 3 && reg.func_count == NESTED + 3 && reg.type_qn_sorted &&
+         reg.func_qn_sorted && ok;
+    for (int types = 0; types < 2; types++) {
+        uint64_t indexed = 0, linear = 0, miss = 0;
+        ok = pylsp_range_oracle(&reg, types != 0, "p.foo.", true, &arena, &indexed) &&
+             indexed > 0 && indexed <= BOUND &&
+             pylsp_range_oracle(&reg, types != 0, "zzzz.", true, &arena, &miss) && miss > 0 &&
+             miss <= BOUND && ok;
+        cbm_registry_test_qn_prefix_block_fail_after(0);
+        ok = pylsp_range_oracle(&reg, types != 0, "p.foo.", true, &arena, &linear) &&
+             linear >= NESTED + 3 && linear > BOUND && ok;
+        cbm_registry_test_qn_prefix_block_fail_after(-1);
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* Test scratch storage must be gone before these retained bindings are read. */
+TEST(pylsp_range_class_binding_keeps_order_shadow_and_package_filters) {
+    static const char source[] = "class Local:\n    pass\n";
+    TSParser *parser = ts_parser_new();
+    bool language = parser && ts_parser_set_language(parser, tree_sitter_python());
+    TSTree *tree =
+        language ? ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source)) : NULL;
+    bool ok = tree && !ts_node_has_error(ts_tree_root_node(tree));
+    for (int package = 0; tree && package < 2; package++) {
+        for (int failure = 0; failure < 6; failure++) {
+            CBMArena owner, arena;
+            cbm_arena_init(&owner);
+            cbm_arena_init(&arena);
+            CBMTypeRegistry head, middle, tail;
+            cbm_registry_init(&head, &owner);
+            cbm_registry_init(&middle, &owner);
+            cbm_registry_init(&tail, &owner);
+            head.fallback = &middle;
+            middle.fallback = &tail;
+            bool built = pylsp_range_add_type(&head, "test.pkg.Head", "Shared") &&
+                         pylsp_range_add_type(&head, "test.pkg.Same", "HeadSame") &&
+                         pylsp_range_add_type(&head, "test.pkg.Local", "Local") &&
+                         pylsp_range_add_type(&middle, "test.pkg.Middle", "Shared") &&
+                         pylsp_range_add_type(&middle, "test.pkg.Same", "Masked") &&
+                         pylsp_range_add_type(&middle, "test.pkg.Deep", "MiddleOnly") &&
+                         pylsp_range_add_type(&tail, "test.pkg.Tail", "Shared") &&
+                         pylsp_range_add_type(&tail, "test.pkg.Deep", "TailOnly") &&
+                         pylsp_range_add_type(&tail, "test.pkg.sub.Hidden", "Hidden");
+            if (failure == 5)
+                cbm_registry_test_type_qn_order_fail_after(0);
+            CBMTypeRegistry *links[] = {&head, &middle, &tail};
+            for (int i = 0; i < 3; i++)
+                cbm_registry_build_type_qn_order(links[i], &owner);
+            cbm_registry_test_type_qn_order_fail_after(-1);
+            if (failure != 5)
+                built =
+                    head.type_qn_sorted && middle.type_qn_sorted && tail.type_qn_sorted && built;
+            else
+                built =
+                    !head.type_qn_sorted && !middle.type_qn_sorted && !tail.type_qn_sorted && built;
+            /* The two fallback Deep entries remain visible: only the head shadows. */
+            bool shadowed = built && cbm_registry_type_shadowed(&head, &middle, 1) &&
+                            !cbm_registry_type_shadowed(&head, &tail, 1) &&
+                            !cbm_registry_type_shadowed(&head, &head, 1);
+            PyLSPContext ctx;
+            CBMResolvedCallArray out = {0};
+            py_lsp_init(&ctx, &arena, source, (int)strlen(source), &head,
+                        package ? "test.pkg.__init__" : "test.pkg", &out);
+            if (failure == 1 || failure == 2)
+                cbm_registry_test_qn_prefix_block_fail_after(failure - 1);
+            if (failure == 3)
+                cbm_py_test_module_prefix_fail_after(0);
+            if (failure == 4)
+                cbm_py_test_module_scratch_fail_after(0);
+            cbm_py_lsp_test_bind_external_classes(&ctx, ts_tree_root_node(tree));
+            pylsp_range_reset_failures();
+            ok = shadowed && !ctx.callable_value_proof_disabled &&
+                 ctx.eval_failure == CBM_LSP_COMPLETE &&
+                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "Shared"),
+                                       "test.pkg.Tail") &&
+                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "HeadSame"),
+                                       "test.pkg.Same") &&
+                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "MiddleOnly"),
+                                       "test.pkg.Deep") &&
+                 pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "TailOnly"),
+                                       "test.pkg.Deep") &&
+                 !cbm_scope_lookup_local(ctx.current_scope, "Masked") &&
+                 !cbm_scope_lookup_local(ctx.current_scope, "Local") && ok;
+            const CBMType *hidden = cbm_scope_lookup_local(ctx.current_scope, "Hidden");
+            ok =
+                (package ? hidden == NULL : pylsp_init_named_type(hidden, "test.pkg.sub.Hidden")) &&
+                ok;
+            cbm_arena_destroy(&arena);
+            cbm_arena_destroy(&owner);
+        }
+    }
+    pylsp_range_reset_failures();
+    if (tree)
+        ts_tree_delete(tree);
+    if (parser)
+        ts_parser_delete(parser);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(pylsp_range_wildcard_and_scratch_failures_keep_exact_later_calls) {
+    static const char source[] = "external = External()\nexternal.ping()\n"
+                                 "from vendor import *\nshadow_only(72)\nExternal(74)\n"
+                                 "def later(v):\n    return v\nlater(73)\n";
+    CBMFileResult *raw = extract_py(source);
+    TSParser *parser = ts_parser_new();
+    bool language = parser && ts_parser_set_language(parser, tree_sitter_python());
+    TSTree *tree =
+        language ? ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source)) : NULL;
+    bool healthy = raw && !raw->has_error && !raw->parse_incomplete && !raw->lsp_skipped && tree &&
+                   !ts_node_has_error(ts_tree_root_node(tree)) &&
+                   pylsp_module_has_def(raw, "test.main.later");
+    bool ok = healthy;
+    for (int failure = 0; healthy && failure < 8; failure++) {
+        CBMArena owner, arena;
+        cbm_arena_init(&owner);
+        cbm_arena_init(&arena);
+        CBMTypeRegistry head, tail;
+        cbm_registry_init(&head, &owner);
+        cbm_registry_init(&tail, &owner);
+        head.fallback = &tail;
+        bool built = pylsp_range_add_type(&head, "test.main.External", "External") &&
+                     pylsp_range_add_type(&tail, "test.main.Other", "Other");
+        cbm_registry_add_func(&head,
+                              (CBMRegisteredFunc){.qualified_name = "test.main.External.ping",
+                                                  .short_name = "ping",
+                                                  .receiver_type = "test.main.External"});
+        cbm_registry_add_func(
+            &head, (CBMRegisteredFunc){.qualified_name = "test.main.later", .short_name = "later"});
+        /* A head method must not suppress invalidation of a fallback free function. */
+        cbm_registry_add_func(&head, (CBMRegisteredFunc){.qualified_name = "test.main.hidden",
+                                                         .short_name = "hidden",
+                                                         .receiver_type = "test.main.External"});
+        cbm_registry_add_func(&tail, (CBMRegisteredFunc){.qualified_name = "test.main.hidden",
+                                                         .short_name = "shadow_only"});
+        cbm_registry_build_type_qn_order(&head, &owner);
+        cbm_registry_build_type_qn_order(&tail, &owner);
+        cbm_registry_build_func_qn_order(&head, &owner);
+        cbm_registry_build_func_qn_order(&tail, &owner);
+        built = built && head.func_count == 3 && tail.func_count == 1 && head.type_qn_sorted &&
+                tail.type_qn_sorted && head.func_qn_sorted && tail.func_qn_sorted;
+        head.read_only = true;
+        tail.read_only = true;
+        PyLSPContext ctx;
+        CBMResolvedCallArray out = {0};
+        py_lsp_init(&ctx, &arena, source, (int)strlen(source), &head, "test.main", &out);
+        if (failure >= 1 && failure <= 4)
+            cbm_registry_test_qn_prefix_block_fail_after(failure - 1);
+        if (failure == 5)
+            cbm_py_test_module_prefix_fail_after(0);
+        if (failure == 6)
+            cbm_py_test_module_scratch_fail_after(0);
+        if (failure == 7)
+            cbm_py_test_module_prefix_fail_after(1);
+        uint64_t before =
+            atomic_load_explicit(&cbm_py_wildcard_invalidations, memory_order_relaxed);
+        py_lsp_process_file(&ctx, ts_tree_root_node(tree));
+        pylsp_range_reset_failures();
+        const CBMType *shadow = cbm_scope_lookup_local(ctx.current_scope, "shadow_only");
+        ok = built && ctx.eval_failure == CBM_LSP_COMPLETE && !ctx.callable_value_proof_disabled &&
+             shadow && cbm_type_is_unknown(shadow) &&
+             atomic_load_explicit(&cbm_py_wildcard_invalidations, memory_order_relaxed) > before &&
+             pylsp_module_site_joins(&raw->calls, &out, source, "external.ping()", "test.main",
+                                     "test.main.External.ping") &&
+             pylsp_module_site_joins(&raw->calls, &out, source, "later(73)", "test.main",
+                                     "test.main.later") &&
+             pylsp_prefix_site_unresolved(&raw->calls, &out, source, "shadow_only(72)",
+                                          "test.main") &&
+             pylsp_prefix_site_unresolved(&raw->calls, &out, source, "External(74)", "test.main") &&
+             ok;
+        cbm_arena_destroy(&arena);
+        cbm_arena_destroy(&owner);
+    }
+    pylsp_range_reset_failures();
+    if (tree)
+        ts_tree_delete(tree);
+    if (parser)
+        ts_parser_delete(parser);
+    if (raw)
+        cbm_free_result(raw);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(py_lsp) {
+    RUN_TEST(pylsp_range_order_boundaries_and_null_contract);
+    RUN_TEST(pylsp_range_growth_rebuild_seal_and_independent_failure);
+    RUN_TEST(pylsp_range_invalid_snapshot_uses_complete_scan);
+    RUN_TEST(pylsp_range_block_failure_preserves_each_link_and_tail);
+    RUN_TEST(pylsp_range_direct_subtree_pruning_has_absolute_bound);
+    RUN_TEST(pylsp_range_class_binding_keeps_order_shadow_and_package_filters);
+    RUN_TEST(pylsp_range_wildcard_and_scratch_failures_keep_exact_later_calls);
+
     RUN_TEST(pylsp_prefix_order_matches_iterator_and_chain_shadowing);
     RUN_TEST(pylsp_prefix_order_survives_array_growth_rebuild_and_seal);
     RUN_TEST(pylsp_prefix_order_allocation_failure_preserves_oracle);

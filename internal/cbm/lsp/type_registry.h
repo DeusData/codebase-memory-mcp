@@ -80,6 +80,12 @@ typedef struct {
     int func_index;
 } CBMRegistryQNEntry;
 
+/* Type identities use their own representation; func_index remains unchanged. */
+typedef struct {
+    const char *qualified_name;
+    int type_index;
+} CBMRegistryTypeQNEntry;
+
 // Cross-file type/function registry.
 typedef struct CBMTypeRegistry {
     CBMRegisteredFunc *funcs;
@@ -163,6 +169,9 @@ typedef struct CBMTypeRegistry {
     CBMRegistryQNEntry *func_qn_sorted;
     int func_qn_sorted_count;
     int func_qn_sorted_upto;
+    CBMRegistryTypeQNEntry *type_qn_sorted;
+    int type_qn_sorted_count;
+    int type_qn_sorted_upto;
 } CBMTypeRegistry;
 
 // Initialize a registry.
@@ -228,6 +237,46 @@ bool cbm_registry_has_func_qn_prefix(const CBMTypeRegistry *reg, const char *pre
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* -1 disables; zero fails this allocation until reset; positive counts down. */
 void cbm_registry_test_qn_order_fail_after(int successful_allocations);
+#endif
+
+/* Optional type order, with the same ownership/immutability/rebuild contract as
+ * the function order. Build shared orders before sealing; queries never build. */
+void cbm_registry_build_type_qn_order(CBMTypeRegistry *reg, CBMArena *arena);
+
+/* Single-link literal-prefix query. Results retain original array order,
+ * including duplicate QNs, followed by the captured unindexed tail. Registry
+ * identities and the borrowed prefix must stay alive and unchanged while open;
+ * no concurrent registry mutation. No movable element pointers are retained.
+ * direct_only excludes a dot anywhere after the prefix (an empty suffix matches).
+ * With a non-NULL out, open always succeeds: missing inputs are empty; missing
+ * scratch, an invalid snapshot or optimization OOM selects the full linear scan.
+ * NULL out returns false; next(NULL) returns -1. Caller owns/destroys scratch.
+ * visits includes compared/inspected QNs in search, count, fill and tail passes,
+ * but excludes string-length work and sorting the original-index block. */
+typedef struct {
+    const CBMTypeRegistry *reg;
+    const char *prefix;
+    size_t prefix_len;
+    bool types;
+    bool direct_only;
+    int *indices;
+    int count;
+    int pos;
+    int tail_i;
+    int tail_end;
+    uint64_t visits;
+} CBMQNPrefixIter;
+
+bool cbm_registry_types_with_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                       bool direct_only, CBMArena *scratch, CBMQNPrefixIter *out);
+bool cbm_registry_funcs_with_qn_prefix(const CBMTypeRegistry *reg, const char *prefix,
+                                       bool direct_only, CBMArena *scratch, CBMQNPrefixIter *out);
+int cbm_qn_prefix_iter_next(CBMQNPrefixIter *it);
+/* Preserve the existing chain iterator's original-head-only type shadow rule. */
+bool cbm_registry_type_shadowed(const CBMTypeRegistry *head, const CBMTypeRegistry *reg, int index);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_registry_test_type_qn_order_fail_after(int successful_allocations);
+void cbm_registry_test_qn_prefix_block_fail_after(int successful_allocations);
 #endif
 
 // Resolve type alias chain: follow alias_of until concrete type found (max 16 levels).

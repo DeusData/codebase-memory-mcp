@@ -244,6 +244,15 @@ bool cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_
  * Only missing exact symbol/type attributes reach this submodule predicate. */
 extern _Atomic uint64_t cbm_py_submodule_probes;
 extern _Atomic uint64_t cbm_py_submodule_probe_visits;
+/* Complete module operations, including optimization fallbacks. Visits count
+ * inspected QNs/search comparisons, not sorting or string-length work. */
+extern _Atomic uint64_t cbm_py_module_class_binds;
+extern _Atomic uint64_t cbm_py_module_class_bind_visits;
+extern _Atomic uint64_t cbm_py_wildcard_invalidations;
+extern _Atomic uint64_t cbm_py_wildcard_invalidation_visits;
+/* -1 disables; zero fails until reset; positive counts down attempts. */
+void cbm_py_test_module_scratch_fail_after(int successful_allocations);
+void cbm_py_test_module_prefix_fail_after(int successful_allocations);
 #endif
 
 #endif // CBM_LSP_PY_LSP_H
