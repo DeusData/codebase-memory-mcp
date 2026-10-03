@@ -489,13 +489,8 @@ static const CBMScope *kt_scope_declaring_name(const CBMScope *scope, const char
     if (!name)
         return NULL;
     for (const CBMScope *current = scope; current; current = current->parent) {
-        for (const CBMScopeChunk *chunk = current->chunks; chunk; chunk = chunk->next) {
-            for (int i = 0; i < chunk->used; i++) {
-                if (chunk->bindings[i].name && strcmp(chunk->bindings[i].name, name) == 0) {
-                    return current;
-                }
-            }
-        }
+        if (cbm_scope_lookup_local(current, name))
+            return current;
     }
     return NULL;
 }
