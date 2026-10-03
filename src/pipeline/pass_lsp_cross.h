@@ -76,7 +76,10 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
  * Both sequential and parallel drivers use this exact helper so import
  * metadata cannot diverge between pipelines. Values are owned by the returned
  * map (not borrowed from gbuf); release both arrays with
- * cbm_pxc_free_import_map(). */
+ * cbm_pxc_free_import_map(). A complete PHP binding snapshot also permits an
+ * allocated empty map. This compatibility projection alone never proves
+ * vendor absence: consumers require cbm_pipeline_php_vendor_names_build's
+ * separate typed evidence, including completion and full import identities. */
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
                              CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
@@ -202,6 +205,11 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count);
 
+void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const char *source,
+                                       int source_len, const char *module_qn, CBMLSPDef *defs,
+                                       int def_count, const char **imp_names, const char **imp_qns,
+                                       int imp_count, const CBMPHPImportBindings *bindings);
+
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
                         CBMLSPDef *defs, int def_count, const char **imp_names,
@@ -221,5 +229,13 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
                            void *rust_shared_ctx);
+
+void cbm_pxc_dispatch_file_with_php_bindings(
+    CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
+    const char *def_module, const CBMCrossLspRegistries *cross_registries,
+    const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
+    const char **imp_keys, const char **imp_vals, int imp_count,
+    CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
+    const CBMPHPImportBindings *bindings);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */
