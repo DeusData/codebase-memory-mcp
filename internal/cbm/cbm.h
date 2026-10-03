@@ -250,10 +250,10 @@ typedef struct {
 
 /* Argument captured from a call expression */
 typedef struct {
-    const char *expr;    // raw expression text ("payload.info", "MY_URL", "'hello'")
-    const char *value;   // raw resolved string value or NULL (constant propagation)
-    const char *keyword; // keyword name if keyword arg ("url", "topic_id"), NULL if positional
-    int index;           // positional index (0-based)
+    const char *expr;      // raw expression text ("payload.info", "MY_URL", "'hello'")
+    const char *value;     // raw resolved string value or NULL (constant propagation)
+    const char *keyword;   // keyword name if keyword arg ("url", "topic_id"), NULL if positional
+    int index;             // positional index (0-based)
     const char *url_value; // URL projection when different; never a topic/string identity
 } CBMCallArg;
 
