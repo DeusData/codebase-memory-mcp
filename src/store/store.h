@@ -23,7 +23,7 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_OK 0
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
-#define CBM_INDEX_FORMAT_VERSION 1
+#define CBM_INDEX_FORMAT_VERSION 2
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
@@ -112,10 +112,11 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
  * stores that have no File nodes. Caller frees each out[i] and out itself. */
 int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count);
 
-/* Persisted index-format identity. Bump when a change alters the QN scheme
- * or node identity of an already-written graph, so an old DB is routed
- * through the full-reindex path instead of producing a mixed graph.
- * 1 = File QNs keep the file extension (#769). */
+/* Persisted index-format identity. Bump when a change alters the QN scheme,
+ * node identity, or required persisted semantic metadata, so an old DB is
+ * routed through the full-reindex path before incremental/no-op admission.
+ * 1 = File QNs keep the file extension (#769).
+ * 2 = Python namespace facts use the versioned LSP surface contract. */
 int cbm_store_get_format_version(cbm_store_t *s, int *out);
 int cbm_store_set_format_version(cbm_store_t *s, int version);
 

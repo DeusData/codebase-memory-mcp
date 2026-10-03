@@ -8522,6 +8522,337 @@ static int python_module_callers_pipeline_case(bool parallel) {
     PASS();
 }
 
+/* Insert after python_module_exact_lsp_edge. Parent registers the four TESTs. */
+static const char namespace_admission_control[] = "def target():\n"
+                                                  "    return 1\n"
+                                                  "def keep():\n"
+                                                  "    return target()\n";
+
+static const char *const namespace_admission_env_keys[] = {"CBM_WORKERS",
+                                                           "CBM_INDEX_SINGLE_THREAD"};
+
+typedef struct {
+    char root[512];
+    char db[768];
+    char *saved[2];
+    bool created;
+    bool saved_env;
+} namespace_admission_fixture;
+
+typedef struct {
+    int rc;
+    int errors;
+    int format;
+    cbm_incremental_route_t route;
+    bool migrated;
+    bool healthy;
+    char project[512];
+    char *json;
+} namespace_admission_result;
+
+static bool namespace_admission_begin(namespace_admission_fixture *f) {
+    int n = snprintf(f->root, sizeof(f->root), "%s/cbm-namespace-admission-XXXXXX", cbm_tmpdir());
+    if (n <= 0 || (size_t)n >= sizeof(f->root) || !cbm_mkdtemp(f->root))
+        return false;
+    f->created = true;
+    n = snprintf(f->db, sizeof(f->db), "%s/namespace.db", f->root);
+    if (n <= 0 || (size_t)n >= sizeof(f->db))
+        return false;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(namespace_admission_env_keys[i]);
+        f->saved[i] = old ? strdup(old) : NULL;
+        if (old && !f->saved[i])
+            return false;
+    }
+    f->saved_env = true;
+    int env_rc = cbm_setenv(namespace_admission_env_keys[0], "1", 1);
+    env_rc |= cbm_setenv(namespace_admission_env_keys[1], "1", 1);
+    return env_rc == 0 &&
+           python_module_write_fixture_file(f->root, "control.py", namespace_admission_control);
+}
+
+static bool namespace_admission_finish(namespace_admission_fixture *f) {
+    int restore_rc = 0;
+    for (int i = 0; i < 2; i++) {
+        if (f->saved_env)
+            restore_rc |= f->saved[i] ? cbm_setenv(namespace_admission_env_keys[i], f->saved[i], 1)
+                                      : cbm_unsetenv(namespace_admission_env_keys[i]);
+        free(f->saved[i]);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    int cleanup_rc = f->created ? th_rmtree(f->root) : 0;
+    return restore_rc == 0 && cleanup_rc == 0;
+}
+
+static bool namespace_admission_exact_hash(cbm_store_t *store, const char *project,
+                                           const char *path, const char *source) {
+    cbm_file_hash_t row = {0};
+    char expected[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(source, strlen(source), expected);
+    bool correct = cbm_store_get_file_hash(store, project, path, &row) == CBM_STORE_OK &&
+                   row.sha256 && strcmp(row.sha256, expected) == 0;
+    cbm_store_clear_file_hash(&row);
+    return correct;
+}
+
+static namespace_admission_result namespace_admission_run(namespace_admission_fixture *f,
+                                                          const char *watch, const char *source,
+                                                          int expected_files) {
+    namespace_admission_result result = {
+        .rc = -1, .errors = -1, .format = -1, .route = CBM_INCREMENTAL_ROUTE_NONE};
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(f->root, f->db, CBM_MODE_FULL);
+    if (!pipeline)
+        return result;
+    result.rc = cbm_pipeline_run(pipeline);
+    result.route = cbm_pipeline_incremental_test_last_route();
+    result.migrated = cbm_pipeline_had_format_migration(pipeline);
+    cbm_file_error_t *errors = NULL;
+    cbm_pipeline_get_file_errors(pipeline, &errors, &result.errors);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    int n = project ? snprintf(result.project, sizeof(result.project), "%s", project) : -1;
+    cbm_store_t *store = result.rc == 0 && n > 0 && (size_t)n < sizeof(result.project)
+                             ? cbm_store_open_path(f->db)
+                             : NULL;
+    if (store) {
+        cbm_node_t *files = NULL;
+        int file_count = 0;
+        bool file_query = cbm_store_find_nodes_by_label(store, project, "File", &files,
+                                                        &file_count) == CBM_STORE_OK;
+        int watched_files = 0;
+        for (int i = 0; file_query && i < file_count; i++)
+            if (files[i].file_path && strcmp(files[i].file_path, watch) == 0)
+                watched_files++;
+        cbm_store_free_nodes(files, file_count);
+        bool positive = python_module_exact_lsp_edge(store, project, "control.keep", "Function",
+                                                     "control.target", "Function");
+        bool hashes = namespace_admission_exact_hash(store, project, "control.py",
+                                                     namespace_admission_control) &&
+                      namespace_admission_exact_hash(store, project, watch, source);
+        bool format_ok = cbm_store_get_format_version(store, &result.format) == CBM_STORE_OK;
+        cbm_lsp_surface_row_t *rows = NULL;
+        int row_count = 0;
+        bool row_query =
+            cbm_store_get_lsp_surfaces(store, project, &rows, &row_count) == CBM_STORE_OK;
+        int matches = 0;
+        for (int i = 0; row_query && i < row_count; i++) {
+            if (!rows[i].rel_path || strcmp(rows[i].rel_path, watch) != 0)
+                continue;
+            matches++;
+            if (rows[i].defs_json && !result.json)
+                result.json = strdup(rows[i].defs_json);
+        }
+        cbm_store_free_lsp_surfaces(rows, row_count);
+        bool python_row = matches == 1 && result.json &&
+                          cbm_lsp_surface_python_change(result.json, result.json) == 0 &&
+                          cbm_lsp_surface_python_change(result.json, NULL) == 1;
+        result.healthy = result.errors == 0 && file_query && file_count == expected_files &&
+                         watched_files == 1 && positive && hashes && format_ok &&
+                         result.format == CBM_INDEX_FORMAT_VERSION && row_query && python_row;
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return result;
+}
+
+TEST(pipeline_python_namespace_admission_upgrade_then_noop) {
+    namespace_admission_fixture fixture = {0};
+    bool setup = namespace_admission_begin(&fixture);
+    namespace_admission_result first = {0}, upgraded = {0}, unchanged = {0};
+    bool stamped = false;
+    if (setup) {
+        first = namespace_admission_run(&fixture, "control.py", namespace_admission_control, 1);
+        cbm_store_t *store = first.healthy ? cbm_store_open_path(fixture.db) : NULL;
+        if (store) {
+            int old_format = -1;
+            stamped = cbm_store_set_format_version(store, 1) == CBM_STORE_OK &&
+                      cbm_store_get_format_version(store, &old_format) == CBM_STORE_OK &&
+                      old_format == 1;
+            cbm_store_close(store);
+        }
+        if (stamped)
+            upgraded =
+                namespace_admission_run(&fixture, "control.py", namespace_admission_control, 1);
+        if (upgraded.healthy)
+            unchanged =
+                namespace_admission_run(&fixture, "control.py", namespace_admission_control, 1);
+    }
+    bool stable = first.json && upgraded.json && unchanged.json &&
+                  cbm_lsp_surface_python_change(first.json, upgraded.json) == 0 &&
+                  cbm_lsp_surface_python_change(upgraded.json, unchanged.json) == 0;
+    free(first.json);
+    free(upgraded.json);
+    free(unchanged.json);
+    bool cleaned = namespace_admission_finish(&fixture);
+    ASSERT_TRUE(setup && stamped && cleaned);
+    ASSERT_TRUE(first.healthy && upgraded.healthy && unchanged.healthy && stable);
+    ASSERT_TRUE(upgraded.migrated);
+    ASSERT_FALSE(unchanged.migrated);
+    ASSERT_EQ(unchanged.route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+
+TEST(pipeline_python_namespace_admission_body_alias_and_all) {
+    static const char initial[] = "from math import floor as Alias\n"
+                                  "__all__ = ['Alias']\n"
+                                  "def body():\n    return 1\n";
+    static const char body_edit[] = "from math import floor as Alias\n"
+                                    "__all__ = ['Alias']\n"
+                                    "def body():\n    return 2\n";
+    static const char alias_edit[] = "from math import ceil as Alias\n"
+                                     "__all__ = ['Alias']\n"
+                                     "def body():\n    return 2\n";
+    static const char all_edit[] = "from math import ceil as Alias\n"
+                                   "__all__ = []\n"
+                                   "def body():\n    return 2\n";
+    namespace_admission_fixture fixture = {0};
+    bool setup = namespace_admission_begin(&fixture);
+    namespace_admission_result phases[4] = {0};
+    const char *sources[] = {initial, body_edit, alias_edit, all_edit};
+    bool wrote_all = setup;
+    for (int i = 0; i < 4 && wrote_all; i++) {
+        wrote_all = python_module_write_fixture_file(fixture.root, "subject.py", sources[i]);
+        if (wrote_all)
+            phases[i] = namespace_admission_run(&fixture, "subject.py", sources[i], 2);
+        if (!phases[i].healthy)
+            break;
+    }
+    bool all_healthy =
+        phases[0].healthy && phases[1].healthy && phases[2].healthy && phases[3].healthy;
+    bool comparisons = all_healthy &&
+                       cbm_lsp_surface_python_change(phases[0].json, phases[1].json) == 0 &&
+                       cbm_lsp_surface_python_change(phases[1].json, phases[2].json) == 1 &&
+                       cbm_lsp_surface_python_change(phases[2].json, phases[3].json) == 1;
+    for (int i = 0; i < 4; i++)
+        free(phases[i].json);
+    bool cleaned = namespace_admission_finish(&fixture);
+    ASSERT_TRUE(setup && wrote_all && cleaned && all_healthy && comparisons);
+    ASSERT_EQ(phases[1].route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(phases[2].route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(phases[3].route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+TEST(pipeline_python_namespace_admission_deleted_and_empty) {
+    const char *sources[] = {"def removed():\n    return 3\n", "# empty namespace\n"};
+    bool setups[2] = {false, false}, removed[2] = {false, false};
+    bool healthy[2] = {false, false}, absent[2] = {false, false}, cleaned[2] = {false, false};
+    cbm_incremental_route_t routes[2] = {CBM_INCREMENTAL_ROUTE_NONE, CBM_INCREMENTAL_ROUTE_NONE};
+    for (int i = 0; i < 2; i++) {
+        namespace_admission_fixture fixture = {0};
+        setups[i] = namespace_admission_begin(&fixture);
+        if (setups[i])
+            setups[i] = python_module_write_fixture_file(fixture.root, "gone.py", sources[i]);
+        namespace_admission_result before = {0}, after = {0};
+        if (setups[i])
+            before = namespace_admission_run(&fixture, "gone.py", sources[i], 2);
+        if (before.healthy) {
+            char path[768];
+            int n = snprintf(path, sizeof(path), "%s/gone.py", fixture.root);
+            removed[i] = n > 0 && (size_t)n < sizeof(path) && cbm_unlink(path) == 0;
+        }
+        if (removed[i])
+            after = namespace_admission_run(&fixture, "control.py", namespace_admission_control, 1);
+        healthy[i] = before.healthy && after.healthy;
+        routes[i] = after.route;
+        cbm_store_t *store = after.healthy ? cbm_store_open_path(fixture.db) : NULL;
+        if (store) {
+            cbm_node_t *nodes = NULL;
+            int count = 0;
+            absent[i] = cbm_store_find_nodes_by_file(store, after.project, "gone.py", &nodes,
+                                                     &count) == CBM_STORE_OK &&
+                        count == 0;
+            cbm_store_free_nodes(nodes, count);
+            cbm_store_close(store);
+        }
+        free(before.json);
+        free(after.json);
+        cleaned[i] = namespace_admission_finish(&fixture);
+    }
+    for (int i = 0; i < 2; i++) {
+        ASSERT_TRUE(setups[i] && removed[i] && healthy[i] && absent[i] && cleaned[i]);
+        ASSERT_EQ(routes[i], CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    }
+    PASS();
+}
+
+TEST(pipeline_python_namespace_admission_invalid_equal_hash) {
+    static const char initial[] = "def body():\n    return 1\n";
+    static const char edited[] = "def body():\n    return 2\n";
+    namespace_admission_fixture fixture = {0};
+    bool setup = namespace_admission_begin(&fixture);
+    if (setup)
+        setup = python_module_write_fixture_file(fixture.root, "subject.py", initial);
+    namespace_admission_result before = {0}, after = {0};
+    bool corrupted = false, wrote = false;
+    char *old_sha = NULL, *new_sha = NULL;
+    if (setup)
+        before = namespace_admission_run(&fixture, "subject.py", initial, 2);
+    cbm_store_t *store = before.healthy ? cbm_store_open_path(fixture.db) : NULL;
+    if (store) {
+        cbm_lsp_surface_row_t *rows = NULL;
+        int count = 0;
+        int rc = cbm_store_get_lsp_surfaces(store, before.project, &rows, &count);
+        for (int i = 0; rc == CBM_STORE_OK && i < count; i++) {
+            if (!rows[i].rel_path || strcmp(rows[i].rel_path, "subject.py") != 0)
+                continue;
+            old_sha = rows[i].surface_sha ? strdup(rows[i].surface_sha) : NULL;
+            cbm_lsp_surface_row_t invalid = rows[i];
+            invalid.defs_json = "{}"; /* Leave the old hash intact: validate before equality. */
+            corrupted = old_sha && cbm_lsp_surface_python_change("{}", "{}") == -1 &&
+                        cbm_store_upsert_lsp_surface_batch(store, &invalid, 1) == CBM_STORE_OK;
+            break;
+        }
+        cbm_store_free_lsp_surfaces(rows, count);
+        rows = NULL;
+        count = 0;
+        bool confirmed = false;
+        rc = corrupted ? cbm_store_get_lsp_surfaces(store, before.project, &rows, &count)
+                       : CBM_STORE_ERR;
+        for (int i = 0; rc == CBM_STORE_OK && i < count; i++) {
+            if (!rows[i].rel_path || strcmp(rows[i].rel_path, "subject.py") != 0)
+                continue;
+            confirmed = rows[i].defs_json && strcmp(rows[i].defs_json, "{}") == 0 &&
+                        rows[i].surface_sha && strcmp(rows[i].surface_sha, old_sha) == 0;
+            break;
+        }
+        corrupted = corrupted && confirmed;
+        cbm_store_free_lsp_surfaces(rows, count);
+        cbm_store_close(store);
+    }
+    if (corrupted)
+        wrote = python_module_write_fixture_file(fixture.root, "subject.py", edited);
+    if (wrote)
+        after = namespace_admission_run(&fixture, "subject.py", edited, 2);
+    store = after.healthy ? cbm_store_open_path(fixture.db) : NULL;
+    if (store) {
+        cbm_lsp_surface_row_t *rows = NULL;
+        int count = 0;
+        int rc = cbm_store_get_lsp_surfaces(store, after.project, &rows, &count);
+        for (int i = 0; rc == CBM_STORE_OK && i < count; i++) {
+            if (rows[i].rel_path && strcmp(rows[i].rel_path, "subject.py") == 0 &&
+                rows[i].surface_sha) {
+                new_sha = strdup(rows[i].surface_sha);
+                break;
+            }
+        }
+        cbm_store_free_lsp_surfaces(rows, count);
+        cbm_store_close(store);
+    }
+    bool equal_hash = old_sha && new_sha && strcmp(old_sha, new_sha) == 0;
+    bool equal_valid_surface = before.healthy && after.healthy &&
+                               cbm_lsp_surface_python_change(before.json, after.json) == 0;
+    free(old_sha);
+    free(new_sha);
+    free(before.json);
+    free(after.json);
+    bool cleaned = namespace_admission_finish(&fixture);
+    ASSERT_TRUE(setup && corrupted && wrote && cleaned);
+    ASSERT_TRUE(before.healthy && after.healthy && equal_hash && equal_valid_surface);
+    ASSERT_EQ(after.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
 TEST(pipeline_python_module_callers_sequential) {
     return python_module_callers_pipeline_case(false);
 }
@@ -16243,6 +16574,247 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
     PASS();
 }
 
+/* Build a real extraction surface without publishing a database. The returned
+ * JSON outlives both the extraction and collector arenas. */
+static char *pipeline_namespace_surface(const char *source, bool include_defs) {
+    CBMFileResult *fr = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
+                                         "namespace_probe", "pkg/__init__.py", 0, NULL, NULL);
+    if (!fr || fr->has_error || fr->parse_incomplete) {
+        cbm_free_result(fr);
+        return NULL;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMFileResult *cache[] = {fr};
+    cbm_file_info_t files[] = {{.rel_path = "pkg/__init__.py", .language = CBM_LANG_PYTHON}};
+    char *modules[] = {NULL};
+    int starts[2] = {0, 0};
+    int def_count = 0;
+    CBMLSPDef *defs = include_defs
+                          ? cbm_pxc_collect_all_defs(NULL, &arena, cache, files, 1,
+                                                     "namespace_probe", modules, &def_count, starts)
+                          : NULL;
+    cbm_lsp_surface_row_t *rows = NULL;
+    int row_count = 0;
+    char *json = NULL;
+    if (cbm_lsp_surface_build_rows(NULL, "namespace_probe", cache, files, 1, defs, starts, &rows,
+                                   &row_count) == 0 &&
+        row_count == 1 && rows[0].defs_json) {
+        json = strdup(rows[0].defs_json);
+    }
+    cbm_store_free_lsp_surfaces(rows, row_count);
+    free(defs);
+    free(modules[0]);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(fr);
+    return json;
+}
+
+TEST(pipeline_python_namespace_change_admission) {
+    const char *sources[] = {
+        "def target(value):\n    return 1\n",
+        "def target(value):\n    return 2\n",
+        "def target(value, extra):\n    return 1\n",
+        "from first import Target as Alias\n",
+        "from second import Target as Alias\n",
+        "from first import Target as Alias\nfrom second import Target as Alias\n",
+        "from second import Target as Alias\nfrom first import Target as Alias\n",
+        "__all__ = []\n",
+        "__all__ = ['Alias']\n",
+        "__all__ = dynamic_names()\n",
+        "# empty namespace\n",
+    };
+    enum { count = (int)(sizeof(sources) / sizeof(sources[0])) };
+    char *json[count];
+    bool complete = true;
+    for (int i = 0; i < count; i++) {
+        json[i] = pipeline_namespace_surface(sources[i], true);
+        complete = complete && json[i] != NULL;
+    }
+    int body = -9, signature = -9, alias = -9, order = -9;
+    int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
+    const char *non_python = "{\"v\":2,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    if (complete) {
+        body = cbm_lsp_surface_python_change(json[0], json[1]);
+        signature = cbm_lsp_surface_python_change(json[0], json[2]);
+        alias = cbm_lsp_surface_python_change(json[3], json[4]);
+        order = cbm_lsp_surface_python_change(json[5], json[6]);
+        empty = cbm_lsp_surface_python_change(json[10], json[7]);
+        literal = cbm_lsp_surface_python_change(json[7], json[8]);
+        unknown = cbm_lsp_surface_python_change(json[7], json[9]);
+        deletion = cbm_lsp_surface_python_change(json[10], NULL);
+        transition = cbm_lsp_surface_python_change(non_python, json[10]);
+    }
+    for (int i = 0; i < count; i++) {
+        free(json[i]);
+    }
+    ASSERT_TRUE(complete);
+    ASSERT_EQ(body, 0);
+    ASSERT_EQ(signature, 1);
+    ASSERT_EQ(alias, 1);
+    ASSERT_EQ(order, 1);
+    ASSERT_EQ(empty, 1);
+    ASSERT_EQ(literal, 1);
+    ASSERT_EQ(unknown, 1);
+    ASSERT_EQ(deletion, 1);
+    ASSERT_EQ(transition, 1);
+    ASSERT_EQ(cbm_lsp_surface_python_change(non_python, NULL), 0);
+    ASSERT_EQ(cbm_lsp_surface_python_change(non_python, non_python), 0);
+    PASS();
+}
+
+static char *pipeline_namespace_payload_json(const char *json) {
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_val *payload = yyjson_obj_get(yyjson_doc_get_root(doc), "py");
+    char *copy = payload ? yyjson_val_write(payload, 0, NULL) : NULL;
+    yyjson_doc_free(doc);
+    return copy;
+}
+
+TEST(pipeline_python_namespace_codec_owns_ordered_facts) {
+    const char *source = "def plain(value):\n    return value\n"
+                         "from .one import First as Alias\n"
+                         "from .two import Second as Alias\n"
+                         "__all__ = ['Alias', '_private', '', 'odd|name']\n"
+                         "__all__ += ('tail',)\n"
+                         "__all__ = []\n"
+                         "__all__ = dynamic_names()\n";
+    char *full = pipeline_namespace_surface(source, true);
+    char *probe = pipeline_namespace_surface(source, false);
+    char *full_facts = pipeline_namespace_payload_json(full);
+    char *probe_facts = pipeline_namespace_payload_json(probe);
+    bool parity = full_facts && probe_facts && strcmp(full_facts, probe_facts) == 0;
+    bool distinct_defs = full && probe && strcmp(full, probe) != 0;
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_lsp_python_namespace_t copied = {0}, failed = {0};
+    cbm_py_namespace_test_copy_fail_after(0);
+    int failed_rc = cbm_lsp_surface_python_namespace_from_json(&arena, full, &failed);
+    cbm_py_namespace_test_copy_fail_after(-1);
+    int rc = cbm_lsp_surface_python_namespace_from_json(&arena, full, &copied);
+    free(full);
+    free(probe);
+    free(full_facts);
+    free(probe_facts);
+
+    /* The original result, collector, JSON documents and serialized bytes are
+     * all gone before the copied strings and nested arrays are inspected. */
+    bool origin = rc == 1 && copied.module_qn && copied.rel_path &&
+                  strcmp(copied.module_qn, "namespace_probe.pkg.__init__") == 0 &&
+                  strcmp(copied.rel_path, "pkg/__init__.py") == 0;
+    bool valid = rc == 1 && cbm_py_namespace_facts_valid(&copied.facts) &&
+                 copied.facts.status == CBM_PY_NS_COMPLETE &&
+                 copied.facts.language == CBM_LANG_PYTHON;
+    int imports = 0;
+    bool import_order = true, names = false, append = false, empty = false, unknown = false;
+    if (valid) {
+        for (int i = 0; i < copied.facts.count; i++) {
+            const CBMPyNamespaceFact *f = &copied.facts.items[i];
+            if (f->kind == CBM_PY_NS_IMPORT_NAME) {
+                const char *module = imports == 0 ? "one" : "two";
+                const char *member = imports == 0 ? "First" : "Second";
+                import_order = import_order && imports < 2 && f->relative_level == 1 &&
+                               f->module_name && strcmp(f->module_name, module) == 0 &&
+                               f->member_name && strcmp(f->member_name, member) == 0 &&
+                               f->local_name && strcmp(f->local_name, "Alias") == 0;
+                imports++;
+            }
+            if (f->kind == CBM_PY_NS_ALL_SET && f->name_count == 4) {
+                names = f->sequence_kind == CBM_PY_NS_SEQUENCE_LIST &&
+                        strcmp(f->names[0], "Alias") == 0 && strcmp(f->names[1], "_private") == 0 &&
+                        strcmp(f->names[2], "") == 0 && strcmp(f->names[3], "odd|name") == 0;
+            }
+            if (f->kind == CBM_PY_NS_ALL_APPEND) {
+                append = f->sequence_kind == CBM_PY_NS_SEQUENCE_TUPLE && f->name_count == 1 &&
+                         strcmp(f->names[0], "tail") == 0;
+            }
+            empty =
+                empty || (f->kind == CBM_PY_NS_ALL_SET && f->name_count == 0 && f->names == NULL);
+            unknown = unknown || f->kind == CBM_PY_NS_ALL_UNKNOWN;
+        }
+    }
+    bool failure_empty = failed.facts.items == NULL && failed.facts.count == 0 &&
+                         failed.module_qn == NULL && failed.rel_path == NULL;
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(parity);
+    ASSERT_TRUE(distinct_defs);
+    ASSERT_EQ(failed_rc, -1);
+    ASSERT_TRUE(failure_empty);
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(origin);
+    ASSERT_TRUE(valid);
+    ASSERT_EQ(imports, 2);
+    ASSERT_TRUE(import_order);
+    ASSERT_TRUE(names);
+    ASSERT_TRUE(append);
+    ASSERT_TRUE(empty);
+    ASSERT_TRUE(unknown);
+    PASS();
+}
+
+TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
+    /* Numeric values below are the frozen version-1 namespace wire values.
+     * Even an empty LSP array must validate its namespace envelope. */
+    const char *bad[] = {
+        "{\"v\":1,\"lsp\":[]}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":2,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":2,\"v\":2,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
+        "\"failure\":0,\"events\":[]}}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
+        "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
+        "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
+        "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
+        "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
+    };
+    bool rejected = true;
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_lsp_python_namespace_t facts = {0};
+        CBMLSPDef *defs = NULL;
+        int ns_rc = cbm_lsp_surface_python_namespace_from_json(&arena, bad[i], &facts);
+        int defs_rc = cbm_lsp_surface_defs_from_json(&arena, bad[i], &defs);
+        int compare_rc = cbm_lsp_surface_python_change(bad[i], bad[i]);
+        int delete_rc = cbm_lsp_surface_python_change(bad[i], NULL);
+        rejected = rejected && ns_rc == -1 && defs_rc == -1 && compare_rc == -1 &&
+                   delete_rc == -1 && facts.facts.items == NULL && defs == NULL;
+        cbm_arena_destroy(&arena);
+    }
+    const char *unknown =
+        "{\"v\":2,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
+        "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
+        "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_lsp_python_namespace_t facts = {0};
+    int unknown_rc = cbm_lsp_surface_python_namespace_from_json(&arena, unknown, &facts);
+    int equal_rc = cbm_lsp_surface_python_change(unknown, unknown);
+    bool retained = unknown_rc == 1 && facts.facts.count == 1 &&
+                    facts.facts.items[0].kind == CBM_PY_NS_UNKNOWN &&
+                    facts.facts.items[0].reason == CBM_PY_NS_REASON_PARSE;
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(rejected);
+    ASSERT_EQ(unknown_rc, 1);
+    ASSERT_EQ(equal_rc, 0);
+    ASSERT_TRUE(retained);
+    PASS();
+}
+
 /* Object arrays are non-flat in yyjson. Exercise ordered decoding and arena
  * ownership across a large surface, including nested string arrays. */
 TEST(pipeline_lsp_surface_large_object_array_decode) {
@@ -16250,7 +16822,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":1,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":2,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -16342,7 +16914,7 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
             /* The row is the versioned codec envelope with the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":1") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":2") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -17302,6 +17874,13 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_fixture_file_parent_is_preserved);
     RUN_TEST(pipeline_fixture_node_count_requires_exact_source_nodes);
     RUN_TEST(pipeline_nested_fixture_graph_has_endpoints);
+    RUN_TEST(pipeline_python_namespace_admission_upgrade_then_noop);
+    RUN_TEST(pipeline_python_namespace_admission_body_alias_and_all);
+    RUN_TEST(pipeline_python_namespace_admission_deleted_and_empty);
+    RUN_TEST(pipeline_python_namespace_admission_invalid_equal_hash);
+    RUN_TEST(pipeline_python_namespace_change_admission);
+    RUN_TEST(pipeline_python_namespace_codec_owns_ordered_facts);
+    RUN_TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows);
     RUN_TEST(pipeline_lsp_surface_large_object_array_decode);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */

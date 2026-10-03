@@ -110,6 +110,190 @@ void cbm_reset_profile(void) {
     atomic_store(&total_files, 0);
 }
 
+/* New facts use checked allocation and atomic publication; legacy extraction
+ * arrays retain their existing contracts. */
+static bool py_namespace_nonempty(const char *s) {
+    return s && s[0];
+}
+
+static bool py_namespace_fact_valid(const CBMPyNamespaceFact *f) {
+    if (!f || f->name_count < 0 || (size_t)f->name_count > SIZE_MAX / sizeof(*f->names) ||
+        (f->name_count == 0 ? f->names != NULL : f->names == NULL))
+        return false;
+    bool literal = f->kind == CBM_PY_NS_ALL_SET || f->kind == CBM_PY_NS_ALL_APPEND;
+    if (!literal && (f->names || f->name_count || f->sequence_kind != CBM_PY_NS_SEQUENCE_NONE))
+        return false;
+    if (f->kind != CBM_PY_NS_OWN_DEF && f->def_kind != CBM_PY_NS_DEF_NONE)
+        return false;
+    if (f->kind != CBM_PY_NS_IMPORT_MODULE && f->flags)
+        return false;
+    if (f->kind != CBM_PY_NS_IMPORT_NAME && f->kind != CBM_PY_NS_IMPORT_STAR && f->relative_level)
+        return false;
+    bool unknown = f->kind == CBM_PY_NS_SHADOW || f->kind == CBM_PY_NS_UNKNOWN ||
+                   f->kind == CBM_PY_NS_ALL_UNKNOWN;
+    if (!unknown && f->reason != CBM_PY_NS_REASON_NONE)
+        return false;
+    switch (f->kind) {
+    case CBM_PY_NS_OWN_DEF:
+        return py_namespace_nonempty(f->local_name) && !f->module_name && !f->member_name &&
+               (f->def_kind == CBM_PY_NS_DEF_FUNCTION || f->def_kind == CBM_PY_NS_DEF_CLASS);
+    case CBM_PY_NS_IMPORT_MODULE:
+        return py_namespace_nonempty(f->local_name) && py_namespace_nonempty(f->module_name) &&
+               !f->member_name && !(f->flags & ~CBM_PY_NS_IMPORT_BINDS_ROOT);
+    case CBM_PY_NS_IMPORT_NAME:
+    case CBM_PY_NS_IMPORT_STAR:
+        if (!f->module_name || (!f->module_name[0] && !f->relative_level))
+            return false;
+        return f->kind == CBM_PY_NS_IMPORT_NAME
+                   ? py_namespace_nonempty(f->local_name) && py_namespace_nonempty(f->member_name)
+                   : !f->local_name && !f->member_name;
+    case CBM_PY_NS_SHADOW:
+        return py_namespace_nonempty(f->local_name) && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_VALUE || f->reason == CBM_PY_NS_REASON_DECORATED ||
+                f->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED);
+    case CBM_PY_NS_DELETE:
+        return py_namespace_nonempty(f->local_name) && strcmp(f->local_name, "__all__") != 0 &&
+               !f->module_name && !f->member_name;
+    case CBM_PY_NS_UNKNOWN:
+        return !f->local_name && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_COMPOUND || f->reason == CBM_PY_NS_REASON_EFFECT ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED || f->reason == CBM_PY_NS_REASON_PARSE);
+    case CBM_PY_NS_ALL_UNKNOWN:
+        return !f->local_name && !f->module_name && !f->member_name &&
+               (f->reason == CBM_PY_NS_REASON_VALUE || f->reason == CBM_PY_NS_REASON_EFFECT ||
+                f->reason == CBM_PY_NS_REASON_UNSUPPORTED || f->reason == CBM_PY_NS_REASON_PARSE);
+    case CBM_PY_NS_ALL_SET:
+    case CBM_PY_NS_ALL_APPEND:
+        if (f->local_name || f->module_name || f->member_name ||
+            (f->sequence_kind != CBM_PY_NS_SEQUENCE_LIST &&
+             f->sequence_kind != CBM_PY_NS_SEQUENCE_TUPLE))
+            return false;
+        for (int i = 0; i < f->name_count; i++) {
+            if (!f->names[i])
+                return false;
+        }
+        return true;
+    case CBM_PY_NS_ALL_DELETE:
+        return !f->local_name && !f->module_name && !f->member_name;
+    default:
+        return false;
+    }
+}
+
+bool cbm_py_namespace_facts_valid(const CBMPyNamespaceFacts *f) {
+    if (!f)
+        return false;
+    bool empty = !f->items && f->count == 0 && f->cap == 0;
+    if (f->version == 0)
+        return f->status == CBM_PY_NS_NOT_CAPTURED && f->failure == CBM_PY_NS_FAILURE_NONE && empty;
+    if (f->version != CBM_PY_NAMESPACE_FACTS_VERSION || f->language < 0 ||
+        f->language >= CBM_LANG_COUNT)
+        return false;
+    switch (f->status) {
+    case CBM_PY_NS_NOT_CAPTURED:
+        return empty && f->failure == CBM_PY_NS_FAILURE_NONE;
+    case CBM_PY_NS_NOT_APPLICABLE:
+        return empty && f->language != CBM_LANG_PYTHON && f->failure == CBM_PY_NS_FAILURE_NONE;
+    case CBM_PY_NS_INCOMPLETE:
+        return empty && f->failure >= CBM_PY_NS_FAILURE_INVALID_INPUT &&
+               f->failure <= CBM_PY_NS_FAILURE_LIMIT;
+    case CBM_PY_NS_COMPLETE:
+        if (f->language != CBM_LANG_PYTHON || f->failure != CBM_PY_NS_FAILURE_NONE ||
+            f->count < 0 || f->cap < f->count || (size_t)f->cap > SIZE_MAX / sizeof(*f->items) ||
+            (f->count == 0 ? !empty : f->items == NULL))
+            return false;
+        for (int i = 0; i < f->count; i++) {
+            if (!py_namespace_fact_valid(&f->items[i]))
+                return false;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static CBM_TLS int py_namespace_copy_left = -1;
+void cbm_py_namespace_test_copy_fail_after(int successful_allocations) {
+    py_namespace_copy_left = successful_allocations;
+}
+#endif
+
+static void *py_namespace_copy_alloc(CBMArena *arena, size_t size) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_namespace_copy_left == 0)
+        return NULL;
+    if (py_namespace_copy_left > 0)
+        py_namespace_copy_left--;
+#endif
+    return cbm_arena_alloc(arena, size);
+}
+
+static bool py_namespace_copy_string(CBMArena *arena, const char *source, const char **out) {
+    *out = NULL;
+    if (!source)
+        return true;
+    size_t len = strlen(source);
+    if (len == SIZE_MAX)
+        return false;
+    char *copy = py_namespace_copy_alloc(arena, len + 1);
+    if (!copy)
+        return false;
+    memcpy(copy, source, len + 1);
+    *out = copy;
+    return true;
+}
+
+bool cbm_py_namespace_facts_copy(CBMArena *arena, const CBMPyNamespaceFacts *source,
+                                 CBMPyNamespaceFacts *out) {
+    if (!out || source == out)
+        return false;
+    CBMPyNamespaceFacts failure = {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                   .language = CBM_LANG_PYTHON,
+                                   .status = CBM_PY_NS_INCOMPLETE,
+                                   .failure = CBM_PY_NS_FAILURE_INVALID_INPUT};
+    if (!arena || !cbm_py_namespace_facts_valid(source)) {
+        *out = failure;
+        return false;
+    }
+    failure.language = source->language;
+    failure.failure = CBM_PY_NS_FAILURE_ALLOCATION;
+    CBMPyNamespaceFacts copy = *source;
+    copy.items = NULL;
+    copy.cap = copy.count;
+    if (copy.count) {
+        copy.items = py_namespace_copy_alloc(arena, (size_t)copy.count * sizeof(*copy.items));
+        if (!copy.items)
+            goto failed;
+        memcpy(copy.items, source->items, (size_t)copy.count * sizeof(*copy.items));
+    }
+    for (int i = 0; i < copy.count; i++) {
+        const CBMPyNamespaceFact *src = &source->items[i];
+        CBMPyNamespaceFact *dst = &copy.items[i];
+        if (!py_namespace_copy_string(arena, src->local_name, &dst->local_name) ||
+            !py_namespace_copy_string(arena, src->module_name, &dst->module_name) ||
+            !py_namespace_copy_string(arena, src->member_name, &dst->member_name))
+            goto failed;
+        dst->names = NULL;
+        if (src->name_count) {
+            dst->names =
+                py_namespace_copy_alloc(arena, (size_t)src->name_count * sizeof(*dst->names));
+            if (!dst->names)
+                goto failed;
+            for (int j = 0; j < src->name_count; j++) {
+                if (!py_namespace_copy_string(arena, src->names[j], &dst->names[j]))
+                    goto failed;
+            }
+        }
+    }
+    *out = copy;
+    return true;
+failed:
+    *out = failure;
+    return false;
+}
+
 // --- Growable array push functions ---
 
 #define GROW_ARRAY(arr, arena)                                                                   \
@@ -2337,6 +2521,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return NULL;
     }
 
+    result->py_namespace.version = CBM_PY_NAMESPACE_FACTS_VERSION;
+    result->py_namespace.language = language;
+    result->py_namespace.status =
+        language == CBM_LANG_PYTHON ? CBM_PY_NS_NOT_CAPTURED : CBM_PY_NS_NOT_APPLICABLE;
     cbm_work_arena_take(&result->arena);
     CBMArena *a = &result->arena;
 
@@ -2523,6 +2711,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // then a single unified cursor walk handles the remaining 7 extractors.
     cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
+    cbm_extract_python_namespace_facts(&ctx);
     cbm_extract_unified(&ctx);
     result->tree_nodes = ts_node_descendant_count(root);
     result->walk_nodes_visited = ctx.walk_nodes_visited;
@@ -3229,6 +3418,35 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     CBMFileResult *result = extract_file_ex_body(source, source_len, language, project, rel_path,
                                                  timeout_micros, extra_defines, include_paths,
                                                  macro_table, return_type_table, &scratch);
+    /* Even early parse/quarantine exits publish conservative Python metadata.
+     * No tree is reparsed, and existing best-effort extraction flags stay intact. */
+    if (result && language == CBM_LANG_PYTHON &&
+        result->py_namespace.status == CBM_PY_NS_NOT_CAPTURED) {
+        CBMPyNamespaceFailure failure = CBM_PY_NS_FAILURE_NONE;
+        if (!result->module_qn || !result->module_qn[0]) {
+            if (!project || !project[0] || !rel_path || !rel_path[0]) {
+                failure = CBM_PY_NS_FAILURE_INVALID_INPUT;
+            } else {
+                result->module_qn =
+                    cbm_fqn_module_source_lang(&result->arena, project, rel_path, language);
+                if (!result->module_qn || !result->module_qn[0])
+                    failure = CBM_PY_NS_FAILURE_ALLOCATION;
+            }
+        }
+        if (failure) {
+            result->py_namespace = (CBMPyNamespaceFacts){.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                                         .language = language,
+                                                         .status = CBM_PY_NS_INCOMPLETE,
+                                                         .failure = failure};
+        } else {
+            CBMExtractCtx facts_ctx = {.arena = &result->arena,
+                                       .result = result,
+                                       .source = source,
+                                       .source_len = source_len,
+                                       .language = language};
+            cbm_extract_python_namespace_facts(&facts_ctx);
+        }
+    }
     /* !tl_scratch_live: a nested extraction (an embedded language inside this
      * file) may already have parked its own; never overwrite it. */
     /* Kept up to CBM_EXTRACT_SCRATCH_KEEP_BYTES, grown blocks included: the

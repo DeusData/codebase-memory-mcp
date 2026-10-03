@@ -19,6 +19,7 @@
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pipeline_internal.h"
 
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,7 @@
 #include "pipeline/worker_pool.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 1 };
+enum { SURFACE_CODEC_VERSION = 2 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -71,10 +72,288 @@ static void add_str_array_or_null(yyjson_mut_doc *doc, yyjson_mut_val *obj, cons
     yyjson_mut_obj_add_val(doc, obj, key, arr);
 }
 
+/* The namespace payload is content-only. Its ordered records never depend on
+ * the registry used to build ordinary LSP definitions. */
+static bool surface_py_add_nullable(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
+                                    const char *value) {
+    return value ? yyjson_mut_obj_add_str(doc, obj, key, value)
+                 : yyjson_mut_obj_add_null(doc, obj, key);
+}
+
+static bool surface_add_python_namespace(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                         const CBMFileResult *result, CBMLanguage language,
+                                         const char *rel_path) {
+    if (language != CBM_LANG_PYTHON) {
+        return yyjson_mut_obj_add_null(doc, root, "py");
+    }
+    if (!result || !result->module_qn || !result->module_qn[0] || !rel_path || !rel_path[0] ||
+        result->py_namespace.status != CBM_PY_NS_COMPLETE ||
+        result->py_namespace.language != CBM_LANG_PYTHON ||
+        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
+        return false;
+    }
+    const CBMPyNamespaceFacts *facts = &result->py_namespace;
+    yyjson_mut_val *py = yyjson_mut_obj(doc);
+    yyjson_mut_val *events = yyjson_mut_arr(doc);
+    if (!py || !events || !yyjson_mut_obj_add_uint(doc, py, "v", facts->version) ||
+        !yyjson_mut_obj_add_int(doc, py, "lang", (int)facts->language) ||
+        !yyjson_mut_obj_add_str(doc, py, "module", result->module_qn) ||
+        !yyjson_mut_obj_add_str(doc, py, "path", rel_path) ||
+        !yyjson_mut_obj_add_int(doc, py, "status", (int)facts->status) ||
+        !yyjson_mut_obj_add_int(doc, py, "failure", (int)facts->failure)) {
+        return false;
+    }
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *f = &facts->items[i];
+        yyjson_mut_val *event = yyjson_mut_obj(doc);
+        yyjson_mut_val *names = yyjson_mut_arr(doc);
+        if (!event || !names || !yyjson_mut_obj_add_int(doc, event, "k", (int)f->kind) ||
+            !yyjson_mut_obj_add_int(doc, event, "d", (int)f->def_kind) ||
+            !yyjson_mut_obj_add_int(doc, event, "s", (int)f->sequence_kind) ||
+            !yyjson_mut_obj_add_int(doc, event, "r", (int)f->reason) ||
+            !yyjson_mut_obj_add_uint(doc, event, "f", f->flags) ||
+            !yyjson_mut_obj_add_uint(doc, event, "l", f->relative_level) ||
+            !surface_py_add_nullable(doc, event, "n", f->local_name) ||
+            !surface_py_add_nullable(doc, event, "m", f->module_name) ||
+            !surface_py_add_nullable(doc, event, "i", f->member_name)) {
+            return false;
+        }
+        for (int j = 0; j < f->name_count; j++) {
+            if (!yyjson_mut_arr_add_str(doc, names, f->names[j])) {
+                return false;
+            }
+        }
+        if (!yyjson_mut_obj_add_val(doc, event, "a", names) ||
+            !yyjson_mut_arr_add_val(events, event)) {
+            return false;
+        }
+    }
+    return yyjson_mut_obj_add_val(doc, py, "events", events) &&
+           yyjson_mut_obj_add_val(doc, root, "py", py);
+}
+
+/* Reject duplicate fields rather than letting object lookup choose one. */
+static yyjson_val *surface_unique_field(yyjson_val *obj, const char *name) {
+    if (!yyjson_is_obj(obj)) {
+        return NULL;
+    }
+    yyjson_val *found = NULL;
+    yyjson_obj_iter it = yyjson_obj_iter_with(obj);
+    yyjson_val *key;
+    while ((key = yyjson_obj_iter_next(&it))) {
+        const char *text = yyjson_get_str(key);
+        if (text && yyjson_get_len(key) == strlen(name) && strcmp(text, name) == 0) {
+            if (found) {
+                return NULL;
+            }
+            found = yyjson_obj_iter_get_val(key);
+        }
+    }
+    return found;
+}
+
+static bool surface_py_uint(yyjson_val *value, uint32_t maximum, uint32_t *out) {
+    if (!yyjson_is_int(value)) {
+        return false;
+    }
+    int64_t n = yyjson_get_sint(value);
+    if (n < 0 || (uint64_t)n > maximum) {
+        return false;
+    }
+    *out = (uint32_t)n;
+    return true;
+}
+
+static bool surface_py_string(yyjson_val *value, bool nullable, const char **out) {
+    *out = NULL;
+    if (!value) {
+        return false;
+    }
+    if (yyjson_is_null(value)) {
+        return nullable;
+    }
+    const char *text = yyjson_get_str(value);
+    if (!text || strlen(text) != yyjson_get_len(value)) {
+        return false;
+    }
+    *out = text;
+    return true;
+}
+
+/* Arrays belong to scratch; strings borrow the immutable JSON document.
+ * The caller keeps both alive until validation/copy/comparison is finished. */
+static int surface_python_namespace_parse(CBMArena *scratch, yyjson_val *root,
+                                          cbm_lsp_python_namespace_t *out) {
+    memset(out, 0, sizeof(*out));
+    uint32_t version = 0, file_language = 0;
+    yyjson_val *py = surface_unique_field(root, "py");
+    if (!surface_py_uint(surface_unique_field(root, "v"), UINT32_MAX, &version) ||
+        version != SURFACE_CODEC_VERSION || !py ||
+        !surface_py_uint(surface_unique_field(root, "lang"), CBM_LANG_COUNT - 1, &file_language) ||
+        !yyjson_is_arr(surface_unique_field(root, "lsp"))) {
+        return -1;
+    }
+    if (yyjson_is_null(py)) {
+        return file_language == CBM_LANG_PYTHON ? -1 : 0;
+    }
+    if (file_language != CBM_LANG_PYTHON || !yyjson_is_obj(py) || yyjson_obj_size(py) != 7) {
+        return -1;
+    }
+    CBMPyNamespaceFacts *facts = &out->facts;
+    uint32_t language, status, failure;
+    if (!surface_py_uint(surface_unique_field(py, "v"), UINT32_MAX, &facts->version) ||
+        !surface_py_uint(surface_unique_field(py, "lang"), INT_MAX, &language) ||
+        !surface_py_uint(surface_unique_field(py, "status"), INT_MAX, &status) ||
+        !surface_py_uint(surface_unique_field(py, "failure"), INT_MAX, &failure) ||
+        !surface_py_string(surface_unique_field(py, "module"), false, &out->module_qn) ||
+        !surface_py_string(surface_unique_field(py, "path"), false, &out->rel_path) ||
+        !out->module_qn[0] || !out->rel_path[0] || language != CBM_LANG_PYTHON ||
+        status != CBM_PY_NS_COMPLETE || failure != CBM_PY_NS_FAILURE_NONE) {
+        return -1;
+    }
+    facts->language = (CBMLanguage)language;
+    facts->status = (CBMPyNamespaceStatus)status;
+    facts->failure = (CBMPyNamespaceFailure)failure;
+    yyjson_val *events = surface_unique_field(py, "events");
+    if (!yyjson_is_arr(events)) {
+        return -1;
+    }
+    size_t count = yyjson_arr_size(events);
+    if (count > INT_MAX || count > SIZE_MAX / sizeof(*facts->items)) {
+        return -1;
+    }
+    facts->count = (int)count;
+    facts->cap = (int)count;
+    if (count) {
+        facts->items = cbm_arena_alloc(scratch, count * sizeof(*facts->items));
+        if (!facts->items) {
+            return -1;
+        }
+        memset(facts->items, 0, count * sizeof(*facts->items));
+    }
+    yyjson_arr_iter it = yyjson_arr_iter_with(events);
+    yyjson_val *event;
+    int i = 0;
+    while ((event = yyjson_arr_iter_next(&it))) {
+        if (!yyjson_is_obj(event) || yyjson_obj_size(event) != 10) {
+            return -1;
+        }
+        CBMPyNamespaceFact *f = &facts->items[i++];
+        uint32_t kind, def_kind, sequence_kind, reason;
+        if (!surface_py_uint(surface_unique_field(event, "k"), INT_MAX, &kind) ||
+            !surface_py_uint(surface_unique_field(event, "d"), INT_MAX, &def_kind) ||
+            !surface_py_uint(surface_unique_field(event, "s"), INT_MAX, &sequence_kind) ||
+            !surface_py_uint(surface_unique_field(event, "r"), INT_MAX, &reason) ||
+            !surface_py_uint(surface_unique_field(event, "f"), UINT32_MAX, &f->flags) ||
+            !surface_py_uint(surface_unique_field(event, "l"), UINT32_MAX, &f->relative_level) ||
+            !surface_py_string(surface_unique_field(event, "n"), true, &f->local_name) ||
+            !surface_py_string(surface_unique_field(event, "m"), true, &f->module_name) ||
+            !surface_py_string(surface_unique_field(event, "i"), true, &f->member_name)) {
+            return -1;
+        }
+        f->kind = (CBMPyNamespaceFactKind)kind;
+        f->def_kind = (CBMPyNamespaceDefKind)def_kind;
+        f->sequence_kind = (CBMPyNamespaceSequenceKind)sequence_kind;
+        f->reason = (CBMPyNamespaceUnknownReason)reason;
+        yyjson_val *names = surface_unique_field(event, "a");
+        if (!yyjson_is_arr(names)) {
+            return -1;
+        }
+        size_t n = yyjson_arr_size(names);
+        if (n > INT_MAX || n > SIZE_MAX / sizeof(*f->names)) {
+            return -1;
+        }
+        f->name_count = (int)n;
+        if (n) {
+            f->names = cbm_arena_alloc(scratch, n * sizeof(*f->names));
+            if (!f->names) {
+                return -1;
+            }
+        }
+        yyjson_arr_iter ni = yyjson_arr_iter_with(names);
+        yyjson_val *name;
+        int j = 0;
+        while ((name = yyjson_arr_iter_next(&ni))) {
+            if (!surface_py_string(name, false, &f->names[j++])) {
+                return -1;
+            }
+        }
+    }
+    return cbm_py_namespace_facts_valid(facts) ? 1 : -1;
+}
+
+int cbm_lsp_surface_python_namespace_from_json(CBMArena *arena, const char *json,
+                                               cbm_lsp_python_namespace_t *out) {
+    if (!out) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!arena || !json) {
+        return -1;
+    }
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return -1;
+    }
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    cbm_lsp_python_namespace_t parsed = {0}, result = {0};
+    int status = surface_python_namespace_parse(&scratch, yyjson_doc_get_root(doc), &parsed);
+    if (status == 1) {
+        if (!cbm_py_namespace_facts_copy(arena, &parsed.facts, &result.facts)) {
+            status = -1;
+        } else {
+            result.module_qn = cbm_arena_strdup(arena, parsed.module_qn);
+            result.rel_path = cbm_arena_strdup(arena, parsed.rel_path);
+            if (!result.module_qn || !result.rel_path) {
+                status = -1;
+            }
+        }
+    }
+    cbm_arena_destroy(&scratch);
+    yyjson_doc_free(doc);
+    if (status == 1) {
+        *out = result;
+    }
+    return status;
+}
+
+int cbm_lsp_surface_python_change(const char *old_json, const char *new_json) {
+    if (!old_json) {
+        return -1;
+    }
+    yyjson_doc *old_doc = yyjson_read(old_json, strlen(old_json), 0);
+    yyjson_doc *new_doc = new_json ? yyjson_read(new_json, strlen(new_json), 0) : NULL;
+    if (!old_doc || (new_json && !new_doc)) {
+        yyjson_doc_free(old_doc);
+        yyjson_doc_free(new_doc);
+        return -1;
+    }
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    cbm_lsp_python_namespace_t old_facts, new_facts;
+    int old_state =
+        surface_python_namespace_parse(&scratch, yyjson_doc_get_root(old_doc), &old_facts);
+    int new_state =
+        new_doc ? surface_python_namespace_parse(&scratch, yyjson_doc_get_root(new_doc), &new_facts)
+                : 0;
+    int result = -1;
+    if (old_state >= 0 && new_state >= 0) {
+        result = (old_state == 0 && new_state == 0)                                         ? 0
+                 : (old_state != new_state || !new_json || strcmp(old_json, new_json) != 0) ? 1
+                                                                                            : 0;
+    }
+    cbm_arena_destroy(&scratch);
+    yyjson_doc_free(old_doc);
+    yyjson_doc_free(new_doc);
+    return result;
+}
+
 /* Serialize one file's surface: its slice of all_defs plus the registry-only
  * symbols from its raw extraction defs. Returns a malloc'd JSON string and its
  * length. */
-static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *defs, int def_count,
+static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage language,
+                                  const char *rel_path, const CBMLSPDef *defs, int def_count,
                                   size_t *out_len) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     if (!doc) {
@@ -82,7 +361,12 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_int(doc, root, "v", SURFACE_CODEC_VERSION);
+    if ((unsigned)language >= CBM_LANG_COUNT ||
+        !yyjson_mut_obj_add_int(doc, root, "v", SURFACE_CODEC_VERSION) ||
+        !yyjson_mut_obj_add_int(doc, root, "lang", (int)language)) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
 
     yyjson_mut_val *lsp = yyjson_mut_arr(doc);
     for (int i = 0; i < def_count; i++) {
@@ -150,6 +434,10 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         yyjson_mut_obj_add_val(doc, root, "http", http);
     }
 
+    if (!surface_add_python_namespace(doc, root, result, language, rel_path)) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
     char *json = yyjson_mut_write(doc, 0, out_len);
     yyjson_mut_doc_free(doc);
     return json;
@@ -186,8 +474,9 @@ static void surface_row_one(int i, void *arg) {
     int start = job->def_starts ? job->def_starts[i] : 0;
     int end = job->def_starts ? job->def_starts[i + 1] : 0;
     size_t json_len = 0;
-    char *json = surface_file_to_json(fr, job->all_defs ? job->all_defs + start : NULL, end - start,
-                                      &json_len);
+    char *json =
+        surface_file_to_json(fr, job->files[i].language, job->files[i].rel_path,
+                             job->all_defs ? job->all_defs + start : NULL, end - start, &json_len);
     cbm_pipeline_result_release(fr, loaded);
     if (!json) {
         atomic_store_explicit(&job->failed, true, memory_order_relaxed);
@@ -302,9 +591,14 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         return -1;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *ver = root ? yyjson_obj_get(root, "v") : NULL;
-    yyjson_val *lsp = root ? yyjson_obj_get(root, "lsp") : NULL;
-    if (!ver || yyjson_get_int(ver) != SURFACE_CODEC_VERSION || !lsp || !yyjson_is_arr(lsp)) {
+    CBMArena namespace_scratch;
+    cbm_arena_init(&namespace_scratch);
+    cbm_lsp_python_namespace_t namespace_payload = {0};
+    int namespace_status =
+        surface_python_namespace_parse(&namespace_scratch, root, &namespace_payload);
+    cbm_arena_destroy(&namespace_scratch);
+    yyjson_val *lsp = surface_unique_field(root, "lsp");
+    if (namespace_status < 0) {
         yyjson_doc_free(doc);
         return -1;
     }
