@@ -612,7 +612,8 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
 
 static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
                                   const char *module_qn, const char **imp_keys,
-                                  const char **imp_vals, int imp_count, int *inherits_count,
+                                  const char **imp_vals, int imp_count,
+                                  const cbm_php_vendor_names_t *php_vendor, int *inherits_count,
                                   int *decorates_count) {
     if (!def->qualified_name) {
         return;
@@ -623,6 +624,12 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     }
     if (def->base_classes) {
         for (int b = 0; def->base_classes[b]; b++) {
+            /* #1186: `extends Request` with `use Saloon\Http\Request` names the
+             * vendor class, never a same-named project class. Mirrors
+             * pass_parallel.c. */
+            if (cbm_pipeline_php_vendor_bound(php_vendor, def->base_classes[b])) {
+                continue;
+            }
             const char *base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn,
                                                    imp_keys, imp_vals, imp_count);
             if (!base_qn) {
@@ -730,6 +737,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_vals = NULL;
         int imp_count = 0;
         build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        cbm_php_vendor_names_t php_vendor;
+        cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       ps_module_is_dir(files[i].language));
@@ -737,7 +746,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {
             sem_process_def_edges(ctx, &result->defs.items[d], module_qn, imp_keys, imp_vals,
-                                  imp_count, &inherits_count, &decorates_count);
+                                  imp_count, &php_vendor, &inherits_count, &decorates_count);
         }
 
         /* ── IMPLEMENTS from impl_traits (Rust) ─────────────────── */
@@ -745,6 +754,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
             resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
 
         free(module_qn);
+        cbm_pipeline_php_vendor_names_free(&php_vendor);
         free_import_map(imp_keys, imp_vals, imp_count);
         if (result_owned) {
             cbm_free_result(result);

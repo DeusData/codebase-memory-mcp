@@ -319,6 +319,15 @@ static inline int cbm_pipeline_invocation_site_rank(const CBMResolvedCall *resol
     return call->requires_lsp_resolution || call->source_origin != resolved->source_origin ? 0 : 1;
 }
 
+/* A resolver row that proves the call's receiver is a type OUTSIDE the project:
+ * PHP `$r->m()` / `R::m()` where `R` is imported from a vendor namespace
+ * (#1186). When its target has no graph node, it rules out every name-only
+ * fallback: the method of a vendor class is not a same-named project method. */
+static inline bool cbm_pipeline_lsp_external_receiver(const CBMResolvedCall *resolved) {
+    return resolved && resolved->strategy &&
+           strcmp(resolved->strategy, "php_external_receiver") == 0;
+}
+
 static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *strategy) {
     return strategy &&
            (strcmp(strategy, "lsp_func_ptr") == 0 || strcmp(strategy, "lsp_callable_alias") == 0 ||

@@ -460,6 +460,12 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         free(file_qn);
         return 0;
     }
+    if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
+        count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
+                                                     namespace_map);
+        free(file_qn);
+        return count;
+    }
     for (int j = 0; j < result->imports.count; j++) {
         const CBMImport *imp = &result->imports.items[j];
         if (!imp->module_path) {

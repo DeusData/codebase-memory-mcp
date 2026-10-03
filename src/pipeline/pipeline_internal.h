@@ -17,6 +17,7 @@
 #include "git/git_context.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
+#include "lsp/php_lsp.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
@@ -248,6 +249,22 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
+
+/* PHP binding arrays borrow current result and graph strings. Free before
+ * releasing/reloading the result; never cache this state across files. */
+typedef CBMPHPImportBindings cbm_php_vendor_names_t;
+void cbm_pipeline_php_vendor_names_build(const cbm_gbuf_t *gbuf, const char *project_name,
+                                         const char *rel, const CBMFileResult *result,
+                                         cbm_php_vendor_names_t *out);
+void cbm_pipeline_php_vendor_names_free(cbm_php_vendor_names_t *value);
+bool cbm_pipeline_php_vendor_bound(const cbm_php_vendor_names_t *value, const char *name);
+bool cbm_pipeline_php_vendor_call(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
+                                  const CBMCall *call);
+bool cbm_pipeline_php_vendor_usage(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
+                                   const CBMUsage *usage);
+int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                         const char *rel, const char *file_qn,
+                                         const cbm_gbuf_node_t *file, CBMHashTable *namespace_map);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by

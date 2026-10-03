@@ -1698,6 +1698,435 @@ TEST(ei_php_require_path_keeps_generic_resolution_issue1186) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * PHP vendor-imported types — #1186 follow-up (CALLS / INHERITS / USAGE)
+ *
+ * With the vendor `use` unresolved, the edges that NAME the imported type fell
+ * back to name guessing: `extends Request` bound to the project's own Request
+ * class, calls on a Request-typed receiver to its same-named methods (or to a
+ * TypeScript function), and the type references to that class. A name bound
+ * by a vendor `use` must take the LSP result or nothing.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Missing source/target nodes or any failed query are fixture failures, not
+ * evidence that a forbidden edge is absent. */
+static int ei_php_checked_file_edges(cbm_store_t *store, const char *project, const char *source,
+                                     const char *type, const char *target) {
+    cbm_node_t *src = NULL, *dst = NULL;
+    int nsrc = 0, ndst = 0;
+    if (cbm_store_find_nodes_by_file(store, project, source, &src, &nsrc) != CBM_STORE_OK ||
+        cbm_store_find_nodes_by_file(store, project, target, &dst, &ndst) != CBM_STORE_OK) {
+        cbm_store_free_nodes(src, nsrc);
+        cbm_store_free_nodes(dst, ndst);
+        return -1;
+    }
+    int source_files = 0, target_files = 0, source_defs = 0, target_defs = 0;
+    for (int i = 0; i < nsrc; i++) {
+        source_files += src[i].label && strcmp(src[i].label, "File") == 0;
+        source_defs += src[i].label &&
+                       (strcmp(src[i].label, "Class") == 0 || strcmp(src[i].label, "Method") == 0);
+    }
+    for (int i = 0; i < ndst; i++) {
+        target_files += dst[i].label && strcmp(dst[i].label, "File") == 0;
+        target_defs += dst[i].label && (strcmp(dst[i].label, "Class") == 0 ||
+                                        strcmp(dst[i].label, "Function") == 0 ||
+                                        strcmp(dst[i].label, "Method") == 0);
+    }
+    int hits =
+        source_files == 1 && target_files == 1 && source_defs > 0 && target_defs > 0 ? 0 : -1;
+    for (int i = 0; hits >= 0 && i < nsrc; i++) {
+        cbm_edge_t *edges = NULL;
+        int count = 0;
+        if (cbm_store_find_edges_by_source_type(store, src[i].id, type, &edges, &count) !=
+            CBM_STORE_OK) {
+            hits = -1;
+        }
+        for (int j = 0; hits >= 0 && j < count; j++) {
+            cbm_node_t node = {0};
+            if (cbm_store_find_node_by_id(store, edges[j].target_id, &node) != CBM_STORE_OK) {
+                hits = -1;
+            } else {
+                hits += node.file_path && strcmp(node.file_path, target) == 0;
+                cbm_node_free_fields(&node);
+            }
+        }
+        cbm_store_free_edges(edges, count);
+    }
+    cbm_store_free_nodes(src, nsrc);
+    cbm_store_free_nodes(dst, ndst);
+    return hits;
+}
+
+static bool ei_php_vendor_sites_present(const char *source, const char *path) {
+    CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP, "vendor_types",
+                                        path, 0, NULL, NULL);
+    if (!r)
+        return false;
+    const char *names[] = {"validated", "makeIt", "go", "build", "get", "sendAsync"};
+    bool ok = r->defs.count > 0 && r->imports.count == 2;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        int found = 0;
+        for (int j = 0; j < r->calls.count; j++) {
+            const CBMCall *call = &r->calls.items[j];
+            if (call->callee_name && strstr(call->callee_name, names[i]) &&
+                call->enclosing_func_qn && strstr(call->enclosing_func_qn, "Foo.run") &&
+                call->site_end_byte > call->site_start_byte &&
+                call->site_end_byte <= strlen(source))
+                found++;
+        }
+        ok = found == 1 && ok;
+    }
+    int request_uses = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        request_uses +=
+            r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, "Request") == 0;
+    }
+    ok = request_uses > 0 && ok;
+    cbm_free_result(r);
+    return ok;
+}
+
+TEST(ei_php_vendor_types_never_bind_by_name_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Http/Requests/Request.php",
+         "<?php\nnamespace App\\Http\\Requests;\n\nclass Request {\n"
+         "    public function validated() { return 1; }\n"
+         "    public static function makeIt() { return 2; }\n"
+         "    public function get($k) { return $k; }\n}\n"},
+        {"app/Services/Svc.php", "<?php\nnamespace App\\Services;\n\nclass Svc {\n"
+                                 "    public function go() { return 3; }\n"
+                                 "    public static function build() { return 4; }\n}\n"},
+        {"resources/js/api.ts", "export function sendAsync(x: number) { return x; }\n"},
+        {"app/Http/Integrations/Foo.php", "<?php\nnamespace App\\Http\\Integrations;\n\n"
+                                          "use Saloon\\Http\\Request;\nuse App\\Services\\Svc;\n\n"
+                                          "class Foo extends Request {\n"
+                                          "    public function run(Request $r, Svc $s) {\n"
+                                          "        $r->validated();\n"
+                                          "        Request::makeIt();\n"
+                                          "        $made = new Request();\n"
+                                          "        $s->go();\n"
+                                          "        Svc::build();\n"
+                                          "        $r->get('id');\n"
+                                          "        return $r->sendAsync(1);\n"
+                                          "    }\n}\n\n"
+                                          "class Bar extends Svc {\n}\n"}};
+    static const char *const foo = "app/Http/Integrations/Foo.php";
+    static const char *const req = "app/Http/Requests/Request.php";
+    static const char *const svc = "app/Services/Svc.php";
+    static const struct {
+        const char *type;
+        const char *tgt;
+        int want_min;
+        int want_max;
+    } checks[] = {
+        {"INHERITS", req, 0, 0}, {"CALLS", req, 0, 0},
+        {"USAGE", req, 0, 0},    {"CALLS", "resources/js/api.ts", 0, 0},
+        {"INHERITS", svc, 1, 1}, {"CALLS", svc, 2, 2},
+        {"CALLS", foo, 0, 0},    {"USAGE", svc, 1, 1 << 20},
+    };
+    ASSERT_TRUE(ei_php_vendor_sites_present(f[4].content, foo));
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, 5);
+    int ok = store != NULL;
+    for (size_t i = 0; store && i < sizeof(checks) / sizeof(checks[0]); i++) {
+        int got = ei_php_checked_file_edges(store, lp.project, foo, checks[i].type, checks[i].tgt);
+        if (got < checks[i].want_min || got > checks[i].want_max) {
+            fprintf(stderr, "  [%s] Foo.php -> %s: got %d, want %d..%d\n", checks[i].type,
+                    checks[i].tgt, got, checks[i].want_min, checks[i].want_max);
+            ok = 0;
+        }
+    }
+    ei_cleanup(&lp, store);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* Build the metadata through the production writer, then challenge its
+ * readback. A File node or an empty edge query alone is never completeness. */
+static bool ei_php_seed_result(cbm_gbuf_t *gb, const char *project, const char *rel,
+                               const CBMFileResult *r) {
+    char *qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
+    if (!qn)
+        return false;
+    int64_t id = cbm_gbuf_upsert_node(gb, "File", rel, qn, rel, 0, 0, "{}");
+    free(qn);
+    if (id <= 0 || !r || r->defs.count == 0)
+        return false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->label || !d->name || !d->qualified_name ||
+            cbm_gbuf_upsert_node(gb, d->label, d->name, d->qualified_name, rel, d->start_line,
+                                 d->end_line, "{}") <= 0)
+            return false;
+    }
+    return true;
+}
+
+TEST(ei_php_binding_snapshot_requires_current_complete_evidence) {
+    const char *source = "<?php\nnamespace Local;\nuse Vendor\\Http\\Request;\n"
+                         "class Main { function run(Request $r) { $r->send(); } }\n";
+    CBMFileResult *r =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT_GT(r->calls.count, 0);
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    cbm_php_vendor_names_t names = {0};
+    cbm_pipeline_php_vendor_names_build(NULL, "p", "main.php", r, &names);
+    ASSERT_NULL(names.targets);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NULL(names.targets); /* no File node */
+    ASSERT_TRUE(ei_php_seed_result(gb, "p", "main.php", r));
+    char *file_qn = cbm_pipeline_fqn_compute("p", "main.php", "__file__");
+    ASSERT_NOT_NULL(file_qn);
+    const cbm_gbuf_node_t *file = cbm_gbuf_find_by_qn(gb, file_qn);
+    ASSERT_NOT_NULL(file);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NULL(names.targets); /* legacy File properties */
+    const char *rels[] = {"main.php"};
+    CBMFileResult *results[] = {r};
+    CBMHashTable *ns = cbm_pipeline_namespace_map_build("p", results, rels, 1);
+    ASSERT_NOT_NULL(ns);
+    cbm_pipeline_ctx_t ctx = {.project_name = "p", .gbuf = gb};
+    CBMHashTable *saved = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_php_create_import_edges(&ctx, r, "main.php", file_qn, file, ns);
+    cbm_pipeline_set_pkgmap(saved);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = -1;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, file->id, "IMPORTS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 0);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NOT_NULL(names.targets);
+    ASSERT_NULL(names.targets[0]);
+    ASSERT_TRUE(cbm_pipeline_php_vendor_bound(&names, "Request"));
+    cbm_pipeline_php_vendor_names_free(&names);
+
+    /* A failed/unknown resolver state cannot reuse the preceding proof. */
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_php_create_import_edges(&ctx, r, "main.php", file_qn, file, NULL);
+    cbm_pipeline_set_pkgmap(saved);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NULL(names.targets);
+    char overlong[4096];
+    memset(overlong, 'X', sizeof(overlong));
+    memcpy(overlong + sizeof(overlong) - 9, "\\Request", 9);
+    CBMImport oversized = r->imports.items[0];
+    oversized.module_path = overlong;
+    CBMFileResult oversized_result = *r;
+    oversized_result.imports.items = &oversized;
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_php_create_import_edges(&ctx, &oversized_result, "main.php", file_qn, file, ns);
+    cbm_pipeline_set_pkgmap(saved);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", &oversized_result, &names);
+    ASSERT_NULL(names.targets);
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_php_create_import_edges(&ctx, r, "main.php", file_qn, file, ns);
+    cbm_pipeline_set_pkgmap(saved);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NOT_NULL(names.targets);
+    cbm_pipeline_php_vendor_names_free(&names);
+
+    CBMImport changed = r->imports.items[0];
+    changed.module_path = "Different\\Http\\Request";
+    CBMFileResult stale = *r;
+    stale.imports.items = &changed;
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", &stale, &names);
+    ASSERT_NULL(names.targets); /* old marker does not cover new extraction */
+    stale.imports.count = 0;
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", &stale, &names);
+    ASSERT_NULL(names.targets); /* even removal invalidates the full manifest */
+
+    ASSERT_EQ(
+        cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, "{\"php_imports_complete\":1}"),
+        0);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NULL(names.targets);
+    ASSERT_EQ(cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, "{invalid"), 0);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NULL(names.targets);
+    cbm_pipeline_namespace_map_free(ns);
+    free(file_qn);
+    cbm_gbuf_free(gb);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ei_php_binding_snapshot_groups_kinds_and_invalidates_failed_rebuild) {
+    const char *source =
+        "<?php\nnamespace Local;\n"
+        "use Lib\\Pkg\\{Thing as Same, function render as Same, const VALUE as Same};\n"
+        "class Main { function run(Same $x) { $x->go(); } }\n";
+    const char *library =
+        "<?php\nnamespace Lib\\Pkg;\n"
+        "class Thing { function go() {} }\nfunction render() {}\nconst VALUE = 1;\n";
+    CBMFileResult *r =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    CBMFileResult *lib = cbm_extract_file(library, (int)strlen(library), CBM_LANG_PHP, "p",
+                                          "lib/Thing.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(lib);
+    ASSERT_EQ(r->imports.count, 3);
+    int class_kind = 0, function_kind = 0, const_kind = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT_STR_EQ(r->imports.items[i].local_name, "Same");
+        class_kind += r->imports.items[i].kind == CBM_IMPORT_KIND_DEFAULT;
+        function_kind += r->imports.items[i].kind == CBM_IMPORT_KIND_FUNCTION;
+        const_kind += r->imports.items[i].kind == CBM_IMPORT_KIND_CONST;
+    }
+    ASSERT_EQ(class_kind, 1);
+    ASSERT_EQ(function_kind, 1);
+    ASSERT_EQ(const_kind, 1);
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_TRUE(ei_php_seed_result(gb, "p", "main.php", r));
+    ASSERT_TRUE(ei_php_seed_result(gb, "p", "lib/Thing.php", lib));
+    char *file_qn = cbm_pipeline_fqn_compute("p", "main.php", "__file__");
+    char *target_qn = cbm_pipeline_fqn_compute("p", "lib/Thing.php", "__file__");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(target_qn);
+    const cbm_gbuf_node_t *file = cbm_gbuf_find_by_qn(gb, file_qn);
+    ASSERT_NOT_NULL(file);
+    CBMFileResult *results[] = {r, lib};
+    const char *rels[] = {"main.php", "lib/Thing.php"};
+    CBMHashTable *ns = cbm_pipeline_namespace_map_build("p", results, rels, 2);
+    ASSERT_NOT_NULL(ns);
+    cbm_pipeline_ctx_t ctx = {.project_name = "p", .gbuf = gb};
+    CBMHashTable *saved = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_php_create_import_edges(&ctx, r, "main.php", file_qn, file, ns);
+    cbm_pipeline_set_pkgmap(saved);
+    cbm_php_vendor_names_t names = {0};
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NOT_NULL(names.targets);
+    for (int i = 0; i < r->imports.count; i++)
+        ASSERT_STR_EQ(names.targets[i], target_qn);
+    ASSERT_TRUE(!cbm_pipeline_php_vendor_bound(&names, "Same"));
+    cbm_pipeline_php_vendor_names_free(&names);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = -1;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, file->id, "IMPORTS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 1); /* same target and alias, three represented kinds */
+    ASSERT_NOT_NULL(strstr(edges[0]->properties_json, "php_import_bindings"));
+
+    /* A copied File marker cannot certify legacy, malformed or dangling
+     * IMPORTS rows. The query succeeds and returns the deliberately bad row. */
+    const char *bad_properties[] = {
+        "{\"local_name\":\"Same\"}",
+        "{\"local_name\":\"Same\",\"php_import_bindings\":[{\"kind\":0}]}",
+        edges[0]->properties_json,
+    };
+    for (int bad = 0; bad < 3; bad++) {
+        cbm_gbuf_t *legacy = cbm_gbuf_new("p", "/tmp");
+        ASSERT_NOT_NULL(legacy);
+        ASSERT_TRUE(ei_php_seed_result(legacy, "p", "main.php", r));
+        ASSERT_TRUE(ei_php_seed_result(legacy, "p", "lib/Thing.php", lib));
+        const cbm_gbuf_node_t *legacy_file = cbm_gbuf_find_by_qn(legacy, file_qn);
+        const cbm_gbuf_node_t *legacy_target = cbm_gbuf_find_by_qn(legacy, target_qn);
+        ASSERT_NOT_NULL(legacy_file);
+        ASSERT_NOT_NULL(legacy_target);
+        ASSERT_EQ(cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)legacy_file,
+                                                    file->properties_json),
+                  0);
+        cbm_gbuf_insert_edge(legacy, legacy_file->id,
+                             bad == 2 ? legacy_target->id + 10000 : legacy_target->id, "IMPORTS",
+                             bad_properties[bad]);
+        const cbm_gbuf_edge_t **bad_edges = NULL;
+        int bad_count = 0;
+        ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(legacy, legacy_file->id, "IMPORTS", &bad_edges,
+                                                     &bad_count),
+                  0);
+        ASSERT_EQ(bad_count, 1);
+        cbm_pipeline_php_vendor_names_build(legacy, "p", "main.php", r, &names);
+        ASSERT_NULL(names.targets);
+        cbm_gbuf_free(legacy);
+    }
+
+    CBMImport duplicates[] = {r->imports.items[0], r->imports.items[0]};
+    CBMFileResult malformed = *r;
+    malformed.imports.items = duplicates;
+    malformed.imports.count = 2;
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_php_create_import_edges(&ctx, &malformed, "main.php", file_qn, file, ns);
+    cbm_pipeline_set_pkgmap(saved);
+    ASSERT_NOT_NULL(strstr(file->properties_json, "\"php_imports_complete\":0"));
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", &malformed, &names);
+    ASSERT_NULL(names.targets);
+    cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
+    ASSERT_NULL(names.targets); /* failed rebuild cannot revive old proof */
+    cbm_pipeline_namespace_map_free(ns);
+    free(file_qn);
+    free(target_qn);
+    cbm_gbuf_free(gb);
+    cbm_free_result(r);
+    cbm_free_result(lib);
+    PASS();
+}
+
+TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown) {
+    EILangFile files[] = {
+        {"composer.json",
+         "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\",\"Vendor\\\\\":\"missing/\"}}}\n"},
+        {"app/Svc.php", "<?php\nnamespace App;\nclass Svc { function go() {} }\n"},
+        {"app/Main.php", "<?php\nnamespace App;\nuse Vendor\\Request;\nuse App\\Svc;\n"
+                         "class Main { function run(Request $r, Svc $s) { $s->go(); } }\n"},
+    };
+    CBMFileResult *r = cbm_extract_file(files[2].content, (int)strlen(files[2].content),
+                                        CBM_LANG_PHP, "p", files[2].name, 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 2);
+    int sites = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        sites += c->callee_name && strstr(c->callee_name, "go") && c->enclosing_func_qn &&
+                 strstr(c->enclosing_func_qn, "Main.run") && c->site_end_byte > c->site_start_byte;
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(sites, 1);
+    const char *covered_missing = files[0].content;
+    const char *empty_prefix =
+        "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\",\"\":\"missing/\"}}}\n";
+    /* The baseline resolver also cannot certify a Composer fallback prefix. */
+    for (int scenario = 0; scenario < 2; scenario++) {
+        files[0].content = scenario == 0 ? covered_missing : empty_prefix;
+        EILangProj lp;
+        cbm_store_t *store = ei_index_files(&lp, files, 3);
+        bool ok = store != NULL;
+        cbm_node_t *nodes = NULL;
+        int count = 0, file_count = 0;
+        if (!store || cbm_store_find_nodes_by_file(store, lp.project, "app/Main.php", &nodes,
+                                                   &count) != CBM_STORE_OK) {
+            ok = false;
+        }
+        for (int i = 0; i < count; i++) {
+            if (nodes[i].label && strcmp(nodes[i].label, "File") == 0) {
+                file_count++;
+                ok = nodes[i].properties_json &&
+                     !strstr(nodes[i].properties_json, "\"php_imports_complete\":1") && ok;
+            }
+        }
+        cbm_store_free_nodes(nodes, count);
+        char target[512];
+        if (store) {
+            ok = ei_import_target_path(store, lp.project, "app/Main.php", "Request", target,
+                                       sizeof(target)) == 0 &&
+                 ok;
+            ok = ei_import_target_path(store, lp.project, "app/Main.php", "Svc", target,
+                                       sizeof(target)) == 1 &&
+                 strcmp(target, "app/Svc.php") == 0 && ok;
+            ok = ei_php_checked_file_edges(store, lp.project, "app/Main.php", "CALLS",
+                                           "app/Svc.php") == 1 &&
+                 ok;
+        }
+        ei_cleanup(&lp, store);
+        ASSERT_EQ(file_count, 1);
+        ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1794,4 +2223,8 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_declared_functions_and_alias_issue1186);
     RUN_TEST(ei_php_null_namespace_map_keeps_php_candidate_issue1186);
     RUN_TEST(ei_php_require_path_keeps_generic_resolution_issue1186);
+    RUN_TEST(ei_php_vendor_types_never_bind_by_name_issue1186);
+    RUN_TEST(ei_php_binding_snapshot_requires_current_complete_evidence);
+    RUN_TEST(ei_php_binding_snapshot_groups_kinds_and_invalidates_failed_rebuild);
+    RUN_TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown);
 }
