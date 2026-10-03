@@ -1203,6 +1203,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             str_call_enclosing += census_len(call->enclosing_func_qn);
             for (int a = 0; a < call->arg_count && a < CBM_MAX_CALL_ARGS; a++) {
                 str_call_args += census_len(call->args[a].expr) + census_len(call->args[a].value) +
+                                 census_len(call->args[a].url_value) +
                                  census_len(call->args[a].keyword);
             }
         }

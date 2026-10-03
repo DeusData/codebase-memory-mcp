@@ -7517,6 +7517,232 @@ TEST(pipeline_ts_config_object_url_http_calls_issue2235) {
     PASS();
 }
 
+/* A failed SQL query must never look like an absent false edge. */
+static int navigation_probe_count(cbm_store_t *store, const char *sql, const char *project,
+                                  const char *value, const char *source_name) {
+    sqlite3_stmt *st = NULL;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    int count = -1;
+    bool bound = sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                 sqlite3_bind_text(st, 2, value, -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    if (bound && source_name) {
+        bound = sqlite3_bind_text(st, 3, source_name, -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    }
+    if (bound && sqlite3_step(st) == SQLITE_ROW) {
+        count = sqlite3_column_int(st, 0);
+        if (sqlite3_step(st) != SQLITE_DONE) {
+            count = -1;
+        }
+    }
+    if (sqlite3_finalize(st) != SQLITE_OK) {
+        count = -1;
+    }
+    return count;
+}
+
+/* #1250: exercise the generic URL heuristic with real extracted occurrences
+ * and real source nodes. More than 50 files selects the parallel resolver.
+ * HTTP clients, custom navigateApi wrappers, Python and ASYNC keep their edges. */
+TEST(pipeline_arg_url_skips_client_navigation) {
+    static const char page[] =
+        "import axios from 'axios';\n"
+        "import { get as navigate } from 'axios';\n"
+        "import { navigateTo, http, navigateApi } from './nav';\n"
+        "export class PaymentsPage {\n"
+        "  constructor(private router: any, private navCtrl: any, private location: any,\n"
+        "              private $router: any, private history: any) {}\n"
+        "  goPayments(): void { this.router.navigateByUrl('/payments/list'); }\n"
+        "  goBenefits(): void { this.navCtrl.navigateForward('/benefits/detail'); }\n"
+        "  goBack(): void { this.location.go('/orders/back'); }\n"
+        "  goVue(): void { this.$router.push('/dashboard/settings'); }\n"
+        "  goHist(): void { this.history.pushState(null, '', '/account/history'); }\n"
+        "  goWidget(id: string): void { navigateTo(`/widgetTypes/view/${id}`); }\n"
+        "  load(): unknown { return http('/api/customers'); }\n"
+        "  orders(): unknown { return axios.get('/api/orders'); }\n"
+        "  items(): unknown { return fetch('/api/items'); }\n"
+        "  custom(): unknown { return navigateApi('/api/navigation'); }\n"
+        "  explicitAlias(): unknown { return navigate('/api/alias'); }\n"
+        "  publish(): void { mqtt.publish('/tenant/events', 'payload'); }\n"
+        "}\n";
+    static const struct {
+        const char *callee;
+        const char *source;
+        const char *path;
+    } navigation[] = {
+        {"this.router.navigateByUrl", "goPayments", "/payments/list"},
+        {"this.navCtrl.navigateForward", "goBenefits", "/benefits/detail"},
+        {"this.location.go", "goBack", "/orders/back"},
+        {"this.$router.push", "goVue", "/dashboard/settings"},
+        {"this.history.pushState", "goHist", "/account/history"},
+        {"navigateTo", "goWidget", "/widgetTypes/view/{}"},
+    };
+    static const char edge_sql[] = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                   "WHERE e.project=?1 AND e.type='HTTP_CALLS' "
+                                   "AND json_extract(e.properties,'$.url_path')=?2 AND s.name=?3";
+    static const char route_sql[] =
+        "SELECT count(*) FROM nodes WHERE project=?1 AND label='Route' AND name=?2";
+    static const char source_sql[] =
+        "SELECT count(*) FROM nodes WHERE project=?1 AND name=?2 AND file_path=?3";
+    static const struct {
+        const char *source;
+        const char *path;
+    } positive[] = {{"load", "/api/customers"},
+                    {"orders", "/api/orders"},
+                    {"items", "/api/items"},
+                    {"custom", "/api/navigation"},
+                    {"load_items", "/api/python/items"},
+                    {"explicitAlias", "/api/alias"}};
+
+    int extracted[6] = {0};
+    CBMFileResult *fr = cbm_extract_file(page, (int)strlen(page), CBM_LANG_TYPESCRIPT,
+                                         "navigation_probe", "src/page.ts", 0, NULL, NULL);
+    bool extraction_ok = fr && !fr->has_error;
+    if (extraction_ok) {
+        for (int c = 0; c < fr->calls.count; c++) {
+            const CBMCall *call = &fr->calls.items[c];
+            for (size_t i = 0; i < sizeof(navigation) / sizeof(navigation[0]); i++) {
+                if (call->callee_name && strcmp(call->callee_name, navigation[i].callee) == 0 &&
+                    call->enclosing_func_qn && call->start_line > 0 &&
+                    call->site_end_byte > call->site_start_byte && call->arg_count > 0) {
+                    extracted[i]++;
+                }
+            }
+        }
+    }
+    cbm_free_result(fr);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        FAIL("save environment");
+    }
+    char tmp[256] = "/tmp/cbm_arg_url_nav_XXXXXX";
+    if (!cbm_mkdtemp(tmp)) {
+        free(saved_workers);
+        free(saved_single);
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/nav.ts",
+                    "export class AppRouter {\n"
+                    "  navigateByUrl(url: string): void {}\n"
+                    "  push(url: string): void {}\n"
+                    "}\n"
+                    "export class NavController {\n"
+                    "  navigateForward(url: string): void {}\n"
+                    "}\n"
+                    "export class AppLocation { go(url: string): void {} }\n"
+                    "export class AppHistory {\n"
+                    "  pushState(state: unknown, title: string, url: string): void {}\n"
+                    "}\n"
+                    "export function navigateTo(url: string): void {}\n"
+                    "export function http(url: string): unknown { return url; }\n"
+                    "export function navigateApi(url: string): unknown { return url; }\n");
+    write_temp_file(tmp, "src/page.ts", page);
+    write_temp_file(tmp, "src/py_client.py",
+                    "def navigate(url):\n    return url\n"
+                    "def load_items():\n    return navigate('/api/python/items')\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    const char *workers = getenv("CBM_WORKERS");
+    bool configured =
+        workers && strcmp(workers, "4") == 0 && getenv("CBM_INDEX_SINGLE_THREAD") == NULL;
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/arg_url_nav.db", tmp);
+    cbm_pipeline_t *p = configured ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *store = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool observed = store != NULL;
+    int nav_edges[6], nav_routes[6], sources[6], good_edges[6];
+    int files = -1, async_edges = -1, async_http = -1;
+    for (size_t i = 0; i < 6; i++) {
+        nav_edges[i] = nav_routes[i] = sources[i] = -1;
+    }
+    for (size_t i = 0; i < 6; i++) {
+        good_edges[i] = -1;
+    }
+    if (store) {
+        const char *project = cbm_pipeline_project_name(p);
+        files = navigation_probe_count(store,
+                                       "SELECT count(*) FROM nodes WHERE project=?1 AND label=?2",
+                                       project, "File", NULL);
+        for (size_t i = 0; i < 6; i++) {
+            nav_edges[i] = navigation_probe_count(store, edge_sql, project, navigation[i].path,
+                                                  navigation[i].source);
+            nav_routes[i] =
+                navigation_probe_count(store, route_sql, project, navigation[i].path, NULL);
+            sources[i] = navigation_probe_count(store, source_sql, project, navigation[i].source,
+                                                "src/page.ts");
+        }
+        for (size_t i = 0; i < 6; i++) {
+            good_edges[i] = navigation_probe_count(store, edge_sql, project, positive[i].path,
+                                                   positive[i].source);
+        }
+        async_edges = navigation_probe_count(
+            store,
+            "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+            "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='ASYNC_CALLS' "
+            "AND t.name=?2 AND s.name=?3",
+            project, "/tenant/events", "publish");
+        async_http = navigation_probe_count(store, edge_sql, project, "/tenant/events", "publish");
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(p);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    const char *restored_workers = getenv("CBM_WORKERS");
+    const char *restored_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    bool restored =
+        (saved_workers ? restored_workers && strcmp(saved_workers, restored_workers) == 0
+                       : !restored_workers) &&
+        (saved_single ? restored_single && strcmp(saved_single, restored_single) == 0
+                      : !restored_single);
+    free(saved_workers);
+    free(saved_single);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(extraction_ok);
+    ASSERT_TRUE(configured);
+    ASSERT_TRUE(restored);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(observed);
+    ASSERT_GTE(files, 55);
+    for (size_t i = 0; i < 6; i++) {
+        ASSERT_EQ(extracted[i], 1);
+        ASSERT_EQ(sources[i], 1);
+        ASSERT_EQ(nav_edges[i], 0);
+        ASSERT_EQ(nav_routes[i], 0);
+    }
+    for (size_t i = 0; i < 6; i++) {
+        ASSERT_GTE(good_edges[i], 1);
+    }
+    ASSERT_GTE(async_edges, 1);
+    ASSERT_EQ(async_http, 0);
+    PASS();
+}
+
 /* Native `fetch()` (#856), sequential path (< 50 files → pass_calls.c). A bare
  * unqualified call to the global fetch API has no import and no local
  * definition anywhere in this project, so registry resolution comes back
@@ -7758,6 +7984,251 @@ TEST(pipeline_local_fetch_shadow_not_classified_as_http) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);
+    PASS();
+}
+
+/* #706 / #1147 end to end: a URL composed from module constants reaches the
+ * HTTP classifier, so the client call forms an HTTP_CALLS edge. Python
+ * `API_URL = API_BASE_URL + "/orders/create"` (env-derived base, literal path
+ * kept) and a TS object-literal endpoint map over a base constant. The
+ * unresolvable control (`requests.get(u)` on a computed value) adds none. */
+TEST(pipeline_url_constant_folding_http_calls_issue706_1147) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_urlfold_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "svc/client.py",
+                    "import os\n"
+                    "import requests\n"
+                    "API_BASE_URL = os.environ[\"API_BASE_URL\"]\n"
+                    "API_URL = API_BASE_URL + \"/orders/create\"\n"
+                    "def send(payload):\n"
+                    "    return requests.post(API_URL, json=payload)\n"
+                    "def dyn():\n"
+                    "    u = os.environ.get(\"X\")\n"
+                    "    return requests.get(u)\n");
+    write_temp_file(tmp, "web/api.ts",
+                    "const BASE = '/api'\n"
+                    "export const API_ENDPOINTS = {\n"
+                    "  USER: `${BASE}/users/me`,\n"
+                    "}\n"
+                    "export function loadUser(): unknown {\n"
+                    "  return fetch(API_ENDPOINTS.USER);\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/urlfold.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Asserted per edge, not by count: a client call may also carry a second,
+     * arg_url-sourced HTTP_CALLS edge for the same path. */
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, project, "HTTP_CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    int py_edges = 0;
+    int ts_edges = 0;
+    int control_edges = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        cbm_node_t src = {0};
+        cbm_store_find_node_by_id(s, edges[i].source_id, &src);
+        if (src.name && strcmp(src.name, "dyn") == 0) {
+            control_edges++;
+        } else if (src.name && strcmp(src.name, "send") == 0 &&
+                   strstr(props, "\"url_path\":\"/orders/create\"")) {
+            py_edges++;
+        } else if (src.name && strcmp(src.name, "loadUser") == 0 &&
+                   strstr(props, "\"url_path\":\"/api/users/me\"")) {
+            ts_edges++;
+        }
+        cbm_node_free_fields(&src);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ASSERT_GTE(py_edges, 1);
+    ASSERT_GTE(ts_edges, 1);
+    ASSERT_EQ(control_edges, 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Run the same identities through both service resolvers. An import alias is
+ * deliberately absent from the callee-name pattern table until resolution. */
+TEST(pipeline_folded_topics_preserve_identity_sequential_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_topicfold_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "src/topics.ts",
+                    "const TENANT = 'tenant';\n"
+                    "const TOPIC = `${TENANT}/events`;\n"
+                    "const TOPICS = { EVENTS: `${TENANT}/events` };\n"
+                    "const PREFIX = 'tenant/';\n"
+                    "const DOUBLE = `${PREFIX}/events`;\n"
+                    "const UNKNOWN = `${tenant}/events`;\n"
+                    "export function literal() { mqtt.publish('tenant/events', 'payload'); }\n"
+                    "export function direct() { mqtt.publish(`${TENANT}/events`, 'payload'); }\n"
+                    "export function constant() { mqtt.publish(TOPIC, 'payload'); }\n"
+                    "export function member() { mqtt.publish(TOPICS.EVENTS, 'payload'); }\n"
+                    "export function doubled() { mqtt.publish(DOUBLE, 'payload'); }\n"
+                    "export function unknown() { mqtt.publish(UNKNOWN, 'payload'); }\n");
+    write_temp_file(tmp, "src/aliases.py",
+                    "from paho.mqtt import publish as send\n"
+                    "TENANT = 'tenant'\n"
+                    "TOPIC = f'{TENANT}/events'\n"
+                    "ABS = f'/{TENANT}/events'\n"
+                    "def alias():\n    send(TOPIC, 'payload')\n"
+                    "def keyword():\n    send(topic=TOPIC, payload='x')\n"
+                    "def slash_topic():\n    send(ABS, 'payload')\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/padding%d.ts", i);
+        snprintf(body, sizeof(body), "export function padding%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    int run_rc[2] = {-1, -1};
+    bool opened[2] = {false, false};
+    int matches[2][9] = {{0}};
+    int http_edges[2] = {-1, -1};
+    int invented[2] = {-1, -1};
+    const char *functions[] = {"literal", "direct", "constant", "member",     "doubled",
+                               "unknown", "alias",  "keyword",  "slash_topic"};
+    const char *topics[] = {"tenant/events", "tenant/events",  "tenant/events",
+                            "tenant/events", "tenant//events", "{}/events",
+                            "tenant/events", "tenant/events",  "/tenant/events"};
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode == 0) {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+            cbm_setenv("CBM_WORKERS", "4", 1);
+        }
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/topics_%d.db", tmp, mode);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc[mode] = p ? cbm_pipeline_run(p) : -1;
+        const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        opened[mode] = s != NULL;
+        if (s && project) {
+            for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+                matches[mode][i] =
+                    named_edge_count(s, project, "ASYNC_CALLS", functions[i], topics[i]);
+            }
+            http_edges[mode] = cbm_store_count_edges_by_type(s, project, "HTTP_CALLS");
+            invented[mode] = count_nodes_named(s, project, "/events");
+            /* Only slash_topic really contains a leading slash. */
+            for (size_t i = 0; i < 8; i++) {
+                invented[mode] +=
+                    named_edge_count(s, project, "ASYNC_CALLS", functions[i], "/tenant/events");
+            }
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p);
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(opened[mode]);
+        for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+            ASSERT_GTE(matches[mode][i], 1);
+        }
+        ASSERT_EQ(http_edges[mode], 0);
+        ASSERT_EQ(invented[mode], 0);
+    }
+    PASS();
+}
+
+/* Relative endpoint maps still supply the parallel wrapper-client heuristic
+ * through their URL candidate, including the request-config slot from #2235. */
+TEST(pipeline_relative_folded_wrapper_url_candidates) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_relativefold_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(
+        tmp, "src/wrapper.ts",
+        "const REL = 'api';\n"
+        "const API_ENDPOINTS = { GAME_LAUNCH_URL: `${REL}/games/launch` };\n"
+        "function client(url: string) { return url; }\n"
+        "function http(config: {url: string}) { return config; }\n"
+        "export function launch() { return client(API_ENDPOINTS.GAME_LAUNCH_URL); }\n"
+        "export function config() { return http({url: API_ENDPOINTS.GAME_LAUNCH_URL}); }\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/padding%d.ts", i);
+        snprintf(body, sizeof(body), "export function padding%d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/wrappers.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    bool opened = s != NULL;
+    int launch_edges = 0;
+    int config_edges = 0;
+    if (s && project) {
+        launch_edges = named_edge_count(s, project, "HTTP_CALLS", "launch", "/api/games/launch");
+        config_edges = named_edge_count(s, project, "HTTP_CALLS", "config", "/api/games/launch");
+    }
+    if (s) {
+        cbm_store_close(s);
+    }
+    cbm_pipeline_free(p);
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_GTE(launch_edges, 1);
+    ASSERT_GTE(config_edges, 1);
     PASS();
 }
 
@@ -16359,12 +16830,16 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
+    RUN_TEST(pipeline_arg_url_skips_client_navigation);
     RUN_TEST(pipeline_ts_config_object_url_http_calls_issue2235);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
+    RUN_TEST(pipeline_url_constant_folding_http_calls_issue706_1147);
+    RUN_TEST(pipeline_folded_topics_preserve_identity_sequential_parallel);
+    RUN_TEST(pipeline_relative_folded_wrapper_url_candidates);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);

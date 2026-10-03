@@ -48,6 +48,16 @@ bool cbm_service_pattern_is_global_fetch(const char *callee_name);
  * Rejects filesystem paths and non-HTTP string consumers. */
 bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
+/* True when a JS/TS-family call is client-side navigation rather than a
+ * network request (#1250): Angular Router.navigate/navigateByUrl, Ionic navigation, Nuxt
+ * navigateTo, react-router navigate, router/history push|replace|prefetch,
+ * History pushState/replaceState, Location go|assign|replace, bare goto /
+ * redirect / permanentRedirect. Its slash-prefixed argument is a client route,
+ * so it must not mint an arg_url HTTP_CALLS edge. js_family is the caller's
+ * FILE-language gate: false always returns false, so no other language's
+ * recall is traded (suppressors stay per-language). */
+bool cbm_service_pattern_is_client_navigation(bool js_family, const char *callee_name);
+
 /* True when text that reached a path slot is a source comment rather than a
  * path: a block comment (slash-star … star-slash), a line comment (slash-slash
  * followed by a space), or any text with a line break. The wildcard route

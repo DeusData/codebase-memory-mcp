@@ -2298,19 +2298,43 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
     return !is_junk_url(norm);
 }
 
+static bool arg_is_topic(const CBMCallArg *arg) {
+    static const char *keywords[] = {"topic",    "topic_id", "topic_name", "queue", "queue_name",
+                                     "queue_id", "subject",  "channel",    NULL};
+    for (int i = 0; arg->keyword && keywords[i]; i++) {
+        if (strcmp(arg->keyword, keywords[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Detect API paths in call arguments and create HTTP_CALLS edges. */
-static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                               const CBMCall *call) {
+static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+                               cbm_svc_kind_t svc, bool js_family) {
+    /* Only the generic argument heuristic is suppressed: explicit HTTP service
+     * classification above this call still emits its edge. */
+    if (cbm_service_pattern_is_client_navigation(js_family, call->callee_name)) {
+        return;
+    }
+    /* A resolved alias may be ASYNC even when its source spelling is unknown.
+     * Neither raw slash topics nor URL projections are HTTP evidence there. */
+    if (svc == CBM_SVC_ASYNC || cbm_service_pattern_match(call->callee_name) == CBM_SVC_ASYNC) {
+        return;
+    }
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
+        if (arg_is_topic(ca)) {
+            continue;
+        }
         /* A slash-prefixed raw expression is not a URL string. In JS/TS this
          * is notably a regex literal (`/<table/i`); genuine string literals
          * and propagated constants are carried in `value`, while template
          * literals keep their leading backtick in `expr`. */
-        if (!ca->value && ca->expr && ca->expr[0] == '/') {
+        if (!ca->value && !ca->url_value && ca->expr && ca->expr[0] == '/') {
             continue;
         }
-        const char *url = ca->value ? ca->value : ca->expr;
+        const char *url = ca->url_value ? ca->url_value : (ca->value ? ca->value : ca->expr);
         if (!url || (url[0] != '/' && url[0] != '`')) {
             continue;
         }
@@ -2526,7 +2550,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_resolution_t *res, const char *module_qn,
                               const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                               const char **imp_keys, const char **imp_vals, int imp_count,
-                              bool suppress_plain_calls) {
+                              bool suppress_plain_calls, bool js_family) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     const char *arg = call->first_string_arg;
 
@@ -2576,7 +2600,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call);
+    detect_url_in_args(gbuf, source, call, svc, js_family);
 }
 
 /* Find the source node for an edge: enclosing function or file node. */
@@ -3042,6 +3066,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                     /* embedded-script hosts — see pass_calls.c */
                                     lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
                                     lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+        /* File-language scope of the client-navigation heuristic (#1250).
+         * Kept explicit so changes to the weak-member guard cannot broaden it. */
+        bool js_family = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                         lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS || lang == CBM_LANG_HTML ||
+                         lang == CBM_LANG_VUE || lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
@@ -3096,7 +3125,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                             .strategy = "service_pattern"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
+                                  imp_count, false, js_family);
                 continue;
             }
         }
@@ -3113,7 +3142,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                  * self-call, so it keeps only the route/service edges. */
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, rust_external);
+                                  imp_count, rust_external, js_family);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
@@ -3165,7 +3194,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 if (url_or_topic) {
                     emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
                                       rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                                      false);
+                                      false, js_family);
                     ws->calls_resolved++;
                 }
             }
@@ -3174,7 +3203,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          drop_plain_call);
+                          drop_plain_call, js_family);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

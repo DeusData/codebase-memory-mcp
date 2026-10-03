@@ -342,6 +342,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_imports.c \
     $(CBM_DIR)/extract_usages.c \
     $(CBM_DIR)/extract_unified.c \
+    $(CBM_DIR)/extract_url_fold.c \
     $(CBM_DIR)/extract_semantic.c \
     $(CBM_DIR)/extract_type_refs.c \
     $(CBM_DIR)/extract_type_assigns.c \

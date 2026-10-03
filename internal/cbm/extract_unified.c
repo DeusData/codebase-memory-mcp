@@ -2,8 +2,9 @@
 #include "arena.h" // cbm_arena_sprintf
 #include "cbm.h"   // CBMExtractCtx
 #include "helpers.h"
-#include "lang_specs.h"      // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
-#include "tree_sitter/api.h" // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
+#include "extract_url_fold.h" // cbm_url_fold_record_constant (#706, #1147)
+#include "lang_specs.h"       // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
+#include "tree_sitter/api.h"  // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
 #include "foundation/constants.h"
 #include "foundation/compat.h" // cbm_thread_cpu_time_ns
 #include <stdlib.h>
@@ -1205,6 +1206,14 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
     /* Name must be an identifier */
     const char *name_kind = ts_node_type(name_node);
     if (strcmp(name_kind, "identifier") != 0 && strcmp(name_kind, "constant") != 0) {
+        return;
+    }
+
+    /* Python and JS/TS fold the value: `BASE + "/path"`, `${BASE}/path`,
+     * f"{BASE}/path" and object-literal endpoint maps (#706, #1147). */
+    if (cbm_url_fold_lang(ctx->language)) {
+        cbm_url_fold_record_constant(ctx, cbm_node_text(ctx->arena, name_node, ctx->source),
+                                     value_node);
         return;
     }
 
