@@ -792,6 +792,62 @@ static bool callee_is_delimiter_or_filesystem_builder(const char *callee_name) {
     return strstr(callee_name, "os.path.join") != NULL || strstr(callee_name, "path.join") != NULL;
 }
 
+/* Case-insensitive "text ends with suffix" over [text, text + len). */
+static bool span_ends_with_ci(const char *text, size_t len, const char *suffix) {
+    size_t sl = strlen(suffix);
+    if (len < sl) {
+        return false;
+    }
+    const char *tail = text + (len - sl);
+    for (size_t i = 0; i < sl; i++) {
+        char a = tail[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (a != suffix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cbm_service_pattern_is_client_navigation(bool js_family, const char *callee_name) {
+    if (!js_family || !callee_name || !callee_name[0]) {
+        return false;
+    }
+    const char *last_dot = strrchr(callee_name, '.');
+    const char *method = last_dot ? last_dot + 1 : callee_name;
+    size_t recv_len = last_dot ? (size_t)(last_dot - callee_name) : 0;
+    /* Angular Router.navigate/navigateByUrl, Ionic NavController.navigateForward/
+     * Back/Root, Nuxt navigateTo, react-router/Gatsby navigate — any receiver. */
+    if (strcmp(method, "navigate") == 0 || strcmp(method, "navigateByUrl") == 0 ||
+        strcmp(method, "navigateTo") == 0 || strcmp(method, "navigateForward") == 0 ||
+        strcmp(method, "navigateBack") == 0 || strcmp(method, "navigateRoot") == 0) {
+        return true;
+    }
+    /* History API: the URL is the third argument of pushState/replaceState. */
+    if (strcmp(method, "pushState") == 0 || strcmp(method, "replaceState") == 0) {
+        return true;
+    }
+    /* Bare SvelteKit goto, Next.js/Remix redirect helpers. */
+    if (!last_dot && (strcmp(method, "goto") == 0 || strcmp(method, "redirect") == 0 ||
+                      strcmp(method, "permanentRedirect") == 0)) {
+        return true;
+    }
+    /* Next.js / Vue router and react-router history objects: router.push,
+     * this.$router.push, props.history.push, Router.prefetch. */
+    if ((strcmp(method, "push") == 0 || strcmp(method, "replace") == 0 ||
+         strcmp(method, "prefetch") == 0) &&
+        (span_ends_with_ci(callee_name, recv_len, "router") ||
+         span_ends_with_ci(callee_name, recv_len, "history"))) {
+        return true;
+    }
+    /* Angular Location.go, window.location.assign / replace. */
+    return (strcmp(method, "go") == 0 || strcmp(method, "assign") == 0 ||
+            strcmp(method, "replace") == 0) &&
+           span_ends_with_ci(callee_name, recv_len, "location");
+}
+
 static const char *strip_string_delimiters(const char *literal, char *buf, size_t buf_sz) {
     if (!literal || !literal[0]) {
         return NULL;

@@ -48,6 +48,62 @@ TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     PASS();
 }
 
+/* #1250: client-side navigation is recognised only in the JS/TS family; genuine
+ * HTTP clients and route registrations are never mistaken for it, and with the
+ * file-language gate off nothing is suppressed (no other language's recall). */
+TEST(infrascan_client_navigation_is_js_family_only) {
+    const char *nav[] = {"this.router.navigateByUrl",
+                         "this.router.navigate",
+                         "navigateTo",
+                         "navigate",
+                         "this.navCtrl.navigateForward",
+                         "this.navCtrl.navigateRoot",
+                         "this.navCtrl.navigateBack",
+                         "router.push",
+                         "this.$router.push",
+                         "Router.replace",
+                         "props.history.push",
+                         "browserHistory.replace",
+                         "router.prefetch",
+                         "history.pushState",
+                         "window.history.replaceState",
+                         "this.location.go",
+                         "window.location.assign",
+                         "location.replace",
+                         "goto",
+                         "redirect",
+                         "permanentRedirect"};
+    for (size_t i = 0; i < sizeof(nav) / sizeof(nav[0]); i++) {
+        ASSERT_TRUE(cbm_service_pattern_is_client_navigation(true, nav[i]));
+        ASSERT_FALSE(cbm_service_pattern_is_client_navigation(false, nav[i]));
+    }
+    const char *http[] = {"fetch",
+                          "axios.get",
+                          "axios.post",
+                          "this.http.get",
+                          "this.http.post",
+                          "httpClient.put",
+                          "http",
+                          "api.patch",
+                          "router.get",
+                          "app.post",
+                          "items.push",
+                          "ky.get",
+                          "res.redirect",
+                          "client.go",
+                          "this.gotoApi",
+                          "$http.get",
+                          "navigateApi",
+                          "client.navigateRequest",
+                          "navigateToEndpoint"};
+    for (size_t i = 0; i < sizeof(http) / sizeof(http[0]); i++) {
+        ASSERT_FALSE(cbm_service_pattern_is_client_navigation(true, http[i]));
+    }
+    ASSERT_FALSE(cbm_service_pattern_is_client_navigation(true, NULL));
+    ASSERT_FALSE(cbm_service_pattern_is_client_navigation(true, ""));
+    PASS();
+}
+
 /* ── Service-pattern QN boundaries (distilled from PR #1245) ─────────
  * A library id must sit on an identifier boundary inside the QN. A raw
  * substring match classified "proj.plugin.loader" as gin ("gin.") and
@@ -305,6 +361,7 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
 
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
+    RUN_TEST(infrascan_client_navigation_is_js_family_only);
     RUN_TEST(infrascan_service_pattern_match_rejects_ids_inside_words);
     RUN_TEST(infrascan_service_pattern_match_keeps_real_library_qns);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
