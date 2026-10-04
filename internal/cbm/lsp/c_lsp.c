@@ -2714,8 +2714,17 @@ static void c_neg_memo_free(CLSPContext *ctx) {
     ctx->neg_memo_count = 0;
 }
 
+/* Match a module boundary, not a textual prefix (mod != mod_extra). */
+static bool c_type_in_module(const char *qn, const char *module) {
+    if (!module || !module[0])
+        return false;
+    size_t len = strlen(module);
+    return strncmp(qn, module, len) == 0 && qn[len] == '.';
+}
+
 static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const char *type_qn,
-                                                      const char *member_name, int depth) {
+                                                      const char *member_name, int depth,
+                                                      bool *ambiguous_out) {
     if (!type_qn || !member_name)
         return NULL;
     if (depth > CBM_LSP_MAX_LOOKUP_DEPTH)
@@ -2730,10 +2739,10 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
 
     // Negative-lookup memo (depth==0, shared read-only registry only). A recorded
     // hit means this exact (type_qn, member) already failed the whole cascade. Under
-    // the sealed Tier-2 registry the module-prefix (below), base-class and short-name
-    // cascades are pure, immutable functions of (type_qn, registry), so they are
-    // provably still NULL and can be skipped. Only the SCOPE-ALIAS path is
-    // context-dependent, so it is still evaluated below before we trust the memo.
+    // the sealed Tier-2 registry and this file's fixed module/include mappings,
+    // the module-prefix, base-class and short-name cascades remain unchanged.
+    // Only the SCOPE-ALIAS path can change during the walk, so it is still
+    // evaluated below before we trust the memo.
     // The direct lookup above already served as the collision/staleness verification.
     bool neg_memo_hit = false;
     uint64_t neg_h = 0;
@@ -2764,7 +2773,7 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
             if (underlying && !cbm_type_is_unknown(underlying)) {
                 const char *alias_target_qn = type_to_qn(underlying);
                 if (alias_target_qn) {
-                    f = c_lookup_member_depth(ctx, alias_target_qn, member_name, depth + 1);
+                    f = c_lookup_member_depth(ctx, alias_target_qn, member_name, depth + 1, NULL);
                     if (f)
                         return f;
                 }
@@ -2773,7 +2782,7 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
     }
 
     // Memo hit and the scope-alias path also missed: the remaining base-class and
-    // short-name cascades are registry-only and provably NULL → skip them (this is
+    // short-name cascades are unchanged for this file and still NULL → skip them (this is
     // where the O(type_count) short-name scan is avoided). Idempotent re-insert is
     // unnecessary since neg_h is already present.
     if (neg_memo_hit)
@@ -2791,7 +2800,7 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
     if (rt) {
         // Alias chain
         if (rt->alias_of) {
-            f = c_lookup_member_depth(ctx, rt->alias_of, member_name, depth + 1);
+            f = c_lookup_member_depth(ctx, rt->alias_of, member_name, depth + 1, NULL);
             if (f)
                 return f;
         }
@@ -2799,7 +2808,7 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         // Base classes (embedded_types stores base class QNs)
         if (rt->embedded_types) {
             for (int i = 0; rt->embedded_types[i]; i++) {
-                f = c_lookup_member_depth(ctx, rt->embedded_types[i], member_name, depth + 1);
+                f = c_lookup_member_depth(ctx, rt->embedded_types[i], member_name, depth + 1, NULL);
                 if (f)
                     return f;
             }
@@ -2812,13 +2821,21 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
      * file-scoped "<module>.Logger" or the bare "Logger" (e.g. the return type of
      * a namespace-scoped factory used outside that namespace). Resolve by the
      * SHORT name (last segment) against the registry and retry with the full QN.
-     * Reached only after the direct/module/alias/base lookups all miss; prefers
-     * an in-module match. Mirrors the C# short-name type fallback. */
+     * Reached only after the direct/module/alias/base lookups all miss. Prefer
+     * the current module, then literal relative includes, then a globally unique
+     * candidate. Equal-rank distinct QNs stay unresolved, independent of order. */
     if (depth == 0 && ctx->registry) {
         const char *dot = strrchr(type_qn, '.');
         const char *shortn = dot ? dot + 1 : type_qn;
         size_t slen = strlen(shortn);
+        const char *type_suffix = type_qn;
+        if (c_type_in_module(type_qn, ctx->module_qn))
+            type_suffix += strlen(ctx->module_qn) + 1;
+        size_t suffix_len = strlen(type_suffix);
         const char *best_qn = NULL;
+        int best_rank = -1;
+        bool ambiguous = false;
+        bool excluded_scope = false;
         CBMTypeShortIter it;
         cbm_registry_types_by_short_name_chain(ctx->registry, shortn, &it);
         int i;
@@ -2835,13 +2852,41 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
             if (strcmp(q, type_qn) == 0) {
                 continue; // already tried as-is above
             }
-            best_qn = q;
-            if (ctx->module_qn && strncmp(q, ctx->module_qn, strlen(ctx->module_qn)) == 0) {
-                break; // prefer a match in the current module
+            // Preserve namespace qualification when comparing included types.
+            // Preserve the legacy cross-file short-name cascade without an
+            // include map, where a QN may carry a different file's prefix.
+            if (ctx->include_count > 0 && suffix_len > slen &&
+                (qlen <= suffix_len || q[qlen - suffix_len - 1] != '.' ||
+                 strcmp(q + qlen - suffix_len, type_suffix) != 0)) {
+                excluded_scope = true;
+                continue;
+            }
+            int rank = c_type_in_module(q, ctx->module_qn) ? 4 : 0;
+            for (int j = 0; j < ctx->include_count; j++) {
+                const char *included = ctx->include_ns_qns[j];
+                if (c_type_in_module(q, included)) {
+                    // A directly named type in the header outranks its
+                    // namespaced short-name homonyms.
+                    int included_rank = strcmp(q + strlen(included) + 1, type_suffix) == 0 ? 3 : 1;
+                    if (included_rank > rank)
+                        rank = included_rank;
+                }
+            }
+            if (rank > best_rank) {
+                best_qn = q;
+                best_rank = rank;
+                ambiguous = false;
+            } else if (rank == best_rank && strcmp(best_qn, q) != 0) {
+                ambiguous = true;
             }
         }
+        if (ambiguous || (!best_qn && excluded_scope)) {
+            if (ambiguous_out)
+                *ambiguous_out = true;
+            return NULL; // Do not memoize: callers need the ambiguity diagnostic.
+        }
         if (best_qn) {
-            f = c_lookup_member_depth(ctx, best_qn, member_name, depth + 1);
+            f = c_lookup_member_depth(ctx, best_qn, member_name, depth + 1, NULL);
             if (f) {
                 return f;
             }
@@ -2857,7 +2902,7 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
 
 const CBMRegisteredFunc *c_lookup_member(CLSPContext *ctx, const char *type_qn,
                                          const char *member_name) {
-    return c_lookup_member_depth(ctx, type_qn, member_name, 0);
+    return c_lookup_member_depth(ctx, type_qn, member_name, 0, NULL);
 }
 
 // True if any BASE class of type_qn (not type_qn itself) declares member_name —
@@ -3990,9 +4035,16 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                             // Use type-aware overload scoring
                             const CBMRegisteredFunc *method = cbm_registry_lookup_method_by_types(
                                 ctx->registry, type_qn, field_name, arg_types, arg_count);
-                            // Fall back to c_lookup_member for base class traversal
+                            // Keep ambiguous receiver identity distinct from an ordinary miss.
+                            bool ambiguous = false;
                             if (!method)
-                                method = c_lookup_member(ctx, type_qn, field_name);
+                                method =
+                                    c_lookup_member_depth(ctx, type_qn, field_name, 0, &ambiguous);
+                            if (!method && ambiguous) {
+                                c_emit_resolved_call_orig_at(ctx, field_name, NULL,
+                                                             "lsp_ambiguous_receiver", 0.0f, node);
+                                goto recurse;
+                            }
                             if (ctx->debug)
                                 fprintf(stderr, "  [clsp] member call result: %s\n",
                                         method ? method->qualified_name : "NULL");
@@ -5425,6 +5477,45 @@ static void c_process_class(CLSPContext *ctx, TSNode class_node) {
 // Process file: top-level walk
 // ============================================================================
 
+/* Only top-level literal quoted includes with an unambiguous relative spelling.
+ * Module QNs omit the extension. Do not guess include search paths, macros,
+ * parent traversal, conditional includes, or dotted path components. */
+static void c_collect_relative_include(CLSPContext *ctx, TSNode node) {
+    if (!ctx->module_qn || strcmp(ts_node_type(node), "preproc_include") != 0)
+        return;
+    TSNode path_node = ts_node_child_by_field_name(node, "path", 4);
+    if (ts_node_is_null(path_node) || strcmp(ts_node_type(path_node), "string_literal") != 0)
+        return;
+    char *path = c_node_text(ctx, path_node);
+    size_t len = path ? strlen(path) : 0;
+    if (len < 4 || path[0] != '"' || path[len - 1] != '"')
+        return;
+    path[len - 1] = '\0';
+    char *relative = path + 1;
+    if (relative[0] == '/' || relative[0] == '\\' || strchr(relative, ':'))
+        return;
+    char *ext = strrchr(relative, '.');
+    if (!ext || (strcmp(ext, ".h") != 0 && strcmp(ext, ".hpp") != 0 && strcmp(ext, ".hh") != 0 &&
+                 strcmp(ext, ".hxx") != 0))
+        return;
+    *ext = '\0';
+    if (!relative[0] || strchr(relative, '.'))
+        return;
+    for (char *p = relative; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            if (p == relative || p[-1] == '.' || !p[1])
+                return;
+            *p = '.';
+        }
+    }
+    const char *dot = strrchr(ctx->module_qn, '.');
+    if (!dot)
+        return;
+    const char *module = cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)(dot - ctx->module_qn),
+                                           ctx->module_qn, relative);
+    c_lsp_add_include(ctx, relative, module);
+}
+
 void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root))
         return;
@@ -5435,6 +5526,9 @@ void c_lsp_process_file(CLSPContext *ctx, TSNode root) {
     TSNode *kids = cbm_lsp_collect_children(ctx->arena, root, &kn);
     TSNode child; // Hoisted: prevents ASan stack-use-after-scope between passes
     TSNode inner;
+
+    for (uint32_t i = 0; i < kn; i++)
+        c_collect_relative_include(ctx, kids[i]);
 
     // Pass 1: process using declarations and global variables
     for (uint32_t i = 0; i < kn; i++) {
