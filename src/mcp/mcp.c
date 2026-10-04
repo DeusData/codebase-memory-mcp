@@ -41,6 +41,10 @@ enum {
     MCP_COMPARE_MAX_SCAN_LIMIT = 10000000,
     MCP_COMPARE_SET_BYTE_BUDGET = 512 * 1024,
     MCP_QUERY_MAX_VISIBLE_ROWS = 99998,
+    /* search_code `context`: lines of surrounding source per hit, the same
+     * ceiling as `source_max_lines`. Clamped at the handler and again where
+     * the window is computed, so the arithmetic never overflows. */
+    MCP_SEARCH_CONTEXT_MAX_LINES = 200,
     /* max_output_tokens is model-neutral sizing guidance, not a tokenizer
      * promise. The actual cross-platform contract is this deterministic UTF-8
      * byte ceiling, applied only at whole semantic-unit boundaries. */
@@ -702,7 +706,7 @@ static const tool_def_t TOOLS[] = {
      "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"path_filter\":{\"type\":\"string\"},"
      "\"mode\":{\"type\":\"string\","
      "\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\"},"
-     "\"context\":{\"type\":\"integer\"},"
+     "\"context\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,\"maximum\":200},"
      "\"regex\":{\"type\":\"boolean\",\"default\":false},"
      "\"debug\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Add scope_ms/scan_ms/enrich_ms phase timings.\"},"
@@ -5336,8 +5340,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                        max_degree != CBM_NOT_FOUND;
     bool semantic_only = sq_present && !has_filters;
     cbm_search_output_t out = {0};
-    if (!semantic_only) {
-        (void)cbm_store_search(store, &params, &out);
+    char search_error[CBM_SZ_512] = "";
+    if (!semantic_only && cbm_store_search(store, &params, &out) != CBM_STORE_OK) {
+        /* A refused or invalid regex aborts the row scan inside SQLite; the
+         * store's reason is the caller's only hint about the pattern. */
+        snprintf(search_error, sizeof(search_error), "search_graph: %s", cbm_store_error(store));
     }
 
     const char *diagnostic_hint = NULL;
@@ -5417,7 +5424,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(file_pattern);
     free(relationship);
 
-    char *result = cbm_mcp_text_result(payload ? payload : "out of memory", payload == NULL);
+    char *result = search_error[0]
+                       ? cbm_mcp_text_result(search_error, true)
+                       : cbm_mcp_text_result(payload ? payload : "out of memory", payload == NULL);
     free(payload);
     return result;
 }
@@ -13674,11 +13683,15 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
             }
         }
     } else if (context_lines > 0 && r->match_count > 0) {
-        int ctx_start = r->match_lines[0] - context_lines;
-        int ctx_end = r->match_lines[r->match_count - SKIP_ONE] + context_lines;
-        if (ctx_start < SKIP_ONE) {
-            ctx_start = SKIP_ONE;
-        }
+        /* Bounded here as well as at the handler: the window must stay
+         * match ± MCP_SEARCH_CONTEXT_MAX_LINES for any caller, and the
+         * arithmetic must not overflow for any value. */
+        int ctx_lines = context_lines > MCP_SEARCH_CONTEXT_MAX_LINES ? MCP_SEARCH_CONTEXT_MAX_LINES
+                                                                     : context_lines;
+        int first_match = r->match_lines[0];
+        int last_match = r->match_lines[r->match_count - SKIP_ONE];
+        int ctx_start = first_match > ctx_lines ? first_match - ctx_lines : SKIP_ONE;
+        int ctx_end = last_match > INT_MAX - ctx_lines ? INT_MAX : last_match + ctx_lines;
         char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
         if (ctx) {
             char *safe_context = sanitize_utf8_lossy(ctx);
@@ -15167,12 +15180,16 @@ static bool search_scratch_open(search_scratch_t *scratch, const char *parent,
     return true;
 }
 
-/* Compile a path filter regex. Returns true if compiled successfully. */
-static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
+/* Compile a path filter regex. Returns true when *re holds the compiled filter.
+ * An absent or empty filter compiles nothing and reports CBM_REG_OK in *rc; a
+ * filter the regex wrapper refuses or cannot compile reports its error there. */
+static bool compile_path_filter(const char *filter, cbm_regex_t *re, int *rc) {
+    *rc = CBM_REG_OK;
     if (!filter || !filter[0]) {
         return false;
     }
-    return cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB) == CBM_REG_OK;
+    *rc = cbm_regcomp(re, filter, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+    return *rc == CBM_REG_OK;
 }
 
 static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
@@ -15248,6 +15265,11 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     int result_limit = cbm_mcp_get_int_arg(args, "result_limit", legacy_limit);
     int result_offset = cbm_mcp_get_int_arg(args, "result_offset", 0);
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
+    if (context_lines < 0) {
+        context_lines = 0;
+    } else if (context_lines > MCP_SEARCH_CONTEXT_MAX_LINES) {
+        context_lines = MCP_SEARCH_CONTEXT_MAX_LINES;
+    }
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
     search_metrics_t metrics = {0};
@@ -15325,7 +15347,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     size_t byte_budget = (size_t)max_output_tokens * (size_t)MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE;
 
     cbm_regex_t path_regex;
-    bool has_path_filter = compile_path_filter(path_filter, &path_regex);
+    int path_filter_rc = CBM_REG_OK; /* reported with the regex probe below */
+    bool has_path_filter = compile_path_filter(path_filter, &path_regex, &path_filter_rc);
     free(path_filter);
     path_filter = NULL;
 
@@ -15380,21 +15403,35 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * unclosed group) makes the underlying grep fail, which the handler would
      * otherwise report as an empty result set — indistinguishable from a
      * legitimate no-match. Validate the user's regex up front and return an
-     * explicit error so callers can tell "broken pattern" from "no matches". */
-    if (use_regex) {
+     * explicit error so callers can tell "broken pattern" from "no matches".
+     * A path_filter the regex wrapper refused or could not compile is reported
+     * the same way instead of silently searching unfiltered. */
+    const char *regex_error = NULL;
+    if (path_filter_rc != CBM_REG_OK) {
+        regex_error = path_filter_rc == CBM_REG_ETOOBIG
+                          ? "path_filter: " CBM_REG_ETOOBIG_REASON
+                          : "invalid path_filter regex: check for unbalanced (), [], or {}";
+    } else if (use_regex) {
         cbm_regex_t probe;
-        if (cbm_regcomp(&probe, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != CBM_REG_OK) {
-            if (has_path_filter) {
-                cbm_regfree(&path_regex);
-            }
-            free(root_path);
-            free(pattern);
-            free(project);
-            free(file_pattern);
-            return cbm_mcp_text_result(
-                "invalid regex pattern (regex=true): check for unbalanced (), [], or {}", true);
+        int probe_rc = cbm_regcomp(&probe, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+        if (probe_rc != CBM_REG_OK) {
+            regex_error =
+                probe_rc == CBM_REG_ETOOBIG
+                    ? CBM_REG_ETOOBIG_REASON " (regex=true)"
+                    : "invalid regex pattern (regex=true): check for unbalanced (), [], or {}";
+        } else {
+            cbm_regfree(&probe);
         }
-        cbm_regfree(&probe);
+    }
+    if (regex_error) {
+        if (has_path_filter) {
+            cbm_regfree(&path_regex);
+        }
+        free(root_path);
+        free(pattern);
+        free(project);
+        free(file_pattern);
+        return cbm_mcp_text_result(regex_error, true);
     }
 
     /* ── Phase 0.5: Multi-word → regex conversion ───────────── */

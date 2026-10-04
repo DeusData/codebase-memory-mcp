@@ -334,7 +334,8 @@ typedef struct {
 } cbm_cypher_result_t;
 
 /* Execute a Cypher query against a store.
- * max_rows: limit on output rows (0 = use virtual ceiling of 100k).
+ * max_rows: limit on output rows; 0 or any value above the 100k ceiling uses
+ *   the ceiling.
  * project: project name filter (NULL = all projects).
  * Returns -1 on error (check out->error for message). */
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,

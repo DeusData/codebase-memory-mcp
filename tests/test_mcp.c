@@ -1963,8 +1963,14 @@ TEST(mcp_issue403_sensitive_root_stops_before_discovery_count) {
 }
 
 TEST(mcp_issue403_explicit_approval_preserves_auto_index) {
-    char *sensitive_home = th_mktempdir("cbm_mcp_403_home");
-    ASSERT_NOT_NULL(sensitive_home);
+    char *created = th_mktempdir("cbm_mcp_403_home");
+    ASSERT_NOT_NULL(created);
+    /* The session root is presented in its resolved form, as the daemon does,
+     * because the home helper hands out the resolved home: with the raw
+     * spelling the two differ on macOS (/tmp is a firmlink) and the root
+     * would pass as an ordinary one, never reaching the approval path. */
+    char sensitive_home[4096];
+    ASSERT_TRUE(cbm_canonical_path(created, sensitive_home, sizeof(sensitive_home)));
     const char *saved_home = getenv("HOME");
     char *saved_home_copy = saved_home ? strdup(saved_home) : NULL;
     cbm_setenv("HOME", sensitive_home, 1);
@@ -11653,6 +11659,87 @@ TEST(search_code_path_filter_matches_nothing) {
     ASSERT_TRUE(strstr(inner, "other.go") == NULL);
 
     free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* An over-budget regex is refused by the wrapper before the platform compiler
+ * expands it. search_code reports that as a tool error naming the argument and
+ * the reason, for path_filter and for a regex=true pattern alike, and keeps
+ * answering afterwards. The pattern is 14^4 = 38,416 expanded atoms: over the
+ * 32,768-unit budget, and tens of MB to hold even when unguarded. */
+TEST(search_code_oversized_path_filter_is_tool_error) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"((((a){14}){14}){14}){14}\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "path_filter"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"((((a){14}){14}){14}){14}\",\"regex\":true,"
+             "\"project\":\"prefilter-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    ASSERT_NOT_NULL(strstr(resp, "regex=true"));
+    free(resp);
+
+    /* The server still answers an ordinary filtered call. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"^src/\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "src/handler.go"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* search_graph compiles name_pattern inside SQLite's REGEXP function. An
+ * over-budget pattern is refused there, the row scan aborts, and the tool
+ * reports the reason as a tool error instead of an empty result. The next call
+ * answers normally. */
+TEST(search_graph_oversized_name_pattern_is_tool_error) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"prefilter-search\",\"name_pattern\":\"((((a){14}){14}){14}){14}\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "too large to compile"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"prefilter-search\",\"name_pattern\":\"^HandleRequest$\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    ASSERT_NOT_NULL(strstr(resp, "HandleRequest"));
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
@@ -22060,6 +22147,346 @@ TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
     PASS();
 }
 
+/* ── Integer argument bounds ────────────────────────────────────────
+ * Sizing arguments are clamped on both sides at the handler. The fixture
+ * file is much longer than the `context` bound so the window is observable. */
+
+enum { CTX_FIXTURE_LINES = 1000, CTX_FIXTURE_NEEDLE_LINE = 500, CTX_BOUND = 200 };
+
+static bool write_context_fixture(const char *tmp, char *path, size_t path_sz) {
+    snprintf(path, path_sz, "%s/project/long.md", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    if (!fp) {
+        return false;
+    }
+    for (int line = 1; line <= CTX_FIXTURE_LINES; line++) {
+        if (line == CTX_FIXTURE_NEEDLE_LINE) {
+            fprintf(fp, "needle-context-window\n");
+        } else {
+            fprintf(fp, "line %04d\n", line);
+        }
+    }
+    return fclose(fp) == 0;
+}
+
+static bool upsert_context_fixture_node(cbm_mcp_server_t *srv) {
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        return false;
+    }
+    cbm_node_t node = {.project = "test-project",
+                       .label = "Section",
+                       .name = "long",
+                       .qualified_name = "test-project.long",
+                       .file_path = "long.md",
+                       .start_line = 1,
+                       .end_line = CTX_FIXTURE_LINES};
+    return cbm_store_upsert_node(st, &node) > 0;
+}
+
+static char *search_code_with_context(cbm_mcp_server_t *srv, const char *context_value) {
+    char req[256];
+    snprintf(req, sizeof(req),
+             "{\"project\":\"test-project\",\"pattern\":\"needle-context-window\","
+             "\"format\":\"json\",\"context\":%s,\"limit\":5}",
+             context_value);
+    char *resp = cbm_mcp_handle_tool(srv, "search_code", req);
+    if (!resp) {
+        return NULL;
+    }
+    char *inner = extract_text_content(resp);
+    free(resp);
+    return inner;
+}
+
+/* Row-0 context object of a json-format search_code answer, or NULL when the
+ * answer carries no context column. *doc_out owns the memory either way. */
+static yyjson_val *search_code_context_object(const char *inner, yyjson_doc **doc_out) {
+    *doc_out = yyjson_read(inner, strlen(inner), 0);
+    if (!*doc_out) {
+        return NULL;
+    }
+    yyjson_val *root = yyjson_doc_get_root(*doc_out);
+    yyjson_val *cols = yyjson_obj_get(root, "cols");
+    yyjson_val *rows = yyjson_obj_get(root, "rows");
+    if (!cols || !rows || yyjson_arr_size(rows) == 0) {
+        return NULL;
+    }
+    size_t col_count = yyjson_arr_size(cols);
+    for (size_t i = 0; i < col_count; i++) {
+        const char *col = yyjson_get_str(yyjson_arr_get(cols, i));
+        if (col && strcmp(col, "context") == 0) {
+            return yyjson_arr_get(yyjson_arr_get(rows, 0), i);
+        }
+    }
+    return NULL;
+}
+
+static int count_newlines(const char *s) {
+    int n = 0;
+    for (; *s; s++) {
+        n += *s == '\n';
+    }
+    return n;
+}
+
+TEST(search_code_context_window_is_bounded) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char fixture[512];
+    ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
+    ASSERT_TRUE(upsert_context_fixture_node(srv));
+
+    /* Far above the bound: the window is match ± 200, not the whole file. */
+    char *inner = search_code_with_context(srv, "100000");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = NULL;
+    yyjson_val *ctx = search_code_context_object(inner, &doc);
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
+              CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
+    const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
+    ASSERT_EQ(strncmp(text, "line 0300\n", 10), 0);
+    ASSERT_NOT_NULL(strstr(text, "\nneedle-context-window\n"));
+    ASSERT_NOT_NULL(strstr(text, "\nline 0700\n"));
+    ASSERT_NULL(strstr(text, "line 0701"));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* Inside the bound the window is unchanged. */
+    inner = search_code_with_context(srv, "3");
+    ASSERT_NOT_NULL(inner);
+    ctx = search_code_context_object(inner, &doc);
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")), CTX_FIXTURE_NEEDLE_LINE - 3);
+    text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(count_newlines(text), 7);
+    ASSERT_EQ(strncmp(text, "line 0497\n", 10), 0);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    unlink(fixture);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(search_code_context_extreme_values_answer_normally) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char fixture[512];
+    ASSERT_TRUE(write_context_fixture(tmp, fixture, sizeof(fixture)));
+    ASSERT_TRUE(upsert_context_fixture_node(srv));
+
+    /* The largest value the argument can carry behaves exactly like the bound. */
+    char *inner = search_code_with_context(srv, "2147483647");
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = NULL;
+    yyjson_val *ctx = search_code_context_object(inner, &doc);
+    ASSERT_NOT_NULL(ctx);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(ctx, "context_start")),
+              CTX_FIXTURE_NEEDLE_LINE - CTX_BOUND);
+    const char *text = yyjson_get_str(yyjson_obj_get(ctx, "context"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_EQ(count_newlines(text), 2 * CTX_BOUND + 1);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* A negative value means no context, exactly like 0: a normal answer. */
+    inner = search_code_with_context(srv, "-5");
+    ASSERT_NOT_NULL(inner);
+    ctx = search_code_context_object(inner, &doc);
+    ASSERT_NULL(ctx);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
+    ASSERT_NOT_NULL(rows);
+    ASSERT_TRUE(yyjson_arr_size(rows) > 0);
+    yyjson_doc_free(doc);
+    free(inner);
+
+    unlink(fixture);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_query_graph_max_rows_above_ceiling_is_capped) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "row-ceiling";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/row-ceiling"), CBM_STORE_OK);
+    /* One row more than the visible ceiling (99998), so the cap is observable. */
+    enum { ROW_CEILING = 99998, ROWS = ROW_CEILING + 1 };
+    ASSERT_EQ(cbm_store_begin_bulk(store), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+    for (int i = 0; i < ROWS; i++) {
+        char name[32];
+        char qualified_name[64];
+        snprintf(name, sizeof(name), "row_%05d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "row-ceiling.rows.%s", name);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "rows.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_end_bulk(store), CBM_STORE_OK);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"project\":\"row-ceiling\",\"query\":\"MATCH (n) RETURN n.name\","
+        "\"format\":\"json\",\"max_rows\":2147483647,\"max_output_tokens\":1000000}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), ROW_CEILING);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), ROWS);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_limit_above_ceiling_is_capped) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "limit-ceiling";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/limit-ceiling"), CBM_STORE_OK);
+    enum { LIMIT_CEILING = 500, NODES = 600 };
+    ASSERT_EQ(cbm_store_begin(store), CBM_STORE_OK);
+    for (int i = 0; i < NODES; i++) {
+        char name[32];
+        char qualified_name[64];
+        snprintf(name, sizeof(name), "fn_%03d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "limit-ceiling.m.%s", name);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "m.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_commit(store), CBM_STORE_OK);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"limit-ceiling\",\"label\":\"Function\",\"limit\":9999,"
+                            "\"format\":\"json\",\"max_output_tokens\":1000000}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "returned")), LIMIT_CEILING);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), NODES);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "has_more")));
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_cursor_truncated_after_leg_is_rejected) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "cursor-leg";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/cursor-leg"), CBM_STORE_OK);
+    cbm_node_t hub = {.project = proj,
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "cursor-leg.h.hub",
+                      .file_path = "h.c",
+                      .start_line = 1,
+                      .end_line = 9};
+    int64_t hid = cbm_store_upsert_node(st, &hub);
+    ASSERT_GT(hid, 0);
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "leaf",
+                         .qualified_name = "cursor-leg.m.leaf",
+                         .file_path = "m.c",
+                         .start_line = 1,
+                         .end_line = 3};
+    int64_t lid = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(lid, 0);
+    cbm_edge_t e = {.project = proj, .source_id = hid, .target_id = lid, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    /* A token that ends right after the leg character has no generation,
+     * hash, hop or node fields to read; it is rejected like any other
+     * malformed token. */
+    static const char *const tokens[] = {"c1.o", "c1.i"};
+    for (size_t t = 0; t < sizeof(tokens) / sizeof(tokens[0]); t++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "{\"project\":\"cursor-leg\",\"function_name\":\"hub\","
+                 "\"direction\":\"outbound\",\"limit\":5,\"cursor\":\"%s\"}",
+                 tokens[t]);
+        char *response = cbm_mcp_handle_tool(srv, "trace_call_path", req);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "invalid_cursor"));
+        free(inner);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_code_rejects_quote_in_file_pattern) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* Both quote characters are rejected before any file is scanned. */
+    static const char *const patterns[] = {"*.go\\\"", "*.go'"};
+    for (size_t p = 0; p < sizeof(patterns) / sizeof(patterns[0]); p++) {
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "{\"project\":\"test-project\",\"pattern\":\"HandleRequest\","
+                 "\"file_pattern\":\"%s\",\"format\":\"json\"}",
+                 patterns[p]);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", req);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        free(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "path or file_pattern contains invalid characters"));
+        free(inner);
+    }
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 SUITE(mcp) {
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
@@ -22313,6 +22740,8 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_long_line_does_not_invent_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
+    RUN_TEST(search_code_oversized_path_filter_is_tool_error);
+    RUN_TEST(search_graph_oversized_name_pattern_is_tool_error);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
@@ -22452,6 +22881,12 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+    RUN_TEST(search_code_context_window_is_bounded);
+    RUN_TEST(search_code_context_extreme_values_answer_normally);
+    RUN_TEST(tool_query_graph_max_rows_above_ceiling_is_capped);
+    RUN_TEST(tool_search_graph_limit_above_ceiling_is_capped);
+    RUN_TEST(tool_trace_cursor_truncated_after_leg_is_rejected);
+    RUN_TEST(search_code_rejects_quote_in_file_pattern);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
