@@ -95,14 +95,24 @@ typedef struct {
 
     // py_eval_expr_type memoization + guards (issues #710/#720; mirrors
     // c_eval_expr_type's guard design in c_lsp.c). All zero via memset —
-    // each file starts with a cold cache and a full budget.
+    // each file starts with a cold cache.
     CBMPyTypeCacheEntry *type_cache; // open addressing, linear probe, arena-allocated
     int type_cache_count;            // occupied slots (kept < 75% of cap)
     int type_cache_cap;              // power-of-two capacity
     uint32_t type_cache_gen;         // bumped on every scope mutation (O(1) flush)
     int eval_depth;                  // evaluator recursion depth (PY_LSP_MAX_EVAL_DEPTH)
-    int eval_steps;                  // per-file work budget used (PY_EVAL_MAX_STEPS_PER_FILE)
-    uint32_t eval_truncations;       // depth/budget cutoff count — gates memo inserts
+    uint32_t eval_truncations;       // depth-cap cutoff count — gates memo inserts
+    CBMLSPStatus eval_failure;       // sticky: memo/depth failure makes this walk incomplete
+    // Pending links of the left-associative chains being evaluated
+    // iteratively (operator, receiver, subscript, conditional and
+    // parenthesis chains): one stack shared by nested evaluations.
+    TSNode *eval_chain; // arena-allocated
+    int eval_chain_len;
+    int eval_chain_cap;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int test_memo_allocations_left;
+    int test_root_name_failure; // 1 = NULL, 2 = empty; only the root-name collection
+#endif
 
     // Sticky fail-closed guard for exact callable-value proof. If a required
     // scope/name/overlay allocation fails, later semantic passes must leave
@@ -161,9 +171,28 @@ void cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 // Phase 10 fills the body; Phase 2 ships a no-op so linkage works.
 void cbm_python_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 
-// --- Cross-file LSP resolution ---
+#define CBM_PY_LSP_DEPTH_ERROR "Python expression recursion depth limit exceeded"
+#define CBM_PY_LSP_MEMO_ERROR "Python expression memo allocation or capacity failure"
+void cbm_py_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_py_lsp_test_memo_fail_after(int successful_allocations);
+void cbm_py_lsp_test_depth_fail(bool enabled);
+const CBMType *cbm_py_lsp_test_eval(PyLSPContext *ctx, TSNode node);
+void cbm_py_lsp_test_bind_external_classes(PyLSPContext *ctx, TSNode root);
+#endif
 
-void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
+// --- Cross-file LSP resolution ---
+// Status variants distinguish memo/depth failure; bool wrappers report success.
+// Existing no-op/parser exits retain their previous behavior.
+
+CBMLSPStatus cbm_run_py_lsp_cross_status(CBMArena *arena, const char *source, int source_len,
+                                         const char *module_qn, CBMLSPDef *defs, int def_count,
+                                         const char **import_names, const char **import_qns,
+                                         int import_count,
+                                         TSTree *cached_tree, // NULL = parse internally
+                                         CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
+
+bool cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           const char *module_qn, CBMLSPDef *defs, int def_count,
                           const char **import_names, const char **import_qns, int import_count,
                           TSTree *cached_tree, // NULL = parse internally
@@ -173,7 +202,13 @@ void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
  * Filters all_defs to Python entries, builds + finalizes once. */
 CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
 
-void cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+CBMLSPStatus cbm_run_py_lsp_cross_with_registry_status(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
+    const char **import_names, const char **import_qns, int import_count, TSTree *cached_tree,
+    CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
+
+bool cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                         const char *module_qn,
                                         CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
                                         const char **import_names, const char **import_qns,
@@ -194,7 +229,7 @@ typedef struct {
     int import_count;
 } CBMBatchPyLSPFile;
 
-void cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
+bool cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
                             CBMResolvedCallArray *out);
 
 #endif // CBM_LSP_PY_LSP_H

@@ -20,6 +20,7 @@
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
 #include "lsp/rust_lsp.h"
+#include "lsp/lsp_work.h"
 #include "preprocessor.h"
 #include "sql_values.h" // #1735: literal INSERT rows kept out of the SQL parse
 #include "foundation/compat.h"
@@ -2146,6 +2147,183 @@ static bool cbm_sql_values_exclusion_on(const char *rel_path) {
     return true;
 }
 
+/* ── Innermost enclosing Function/Method per call (#1527) ──────────────
+ * The call-context metrics attribute each call to the Function/Method def with
+ * the SMALLEST line span containing the call's line, ties to the lowest def
+ * index. Scanning every def for every call made that O(calls x defs) per file
+ * -- quadratic in file size, the largest single cost on a module with
+ * thousands of methods. The sweep below gives the identical answer in
+ * O((calls + defs) log defs): calls in line order, candidates entering a
+ * min-heap keyed (span, index) once their start line is reached and leaving it
+ * lazily once their end line has passed -- lines only grow, so a def that has
+ * ended never contains a later call. The heap top is then the smallest
+ * (span, index) among the defs that contain the line. */
+static bool enclosing_is_callable(const CBMDefinition *d) {
+    return d->name && d->label &&
+           (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0);
+}
+
+/* The reference answer for one line (and the path when the sweep's arrays
+ * cannot be allocated). */
+static int cbm_enclosing_callable_scan(const CBMFileResult *result, int line) {
+    int best = -1;
+    int best_span = -1;
+    for (int di = 0; di < result->defs.count; di++) {
+        const CBMDefinition *d = &result->defs.items[di];
+        CBM_LSP_WORK(1);
+        if (!enclosing_is_callable(d)) {
+            continue;
+        }
+        if ((int)d->start_line <= line && line <= (int)d->end_line) {
+            int span = (int)d->end_line - (int)d->start_line;
+            if (best < 0 || span < best_span) {
+                best_span = span;
+                best = di;
+            }
+        }
+    }
+    return best;
+}
+
+static CBM_TLS const CBMFileResult *tl_enclosing_result;
+
+static int enclosing_def_by_start(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    uint32_t la = tl_enclosing_result->defs.items[ia].start_line;
+    uint32_t lb = tl_enclosing_result->defs.items[ib].start_line;
+    return la < lb ? -1 : la > lb ? 1 : ia - ib;
+}
+
+static int enclosing_call_by_line(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    int la = tl_enclosing_result->calls.items[ia].start_line;
+    int lb = tl_enclosing_result->calls.items[ib].start_line;
+    return la < lb ? -1 : la > lb ? 1 : ia - ib;
+}
+
+/* Heap order: smaller span first, then smaller def index. */
+static bool enclosing_heap_less(const CBMFileResult *r, int a, int b) {
+    const CBMDefinition *da = &r->defs.items[a];
+    const CBMDefinition *db = &r->defs.items[b];
+    int sa = (int)da->end_line - (int)da->start_line;
+    int sb = (int)db->end_line - (int)db->start_line;
+    return sa != sb ? sa < sb : a < b;
+}
+
+static void enclosing_heap_push(const CBMFileResult *r, int *heap, int *n, int di) {
+    int i = (*n)++;
+    heap[i] = di;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        CBM_LSP_WORK(1);
+        if (!enclosing_heap_less(r, heap[i], heap[parent])) {
+            break;
+        }
+        int t = heap[i];
+        heap[i] = heap[parent];
+        heap[parent] = t;
+        i = parent;
+    }
+}
+
+static void enclosing_heap_pop(const CBMFileResult *r, int *heap, int *n) {
+    heap[0] = heap[--(*n)];
+    int i = 0;
+    for (;;) {
+        int l = (2 * i) + 1;
+        int m = i;
+        CBM_LSP_WORK(1);
+        if (l < *n && enclosing_heap_less(r, heap[l], heap[m])) {
+            m = l;
+        }
+        if (l + 1 < *n && enclosing_heap_less(r, heap[l + 1], heap[m])) {
+            m = l + 1;
+        }
+        if (m == i) {
+            break;
+        }
+        int t = heap[i];
+        heap[i] = heap[m];
+        heap[m] = t;
+        i = m;
+    }
+}
+
+/* enclosing[ci] = innermost Function/Method def index for call ci, or -1.
+ * Returns NULL when the working arrays cannot be allocated; the caller then
+ * asks cbm_enclosing_callable_scan per call (same answer, old cost). */
+static int *cbm_enclosing_callables(const CBMFileResult *result, int call_count) {
+    int def_count = result->defs.count;
+    if (call_count <= 0) {
+        return NULL;
+    }
+    size_t call_bytes = (size_t)call_count * sizeof(int);
+    size_t def_bytes = (size_t)(def_count > 0 ? def_count : 1) * sizeof(int);
+    int *enclosing = cbm_alloc(CBM_MEM_CLASS_OTHER, call_bytes);
+    int *call_order = cbm_alloc(CBM_MEM_CLASS_OTHER, call_bytes);
+    int *cands = cbm_alloc(CBM_MEM_CLASS_OTHER, def_bytes);
+    int *heap = cbm_alloc(CBM_MEM_CLASS_OTHER, def_bytes);
+    if (!enclosing || !call_order || !cands || !heap) {
+        cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
+        cbm_free(CBM_MEM_CLASS_OTHER, call_order);
+        cbm_free(CBM_MEM_CLASS_OTHER, cands);
+        cbm_free(CBM_MEM_CLASS_OTHER, heap);
+        return NULL;
+    }
+    int ncand = 0;
+    for (int di = 0; di < def_count; di++) {
+        if (enclosing_is_callable(&result->defs.items[di])) {
+            cands[ncand++] = di;
+        }
+    }
+    for (int ci = 0; ci < call_count; ci++) {
+        call_order[ci] = ci;
+        enclosing[ci] = -1;
+    }
+    tl_enclosing_result = result;
+    qsort(cands, (size_t)ncand, sizeof(int), enclosing_def_by_start);
+    qsort(call_order, (size_t)call_count, sizeof(int), enclosing_call_by_line);
+    tl_enclosing_result = NULL;
+
+    int heap_n = 0;
+    int next = 0;
+    for (int k = 0; k < call_count; k++) {
+        int ci = call_order[k];
+        int line = result->calls.items[ci].start_line;
+        while (next < ncand && (int)result->defs.items[cands[next]].start_line <= line) {
+            enclosing_heap_push(result, heap, &heap_n, cands[next++]);
+        }
+        while (heap_n > 0 && (int)result->defs.items[heap[0]].end_line < line) {
+            enclosing_heap_pop(result, heap, &heap_n);
+        }
+        enclosing[ci] = heap_n > 0 ? heap[0] : -1;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, call_order);
+    cbm_free(CBM_MEM_CLASS_OTHER, cands);
+    cbm_free(CBM_MEM_CLASS_OTHER, heap);
+    return enclosing;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
+    int *enclosing = cbm_enclosing_callables(result, result->calls.count);
+    if (!enclosing) {
+        return result->calls.count > 0 ? -1 : 0;
+    }
+    int mismatches = 0;
+    for (int ci = 0; ci < result->calls.count; ci++) {
+        int line = result->calls.items[ci].start_line;
+        if (line > 0 && enclosing[ci] != cbm_enclosing_callable_scan(result, line)) {
+            mismatches++;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
+    return mismatches;
+}
+#endif
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -2509,8 +2687,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
-                    cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+                    if (!result->lsp_skipped) {
+                        cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
+                                      language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
+                    }
 
                     /* All C-LSP emitters stamp origin directly so rewrite-time
                      * comparisons are already safe. Keep this boundary sweep as
@@ -2833,28 +3013,14 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         d->param_count = pc;
     }
 
+    int *enclosing = cbm_enclosing_callables(result, orig_calls_count);
     for (int ci = 0; ci < orig_calls_count; ci++) {
         const CBMCall *c = &result->calls.items[ci];
         if (!c->callee_name || c->start_line <= 0) {
             continue;
         }
         // Innermost enclosing Function/Method def by line range (smallest span).
-        int best = -1;
-        int best_span = -1;
-        for (int di = 0; di < def_count; di++) {
-            const CBMDefinition *d = &result->defs.items[di];
-            if (!d->name || !d->label ||
-                (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)) {
-                continue;
-            }
-            if ((int)d->start_line <= c->start_line && c->start_line <= (int)d->end_line) {
-                int span = (int)d->end_line - (int)d->start_line;
-                if (best < 0 || span < best_span) {
-                    best_span = span;
-                    best = di;
-                }
-            }
-        }
+        int best = enclosing ? enclosing[ci] : cbm_enclosing_callable_scan(result, c->start_line);
         if (best < 0) {
             continue;
         }
@@ -2899,6 +3065,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
     free(has_self);
     free(has_guarded);
+    cbm_free(CBM_MEM_CLASS_OTHER, enclosing);
 
     uint64_t t2 = now_ns();
 

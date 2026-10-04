@@ -99,11 +99,38 @@ typedef struct {
                           // READ-ONLY across resolve workers — never mutate it
                           // (and never store per-worker arena pointers into it)
     bool debug;
-    int eval_depth;         // recursion depth for c_eval_expr_type (crash guard)
-    int eval_steps;         // total expression eval calls for current file (hang guard)
+    int eval_depth;            // recursion depth for c_eval_expr_type (crash guard)
+    uint32_t eval_truncations; // depth-cap cutoffs; a truncated result is never memoized
+    // Per-evaluation memo (#1527): results of the sub-expressions evaluated
+    // during ONE outermost c_eval_expr_type call, keyed by node identity. The
+    // evaluator re-evaluates a call's receiver (member lookup, then template
+    // substitution), which made an N-link fluent chain cost 2^N; the per-file
+    // step cap that used to hide that is gone. Evaluation never mutates scope
+    // or context, so within one outermost call a node's type cannot change;
+    // the memo is emptied when the next outermost call starts, because the
+    // resolver walk mutates scope between calls.
+    struct CLSPEvalMemoSlot *eval_memo; // open addressing, arena-owned
+    int *eval_memo_used;                // slots filled by the current evaluation
+    int eval_memo_cap;                  // power of two, or 0
+    int eval_memo_count;
+    // Pending links of the left-associative chains being evaluated
+    // iteratively (operator, receiver, subscript, conditional, parenthesis and
+    // comma chains): one stack shared by nested evaluations, arena-owned.
+    TSNode *eval_chain;
+    int eval_chain_len;
+    int eval_chain_cap;
+    CBMLSPStatus eval_failure; // sticky: stop refinement rather than repeat uncached work
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int test_memo_allocations_left; // -1 = normal; 0 = fail the next memo allocation
+#endif
     int walk_depth;         // c_resolve_calls_in_node self-recursion (AST nesting)
     int control_flow_depth; // if/loop/switch/catch nesting; assignments merge fail-closed
 } CLSPContext;
+
+struct CLSPEvalMemoSlot {
+    const void *node_id; // TSNode.id; NULL = empty
+    const CBMType *result;
+};
 
 // --- API ---
 
@@ -132,8 +159,28 @@ const CBMType *c_simplify_type(CLSPContext *ctx, const CBMType *t, bool unwrap_p
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                    TSNode root, bool cpp_mode, CBMSourceOrigin source_origin);
 
+// A memo allocation/capacity failure is an explicit incomplete-refinement error.
+#define CBM_C_LSP_DEPTH_ERROR "C/C++ expression recursion depth limit exceeded"
+#define CBM_C_LSP_MEMO_ERROR "C/C++ expression memo allocation or capacity failure"
+void cbm_c_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status);
+#ifdef CBM_ENABLE_TEST_SEAMS
+// Thread-local, scoped to memo allocations only; restore with -1 after a test.
+void cbm_c_lsp_test_memo_fail_after(int successful_allocations);
+void cbm_c_lsp_test_depth_fail(bool enabled);
+uint32_t cbm_c_lsp_test_walks_take(void);
+#endif
+
 // Cross-file LSP: build registry from defs + stdlib, re-parse and resolve.
-void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,
+// Status variants distinguish memo/depth failure. Bool wrappers report success.
+// Completed output before a failed walk is kept.
+CBMLSPStatus cbm_run_c_lsp_cross_status(CBMArena *arena, const char *source, int source_len,
+                                        const char *module_qn, bool cpp_mode, CBMLSPDef *defs,
+                                        int def_count, const char **include_paths,
+                                        const char **include_ns_qns, int include_count,
+                                        TSTree *cached_tree, // NULL = parse internally
+                                        CBMResolvedCallArray *out);
+
+bool cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,
                          bool cpp_mode, CBMLSPDef *defs, int def_count, const char **include_paths,
                          const char **include_ns_qns, int include_count,
                          TSTree *cached_tree, // NULL = parse internally
@@ -146,7 +193,14 @@ CBMTypeRegistry *cbm_c_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, in
 
 // Cross-file LSP using a pre-built shared registry (Tier 2). Skips the
 // per-file registry build; just parse + resolve.
-void cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
+    const char **include_paths, const char **include_ns_qns, int include_count,
+    TSTree *cached_tree, // NULL = parse internally
+    CBMResolvedCallArray *out);
+
+bool cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
                                        const char *module_qn, bool cpp_mode,
                                        CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
                                        const char **include_paths, const char **include_ns_qns,
@@ -178,7 +232,7 @@ typedef struct {
 
 // Process multiple C/C++ files' cross-file LSP in one CGo call.
 // out must point to file_count pre-zeroed CBMResolvedCallArray structs.
-void cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_count,
+bool cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_count,
                            CBMResolvedCallArray *out);
 
 #endif // CBM_LSP_C_LSP_H
