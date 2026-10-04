@@ -1377,6 +1377,7 @@ typedef struct {
      * itself instead, which is the edge a reader on another thread needs. */
     atomic_bool args_captured[APP_FAKE_MAX_ATTEMPTS];
     size_t memory_budgets[APP_FAKE_MAX_ATTEMPTS];
+    bool background_requests[APP_FAKE_MAX_ATTEMPTS];
 } app_fake_worker_context_t;
 
 typedef struct {
@@ -1444,6 +1445,8 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
                        args_json ? args_json : "");
         atomic_store(&context->args_captured[worker->attempt], true);
         context->memory_budgets[worker->attempt] = memory_budget_bytes;
+        context->background_requests[worker->attempt] =
+            cbm_mcp_get_bool_arg(args_json, "_cbm_background");
         if (marker_file) {
             (void)snprintf(context->marker_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
                            marker_file);
@@ -2213,6 +2216,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_TRUE(first_initialized);
     ASSERT_TRUE(first_owned);
     ASSERT_TRUE(auto_policy_propagated);
+    ASSERT_TRUE(fake.background_requests[0]);
     ASSERT_TRUE(second_initialized);
     ASSERT_TRUE(coalesced);
     ASSERT_TRUE(restricted_disconnect_kept_job);
@@ -3715,6 +3719,7 @@ TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session) {
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(subscribed);
     ASSERT_TRUE(worker_started);
+    ASSERT_FALSE(fixture.fake.background_requests[0]);
     ASSERT_TRUE(request_returned);
     ASSERT_TRUE(thread_joined);
     ASSERT_EQ(request.status, CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED);
@@ -4012,6 +4017,7 @@ TEST(daemon_application_final_cancel_drains_admitted_watcher_job) {
     ASSERT_TRUE(fixture_ready);
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(worker_started);
+    ASSERT_TRUE(fixture.fake.background_requests[0]);
     ASSERT_TRUE(job_active);
     ASSERT_EQ(watches_after_cancel, 0);
     ASSERT_TRUE(thread_joined);
