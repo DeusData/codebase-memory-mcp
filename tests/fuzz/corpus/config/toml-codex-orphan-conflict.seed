@@ -1,0 +1,8 @@
+m# >>> codebase-memory-mcp MCP >>>
+[mcp_servers.codebase-memory-mcp]
+command = "/old/codebase-memory-mcp"
+command.detail = "conflict"
+[desktop]
+followUpQueueMode = "steer"
+[mcp_servers.codebase-memory-mcp.env]
+RECOVERY_SENTINEL = "scattered"

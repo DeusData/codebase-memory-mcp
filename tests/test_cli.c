@@ -14407,6 +14407,66 @@ TEST(cli_codex_mcp_keeps_foreign_tables_in_managed_region_issue2228) {
     PASS();
 }
 
+/* Codex app-server 0.149.1 drops the closing MCP marker with node_repl
+ * during config/value/write (replace with null). This is the remaining
+ * config from the #2228 reproduction, with unrelated hooks omitted. */
+TEST(cli_codex_mcp_recovers_lost_closing_marker_issue2228) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-recover-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/config.toml", tmpdir);
+#define CLI_RECOVER_PREFIX                                                    \
+    "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"/bin/echo\"\n" \
+    "args = [\"unrelated\"]\n"
+#define CLI_RECOVER_TAIL                                   \
+    "[desktop]\nfollowUpQueueMode = \"steer\"\n\n"         \
+    "[marketplaces.openai-codex]\nsource_type = \"git\"\n" \
+    "source = \"https://example.com/test.git\"\n"
+    const char *before = CLI_RECOVER_PREFIX "# >>> codebase-memory-mcp MCP >>>\n"
+                                            "[mcp_servers.codebase-memory-mcp]\n"
+                                            "command = \"/root/bin/codebase-memory-mcp\"\n"
+                                            "args = []\n"
+                                            "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+                                            "startup_timeout_sec = 90\n\n" CLI_RECOVER_TAIL;
+    const char *expected =
+        CLI_RECOVER_PREFIX "# >>> codebase-memory-mcp MCP >>>\n"
+                           "[mcp_servers.codebase-memory-mcp]\n"
+                           "command = \"/new/codebase-memory-mcp\"\n"
+                           "args = []\n"
+                           "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+                           "startup_timeout_sec = 90\n"
+                           "# <<< codebase-memory-mcp MCP <<<\n\n" CLI_RECOVER_TAIL;
+    const char *removed = CLI_RECOVER_PREFIX "\n" CLI_RECOVER_TAIL;
+#undef CLI_RECOVER_PREFIX
+#undef CLI_RECOVER_TAIL
+    if (write_test_file(configpath, before) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to write Codex recovery fixture");
+    }
+    int install_rc = cbm_upsert_codex_mcp("/new/codebase-memory-mcp", configpath);
+    char *installed = read_test_file_alloc(configpath);
+    int reinstall_rc = cbm_upsert_codex_mcp("/new/codebase-memory-mcp", configpath);
+    char *reinstalled = read_test_file_alloc(configpath);
+    int remove_rc = cbm_remove_codex_mcp(configpath);
+    char *uninstalled = read_test_file_alloc(configpath);
+    bool recovered = installed && strcmp(installed, expected) == 0;
+    bool stable = reinstalled && strcmp(reinstalled, expected) == 0;
+    bool removed_owned = uninstalled && strcmp(uninstalled, removed) == 0;
+    free(installed);
+    free(reinstalled);
+    free(uninstalled);
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT(recovered);
+    ASSERT_EQ(reinstall_rc, 0);
+    ASSERT(stable);
+    ASSERT_EQ(remove_rc, 0);
+    ASSERT(removed_owned);
+    PASS();
+}
+
 TEST(cli_upsert_codex_mcp_existing) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-XXXXXX");
@@ -18002,6 +18062,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_codex_mcp_fresh);
     RUN_TEST(cli_upsert_codex_mcp_escapes_windows_path);
     RUN_TEST(cli_codex_mcp_keeps_foreign_tables_in_managed_region_issue2228);
+    RUN_TEST(cli_codex_mcp_recovers_lost_closing_marker_issue2228);
     RUN_TEST(cli_upsert_codex_mcp_existing);
     RUN_TEST(cli_upsert_codex_mcp_replace);
     RUN_TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string);

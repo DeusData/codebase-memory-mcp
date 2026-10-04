@@ -130,7 +130,9 @@ static void fuzz_config(const uint8_t *data, size_t size) {
         return;
     }
     char path[FUZZ_PATH_MAX + FUZZ_FILE_NAME_ROOM];
-    const char *ext = data[0] == 't' ? "toml" : data[0] == 'y' ? "yaml" : "json";
+    const char *ext = (data[0] == 't' || data[0] == 'm') ? "toml"
+                      : data[0] == 'y'                   ? "yaml"
+                                                         : "json";
     (void)snprintf(path, sizeof(path), "%s/config.%s", g_dir, ext);
     FILE *f = cbm_fopen(path, "wb");
     if (!f) {
@@ -145,6 +147,15 @@ static void fuzz_config(const uint8_t *data, size_t size) {
         return;
     }
     switch (data[0]) {
+    case 'm': {
+        int recovered = 0;
+        (void)cbm_toml_recover_codex_mcp(
+            path, "# >>> codebase-memory-mcp MCP >>>", "# <<< codebase-memory-mcp MCP <<<",
+            "[mcp_servers.codebase-memory-mcp]\ncommand = \"/new/codebase-memory-mcp\"\n"
+            "args = []\nenv_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n",
+            &recovered);
+        break;
+    }
     case 't':
         (void)cbm_toml_upsert_managed_block(path, "# BEGIN codebase-memory",
                                             "# END codebase-memory", "owned = true\n");
