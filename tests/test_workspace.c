@@ -9,8 +9,13 @@
 #include "test_helpers.h"
 #include "foundation/workspace.h"
 #include "foundation/compat_fs.h"
+#include "foundation/platform.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 static const char *HOME = "/Users/dev";
 static const char *CACHE = "/Users/dev/.cache/codebase-memory-mcp";
@@ -375,6 +380,89 @@ TEST(ws_manifest_approval_refuses_overbroad_requests) {
     PASS();
 }
 
+/* ── Environment helpers ────────────────────────────────────────────────── */
+
+static char *ws_env_save(const char *name) {
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+static void ws_env_restore(const char *name, char *saved) {
+    if (saved) {
+        (void)cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        (void)cbm_unsetenv(name);
+    }
+}
+
+/* The policy compares the home directory against canonical paths, so the
+ * helper must hand out the canonical form. A plain temp directory already
+ * shows the difference: on macOS /tmp is a firmlink to /private/tmp, and on
+ * Windows the temp path may carry a short (8.3) component. */
+TEST(ws_home_dir_is_resolved) {
+    char *created = th_mktempdir("cbm_ws_home");
+    ASSERT_NOT_NULL(created);
+    char real[256];
+    snprintf(real, sizeof(real), "%s", created);
+    char expected[4096];
+    ASSERT_TRUE(cbm_canonical_path(real, expected, sizeof(expected)));
+    cbm_normalize_path_sep(expected);
+
+    char *saved_home = ws_env_save("HOME");
+    ASSERT_EQ(cbm_setenv("HOME", real, 1), 0);
+    const char *home = cbm_workspace_home_dir();
+    bool resolved = home && strcmp(home, expected) == 0;
+    ws_env_restore("HOME", saved_home);
+    th_cleanup(real);
+
+    ASSERT_TRUE(resolved);
+    PASS();
+}
+
+/* A home directory reached through a link — "/home" kept on another volume,
+ * an account whose HOME is itself a link — is still the home directory when
+ * a caller presents its resolved path, and must be refused as such. */
+TEST(ws_linked_home_classified_as_home) {
+#ifdef _WIN32
+    /* symlink() does not exist on Windows, and creating a symbolic link there
+     * needs a privilege an ordinary account (and the CI runner) does not hold.
+     * A directory junction (cmd.exe mklink /J) is the Windows shape of the
+     * same case and would need a cmd.exe fixture; the resolution the case
+     * depends on is covered on Windows by ws_home_dir_is_resolved, and the
+     * link itself is exercised on POSIX. */
+    SKIP_PLATFORM("Windows: symlink() unavailable; links need a privilege");
+#else
+    char *created = th_mktempdir("cbm_ws_linked_home");
+    ASSERT_NOT_NULL(created);
+    char base[256];
+    snprintf(base, sizeof(base), "%s", created);
+    char real[512];
+    char link[512];
+    snprintf(real, sizeof(real), "%s/real", base);
+    snprintf(link, sizeof(link), "%s/link", base);
+    ASSERT_EQ(cbm_mkdir(real), 0);
+    ASSERT_EQ(symlink(real, link), 0);
+
+    char canonical_real[4096];
+    ASSERT_TRUE(cbm_canonical_path(real, canonical_real, sizeof(canonical_real)));
+    /* The fixture proves something only when the two spellings differ. */
+    ASSERT_TRUE(strcmp(link, canonical_real) != 0);
+
+    char *saved_home = ws_env_save("HOME");
+    ASSERT_EQ(cbm_setenv("HOME", link, 1), 0);
+    const char *home = cbm_workspace_home_dir();
+    bool resolved = home && strcmp(home, canonical_real) == 0;
+    cbm_ws_verdict_t verdict = cbm_workspace_classify_root(canonical_real, home, NULL);
+    ws_env_restore("HOME", saved_home);
+    th_cleanup(base);
+
+    ASSERT_TRUE(resolved);
+    ASSERT_EQ(verdict, CBM_WS_DENY_SENSITIVE);
+    PASS();
+#endif
+}
+
 SUITE(workspace) {
     RUN_TEST(ws_manifest_absent_is_not_an_error);
     RUN_TEST(ws_manifest_parses_entries_and_skips_comments);
@@ -396,4 +484,6 @@ SUITE(workspace) {
     RUN_TEST(ws_posix_matching_is_case_sensitive);
     RUN_TEST(ws_null_context_disables_dependent_checks);
     RUN_TEST(ws_every_verdict_has_a_reason);
+    RUN_TEST(ws_home_dir_is_resolved);
+    RUN_TEST(ws_linked_home_classified_as_home);
 }

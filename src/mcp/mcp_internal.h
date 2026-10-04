@@ -29,6 +29,11 @@ void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
 void cbm_mcp_server_set_search_scan_command_for_test(cbm_mcp_server_t *srv, const char *command);
 void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint64_t timeout_ms,
                                                      bool override_set);
+/* Parent directory for search_code's private cbm-search-XXXXXX scratch
+ * (NULL restores cbm_tmpdir()). Tests point it at a private directory so a
+ * scratch count cannot see other processes' entries in the shared temp dir.
+ * The server borrows dir until it is reset or the server is freed. */
+void cbm_mcp_server_set_search_scratch_dir_for_test(cbm_mcp_server_t *srv, const char *dir);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use

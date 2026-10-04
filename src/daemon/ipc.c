@@ -7078,3 +7078,21 @@ int cbm_daemon_ipc_receive_frame(cbm_daemon_ipc_connection_t *connection, uint32
     return cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms, CBM_DAEMON_MAX_FRAME_SIZE,
                                                 frame_out, payload_out);
 }
+
+int cbm_daemon_ipc_receive_frame_after_failed_send(cbm_daemon_ipc_connection_t *connection,
+                                                   uint32_t timeout_ms, uint32_t max_payload_length,
+                                                   cbm_daemon_frame_t *frame_out,
+                                                   uint8_t **payload_out) {
+    if (!connection) {
+        return cbm_daemon_ipc_receive_frame_bounded(NULL, timeout_ms, max_payload_length, frame_out,
+                                                    payload_out);
+    }
+    /* The poison came from the failed send alone (nothing was read yet), and it
+     * guards the OUTBOUND frame boundary; the inbound one is intact. Lift it for
+     * this one receive, then restore it so no later send can reuse the stream. */
+    atomic_store_explicit(&connection->poisoned, false, memory_order_release);
+    int received = cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms, max_payload_length,
+                                                        frame_out, payload_out);
+    atomic_store_explicit(&connection->poisoned, true, memory_order_release);
+    return received;
+}

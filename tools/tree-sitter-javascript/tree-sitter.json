@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "javascript",
+      "camelcase": "JavaScript",
+      "scope": "source.js",
+      "path": ".",
+      "file-types": ["js", "mjs", "cjs", "jsx"]
+    }
+  ],
+  "metadata": {
+    "version": "0.25.0-cbm.1",
+    "license": "MIT",
+    "description": "cbm fork of tree-sitter-javascript @ 58404d8 (JSX lone-ampersand fix)"
+  }
+}

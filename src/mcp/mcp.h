@@ -244,6 +244,12 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
 
 /* ── Supervised background index (RSS isolation, #832) ────────── */
 
+/* #1300: the explicit error response for a worker that exited cleanly without
+ * writing a response (worker_result->response_missing). Names the retained
+ * worker log and the last phase it reached; caller frees. */
+char *cbm_mcp_index_worker_no_response_failure(const char *args,
+                                               const cbm_index_worker_result_t *worker_result);
+
 /* One shared policy gate for supervised-index callers. Only an explicitly safe
  * terminal can yield a result or enter crash/hang recovery; cancellation,
  * failed tree containment, and unavailable worker startup are terminal. The

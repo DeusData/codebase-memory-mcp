@@ -1205,7 +1205,29 @@ static void parse_wolfram_imports(CBMExtractCtx *ctx) {
 // require/include forms remain `expression_statement`s and are still handled by
 // the text fallback.  Take the first qualified_name/name descendant of each
 // clause as the module path.
-static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix) {
+// `use function` / `use const` carry the keyword as an anonymous direct child
+// of the declaration (flat form) or of the clause (grouped form
+// `use A\{function f, const C, K}`). DEFAULT when neither is present.
+static CBMImportKind php_use_kind(TSNode node) {
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (ts_node_is_named(c)) {
+            continue;
+        }
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "function") == 0) {
+            return CBM_IMPORT_KIND_FUNCTION;
+        }
+        if (strcmp(k, "const") == 0) {
+            return CBM_IMPORT_KIND_CONST;
+        }
+    }
+    return CBM_IMPORT_KIND_DEFAULT;
+}
+
+static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix,
+                                CBMImportKind decl_kind) {
     CBMArena *a = ctx->arena;
     // The path node is the qualified_name / namespace_name / name child.
     TSNode path_node = clause;
@@ -1230,12 +1252,14 @@ static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *g
     TSNode alias = ts_node_child_by_field_name(clause, TS_FIELD("alias"));
     const char *local =
         !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
-    CBMImport imp = {.local_name = local, .module_path = path};
+    CBMImportKind kind = decl_kind != CBM_IMPORT_KIND_DEFAULT ? decl_kind : php_use_kind(clause);
+    CBMImport imp = {.local_name = local, .module_path = path, .kind = kind};
     cbm_imports_push(&ctx->result->imports, a, imp);
 }
 
 static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     CBMArena *a = ctx->arena;
+    const CBMImportKind decl_kind = php_use_kind(decl);
     // Grouped form: namespace_use_group with a leading prefix qualified_name.
     TSNode group = decl;
     if (find_first_descendant_of(decl, "namespace_use_group", &group)) {
@@ -1257,7 +1281,7 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
             const char *ck = ts_node_type(clause);
             if (strcmp(ck, "namespace_use_group_clause") == 0 ||
                 strcmp(ck, "namespace_use_clause") == 0) {
-                emit_php_use_clause(ctx, clause, prefix);
+                emit_php_use_clause(ctx, clause, prefix, decl_kind);
             }
         }
         return;
@@ -1268,13 +1292,13 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     for (uint32_t i = 0; i < dc; i++) {
         TSNode clause = ts_node_named_child(decl, i);
         if (strcmp(ts_node_type(clause), "namespace_use_clause") == 0) {
-            emit_php_use_clause(ctx, clause, NULL);
+            emit_php_use_clause(ctx, clause, NULL, decl_kind);
             any = true;
         }
     }
     if (!any) {
         // Some grammar versions inline the path directly under the declaration.
-        emit_php_use_clause(ctx, decl, NULL);
+        emit_php_use_clause(ctx, decl, NULL, decl_kind);
     }
 }
 

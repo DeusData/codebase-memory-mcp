@@ -1437,6 +1437,184 @@ TEST(sql_values_scanner_keeps_positions_of_kept_text_issue1735) {
     PASS();
 }
 
+/* ── #1736: a lone '&' in JSX is text, not a parse failure ────────────────
+ * Upstream tree-sitter-javascript (and the tsx dialect built on it) accepted
+ * '&' inside a JSX string only before a space/digit or as a complete
+ * character reference, and never inside JSX text, so `href="...?a=1&b=2"`
+ * (the reporter's Google Fonts URL) or `<p>Tom &Jerry</p>` produced an ERROR
+ * node and a parse_partial flag. Both grammars are now self-maintained forks
+ * (tools/tree-sitter-javascript, tools/tree-sitter-tsx). Each case wraps the
+ * JSX in a component and puts a second function AFTER it, so a pass also
+ * proves the definitions around the JSX are extracted. */
+static const char *const JSX_AMP_BODIES[] = {
+    /* the #1736 shape: '&' + letter in a double-quoted attribute */
+    "<link href=\"https://fonts.x/css2?family=Inter:wght@300;400&family=Syne&display=swap\" />",
+    "<link href='https://x.com/a?a=1&b=2' />", /* single-quoted attribute */
+    "<p title=\"a&\">x</p>",                   /* '&' right before the quote */
+    "<p>Tom &Jerry</p>",                       /* '&' + letter in JSX text */
+    "<p>Tom & Jerry</p>",                      /* '&' + space in JSX text */
+    "<p>x &1 y</p>",                           /* '&' + digit in JSX text */
+    /* controls: references keep parsing; '& ' / '&1' in attributes */
+    "<p title=\"x&amp;y&#38;z & w &1\">A&amp;B &#38; C</p>",
+};
+
+static const struct {
+    CBMLanguage lang;
+    const char *path;
+} JSX_AMP_LANGS[] = {
+    {CBM_LANG_JAVASCRIPT, "app/page.js"},
+    {CBM_LANG_JAVASCRIPT, "app/page.jsx"},
+    {CBM_LANG_TSX, "app/layout.tsx"},
+};
+
+enum { JSX_AMP_SRC_CAP = 512 };
+
+TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736) {
+    size_t nb = sizeof(JSX_AMP_BODIES) / sizeof(JSX_AMP_BODIES[0]);
+    size_t nl = sizeof(JSX_AMP_LANGS) / sizeof(JSX_AMP_LANGS[0]);
+    int failures = 0;
+    for (size_t l = 0; l < nl; l++) {
+        for (size_t b = 0; b < nb; b++) {
+            char src[JSX_AMP_SRC_CAP];
+            snprintf(src, sizeof(src),
+                     "export default function Page() {\n  return (\n    %s\n  );\n}\n"
+                     "export function After() {\n  return 1;\n}\n",
+                     JSX_AMP_BODIES[b]);
+            CBMFileResult *r = do_extract(src, JSX_AMP_LANGS[l].lang, JSX_AMP_LANGS[l].path);
+            ASSERT_NOT_NULL(r);
+            bool bad = r->parse_incomplete || !has_def(r, "Page") || !has_def(r, "After");
+            if (bad) {
+                fprintf(stderr, "  %s flagged=%d ranges=%s body=%s\n", JSX_AMP_LANGS[l].path,
+                        (int)r->parse_incomplete, r->error_ranges ? r->error_ranges : "(none)",
+                        JSX_AMP_BODIES[b]);
+                failures++;
+            }
+            cbm_free_result(r);
+        }
+    }
+    ASSERT_EQ(failures, 0);
+    PASS();
+}
+
+/* GUARD against an inert test: the same wrapper with genuinely broken JSX is
+ * still flagged in every one of the three languages, so the green above is the
+ * grammar accepting '&', not the signal being switched off. */
+TEST(jsx_broken_markup_still_parse_partial_issue1736) {
+    size_t nl = sizeof(JSX_AMP_LANGS) / sizeof(JSX_AMP_LANGS[0]);
+    for (size_t l = 0; l < nl; l++) {
+        const char *src = "export default function Page() {\n  return (\n"
+                          "    <p title=\"a\" =>x</p>\n  );\n}\n"
+                          "export function After() {\n  return 1;\n}\n";
+        CBMFileResult *r = do_extract(src, JSX_AMP_LANGS[l].lang, JSX_AMP_LANGS[l].path);
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        ASSERT_TRUE(flagged);
+    }
+    PASS();
+}
+
+/* ── #1748: C# 12 collection expressions in conditional branches ─────────────
+ * The vendored tree-sitter-c-sharp (pin 88366631d598) predated upstream's
+ * collection-expression support (#402, first released in v0.23.4): `[...]` was
+ * only reachable as an element_binding_expression, so an empty or a second
+ * collection literal after `?`/`:` had no valid parse and error recovery ate
+ * the surrounding statement. Every body below is valid C# 12; the method that
+ * FOLLOWS it pins that extraction resumes after the conditional. */
+#define CS_1748_WRAP(body)                         \
+    "class M\n"                                    \
+    "{\n"                                          \
+    "    async Task Go(bool c, List<int> items)\n" \
+    "    {\n" body "\n"                            \
+    "    }\n"                                      \
+    "    Task<List<int>> F() => null;\n"           \
+    "    void AfterConditional() { }\n"            \
+    "}\n"
+
+TEST(cs_collection_expression_in_conditional_is_complete_issue1748) {
+    static const char *const bodies[] = {
+        /* the reported shape: wrapped ternary, empty collection first */
+        CS_1748_WRAP("        var x = c\n            ? []\n            : await F();"),
+        CS_1748_WRAP("        var x = c ? []\n            : await F();"),
+        CS_1748_WRAP("        List<int> x = c\n            ? []\n            : [items.First()];"),
+        /* both branches collection expressions, single line */
+        CS_1748_WRAP("        List<int> x = c ? [] : [1];"),
+        /* single-line, single collection branch (also failed on the old pin) */
+        CS_1748_WRAP("        var x = c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? [] : await F();"),
+        CS_1748_WRAP("        return c ? [] : items;"),
+        CS_1748_WRAP("        if (c) return c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? items : [];"),
+        CS_1748_WRAP("        var x = c switch { true => [], _ => items };"),
+        CS_1748_WRAP("        int[] a = [1, 2, ..items];"),
+        /* control: the same wrapped shape without a collection expression */
+        CS_1748_WRAP("        var x = c\n            ? null\n            : await F();"),
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        CBMFileResult *r = do_extract(bodies[i], CBM_LANG_CSHARP, "M.cs");
+        ASSERT_NOT_NULL(r);
+        bool partial = r->parse_incomplete;
+        bool has_after = has_def(r, "AfterConditional");
+        if (partial || !has_after) {
+            fprintf(stderr, "  case %zu: partial=%d ranges=%s after_def=%d\n", i, partial,
+                    r->error_ranges ? r->error_ranges : "(none)", has_after);
+            failures++;
+        }
+        cbm_free_result(r);
+    }
+    if (failures != 0) {
+        FAIL("valid C# 12 collection expressions in conditional branches must parse completely");
+    }
+    PASS();
+}
+
+/* Calls nested in a collection expression (element and spread) must still be
+ * extracted after the refresh moved them under collection_expression /
+ * expression_element / spread_element (previously element_binding_expression /
+ * argument / range_expression). */
+TEST(cs_calls_inside_collection_expression_extracted_issue1748) {
+    const char *src = "class M\n"
+                      "{\n"
+                      "    int[] Build(bool c)\n"
+                      "    {\n"
+                      "        return c ? [] : [Head(), ..Tail()];\n"
+                      "    }\n"
+                      "    int Head() => 1;\n"
+                      "    int[] Tail() => null;\n"
+                      "}\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    bool partial = r->parse_incomplete;
+    bool head = false;
+    bool tail = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *n = r->calls.items[i].callee_name;
+        if (n && strcmp(n, "Head") == 0) {
+            head = true;
+        }
+        if (n && strcmp(n, "Tail") == 0) {
+            tail = true;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_FALSE(partial);
+    ASSERT_TRUE(head);
+    ASSERT_TRUE(tail);
+    PASS();
+}
+
+/* GUARD: the refreshed grammar must not hide genuinely broken C#. */
+TEST(cs_malformed_conditional_remains_partial_issue1748) {
+    CBMFileResult *r =
+        do_extract(CS_1748_WRAP("        var x = c ? ] : ;"), CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -1483,4 +1661,9 @@ SUITE(parse_coverage) {
     RUN_TEST(sql_dump_tuple_with_subquery_or_call_is_still_parsed_issue1735);
     RUN_TEST(sql_dump_parse_does_not_grow_with_the_row_count_issue1735);
     RUN_TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735);
+    RUN_TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736);
+    RUN_TEST(jsx_broken_markup_still_parse_partial_issue1736);
+    RUN_TEST(cs_collection_expression_in_conditional_is_complete_issue1748);
+    RUN_TEST(cs_calls_inside_collection_expression_extracted_issue1748);
+    RUN_TEST(cs_malformed_conditional_remains_partial_issue1748);
 }
