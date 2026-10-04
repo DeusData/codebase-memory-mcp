@@ -10,7 +10,10 @@
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
 #include "pipeline/lsp_surface.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
@@ -8860,6 +8863,736 @@ static void teardown_usages_repo(void) {
     g_usages_tmpdir[0] = '\0';
 }
 
+/* Real cross-file memo failure, after successful extraction. The failure
+ * must reach the public per-file error list on both production drivers. */
+static int pipeline_lsp_failure_case(bool parallel, const char *stage, bool python, bool depth) {
+    const char *src = "struct S { int m() { return 1; } };\n"
+                      "void run() { S s; s.m(); }\n";
+    if (python)
+        src = "class S:\n    def m(self):\n        return 1\ndef run():\n    s = S()\n    s.m()\n";
+    const char *filename = python ? "memo.py" : "memo.cpp";
+    const char *extra_name = NULL;
+    const char *extra_src = NULL;
+    /* The cross stage needs a call the per-file LSP cannot resolve: the parallel
+     * driver skips the cross walk for a file whose sites are all resolved. */
+    if (strcmp(stage, "cross") == 0) {
+        src = python ? "from memo_def import S\ndef run():\n    s = S()\n    s.m()\n"
+                     : "void run() { S s; s.m(); }\n";
+        extra_name = python ? "memo_def.py" : "memo_def.cpp";
+        extra_src = python ? "class S:\n    def m(self):\n        return 1\n"
+                           : "struct S { int m() { return 1; } };\n";
+    }
+    if (setup_usages_repo(filename, src, extra_name, extra_src) != 0)
+        FAIL("failed to create memo fixture");
+    char path[512];
+    if (parallel) {
+        for (int i = 0; i < 51; i++) {
+            snprintf(path, sizeof(path), "%s/memo_pad_%02d.%s", g_usages_tmpdir, i,
+                     python ? "py" : "cpp");
+            if (th_write_file(path, python ? "# inert parallel routing fixture\n"
+                                           : "// inert parallel routing fixture\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to create parallel routing fixture");
+            }
+        }
+    }
+    const char *keys[] = {
+        "CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD",
+        depth ? (python ? "CBM_TEST_PY_LSP_DEPTH_FAIL_STAGE" : "CBM_TEST_C_LSP_DEPTH_FAIL_STAGE")
+              : (python ? "CBM_TEST_PY_LSP_MEMO_FAIL_STAGE" : "CBM_TEST_C_LSP_MEMO_FAIL_STAGE")};
+    char *saved[3] = {0};
+    bool env_saved = true;
+    for (int i = 0; i < 3; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        env_saved = env_saved && (!old || saved[i]);
+    }
+    if (!env_saved) {
+        for (int i = 0; i < 3; i++)
+            free(saved[i]);
+        teardown_usages_repo();
+        FAIL("failed to save memo fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    set_rc |= cbm_setenv(keys[2], stage, 1);
+    snprintf(path, sizeof(path), "%s/memo.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = set_rc == 0 ? cbm_pipeline_new(g_usages_tmpdir, path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    cbm_pipeline_get_file_errors(p, &errors, &error_count);
+    int memo_errors = 0;
+    const char *expected_phase = strcmp(stage, "cross") == 0 ? "lsp_skipped" : "extract";
+    bool precise = true;
+    for (int i = 0; i < error_count; i++) {
+        if (errors[i].path && strcmp(errors[i].path, filename) == 0) {
+            memo_errors++;
+            precise = precise && errors[i].phase && strcmp(errors[i].phase, expected_phase) == 0 &&
+                      errors[i].reason &&
+                      strcmp(errors[i].reason,
+                             depth ? (python ? CBM_PY_LSP_DEPTH_ERROR : CBM_C_LSP_DEPTH_ERROR)
+                                   : (python ? CBM_PY_LSP_MEMO_ERROR : CBM_C_LSP_MEMO_ERROR)) == 0;
+        }
+    }
+    cbm_pipeline_free(p);
+    int restore_rc = 0;
+    for (int i = 0; i < 3; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    teardown_usages_repo();
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(memo_errors, 1);
+    ASSERT_TRUE(precise);
+    PASS();
+}
+
+TEST(pipeline_issue1527_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", false, false);
+}
+TEST(pipeline_issue1527_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", false, false);
+}
+
+TEST(pipeline_issue1527_raw_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", false, false);
+}
+TEST(pipeline_issue1527_raw_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", false, false);
+}
+
+TEST(pipeline_issue1527_python_raw_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", true, false);
+}
+
+TEST(pipeline_issue1527_python_raw_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", true, false);
+}
+
+TEST(pipeline_issue1527_python_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", true, false);
+}
+
+TEST(pipeline_issue1527_python_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", true, false);
+}
+
+TEST(pipeline_issue1527_c_raw_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", false, true);
+}
+
+TEST(pipeline_issue1527_c_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", false, true);
+}
+
+TEST(pipeline_issue1527_c_raw_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", false, true);
+}
+
+TEST(pipeline_issue1527_c_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", false, true);
+}
+
+TEST(pipeline_issue1527_python_raw_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "raw", true, true);
+}
+
+TEST(pipeline_issue1527_python_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, "cross", true, true);
+}
+
+TEST(pipeline_issue1527_python_raw_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "raw", true, true);
+}
+
+TEST(pipeline_issue1527_python_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, "cross", true, true);
+}
+
+TEST(pipeline_issue1527_cross_memo_failure_fallback) {
+    const char *src = "struct S { int m() { return 1; } }; void run() { S s; s.m(); }";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.S", .short_name = "S", .label = "Class", .lang = CBM_LANG_CPP},
+        {.qualified_name = "test.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "int",
+         .lang = CBM_LANG_CPP},
+    };
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_c_lsp_test_memo_fail_after(0);
+    cbm_pxc_run_one(CBM_LANG_CPP, &result, src, (int)strlen(src), "test", defs, 2, NULL, NULL, 0);
+    cbm_c_lsp_test_memo_fail_after(-1);
+    bool reported = result.has_error && result.lsp_skipped && result.error_msg &&
+                    strcmp(result.error_msg, CBM_C_LSP_MEMO_ERROR) == 0 &&
+                    result.resolved_calls.count == 0;
+    cbm_arena_destroy(&result.arena);
+    ASSERT_TRUE(reported);
+    PASS();
+}
+
+static bool python_module_write_fixture_file(const char *root, const char *name, const char *text) {
+    char path[768];
+    int n = snprintf(path, sizeof(path), "%s/%s", root, name);
+    return n > 0 && (size_t)n < sizeof(path) && th_write_file(path, text) == 0;
+}
+
+/* An absent node, failed edge query, or heuristic edge must not satisfy this
+ * integration check. Exact source/target identities precede strategy checks. */
+static bool python_module_exact_lsp_edge(cbm_store_t *store, const char *project,
+                                         const char *caller, const char *caller_label,
+                                         const char *target, const char *target_label) {
+    char source_qn[768], target_qn[768];
+    int sn = snprintf(source_qn, sizeof(source_qn), "%s.%s", project, caller);
+    int tn = snprintf(target_qn, sizeof(target_qn), "%s.%s", project, target);
+    if (sn <= 0 || (size_t)sn >= sizeof(source_qn) || tn <= 0 || (size_t)tn >= sizeof(target_qn))
+        return false;
+    cbm_node_t source = {0}, destination = {0};
+    bool correct =
+        cbm_store_find_node_by_qn(store, project, source_qn, &source) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(store, project, target_qn, &destination) == CBM_STORE_OK &&
+        source.id > 0 && destination.id > 0 && source.label && destination.label &&
+        strcmp(source.label, caller_label) == 0 && strcmp(destination.label, target_label) == 0;
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0, hits = 0;
+    if (correct) {
+        correct = cbm_store_find_edges_by_source_type(store, source.id, "CALLS", &edges,
+                                                      &edge_count) == CBM_STORE_OK;
+        for (int i = 0; correct && i < edge_count; i++) {
+            if (edges[i].source_id != source.id || edges[i].target_id != destination.id)
+                continue;
+            hits++;
+            const char *properties = edges[i].properties_json;
+            yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
+            const char *strategy =
+                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
+            correct = strategy && strncmp(strategy, "lsp_", 4) == 0;
+            if (doc)
+                yyjson_doc_free(doc);
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_node_free_fields(&source);
+    cbm_node_free_fields(&destination);
+    return correct && hits == 1;
+}
+
+static int python_module_callers_pipeline_case(bool parallel) {
+    static const char helpers[] = "def helper():\n"
+                                  "    return 1\n"
+                                  "class Service:\n"
+                                  "    def run(self):\n"
+                                  "        return 2\n";
+    static const char app[] = "from helpers import helper, Service\n"
+                              "def local_helper():\n"
+                              "    return 3\n"
+                              "class Local:\n"
+                              "    def run(self):\n"
+                              "        return 4\n"
+                              "class Controller:\n"
+                              "    def run(self):\n"
+                              "        helper()\n"
+                              "        method_service = Service()\n"
+                              "        method_service.run()\n"
+                              "def control():\n"
+                              "    helper()\n"
+                              "    function_service = Service()\n"
+                              "    function_service.run()\n"
+                              "    local_helper()\n"
+                              "    function_local = Local()\n"
+                              "    function_local.run()\n"
+                              "helper()\n"
+                              "module_service = Service()\n"
+                              "module_service.run()\n"
+                              "local_helper()\n"
+                              "module_local = Local()\n"
+                              "module_local.run()\n";
+    static const struct {
+        const char *caller;
+        const char *caller_label;
+        const char *target;
+        const char *target_label;
+    } expected[] = {
+        {"app", "Module", "helpers.helper", "Function"},
+        {"app", "Module", "helpers.Service.run", "Method"},
+        {"app", "Module", "app.local_helper", "Function"},
+        {"app", "Module", "app.Local.run", "Method"},
+        {"app.control", "Function", "helpers.helper", "Function"},
+        {"app.control", "Function", "helpers.Service.run", "Method"},
+        {"app.control", "Function", "app.local_helper", "Function"},
+        {"app.control", "Function", "app.Local.run", "Method"},
+        {"app.Controller.run", "Method", "helpers.helper", "Function"},
+        {"app.Controller.run", "Method", "helpers.Service.run", "Method"},
+        {"pkg.__init__", "Module", "helpers.helper", "Function"},
+    };
+    char root[512];
+    int n = snprintf(root, sizeof(root), "%s/cbm-python-module-XXXXXX", cbm_tmpdir());
+    if (n <= 0 || (size_t)n >= sizeof(root) || !cbm_mkdtemp(root))
+        FAIL("failed to create Python module fixture");
+    char path[768];
+    n = snprintf(path, sizeof(path), "%s/pkg", root);
+    bool written = n > 0 && (size_t)n < sizeof(path);
+    if (written) {
+        cbm_mkdir_p(path, 0755);
+        written = python_module_write_fixture_file(root, "helpers.py", helpers) &&
+                  python_module_write_fixture_file(root, "app.py", app) &&
+                  python_module_write_fixture_file(root, "pkg/__init__.py",
+                                                   "from helpers import helper\n"
+                                                   "PACKAGE_VALUE = helper()\n");
+    }
+    for (int i = 0; written && parallel && i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "module_pad_%02d.py", i);
+        written = python_module_write_fixture_file(root, name, "padding = 0\n");
+    }
+    if (!written) {
+        th_rmtree(root);
+        FAIL("failed to write Python module fixture");
+    }
+
+    const char *keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {0};
+    bool saved_ok = true;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        saved_ok = saved_ok && (!old || saved[i]);
+    }
+    if (!saved_ok) {
+        free(saved[0]);
+        free(saved[1]);
+        th_rmtree(root);
+        FAIL("failed to save Python module fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    n = snprintf(path, sizeof(path), "%s/module.db", root);
+    cbm_pipeline_t *pipeline = set_rc == 0 && n > 0 && (size_t)n < sizeof(path)
+                                   ? cbm_pipeline_new(root, path, CBM_MODE_FULL)
+                                   : NULL;
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    cbm_pipeline_get_file_errors(pipeline, &errors, &error_count);
+    cbm_store_t *store = run_rc == 0 ? cbm_store_open_path(path) : NULL;
+    bool correct = store != NULL;
+    int file_count = 0;
+    if (store) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        cbm_node_t *files = NULL;
+        correct = project &&
+                  cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
+                      CBM_STORE_OK &&
+                  file_count == (parallel ? 55 : 3);
+        cbm_store_free_nodes(files, file_count);
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            bool edge = project && python_module_exact_lsp_edge(
+                                       store, project, expected[i].caller, expected[i].caller_label,
+                                       expected[i].target, expected[i].target_label);
+            correct = correct && edge;
+        }
+        /* Neither the ordinary nor package Module should acquire a fake
+         * __module__ owner node. A failed lookup query is not absence proof. */
+        const char *phantoms[] = {"app.__module__", "pkg.__init__.__module__"};
+        for (int i = 0; project && i < 2; i++) {
+            char qn[768];
+            n = snprintf(qn, sizeof(qn), "%s.%s", project, phantoms[i]);
+            cbm_node_t node = {0};
+            bool absent =
+                n > 0 && (size_t)n < sizeof(qn) &&
+                cbm_store_find_node_by_qn(store, project, qn, &node) == CBM_STORE_NOT_FOUND;
+            correct = correct && absent;
+            cbm_node_free_fields(&node);
+        }
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    int restore_rc = 0;
+    for (int i = 0; i < 2; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    int cleanup_rc = th_rmtree(root);
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(cleanup_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(error_count, 0);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(pipeline_python_module_callers_sequential) {
+    return python_module_callers_pipeline_case(false);
+}
+
+TEST(pipeline_python_module_callers_parallel) {
+    return python_module_callers_pipeline_case(true);
+}
+
+/* Python file identity keeps .__init__; its exported symbols do not. */
+static bool python_init_local_inheritance(cbm_store_t *store, const char *project,
+                                          const char *module) {
+    char child_qn[768], parent_qn[768], wrong_qn[768];
+    int cn = snprintf(child_qn, sizeof(child_qn), "%s.%s.BooleanField", project, module);
+    int pn = snprintf(parent_qn, sizeof(parent_qn), "%s.%s.Field", project, module);
+    int wn = snprintf(wrong_qn, sizeof(wrong_qn), "%s.other.Field", project);
+    if (cn <= 0 || (size_t)cn >= sizeof(child_qn) || pn <= 0 || (size_t)pn >= sizeof(parent_qn) ||
+        wn <= 0 || (size_t)wn >= sizeof(wrong_qn))
+        return false;
+    cbm_node_t child = {0}, parent = {0}, wrong = {0};
+    bool ok = cbm_store_find_node_by_qn(store, project, child_qn, &child) == CBM_STORE_OK &&
+              cbm_store_find_node_by_qn(store, project, parent_qn, &parent) == CBM_STORE_OK &&
+              cbm_store_find_node_by_qn(store, project, wrong_qn, &wrong) == CBM_STORE_OK &&
+              child.id > 0 && parent.id > 0 && wrong.id > 0 && parent.id != wrong.id &&
+              child.label && parent.label && wrong.label && strcmp(child.label, "Class") == 0 &&
+              strcmp(parent.label, "Class") == 0 && strcmp(wrong.label, "Class") == 0;
+    cbm_edge_t *edges = NULL;
+    int count = 0, local = 0, foreign = 0;
+    if (ok) {
+        ok = cbm_store_find_edges_by_source_type(store, child.id, "INHERITS", &edges, &count) ==
+             CBM_STORE_OK;
+        for (int i = 0; ok && i < count; i++) {
+            local += edges[i].target_id == parent.id;
+            foreign += edges[i].target_id == wrong.id;
+        }
+    }
+    cbm_store_free_edges(edges, count);
+    cbm_node_free_fields(&child);
+    cbm_node_free_fields(&parent);
+    cbm_node_free_fields(&wrong);
+    return ok && local == 1 && foreign == 0;
+}
+
+static int python_init_scope_pipeline_case(bool parallel, const char *failure_stage) {
+    static const char body[] = "from util import normalize\n"
+                               "from other import Field as OtherField\n"
+                               "def helper(value):\n    return normalize(value)\n"
+                               "class Field:\n"
+                               "    def clean(self, value):\n        return helper(value)\n"
+                               "    def validate(self, value):\n        return self.clean(value)\n"
+                               "class BooleanField(Field):\n"
+                               "    def to_python(self, value):\n"
+                               "        self.validate(value)\n        return helper(value)\n"
+                               "def build(value):\n"
+                               "    field = BooleanField()\n"
+                               "    field.to_python(value)\n    return helper(value)\n";
+    static const char consumer[] = "from pkg import BooleanField, helper\n"
+                                   "def consume(value):\n"
+                                   "    field = BooleanField()\n"
+                                   "    field.to_python(value)\n    return helper(value)\n";
+    static const struct {
+        const char *caller;
+        const char *caller_label;
+        const char *target;
+        const char *target_label;
+    } local_edges[] = {
+        {"Field.clean", "Method", "helper", "Function"},
+        {"Field.validate", "Method", "Field.clean", "Method"},
+        {"BooleanField.to_python", "Method", "Field.validate", "Method"},
+        {"BooleanField.to_python", "Method", "helper", "Function"},
+        {"build", "Function", "BooleanField.to_python", "Method"},
+        {"build", "Function", "helper", "Function"},
+    };
+    char root[512], path[768];
+    int n = snprintf(root, sizeof(root), "%s/cbm-python-init-XXXXXX", cbm_tmpdir());
+    if (n <= 0 || (size_t)n >= sizeof(root) || !cbm_mkdtemp(root))
+        FAIL("failed to create Python package fixture");
+    n = snprintf(path, sizeof(path), "%s/pkg", root);
+    bool written = n > 0 && (size_t)n < sizeof(path);
+    /* The cross and register stages run inside the cross-file walk, which the
+     * parallel driver skips for a file whose call sites the per-file LSP
+     * already resolved: those stages need a call only the cross walk resolves. */
+    bool cross_walk_stage = failure_stage && (strcmp(failure_stage, "cross") == 0 ||
+                                              strcmp(failure_stage, "register") == 0);
+    if (written) {
+        cbm_mkdir_p(path, 0755);
+        written = python_module_write_fixture_file(
+            root, "pkg/__init__.py",
+            cross_walk_stage ? "from memo_def import S\n"
+                               "def run():\n    s = S()\n    return s.m()\n"
+            : failure_stage  ? "class S:\n    def m(self):\n        return 1\n"
+                               "def run():\n    s = S()\n    return s.m()\n"
+                             : body);
+    }
+    if (written && cross_walk_stage) {
+        written = python_module_write_fixture_file(root, "memo_def.py",
+                                                    "class S:\n    def m(self):\n        return 1\n");
+    }
+    if (written && !failure_stage) {
+        written = python_module_write_fixture_file(root, "plain.py", body) &&
+                  python_module_write_fixture_file(root, "consumer.py", consumer) &&
+                  python_module_write_fixture_file(root, "util.py",
+                                                   "def normalize(value):\n    return value\n") &&
+                  python_module_write_fixture_file(root, "other.py", "class Field:\n    pass\n");
+    }
+    for (int i = 0; written && parallel && i < 52; i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "init_pad_%02d.py", i);
+        written = python_module_write_fixture_file(root, name, "# inert parallel routing file\n");
+    }
+    if (!written) {
+        th_rmtree(root);
+        FAIL("failed to write Python package fixture");
+    }
+    const char *keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD",
+                          "CBM_TEST_PY_LSP_SCOPE_FAIL_STAGE"};
+    char *saved[3] = {0};
+    bool saved_ok = true;
+    for (int i = 0; i < 3; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        saved_ok = saved_ok && (!old || saved[i]);
+    }
+    if (!saved_ok) {
+        for (int i = 0; i < 3; i++)
+            free(saved[i]);
+        th_rmtree(root);
+        FAIL("failed to save Python package fixture environment");
+    }
+    int set_rc = cbm_setenv(keys[0], parallel ? "4" : "1", 1);
+    set_rc |= parallel ? cbm_unsetenv(keys[1]) : cbm_setenv(keys[1], "1", 1);
+    set_rc |= failure_stage ? cbm_setenv(keys[2], failure_stage, 1) : cbm_unsetenv(keys[2]);
+    n = snprintf(path, sizeof(path), "%s/package.db", root);
+    cbm_pipeline_t *pipeline = set_rc == 0 && n > 0 && (size_t)n < sizeof(path)
+                                   ? cbm_pipeline_new(root, path, CBM_MODE_FULL)
+                                   : NULL;
+    int run_rc = pipeline ? cbm_pipeline_run(pipeline) : -1;
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0, scope_errors = 0;
+    bool precise = true;
+    cbm_pipeline_get_file_errors(pipeline, &errors, &error_count);
+    for (int i = 0; i < error_count; i++) {
+        bool is_package = errors[i].path && strcmp(errors[i].path, "pkg/__init__.py") == 0;
+        if (failure_stage && is_package) {
+            scope_errors++;
+            const char *phase = strcmp(failure_stage, "raw") == 0 ? "extract" : "lsp_skipped";
+            precise = precise && errors[i].phase && strcmp(errors[i].phase, phase) == 0 &&
+                      errors[i].reason && strcmp(errors[i].reason, CBM_PY_LSP_SCOPE_ERROR) == 0;
+        } else {
+            precise = false;
+        }
+    }
+    cbm_store_t *store = run_rc == 0 ? cbm_store_open_path(path) : NULL;
+    bool correct = store != NULL;
+    if (store) {
+        const char *project = cbm_pipeline_project_name(pipeline);
+        cbm_node_t *files = NULL;
+        int file_count = 0;
+        correct = project &&
+                  cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
+                      CBM_STORE_OK &&
+                  file_count ==
+                      (cross_walk_stage ? 2 : failure_stage ? 1 : 5) + (parallel ? 52 : 0);
+        cbm_store_free_nodes(files, file_count);
+        if (project && !failure_stage) {
+            const char *modules[] = {"plain", "pkg"};
+            for (int m = 0; m < 2; m++) {
+                for (size_t i = 0; i < sizeof(local_edges) / sizeof(local_edges[0]); i++) {
+                    char caller[128], target[128];
+                    snprintf(caller, sizeof(caller), "%s.%s", modules[m], local_edges[i].caller);
+                    snprintf(target, sizeof(target), "%s.%s", modules[m], local_edges[i].target);
+                    bool edge = python_module_exact_lsp_edge(store, project, caller,
+                                                             local_edges[i].caller_label, target,
+                                                             local_edges[i].target_label);
+                    correct = correct && edge;
+                }
+                char caller[128];
+                snprintf(caller, sizeof(caller), "%s.helper", modules[m]);
+                bool imported = python_module_exact_lsp_edge(store, project, caller, "Function",
+                                                             "util.normalize", "Function");
+                bool inherits = python_init_local_inheritance(store, project, modules[m]);
+                correct = correct && imported && inherits;
+            }
+            bool method =
+                python_module_exact_lsp_edge(store, project, "consumer.consume", "Function",
+                                             "pkg.BooleanField.to_python", "Method");
+            bool function = python_module_exact_lsp_edge(store, project, "consumer.consume",
+                                                         "Function", "pkg.helper", "Function");
+            correct = correct && method && function;
+        }
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    int restore_rc = 0;
+    for (int i = 0; i < 3; i++) {
+        restore_rc |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+        free(saved[i]);
+    }
+    int cleanup_rc = th_rmtree(root);
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(cleanup_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(error_count, failure_stage ? 1 : 0);
+    ASSERT_EQ(scope_errors, failure_stage ? 1 : 0);
+    ASSERT_TRUE(precise && correct);
+    PASS();
+}
+
+TEST(pipeline_python_init_scope_sequential) {
+    return python_init_scope_pipeline_case(false, NULL);
+}
+TEST(pipeline_python_init_scope_parallel) {
+    return python_init_scope_pipeline_case(true, NULL);
+}
+TEST(pipeline_python_init_raw_scope_failure_sequential) {
+    return python_init_scope_pipeline_case(false, "raw");
+}
+TEST(pipeline_python_init_raw_scope_failure_parallel) {
+    return python_init_scope_pipeline_case(true, "raw");
+}
+TEST(pipeline_python_init_cross_scope_failure_sequential) {
+    return python_init_scope_pipeline_case(false, "cross");
+}
+TEST(pipeline_python_init_cross_scope_failure_parallel) {
+    return python_init_scope_pipeline_case(true, "cross");
+}
+TEST(pipeline_python_init_register_scope_failure_sequential) {
+    return python_init_scope_pipeline_case(false, "register");
+}
+TEST(pipeline_python_init_register_scope_failure_parallel) {
+    return python_init_scope_pipeline_case(true, "register");
+}
+
+/* Compare identities, not just counts; a duplicate import must stop at the
+ * same nearest eligible entry even when it contributes no new selections. */
+static bool python_init_filter_is(CBMLSPDef *defs, int def_count, const char *const *imports,
+                                  int import_count, const char *const *expected, int count) {
+    CBMModuleDefIndex *index = cbm_pxc_build_module_def_index(defs, def_count);
+    int got_count = -1;
+    bool succeeded = false;
+    CBMLSPDef *got =
+        cbm_pxc_filter_defs_for_file(index, defs, CBM_LANG_PYTHON, NULL, "test.consumer", imports,
+                                     import_count, &got_count, &succeeded);
+    bool correct = index && succeeded && got_count == count && (count == 0 || got);
+    for (int i = 0; correct && i < count; i++) {
+        int hits = 0;
+        for (int j = 0; j < got_count; j++)
+            hits += got[j].qualified_name && strcmp(got[j].qualified_name, expected[i]) == 0;
+        correct = hits == 1;
+    }
+    free(got);
+    cbm_pxc_free_module_def_index(index);
+    return correct;
+}
+
+TEST(pipeline_python_init_import_filter_precedence) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.consumer.use",
+         .def_module_qn = "test.consumer",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.Store",
+         .def_module_qn = "test.pkg.__init__",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.Foreign",
+         .def_module_qn = "test.pkg.__init__",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "test.Parent",
+         .def_module_qn = "test.__init__",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.foreign.Only",
+         .def_module_qn = "test.foreign.__init__",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "test.unknown.Only",
+         .def_module_qn = "test.unknown.__init__",
+         .lang = (CBMLanguage)-1},
+        {.qualified_name = "test.plain.Exact",
+         .def_module_qn = "test.plain",
+         .lang = CBM_LANG_JAVA},
+        {.qualified_name = "test.plain.Package",
+         .def_module_qn = "test.plain.__init__",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.nested.Item",
+         .def_module_qn = "test.pkg.nested.__init__",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.sub.Item",
+         .def_module_qn = "test.pkg.sub",
+         .lang = CBM_LANG_PYTHON},
+    };
+    const char *pkg[] = {"test.pkg", "test.pkg.Store", "test.pkg.Store"};
+    const char *want_pkg[] = {"test.consumer.use", "test.pkg.Store"};
+    const char *foreign[] = {"test.foreign.Only", "test.unknown.Only"};
+    const char *want_parent[] = {"test.consumer.use", "test.Parent"};
+    const char *normal[] = {"test.plain.Exact", "test.plain.Exact"};
+    const char *want_normal[] = {"test.consumer.use", "test.plain.Exact"};
+    const char *nested[] = {"test.pkg.nested.Item", "test.pkg.nested.Item"};
+    const char *want_nested[] = {"test.consumer.use", "test.pkg.nested.Item"};
+    const char *submodule[] = {"test.pkg.sub.Item"};
+    const char *want_submodule[] = {"test.consumer.use", "test.pkg.sub.Item"};
+    int n = (int)(sizeof(defs) / sizeof(defs[0]));
+    bool pkg_ok = python_init_filter_is(defs, n, pkg, 3, want_pkg, 2);
+    bool foreign_ok = python_init_filter_is(defs, n, foreign, 2, want_parent, 2);
+    bool normal_ok = python_init_filter_is(defs, n, normal, 2, want_normal, 2);
+    bool nested_ok = python_init_filter_is(defs, n, nested, 2, want_nested, 2);
+    bool submodule_ok = python_init_filter_is(defs, n, submodule, 1, want_submodule, 2);
+    ASSERT_TRUE(pkg_ok && foreign_ok && normal_ok && nested_ok && submodule_ok);
+    PASS();
+}
+
+TEST(pipeline_python_init_import_probe_failure_falls_back) {
+    const char *source = "from pkg import Store\n"
+                         "def use():\n    store = Store()\n    return store.get()\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.consumer.use",
+         .short_name = "use",
+         .label = "Function",
+         .def_module_qn = "test.consumer",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.Store",
+         .short_name = "Store",
+         .label = "Class",
+         .def_module_qn = "test.pkg.__init__",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.pkg.Store.get",
+         .short_name = "get",
+         .label = "Method",
+         .def_module_qn = "test.pkg.__init__",
+         .receiver_type = "test.pkg.Store",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+    };
+    const char *keys[] = {"Store"};
+    const char *values[] = {"test.pkg.Store"};
+    CBMModuleDefIndex *index = cbm_pxc_build_module_def_index(defs, 3);
+    int count = -1;
+    bool succeeded = true;
+    cbm_pxc_test_import_probe_fail_after(0);
+    CBMLSPDef *filtered = cbm_pxc_filter_defs_for_file(
+        index, defs, CBM_LANG_PYTHON, NULL, "test.consumer", values, 1, &count, &succeeded);
+    cbm_pxc_test_import_probe_fail_after(-1);
+    bool failed_precisely = index && !filtered && count == 0 && !succeeded;
+    free(filtered);
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_pxc_test_import_probe_fail_after(0);
+    cbm_pxc_dispatch_file(CBM_LANG_PYTHON, &result, source, (int)strlen(source), "consumer.py",
+                          "test.consumer", NULL, index, defs, 3, keys, values, 1, NULL, NULL);
+    cbm_pxc_test_import_probe_fail_after(-1);
+    const char *site = strstr(source, "store.get()");
+    int exact = 0;
+    for (int i = 0; i < result.resolved_calls.count; i++) {
+        const CBMResolvedCall *call = &result.resolved_calls.items[i];
+        if (call->caller_qn && strcmp(call->caller_qn, "test.consumer.use") == 0 &&
+            call->callee_qn && strcmp(call->callee_qn, "test.pkg.Store.get") == 0 &&
+            call->kind == CBM_RESOLVED_INVOCATION && call->strategy &&
+            strncmp(call->strategy, "lsp_", 4) == 0 && site &&
+            call->site_start_byte == (uint32_t)(site - source) &&
+            call->site_end_byte == (uint32_t)(site - source + strlen("store.get()")))
+            exact++;
+    }
+    bool resolved = !result.has_error && !result.lsp_skipped && exact == 1;
+    cbm_arena_destroy(&result.arena);
+    cbm_pxc_free_module_def_index(index);
+    ASSERT_TRUE(failed_precisely && resolved);
+    PASS();
+}
+
 /* #1277: typed instance fields of a Python class imported from another file.
  * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
  * LSP strategy. */
@@ -17577,6 +18310,35 @@ TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_python_module_callers_sequential);
+    RUN_TEST(pipeline_python_module_callers_parallel);
+    RUN_TEST(pipeline_python_init_scope_sequential);
+    RUN_TEST(pipeline_python_init_scope_parallel);
+    RUN_TEST(pipeline_python_init_raw_scope_failure_sequential);
+    RUN_TEST(pipeline_python_init_raw_scope_failure_parallel);
+    RUN_TEST(pipeline_python_init_cross_scope_failure_sequential);
+    RUN_TEST(pipeline_python_init_cross_scope_failure_parallel);
+    RUN_TEST(pipeline_python_init_register_scope_failure_sequential);
+    RUN_TEST(pipeline_python_init_register_scope_failure_parallel);
+    RUN_TEST(pipeline_python_init_import_filter_precedence);
+    RUN_TEST(pipeline_python_init_import_probe_failure_falls_back);
+    RUN_TEST(pipeline_issue1527_python_raw_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_raw_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_c_raw_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_c_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_c_raw_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_c_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_raw_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue1527_python_raw_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_python_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_raw_memo_failure_sequential);
+    RUN_TEST(pipeline_issue1527_raw_memo_failure_parallel);
+    RUN_TEST(pipeline_issue1527_cross_memo_failure_fallback);
     RUN_TEST(pipeline_nested_fixture_files_are_written);
     RUN_TEST(pipeline_fixture_file_parent_is_preserved);
     RUN_TEST(pipeline_fixture_node_count_requires_exact_source_nodes);

@@ -1,4 +1,5 @@
 #include "type_registry.h"
+#include "lsp_work.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -56,7 +57,12 @@ static void build_qn_index(CBMTypeRegistry *reg, CBMArena *idx_arena, bool for_f
     for (int i = 0; i < bucket_count; i++)
         buckets[i] = -1;
 
-    for (int i = 0; i < count; i++) {
+    /* Chains are built by prepending, so the entry inserted LAST is found
+     * first. Insert descending when the registry asked for first-registered
+     * answers (see index_first_registered). */
+    bool first = reg->index_first_registered;
+    for (int k = 0; k < count; k++) {
+        int i = first ? count - 1 - k : k;
         const char *qn = for_funcs ? reg->funcs[i].qualified_name : reg->types[i].qualified_name;
         if (!qn)
             continue;
@@ -96,7 +102,9 @@ static void build_method_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
         buckets[i] = -1;
 
     int idx = 0;
-    for (int i = 0; i < reg->func_count; i++) {
+    bool first = reg->index_first_registered; /* see build_qn_index */
+    for (int k = 0; k < reg->func_count; k++) {
+        int i = first ? reg->func_count - 1 - k : k;
         const CBMRegisteredFunc *f = &reg->funcs[i];
         if (!f->receiver_type || !f->short_name)
             continue;
@@ -779,6 +787,7 @@ static const CBMRegisteredFunc *lookup_method_self(const CBMTypeRegistry *reg,
         int slot = (int)(h & (uint64_t)(reg->method_bucket_count - 1));
         for (int idx = reg->method_buckets[slot]; idx >= 0;
              idx = reg->method_entries[idx].next_index) {
+            CBM_LSP_WORK(1);
             if (reg->method_entries[idx].hash != h)
                 continue;
             const CBMRegisteredFunc *f = &reg->funcs[reg->method_entries[idx].payload_index];
@@ -792,6 +801,7 @@ static const CBMRegisteredFunc *lookup_method_self(const CBMTypeRegistry *reg,
          * post-finalize additions stay visible instead of silently vanishing. */
         for (int i = reg->func_qn_entry_count; i < reg->func_count; i++) {
             const CBMRegisteredFunc *f = &reg->funcs[i];
+            CBM_LSP_WORK(1);
             if (f->receiver_type && f->short_name && strcmp(f->receiver_type, receiver_qn) == 0 &&
                 strcmp(f->short_name, method_name) == 0) {
                 return f;
@@ -802,6 +812,7 @@ static const CBMRegisteredFunc *lookup_method_self(const CBMTypeRegistry *reg,
 
     for (int i = 0; i < reg->func_count; i++) {
         const CBMRegisteredFunc *f = &reg->funcs[i];
+        CBM_LSP_WORK(1);
         if (f->receiver_type && f->short_name && strcmp(f->receiver_type, receiver_qn) == 0 &&
             strcmp(f->short_name, method_name) == 0) {
             return f;
@@ -829,6 +840,7 @@ static const CBMRegisteredType *lookup_type_self(const CBMTypeRegistry *reg,
         int slot = (int)(h & (uint64_t)(reg->type_qn_bucket_count - 1));
         for (int idx = reg->type_qn_buckets[slot]; idx >= 0;
              idx = reg->type_qn_entries[idx].next_index) {
+            CBM_LSP_WORK(1);
             if (reg->type_qn_entries[idx].hash != h)
                 continue;
             int p = reg->type_qn_entries[idx].payload_index;
@@ -839,6 +851,7 @@ static const CBMRegisteredType *lookup_type_self(const CBMTypeRegistry *reg,
         }
         /* Tail-scan types added after finalize (see lookup_method_self). */
         for (int i = reg->type_qn_entry_count; i < reg->type_count; i++) {
+            CBM_LSP_WORK(1);
             if (reg->types[i].qualified_name &&
                 strcmp(reg->types[i].qualified_name, qualified_name) == 0) {
                 return &reg->types[i];
@@ -848,6 +861,7 @@ static const CBMRegisteredType *lookup_type_self(const CBMTypeRegistry *reg,
     }
 
     for (int i = 0; i < reg->type_count; i++) {
+        CBM_LSP_WORK(1);
         if (strcmp(reg->types[i].qualified_name, qualified_name) == 0) {
             return &reg->types[i];
         }
@@ -873,6 +887,7 @@ static const CBMRegisteredFunc *lookup_func_self(const CBMTypeRegistry *reg,
         int slot = (int)(h & (uint64_t)(reg->func_qn_bucket_count - 1));
         for (int idx = reg->func_qn_buckets[slot]; idx >= 0;
              idx = reg->func_qn_entries[idx].next_index) {
+            CBM_LSP_WORK(1);
             if (reg->func_qn_entries[idx].hash != h)
                 continue;
             int p = reg->func_qn_entries[idx].payload_index;
@@ -883,6 +898,7 @@ static const CBMRegisteredFunc *lookup_func_self(const CBMTypeRegistry *reg,
         }
         /* Tail-scan funcs added after finalize (see lookup_method_self). */
         for (int i = reg->func_qn_entry_count; i < reg->func_count; i++) {
+            CBM_LSP_WORK(1);
             if (reg->funcs[i].qualified_name &&
                 strcmp(reg->funcs[i].qualified_name, qualified_name) == 0) {
                 return &reg->funcs[i];
@@ -892,6 +908,7 @@ static const CBMRegisteredFunc *lookup_func_self(const CBMTypeRegistry *reg,
     }
 
     for (int i = 0; i < reg->func_count; i++) {
+        CBM_LSP_WORK(1);
         if (strcmp(reg->funcs[i].qualified_name, qualified_name) == 0) {
             return &reg->funcs[i];
         }
