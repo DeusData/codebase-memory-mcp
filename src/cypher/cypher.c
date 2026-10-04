@@ -12,6 +12,8 @@
 #include "foundation/platform.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
+#include "foundation/hash_table.h"
+#include "foundation/mem_core.h"
 
 enum {
     CYP_BUF_16 = 16,
@@ -2837,6 +2839,104 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
     rb->rows[rb->row_count++] = row;
 }
 
+/* ── DISTINCT while projecting (#1364) ─────────────────────────────
+ *
+ * RETURN DISTINCT used to project up to the engine row cap and only then drop
+ * duplicates, so a value first seen past the cap never reached the result: on
+ * a 150k-edge index `RETURN DISTINCT type(r)` lost its one HAS_BRANCH edge.
+ * The projection loops now de-duplicate as they go, so the cap counts DISTINCT
+ * rows. Memory stays bounded by the cap: only admitted rows are remembered;
+ * rows past the cap are probed (no insert) solely to decide `truncated`. */
+typedef struct {
+    CBMHashTable *seen; /* row key -> the same heap key; NULL = not DISTINCT */
+} rb_distinct_t;
+
+static void rb_distinct_init(rb_distinct_t *d, bool distinct) {
+    d->seen = distinct ? cbm_ht_create(CBM_SZ_64) : NULL;
+}
+
+static void rb_distinct_free_key(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+}
+
+static void rb_distinct_free(rb_distinct_t *d) {
+    if (d->seen) {
+        cbm_ht_foreach(d->seen, rb_distinct_free_key, NULL);
+        cbm_ht_free(d->seen);
+        d->seen = NULL;
+    }
+}
+
+/* Length-prefixed row key ("<len>:<value>" per column), so no value content
+ * can make two different rows collide. NULL projects as "" (as rb_add_row). */
+static char *rb_distinct_row_key(const char **vals, int n) {
+    size_t total = SKIP_ONE;
+    for (int i = 0; i < n; i++) {
+        total += (vals[i] ? strlen(vals[i]) : 0) + CBM_SZ_32;
+    }
+    char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, total);
+    if (!key) {
+        return NULL;
+    }
+    size_t pos = 0;
+    key[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        const char *v = vals[i] ? vals[i] : "";
+        int w = snprintf(key + pos, total - pos, "%zu:%s", strlen(v), v);
+        if (w > 0) {
+            pos += (size_t)w;
+        }
+    }
+    return key;
+}
+
+/* Admission for one projected row. Returns false for a row DISTINCT already
+ * holds. On true, *key_out is the key to hand to rb_distinct_keep (NULL when
+ * not DISTINCT, or when the key allocation failed — the row is then admitted
+ * without de-duplication rather than dropped). */
+static bool rb_distinct_is_new(const rb_distinct_t *d, const char **vals, int n, char **key_out) {
+    *key_out = NULL;
+    if (!d->seen) {
+        return true;
+    }
+    char *key = rb_distinct_row_key(vals, n);
+    if (!key) {
+        return true;
+    }
+    if (cbm_ht_has(d->seen, key)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        return false;
+    }
+    *key_out = key;
+    return true;
+}
+
+static void rb_distinct_keep(rb_distinct_t *d, char *key) {
+    if (key) {
+        cbm_ht_set(d->seen, key, key);
+    }
+}
+
+/* Add one projected row under a row cap, de-duplicating when DISTINCT.
+ * Returns false once a NEW row arrives with the cap already full: the caller
+ * stops there, and flags truncation when the cap is the engine budget. A
+ * duplicate past the cap is neither kept nor evidence of truncation. */
+static bool rb_add_row_capped(result_builder_t *rb, rb_distinct_t *d, const char **vals, int cap) {
+    char *key = NULL;
+    if (!rb_distinct_is_new(d, vals, rb->col_count, &key)) {
+        return true;
+    }
+    if (rb->row_count >= cap) {
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        return false;
+    }
+    rb_distinct_keep(d, key);
+    rb_add_row(rb, vals);
+    return true;
+}
+
 /* ── Main execution ─────────────────────────────────────────────── */
 
 /* Hard ceiling: queries returning more than this trigger an error instead of data.
@@ -4359,14 +4459,20 @@ static void execute_return_star_after_with(cbm_query_t *q, binding_t *bindings, 
         cols[i] = resolve_item_alias(&wc->items[i], name_bufs[i], sizeof(name_bufs[i]));
     }
     rb_set_columns(rb, cols, col_n);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, q->ret && q->ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CYP_MAX_VARS];
         for (int i = 0; i < col_n; i++) {
             cbm_node_t *vn = binding_get(&bindings[bi], cols[i]);
             vals[i] = vn && vn->name ? vn->name : "";
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, max_rows)) {
+            g_cypher_truncated = true;
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_count, int max_rows,
@@ -4381,19 +4487,22 @@ static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_co
     int projection_cap = max_rows;
     bool cap_is_engine_budget = true;
     cbm_return_clause_t *ret = q->ret;
-    if (ret && ret->limit >= 0 && ret->limit <= max_rows && !ret->distinct &&
-        ret->order_key_count == 0 && ret->skip <= 0) {
-        projection_cap = ret->limit;
+    if (ret && ret->limit >= 0 && ret->limit <= max_rows && ret->order_key_count == 0 &&
+        ret->skip <= 0) {
+        projection_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
         cap_is_engine_budget = false;
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < projection_cap; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, ret && ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_128];
         project_star_row(&bindings[bi], vars, vc, vals);
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, projection_cap)) {
+            g_cypher_truncated = g_cypher_truncated || cap_is_engine_budget;
+            break;
+        }
     }
-    if (cap_is_engine_budget && bind_count > projection_cap) {
-        g_cypher_truncated = true;
-    }
+    rb_distinct_free(&seen);
 }
 
 /* Format an aggregate value into buf based on function name */
@@ -4662,22 +4771,25 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
     bool cap_is_engine_budget = true;
-    if (ret->limit >= 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit;
+    if (ret->limit >= 0 && ret->order_key_count == 0 && ret->skip <= 0) {
+        proj_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
         cap_is_engine_budget = false;
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_32];
         char func_bufs[CBM_SZ_32][CBM_SZ_512];
         for (int ci = 0; ci < ret->count; ci++) {
             vals[ci] =
                 project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, proj_cap)) {
+            g_cypher_truncated = g_cypher_truncated || cap_is_engine_budget;
+            break;
+        }
     }
-    if (cap_is_engine_budget && bind_count > proj_cap) {
-        g_cypher_truncated = true;
-    }
+    rb_distinct_free(&seen);
 }
 
 /* Build default 3-column headers (name, qualified_name, label) per variable */
@@ -5019,7 +5131,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         }
     }
 
-    if (ret->distinct) {
+    /* The simple and star projections de-duplicate while projecting (#1364);
+     * only aggregate rows still need the post-pass. */
+    if (ret->distinct && has_agg && !ret->star) {
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);

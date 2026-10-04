@@ -1107,7 +1107,7 @@ static void print_help(void) {
            "[--dir=<path>] [--skip-config]\n");
     printf("                                      [--clients=<tokens>]  Run "
            "'install --clients' to list tokens\n");
-    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
+    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run] [--delete-indexes]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp --version    Print version\n");

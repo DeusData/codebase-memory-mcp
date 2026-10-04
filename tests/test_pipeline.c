@@ -1786,6 +1786,35 @@ static int named_edge_count(cbm_store_t *s, const char *project, const char *edg
     return matches;
 }
 
+/* HTTP_CALLS edges out of the function `source_name` whose Route target's
+ * qualified name contains `route_qn_part` (e.g. "__route__GET__"). */
+static int http_calls_to_route(cbm_store_t *s, const char *project, const char *source_name,
+                               const char *route_qn_part) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "HTTP_CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            strcmp(source.name, source_name) == 0 && strstr(target.qualified_name, route_qn_part)) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
 /* Like named_edge_count, but distinguish same-named targets by their source
  * file. Semantic-control fixtures intentionally keep the exported short name
  * identical in two modules so a project-wide unique-name fallback cannot make
@@ -3107,6 +3136,115 @@ TEST(pipeline_incremental_repoints_call_reference_without_stale_edge) {
     cbm_store_close(second_store);
     cbm_pipeline_free(second);
     th_rmtree(tmp);
+    PASS();
+}
+
+/* #1419: every index publishes through a private staging DB in WAL mode that
+ * cbm_store_seal_for_atomic_publish() checkpoints at synchronous=FULL and
+ * switches to DELETE mode before the atomic rename. A crash before that rename
+ * discards the stage, so a WAL commit at FULL only adds an fsync per
+ * transaction without protecting anything; SQLite documents NORMAL as
+ * corruption-safe under WAL. The probe reads the EFFECTIVE synchronous level
+ * of the committing handle from a WAL hook on every connection the run opens.
+ *
+ * SQLite installs its default autocheckpoint WAL hook after auto-extensions
+ * run, so the auto-extension installs a statement trace and the trace installs
+ * the probe once the connection is fully open. The probe keeps SQLite's
+ * default 1000-frame autocheckpoint, so it does not change what the run
+ * writes. */
+enum { I1419_SYNC_FULL = 2, I1419_DEFAULT_AUTOCHECKPOINT = 1000 };
+static atomic_int g_i1419_wal_commits;
+static atomic_int g_i1419_full_sync_commits;
+
+static int i1419_wal_probe(void *arg, sqlite3 *db, const char *db_name, int wal_frames) {
+    (void)arg;
+    atomic_fetch_add(&g_i1419_wal_commits, 1);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "PRAGMA synchronous;", -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) >= I1419_SYNC_FULL) {
+        atomic_fetch_add(&g_i1419_full_sync_commits, 1);
+    }
+    sqlite3_finalize(stmt);
+    if (wal_frames >= I1419_DEFAULT_AUTOCHECKPOINT) {
+        (void)sqlite3_wal_checkpoint(db, db_name);
+    }
+    return SQLITE_OK;
+}
+
+static int i1419_trace(unsigned type, void *ctx, void *stmt, void *sql) {
+    (void)type;
+    (void)ctx;
+    (void)sql;
+    (void)sqlite3_wal_hook(sqlite3_db_handle((sqlite3_stmt *)stmt), i1419_wal_probe, NULL);
+    return 0;
+}
+
+static int i1419_install_probe(sqlite3 *db, char **errmsg, const sqlite3_api_routines *api) {
+    (void)errmsg;
+    (void)api;
+    return sqlite3_trace_v2(db, SQLITE_TRACE_STMT, i1419_trace, NULL);
+}
+
+static int i1419_index(const char *repo, const char *db_path) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_staged_publish_commits_below_full_sync_issue1419) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_i1419_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* Equal lengths + equal mtimes: the second run must route on content
+     * bytes to the closure-repair (delta) publish, not a full rebuild. */
+    static const char initial_source[] =
+        "package syncprobe\n"
+        "func alphaSyncTarget() {}\n"
+        "func bravoSyncTarget() {}\n"
+        "func syncProbeAccept(callback func()) {}\n"
+        "func syncProbeSite() { syncProbeAccept(alphaSyncTarget) }\n";
+    static const char replacement_source[] =
+        "package syncprobe\n"
+        "func alphaSyncTarget() {}\n"
+        "func bravoSyncTarget() {}\n"
+        "func syncProbeAccept(callback func()) {}\n"
+        "func syncProbeSite() { syncProbeAccept(bravoSyncTarget) }\n";
+    ASSERT_EQ(sizeof(initial_source), sizeof(replacement_source));
+    write_temp_file(tmp, "probe.go", initial_source);
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/probe.go", tmp);
+    const time_t fixed_mtime = 1700000000;
+    ASSERT_EQ(pipeline_test_set_mtime(source_path, fixed_mtime, 123456789L), 0);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/i1419.db", tmp);
+
+    atomic_store(&g_i1419_wal_commits, 0);
+    atomic_store(&g_i1419_full_sync_commits, 0);
+    ASSERT_EQ(sqlite3_auto_extension((void (*)(void))i1419_install_probe), SQLITE_OK);
+    /* Both publish routes run before any assertion, so the probe is always
+     * unregistered again even when a run fails. */
+    int full_rc = i1419_index(tmp, db_path);
+    write_temp_file(tmp, "probe.go", replacement_source);
+    int mtime_rc = pipeline_test_set_mtime(source_path, fixed_mtime, 123456789L);
+    cbm_pipeline_incremental_test_reset_faults();
+    int delta_rc = i1419_index(tmp, db_path);
+    cbm_incremental_route_t delta_route = cbm_pipeline_incremental_test_last_route();
+    (void)sqlite3_cancel_auto_extension((void (*)(void))i1419_install_probe);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_rc, 0);
+    ASSERT_EQ(mtime_rc, 0);
+    ASSERT_EQ(delta_rc, 0);
+    ASSERT_EQ(delta_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Non-vacuous: both publishes commit through the WAL. */
+    ASSERT_GT(atomic_load(&g_i1419_wal_commits), 0);
+    ASSERT_EQ(atomic_load(&g_i1419_full_sync_commits), 0);
     PASS();
 }
 
@@ -6399,6 +6537,254 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
     PASS();
 }
 
+/* A query failure is distinct from a valid zero-edge result. */
+static int ts514_pipeline_count(cbm_store_t *store, const char *sql, const char **values,
+                                int value_count) {
+    sqlite3_stmt *stmt = NULL;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    bool bound = sqlite3_bind_parameter_count(stmt) == value_count;
+    for (int i = 0; bound && i < value_count; i++)
+        bound = values[i] &&
+                sqlite3_bind_text(stmt, i + 1, values[i], -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    int count = -1;
+    if (bound && sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+            count = -1;
+    }
+    if (sqlite3_finalize(stmt) != SQLITE_OK)
+        count = -1;
+    return count;
+}
+
+/* #514: constructor injection and new-initialized fields resolve through both
+ * drivers. Same-named methods make wrong-owner and self-loop claims meaningful.
+ * Every negative has a real extracted call, source and target, plus successful
+ * queries and typed positive controls in the same run. */
+TEST(pipeline_ts_param_property_injection_issue514) {
+    static const char *paths[] = {"cats/service.ts", "cats/controller.ts", "cats/reporter.ts"};
+    static const char *sources[] = {
+        "export class BaseService { findAll(): string[] { return []; } }\n"
+        "export class CatService extends BaseService { findAll(): string[] { return ['cat']; } }\n",
+        "import { CatService } from './service';\n"
+        "export class CatController {\n"
+        "  constructor(private readonly catService: CatService, plain: CatService) {}\n"
+        "  findAll() { return this.catService.findAll(); }\n"
+        "  direct(control: CatService) { return control.findAll(); }\n"
+        "  viaPlain() { return this.plain.findAll(); }\n"
+        "}\n",
+        "import { CatService, BaseService } from './service';\n"
+        "function makeService(): CatService { return new CatService(); }\n"
+        "export class CatReporter {\n"
+        "  private fresh = new CatService();\n"
+        "  private annotated: BaseService = new CatService();\n"
+        "  private factory = makeService();\n"
+        "  constructor(protected cats: CatService) {}\n"
+        "  reportInjected() { return this.cats.findAll(); }\n"
+        "  reportLocal() { return this.fresh.findAll(); }\n"
+        "  reportAnnotated() { return this.annotated.findAll(); }\n"
+        "  reportFactory() { return this.factory.findAll(); }\n"
+        "}\n",
+    };
+    static const struct {
+        int file;
+        const char *symbol;
+        const char *expression;
+        const char *callee;
+        const char *target;
+        int want;
+    } cases[] = {
+        {1, "CatController.direct", "control.findAll()", "control.findAll", "CatService.findAll",
+         1},
+        {1, "CatController.findAll", "this.catService.findAll()", "this.catService.findAll",
+         "CatService.findAll", 1},
+        {2, "CatReporter.reportInjected", "this.cats.findAll()", "this.cats.findAll",
+         "CatService.findAll", 1},
+        {2, "CatReporter.reportLocal", "this.fresh.findAll()", "this.fresh.findAll",
+         "CatService.findAll", 1},
+        {2, "CatReporter.reportAnnotated", "this.annotated.findAll()", "this.annotated.findAll",
+         "BaseService.findAll", 1},
+        {1, "CatController.viaPlain", "this.plain.findAll()", "this.plain.findAll",
+         "CatService.findAll", 0},
+        {2, "CatReporter.reportFactory", "this.factory.findAll()", "this.factory.findAll",
+         "CatService.findAll", 0},
+    };
+    enum { NCASES = (int)(sizeof(cases) / sizeof(cases[0])) };
+    static const char node_sql[] = "SELECT count(*) FROM nodes WHERE project=?1 AND "
+                                   "qualified_name=?2 AND file_path=?3 AND label='Method'";
+    static const char edge_sql[] =
+        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id "
+        "WHERE e.project=?1 AND e.type='CALLS' AND s.qualified_name=?2 AND s.file_path=?3 "
+        "AND t.qualified_name=?4 AND t.file_path=?5 "
+        "AND (?6='' OR json_extract(e.properties,'$.strategy')=?6)";
+
+    CBMFileResult *fr[3] = {0};
+    bool extraction_ok = true;
+    for (int i = 0; i < 3; i++) {
+        fr[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_TYPESCRIPT,
+                                 "ts514_probe", paths[i], 0, NULL, NULL);
+        extraction_ok = extraction_ok && fr[i] && !fr[i]->has_error;
+    }
+    int occurrences[NCASES] = {0};
+    if (extraction_ok) {
+        for (int i = 0; i < NCASES; i++) {
+            int file = cases[i].file;
+            const char *site = strstr(sources[file], cases[i].expression);
+            char *caller = cbm_pipeline_fqn_compute("ts514_probe", paths[file], cases[i].symbol);
+            for (int c = 0; site && caller && c < fr[file]->calls.count; c++) {
+                const CBMCall *call = &fr[file]->calls.items[c];
+                uint32_t start = (uint32_t)(site - sources[file]);
+                if (call->enclosing_func_qn && strcmp(call->enclosing_func_qn, caller) == 0 &&
+                    call->callee_name && strcmp(call->callee_name, cases[i].callee) == 0 &&
+                    call->site_start_byte == start &&
+                    call->site_end_byte == start + strlen(cases[i].expression) &&
+                    call->start_line > 0)
+                    occurrences[i]++;
+            }
+            free(caller);
+        }
+    }
+    for (int i = 0; i < 3; i++)
+        cbm_free_result(fr[i]);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        FAIL("save environment");
+    }
+    char tmp[256] = "/tmp/cbm_ts_514_XXXXXX";
+    if (!cbm_mkdtemp(tmp)) {
+        free(saved_workers);
+        free(saved_single);
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < 3; i++)
+        write_temp_file(tmp, paths[i], sources[i]);
+    for (int i = 0; i < 52; i++) {
+        char name[64], body[128];
+        snprintf(name, sizeof(name), "cats/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    int run_rc[2] = {-1, -1}, files[2] = {-1, -1};
+    int edges[2][NCASES], source_nodes[2][NCASES], target_nodes[2][NCASES];
+    int unresolved_calls[2][2] = {{-1, -1}, {-1, -1}};
+    int self_loop[2] = {-1, -1}, annotation_wrong[2] = {-1, -1};
+    bool configured[2] = {false, false}, opened[2] = {false, false};
+    for (int mode = 0; mode < 2; mode++) {
+        for (int i = 0; i < NCASES; i++)
+            edges[mode][i] = source_nodes[mode][i] = target_nodes[mode][i] = -1;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+        if (mode == 0)
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        else
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        const char *workers = getenv("CBM_WORKERS");
+        const char *single = getenv("CBM_INDEX_SINGLE_THREAD");
+        configured[mode] = workers && strcmp(workers, "4") == 0 &&
+                           (mode == 0 ? single && strcmp(single, "1") == 0 : !single);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/ts514_%d.db", tmp, mode);
+        cbm_pipeline_t *pipeline =
+            configured[mode] ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+        run_rc[mode] = pipeline ? cbm_pipeline_run(pipeline) : -1;
+        cbm_store_t *store = run_rc[mode] == 0 ? cbm_store_open_path(db_path) : NULL;
+        opened[mode] = store != NULL;
+        if (store) {
+            const char *project = cbm_pipeline_project_name(pipeline);
+            const char *file_values[] = {project};
+            files[mode] = ts514_pipeline_count(
+                store, "SELECT count(*) FROM nodes WHERE project=?1 AND label='File'", file_values,
+                1);
+            for (int i = 0; i < NCASES; i++) {
+                char *src =
+                    cbm_pipeline_fqn_compute(project, paths[cases[i].file], cases[i].symbol);
+                char *tgt = cbm_pipeline_fqn_compute(project, paths[0], cases[i].target);
+                const char *src_values[] = {project, src, paths[cases[i].file]};
+                const char *tgt_values[] = {project, tgt, paths[0]};
+                source_nodes[mode][i] = ts514_pipeline_count(store, node_sql, src_values, 3);
+                target_nodes[mode][i] = ts514_pipeline_count(store, node_sql, tgt_values, 3);
+                const char *edge_values[] = {
+                    project, src,      paths[cases[i].file],
+                    tgt,     paths[0], cases[i].want ? "lsp_ts_method" : ""};
+                edges[mode][i] = ts514_pipeline_count(store, edge_sql, edge_values, 6);
+                if (!cases[i].want)
+                    unresolved_calls[mode][i - 5] = ts514_pipeline_count(
+                        store,
+                        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                        "WHERE e.project=?1 AND e.type='CALLS' "
+                        "AND s.qualified_name=?2 AND s.file_path=?3",
+                        src_values, 3);
+                if (i == 1) {
+                    edge_values[3] = src;
+                    edge_values[4] = paths[cases[i].file];
+                    edge_values[5] = "";
+                    self_loop[mode] = ts514_pipeline_count(store, edge_sql, edge_values, 6);
+                }
+                if (i == 4) {
+                    char *wrong = cbm_pipeline_fqn_compute(project, paths[0], "CatService.findAll");
+                    edge_values[3] = wrong;
+                    edge_values[5] = "";
+                    annotation_wrong[mode] = ts514_pipeline_count(store, edge_sql, edge_values, 6);
+                    free(wrong);
+                }
+                free(src);
+                free(tgt);
+            }
+            cbm_store_close(store);
+        }
+        cbm_pipeline_free(pipeline);
+    }
+    if (saved_workers)
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    else
+        cbm_unsetenv("CBM_WORKERS");
+    if (saved_single)
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+    else
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    const char *restored_workers = getenv("CBM_WORKERS");
+    const char *restored_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    bool restored =
+        (saved_workers ? restored_workers && strcmp(saved_workers, restored_workers) == 0
+                       : !restored_workers) &&
+        (saved_single ? restored_single && strcmp(saved_single, restored_single) == 0
+                      : !restored_single);
+    free(saved_workers);
+    free(saved_single);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(extraction_ok);
+    ASSERT_TRUE(restored);
+    for (int i = 0; i < NCASES; i++)
+        ASSERT_EQ(occurrences[i], 1);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_TRUE(configured[mode]);
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(opened[mode]);
+        ASSERT_GTE(files[mode], 55);
+        for (int i = 0; i < NCASES; i++) {
+            ASSERT_EQ(source_nodes[mode][i], 1);
+            ASSERT_EQ(target_nodes[mode][i], 1);
+            ASSERT_EQ(edges[mode][i], cases[i].want);
+        }
+        ASSERT_EQ(unresolved_calls[mode][0], 0);
+        ASSERT_EQ(unresolved_calls[mode][1], 0);
+        ASSERT_EQ(self_loop[mode], 0);
+        ASSERT_EQ(annotation_wrong[mode], 0);
+    }
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_recv_XXXXXX");
@@ -7139,16 +7525,19 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
 
-    /* (1) Genuine HTTP_CALLS survive under the guard (>= 3):
-     *   - axios.get('/api/orders') -> 2 edges (recognized lib #523 callee bypass
-     *     + detect_url_in_args), and
+    /* (1) Genuine HTTP_CALLS survive under the guard:
+     *   - axios.get('/api/orders') -> 1 edge, typed GET (recognized lib #523
+     *     callee bypass; no method-less arg-URL twin), and
      *   - dev.load('/api/data')    -> 1 edge via detect_url_in_args, which runs
-     *     unconditionally after emit_service_edge's branch even when the plain
-     *     fall-through is suppressed.
+     *     after emit_service_edge's branch even when the plain fall-through is
+     *     suppressed.
      * dev.load is the class the predicate-duplicating guard lost: `.load` is not
      * a route suffix and `dev` is not an HTTP lib, so it was dropped before
-     * emit_service_edge ran (RED on that guard: only axios's 2). */
-    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 3);
+     * emit_service_edge ran (RED on that guard: only axios's edge). */
+    ASSERT_EQ(http_calls_to_route(s, project, "callApi", "__route__GET__"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "callApi", "__route__"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "callLoad", "__route__ANY__"), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 2);
     /* (2) The verb-suffix + route-path member calls keep their route
      * registrations (edge type CALLS -> a Route node named by the path). These
      * classify as route_registration on main, NOT HTTP_CALLS — Option A preserves
@@ -7176,6 +7565,120 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     }
     th_rmtree(tmp);
     PASS();
+}
+
+/* Route-registration CALLS edges (via=route_registration) out of the function
+ * `source_name`. */
+static int route_registrations_from(cbm_store_t *s, const char *project, const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        if (source_ok && source.name && strcmp(source.name, source_name) == 0 &&
+            edges[i].properties_json &&
+            strstr(edges[i].properties_json, "\"via\":\"route_registration\"")) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* `import Axios from "axios"` -- the default-import binding capitalized, a
+ * common convention -- must classify `Axios.get/post/delete(url)` as HTTP
+ * client calls exactly like `axios.*`. The library table matched only the
+ * lowercase id, so the calls fell through to the `.get`/`.post` route-suffix
+ * fallback and became route REGISTRATIONS: on
+ * microsoft/Game-Control-Puzzle-Event-Administration-Tools all 69 client
+ * calls masqueraded as server Routes. A real Express registration in the same
+ * project stays a registration. `fillers` > 0 forces the parallel resolver,
+ * 0 keeps the sequential one; both classify through the same table. */
+static int capitalized_axios_case(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_axios_cap_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/service.ts",
+                    "import Axios from \"axios\";\n"
+                    "export function getSettings(eventId: string) {\n"
+                    "  return Axios.get(`/api/admin/events/${eventId}/settings`);\n"
+                    "}\n"
+                    "export function addUser(eventId: string, participant: unknown) {\n"
+                    "  return Axios.post(`/api/admin/users/${eventId}`, participant);\n"
+                    "}\n"
+                    "export function removeUser(id: string) {\n"
+                    "  return Axios.delete(`/api/admin/users/${id}`);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/server.ts",
+                    "function listUsers(req: unknown, res: unknown) {}\n"
+                    "export function mount(router: any) {\n"
+                    "  router.get('/api/admin/users', listUsers);\n"
+                    "}\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/axios_cap.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *typed_route;
+    } client[] = {{"getSettings", "__route__GET__"},
+                  {"addUser", "__route__POST__"},
+                  {"removeUser", "__route__DELETE__"}};
+    for (size_t i = 0; i < sizeof(client) / sizeof(client[0]); i++) {
+        ASSERT_EQ(route_registrations_from(s, project, client[i].caller), 0);
+        ASSERT_EQ(http_calls_to_route(s, project, client[i].caller, client[i].typed_route), 1);
+    }
+    /* Control: the server-side registration is untouched. */
+    ASSERT_EQ(route_registrations_from(s, project, "mount"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "mount", "__route__"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_capitalized_axios_import_is_http_client) {
+    return capitalized_axios_case(52);
+}
+
+TEST(pipeline_capitalized_axios_import_is_http_client_sequential) {
+    return capitalized_axios_case(0);
 }
 
 /* Python bare-call local-binding suppression, sequential path. The bare-call
@@ -7955,6 +8458,103 @@ TEST(pipeline_local_fetch_shadow_not_classified_as_http) {
     PASS();
 }
 
+/* A call the HTTP service patterns classify (axios, an axios.create instance)
+ * gets exactly ONE HTTP_CALLS edge, typed with the verb its callee names. The
+ * arg-URL heuristic (detect_url_in_args, via=arg_url) exists for calls the
+ * patterns do not know -- a local fetch wrapper such as callApi('/api/orders')
+ * -- and must not add a second, method-less __route__ANY__ edge for the same
+ * call site. On microsoft/healthcare-ai-model-evaluator 59 of 129 HTTP_CALLS
+ * were such twins, and the cross-repo matcher bound them to server handlers of
+ * any method. `fillers` > 0 forces the parallel resolver (the RED case); 0
+ * keeps the sequential one, which must agree. */
+static int typed_http_no_url_twin_case(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_http_twin_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/api.ts",
+                    "import axios from 'axios';\n"
+                    "const axiosInstance = axios.create({ baseURL: 'http://localhost:5000' });\n"
+                    "export function getModel(id: string) {\n"
+                    "  return axiosInstance.get(`/api/models/${id}`);\n"
+                    "}\n"
+                    "export function addModel(body: unknown) {\n"
+                    "  return axiosInstance.post('/api/models', body);\n"
+                    "}\n"
+                    "export function removeModel(id: string) {\n"
+                    "  return axios.delete(`/api/models/${id}`);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/wrapper.ts",
+                    "function callApi(path: string): Promise<Response> {\n"
+                    "  return fetch(path);\n"
+                    "}\n"
+                    "export function listOrders() {\n"
+                    "  return callApi('/api/orders');\n"
+                    "}\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/http_twin.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *typed_route;
+    } typed[] = {{"getModel", "__route__GET__"},
+                 {"addModel", "__route__POST__"},
+                 {"removeModel", "__route__DELETE__"}};
+    for (size_t i = 0; i < sizeof(typed) / sizeof(typed[0]); i++) {
+        /* The typed edge stays ... */
+        ASSERT_EQ(http_calls_to_route(s, project, typed[i].caller, typed[i].typed_route), 1);
+        /* ... and it is the only HTTP_CALLS edge of that call site. */
+        ASSERT_EQ(http_calls_to_route(s, project, typed[i].caller, "__route__ANY__"), 0);
+        ASSERT_EQ(http_calls_to_route(s, project, typed[i].caller, "__route__"), 1);
+    }
+    if (fillers > 0) {
+        /* Control: the heuristic still covers the call no pattern knows. The
+         * sequential resolver has no arg-URL heuristic yet (#2235). */
+        ASSERT_EQ(http_calls_to_route(s, project, "listOrders", "__route__ANY__"), 1);
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_typed_http_call_has_no_arg_url_twin) {
+    return typed_http_no_url_twin_case(52);
+}
+
+TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential) {
+    return typed_http_no_url_twin_case(0);
+}
+
 /* ── Git history pass tests ─────────────────────────────────────── */
 
 TEST(githistory_is_trackable) {
@@ -8358,6 +8958,145 @@ static void teardown_usages_repo(void) {
     if (g_usages_tmpdir[0])
         rm_rf(g_usages_tmpdir);
     g_usages_tmpdir[0] = '\0';
+}
+
+/* #1277: typed instance fields of a Python class imported from another file.
+ * Counts CALLS edges caller -> callee (QN suffixes) whose properties name an
+ * LSP strategy. */
+static int count_lsp_calls(cbm_store_t *s, const char *project, const char *caller_suffix,
+                           const char *callee_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    int hits = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            size_t cs = strlen(caller_suffix);
+            size_t ts = strlen(callee_suffix);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0 &&
+                edges[i].properties_json && strstr(edges[i].properties_json, "lsp")) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    return hits;
+}
+
+static int check_python_crossfile_typed_field_calls_issue1277(bool parallel) {
+    const char *contracts = "class Contract:\n"
+                            "    def process_batch(self) -> None:\n"
+                            "        ...\n";
+    const char *trainer = "from contracts import Contract\n\n"
+                          "def make():\n"
+                          "    return None\n\n"
+                          "class Trainer:\n"
+                          "    engine: Contract\n\n"
+                          "    def __init__(self, strategies: Contract) -> None:\n"
+                          "        self.strategies = strategies\n"
+                          "        self.typed: Contract = strategies\n"
+                          "        self.plain = make()\n";
+    const char *loop = "from trainer import Trainer\n\n"
+                       "def run(trainer: Trainer) -> None:\n"
+                       "    strategies = trainer.strategies\n"
+                       "    strategies.process_batch()\n\n"
+                       "def run_typed(trainer: Trainer) -> None:\n"
+                       "    trainer.typed.process_batch()\n\n"
+                       "def run_classlevel(trainer: Trainer) -> None:\n"
+                       "    trainer.engine.process_batch()\n\n"
+                       "def run_untyped(trainer: Trainer) -> None:\n"
+                       "    trainer.plain.process_batch()\n";
+    if (setup_usages_repo("contracts.py", contracts, "trainer.py", trainer) != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/loop.py", g_usages_tmpdir);
+    if (th_write_file(path, loop) != 0) {
+        teardown_usages_repo();
+        FAIL("failed to write loop.py");
+    }
+    if (parallel) {
+        /* Three semantic files plus 50 inert files exceed the production
+         * threshold for the fused parallel pipeline. */
+        for (int i = 0; i < 50; i++) {
+            snprintf(path, sizeof(path), "%s/field_pad_%02d.py", g_usages_tmpdir, i);
+            if (th_write_file(path, "field_padding = 0\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to write parallel-selection fixture");
+            }
+        }
+    }
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_usages_repo();
+        FAIL("failed to save pipeline environment");
+    }
+    int pin_workers_rc = parallel ? cbm_setenv("CBM_WORKERS", "4", 1) : 0;
+    int pin_single_rc = parallel ? cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") : 0;
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_1277.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = pin_workers_rc == 0 && pin_single_rc == 0
+                            ? cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL)
+                            : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_store_t *s = run_rc == 0 ? cbm_store_open_path(db_path) : NULL;
+    bool store_opened = s != NULL;
+    int via_alias = -1, via_typed = -1, via_class = -1, via_untyped = -1;
+    if (s) {
+        const char *project = cbm_pipeline_project_name(p);
+        via_alias = count_lsp_calls(s, project, "loop.run", "contracts.Contract.process_batch");
+        via_typed =
+            count_lsp_calls(s, project, "loop.run_typed", "contracts.Contract.process_batch");
+        via_class =
+            count_lsp_calls(s, project, "loop.run_classlevel", "contracts.Contract.process_batch");
+        via_untyped = count_lsp_calls(s, project, "loop.run_untyped", "process_batch");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    int restore_single_rc = saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                                         : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+    teardown_usages_repo();
+
+    ASSERT_EQ(pin_workers_rc, 0);
+    ASSERT_EQ(pin_single_rc, 0);
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(restore_single_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_EQ(via_alias, 1);   /* self.x = <annotated __init__ parameter> */
+    ASSERT_EQ(via_typed, 1);   /* self.x: T = ... */
+    ASSERT_EQ(via_class, 1);   /* class-level x: T */
+    ASSERT_EQ(via_untyped, 0); /* control: no annotation, no guess */
+    PASS();
+}
+
+TEST(python_crossfile_typed_field_calls_issue1277) {
+    return check_python_crossfile_typed_field_calls_issue1277(false);
+}
+
+TEST(python_crossfile_typed_field_calls_issue1277_parallel) {
+    return check_python_crossfile_typed_field_calls_issue1277(true);
 }
 
 TEST(usages_creates_edges) {
@@ -9769,6 +10508,83 @@ TEST(pipeline_docstring_go_class) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
+    PASS();
+}
+
+/* Index one file; true when the node with this label and name stores `want` in
+ * its properties JSON. */
+static bool doc_props_contain(const char *file, const char *content, const char *label,
+                              const char *name, const char *want) {
+    const char *files[] = {file};
+    const char *contents[] = {content};
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        return false;
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    bool found = false;
+    if (p && cbm_pipeline_run(p) == 0) {
+        cbm_store_t *s = cbm_store_open_path(db);
+        cbm_node_t *nodes = NULL;
+        int nc = 0;
+        if (s && cbm_store_find_nodes_by_label(s, cbm_pipeline_project_name(p), label, &nodes,
+                                               &nc) == 0) {
+            for (int i = 0; i < nc; i++) {
+                if (nodes[i].name && strcmp(nodes[i].name, name) == 0 && nodes[i].properties_json &&
+                    strstr(nodes[i].properties_json, want)) {
+                    found = true;
+                }
+            }
+            cbm_store_free_nodes(nodes, nc);
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    teardown_lang_repo();
+    return found;
+}
+
+TEST(pipeline_doc_go_package_comment_on_file_node) {
+    /* go/doc: the comment group touching `package` documents the package; it is
+     * stored on the File node. */
+    ASSERT_TRUE(doc_props_contain("knob.go",
+                                  "// Package knob turns knobs.\n"
+                                  "package knob\n\n"
+                                  "func Turn() {}\n",
+                                  "File", "knob.go",
+                                  "\"docstring\":\"// Package knob turns knobs.\""));
+    PASS();
+}
+
+TEST(pipeline_doc_rust_inner_doc_on_file_node) {
+    ASSERT_TRUE(doc_props_contain("lib.rs",
+                                  "//! Knob crate.\n"
+                                  "//! Turns knobs.\n"
+                                  "\n"
+                                  "pub fn turn() {}\n",
+                                  "File", "lib.rs",
+                                  "\"docstring\":\"//! Knob crate.\\n//! Turns knobs.\""));
+    PASS();
+}
+
+TEST(pipeline_doc_long_docstring_stored_whole) {
+    /* A 30-line doc (longer than the old fixed 2 KB properties buffer on its
+     * own) is stored whole, and the fields after it are not dropped. */
+    char src[4096];
+    int s = snprintf(src, sizeof(src), "package knob\n\n");
+    for (int i = 0; i < 30; i++) {
+        s += snprintf(src + s, sizeof(src) - (size_t)s,
+                      "// Line %02d of a long doc comment that keeps on going.\n", i);
+    }
+    snprintf(src + s, sizeof(src) - (size_t)s, "func Long(steps int) int { return steps }\n");
+    ASSERT_TRUE(doc_props_contain("knob.go", src, "Function", "Long",
+                                  "that keeps on going.\\n// Line 29 of a long doc"));
+    ASSERT_TRUE(doc_props_contain("knob.go", src, "Function", "Long", "\"signature\":"));
     PASS();
 }
 
@@ -16464,6 +17280,402 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 }
 #endif
 
+/* #1153: a C++ method called on the object a static factory returns
+ * (`SecdManager::getInstance()->m()`, `Registry::instance().m()`,
+ * `auto w = Widget::create(); w->m()`) got no CALLS edge when the class lives
+ * in another file. The class is declared in a header, its methods are defined
+ * out of line in a .cpp, and the call is in a third file -- the reporter's
+ * layout. The cross-file C++ LSP resolved `Class::member` only under the
+ * caller's own module QN or as a bare QN, so the static call missed, its return
+ * type stayed unknown, and every receiver built from it dropped the method
+ * call. In one file the same code already resolved.
+ *
+ * `Other` declares the same method names in the same header: a correct
+ * resolution must never bind them. `Twin` is declared by two libraries, so
+ * `Twin::get()` names no single class and must stay unresolved. `Mystery` is
+ * never defined, so `m->paint()` has no receiver type to dispatch on. 52
+ * fillers + CBM_WORKERS=4 force the parallel path; each test runs both. */
+/* write_temp_file creates one directory level; this layout nests two. */
+static void cpp_recv_write(const char *tmp, const char *name, const char *content) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/%s", tmp, name);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        cbm_mkdir_p(dir, 0755);
+    }
+    write_temp_file(tmp, name, content);
+}
+
+static void cpp_recv_write_fixture(const char *tmp, bool parallel) {
+    cpp_recv_write(tmp, "app/src/SecdManager.h",
+                   "#pragma once\n"
+                   "#include <memory>\n\n"
+                   "class SecdManager {\n"
+                   "public:\n"
+                   "    static SecdManager *getInstance();\n"
+                   "    bool secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, int &pic_id);\n"
+                   "};\n\n"
+                   "class Registry {\n"
+                   "public:\n"
+                   "    static Registry &instance();\n"
+                   "    void registerItem(int id);\n"
+                   "};\n\n"
+                   "class Widget {\n"
+                   "public:\n"
+                   "    static std::unique_ptr<Widget> create();\n"
+                   "    void paint();\n"
+                   "};\n\n"
+                   "class Session {\n"
+                   "public:\n"
+                   "    static std::shared_ptr<Session> open();\n"
+                   "    void close();\n"
+                   "};\n\n"
+                   "class Other {\n"
+                   "public:\n"
+                   "    bool secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, int &pic_id);\n"
+                   "    void registerItem(int id);\n"
+                   "    void paint();\n"
+                   "    void close();\n"
+                   "};\n");
+    cpp_recv_write(
+        tmp, "app/src/SecdManager.cpp",
+        "#include \"SecdManager.h\"\n\n"
+        "SecdManager *SecdManager::getInstance() {\n"
+        "    static SecdManager inst;\n"
+        "    return &inst;\n"
+        "}\n\n"
+        "bool SecdManager::secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, "
+        "int &pic_id) {\n"
+        "    fpc_id = ifdh;\n"
+        "    pic_id = ifdh;\n"
+        "    return true;\n"
+        "}\n\n"
+        "Registry &Registry::instance() {\n"
+        "    static Registry r;\n"
+        "    return r;\n"
+        "}\n\n"
+        "void Registry::registerItem(int id) { (void)id; }\n\n"
+        "std::unique_ptr<Widget> Widget::create() { return std::make_unique<Widget>(); }\n\n"
+        "void Widget::paint() {}\n\n"
+        "std::shared_ptr<Session> Session::open() { return std::make_shared<Session>(); }\n\n"
+        "void Session::close() {}\n\n"
+        "bool Other::secd_retrieve_pic_fpc_i2c_id(int ifdh, int &fpc_id, int &pic_id) {\n"
+        "    fpc_id = pic_id = ifdh;\n"
+        "    return false;\n"
+        "}\n"
+        "void Other::registerItem(int id) { (void)id; }\n"
+        "void Other::paint() {}\n"
+        "void Other::close() {}\n");
+    for (int lib = 0; lib < 2; lib++) {
+        char path[64];
+        snprintf(path, sizeof(path), "lib_%c/Twin.h", 'a' + lib);
+        cpp_recv_write(tmp, path,
+                       "#pragma once\n"
+                       "class Twin {\n"
+                       "public:\n"
+                       "    static Twin *get();\n"
+                       "    void run();\n"
+                       "};\n");
+        snprintf(path, sizeof(path), "lib_%c/Twin.cpp", 'a' + lib);
+        cpp_recv_write(tmp, path,
+                       "#include \"Twin.h\"\n\n"
+                       "Twin *Twin::get() {\n"
+                       "    static Twin t;\n"
+                       "    return &t;\n"
+                       "}\n\n"
+                       "void Twin::run() {}\n");
+    }
+    cpp_recv_write(
+        tmp, "pil/src/SecdCfgHandlerThread.cpp",
+        "#include \"SecdManager.h\"\n"
+        "#include \"Twin.h\"\n\n"
+        "int GetExternalPhyPresent(int ifdh) {\n"
+        "    int fpc_id = 0, pic_id = 0;\n"
+        "    if (!SecdManager::getInstance()->secd_retrieve_pic_fpc_i2c_id(ifdh, fpc_id, "
+        "pic_id)) {\n"
+        "        return -1;\n"
+        "    }\n"
+        "    return fpc_id + pic_id;\n"
+        "}\n\n"
+        "void UseRegistry() {\n"
+        "    Registry::instance().registerItem(7);\n"
+        "}\n\n"
+        "void UseWidget() {\n"
+        "    auto w = Widget::create();\n"
+        "    w->paint();\n"
+        "}\n\n"
+        "void UseSession() {\n"
+        "    auto s = Session::open();\n"
+        "    s->close();\n"
+        "}\n\n"
+        "void UseUnknown(struct Mystery *m) {\n"
+        "    m->paint();\n"
+        "}\n\n"
+        "void UseTwin() {\n"
+        "    Twin::get()->run();\n"
+        "}\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64];
+        char pad[128];
+        snprintf(name, sizeof(name), "pad/cpp_pad_%02d.cpp", i);
+        snprintf(pad, sizeof(pad), "int cpp_pad_%02d() { return %d; }\n", i, i);
+        write_temp_file(tmp, name, pad);
+    }
+}
+
+typedef struct {
+    char tmp[256];
+    char db[512];
+    char *saved_workers;
+    cbm_pipeline_t *p;
+    cbm_store_t *s;
+    const char *project;
+} CppRecvRun;
+
+static void cpp_recv_close(CppRecvRun *r) {
+    if (r->s) {
+        cbm_store_close(r->s);
+    }
+    if (r->p) {
+        cbm_pipeline_free(r->p);
+    }
+    if (r->saved_workers) {
+        cbm_setenv("CBM_WORKERS", r->saved_workers, 1);
+        free(r->saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (r->tmp[0]) {
+        th_rmtree(r->tmp);
+    }
+    memset(r, 0, sizeof(*r));
+}
+
+/* Every node an assertion names must exist, or "no CALLS edge" would also
+ * pass for a fixture that never got indexed. */
+static bool cpp_recv_fixture_indexed(const CppRecvRun *r) {
+    static const char *const required[] = {
+        "pil.src.SecdCfgHandlerThread.GetExternalPhyPresent",
+        "pil.src.SecdCfgHandlerThread.UseRegistry",
+        "pil.src.SecdCfgHandlerThread.UseWidget",
+        "pil.src.SecdCfgHandlerThread.UseSession",
+        "pil.src.SecdCfgHandlerThread.UseUnknown",
+        "pil.src.SecdCfgHandlerThread.UseTwin",
+        "app.src.SecdManager.SecdManager.getInstance",
+        "app.src.SecdManager.SecdManager.secd_retrieve_pic_fpc_i2c_id",
+        "app.src.SecdManager.Registry.registerItem",
+        "app.src.SecdManager.Widget.paint",
+        "app.src.SecdManager.Session.close",
+        "app.src.SecdManager.Other.secd_retrieve_pic_fpc_i2c_id",
+        "app.src.SecdManager.Other.registerItem",
+        "app.src.SecdManager.Other.paint",
+        "app.src.SecdManager.Other.close",
+        "lib_a.Twin.Twin.get",
+        "lib_a.Twin.Twin.run",
+        "lib_b.Twin.Twin.get",
+        "lib_b.Twin.Twin.run",
+    };
+    bool all = true;
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        char qn[512];
+        snprintf(qn, sizeof(qn), "%s.%s", r->project, required[i]);
+        cbm_node_t n;
+        memset(&n, 0, sizeof(n));
+        if (cbm_store_find_node_by_qn(r->s, r->project, qn, &n) != CBM_STORE_OK) {
+            printf("  fixture node missing: %s\n", qn);
+            all = false;
+        }
+        cbm_node_free_fields(&n);
+    }
+    return all;
+}
+
+/* Index the fixture; false (after cleanup) when the run itself fails. */
+static bool cpp_recv_open(CppRecvRun *r, bool parallel) {
+    memset(r, 0, sizeof(*r));
+    snprintf(r->tmp, sizeof(r->tmp), "/tmp/cbm_cpp_recv_XXXXXX");
+    if (!cbm_mkdtemp(r->tmp)) {
+        r->tmp[0] = '\0';
+        return false;
+    }
+    cpp_recv_write_fixture(r->tmp, parallel);
+    const char *old_workers = getenv("CBM_WORKERS");
+    r->saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+    snprintf(r->db, sizeof(r->db), "%s/cpp_recv.db", r->tmp);
+    r->p = cbm_pipeline_new(r->tmp, r->db, CBM_MODE_FULL);
+    if (!r->p || cbm_pipeline_run(r->p) != 0) {
+        cpp_recv_close(r);
+        return false;
+    }
+    r->s = cbm_store_open_path(r->db);
+    r->project = cbm_pipeline_project_name(r->p);
+    if (!r->s || !r->project || !cpp_recv_fixture_indexed(r)) {
+        cpp_recv_close(r);
+        return false;
+    }
+    return true;
+}
+
+/* Properties of the CALLS edge caller -> target (QNs below the project), or
+ * NULL when there is no such edge. The caller frees the result. */
+static char *cpp_recv_calls(const CppRecvRun *r, const char *caller, const char *target) {
+    char src_qn[512];
+    char tgt_qn[512];
+    snprintf(src_qn, sizeof(src_qn), "%s.%s", r->project, caller);
+    snprintf(tgt_qn, sizeof(tgt_qn), "%s.%s", r->project, target);
+    cbm_node_t src;
+    cbm_node_t tgt;
+    memset(&src, 0, sizeof(src));
+    memset(&tgt, 0, sizeof(tgt));
+    char *props = NULL;
+    if (cbm_store_find_node_by_qn(r->s, r->project, src_qn, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(r->s, r->project, tgt_qn, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(r->s, src.id, "CALLS", &edges, &ec);
+        for (int i = 0; i < ec && !props; i++) {
+            if (edges[i].target_id == tgt.id) {
+                props = strdup(edges[i].properties_json ? edges[i].properties_json : "{}");
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    return props;
+}
+
+#define CPP_RECV_CALLER "pil.src.SecdCfgHandlerThread."
+#define CPP_RECV_CLASS "app.src.SecdManager."
+
+/* 1 = an lsp_* CALLS edge, 0 = no edge, -1 = an edge from a name heuristic. */
+static int cpp_recv_edge_kind(const CppRecvRun *r, bool parallel, const char *caller,
+                              const char *target) {
+    char *props = cpp_recv_calls(r, caller, target);
+    int kind = props ? (strstr(props, "\"strategy\":\"lsp_") ? 1 : -1) : 0;
+    if (kind != 1) {
+        printf("  [%s] %s -> %s: %s\n", parallel ? "parallel" : "sequential", caller, target,
+               props ? props : "(no CALLS edge)");
+    }
+    free(props);
+    return kind;
+}
+
+/* Reported shape: a raw pointer from a singleton accessor. */
+TEST(pipeline_cpp_static_factory_pointer_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int factory = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "GetExternalPhyPresent",
+                                         CPP_RECV_CLASS "SecdManager.getInstance");
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "GetExternalPhyPresent",
+                                        CPP_RECV_CLASS "SecdManager.secd_retrieve_pic_fpc_i2c_id");
+        char *wrong = cpp_recv_calls(&r, CPP_RECV_CALLER "GetExternalPhyPresent",
+                                     CPP_RECV_CLASS "Other.secd_retrieve_pic_fpc_i2c_id");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(factory, 1); /* RED: only a unique_name guess */
+        ASSERT_EQ(method, 1);  /* RED: the call through the returned pointer dropped */
+        ASSERT_TRUE(no_wrong); /* control: never the same-named Other method */
+    }
+    PASS();
+}
+
+/* `Foo::instance().bar()`: a reference-returning accessor. */
+TEST(pipeline_cpp_static_factory_reference_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "UseRegistry",
+                                        CPP_RECV_CLASS "Registry.registerItem");
+        char *wrong =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseRegistry", CPP_RECV_CLASS "Other.registerItem");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(method, 1);  /* RED: dropped */
+        ASSERT_TRUE(no_wrong); /* control: never the same-named Other method */
+    }
+    PASS();
+}
+
+/* `auto w = Widget::create(); w->paint();` with std::unique_ptr<Widget>. */
+TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "UseWidget",
+                                        CPP_RECV_CLASS "Widget.paint");
+        char *wrong = cpp_recv_calls(&r, CPP_RECV_CALLER "UseWidget", CPP_RECV_CLASS "Other.paint");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(method, 1);
+        ASSERT_TRUE(no_wrong);
+    }
+    PASS();
+}
+
+/* `auto s = Session::open(); s->close();` with std::shared_ptr<Session>. */
+TEST(pipeline_cpp_static_factory_shared_ptr_receiver_issue1153) {
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        int method = cpp_recv_edge_kind(&r, parallel, CPP_RECV_CALLER "UseSession",
+                                        CPP_RECV_CLASS "Session.close");
+        char *wrong =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseSession", CPP_RECV_CLASS "Other.close");
+        cpp_recv_close(&r);
+        bool no_wrong = wrong == NULL;
+        free(wrong);
+        ASSERT_EQ(method, 1);
+        ASSERT_TRUE(no_wrong);
+    }
+    PASS();
+}
+
+/* Controls: no receiver type, or a class name two libraries declare, gives
+ * the LSP nothing to dispatch on -- neither may gain an edge. */
+TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153) {
+    static const char *const twin_targets[] = {"lib_a.Twin.Twin.get", "lib_a.Twin.Twin.run",
+                                               "lib_b.Twin.Twin.get", "lib_b.Twin.Twin.run"};
+    for (int mode = 0; mode < 2; mode++) {
+        bool parallel = mode == 1;
+        CppRecvRun r;
+        ASSERT_TRUE(cpp_recv_open(&r, parallel));
+        char *widget =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseUnknown", CPP_RECV_CLASS "Widget.paint");
+        char *other =
+            cpp_recv_calls(&r, CPP_RECV_CALLER "UseUnknown", CPP_RECV_CLASS "Other.paint");
+        int twin_lsp = 0;
+        for (int t = 0; t < 4; t++) {
+            char *props = cpp_recv_calls(&r, CPP_RECV_CALLER "UseTwin", twin_targets[t]);
+            if (props && strstr(props, "\"strategy\":\"lsp_")) {
+                printf("  [%s] UseTwin -> %s: %s\n", parallel ? "parallel" : "sequential",
+                       twin_targets[t], props);
+                twin_lsp++;
+            }
+            free(props);
+        }
+        cpp_recv_close(&r);
+        bool unknown_unbound = widget == NULL && other == NULL;
+        free(widget);
+        free(other);
+        ASSERT_TRUE(unknown_unbound);
+        ASSERT_EQ(twin_lsp, 0);
+    }
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_nested_fixture_files_are_written);
     RUN_TEST(pipeline_fixture_file_parent_is_preserved);
@@ -16541,6 +17753,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916);
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
+    RUN_TEST(pipeline_ts_param_property_injection_issue514);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
@@ -16551,6 +17764,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_capitalized_axios_import_is_http_client);
+    RUN_TEST(pipeline_capitalized_axios_import_is_http_client_sequential);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
@@ -16563,6 +17778,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
+    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
+    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
@@ -16576,6 +17793,8 @@ SUITE(pipeline) {
     RUN_TEST(implements_creates_override);
     RUN_TEST(implements_no_match);
     /* Usages pass (full pipeline integration) */
+    RUN_TEST(python_crossfile_typed_field_calls_issue1277);
+    RUN_TEST(python_crossfile_typed_field_calls_issue1277_parallel);
     RUN_TEST(usages_creates_edges);
     RUN_TEST(usages_no_duplicate_calls);
     RUN_TEST(calls_edge_carries_call_site_line);
@@ -16603,6 +17822,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_docstring_java_method);
     RUN_TEST(pipeline_docstring_kotlin_function);
     RUN_TEST(pipeline_docstring_go_class);
+    RUN_TEST(pipeline_doc_go_package_comment_on_file_node);
+    RUN_TEST(pipeline_doc_rust_inner_doc_on_file_node);
+    RUN_TEST(pipeline_doc_long_docstring_stored_whole);
     /* Project name */
     RUN_TEST(project_name_from_path);
     RUN_TEST(project_name_drive_letter_case_insensitive_issue394);
@@ -16834,6 +18056,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
     RUN_TEST(pipeline_semantic_edges_no_functions);
     RUN_TEST(pipeline_semantic_batched_matches_unbatched);
+    RUN_TEST(pipeline_cpp_static_factory_pointer_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_static_factory_reference_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_static_factory_shared_ptr_receiver_issue1153);
+    RUN_TEST(pipeline_cpp_unresolvable_receiver_stays_unbound_issue1153);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
@@ -16842,6 +18069,7 @@ SUITE(pipeline) {
 SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete);
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
+    RUN_TEST(pipeline_staged_publish_commits_below_full_sync_issue1419);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);

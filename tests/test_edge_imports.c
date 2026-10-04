@@ -1244,6 +1244,194 @@ TEST(ei_php_interface_use) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * PHP PSR-4 — #1186
+ *
+ * With composer.json `autoload.psr-4`, `use App\Models\Agency;` names exactly
+ * one file: <mapped-dir>/Models/Agency.php. The resolver instead fell through
+ * to the namespace bucket and bound every class import of App\Models to the
+ * FIRST file declaring that namespace (User.php), fabricating a hub. These
+ * tests pin the exact target file per local name; a missing class file must
+ * leave the import unresolved rather than land on a sibling.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const char *local_name; /* IMPORTS edge local_name */
+    const char *want_path;  /* expected target file_path; NULL = no edge */
+} EIPhpImportExpect;
+
+/* Find the IMPORTS edge of `importer` whose local_name is `local` and write
+ * its target's file_path into `out` ("" when there is no such edge). */
+static void ei_import_target_path(cbm_store_t *store, const char *project, const char *importer,
+                                  const char *local, char *out, size_t outsz) {
+    out[0] = '\0';
+    int64_t src_id = ei_node_id_for_file_label(store, project, importer, "File");
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (src_id <= 0 ||
+        cbm_store_find_edges_by_source_type(store, src_id, "IMPORTS", &edges, &n) != CBM_STORE_OK) {
+        return;
+    }
+    char needle[256];
+    snprintf(needle, sizeof(needle), "\"local_name\":\"%s\"", local);
+    for (int i = 0; i < n; i++) {
+        if (!edges[i].properties_json || !strstr(edges[i].properties_json, needle)) {
+            continue;
+        }
+        cbm_node_t target;
+        memset(&target, 0, sizeof(target));
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) == CBM_STORE_OK) {
+            snprintf(out, outsz, "%s", target.file_path ? target.file_path : "?");
+            cbm_node_free_fields(&target);
+        }
+        break;
+    }
+    cbm_store_free_edges(edges, n);
+}
+
+/* Index `files` and check every expectation for `importer`. Returns 1 when
+ * all hold; prints each mismatch so a RED names the fabricated target. */
+static int ei_php_imports_match(const EILangFile *files, int nfiles, const char *importer,
+                                const EIPhpImportExpect *want, int nwant) {
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, nfiles);
+    if (!store) {
+        ei_cleanup(&lp, store);
+        return 0;
+    }
+    int ok = 1;
+    for (int i = 0; i < nwant; i++) {
+        char got[512];
+        ei_import_target_path(store, lp.project, importer, want[i].local_name, got, sizeof(got));
+        const char *expect = want[i].want_path ? want[i].want_path : "";
+        if (strcmp(got, expect) != 0) {
+            fprintf(stderr, "  [IMPORTS %s] %s -> got \"%s\", want \"%s\"\n", importer,
+                    want[i].local_name, got, expect);
+            ok = 0;
+        }
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+#define EI_PHP_CLASS(ns, cls) "<?php\nnamespace " ns ";\n\nclass " cls " {\n}\n"
+
+/* Several classes in one namespace directory: each import binds its own file,
+ * not the first file of App\Models. */
+TEST(ei_php_psr4_class_per_file_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json",
+         "{\"name\":\"acme/app\",\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Models/Agency.php", EI_PHP_CLASS("App\\Models", "Agency")},
+        {"app/Models/Client.php", EI_PHP_CLASS("App\\Models", "Client")},
+        {"app/Models/Property.php", EI_PHP_CLASS("App\\Models", "Property")},
+        {"app/Models/User.php", EI_PHP_CLASS("App\\Models", "User")},
+        {"app/Http/Controller.php", "<?php\nnamespace App\\Http;\n\n"
+                                    "use App\\Models\\Property;\nuse App\\Models\\User;\n"
+                                    "use App\\Models\\Client as C;\n\n"
+                                    "class Controller {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Property", "app/Models/Property.php"},
+        {"User", "app/Models/User.php"},
+        {"C", "app/Models/Client.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 6, "app/Http/Controller.php", want, 3));
+    PASS();
+}
+
+/* Sub-namespaces map to subdirectories of the PSR-4 root, at any depth. */
+TEST(ei_php_psr4_nested_subnamespace_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Models/Billing/Account.php", EI_PHP_CLASS("App\\Models\\Billing", "Account")},
+        {"app/Models/Billing/Invoice.php", EI_PHP_CLASS("App\\Models\\Billing", "Invoice")},
+        {"app/Models/Billing/Tax/Exempt.php", EI_PHP_CLASS("App\\Models\\Billing\\Tax", "Exempt")},
+        {"app/Models/Billing/Tax/Rate.php", EI_PHP_CLASS("App\\Models\\Billing\\Tax", "Rate")},
+        {"app/Jobs/Bill.php", "<?php\nnamespace App\\Jobs;\n\n"
+                              "use App\\Models\\Billing\\Invoice;\n"
+                              "use App\\Models\\Billing\\Tax\\Rate;\n\n"
+                              "class Bill {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Invoice", "app/Models/Billing/Invoice.php"},
+        {"Rate", "app/Models/Billing/Tax/Rate.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 6, "app/Jobs/Bill.php", want, 2));
+    PASS();
+}
+
+/* Several psr-4 roots, across two composer.json files and both autoload
+ * sections: the longest matching prefix wins (App\Domain\ -> src/Domain/ over
+ * App\ -> app/), a package's own root maps its namespace, and autoload-dev
+ * maps Tests\. The decoy app/Domain/Order.php declares the same namespace and
+ * sorts first. */
+TEST(ei_php_psr4_multiple_roots_longest_prefix_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\","
+                          "\"App\\\\Domain\\\\\":\"src/Domain/\"}},"
+                          "\"autoload-dev\":{\"psr-4\":{\"Tests\\\\\":\"tests/\"}}}\n"},
+        {"tests/Support/Assert.php", EI_PHP_CLASS("Tests\\Support", "Assert")},
+        {"tests/Support/Factory.php", EI_PHP_CLASS("Tests\\Support", "Factory")},
+        {"packages/billing/composer.json",
+         "{\"name\":\"acme/billing\",\"autoload\":{\"psr-4\":{\"Billing\\\\\":\"src/\"}}}\n"},
+        {"app/Domain/Order.php", EI_PHP_CLASS("App\\Domain", "Order")},
+        {"src/Domain/Customer.php", EI_PHP_CLASS("App\\Domain", "Customer")},
+        {"src/Domain/Order.php", EI_PHP_CLASS("App\\Domain", "Order")},
+        {"packages/billing/src/Account.php", EI_PHP_CLASS("Billing", "Account")},
+        {"packages/billing/src/Ledger.php", EI_PHP_CLASS("Billing", "Ledger")},
+        {"app/Http/Checkout.php", "<?php\nnamespace App\\Http;\n\n"
+                                  "use App\\Domain\\Order;\nuse Billing\\Ledger;\n"
+                                  "use Tests\\Support\\Assert;\n\n"
+                                  "class Checkout {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Order", "src/Domain/Order.php"},
+        {"Ledger", "packages/billing/src/Ledger.php"},
+        {"Assert", "tests/Support/Assert.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 10, "app/Http/Checkout.php", want, 3));
+    PASS();
+}
+
+/* Control: `use function` / `use const` name a namespace member, not a class
+ * file, so they must not go through PSR-4 class-file mapping (there is no
+ * app/Helpers/format_money.php); they keep resolving to the declaring file. */
+TEST(ei_php_psr4_use_function_not_class_mapped_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Helpers/money.php", "<?php\nnamespace App\\Helpers;\n\n"
+                                  "const CURRENCY = 'EUR';\n\n"
+                                  "function format_money($x) { return $x; }\n"},
+        {"app/Http/Shop.php", "<?php\nnamespace App\\Http;\n\n"
+                              "use function App\\Helpers\\format_money;\n"
+                              "use const App\\Helpers\\CURRENCY;\n\n"
+                              "class Shop {\n"
+                              "    public function show() { return format_money(CURRENCY); }\n"
+                              "}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"format_money", "app/Helpers/money.php"},
+        {"CURRENCY", "app/Helpers/money.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 3, "app/Http/Shop.php", want, 2));
+    PASS();
+}
+
+/* Control: a PSR-4 class whose file does not exist stays unresolved — it must
+ * never fall back to the first file of the namespace directory. The present
+ * sibling import still resolves. */
+TEST(ei_php_psr4_missing_class_file_unresolved_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Models/User.php", EI_PHP_CLASS("App\\Models", "User")},
+        {"app/Http/Guard.php", "<?php\nnamespace App\\Http;\n\n"
+                               "use App\\Models\\Ghost;\nuse App\\Models\\User;\n\n"
+                               "class Guard {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Ghost", NULL},
+        {"User", "app/Models/User.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 3, "app/Http/Guard.php", want, 2));
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1326,4 +1514,9 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_const_use);
     RUN_TEST(ei_php_multiple_use_statements);
     RUN_TEST(ei_php_interface_use);
+    RUN_TEST(ei_php_psr4_class_per_file_issue1186);
+    RUN_TEST(ei_php_psr4_nested_subnamespace_issue1186);
+    RUN_TEST(ei_php_psr4_multiple_roots_longest_prefix_issue1186);
+    RUN_TEST(ei_php_psr4_use_function_not_class_mapped_issue1186);
+    RUN_TEST(ei_php_psr4_missing_class_file_unresolved_issue1186);
 }

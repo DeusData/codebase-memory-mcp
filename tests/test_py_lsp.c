@@ -580,6 +580,119 @@ TEST(pylsp_crossfile_method_dispatch) {
     PASS();
 }
 
+/* Issue #1277 (reproducer contributed by @Enferlain): a method call through a
+ * typed instance field of a class imported from ANOTHER file. The field type
+ * reaches the resolver only through CBMLSPDef.field_defs on the class def. */
+TEST(pylsp_crossfile_receiver_through_typed_field) {
+    const char *source = "from trainer import Trainer\n"
+                         "def run(trainer: Trainer):\n"
+                         "    strategies = trainer.strategies\n"
+                         "    return strategies.process_batch()\n";
+
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+
+    defs[0].qualified_name = "contracts.Contract";
+    defs[0].short_name = "Contract";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "contracts";
+
+    defs[1].qualified_name = "contracts.Contract.process_batch";
+    defs[1].short_name = "process_batch";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "contracts.Contract";
+    defs[1].def_module_qn = "contracts";
+
+    defs[2].qualified_name = "trainer.Trainer";
+    defs[2].short_name = "Trainer";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "trainer";
+    defs[2].field_defs = "strategies:contracts.Contract";
+
+    const char *imp_names[] = {"Trainer"};
+    const char *imp_qns[] = {"trainer.Trainer"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.loop", defs, 3, imp_names,
+                         imp_qns, 1, NULL, &out, NULL);
+
+    ASSERT_GTE(find_resolved_arr(&out, "run", "process_batch"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* #1277 on the production path: the sealed shared Tier-2 registry. Covers the
+ * direct chain, the local alias, a field inherited from a base class, and two
+ * controls: an undeclared field and a field whose type has no such method
+ * must stay unresolved (never guessed). */
+TEST(pylsp_crossfile_typed_field_shared_registry) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    CBMLSPDef defs[5];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "contracts.Contract";
+    defs[0].short_name = "Contract";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "contracts";
+    defs[1].qualified_name = "contracts.Contract.process_batch";
+    defs[1].short_name = "process_batch";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "contracts.Contract";
+    defs[1].def_module_qn = "contracts";
+    defs[2].qualified_name = "trainer.Trainer";
+    defs[2].short_name = "Trainer";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "trainer";
+    defs[2].field_defs = "strategies:contracts.Contract|name:builtins.str";
+    defs[3].qualified_name = "trainer.SubTrainer";
+    defs[3].short_name = "SubTrainer";
+    defs[3].label = "Class";
+    defs[3].def_module_qn = "trainer";
+    defs[3].embedded_types = "trainer.Trainer";
+    defs[4].qualified_name = "trainer.Other";
+    defs[4].short_name = "Other";
+    defs[4].label = "Class";
+    defs[4].def_module_qn = "trainer";
+    for (int i = 0; i < 5; i++) {
+        defs[i].lang = CBM_LANG_PYTHON;
+    }
+
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 5);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+
+    const char *src = "from trainer import Trainer, SubTrainer, Other\n"
+                      "def direct(t: Trainer):\n"
+                      "    return t.strategies.process_batch()\n"
+                      "def alias(t: Trainer):\n"
+                      "    s = t.strategies\n"
+                      "    return s.process_batch()\n"
+                      "def inherited(t: SubTrainer):\n"
+                      "    return t.strategies.process_batch()\n"
+                      "def undeclared(t: Other):\n"
+                      "    return t.strategies.process_batch()\n"
+                      "def wrong_type(t: Trainer):\n"
+                      "    return t.name.process_batch()\n";
+    const char *imp_names[] = {"Trainer", "SubTrainer", "Other"};
+    const char *imp_qns[] = {"trainer.Trainer", "trainer.SubTrainer", "trainer.Other"};
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.loop", reg, imp_names,
+                                       imp_qns, 3, NULL, &out, NULL);
+
+    ASSERT_GTE(find_resolved_arr(&out, "direct", "Contract.process_batch"), 0);
+    ASSERT_GTE(find_resolved_arr(&out, "alias", "Contract.process_batch"), 0);
+    ASSERT_GTE(find_resolved_arr(&out, "inherited", "Contract.process_batch"), 0);
+    ASSERT_EQ(find_resolved_arr(&out, "undeclared", "process_batch"), -1);
+    ASSERT_EQ(find_resolved_arr(&out, "wrong_type", "process_batch"), -1);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* Graph-quality guard for the Python seal fix (per-file field overlay). In the
  * FUSED path the shared Tier-2 registry is read_only, so `self.b = Bar()` can no
  * longer be recorded by mutating the shared registry; it is recorded in the per-file
@@ -2193,6 +2306,8 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_pep695_generic_class);
     /* Phase 9 — cross-file + batch */
     RUN_TEST(pylsp_crossfile_method_dispatch);
+    RUN_TEST(pylsp_crossfile_receiver_through_typed_field);
+    RUN_TEST(pylsp_crossfile_typed_field_shared_registry);
     RUN_TEST(pylsp_fused_self_attr_chain_via_overlay);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);

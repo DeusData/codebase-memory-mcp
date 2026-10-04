@@ -105,6 +105,13 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
 int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
                                       cbm_node_t **out, int *count);
 
+/* Find callables whose signature-qualified QN (#2061) has `base` as its base
+ * QN (exact), or a base ending with "." + `base` (suffix_match). QNs without
+ * a callable identity suffix never match: this is the tier that lets a bare
+ * QN name every overload. */
+int cbm_store_find_nodes_by_qn_base(cbm_store_t *s, const char *project, const char *base,
+                                    bool suffix_match, cbm_node_t **out, int *count);
+
 /* Get CALLS degree of a node (inbound and outbound). */
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
 
@@ -427,11 +434,12 @@ int cbm_store_rollback(cbm_store_t *s);
 
 /* ── Bulk write optimization ────────────────────────────────────── */
 
-/* Tune pragmas for bulk write throughput (synchronous=OFF, large cache).
+/* Tune pragmas for bulk write throughput (synchronous=OFF, 64 MiB cache).
  * WAL journal mode is preserved throughout for crash safety. */
 int cbm_store_begin_bulk(cbm_store_t *s);
 
-/* Restore normal pragmas (synchronous=NORMAL, default cache) after bulk writes. */
+/* Restore normal pragmas (synchronous=NORMAL, the 64 MiB read-write cache)
+ * after bulk writes. */
 int cbm_store_end_bulk(cbm_store_t *s);
 
 /* Drop user indexes for faster bulk inserts. */

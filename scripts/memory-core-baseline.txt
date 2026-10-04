@@ -52,7 +52,7 @@ src/git/git_context.c	18
 src/main.c	32
 src/mcp/compact_out.c	39
 src/mcp/index_supervisor.c	8
-src/mcp/mcp.c	784
+src/mcp/mcp.c	778
 src/pipeline/artifact.c	38
 src/pipeline/fqn.c	23
 src/pipeline/lsp_resolve.h	4
