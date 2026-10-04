@@ -433,6 +433,15 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
         if (cbm_pipeline_relpath_is_excluded(child_rel, excluded_dirs, excluded_count)) {
             continue;
         }
+        /* A link is not followed, as discovery does not follow one. is_dir is
+         * also true for a junction or a directory symbolic link on Windows,
+         * and either can lead out of the repository. A child whose metadata
+         * cannot be read is skipped the same way. */
+        cbm_path_info_t child_info;
+        if (cbm_path_info_utf8(child_abs, &child_info) != CBM_PATH_INFO_OK ||
+            child_info.is_symlink) {
+            continue;
+        }
         find_alias_files(child_abs, child_rel, out, count, max_count, depth + 1, excluded_dirs,
                          excluded_count);
     }
