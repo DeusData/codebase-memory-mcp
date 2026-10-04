@@ -8777,7 +8777,18 @@ static int pipeline_lsp_failure_case(bool parallel, const char *stage, bool pyth
     if (python)
         src = "class S:\n    def m(self):\n        return 1\ndef run():\n    s = S()\n    s.m()\n";
     const char *filename = python ? "memo.py" : "memo.cpp";
-    if (setup_usages_repo(filename, src, NULL, NULL) != 0)
+    const char *extra_name = NULL;
+    const char *extra_src = NULL;
+    /* The cross stage needs a call the per-file LSP cannot resolve: the parallel
+     * driver skips the cross walk for a file whose sites are all resolved. */
+    if (strcmp(stage, "cross") == 0) {
+        src = python ? "from memo_def import S\ndef run():\n    s = S()\n    s.m()\n"
+                     : "void run() { S s; s.m(); }\n";
+        extra_name = python ? "memo_def.py" : "memo_def.cpp";
+        extra_src = python ? "class S:\n    def m(self):\n        return 1\n"
+                           : "struct S { int m() { return 1; } };\n";
+    }
+    if (setup_usages_repo(filename, src, extra_name, extra_src) != 0)
         FAIL("failed to create memo fixture");
     char path[512];
     if (parallel) {
