@@ -146,6 +146,13 @@ typedef struct CBMTypeRegistry {
      * every lookup linear-scans it -> O(files*defs) (the Linux-kernel full-index
      * hang) plus a heap data race across workers. */
     bool read_only;
+    // Set before finalize by a caller whose lookups used to run unfinalized
+    // (#1527): the exact-QN and method indexes then chain entries in
+    // registration order, so a duplicated name resolves to its FIRST
+    // registration -- the answer the linear scan gave. Without it the
+    // hashed chains answer with the LAST registration (the Tier-2 behavior,
+    // left unchanged).
+    bool index_first_registered;
 } CBMTypeRegistry;
 
 // Initialize a registry.
