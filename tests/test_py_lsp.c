@@ -3132,6 +3132,12 @@ static bool pylsp_init_named_type(const CBMType *type, const char *qn) {
            strcmp(type->data.named.qualified_name, qn) == 0;
 }
 
+/* Type of the binding of name in this frame only, or NULL when unbound. */
+static const CBMType *pylsp_local_type(const CBMScope *scope, const char *name) {
+    const CBMVarBinding *binding = cbm_scope_lookup_local(scope, name);
+    return binding ? binding->type : NULL;
+}
+
 static bool pylsp_init_signature(const CBMTypeRegistry *registry, const char *function,
                                  const char *expected_type) {
     const CBMRegisteredFunc *f = cbm_registry_lookup_func(registry, function);
@@ -3257,7 +3263,7 @@ TEST(pylsp_init_scope_external_classes_and_cross_exact_joins) {
         py_lsp_init(&ctx, &arena, source, (int)strlen(source), &overlay, "test.pkg.__init__", &out);
         cbm_py_lsp_test_bind_external_classes(&ctx, ts_tree_root_node(tree));
         bool globals = base && ctx.eval_failure == CBM_LSP_COMPLETE &&
-                       pylsp_init_named_type(cbm_scope_lookup_local(ctx.current_scope, "Store"),
+                       pylsp_init_named_type(pylsp_local_type(ctx.current_scope, "Store"),
                                              "test.pkg.Store") &&
                        !cbm_scope_lookup_local(ctx.current_scope, "Widget") &&
                        !cbm_scope_lookup_local(ctx.current_scope, "Nested");
