@@ -1088,4 +1088,79 @@ int cbm_store_exec(cbm_store_t *s, const char *sql);
  * fatal); CBM_STORE_ERR on a genuine write failure. */
 int cbm_store_fts_rebuild(cbm_store_t *s, const char *project, int64_t after_id);
 
+/* ── Blast radius & impact analysis (RFC 001) ─────────────────── */
+
+typedef struct {
+    int max_depth;              /* 1..10, default 3 */
+    bool include_co_changes;    /* default true */
+} cbm_blast_radius_opts_t;
+
+typedef struct {
+    char *symbol_name;
+    char *qualified_name;
+    char *file_path;
+    int start_line;
+    int end_line;
+    int distance;               /* hops from target */
+    char *edge_type;            /* CALLS, USAGE, IMPORTS */
+    double importance;
+} cbm_blast_affected_node_t;
+
+typedef struct {
+    char *method;               /* GET, POST, etc. */
+    char *url_path;
+    char *handler_name;
+    char *file_path;
+    int line;
+    int distance;
+} cbm_blast_exposed_route_t;
+
+typedef struct {
+    char *test_symbol;
+    char *test_file;
+    int line;
+    char *test_type;            /* direct_test, caller_test */
+    int distance;
+} cbm_blast_covering_test_t;
+
+typedef struct {
+    char *file_path;
+    int co_commit_count;
+    double confidence;
+} cbm_blast_co_change_t;
+
+typedef struct {
+    char *target;
+    char *target_type;          /* Function, Class, File, etc. */
+    char *file_path;
+    int start_line;
+    int end_line;
+
+    double risk_score;          /* 0.0 .. 1.0 */
+    char *risk_level;           /* LOW, MEDIUM, HIGH */
+    char *risk_rationale;
+
+    int affected_symbols_count;
+    int affected_files_count;
+    int exposed_routes_count;
+    int covering_tests_count;
+    double test_coverage_ratio;
+
+    cbm_blast_affected_node_t *affected_symbols;
+    int affected_symbols_cap;
+
+    cbm_blast_exposed_route_t *exposed_routes;
+    int exposed_routes_cap;
+
+    cbm_blast_covering_test_t *covering_tests;
+    int covering_tests_cap;
+
+    cbm_blast_co_change_t *co_changes;
+    int co_changes_count;
+} cbm_blast_radius_result_t;
+
+int cbm_store_blast_radius(cbm_store_t *s, const char *project, const char *target,
+                           const cbm_blast_radius_opts_t *opts, cbm_blast_radius_result_t **out);
+void cbm_store_blast_radius_free(cbm_blast_radius_result_t *res);
+
 #endif /* CBM_STORE_H */

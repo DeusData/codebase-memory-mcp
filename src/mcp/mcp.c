@@ -625,6 +625,21 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Add resolver class and confidence.\"}},"
      "\"required\":[\"function_name\",\"project\"]}"},
 
+    {"analyze_blast_radius",
+     "Compute comprehensive blast radius for a symbol or file: downstream callers, exposed "
+     "public routes, covering tests, git history co-changes, and composite risk assessment.",
+     "{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"description\":"
+     "\"Qualified symbol name (e.g. 'cbm_store_close') or relative file path (e.g. 'src/store/store.c').\"},"
+     "\"project\":{\"type\":\"string\",\"description\":\"Project identifier.\"},"
+     "\"max_depth\":{\"type\":\"integer\",\"default\":3,\"minimum\":1,\"maximum\":10,"
+     "\"description\":\"Max caller traversal depth (1..10, default 3).\"},"
+     "\"include_co_changes\":{\"type\":\"boolean\",\"default\":true,"
+     "\"description\":\"Include companion files historically committed together via FILE_CHANGES_WITH.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"detailed\",\"summary\",\"json\"],\"default\":\"detailed\","
+     "\"description\":\"Output format style.\"}},"
+     "\"required\":[\"target\",\"project\"]}"},
+
+
     {"get_code_snippet",
      "Read a search_graph symbol. auto bounds source and outlines large containers; full "
      "restores up to 500 lines. Source/outline pages continue; coverage_note marks gaps.",
@@ -857,6 +872,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"search_graph", true, false, true, false},
     {"query_graph", true, false, true, false},
     {"trace_path", true, false, true, false},
+    {"analyze_blast_radius", true, false, true, false},
     {"get_code_snippet", true, false, true, false},
     {"get_file_outline", true, false, true, false},
     {"get_graph_schema", true, false, true, false},
@@ -8256,6 +8272,163 @@ static char *handle_export_diagram(cbm_mcp_server_t *srv, const char *args) {
     free(json);
     return mcp_res;
 }
+
+static char *handle_analyze_blast_radius(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store && srv && srv->store) {
+        store = srv->store;
+    }
+    REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed && srv && srv->store == store && cbm_store_count_nodes(store, project) > 0) {
+        free(not_indexed);
+        not_indexed = NULL;
+    }
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
+    char *target = cbm_mcp_get_string_arg(args, "target");
+    if (!target || target[0] == '\0') {
+        free(project);
+        free(target);
+        return cbm_mcp_text_result("missing required argument: target (qualified symbol name or file path)", true);
+    }
+
+    int max_depth = cbm_mcp_get_int_arg(args, "max_depth", 3);
+    bool include_co_changes = true;
+    if (args) {
+        yyjson_doc *arg_doc = yyjson_read(args, strlen(args), 0);
+        if (arg_doc) {
+            yyjson_val *arg_root = yyjson_doc_get_root(arg_doc);
+            yyjson_val *v = yyjson_obj_get(arg_root, "include_co_changes");
+            if (!v) {
+                v = yyjson_obj_get(arg_root, "include_temporal");
+            }
+            if (v && yyjson_is_bool(v)) {
+                include_co_changes = yyjson_get_bool(v);
+            }
+            yyjson_doc_free(arg_doc);
+        }
+    }
+
+    cbm_blast_radius_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.max_depth = max_depth;
+    opts.include_co_changes = include_co_changes;
+
+    cbm_blast_radius_result_t *res = NULL;
+    int rc = cbm_store_blast_radius(store, project, target, &opts, &res);
+    if (rc != CBM_STORE_OK || !res) {
+        char err[CBM_SZ_512];
+        if (rc == CBM_STORE_NOT_FOUND) {
+            snprintf(err, sizeof(err), "target '%s' not found in project '%s'", target, project ? project : "");
+        } else {
+            snprintf(err, sizeof(err), "failed to analyze blast radius for '%s'", target);
+        }
+        free(project);
+        free(target);
+        return cbm_mcp_text_result(err, true);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_obj_add_str(doc, root, "target", res->target);
+    yyjson_mut_obj_add_str(doc, root, "target_type", res->target_type);
+    yyjson_mut_obj_add_str(doc, root, "file_path", res->file_path);
+
+    yyjson_mut_val *lr = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_int(doc, lr, res->start_line);
+    yyjson_mut_arr_add_int(doc, lr, res->end_line);
+    yyjson_mut_obj_add_val(doc, root, "line_range", lr);
+
+    /* risk_assessment */
+    yyjson_mut_val *risk = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_real(doc, risk, "score", res->risk_score);
+    yyjson_mut_obj_add_str(doc, risk, "level", res->risk_level);
+    yyjson_mut_obj_add_str(doc, risk, "rationale", res->risk_rationale);
+    yyjson_mut_obj_add_val(doc, root, "risk_assessment", risk);
+
+    /* metrics */
+    yyjson_mut_val *metrics = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, metrics, "affected_symbols_count", res->affected_symbols_count);
+    yyjson_mut_obj_add_int(doc, metrics, "affected_files_count", res->affected_files_count);
+    yyjson_mut_obj_add_int(doc, metrics, "exposed_routes_count", res->exposed_routes_count);
+    yyjson_mut_obj_add_int(doc, metrics, "covering_tests_count", res->covering_tests_count);
+    yyjson_mut_obj_add_real(doc, metrics, "test_coverage_ratio", res->test_coverage_ratio);
+    yyjson_mut_obj_add_val(doc, root, "metrics", metrics);
+
+    /* exposed_routes */
+    yyjson_mut_val *routes_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < res->exposed_routes_count; i++) {
+        yyjson_mut_val *robj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, robj, "method", res->exposed_routes[i].method);
+        yyjson_mut_obj_add_str(doc, robj, "url_path", res->exposed_routes[i].url_path);
+        yyjson_mut_obj_add_str(doc, robj, "handler", res->exposed_routes[i].handler_name);
+        yyjson_mut_obj_add_str(doc, robj, "file_path", res->exposed_routes[i].file_path);
+        yyjson_mut_obj_add_int(doc, robj, "line", res->exposed_routes[i].line);
+        yyjson_mut_obj_add_int(doc, robj, "distance", res->exposed_routes[i].distance);
+        yyjson_mut_arr_add_val(routes_arr, robj);
+    }
+    yyjson_mut_obj_add_val(doc, root, "exposed_routes", routes_arr);
+
+    /* covering_tests */
+    yyjson_mut_val *tests_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < res->covering_tests_count; i++) {
+        yyjson_mut_val *tobj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, tobj, "test_symbol", res->covering_tests[i].test_symbol);
+        yyjson_mut_obj_add_str(doc, tobj, "test_file", res->covering_tests[i].test_file);
+        yyjson_mut_obj_add_int(doc, tobj, "line", res->covering_tests[i].line);
+        yyjson_mut_obj_add_str(doc, tobj, "test_type", res->covering_tests[i].test_type);
+        yyjson_mut_obj_add_int(doc, tobj, "distance", res->covering_tests[i].distance);
+        yyjson_mut_arr_add_val(tests_arr, tobj);
+    }
+    yyjson_mut_obj_add_val(doc, root, "covering_tests", tests_arr);
+
+    /* affected_symbols */
+    yyjson_mut_val *syms_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < res->affected_symbols_count; i++) {
+        yyjson_mut_val *sobj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, sobj, "symbol_name", res->affected_symbols[i].symbol_name);
+        yyjson_mut_obj_add_str(doc, sobj, "qualified_name", res->affected_symbols[i].qualified_name);
+        yyjson_mut_obj_add_str(doc, sobj, "file_path", res->affected_symbols[i].file_path);
+        yyjson_mut_obj_add_int(doc, sobj, "start_line", res->affected_symbols[i].start_line);
+        yyjson_mut_obj_add_int(doc, sobj, "end_line", res->affected_symbols[i].end_line);
+        yyjson_mut_obj_add_int(doc, sobj, "distance", res->affected_symbols[i].distance);
+        yyjson_mut_obj_add_str(doc, sobj, "edge_type", res->affected_symbols[i].edge_type);
+        yyjson_mut_obj_add_real(doc, sobj, "importance", res->affected_symbols[i].importance);
+        yyjson_mut_arr_add_val(syms_arr, sobj);
+    }
+    yyjson_mut_obj_add_val(doc, root, "affected_symbols", syms_arr);
+
+    /* git_co_changes */
+    yyjson_mut_val *co_arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < res->co_changes_count; i++) {
+        yyjson_mut_val *cobj = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, cobj, "file_path", res->co_changes[i].file_path);
+        yyjson_mut_obj_add_int(doc, cobj, "co_commit_count", res->co_changes[i].co_commit_count);
+        yyjson_mut_obj_add_real(doc, cobj, "confidence", res->co_changes[i].confidence);
+        yyjson_mut_arr_add_val(co_arr, cobj);
+    }
+    yyjson_mut_obj_add_val(doc, root, "git_co_changes", co_arr);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    cbm_store_blast_radius_free(res);
+    free(project);
+    free(target);
+
+    char *mcp_res = cbm_mcp_text_result(json, false);
+    free(json);
+    return mcp_res;
+}
+
 
 /* Resolve edge types from args: explicit array > mode-based > default ("CALLS").
  * Writes types into out_types (max 16). Returns the parsed yyjson_doc if explicit
@@ -17878,6 +18051,10 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     if (strcmp(tool_name, "export_diagram") == 0) {
         return handle_export_diagram(srv, args_json);
     }
+    if (strcmp(tool_name, "analyze_blast_radius") == 0) {
+        return handle_analyze_blast_radius(srv, args_json);
+    }
+
 
     /* Pipeline-dependent tools */
     if (strcmp(tool_name, "index_repository") == 0) {

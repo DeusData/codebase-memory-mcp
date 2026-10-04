@@ -150,6 +150,37 @@ export const MCP_TOOLS: McpToolDefinition[] = [
     ),
   },
   {
+    name: "analyze_blast_radius",
+    category: "Tracing & Architecture",
+    summary: "Calculate upstream transitive callers, affected entry points, exposed routes, and risk score",
+    description:
+      "Perform deep impact analysis for a target symbol or function. Computes transitive callers up to N hops, exposed API/HTTP routes, covering test cases, and historical Git co-change coupling to compute an overall risk score (LOW/MEDIUM/HIGH/CRITICAL).",
+    readOnly: true,
+    idempotent: true,
+    parameters: [
+      { name: "project", type: "string", required: true, description: "Target project identifier" },
+      { name: "target", type: "string", required: true, description: "Function, method, class, or symbol name to analyze" },
+      { name: "file_path", type: "string", required: false, description: "Disambiguate symbol by source file path" },
+      { name: "max_depth", type: "integer", required: false, defaultVal: 3, description: "Maximum upstream traversal depth (1-10)" },
+      { name: "include_temporal", type: "boolean", required: false, defaultVal: true, description: "Include Git co-change coupling analysis" },
+      { name: "format", type: "string", required: false, defaultVal: "json", enumVals: ["json", "tree", "markdown"], description: "Output format" },
+    ],
+    cliExample: "cbm cli analyze_blast_radius --project={PROJECT} --target=\"process_payment\" --max_depth=3",
+    jsonExample: JSON.stringify(
+      {
+        name: "analyze_blast_radius",
+        arguments: {
+          project: "{PROJECT}",
+          target: "process_payment",
+          max_depth: 3,
+          include_temporal: true,
+        },
+      },
+      null,
+      2
+    ),
+  },
+  {
     name: "get_code_snippet",
     category: "Code Discovery",
     summary: "Fetch precise source code for a symbol, function, or line range",
@@ -584,26 +615,30 @@ export function ToolsTab({ selectedProject }: ToolsTabProps) {
                   <Sparkles className="w-3 h-3" />
                   Protocol Server · stdio / JSON-RPC 2.0
                 </span>
-                <span className="text-[11px] font-mono text-foreground/40">18 Tools Registered</span>
+                <span className="text-[11px] font-mono text-foreground/40">{MCP_TOOLS.length} Tools Registered</span>
               </div>
               <h1 className="text-2xl font-bold tracking-tight text-foreground/90">MCP Tools Directory</h1>
               <p className="text-[13px] text-foreground/50 max-w-2xl mt-1">
-                Authoritative reference for all 18 tools exposed by <code className="text-primary font-mono text-[12px]">codebase-memory-mcp</code> to AI assistants (Cursor, Claude Code, Antigravity) and CLI scripts.
+                Authoritative reference for all {MCP_TOOLS.length} tools exposed by <code className="text-primary font-mono text-[12px]">codebase-memory-mcp</code> to AI assistants (Cursor, Claude Code, Antigravity) and CLI scripts.
               </p>
             </div>
 
             {/* Quick KPI Counters */}
             <div className="flex items-center gap-3">
               <div className="px-3.5 py-2 rounded-xl bg-white/[0.03] border border-border/30 flex flex-col items-center">
-                <span className="text-[18px] font-bold text-primary font-mono tabular-nums">18</span>
+                <span className="text-[18px] font-bold text-primary font-mono tabular-nums">{MCP_TOOLS.length}</span>
                 <span className="text-[9px] uppercase tracking-wider text-foreground/40">Total Tools</span>
               </div>
               <div className="px-3.5 py-2 rounded-xl bg-white/[0.03] border border-border/30 flex flex-col items-center">
-                <span className="text-[18px] font-bold text-emerald-400 font-mono tabular-nums">14</span>
+                <span className="text-[18px] font-bold text-emerald-400 font-mono tabular-nums">
+                  {MCP_TOOLS.filter((t) => t.readOnly).length}
+                </span>
                 <span className="text-[9px] uppercase tracking-wider text-foreground/40">Read-Only</span>
               </div>
               <div className="px-3.5 py-2 rounded-xl bg-white/[0.03] border border-border/30 flex flex-col items-center">
-                <span className="text-[18px] font-bold text-amber-400 font-mono tabular-nums">4</span>
+                <span className="text-[18px] font-bold text-amber-400 font-mono tabular-nums">
+                  {MCP_TOOLS.filter((t) => !t.readOnly).length}
+                </span>
                 <span className="text-[9px] uppercase tracking-wider text-foreground/40">Mutating</span>
               </div>
             </div>

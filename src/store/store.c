@@ -10288,3 +10288,344 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     *out_count = count;
     return CBM_STORE_OK;
 }
+
+/* ── Blast radius & impact analysis (RFC 001) ─────────────────── */
+
+void cbm_store_blast_radius_free(cbm_blast_radius_result_t *res) {
+    if (!res) {
+        return;
+    }
+    free(res->target);
+    free(res->target_type);
+    free(res->file_path);
+    free(res->risk_level);
+    free(res->risk_rationale);
+    if (res->affected_symbols) {
+        for (int i = 0; i < res->affected_symbols_count; i++) {
+            free(res->affected_symbols[i].symbol_name);
+            free(res->affected_symbols[i].qualified_name);
+            free(res->affected_symbols[i].file_path);
+            free(res->affected_symbols[i].edge_type);
+        }
+        free(res->affected_symbols);
+    }
+    if (res->exposed_routes) {
+        for (int i = 0; i < res->exposed_routes_count; i++) {
+            free(res->exposed_routes[i].method);
+            free(res->exposed_routes[i].url_path);
+            free(res->exposed_routes[i].handler_name);
+            free(res->exposed_routes[i].file_path);
+        }
+        free(res->exposed_routes);
+    }
+    if (res->covering_tests) {
+        for (int i = 0; i < res->covering_tests_count; i++) {
+            free(res->covering_tests[i].test_symbol);
+            free(res->covering_tests[i].test_file);
+            free(res->covering_tests[i].test_type);
+        }
+        free(res->covering_tests);
+    }
+    if (res->co_changes) {
+        for (int i = 0; i < res->co_changes_count; i++) {
+            free(res->co_changes[i].file_path);
+        }
+        free(res->co_changes);
+    }
+    free(res);
+}
+
+int cbm_store_blast_radius(cbm_store_t *s, const char *project, const char *target,
+                           const cbm_blast_radius_opts_t *opts, cbm_blast_radius_result_t **out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    if (!s || !s->db || !project || !target || target[0] == '\0') {
+        return CBM_STORE_ERR;
+    }
+
+    int max_depth = opts ? opts->max_depth : 3;
+    if (max_depth < 1) max_depth = 1;
+    if (max_depth > 10) max_depth = 10;
+    bool include_co_changes = opts ? opts->include_co_changes : true;
+
+    /* 1. Resolve target node */
+    const char *resolve_sql =
+        "SELECT id, name, qualified_name, label, file_path, start_line, end_line, properties "
+        "FROM nodes "
+        "WHERE project = ?1 AND (qualified_name = ?2 OR name = ?2 OR file_path = ?2) "
+        "ORDER BY (qualified_name = ?2) DESC, (name = ?2) DESC "
+        "LIMIT 1;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, resolve_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, target, -1, SQLITE_STATIC);
+
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    int64_t target_id = sqlite3_column_int64(stmt, 0);
+    const char *target_name = (const char *)sqlite3_column_text(stmt, 1);
+    const char *target_qn = (const char *)sqlite3_column_text(stmt, 2);
+    const char *target_label = (const char *)sqlite3_column_text(stmt, 3);
+    const char *target_file = (const char *)sqlite3_column_text(stmt, 4);
+    int target_start = sqlite3_column_int(stmt, 5);
+    int target_end = sqlite3_column_int(stmt, 6);
+
+    cbm_blast_radius_result_t *res = calloc(1, sizeof(*res));
+    if (!res) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    res->target = strdup(target_qn ? target_qn : (target_name ? target_name : target));
+    res->target_type = strdup(target_label ? target_label : "Symbol");
+    res->file_path = strdup(target_file ? target_file : "");
+    res->start_line = target_start;
+    res->end_line = target_end;
+    sqlite3_finalize(stmt);
+
+    /* 2. Traverse upstream callers and dependencies (recursive CTE) */
+    const char *upstream_sql =
+        "WITH RECURSIVE upstream(node_id, depth, edge_type, path) AS ("
+        "    SELECT ?1, 0, '', ',' || CAST(?1 AS TEXT) || ','"
+        "    UNION"
+        "    SELECT e.source_id, u.depth + 1, e.type, u.path || CAST(e.source_id AS TEXT) || ','"
+        "    FROM edges e"
+        "    JOIN upstream u ON e.target_id = u.node_id"
+        "    WHERE e.project = ?2"
+        "      AND e.type IN ('CALLS', 'USAGE', 'IMPORTS')"
+        "      AND u.depth < ?3"
+        "      AND instr(u.path, ',' || CAST(e.source_id AS TEXT) || ',') = 0"
+        ")"
+        "SELECT u.node_id, u.depth, u.edge_type, n.name, n.qualified_name, n.label, n.file_path,"
+        "       n.start_line, n.end_line,"
+        "       coalesce(cast(json_extract(n.properties, '$.importance') AS REAL), 1.0), "
+        "       coalesce(json_extract(n.properties, '$.method'), 'ANY'), "
+        "       coalesce(json_extract(n.properties, '$.url_path'), n.name) "
+        "FROM upstream u "
+        "JOIN nodes n ON u.node_id = n.id "
+        "WHERE u.depth > 0 "
+        "ORDER BY u.depth ASC "
+        "LIMIT 500;";
+
+    if (sqlite3_prepare_v2(s->db, upstream_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, target_id);
+        sqlite3_bind_text(stmt, 2, project, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 3, max_depth);
+
+        int sym_cap = 32;
+        res->affected_symbols = malloc(sym_cap * sizeof(cbm_blast_affected_node_t));
+        int route_cap = 16;
+        res->exposed_routes = malloc(route_cap * sizeof(cbm_blast_exposed_route_t));
+
+        /* Keep a small unique files tracker */
+        char *seen_files[256];
+        int seen_files_count = 0;
+        if (target_file && target_file[0] != '\0') {
+            seen_files[seen_files_count++] = strdup(target_file);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int depth = sqlite3_column_int(stmt, 1);
+            const char *edge_type = (const char *)sqlite3_column_text(stmt, 2);
+            const char *name = (const char *)sqlite3_column_text(stmt, 3);
+            const char *qn = (const char *)sqlite3_column_text(stmt, 4);
+            const char *label = (const char *)sqlite3_column_text(stmt, 5);
+            const char *file_path = (const char *)sqlite3_column_text(stmt, 6);
+            int start_line = sqlite3_column_int(stmt, 7);
+            int end_line = sqlite3_column_int(stmt, 8);
+            double importance = sqlite3_column_double(stmt, 9);
+            const char *route_method = (const char *)sqlite3_column_text(stmt, 10);
+            const char *route_url = (const char *)sqlite3_column_text(stmt, 11);
+
+            /* Track distinct files */
+            if (file_path && file_path[0] != '\0' && seen_files_count < 256) {
+                bool already = false;
+                for (int f = 0; f < seen_files_count; f++) {
+                    if (strcmp(seen_files[f], file_path) == 0) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    seen_files[seen_files_count++] = strdup(file_path);
+                }
+            }
+
+            if (label && strcmp(label, "Route") == 0) {
+                if (res->exposed_routes_count >= route_cap) {
+                    route_cap *= 2;
+                    cbm_blast_exposed_route_t *grown = realloc(res->exposed_routes, route_cap * sizeof(cbm_blast_exposed_route_t));
+                    if (grown) res->exposed_routes = grown;
+                }
+                if (res->exposed_routes && res->exposed_routes_count < route_cap) {
+                    cbm_blast_exposed_route_t *r = &res->exposed_routes[res->exposed_routes_count++];
+                    r->method = strdup(route_method ? route_method : "ANY");
+                    r->url_path = strdup(route_url ? route_url : (name ? name : "/"));
+                    r->handler_name = strdup(name ? name : "");
+                    r->file_path = strdup(file_path ? file_path : "");
+                    r->line = start_line;
+                    r->distance = depth;
+                }
+            } else {
+                if (res->affected_symbols_count >= sym_cap) {
+                    sym_cap *= 2;
+                    cbm_blast_affected_node_t *grown = realloc(res->affected_symbols, sym_cap * sizeof(cbm_blast_affected_node_t));
+                    if (grown) res->affected_symbols = grown;
+                }
+                if (res->affected_symbols && res->affected_symbols_count < sym_cap) {
+                    cbm_blast_affected_node_t *node = &res->affected_symbols[res->affected_symbols_count++];
+                    node->symbol_name = strdup(name ? name : "");
+                    node->qualified_name = strdup(qn ? qn : (name ? name : ""));
+                    node->file_path = strdup(file_path ? file_path : "");
+                    node->start_line = start_line;
+                    node->end_line = end_line;
+                    node->distance = depth;
+                    node->edge_type = strdup(edge_type ? edge_type : "CALLS");
+                    node->importance = importance;
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+        res->affected_files_count = seen_files_count;
+        for (int f = 0; f < seen_files_count; f++) {
+            free(seen_files[f]);
+        }
+    }
+
+    /* 3. Query covering tests */
+    const char *tests_sql =
+        "WITH RECURSIVE upstream(node_id, depth, path) AS ("
+        "    SELECT ?1, 0, CAST(?1 AS TEXT)"
+        "    UNION"
+        "    SELECT e.source_id, u.depth + 1, u.path || ',' || CAST(e.source_id AS TEXT)"
+        "    FROM edges e"
+        "    JOIN upstream u ON e.target_id = u.node_id"
+        "    WHERE e.project = ?2"
+        "      AND e.type IN ('CALLS', 'USAGE', 'IMPORTS')"
+        "      AND u.depth < ?3"
+        "      AND instr(u.path, CAST(e.source_id AS TEXT)) = 0"
+        ")"
+        "SELECT DISTINCT t.name, t.file_path, t.start_line, e.type, u.depth "
+        "FROM edges e "
+        "JOIN nodes t ON e.source_id = t.id "
+        "JOIN upstream u ON e.target_id = u.node_id "
+        "WHERE e.project = ?2 "
+        "  AND (e.type = 'TESTS' OR json_extract(t.properties, '$.is_test') = 1) "
+        "LIMIT 100;";
+
+    if (sqlite3_prepare_v2(s->db, tests_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, target_id);
+        sqlite3_bind_text(stmt, 2, project, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 3, max_depth);
+
+        int test_cap = 16;
+        res->covering_tests = malloc(test_cap * sizeof(cbm_blast_covering_test_t));
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *t_name = (const char *)sqlite3_column_text(stmt, 0);
+            const char *t_file = (const char *)sqlite3_column_text(stmt, 1);
+            int t_line = sqlite3_column_int(stmt, 2);
+            int depth = sqlite3_column_int(stmt, 4);
+
+            if (res->covering_tests_count >= test_cap) {
+                test_cap *= 2;
+                cbm_blast_covering_test_t *grown = realloc(res->covering_tests, test_cap * sizeof(cbm_blast_covering_test_t));
+                if (grown) res->covering_tests = grown;
+            }
+            if (res->covering_tests && res->covering_tests_count < test_cap) {
+                cbm_blast_covering_test_t *t = &res->covering_tests[res->covering_tests_count++];
+                t->test_symbol = strdup(t_name ? t_name : "");
+                t->test_file = strdup(t_file ? t_file : "");
+                t->line = t_line;
+                t->test_type = strdup(depth == 0 ? "direct_test" : "caller_test");
+                t->distance = depth;
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    /* 4. Query git commit temporal co-change companion files */
+    if (include_co_changes && res->file_path && res->file_path[0] != '\0') {
+        const char *co_sql =
+            "SELECT target_f.file_path, "
+            "       coalesce(cast(json_extract(e.properties, '$.co_commits') AS INTEGER), 1) AS co_commits, "
+            "       coalesce(cast(json_extract(e.properties, '$.confidence') AS REAL), 0.5) AS conf "
+            "FROM nodes src_f "
+            "JOIN edges e ON (e.source_id = src_f.id AND e.type = 'FILE_CHANGES_WITH') "
+            "JOIN nodes target_f ON e.target_id = target_f.id "
+            "WHERE src_f.project = ?1 "
+            "  AND src_f.label = 'File' "
+            "  AND src_f.file_path = ?2 "
+            "ORDER BY conf DESC, co_commits DESC "
+            "LIMIT 10;";
+
+        if (sqlite3_prepare_v2(s->db, co_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt, 2, res->file_path, -1, SQLITE_STATIC);
+
+            int co_cap = 10;
+            res->co_changes = malloc(co_cap * sizeof(cbm_blast_co_change_t));
+
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char *cf = (const char *)sqlite3_column_text(stmt, 0);
+                int co_commits = sqlite3_column_int(stmt, 1);
+                double conf = sqlite3_column_double(stmt, 2);
+
+                if (res->co_changes && res->co_changes_count < co_cap) {
+                    cbm_blast_co_change_t *c = &res->co_changes[res->co_changes_count++];
+                    c->file_path = strdup(cf ? cf : "");
+                    c->co_commit_count = co_commits;
+                    c->confidence = conf;
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    /* 5. Compute risk score and rationale */
+    int S = res->affected_symbols_count;
+    double R_exp = (res->exposed_routes_count > 2) ? 1.0 : ((double)res->exposed_routes_count / 2.0);
+    double C_test = (S > 0) ? ((double)res->covering_tests_count / (double)S) : 1.0;
+    if (C_test > 1.0) C_test = 1.0;
+    res->test_coverage_ratio = C_test;
+
+    int coupled_high_conf = 0;
+    for (int i = 0; i < res->co_changes_count; i++) {
+        if (res->co_changes[i].confidence >= 0.5) coupled_high_conf++;
+    }
+    double F_coupled = (coupled_high_conf > 3) ? 1.0 : ((double)coupled_high_conf / 3.0);
+
+    double log_term = 0.35 * log10((double)S + 1.0);
+    if (log_term > 0.35) log_term = 0.35;
+
+    double score = log_term + (0.30 * R_exp) + (0.25 * (1.0 - C_test)) + (0.10 * F_coupled);
+    if (score > 1.0) score = 1.0;
+    if (score < 0.0) score = 0.0;
+    res->risk_score = score;
+
+    if (score >= 0.65) {
+        res->risk_level = strdup("HIGH");
+    } else if (score >= 0.35) {
+        res->risk_level = strdup("MEDIUM");
+    } else {
+        res->risk_level = strdup("LOW");
+    }
+
+    char rationale[512];
+    snprintf(rationale, sizeof(rationale),
+             "%s blast radius: %d affected symbols across %d files; %d exposed routes; %d covering tests (coverage: %.1f%%).",
+             res->risk_level, S, res->affected_files_count, res->exposed_routes_count,
+             res->covering_tests_count, C_test * 100.0);
+    res->risk_rationale = strdup(rationale);
+
+    *out = res;
+    return CBM_STORE_OK;
+}

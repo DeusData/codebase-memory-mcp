@@ -1419,6 +1419,7 @@ TEST(mcp_tools_have_behavior_annotations) {
          * actually lands (#2118). */
         {"ingest_traces", true, false, true, false},
         {"export_diagram", true, false, true, false},
+        {"analyze_blast_radius", true, false, true, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -20817,7 +20818,116 @@ TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
     PASS();
 }
 
+
+TEST(tool_analyze_blast_radius_basic) {
+    const char *project = "test-blast-radius";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/test-blast-radius"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    /* Insert test nodes */
+    cbm_node_t target_node = {0};
+    target_node.project = project;
+    target_node.label = "Function";
+    target_node.name = "process_payment";
+    target_node.qualified_name = "pkg.billing.process_payment";
+    target_node.file_path = "pkg/billing/pay.c";
+    target_node.start_line = 100;
+    target_node.end_line = 150;
+    target_node.properties_json = "{\"importance\": 4.5}";
+    int64_t target_id = cbm_store_upsert_node(st, &target_node);
+    ASSERT(target_id > 0);
+
+    cbm_node_t caller_node = {0};
+    caller_node.project = project;
+    caller_node.label = "Function";
+    caller_node.name = "checkout_handler";
+    caller_node.qualified_name = "pkg.api.checkout_handler";
+    caller_node.file_path = "pkg/api/handler.c";
+    caller_node.start_line = 20;
+    caller_node.end_line = 60;
+    caller_node.properties_json = "{\"importance\": 8.0, \"is_entry_point\": 1}";
+    int64_t caller_id = cbm_store_upsert_node(st, &caller_node);
+    ASSERT(caller_id > 0);
+
+    cbm_node_t route_node = {0};
+    route_node.project = project;
+    route_node.label = "Route";
+    route_node.name = "POST /api/checkout";
+    route_node.qualified_name = "route.POST.api.checkout";
+    route_node.file_path = "pkg/api/routes.c";
+    route_node.start_line = 10;
+    route_node.end_line = 15;
+    route_node.properties_json = "{\"method\": \"POST\", \"url_path\": \"/api/checkout\"}";
+    int64_t route_id = cbm_store_upsert_node(st, &route_node);
+    ASSERT(route_id > 0);
+
+    cbm_node_t test_node = {0};
+    test_node.project = project;
+    test_node.label = "Function";
+    test_node.name = "test_process_payment";
+    test_node.qualified_name = "tests.test_pay.test_process_payment";
+    test_node.file_path = "tests/test_pay.c";
+    test_node.start_line = 10;
+    test_node.end_line = 40;
+    test_node.properties_json = "{\"is_test\": true}";
+    int64_t test_id = cbm_store_upsert_node(st, &test_node);
+    ASSERT(test_id > 0);
+
+    /* Insert edges:
+     * route -> caller (CALLS)
+     * caller -> target (CALLS)
+     * test -> target (TESTS)
+     */
+    cbm_edge_t e1 = {0};
+    e1.project = project;
+    e1.source_id = route_id;
+    e1.target_id = caller_id;
+    e1.type = "CALLS";
+    e1.properties_json = "{}";
+    ASSERT(cbm_store_insert_edge(st, &e1) > 0);
+
+    cbm_edge_t e2 = {0};
+    e2.project = project;
+    e2.source_id = caller_id;
+    e2.target_id = target_id;
+    e2.type = "CALLS";
+    e2.properties_json = "{}";
+    ASSERT(cbm_store_insert_edge(st, &e2) > 0);
+
+    cbm_edge_t e3 = {0};
+    e3.project = project;
+    e3.source_id = test_id;
+    e3.target_id = target_id;
+    e3.type = "TESTS";
+    e3.properties_json = "{}";
+    ASSERT(cbm_store_insert_edge(st, &e3) > 0);
+
+    /* Call tool analyze_blast_radius */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "analyze_blast_radius",
+        "{\"project\":\"test-blast-radius\",\"target\":\"process_payment\",\"max_depth\":3}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"target\":\"pkg.billing.process_payment\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"risk_assessment\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"affected_symbols\""));
+    ASSERT_NOT_NULL(strstr(resp, "checkout_handler"));
+    ASSERT_NOT_NULL(strstr(resp, "\"exposed_routes\""));
+    ASSERT_NOT_NULL(strstr(resp, "/api/checkout"));
+    ASSERT_NOT_NULL(strstr(resp, "\"covering_tests\""));
+    ASSERT_NOT_NULL(strstr(resp, "test_process_payment"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(tool_analyze_blast_radius_basic);
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
     RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
