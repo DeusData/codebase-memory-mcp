@@ -1417,6 +1417,41 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * directly across N files (test_incremental.c saw 3.5 GB peak on a
  * 1100-file repo before this fix). Output gets copied into the file's own
  * arena and merged into result->resolved_calls. */
+/* Preserve a negative receiver-identity decision at the exact raw/preprocessed
+ * occurrence. Both sequential and fused-parallel CALLS passes already honor
+ * requires_lsp_resolution; unrelated unresolved calls keep their fallback. */
+static void pxc_require_unambiguous_receivers(CBMFileResult *result,
+                                              const CBMResolvedCallArray *out) {
+    CBMArena keys;
+    cbm_arena_init(&keys);
+    CBMHashTable *blocked = NULL;
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *r = &out->items[i];
+        if (!r->strategy || strcmp(r->strategy, "lsp_ambiguous_receiver") != 0 ||
+            r->kind != CBM_RESOLVED_INVOCATION || !r->caller_qn ||
+            r->site_end_byte <= r->site_start_byte)
+            continue;
+        if (!blocked)
+            blocked = cbm_ht_create((uint32_t)(out->count + 1));
+        char *key = cbm_arena_sprintf(&keys, "%s:%u:%u:%u", r->caller_qn, r->site_start_byte,
+                                      r->site_end_byte, (unsigned)r->source_origin);
+        cbm_ht_set(blocked, key, (void *)1);
+    }
+    for (int i = 0; blocked && i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || call->site_end_byte <= call->site_start_byte)
+            continue;
+        char *key =
+            cbm_arena_sprintf(&keys, "%s:%u:%u:%u", call->enclosing_func_qn, call->site_start_byte,
+                              call->site_end_byte, (unsigned)call->source_origin);
+        if (cbm_ht_get(blocked, key))
+            call->requires_lsp_resolution = true;
+    }
+    if (blocked)
+        cbm_ht_free(blocked);
+    cbm_arena_destroy(&keys);
+}
+
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count) {
@@ -1478,6 +1513,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         break;
     }
 
+    pxc_require_unambiguous_receivers(r, &out);
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
@@ -1497,6 +1533,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_run_ts_lsp_cross(&scratch, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, defs,
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
+    pxc_require_unambiguous_receivers(r, &out);
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
@@ -1658,6 +1695,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             break;
         }
         if (used_prebuilt) {
+            pxc_require_unambiguous_receivers(result, &out);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
         }
