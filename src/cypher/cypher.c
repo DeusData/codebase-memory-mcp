@@ -4245,7 +4245,54 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
     }
 }
 
-/* Apply post-WITH WHERE filter */
+static bool condition_bindings_available(const cbm_condition_t *condition, binding_t *binding) {
+    if (condition->variable && !binding_get(binding, condition->variable) &&
+        !binding_get_edge(binding, condition->variable)) {
+        return false;
+    }
+    for (int i = 0; i < condition->arg_count; i++) {
+        const char *var = condition->args[i].variable;
+        if (var && !binding_get(binding, var) && !binding_get_edge(binding, var)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool expr_bindings_available(const cbm_expr_t *expr, binding_t *binding) {
+    if (!expr) {
+        return true;
+    }
+    switch (expr->type) {
+    case EXPR_CONDITION:
+        return condition_bindings_available(&expr->cond, binding);
+    case EXPR_AND:
+    case EXPR_OR:
+    case EXPR_XOR:
+        return expr_bindings_available(expr->left, binding) &&
+               expr_bindings_available(expr->right, binding);
+    case EXPR_NOT:
+        return expr_bindings_available(expr->left, binding);
+    }
+    return false;
+}
+
+static bool where_bindings_available(const cbm_where_clause_t *where, binding_t *binding) {
+    if (!where) {
+        return true;
+    }
+    if (where->root) {
+        return expr_bindings_available(where->root, binding);
+    }
+    for (int i = 0; i < where->count; i++) {
+        if (!condition_bindings_available(&where->conditions[i], binding)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Apply a WHERE filter after its referenced variables have been bound. */
 static void filter_bindings_where(const cbm_where_clause_t *where, binding_t *vbindings,
                                   int *vcount) {
     int kept = 0;
@@ -5263,7 +5310,8 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         binding_t b = {0};
         b.store = store;
         binding_set(&b, var_name, &scanned[i]);
-        bool pass = !q->where || eval_where(q->where, &b);
+        bool pass = !q->where || !where_bindings_available(q->where, &b) ||
+                    eval_where(q->where, &b);
         if (pass) {
             bindings[bind_count++] = b;
         } else {
