@@ -2625,8 +2625,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         const char *route_path = find_route_path_in_args(call, &handler_ref);
         if (route_path) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
-                                    registry, main_gbuf, imp_keys, imp_vals, imp_count,
-                                    route_mount, lang);
+                                    registry, main_gbuf, imp_keys, imp_vals, imp_count, route_mount,
+                                    lang);
             return;
         }
         /* No path found — fall through to normal CALLS edge */
