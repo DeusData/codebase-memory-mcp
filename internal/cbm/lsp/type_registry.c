@@ -677,8 +677,28 @@ CBMRegisteredType *cbm_registry_type_for_update(CBMTypeRegistry *head, const cha
     for (const CBMTypeRegistry *r = head->fallback; r; r = r->fallback) {
         const CBMRegisteredType *base = lookup_type_self(r, qualified_name);
         if (base) {
+            CBMRegisteredType copy = *base;
+            /* Field refinements overwrite entries in this array. The type
+             * objects remain immutable, but the writable overlay must own
+             * the pointer array rather than mutate its shared fallback. */
+            if (base->field_types) {
+                size_t count = 0;
+                /* Types are parallel to names; a named field may have no
+                 * type, so an interior NULL does not terminate that array. */
+                while (base->field_names ? base->field_names[count] != NULL
+                                         : base->field_types[count] != NULL) {
+                    count++;
+                }
+                const CBMType **field_types = (const CBMType **)cbm_arena_alloc(
+                    head->arena, (count + 1) * sizeof(*field_types));
+                if (!field_types) {
+                    return NULL;
+                }
+                memcpy(field_types, base->field_types, (count + 1) * sizeof(*field_types));
+                copy.field_types = field_types;
+            }
             int before = head->type_count;
-            cbm_registry_add_type(head, *base);
+            cbm_registry_add_type(head, copy);
             if (head->type_count == before + 1) {
                 return &head->types[before];
             }

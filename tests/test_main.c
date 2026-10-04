@@ -377,6 +377,14 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         fflush(NULL);
         _Exit(response ? 0 : 1);
     }
+    if (strstr(args_json, "\"silent-exit\"")) {
+        /* #1300: reach a phase, then exit 0 without writing the response. The
+         * trailing plain-text line must not be mistaken for a phase. */
+        cbm_log_info("incremental.edge_snapshot", "captured", "3");
+        (void)fprintf(stderr, "async worker silent-exit probe\n");
+        fflush(NULL);
+        _Exit(0);
+    }
     if (strstr(args_json, "\"crash\"")) {
         (void)fprintf(stderr, "async worker crash probe\n");
         fflush(NULL);
@@ -892,6 +900,7 @@ extern void suite_subprocess(void);
 extern void suite_private_file_lock(void);
 extern void suite_lock_registry(void);
 extern void suite_extraction(void);
+extern void suite_callable_sig(void);
 extern void suite_extraction_inheritance(void);
 extern void suite_extraction_imports(void);
 extern void suite_parse_coverage(void);
@@ -1210,6 +1219,7 @@ int main(int argc, char **argv) {
     /* Existing C code regression tests */
     RUN_SELECTED_SUITE(ac);
     RUN_SELECTED_SUITE(extraction);
+    RUN_SELECTED_SUITE(callable_sig);
     RUN_SELECTED_SUITE(extraction_inheritance);
     RUN_SELECTED_SUITE(extraction_imports);
     RUN_SELECTED_SUITE(parse_coverage);

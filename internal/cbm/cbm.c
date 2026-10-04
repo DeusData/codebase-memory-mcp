@@ -243,6 +243,11 @@ void cbm_typeassign_push(CBMTypeAssignArray *arr, CBMArena *a, CBMTypeAssign ta)
     arr->items[arr->count++] = ta;
 }
 
+void cbm_fieldtype_push(CBMFieldTypeArray *arr, CBMArena *a, CBMFieldType ft) {
+    GROW_ARRAY(arr, a);
+    arr->items[arr->count++] = ft;
+}
+
 void cbm_stringref_push(CBMStringRefArray *arr, CBMArena *a, CBMStringRef sr) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = sr;

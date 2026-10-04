@@ -39,6 +39,9 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -3011,8 +3014,8 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3072,8 +3075,8 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     };
     cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
     cbm_cli_set_activation_ops_for_test(&ops);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);
 
@@ -3091,6 +3094,329 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     ASSERT_EQ(fake.mutation_reserve_count, 1);
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+/* Uninstall requires a separate choice before deleting project data. Keep
+ * fixture state and activation coordination independent of the developer's
+ * installation, and validate setup before absence can count as deletion. */
+enum { UNINSTALL_INDEX_COUNT = 3, UNINSTALL_FILES_PER_INDEX = 6 };
+
+typedef struct {
+    char tmpdir[256];
+    char cache_dir[512];
+    char bin_target[640];
+    char internal_store[640];
+    char index_paths[UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX][640];
+    char index_bodies[UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX][64];
+    char *old_home;
+    char *old_cache;
+    char *old_path;
+    bool created;
+} cli_uninstall_index_fixture_t;
+
+static bool cli_uninstall_index_fixture_intact(const cli_uninstall_index_fixture_t *fx) {
+    for (int i = 0; i < UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX; i++) {
+        const char *body = read_test_file(fx->index_paths[i]);
+        if (!body || strcmp(body, fx->index_bodies[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool cli_uninstall_test_file_is(const char *path, const char *expected) {
+    const char *body = read_test_file(path);
+    return body && strcmp(body, expected) == 0;
+}
+
+static bool cli_uninstall_test_absent(const char *path) {
+    struct stat st;
+    errno = 0;
+    return stat(path, &st) != 0 && errno == ENOENT;
+}
+
+static bool cli_uninstall_index_fixture_setup(cli_uninstall_index_fixture_t *fx, const char *tag) {
+    memset(fx, 0, sizeof(*fx));
+    snprintf(fx->tmpdir, sizeof(fx->tmpdir), "/tmp/cli-uninstall-%s-XXXXXX", tag);
+    if (!cbm_mkdtemp(fx->tmpdir)) {
+        return false;
+    }
+    fx->created = true;
+    cli_activation_save_env(&fx->old_home, &fx->old_cache);
+    fx->old_path = save_test_env("PATH");
+    cbm_setenv("HOME", fx->tmpdir, 1);
+    cbm_setenv("PATH", fx->tmpdir, 1);
+    snprintf(fx->cache_dir, sizeof(fx->cache_dir), "%s/cache", fx->tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", fx->cache_dir, 1);
+    const char *home = getenv("HOME");
+    const char *path = getenv("PATH");
+    const char *cache = getenv("CBM_CACHE_DIR");
+    if (!home || !path || !cache || strcmp(home, fx->tmpdir) != 0 ||
+        strcmp(path, fx->tmpdir) != 0 || strcmp(cache, fx->cache_dir) != 0) {
+        return false;
+    }
+    test_mkdirp(fx->cache_dir);
+    static const char *const suffixes[UNINSTALL_FILES_PER_INDEX] = {
+        ".db", ".db-wal", ".db-shm", ".db-journal", ".db.tmp", ".db.tmp-wal"};
+    for (int i = 0; i < UNINSTALL_INDEX_COUNT; i++) {
+        for (int j = 0; j < UNINSTALL_FILES_PER_INDEX; j++) {
+            int k = i * UNINSTALL_FILES_PER_INDEX + j;
+            snprintf(fx->index_paths[k], sizeof(fx->index_paths[k]), "%s/project-%d%s",
+                     fx->cache_dir, i, suffixes[j]);
+            snprintf(fx->index_bodies[k], sizeof(fx->index_bodies[k]), "index %d file %d %s", i, j,
+                     tag);
+            write_test_file(fx->index_paths[k], fx->index_bodies[k]);
+        }
+    }
+    snprintf(fx->internal_store, sizeof(fx->internal_store), "%s/_config.db", fx->cache_dir);
+    write_test_file(fx->internal_store, "internal store sentinel");
+    char bin_dir[512];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", fx->tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(fx->bin_target, sizeof(fx->bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(fx->bin_target, sizeof(fx->bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(fx->bin_target, "uninstall fixture binary");
+    return cli_uninstall_index_fixture_intact(fx) &&
+           cli_uninstall_test_file_is(fx->internal_store, "internal store sentinel") &&
+           cli_uninstall_test_file_is(fx->bin_target, "uninstall fixture binary");
+}
+
+static void cli_uninstall_index_fixture_teardown(cli_uninstall_index_fixture_t *fx) {
+    if (fx->created) {
+        cli_activation_restore_env(fx->old_home, fx->old_cache);
+        restore_test_env("PATH", fx->old_path);
+        test_rmdir_r(fx->tmpdir);
+    }
+}
+
+static int cli_uninstall_index_fixture_run(char **argv, int argc, int *reservations) {
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_set_auto_answer_for_test(0);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    int rc = cli_test_cmd_uninstall(argc, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    if (reservations) {
+        *reservations = fake.mutation_reserve_count;
+    }
+    return rc;
+}
+
+/* These local redirect helpers also exercise the Windows CRT descriptor path;
+ * unlike the older POSIX capture fixture, neither test is compiled out there. */
+static int cli_uninstall_redirect_stream(FILE *stream, FILE *replacement) {
+    if (stream != stdin && fflush(stream) != 0) {
+        return -1;
+    }
+#ifdef _WIN32
+    int target = _fileno(stream);
+    int saved = _dup(target);
+    if (saved >= 0 && _dup2(_fileno(replacement), target) != 0) {
+        _close(saved);
+        return -1;
+    }
+#else
+    int target = fileno(stream);
+    int saved = dup(target);
+    if (saved >= 0 && dup2(fileno(replacement), target) < 0) {
+        close(saved);
+        return -1;
+    }
+#endif
+    clearerr(stream);
+    return saved;
+}
+
+static bool cli_uninstall_restore_stream(FILE *stream, int saved) {
+    if (saved < 0) {
+        return false;
+    }
+    bool flushed = stream == stdin || fflush(stream) == 0;
+#ifdef _WIN32
+    bool restored = _dup2(saved, _fileno(stream)) == 0;
+    _close(saved);
+#else
+    bool restored = dup2(saved, fileno(stream)) >= 0;
+    close(saved);
+#endif
+    clearerr(stream);
+    return flushed && restored;
+}
+
+static bool cli_uninstall_capture_text(FILE *file, char *out, size_t capacity) {
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        return false;
+    }
+    size_t n = fread(out, 1, capacity - 1, file);
+    out[n] = '\0';
+    return !ferror(file);
+}
+
+TEST(cli_uninstall_auto_answers_keep_indexes_without_delete_indexes) {
+    char *answers[] = {"--yes", "-y", "--no", "-n"};
+    for (size_t i = 0; i < sizeof(answers) / sizeof(answers[0]); i++) {
+        cli_uninstall_index_fixture_t fx;
+        if (!cli_uninstall_index_fixture_setup(&fx, "keep")) {
+            cli_uninstall_index_fixture_teardown(&fx);
+            FAIL("uninstall fixture setup failed");
+        }
+        char *argv[] = {answers[i]};
+        int rc = cli_uninstall_index_fixture_run(argv, 1, NULL);
+        bool kept = cli_uninstall_index_fixture_intact(&fx);
+        bool binary_gone = cli_uninstall_test_absent(fx.bin_target);
+        bool internal_kept =
+            cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+        cli_uninstall_index_fixture_teardown(&fx);
+        ASSERT_EQ(rc, 0);
+        ASSERT_TRUE(kept);
+        ASSERT_TRUE(binary_gone);
+        ASSERT_TRUE(internal_kept);
+    }
+    PASS();
+}
+
+TEST(cli_uninstall_delete_indexes_is_explicit_and_overrides_no) {
+    char *argvs[][2] = {{"--delete-indexes", NULL},
+                        {"--yes", "--delete-indexes"},
+                        {"--no", "--delete-indexes"},
+                        {"--delete-indexes", "--no"}};
+    for (size_t i = 0; i < sizeof(argvs) / sizeof(argvs[0]); i++) {
+        cli_uninstall_index_fixture_t fx;
+        if (!cli_uninstall_index_fixture_setup(&fx, "delete")) {
+            cli_uninstall_index_fixture_teardown(&fx);
+            FAIL("uninstall fixture setup failed");
+        }
+        int reservations = 0;
+        int rc = cli_uninstall_index_fixture_run(argvs[i], i == 0 ? 1 : 2, &reservations);
+        bool absent = true;
+        for (int k = 0; k < UNINSTALL_INDEX_COUNT * UNINSTALL_FILES_PER_INDEX; k++) {
+            absent = cli_uninstall_test_absent(fx.index_paths[k]) && absent;
+        }
+        bool binary_gone = cli_uninstall_test_absent(fx.bin_target);
+        bool internal_kept =
+            cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+        cli_uninstall_index_fixture_teardown(&fx);
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(reservations, 1);
+        ASSERT_TRUE(absent);
+        ASSERT_TRUE(binary_gone);
+        ASSERT_TRUE(internal_kept);
+    }
+    PASS();
+}
+
+TEST(cli_uninstall_delete_indexes_dry_run_keeps_files) {
+    cli_uninstall_index_fixture_t fx;
+    if (!cli_uninstall_index_fixture_setup(&fx, "dry")) {
+        cli_uninstall_index_fixture_teardown(&fx);
+        FAIL("uninstall fixture setup failed");
+    }
+    FILE *output = tmpfile();
+    int saved = output ? cli_uninstall_redirect_stream(stdout, output) : -1;
+    int rc = -1;
+    int reservations = -1;
+    if (saved >= 0) {
+        char *argv[] = {"--dry-run", "--delete-indexes", "--no"};
+        rc = cli_uninstall_index_fixture_run(argv, 3, &reservations);
+    }
+    bool restored = saved >= 0 && cli_uninstall_restore_stream(stdout, saved);
+    char text[8192] = "";
+    bool captured = output && cli_uninstall_capture_text(output, text, sizeof(text));
+    if (output) {
+        fclose(output);
+    }
+    bool kept = cli_uninstall_index_fixture_intact(&fx) &&
+                cli_uninstall_test_file_is(fx.bin_target, "uninstall fixture binary") &&
+                cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+    bool named = strstr(text, "indexes would be deleted") != NULL;
+    cli_uninstall_index_fixture_teardown(&fx);
+    ASSERT_TRUE(restored && captured);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(reservations, 0);
+    ASSERT_TRUE(kept);
+    ASSERT_TRUE(named);
+    PASS();
+}
+
+TEST(cli_uninstall_non_tty_affirmative_input_keeps_indexes) {
+    cli_uninstall_index_fixture_t fx;
+    if (!cli_uninstall_index_fixture_setup(&fx, "notty")) {
+        cli_uninstall_index_fixture_teardown(&fx);
+        FAIL("uninstall fixture setup failed");
+    }
+    FILE *input = tmpfile();
+    FILE *output = tmpfile();
+    FILE *errors = tmpfile();
+    bool input_ready =
+        input && fputs("y\n", input) >= 0 && fflush(input) == 0 && fseek(input, 0, SEEK_SET) == 0;
+    int saved_in = input_ready ? cli_uninstall_redirect_stream(stdin, input) : -1;
+    int saved_out = output ? cli_uninstall_redirect_stream(stdout, output) : -1;
+    int saved_err = errors ? cli_uninstall_redirect_stream(stderr, errors) : -1;
+    int rc = -1;
+    if (saved_in >= 0 && saved_out >= 0 && saved_err >= 0 && fseek(stdin, 0, SEEK_SET) == 0) {
+        char *argv[] = {"uninstall"};
+        rc = cli_uninstall_index_fixture_run(argv, 1, NULL);
+    }
+    bool restored_err = saved_err >= 0 && cli_uninstall_restore_stream(stderr, saved_err);
+    bool restored_out = saved_out >= 0 && cli_uninstall_restore_stream(stdout, saved_out);
+    bool restored_in = saved_in >= 0 && cli_uninstall_restore_stream(stdin, saved_in);
+    char out_text[8192] = "";
+    char err_text[8192] = "";
+    bool captured = output && errors &&
+                    cli_uninstall_capture_text(output, out_text, sizeof(out_text)) &&
+                    cli_uninstall_capture_text(errors, err_text, sizeof(err_text));
+    bool unread = input && fgetc(input) == 'y';
+    if (input) {
+        fclose(input);
+    }
+    if (output) {
+        fclose(output);
+    }
+    if (errors) {
+        fclose(errors);
+    }
+    bool kept = cli_uninstall_index_fixture_intact(&fx) &&
+                cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+    bool binary_gone = cli_uninstall_test_absent(fx.bin_target);
+    bool explained = strstr(out_text, "--delete-indexes") && strstr(out_text, fx.cache_dir) &&
+                     !strstr(out_text, "Delete these indexes?") &&
+                     !strstr(err_text, "requires a terminal");
+    cli_uninstall_index_fixture_teardown(&fx);
+    ASSERT_TRUE(restored_in && restored_out && restored_err && captured);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(unread);
+    ASSERT_TRUE(kept);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(explained);
+    PASS();
+}
+
+TEST(cli_uninstall_delete_indexes_help_and_invalid_options_preserve_files) {
+    char *argvs[][3] = {{"--yes", "--delete-indexes", "--help"},
+                        {"--delete-indexes", "--unknown", NULL},
+                        {"--delete-indexes", "--dir=", NULL},
+                        {"--delete-indexes", "--dir", NULL}};
+    for (size_t i = 0; i < sizeof(argvs) / sizeof(argvs[0]); i++) {
+        cli_uninstall_index_fixture_t fx;
+        if (!cli_uninstall_index_fixture_setup(&fx, "early")) {
+            cli_uninstall_index_fixture_teardown(&fx);
+            FAIL("uninstall fixture setup failed");
+        }
+        int reservations = -1;
+        int rc = cli_uninstall_index_fixture_run(argvs[i], i == 0 ? 3 : 2, &reservations);
+        bool kept = cli_uninstall_index_fixture_intact(&fx) &&
+                    cli_uninstall_test_file_is(fx.bin_target, "uninstall fixture binary") &&
+                    cli_uninstall_test_file_is(fx.internal_store, "internal store sentinel");
+        cli_uninstall_index_fixture_teardown(&fx);
+        ASSERT_EQ(rc, i == 0 ? 0 : 1);
+        ASSERT_EQ(reservations, 0);
+        ASSERT_TRUE(kept);
+    }
     PASS();
 }
 
@@ -3148,8 +3474,8 @@ TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails) {
     cli_fd_capture_t err_capture;
     cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
     cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *err_text = cli_fd_capture_end(&err_capture);
     char *out_text = cli_fd_capture_end(&out_capture);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -3231,8 +3557,8 @@ TEST(cli_uninstall_cleans_user_owned_symlinked_config) {
     cli_fd_capture_t err_capture;
     cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
     cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
-    char *argv[] = {"--yes"};
-    int rc = cli_test_cmd_uninstall(1, argv);
+    char *argv[] = {"--yes", "--delete-indexes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *err_text = cli_fd_capture_end(&err_capture);
     char *out_text = cli_fd_capture_end(&out_capture);
     cbm_cli_set_activation_ops_for_test(NULL);
@@ -6049,6 +6375,11 @@ TEST(cli_detect_agents_finds_claude) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/.claude", tmpdir);
     test_mkdirp(dir);
+    /* #1180: a bare directory is not evidence; the settings file Claude Code
+     * reads is. */
+    char settings[640];
+    snprintf(settings, sizeof(settings), "%s/settings.json", dir);
+    write_test_file(settings, "{}\n");
 
     /* Unset CLAUDE_CONFIG_DIR so detection is exercised against home_dir/.claude
      * and the runner's real env (which may set it) does not leak in. */
@@ -6078,6 +6409,10 @@ TEST(cli_detect_agents_finds_claude_via_env) {
     char ccd[512];
     snprintf(ccd, sizeof(ccd), "%s/custom-claude", tmpdir);
     test_mkdirp(ccd);
+    /* #1180: Claude Code keeps .claude.json inside CLAUDE_CONFIG_DIR. */
+    char user_config[640];
+    snprintf(user_config, sizeof(user_config), "%s/.claude.json", ccd);
+    write_test_file(user_config, "{}\n");
 
     const char *saved_ccd = getenv("CLAUDE_CONFIG_DIR");
     char *saved_ccd_copy = saved_ccd ? strdup(saved_ccd) : NULL;
@@ -6095,6 +6430,255 @@ TEST(cli_detect_agents_finds_claude_via_env) {
     }
 
     test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* #1167/#1180: detection runs against a synthetic home with every env var that
+ * can redirect Claude/OpenCode/Hermes lookups cleared and PATH reduced to one
+ * empty directory, so the host's own installs never leak into the verdict. */
+typedef struct {
+    char *path;
+    char *claude_config_dir;
+    char *opencode_config;
+    char *opencode_config_dir;
+    char *hermes_home;
+} client_detect_env_t;
+
+static client_detect_env_t client_detect_env_isolate(const char *path_dir) {
+    client_detect_env_t saved = {
+        save_test_env("PATH"), save_test_env("CLAUDE_CONFIG_DIR"), save_test_env("OPENCODE_CONFIG"),
+        save_test_env("OPENCODE_CONFIG_DIR"), save_test_env("HERMES_HOME")};
+    cbm_setenv("PATH", path_dir, 1);
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    cbm_unsetenv("OPENCODE_CONFIG");
+    cbm_unsetenv("OPENCODE_CONFIG_DIR");
+    cbm_unsetenv("HERMES_HOME");
+    return saved;
+}
+
+static void client_detect_env_restore(client_detect_env_t *saved) {
+    restore_test_env("PATH", saved->path);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved->claude_config_dir);
+    restore_test_env("OPENCODE_CONFIG", saved->opencode_config);
+    restore_test_env("OPENCODE_CONFIG_DIR", saved->opencode_config_dir);
+    restore_test_env("HERMES_HOME", saved->hermes_home);
+}
+
+/* Fresh home plus an empty bin dir used as the whole PATH. */
+static bool client_detect_fixture(char *home, size_t home_sz, char *bin, size_t bin_sz) {
+    snprintf(home, home_sz, "/tmp/cli-client-detect-XXXXXX");
+    if (!cbm_mkdtemp(home)) {
+        return false;
+    }
+    snprintf(bin, bin_sz, "%s/bin", home);
+    test_mkdirp(bin);
+    return true;
+}
+
+/* #1180: a bare ~/.claude directory no longer counts as Claude Code. Fixtures
+ * that model a Claude Code user add the user config Claude Code itself writes
+ * (.claude.json in the home, or in CLAUDE_CONFIG_DIR when that is set). */
+static void test_mark_claude_code_installed(const char *user_root) {
+    char path[768];
+    snprintf(path, sizeof(path), "%s/.claude.json", user_root);
+    write_test_file(path, "{}\n");
+}
+
+/* #1180: a user with only an (empty) ~/.claude folder and no Claude Code CLI
+ * was reported as "Detected agents: Claude-Code" and got hooks, skills and
+ * MCP entries written for a client they never installed. */
+TEST(cli_detect_claude_empty_dir_not_detected_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.claude", home);
+    test_mkdirp(dir);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (agents.claude_code)
+        FAIL("an empty ~/.claude directory must not count as an installed Claude Code");
+    PASS();
+}
+
+TEST(cli_detect_claude_empty_config_dir_env_not_detected_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char ccd[512];
+    snprintf(ccd, sizeof(ccd), "%s/custom-claude", home);
+    test_mkdirp(ccd);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_setenv("CLAUDE_CONFIG_DIR", ccd, 1);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (agents.claude_code)
+        FAIL("an empty CLAUDE_CONFIG_DIR must not count as an installed Claude Code");
+    PASS();
+}
+
+/* The evidence that DOES mean Claude Code is installed, one at a time: its
+ * settings file, its user config ~/.claude.json, or the claude CLI. */
+TEST(cli_detect_claude_real_install_detected_issue1180) {
+    enum { EVIDENCE_SETTINGS, EVIDENCE_USER_CONFIG, EVIDENCE_CLI, EVIDENCE_COUNT };
+    static const char *const names[EVIDENCE_COUNT] = {"settings.json", ".claude.json",
+                                                      "claude CLI"};
+    for (int kind = 0; kind < EVIDENCE_COUNT; kind++) {
+        char home[256];
+        char bin[320];
+        if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+            FAIL("cbm_mkdtemp failed");
+        char path[640];
+        if (kind == EVIDENCE_SETTINGS) {
+            snprintf(path, sizeof(path), "%s/.claude", home);
+            test_mkdirp(path);
+            snprintf(path, sizeof(path), "%s/.claude/settings.json", home);
+            write_test_file(path, "{}\n");
+        } else if (kind == EVIDENCE_USER_CONFIG) {
+            snprintf(path, sizeof(path), "%s/.claude.json", home);
+            write_test_file(path, "{}\n");
+        } else {
+            snprintf(path, sizeof(path), "%s/claude", bin);
+            write_test_file(path, "#!/bin/sh\nexit 0\n");
+            chmod(path, 0755);
+        }
+        client_detect_env_t saved = client_detect_env_isolate(bin);
+        cbm_detected_agents_t agents = cbm_detect_agents(home);
+        client_detect_env_restore(&saved);
+        test_rmdir_r(home);
+        if (!agents.claude_code) {
+            printf("  evidence: %s\n", names[kind]);
+            FAIL("real Claude Code evidence must be detected");
+        }
+    }
+    PASS();
+}
+
+/* #1180: OpenCode keeps its data in ~/.local/share/opencode on every OS
+ * (opencode.ai/docs/troubleshooting, "Storage"; Windows:
+ * %USERPROFILE%\.local\share\opencode), and the Desktop app's bundled
+ * opencode-cli server creates it too. With no config file, no
+ * ~/.config/opencode and no opencode on PATH it is the remaining evidence. */
+TEST(cli_detect_opencode_desktop_storage_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.local/share/opencode", home);
+    test_mkdirp(dir);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (!agents.opencode)
+        FAIL("OpenCode's data dir ~/.local/share/opencode must detect OpenCode");
+    PASS();
+}
+
+/* #1180: native Windows Hermes (install.ps1 CLI, MSIX package, Desktop app)
+ * defaults HERMES_HOME to %LOCALAPPDATA%\hermes and reads a legacy ~/.hermes
+ * only while that directory is absent (hermes-agent windows-native.md "Data
+ * layout"; apps/desktop/electron/data-paths.mjs). cbm probed and wrote
+ * ~/.hermes only. Elsewhere the home stays ~/.hermes. */
+TEST(cli_hermes_home_windows_localappdata_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char native[512];
+    char legacy[512];
+    snprintf(native, sizeof(native), "%s/AppData/Local/hermes", home);
+    snprintf(legacy, sizeof(legacy), "%s/.hermes", home);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    char fresh_windows[512];
+    char fresh_posix[512];
+    char legacy_windows[512];
+    char both_windows[512];
+    char both_posix[512];
+    cbm_hermes_home_dir_for_testing(home, true, fresh_windows, sizeof(fresh_windows));
+    cbm_hermes_home_dir_for_testing(home, false, fresh_posix, sizeof(fresh_posix));
+    test_mkdirp(legacy);
+    cbm_hermes_home_dir_for_testing(home, true, legacy_windows, sizeof(legacy_windows));
+    test_mkdirp(native);
+    cbm_hermes_home_dir_for_testing(home, true, both_windows, sizeof(both_windows));
+    cbm_hermes_home_dir_for_testing(home, false, both_posix, sizeof(both_posix));
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+
+    bool ok = strcmp(fresh_windows, native) == 0 && strcmp(fresh_posix, legacy) == 0 &&
+              strcmp(legacy_windows, legacy) == 0 && strcmp(both_windows, native) == 0 &&
+              strcmp(both_posix, legacy) == 0;
+    if (!ok) {
+        printf("  fresh: windows=%s posix=%s\n  legacy-only windows=%s\n"
+               "  both: windows=%s posix=%s\n",
+               fresh_windows, fresh_posix, legacy_windows, both_windows, both_posix);
+        FAIL("Windows Hermes home must be AppData/Local/hermes unless only ~/.hermes exists");
+    }
+    PASS();
+}
+
+/* #1180 end to end on the compiled-in platform: a Hermes Desktop home in
+ * AppData/Local/hermes is detected and receives config.yaml + the skill on
+ * Windows, and is not evidence anywhere else. */
+TEST(cli_detect_hermes_desktop_home_issue1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/AppData/Local/hermes", home);
+    test_mkdirp(dir);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    char *json = cbm_build_install_plan_json(home, "/usr/local/bin/codebase-memory-mcp");
+    client_detect_env_restore(&saved);
+#ifdef _WIN32
+    bool ok = agents.hermes && json && strstr(json, "/AppData/Local/hermes/config.yaml") &&
+              strstr(json, "/AppData/Local/hermes/skills/codebase-memory/SKILL.md") &&
+              !strstr(json, "/.hermes/config.yaml");
+#else
+    bool ok = !agents.hermes && json && !strstr(json, "/AppData/Local/hermes/");
+#endif
+    free(json);
+    test_rmdir_r(home);
+    if (!ok)
+        FAIL("the Hermes home must follow the platform's documented default");
+    PASS();
+}
+
+/* Control: look-alike neighbours of every new probe must not detect anything. */
+TEST(cli_detect_client_non_install_control_issue1167_1180) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+    char path[640];
+    snprintf(path, sizeof(path), "%s/.local/share/opencode-other", home);
+    test_mkdirp(path);
+    snprintf(path, sizeof(path), "%s/.claude-other", home);
+    test_mkdirp(path);
+    snprintf(path, sizeof(path), "%s/claude.json", home);
+    write_test_file(path, "{}\n");
+    snprintf(path, sizeof(path), "%s/AppData/Local/hermes-other", home);
+    test_mkdirp(path);
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    client_detect_env_restore(&saved);
+    test_rmdir_r(home);
+    if (agents.claude_code || agents.opencode || agents.hermes)
+        FAIL("unrelated files next to the probed locations must not detect a client");
     PASS();
 }
 
@@ -6975,6 +7559,7 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
         test_mkdirp(path);
     }
+    test_mark_claude_code_installed(tmpdir);
     snprintf(path, sizeof(path), "%s/mcp-config.json", copilot_home);
     write_test_file(path, "{}\n");
 
@@ -8221,6 +8806,7 @@ TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
     if (!cbm_mkdir_p(hooks_dir, 0755))
         FAIL("mkdir hooks_dir failed");
+    test_mark_claude_code_installed(tmpdir);
     /* A gate script that is NOT ours: a manual install pointing at another
      * binary. The real install refuses to rewrite it (TEXT_UNOWNED). */
     char gate_path[768];
@@ -9385,6 +9971,7 @@ TEST(cli_devin_does_not_duplicate_owned_claude_session_start) {
     snprintf(claude_settings, sizeof(claude_settings), "%s/settings.json", claude_dir);
     snprintf(devin_config, sizeof(devin_config), "%s/config.json", devin_dir);
     test_mkdirp(claude_dir);
+    test_mark_claude_code_installed(tmpdir);
     test_mkdirp(devin_dir);
     write_test_file(devin_config, "{}\n");
 
@@ -9651,6 +10238,7 @@ TEST(cli_claude_user_scope_avoids_nested_mcp_json) {
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/.claude", tmpdir);
     test_mkdirp(dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
     bool has_user_config = json && strstr(json, "/.claude.json") != NULL;
@@ -10315,7 +10903,13 @@ TEST(cli_relative_kiro_and_hermes_homes_never_target_root) {
     char expected_kiro[512];
     char expected_hermes[512];
     snprintf(expected_kiro, sizeof(expected_kiro), "%s/.kiro/settings/mcp.json", tmpdir);
+#ifdef _WIN32
+    /* #1180: native Windows Hermes defaults to %LOCALAPPDATA%\hermes. */
+    snprintf(expected_hermes, sizeof(expected_hermes), "%s/AppData/Local/hermes/config.yaml",
+             tmpdir);
+#else
     snprintf(expected_hermes, sizeof(expected_hermes), "%s/.hermes/config.yaml", tmpdir);
+#endif
     bool safe = json && strstr(json, expected_kiro) && strstr(json, expected_hermes) &&
                 !strstr(json, "\"/settings/mcp.json\"") && !strstr(json, "\"/config.yaml\"");
 
@@ -10352,7 +10946,12 @@ TEST(cli_fresh_cli_only_yaml_and_toml_agents_create_parent_dirs) {
     cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
 
     char path[768];
+#ifdef _WIN32
+    /* #1180: native Windows Hermes defaults to %LOCALAPPDATA%\hermes. */
+    snprintf(path, sizeof(path), "%s/AppData/Local/hermes/config.yaml", tmpdir);
+#else
     snprintf(path, sizeof(path), "%s/.hermes/config.yaml", tmpdir);
+#endif
     bool installed = test_file_contains_all(
         path, (const char *const[]){"mcp_servers:", "codebase-memory-mcp:"}, 2);
 #ifdef _WIN32
@@ -11060,6 +11659,7 @@ TEST(cli_uninstall_preserves_hook_script_with_modified_binary) {
     snprintf(script_path, sizeof(script_path), "%s/hooks/cbm-session-reminder", claude_dir);
 #endif
     test_mkdirp(claude_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -11402,6 +12002,7 @@ TEST(cli_claude_lifecycle_hooks_delegate_to_augmenter) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_path = save_test_env("PATH");
     char *saved_claude = save_test_env("CLAUDE_CONFIG_DIR");
@@ -12055,6 +12656,7 @@ TEST(cli_claude_hook_scripts_shell_quote_binary_path) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
     char copilot_dir[512];
     snprintf(copilot_dir, sizeof(copilot_dir), "%s/.copilot", tmpdir);
     test_mkdirp(copilot_dir);
@@ -12128,6 +12730,7 @@ TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir) {
     snprintf(config_dir, sizeof(config_dir), "%s/custom claude;$(touch cbm-hook-path-pwned)",
              tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(config_dir);
     char *saved_path = save_test_env("PATH");
     char *saved_claude = save_test_env("CLAUDE_CONFIG_DIR");
     cbm_setenv("PATH", tmpdir, 1);
@@ -13128,6 +13731,7 @@ TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
     snprintf(subagent_path, sizeof(subagent_path), "%s/cbm-subagent-reminder", hooks_dir);
     snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char legacy_gate[8192];
     ASSERT_TRUE(test_build_released_gate_hook_script("/opt/codebase-memory-mcp", legacy_gate,
@@ -13198,6 +13802,7 @@ TEST(cli_upgrade_preserves_near_legacy_claude_hook_script) {
     snprintf(gate_path, sizeof(gate_path), "%s/cbm-code-discovery-gate", hooks_dir);
     snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(tmpdir);
     const char *modified_legacy =
         "#!/usr/bin/env bash\n"
         "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
@@ -13289,6 +13894,7 @@ TEST(cli_claude_hook_script_collisions_are_not_registered) {
     snprintf(session, sizeof(session), "%s/cbm-session-reminder", hooks_dir);
     snprintf(settings, sizeof(settings), "%s/.claude/settings.json", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(tmpdir);
     write_test_file(victim, "victim-owned\n");
     ASSERT_EQ(symlink(victim, gate), 0);
     write_test_file(session, "#!/bin/sh\necho user-owned\n");
@@ -13355,6 +13961,7 @@ TEST(cli_uninstall_removes_claude_hook_scripts) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -13425,6 +14032,7 @@ TEST(cli_uninstall_preserves_modified_claude_hook_script) {
     char config_dir[512];
     snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
     test_mkdirp(config_dir);
+    test_mark_claude_code_installed(tmpdir);
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -13721,6 +14329,81 @@ TEST(cli_upsert_codex_mcp_escapes_windows_path) {
         FAIL("Codex MCP TOML must escape Windows backslashes or use a literal string");
     if (!has_args)
         FAIL("Codex MCP TOML must include the documented empty args array");
+    PASS();
+}
+
+/* #2228: a 0.10.4 -> 0.11.0 upgrade deleted every table Codex Desktop had
+ * appended between our markers (the closing marker stayed the file's last
+ * line) and the startup_timeout_sec the user had added to our table. Install
+ * must keep all of it; uninstall must remove only our table. */
+TEST(cli_codex_mcp_keeps_foreign_tables_in_managed_region_issue2228) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-2228-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/config.toml", tmpdir);
+#define CLI_2228_PREFIX                                                       \
+    "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n" \
+    "args = [\"serve\", \"--mcp\"]\n"
+#define CLI_2228_FOREIGN                                                                   \
+    "[mcp_servers.node_repl]\nargs = []\n"                                                 \
+    "command = \"/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl\"\n"  \
+    "startup_timeout_sec = 120\n\n"                                                        \
+    "[mcp_servers.node_repl.env]\nNODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = \"5000\"\n\n" \
+    "[desktop]\nfollowUpQueueMode = \"steer\"\n\n"                                         \
+    "[marketplaces.openai-codex]\nsource_type = \"git\"\n"                                 \
+    "source = \"https://github.com/openai/codex-plugin-cc.git\"\n"
+    const char *before = CLI_2228_PREFIX "# >>> codebase-memory-mcp MCP >>>\n"
+                                         "[mcp_servers.codebase-memory-mcp]\n"
+                                         "command = \"/old/codebase-memory-mcp\"\n"
+                                         "args = []\n"
+                                         "startup_timeout_sec = 90\n\n" CLI_2228_FOREIGN
+                                         "# <<< codebase-memory-mcp MCP <<<\n";
+    const char *installed = CLI_2228_PREFIX "# >>> codebase-memory-mcp MCP >>>\n"
+                                            "[mcp_servers.codebase-memory-mcp]\n"
+                                            "command = \"/new/codebase-memory-mcp\"\n"
+                                            "args = []\n"
+                                            "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+                                            "startup_timeout_sec = 90\n"
+                                            "# <<< codebase-memory-mcp MCP <<<\n" CLI_2228_FOREIGN;
+    const char *uninstalled = CLI_2228_PREFIX CLI_2228_FOREIGN;
+#undef CLI_2228_PREFIX
+#undef CLI_2228_FOREIGN
+
+    write_test_file(configpath, before);
+    int install_rc = cbm_upsert_codex_mcp("/new/codebase-memory-mcp", configpath);
+    char *after_install = read_test_file_alloc(configpath);
+    int reinstall_rc = cbm_upsert_codex_mcp("/new/codebase-memory-mcp", configpath);
+    char *after_reinstall = read_test_file_alloc(configpath);
+    int remove_rc = cbm_remove_codex_mcp(configpath);
+    char *after_remove = read_test_file_alloc(configpath);
+    /* Uninstall straight from the reported state: the foreign tables are
+     * still inside the markers there. */
+    write_test_file(configpath, before);
+    int direct_remove_rc = cbm_remove_codex_mcp(configpath);
+    char *after_direct_remove = read_test_file_alloc(configpath);
+    bool install_kept = install_rc == 0 && after_install && strcmp(after_install, installed) == 0;
+    bool reinstall_stable =
+        reinstall_rc == 0 && after_reinstall && strcmp(after_reinstall, installed) == 0;
+    bool remove_kept = remove_rc == 0 && after_remove && strcmp(after_remove, uninstalled) == 0 &&
+                       direct_remove_rc == 0 && after_direct_remove &&
+                       strcmp(after_direct_remove, uninstalled) == 0;
+    if (!install_kept && after_install)
+        printf("  install produced:\n%s\n", after_install);
+    if (!remove_kept && after_direct_remove)
+        printf("  uninstall produced:\n%s\n", after_direct_remove);
+    free(after_install);
+    free(after_reinstall);
+    free(after_remove);
+    free(after_direct_remove);
+    test_rmdir_r(tmpdir);
+    if (!install_kept)
+        FAIL("Codex install must keep foreign tables and user keys found between its markers");
+    if (!reinstall_stable)
+        FAIL("Codex reinstall must be byte-identical once foreign tables sit outside the block");
+    if (!remove_kept)
+        FAIL("Codex uninstall must remove only its own table and keep foreign tables");
     PASS();
 }
 
@@ -14205,6 +14888,33 @@ TEST(cli_agent_instructions_content) {
     PASS();
 }
 
+/* #1690: an agent in a checkout whose directory name differs from the repo
+ * name guessed the project from the repo name, got "project not found" and
+ * dropped the graph. Every installed guidance variant must say how to pick the
+ * project: the list_projects entry whose root_path contains the working
+ * directory, or that absolute directory itself, never a repo or folder name. */
+static int i1690_names_project_by_root(const char *text) {
+    return text && strstr(text, "root_path") != NULL &&
+           strstr(text, "contains your working directory") != NULL &&
+           strstr(text, "absolute directory") != NULL &&
+           strstr(text, "never a repo or folder name") != NULL;
+}
+
+TEST(cli_guidance_resolves_project_by_root_path_issue1690) {
+    const cbm_skill_t *skills = cbm_get_skills();
+    ASSERT_NOT_NULL(skills);
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        if (!i1690_names_project_by_root(skills[i].content)) {
+            fprintf(stderr, "  [1690] skill %s does not say how to pick the project\n",
+                    skills[i].name);
+        }
+        ASSERT(i1690_names_project_by_root(skills[i].content));
+    }
+    ASSERT(i1690_names_project_by_root(cbm_get_agent_instructions()));
+    ASSERT(i1690_names_project_by_root(cbm_get_aider_instructions()));
+    PASS();
+}
+
 TEST(cli_qwen_windows_hook_command_uses_powershell_schema) {
     char command[1024];
     char shell[32];
@@ -14581,6 +15291,7 @@ TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes) {
     snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
     snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
     test_mkdirp(hooks_dir);
+    test_mark_claude_code_installed(config_dir);
 
     const char *const env_names[] = {"HOME",        "PATH",       "CLAUDE_CONFIG_DIR",
                                      "APPDATA",     "CODEX_HOME", "OPENCODE_CONFIG",
@@ -14954,6 +15665,260 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
     cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
     test_rmdir_r(tmpdir);
+    PASS();
+#endif
+}
+
+/* ── hook-augment breadcrumb log location ──────────────────────────
+ * Arming the deadline opens the breadcrumb log with O_CREAT. Its path was
+ * "$HOME/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log" built in
+ * 1 KiB buffers with no length check, so a long HOME created a file at a
+ * cut-off name, and CBM_CACHE_DIR, which every other cbm log honours, was
+ * ignored. These run the real entry point in a child with a no-op Bash
+ * payload: the deadline is armed (the log opened), then the hook passes
+ * through with exit 0. POSIX only: the in-process deadline and its log are
+ * compiled out on Windows. */
+#ifndef _WIN32
+enum { HL_PATH_CAP = 1024, HL_SEGMENT = 200 };
+
+/* Exit code of `hook-augment` run in a child with HOME = home and
+ * CBM_CACHE_DIR = cache_dir (unset when NULL), or -1 when it did not exit. */
+static int hl_run_hook(const char *home, const char *cache_dir) {
+    static const char payload[] = "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\","
+                                  "\"tool_input\":{\"command\":\"ls\"}}";
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+    /* Queued before the fork, so no write can meet a reader that has gone. */
+    ssize_t queued = write(fds[1], payload, sizeof(payload) - 1);
+    close(fds[1]);
+    if (queued != (ssize_t)(sizeof(payload) - 1)) {
+        close(fds[0]);
+        return -1;
+    }
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(fds[0], STDIN_FILENO);
+        close(fds[0]);
+        cbm_setenv("HOME", home, 1);
+        cbm_unsetenv("USERPROFILE");
+        cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
+        if (cache_dir) {
+            cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+        } else {
+            cbm_unsetenv("CBM_CACHE_DIR");
+        }
+        _exit(cbm_cmd_hook_augment(0, NULL));
+    }
+    close(fds[0]);
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) {
+        return -1;
+    }
+    return WEXITSTATUS(status);
+}
+
+/* A fresh synthetic root with its links resolved. The kernel bounds the
+ * EXPANDED path, and macOS /tmp is a link to /private/tmp: under the link a
+ * near-1 KiB path can be neither created nor probed, which hides the very
+ * cut-off file these tests look for. */
+static bool hl_make_root(char *root, size_t root_sz) {
+    char tmpl[256];
+    char real[4096];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm-hooklog-XXXXXX");
+    if (!cbm_mkdtemp(tmpl)) {
+        return false;
+    }
+    if (!cbm_canonical_path(tmpl, real, sizeof(real))) {
+        th_rmtree(tmpl);
+        return false;
+    }
+    int n = snprintf(root, root_sz, "%s", real);
+    return n > 0 && (size_t)n < root_sz;
+}
+
+/* "<root>/hhh…/hhh…" of exactly `len` bytes, every component short of
+ * NAME_MAX. False when it cannot be built. */
+static bool hl_long_dir(char *out, size_t out_sz, const char *root, size_t len) {
+    int n = snprintf(out, out_sz, "%s", root);
+    if (n <= 0 || (size_t)n >= len || len >= out_sz) {
+        return false;
+    }
+    size_t at = (size_t)n;
+    while (at < len) {
+        out[at++] = '/';
+        for (int seg = 0; seg < HL_SEGMENT && at < len; seg++) {
+            out[at++] = 'h';
+        }
+    }
+    out[at] = '\0';
+    return out[len - 1] != '/';
+}
+
+/* The first HL_PATH_CAP - 1 bytes of "<base>/<suffix>": the name the old
+ * unchecked 1 KiB buffer cut that path down to. */
+static void hl_cut_name(char *out, const char *base, const char *suffix) {
+    char full[2 * HL_PATH_CAP];
+    snprintf(full, sizeof(full), "%s/%s", base, suffix);
+    snprintf(out, HL_PATH_CAP, "%.*s", HL_PATH_CAP - 1, full);
+}
+
+static bool hl_is_ancestor_or_self(const char *path, const char *of) {
+    size_t n = strlen(path);
+    return of && strncmp(of, path, n) == 0 && (of[n] == '/' || of[n] == '\0');
+}
+
+/* Entries under dir that are neither keep_a, keep_b nor one of their
+ * ancestors: whatever the hook created. Each is printed by its tail. */
+static int hl_count_strays(const char *dir, const char *keep_a, const char *keep_b) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return 0;
+    }
+    int strays = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0) {
+            continue;
+        }
+        char child[HL_PATH_CAP];
+        int n = snprintf(child, sizeof(child), "%s/%s", dir, entry->name);
+        bool named = n > 0 && (size_t)n < sizeof(child);
+        if (named &&
+            (hl_is_ancestor_or_self(child, keep_a) || hl_is_ancestor_or_self(child, keep_b))) {
+            if (entry->is_dir) {
+                strays += hl_count_strays(child, keep_a, keep_b);
+            }
+            continue;
+        }
+        size_t len = named ? (size_t)n : strlen(child);
+        printf("  stray entry: ...%s\n", child + (len > 60 ? len - 60 : 0));
+        strays++;
+    }
+    cbm_closedir(d);
+    return strays;
+}
+#endif
+
+/* A HOME of ~1 KiB: the log path "<HOME>/.cache/codebase-memory-mcp/logs/
+ * hook-augment-timeouts.log" does not fit the buffer. The old code opened its
+ * cut-off prefix ".../logs/hook-augme" with O_CREAT. Nothing may be created at
+ * a cut path (nothing at all under the synthetic root), and the hook must
+ * still exit 0: it never fails the host agent's hook call. */
+TEST(cli_hook_augment_log_long_home_creates_no_cut_path) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process deadline breadcrumb log is POSIX-only");
+#else
+    enum { HL_HOME_LEN = 980 }; /* "<HOME>/.cache/.../logs" fits 1 KiB, the file name does not */
+    char root[256];
+    if (!hl_make_root(root, sizeof(root))) {
+        FAIL("synthetic root failed");
+    }
+    char home[HL_PATH_CAP];
+    bool built = hl_long_dir(home, sizeof(home), root, HL_HOME_LEN) && th_mkdir_p(home) == 0;
+    char cut[HL_PATH_CAP];
+    hl_cut_name(cut, home, ".cache/codebase-memory-mcp/logs/hook-augment-timeouts.log");
+
+    int rc = built ? hl_run_hook(home, NULL) : -1;
+    bool cut_exists = cbm_file_exists(cut);
+    int strays = hl_count_strays(root, home, NULL);
+    test_rmdir_r(root);
+
+    ASSERT_TRUE(built);
+    ASSERT_EQ(rc, 0);
+    if (cut_exists) {
+        printf("  log opened at the cut-off name ...%s\n", cut + strlen(cut) - 40);
+    }
+    ASSERT_FALSE(cut_exists);
+    ASSERT_EQ(strays, 0);
+    PASS();
+#endif
+}
+
+/* CBM_CACHE_DIR is where every cbm log goes (<cache_dir>/logs), so the hook's
+ * breadcrumb goes there too, and not under HOME. A CBM_CACHE_DIR of ~1 KiB
+ * whose log path does not fit is no log at all: no cut-off file, no stray
+ * directory, and the hook still exits 0. */
+TEST(cli_hook_augment_log_honours_cache_dir) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process deadline breadcrumb log is POSIX-only");
+#else
+    enum { HL_CACHE_LEN = 1000 }; /* "<cache>/logs" fits 1 KiB, the file name does not */
+    char root[256];
+    if (!hl_make_root(root, sizeof(root))) {
+        FAIL("synthetic root failed");
+    }
+    char home[512];
+    char cache[512];
+    char expected[640];
+    snprintf(home, sizeof(home), "%s/home", root);
+    snprintf(cache, sizeof(cache), "%s/cache", root);
+    snprintf(expected, sizeof(expected), "%s/logs/hook-augment-timeouts.log", cache);
+    bool made = th_mkdir_p(home) == 0 && th_mkdir_p(cache) == 0;
+
+    /* A configured cache dir holds the log; HOME is left alone. */
+    int rc = made ? hl_run_hook(home, cache) : -1;
+    bool in_cache = cbm_file_exists(expected);
+    int strays = hl_count_strays(root, home, expected);
+
+    /* A configured cache dir too long for the log path: no log anywhere. */
+    char long_cache[HL_PATH_CAP];
+    char cut[HL_PATH_CAP];
+    bool long_built = hl_long_dir(long_cache, sizeof(long_cache), root, HL_CACHE_LEN) &&
+                      th_mkdir_p(long_cache) == 0;
+    hl_cut_name(cut, long_cache, "logs/hook-augment-timeouts.log");
+    bool reset = th_rmtree(home) == 0 && th_rmtree(cache) == 0 && th_mkdir_p(home) == 0;
+    int long_rc = long_built && reset ? hl_run_hook(home, long_cache) : -1;
+    bool cut_exists = cbm_file_exists(cut);
+    int long_strays = hl_count_strays(root, home, long_cache);
+    test_rmdir_r(root);
+
+    ASSERT_TRUE(made);
+    ASSERT_EQ(rc, 0);
+    if (!in_cache) {
+        printf("  no breadcrumb log under CBM_CACHE_DIR/logs\n");
+    }
+    ASSERT_TRUE(in_cache);
+    ASSERT_EQ(strays, 0);
+    ASSERT_TRUE(long_built);
+    ASSERT_TRUE(reset);
+    ASSERT_EQ(long_rc, 0);
+    ASSERT_FALSE(cut_exists);
+    ASSERT_EQ(long_strays, 0);
+    PASS();
+#endif
+}
+
+/* Positive control: with a normal HOME and no CBM_CACHE_DIR the breadcrumb log
+ * stays exactly where it always was,
+ * "$HOME/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log", and the
+ * hook creates nothing else. */
+TEST(cli_hook_augment_log_default_location_unchanged) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process deadline breadcrumb log is POSIX-only");
+#else
+    char root[256];
+    if (!hl_make_root(root, sizeof(root))) {
+        FAIL("synthetic root failed");
+    }
+    char home[512];
+    char expected[640];
+    snprintf(home, sizeof(home), "%s/home", root);
+    snprintf(expected, sizeof(expected),
+             "%s/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log", home);
+    bool made = th_mkdir_p(home) == 0;
+
+    int rc = made ? hl_run_hook(home, NULL) : -1;
+    bool at_default = cbm_file_exists(expected);
+    int strays = hl_count_strays(root, expected, NULL);
+    test_rmdir_r(root);
+
+    ASSERT_TRUE(made);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(at_default);
+    ASSERT_EQ(strays, 0);
     PASS();
 #endif
 }
@@ -15604,6 +16569,40 @@ TEST(cli_config_watcher_enabled_default_and_persist) {
     ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
 
     cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* #1948: non-git roots are polled only when `watch_non_git` opts in. The key
+ * defaults OFF (behaviour unchanged, also for a NULL config) and is listed in
+ * the config-key table so `config list` / `config set` can find it. */
+TEST(cli_config_watch_non_git_default_off_and_listed_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-ng-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    ASSERT_FALSE(cbm_config_watch_non_git(NULL));
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_FALSE(cbm_config_watch_non_git(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCH_NON_GIT, "true");
+    ASSERT_TRUE(cbm_config_watch_non_git(cfg));
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_TRUE(cbm_config_watch_non_git(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCH_NON_GIT, "false");
+    ASSERT_FALSE(cbm_config_watch_non_git(cfg));
+    cbm_config_close(cfg);
+
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        listed = listed || (key && strcmp(key, CBM_CONFIG_WATCH_NON_GIT) == 0);
+    }
+    ASSERT_TRUE(listed);
+
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -16713,6 +17712,11 @@ SUITE(cli) {
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
+    RUN_TEST(cli_uninstall_auto_answers_keep_indexes_without_delete_indexes);
+    RUN_TEST(cli_uninstall_delete_indexes_is_explicit_and_overrides_no);
+    RUN_TEST(cli_uninstall_delete_indexes_dry_run_keeps_files);
+    RUN_TEST(cli_uninstall_non_tty_affirmative_input_keeps_indexes);
+    RUN_TEST(cli_uninstall_delete_indexes_help_and_invalid_options_preserve_files);
 #ifndef _WIN32
     RUN_TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails);
     RUN_TEST(cli_uninstall_cleans_user_owned_symlinked_config);
@@ -16845,6 +17849,13 @@ SUITE(cli) {
     /* Agent detection (6 tests — group A) */
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
+    RUN_TEST(cli_detect_claude_empty_dir_not_detected_issue1180);
+    RUN_TEST(cli_detect_claude_empty_config_dir_env_not_detected_issue1180);
+    RUN_TEST(cli_detect_claude_real_install_detected_issue1180);
+    RUN_TEST(cli_detect_opencode_desktop_storage_issue1180);
+    RUN_TEST(cli_hermes_home_windows_localappdata_issue1180);
+    RUN_TEST(cli_detect_hermes_desktop_home_issue1180);
+    RUN_TEST(cli_detect_client_non_install_control_issue1167_1180);
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_grok);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
@@ -16990,6 +18001,7 @@ SUITE(cli) {
     /* Codex MCP config upsert (3 tests — group B) */
     RUN_TEST(cli_upsert_codex_mcp_fresh);
     RUN_TEST(cli_upsert_codex_mcp_escapes_windows_path);
+    RUN_TEST(cli_codex_mcp_keeps_foreign_tables_in_managed_region_issue2228);
     RUN_TEST(cli_upsert_codex_mcp_existing);
     RUN_TEST(cli_upsert_codex_mcp_replace);
     RUN_TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string);
@@ -17016,6 +18028,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_instructions_no_duplicate);
     RUN_TEST(cli_remove_instructions);
     RUN_TEST(cli_agent_instructions_content);
+    RUN_TEST(cli_guidance_resolves_project_by_root_path_issue1690);
     RUN_TEST(cli_qwen_windows_hook_command_uses_powershell_schema);
     RUN_TEST(cli_windows_optional_hooks_require_a_documented_shell);
     RUN_TEST(cli_installed_skill_limits_match_server_contract);
@@ -17032,6 +18045,9 @@ SUITE(cli) {
     RUN_TEST(cli_claude_exec_hooks_custom_dir_uninstall_issue1733);
     RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
+    RUN_TEST(cli_hook_augment_log_long_home_creates_no_cut_path);
+    RUN_TEST(cli_hook_augment_log_honours_cache_dir);
+    RUN_TEST(cli_hook_augment_log_default_location_unchanged);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_tool_hooks_preserve_foreign_same_matcher);
@@ -17058,6 +18074,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);
+    RUN_TEST(cli_config_watch_non_git_default_off_and_listed_issue1948);
 
     /* Replace binary (update command helper — group H) */
 #ifndef _WIN32

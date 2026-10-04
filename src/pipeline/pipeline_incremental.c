@@ -102,6 +102,25 @@ static const char *itoa_buf(int v) {
     return buf[idx];
 }
 
+/* #1300: the purge of stale per-file nodes can run for a long time on a large
+ * persisted graph (reported: hundreds of files against ~268k stored hashes),
+ * and it logged nothing between incremental.edge_snapshot and
+ * incremental.purge — a stall there and a clean exit left no trace of where
+ * the run was. Progress is counts only: a ceiling stride keeps it to at most
+ * INCR_PURGE_PROGRESS_STEPS lines plus the final one, never one per file. */
+enum { INCR_PURGE_PROGRESS_STEPS = 20 };
+
+static void incr_purge_progress(int done, int total, struct timespec start) {
+    int stride = (total + INCR_PURGE_PROGRESS_STEPS - SKIP_ONE) / INCR_PURGE_PROGRESS_STEPS;
+    if (stride < SKIP_ONE) {
+        stride = SKIP_ONE;
+    }
+    if (done % stride == 0 || done == total) {
+        cbm_log_info("incremental.purge.progress", "files_done", itoa_buf(done), "files_total",
+                     itoa_buf(total), "elapsed_ms", itoa_buf((int)elapsed_ms(start)));
+    }
+}
+
 static const char *incr_mode_name(int mode) {
     switch (mode) {
     case CBM_MODE_FULL:
@@ -2688,12 +2707,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     /* Step 2: Purge stale nodes */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    int purge_total = ci + deleted_count;
+    cbm_log_info("incremental.purge.start", "changed", itoa_buf(ci), "deleted",
+                 itoa_buf(deleted_count));
     for (int i = 0; i < ci; i++) {
         cbm_gbuf_delete_by_file(existing, changed_files[i].rel_path);
+        incr_purge_progress(i + SKIP_ONE, purge_total, t);
     }
     for (int i = 0; i < deleted_count; i++) {
         cbm_gbuf_delete_by_file(existing, deleted[i]);
         free(deleted[i]);
+        incr_purge_progress(ci + i + SKIP_ONE, purge_total, t);
     }
     free(deleted);
     cbm_log_info("incremental.purge", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));

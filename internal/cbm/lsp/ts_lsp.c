@@ -1998,6 +1998,22 @@ static const CBMType *ts_new_bare_class_type(TSLSPContext *ctx, const char *cnam
     return cbm_type_named(ctx->arena, local_qn);
 }
 
+/* Type of a `new_expression`: a bare constructor name follows TS scoping
+ * (ts_new_bare_class_type), a dotted one is taken as spelled. NULL when the
+ * node carries no constructor. Shared by expression evaluation and by the
+ * field-initializer inference in ast_sweep_shapes, so `const t = new C()`
+ * and `private t = new C()` type the instance identically. */
+static const CBMType *ts_new_expression_type(TSLSPContext *ctx, TSNode node) {
+    TSNode ctor = ts_node_child_by_field_name(node, "constructor", TS_LSP_FIELD_LEN("constructor"));
+    if (ts_node_is_null(ctor))
+        return NULL;
+    char *cname = node_text(ctx, ctor);
+    if (!cname)
+        return NULL;
+    return strchr(cname, '.') == NULL ? ts_new_bare_class_type(ctx, cname)
+                                      : cbm_type_named(ctx->arena, cname);
+}
+
 static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, const char *object_name,
                                                          const char *method_name, TSNode args,
                                                          bool *out_is_import) {
@@ -2223,15 +2239,9 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
                 result = lookup_member_type(ctx, recv, pname);
         }
     } else if (strcmp(kind, "new_expression") == 0) {
-        TSNode ctor =
-            ts_node_child_by_field_name(node, "constructor", TS_LSP_FIELD_LEN("constructor"));
-        if (!ts_node_is_null(ctor)) {
-            char *cname = node_text(ctx, ctor);
-            if (cname) {
-                result = strchr(cname, '.') == NULL ? ts_new_bare_class_type(ctx, cname)
-                                                    : cbm_type_named(ctx->arena, cname);
-            }
-        }
+        const CBMType *nt = ts_new_expression_type(ctx, node);
+        if (nt)
+            result = nt;
     } else if (strcmp(kind, "call_expression") == 0) {
         TSNode fn = ts_node_child_by_field_name(node, "function", TS_LSP_FIELD_LEN("function"));
         if (!ts_node_is_null(fn)) {
@@ -5357,6 +5367,76 @@ static const CBMType *interface_method_signature_from_ast(TSLSPContext *ctx, TSN
     return cbm_type_func(ctx->arena, NULL, param_count ? param_types : NULL, return_types);
 }
 
+/* Parsed type of a `type_annotation` field (`: T`), or unknown. */
+static const CBMType *ts_annotation_field_type(TSLSPContext *ctx, TSNode owner) {
+    TSNode tann = ts_node_child_by_field_name(owner, "type", TS_LSP_FIELD_LEN("type"));
+    if (ts_node_is_null(tann))
+        return cbm_type_unknown();
+    TSNode tn =
+        strcmp(ts_node_type(tann), "type_annotation") == 0 ? ts_node_named_child(tann, 0) : tann;
+    return ts_node_is_null(tn) ? cbm_type_unknown() : ts_parse_type_node(ctx, tn);
+}
+
+/* Declared type of a class field (`public_field_definition`) or interface
+ * property: the annotation when present, else, for an unannotated field
+ * initialised with `new C()`, the type of that instance (#514). No other
+ * initializer is inferred: `new` names its type exactly, arbitrary
+ * expressions do not. */
+static const CBMType *ts_field_decl_type(TSLSPContext *ctx, TSNode m) {
+    if (!ts_node_is_null(ts_node_child_by_field_name(m, "type", TS_LSP_FIELD_LEN("type"))))
+        return ts_annotation_field_type(ctx, m);
+    TSNode val = ts_node_child_by_field_name(m, "value", TS_LSP_FIELD_LEN("value"));
+    if (ts_node_is_null(val) || strcmp(ts_node_type(val), "new_expression") != 0)
+        return cbm_type_unknown();
+    const CBMType *nt = ts_new_expression_type(ctx, val);
+    return nt ? nt : cbm_type_unknown();
+}
+
+/* A constructor parameter is a TS parameter property, i.e. also declares a
+ * class field, iff it carries an accessibility modifier, `readonly` or
+ * `override`. */
+static bool ts_param_is_property(TSNode p) {
+    uint32_t pc = ts_node_child_count(p);
+    for (uint32_t ci = 0; ci < pc; ci++) {
+        const char *ck = ts_node_type(ts_node_child(p, ci));
+        if (strcmp(ck, "accessibility_modifier") == 0 || strcmp(ck, "readonly") == 0 ||
+            strcmp(ck, "override_modifier") == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Append the parameter properties of a `constructor` method_definition to
+ * the field arrays (#514): `constructor(private readonly svc: Svc)` declares
+ * field `svc: Svc`, the dominant NestJS injection shape. Any other member is
+ * ignored. Returns the new field count. */
+static int ts_collect_param_properties(TSLSPContext *ctx, TSNode m, const char **names,
+                                       const CBMType **types, int count, int cap) {
+    TSNode mname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
+    char *mnm = ts_node_is_null(mname) ? NULL : node_text(ctx, mname);
+    if (!mnm || strcmp(mnm, "constructor") != 0)
+        return count;
+    TSNode params = ts_node_child_by_field_name(m, "parameters", TS_LSP_FIELD_LEN("parameters"));
+    uint32_t pnc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    for (uint32_t pi = 0; pi < pnc && count < cap; pi++) {
+        TSNode p = ts_node_named_child(params, pi);
+        const char *pk = ts_node_type(p);
+        if ((strcmp(pk, "required_parameter") != 0 && strcmp(pk, "optional_parameter") != 0) ||
+            !ts_param_is_property(p))
+            continue;
+        TSNode pat = ts_node_child_by_field_name(p, "pattern", TS_LSP_FIELD_LEN("pattern"));
+        if (ts_node_is_null(pat) || strcmp(ts_node_type(pat), "identifier") != 0)
+            continue;
+        char *pnm = node_text(ctx, pat);
+        if (!pnm)
+            continue;
+        names[count] = pnm;
+        types[count] = ts_annotation_field_type(ctx, p);
+        count++;
+    }
+    return count;
+}
+
 // AST sweep: walk class/interface bodies to collect field names+types and refine
 // embedded_types / type_param_names.
 static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg) {
@@ -5469,21 +5549,21 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
             if (strcmp(mk, "public_field_definition") == 0 ||
                 strcmp(mk, "property_signature") == 0) {
                 TSNode fname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
-                TSNode ftype = ts_node_child_by_field_name(m, "type", TS_LSP_FIELD_LEN("type"));
                 if (ts_node_is_null(fname))
                     continue;
                 char *fnm = node_text(ctx, fname);
                 if (!fnm)
                     continue;
-                const CBMType *ft = cbm_type_unknown();
-                if (!ts_node_is_null(ftype)) {
-                    TSNode tch = ts_node_named_child(ftype, 0);
-                    if (!ts_node_is_null(tch))
-                        ft = ts_parse_type_node(ctx, tch);
-                }
                 field_names[field_count] = fnm;
-                field_types[field_count] = ft;
+                field_types[field_count] = ts_field_decl_type(ctx, m);
                 field_count++;
+                continue;
+            }
+
+            // Constructor parameter properties are class fields too (#514).
+            if (!is_interface && strcmp(mk, "method_definition") == 0) {
+                field_count =
+                    ts_collect_param_properties(ctx, m, field_names, field_types, field_count, 63);
                 continue;
             }
 

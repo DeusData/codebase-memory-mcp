@@ -22,6 +22,7 @@
 #define CBM_PIPELINE_LSP_RESOLVE_H
 
 #include "cbm.h"
+#include "callable_sig.h" /* cbm_qn_callable_base_len — leaf splitters skip the suffix */
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 
@@ -64,7 +65,10 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
         return name;
     }
     const char *seg = name;
-    for (const char *p = name; *p; p++) {
+    /* Scan the base only: a callable identity suffix (#2061) belongs to the
+     * leaf and may itself contain ':' (Swift labels) or '>' (generics). */
+    const char *end = name + cbm_qn_callable_base_len(name);
+    for (const char *p = name; p < end; p++) {
         /* '.' (dotted QN / Java-style member) and ':' (C++ `::`, last colon
          * wins) are member/scope separators. '>' is only a separator when it
          * closes the `->` arrow (preceded by '-'); a bare '>' closes a template
@@ -86,7 +90,15 @@ static inline const char *cbm_pipeline_qn_class_method_tail(const char *qn) {
     if (!qn) {
         return NULL;
     }
-    const char *last = strrchr(qn, '.');
+    /* The last '.' of the BASE QN: a callable identity suffix (#2061) never
+     * contains '.', so this is the historical strrchr for every QN. */
+    const char *last = NULL;
+    size_t base_len = cbm_qn_callable_base_len(qn);
+    for (size_t i = 0; i < base_len; i++) {
+        if (qn[i] == '.') {
+            last = qn + i;
+        }
+    }
     if (!last || last == qn) {
         return NULL;
     }
