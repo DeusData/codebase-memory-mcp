@@ -9,6 +9,7 @@ export const messages = {
       projects: "Projects",
       control: "Control",
       diagrams: "Diagrams",
+      tools: "Tools",
     },
     common: {
       cancel: "Cancel",
@@ -81,6 +82,7 @@ export const messages = {
       projects: "项目",
       control: "控制",
       diagrams: "架构图",
+      tools: "工具",
     },
     common: {
       cancel: "取消",

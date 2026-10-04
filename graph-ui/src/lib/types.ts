@@ -80,7 +80,29 @@ export interface SchemaInfo {
   total_edges: number;
 }
 
-export type TabId = "graph" | "stats" | "control" | "diagrams";
+export type TabId = "control" | "stats" | "diagrams" | "tools" | "graph";
+
+export interface McpToolParam {
+  name: string;
+  type: string;
+  required: boolean;
+  defaultVal?: string | number | boolean;
+  enumVals?: string[];
+  description: string;
+}
+
+export interface McpToolDefinition {
+  name: string;
+  category: "Code Discovery" | "Tracing & Architecture" | "Indexing & Projects" | "Governance & Schema";
+  summary: string;
+  description: string;
+  readOnly: boolean;
+  destructive?: boolean;
+  idempotent?: boolean;
+  parameters: McpToolParam[];
+  cliExample: string;
+  jsonExample: string;
+}
 
 export interface ProcessInfo {
   pid: number;

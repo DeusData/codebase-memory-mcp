@@ -3,10 +3,11 @@ import { GraphTab } from "./components/GraphTab";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
 import { DiagramsTab } from "./components/DiagramsTab";
+import { ToolsTab } from "./components/ToolsTab";
 import type { TabId } from "./lib/types";
 import { useUiMessages } from "./lib/i18n";
 
-const TAB_IDS: TabId[] = ["graph", "stats", "control", "diagrams"];
+const TAB_IDS: TabId[] = ["control", "stats", "diagrams", "tools", "graph"];
 
 interface RouteState {
   tab: TabId;
@@ -84,6 +85,7 @@ export function App() {
     { id: "control", label: t.tabs.control },
     { id: "stats", label: t.tabs.projects },
     { id: "diagrams", label: t.tabs.diagrams },
+    { id: "tools", label: t.tabs.tools },
     { id: "graph", label: t.tabs.graph },
   ];
 
@@ -167,6 +169,8 @@ export function App() {
             initialDiagram={activeDiagram}
             onSelectDiagram={(d) => navigate("diagrams", selectedProject, d)}
           />
+        ) : activeTab === "tools" ? (
+          <ToolsTab selectedProject={selectedProject} />
         ) : (
           <StatsTab
             onSelectProject={(p) => navigate("graph", p)}

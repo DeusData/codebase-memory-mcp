@@ -13,6 +13,9 @@ vi.mock("./components/DiagramsTab", () => ({
     <div data-testid="diagrams-tab">Diagrams View: {initialDiagram || "overview"}</div>
   ),
 }));
+vi.mock("./components/ToolsTab", () => ({
+  ToolsTab: () => <div data-testid="tools-tab">Tools Directory</div>,
+}));
 
 vi.mock("./lib/i18n", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/i18n")>();
@@ -91,5 +94,23 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByTestId("diagrams-tab")).toHaveTextContent("Diagrams View: architecture");
+  });
+
+  it("renders the tools navigation tab and switches to tools view on click", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      new Response(JSON.stringify({ lang: "en", version: "0.10.8" }), { status: 200 }),
+    ));
+
+    render(<App />);
+
+    const toolsBtn = screen.getByRole("button", { name: "Tools" });
+    expect(toolsBtn).toBeInTheDocument();
+
+    await waitFor(() => {
+      fireEvent.click(toolsBtn);
+    });
+
+    expect(await screen.findByTestId("tools-tab")).toBeInTheDocument();
+    expect(window.location.search).toContain("tab=tools");
   });
 });
