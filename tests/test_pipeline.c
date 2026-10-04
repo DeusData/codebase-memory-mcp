@@ -9211,13 +9211,24 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
         FAIL("failed to create Python package fixture");
     n = snprintf(path, sizeof(path), "%s/pkg", root);
     bool written = n > 0 && (size_t)n < sizeof(path);
+    /* The cross and register stages run inside the cross-file walk, which the
+     * parallel driver skips for a file whose call sites the per-file LSP
+     * already resolved: those stages need a call only the cross walk resolves. */
+    bool cross_walk_stage = failure_stage && (strcmp(failure_stage, "cross") == 0 ||
+                                              strcmp(failure_stage, "register") == 0);
     if (written) {
         cbm_mkdir_p(path, 0755);
         written = python_module_write_fixture_file(
             root, "pkg/__init__.py",
-            failure_stage ? "class S:\n    def m(self):\n        return 1\n"
-                            "def run():\n    s = S()\n    return s.m()\n"
-                          : body);
+            cross_walk_stage ? "from memo_def import S\n"
+                               "def run():\n    s = S()\n    return s.m()\n"
+            : failure_stage  ? "class S:\n    def m(self):\n        return 1\n"
+                               "def run():\n    s = S()\n    return s.m()\n"
+                             : body);
+    }
+    if (written && cross_walk_stage) {
+        written = python_module_write_fixture_file(root, "memo_def.py",
+                                                    "class S:\n    def m(self):\n        return 1\n");
     }
     if (written && !failure_stage) {
         written = python_module_write_fixture_file(root, "plain.py", body) &&
@@ -9282,7 +9293,8 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
         correct = project &&
                   cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
                       CBM_STORE_OK &&
-                  file_count == (failure_stage ? 1 : 5) + (parallel ? 52 : 0);
+                  file_count ==
+                      (cross_walk_stage ? 2 : failure_stage ? 1 : 5) + (parallel ? 52 : 0);
         cbm_store_free_nodes(files, file_count);
         if (project && !failure_stage) {
             const char *modules[] = {"plain", "pkg"};
