@@ -6,6 +6,7 @@
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
 
@@ -239,6 +240,22 @@ static bool ws_is_windows_user_programs_tree(const char *path) {
     return true;
 }
 
+/* strncmp that treats "/" and "\" as the same character. On Windows a
+ * canonical path arrives with backslashes from the resolver and with forward
+ * slashes from callers that normalize, and both spell one directory. Stops at
+ * the end of either string like strncmp does. */
+static bool ws_prefix_equal(const char *a, const char *b, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (a[i] != b[i] && !(ws_is_sep(a[i]) && ws_is_sep(b[i]))) {
+            return false;
+        }
+        if (a[i] == '\0') {
+            break;
+        }
+    }
+    return true;
+}
+
 /* True when b is a or lives under a. Compares on a separator boundary so
  * "/a/bc" is not treated as living under "/a/b". */
 static bool ws_is_ancestor_or_equal(const char *a, const char *b) {
@@ -249,7 +266,7 @@ static bool ws_is_ancestor_or_equal(const char *a, const char *b) {
     while (la > 1 && ws_is_sep(a[la - 1])) {
         la--;
     }
-    if (strncmp(a, b, la) != 0) {
+    if (!ws_prefix_equal(a, b, la)) {
         return false;
     }
     return b[la] == '\0' || ws_is_sep(b[la]);
@@ -600,14 +617,34 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
 /* ── Environment helpers ──────────────────────────────────────────────────── */
 
 /* Callers should not each re-derive these; a caller that resolved the home
- * directory differently would classify the same path differently. */
+ * directory differently would classify the same path differently.
+ *
+ * The value is the CANONICAL form of $HOME (then %USERPROFILE%), through the
+ * same resolver callers apply to the path they classify. The policy compares
+ * the two byte for byte, and a home reached through a link — "/home" kept on
+ * another volume, a macOS firmlink, a HOME that is itself a link — differs
+ * from its resolved form, so the raw value would never match and the home
+ * rule would not fire. A home that cannot be resolved (it does not exist)
+ * falls back to the raw value, which is all the comparison could use anyway.
+ *
+ * Storage is per thread and recomputed on every call, as cbm_resolve_cache_dir
+ * does: no lock, a changed environment is seen at once, and the pointer stays
+ * valid until the next call on the same thread. */
 const char *cbm_workspace_home_dir(void) {
-    const char *home = getenv("HOME");
-    if (home && home[0]) {
-        return home;
+    static CBM_TLS char resolved[CBM_SZ_4K];
+    char raw[CBM_SZ_4K];
+    const char *home = cbm_safe_getenv("HOME", raw, sizeof(raw), NULL);
+    if (!home || !home[0]) {
+        home = cbm_safe_getenv("USERPROFILE", raw, sizeof(raw), NULL);
     }
-    home = getenv("USERPROFILE");
-    return (home && home[0]) ? home : NULL;
+    if (!home || !home[0]) {
+        return NULL;
+    }
+    if (!cbm_canonical_path(home, resolved, sizeof(resolved))) {
+        memcpy(resolved, raw, strlen(raw) + 1);
+    }
+    cbm_normalize_path_sep(resolved);
+    return resolved;
 }
 
 const char *cbm_workspace_cache_dir(void) {

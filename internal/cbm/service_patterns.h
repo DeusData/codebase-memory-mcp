@@ -12,6 +12,7 @@
 #define CBM_SERVICE_PATTERNS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Edge type returned by pattern match. */
 typedef enum {
@@ -76,5 +77,18 @@ const char *cbm_service_pattern_route_method(const char *callee_name);
 /* Get the broker name for an async QN (e.g., "pubsub" from a Pub/Sub QN).
  * Returns NULL if not an async pattern. */
 const char *cbm_service_pattern_broker(const char *resolved_qn);
+
+/* GraphQL operation identity of a client call argument (#598).
+ * Scans `doc` as a GraphQL document (skipping comments, strings, `${...}`
+ * template interpolations and leading fragment definitions) and reports the
+ * first operation: *op_type is "query", "mutation" or "subscription" ("query"
+ * for the `{ ... }` shorthand). Returns true and writes the operation name to
+ * name_buf when the operation is named. Returns false for an anonymous
+ * operation, or with *op_type = "operation" when `doc` is not a GraphQL
+ * document (NULL, a URL, a bare word such as a dict key ...). The operation
+ * text itself is never copied, so callers can key Routes on a bounded
+ * identity. */
+bool cbm_service_pattern_graphql_operation(const char *doc, const char **op_type, char *name_buf,
+                                           size_t name_sz);
 
 #endif /* CBM_SERVICE_PATTERNS_H */

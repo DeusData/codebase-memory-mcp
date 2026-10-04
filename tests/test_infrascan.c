@@ -113,6 +113,8 @@ TEST(infrascan_service_pattern_match_rejects_ids_inside_words) {
         {"gqlalchemy.Memgraph.execute", CBM_SVC_NONE},
         {"celeryconfig.broker_url", CBM_SVC_NONE},
         {"kafkaesque.story.tell", CBM_SVC_NONE},
+        /* "Axios" glued to a lowercase continuation */
+        {"geo.Axiosphere.map", CBM_SVC_NONE},
         {NULL, CBM_SVC_NONE},
     };
     ASSERT_EQ(svc_case_mismatches(cases), 0);
@@ -136,6 +138,11 @@ TEST(infrascan_service_pattern_match_keeps_real_library_qns) {
         {"package:dio/dio.dart", CBM_SVC_HTTP},
         {"dio.Dio.get", CBM_SVC_HTTP},
         {"pkg.net.curl.get", CBM_SVC_HTTP},
+        /* axios under a capitalized default-import binding
+         * (`import Axios from "axios"`) and axios's own instance type */
+        {"Axios.get", CBM_SVC_HTTP},
+        {"Axios.post", CBM_SVC_HTTP},
+        {"AxiosInstance.get", CBM_SVC_HTTP},
         {"curl_exec", CBM_SVC_HTTP},
         {"surf.get", CBM_SVC_HTTP},
         {"hyper.Client.request", CBM_SVC_HTTP},
@@ -225,6 +232,25 @@ TEST(infrascan_service_pattern_match_keeps_real_library_qns) {
     PASS();
 }
 
+/* Document/log extensions are never HTTP routes (distilled from PR #1245):
+ * the arg-URL detector runs for every resolved call, so without the
+ * extension guard `open("/new/file.txt")` minted a Route + HTTP_CALLS.
+ * First segments deliberately avoid the filesystem-root list so ONLY the
+ * extension guard can reject them; `/api/...` marker paths stay routes. */
+TEST(infrascan_http_route_literal_guard_rejects_document_extensions) {
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/new/file.txt", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/guide.md", "read"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/data/app.log", "write"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/fake/path.pdf", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/index.rst", "open"));
+    /* Same extensions under a query string are still files. */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/guide.md?raw=1", "open"));
+    /* Positive controls: extension-less routes and the same callees. */
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/api/items", "requests.get"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/docs/guide", "open"));
+    PASS();
+}
+
 TEST(infrascan_route_nodes_skip_bad_http_url_paths) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_route_guard");
     ASSERT_NOT_NULL(gb);
@@ -305,6 +331,7 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
 
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
+    RUN_TEST(infrascan_http_route_literal_guard_rejects_document_extensions);
     RUN_TEST(infrascan_service_pattern_match_rejects_ids_inside_words);
     RUN_TEST(infrascan_service_pattern_match_keeps_real_library_qns);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
