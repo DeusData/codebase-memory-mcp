@@ -103,6 +103,12 @@ typedef struct {
     int eval_depth;                  // evaluator recursion depth (PY_LSP_MAX_EVAL_DEPTH)
     uint32_t eval_truncations;       // depth-cap cutoff count — gates memo inserts
     CBMLSPStatus eval_failure;       // sticky: memo/depth failure makes this walk incomplete
+    // Pending links of the left-associative chains being evaluated
+    // iteratively (operator, receiver, subscript, conditional and
+    // parenthesis chains): one stack shared by nested evaluations.
+    TSNode *eval_chain; // arena-allocated
+    int eval_chain_len;
+    int eval_chain_cap;
 #ifdef CBM_ENABLE_TEST_SEAMS
     int test_memo_allocations_left;
     int test_root_name_failure; // 1 = NULL, 2 = empty; only the root-name collection

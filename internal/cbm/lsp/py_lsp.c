@@ -16,6 +16,7 @@
 #include "lsp_node_iter.h"
 #include "tree_sitter/api.h"
 #include <ctype.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,9 @@
 #include "py_builtins.c"
 
 /* Stack guard for py_eval_expr_type (#720; same limit as C_EVAL_DEPTH_LIMIT).
+ * It counts expression NESTING (call arguments, container elements, operands
+ * outside a chain); the links of a left-associative chain do not count, see
+ * py_eval_chain_operands.
  * There is deliberately NO per-file work budget (#1527): the step cap that
  * used to sit here stopped resolution after 10000 evaluations and left the
  * rest of a large file silently unresolved while the file still reported
@@ -2250,26 +2254,93 @@ static bool py_type_cache_insert(PyLSPContext *ctx, const void *id, const CBMTyp
     return false;
 }
 
-/* Memoizing, depth-guarded wrapper — the function every call site in this
- * file goes through. */
-static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
-    if (!ctx || ctx->eval_failure || ts_node_is_null(node))
-        return cbm_type_unknown();
+/* ── Left-associative chains are evaluated iteratively ───────────────────
+ *
+ * A chain's length is not nesting. `a + b + ... + z`, `x.a().b()...`,
+ * `x.f.g.h`, `m[i][j]`, `a if p else b if q else ...` and runs of
+ * parentheses are trees in which every link derives its type from ONE chain
+ * operand. Recursing through them spent native stack and a
+ * PY_LSP_MAX_EVAL_DEPTH unit per link, so a 300-term sum exceeded the guard
+ * and rolled back the whole file.
+ *
+ * py_eval_expr_type therefore first walks down the chain operands below the
+ * node, then evaluates them innermost first, each at the caller's depth. When
+ * a link is evaluated, its chain operand is already cached, so the
+ * evaluator's own recursive call into it is a cache hit one frame deep. The
+ * types are exactly the recursive ones: every node is still evaluated by
+ * py_eval_expr_type_uncached, the cache is generation-checked (evaluation
+ * never binds or restores scope, and if it did a stale entry would simply
+ * miss and recurse), and only an operand the uncached evaluator always
+ * evaluates is pre-evaluated, so no node is evaluated that the recursion
+ * would not have evaluated. Operands in any other position (call arguments,
+ * container elements, dictionary keys and values, await operands, ...) are
+ * genuine nesting and still count depth. */
 
-    /* Depth cap (issue #720): the evaluator recurses once per expression
-     * nesting level, so a pathologically deep expression (tens of
-     * thousands of parens) overflowed the native stack. At the existing bound,
-     * stop this walk explicitly; never memoize a truncated result as complete. */
-    if (ctx->eval_depth >= PY_LSP_MAX_EVAL_DEPTH) {
-        ctx->eval_truncations++;
-        ctx->eval_failure = CBM_LSP_DEPTH_EXCEEDED;
-        return cbm_type_unknown();
+/* The chain operand of a link: an operand py_eval_expr_type_uncached always
+ * evaluates and derives the link's type from. A null node when `node` is not
+ * a chain link. */
+static TSNode py_chain_operand(TSNode node) {
+    const TSNode none = {0};
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "attribute") == 0) {
+        if (ts_node_is_null(ts_node_child_by_field_name(node, "attribute", 9)))
+            return none;
+        return ts_node_child_by_field_name(node, "object", 6);
     }
+    if (strcmp(k, "call") == 0) {
+        TSNode fn = ts_node_child_by_field_name(node, "function", 8);
+        if (ts_node_is_null(fn))
+            return none;
+        const char *fk = ts_node_type(fn);
+        /* `obj.m(...)` evaluates obj, never the attribute node itself. */
+        if (strcmp(fk, "attribute") == 0) {
+            if (ts_node_is_null(ts_node_child_by_field_name(fn, "attribute", 9)))
+                return none;
+            return ts_node_child_by_field_name(fn, "object", 6);
+        }
+        /* `f()()` / `(expr)()`: the callee expression is evaluated. */
+        if (strcmp(fk, "call") == 0 || strcmp(fk, "parenthesized_expression") == 0)
+            return fn;
+        return none;
+    }
+    if (strcmp(k, "subscript") == 0)
+        return ts_node_child_by_field_name(node, "value", 5);
+    if (strcmp(k, "binary_operator") == 0)
+        return ts_node_child_by_field_name(node, "left", 4);
+    if (strcmp(k, "conditional_expression") == 0) {
+        /* Both branches are evaluated; a conditional chain continues in the
+         * else branch: `a if p else (b if q else ...)`. */
+        return ts_node_named_child_count(node) >= 3 ? ts_node_named_child(node, 2) : none;
+    }
+    if (strcmp(k, "parenthesized_expression") == 0)
+        return ts_node_named_child_count(node) > 0 ? ts_node_named_child(node, 0) : none;
+    return none;
+}
 
-    const CBMType *cached = py_type_cache_lookup(ctx, node.id);
-    if (cached)
-        return cached;
+/* Push a pending link. On allocation failure the caller stops collecting:
+ * the rest of the chain is then evaluated recursively, under the depth
+ * guard, exactly as before -- slower to fail, never a wrong type. */
+static bool py_eval_chain_push(PyLSPContext *ctx, TSNode link) {
+    if (ctx->eval_chain_len == ctx->eval_chain_cap) {
+        if (ctx->eval_chain_cap > INT_MAX / 2)
+            return false;
+        int new_cap = ctx->eval_chain_cap ? ctx->eval_chain_cap * 2 : 64;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(TSNode))
+            return false;
+        TSNode *grown = (TSNode *)cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(TSNode));
+        if (!grown)
+            return false;
+        if (ctx->eval_chain_len > 0)
+            memcpy(grown, ctx->eval_chain, (size_t)ctx->eval_chain_len * sizeof(TSNode));
+        ctx->eval_chain = grown;
+        ctx->eval_chain_cap = new_cap;
+    }
+    ctx->eval_chain[ctx->eval_chain_len++] = link;
+    return true;
+}
 
+/* One real evaluation of a node that has no live cache entry. */
+static const CBMType *py_eval_expr_type_node(PyLSPContext *ctx, TSNode node) {
     /* One real (non-memoized) evaluation: the work the complexity tests count
      * to prove evaluation stays linear without a budget. */
     CBM_LSP_WORK(1);
@@ -2289,6 +2360,51 @@ static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
         !py_type_cache_insert(ctx, node.id, result))
         ctx->eval_failure = CBM_LSP_MEMO_FAILED;
     return ctx->eval_failure ? cbm_type_unknown() : result;
+}
+
+/* Evaluate the uncached chain operands below `node`, innermost first.
+ * Nested evaluations push above the links still pending, so the stack is
+ * shared; a link's index is re-read after each evaluation (it may grow). */
+static void py_eval_chain_operands(PyLSPContext *ctx, TSNode node) {
+    int base = ctx->eval_chain_len;
+    for (TSNode op = py_chain_operand(node); !ts_node_is_null(op); op = py_chain_operand(op)) {
+        if (py_type_cache_lookup(ctx, op.id) || !py_eval_chain_push(ctx, op))
+            break;
+    }
+    for (int i = ctx->eval_chain_len - 1; i >= base && !ctx->eval_failure; i--) {
+        TSNode link = ctx->eval_chain[i];
+        ctx->eval_chain_len = i;
+        if (!py_type_cache_lookup(ctx, link.id))
+            (void)py_eval_expr_type_node(ctx, link);
+    }
+    ctx->eval_chain_len = base;
+}
+
+/* Memoizing, depth-guarded wrapper — the function every call site in this
+ * file goes through. */
+static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node) {
+    if (!ctx || ctx->eval_failure || ts_node_is_null(node))
+        return cbm_type_unknown();
+
+    /* Depth cap (issue #720): the evaluator recurses once per expression
+     * nesting level, so a pathologically deep expression (tens of
+     * thousands of nested brackets) overflowed the native stack. At the
+     * existing bound, stop this walk explicitly; never memoize a truncated
+     * result as complete. Chain links do not nest (see above). */
+    if (ctx->eval_depth >= PY_LSP_MAX_EVAL_DEPTH) {
+        ctx->eval_truncations++;
+        ctx->eval_failure = CBM_LSP_DEPTH_EXCEEDED;
+        return cbm_type_unknown();
+    }
+
+    const CBMType *cached = py_type_cache_lookup(ctx, node.id);
+    if (cached)
+        return cached;
+
+    py_eval_chain_operands(ctx, node);
+    if (ctx->eval_failure)
+        return cbm_type_unknown();
+    return py_eval_expr_type_node(ctx, node);
 }
 
 #ifdef CBM_ENABLE_TEST_SEAMS

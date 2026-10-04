@@ -113,6 +113,12 @@ typedef struct {
     int *eval_memo_used;                // slots filled by the current evaluation
     int eval_memo_cap;                  // power of two, or 0
     int eval_memo_count;
+    // Pending links of the left-associative chains being evaluated
+    // iteratively (operator, receiver, subscript, conditional, parenthesis and
+    // comma chains): one stack shared by nested evaluations, arena-owned.
+    TSNode *eval_chain;
+    int eval_chain_len;
+    int eval_chain_cap;
     CBMLSPStatus eval_failure; // sticky: stop refinement rather than repeat uncached work
 #ifdef CBM_ENABLE_TEST_SEAMS
     int test_memo_allocations_left; // -1 = normal; 0 = fail the next memo allocation

@@ -2486,6 +2486,133 @@ TEST(pylsp_issue1527_memo_and_depth_failures_stop_work) {
     PASS();
 }
 
+/* A chain's LENGTH is not nesting depth (#1527 follow-up). An operator chain
+ * `a + a + ... + a` and a receiver chain `b.a().a()...` are evaluated link by
+ * link, so neither consumes the evaluator's depth guard: the file keeps its
+ * LSP resolution (an unrelated call in another function still resolves), no
+ * file-level failure is recorded, and the chain's result type still drives
+ * the call made on it. Before the iterative evaluation, 300 terms already
+ * exceeded the guard and rolled back every resolution of the file. */
+static const int pylsp_long_chain_sizes[] = {300, 2000, 20000};
+
+static char *pylsp_long_chain_source(bool receiver, int links) {
+    size_t sz = (size_t)links * 8 + 512;
+    char *src = malloc(sz);
+    if (!src)
+        return NULL;
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "from typing import Self\n"
+                                  "class V:\n"
+                                  "    def done(self):\n"
+                                  "        return 1\n"
+                                  "class B:\n"
+                                  "    def a(self) -> Self:\n"
+                                  "        return self\n"
+                                  "    def done(self):\n"
+                                  "        return 1\n"
+                                  "class S:\n"
+                                  "    def m(self):\n"
+                                  "        return 1\n");
+    if (receiver) {
+        pos += (size_t)snprintf(src + pos, sz - pos, "def chain(b: B):\n    b");
+        for (int i = 0; i < links; i++)
+            pos += (size_t)snprintf(src + pos, sz - pos, ".a()");
+        pos += (size_t)snprintf(src + pos, sz - pos, ".done()\n");
+    } else {
+        pos += (size_t)snprintf(src + pos, sz - pos, "def deep(a: V):\n    x = a");
+        for (int i = 1; i < links; i++)
+            pos += (size_t)snprintf(src + pos, sz - pos, " + a");
+        pos += (size_t)snprintf(src + pos, sz - pos, "\n    x.done()\n");
+    }
+    snprintf(src + pos, sz - pos, "def run():\n    s = S()\n    s.m()\n");
+    return src;
+}
+
+/* The full per-file extraction runs at the smallest size only: its Python
+ * usage pass climbs every identifier's ancestors with ts_node_parent, itself
+ * O(depth), which is cubic in one deep expression -- a separate cost outside
+ * the LSP. The cross-file LSP dispatch the pipeline uses (it records the
+ * same file-level error) runs at every size. */
+static int pylsp_long_chain_case(bool receiver) {
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.V", .short_name = "V", .label = "Class", .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.V.done",
+         .short_name = "done",
+         .label = "Method",
+         .receiver_type = "test.V",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.B", .short_name = "B", .label = "Class", .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.B.a",
+         .short_name = "a",
+         .label = "Method",
+         .receiver_type = "test.B",
+         .return_types = "test.B",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.B.done",
+         .short_name = "done",
+         .label = "Method",
+         .receiver_type = "test.B",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.S", .short_name = "S", .label = "Class", .lang = CBM_LANG_PYTHON},
+        {.qualified_name = "test.S.m",
+         .short_name = "m",
+         .label = "Method",
+         .receiver_type = "test.S",
+         .return_types = "int",
+         .lang = CBM_LANG_PYTHON},
+    };
+    int def_count = (int)(sizeof(defs) / sizeof(defs[0]));
+    const char *chain_fn = receiver ? "chain" : "deep";
+    const char *done = receiver ? "B.done" : "V.done";
+    int sizes = (int)(sizeof(pylsp_long_chain_sizes) / sizeof(pylsp_long_chain_sizes[0]));
+    for (int i = 0; i < sizes; i++) {
+        int links = pylsp_long_chain_sizes[i];
+        char *src = pylsp_long_chain_source(receiver, links);
+        ASSERT_NOT_NULL(src);
+        bool per_file_ok = true;
+        if (i == 0) {
+            CBMFileResult *r = extract_py(src);
+            per_file_ok = r && !r->has_error && !r->lsp_skipped &&
+                          find_resolved(r, "run", "S.m") >= 0 &&
+                          find_resolved(r, chain_fn, done) >= 0;
+            printf("    per-file %s chain of %d: error=%d ok=%d\n",
+                   receiver ? "receiver" : "binary", links, r ? (int)r->has_error : -1,
+                   (int)per_file_ok);
+            if (r)
+                cbm_free_result(r);
+        }
+        CBMFileResult cross = {0};
+        cbm_arena_init(&cross.arena);
+        (void)cbm_lsp_work_take();
+        cbm_pxc_run_one(CBM_LANG_PYTHON, &cross, src, (int)strlen(src), "test", defs, def_count,
+                        NULL, NULL, 0);
+        uint64_t work = cbm_lsp_work_take();
+        free(src);
+        bool no_error = !cross.has_error && !cross.lsp_skipped;
+        bool unrelated = find_resolved(&cross, "run", "S.m") >= 0;
+        bool typed = find_resolved(&cross, chain_fn, done) >= 0;
+        printf("    cross %s chain of %d: error=%d run->S.m=%d %s=%d resolved=%d work=%llu\n",
+               receiver ? "receiver" : "binary", links, (int)cross.has_error, (int)unrelated, done,
+               (int)typed, cross.resolved_calls.count, (unsigned long long)work);
+        cbm_arena_destroy(&cross.arena);
+        ASSERT_TRUE(per_file_ok);
+        ASSERT_TRUE(no_error);
+        ASSERT_TRUE(unrelated);
+        ASSERT_TRUE(typed);
+    }
+    PASS();
+}
+
+TEST(pylsp_issue1527_long_binary_chain_is_not_nesting) {
+    return pylsp_long_chain_case(false);
+}
+
+TEST(pylsp_issue1527_long_receiver_chain_is_not_nesting) {
+    return pylsp_long_chain_case(true);
+}
+
 TEST(pylsp_issue1527_root_class_name_failure_binds_no_external_class) {
     const char *src = "class Local:\n    pass\n";
     TSParser *parser = ts_parser_new();
@@ -2704,6 +2831,8 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_issue1527_root_class_name_failure_binds_no_external_class);
     RUN_TEST(pylsp_issue1527_memo_and_depth_failures_stop_work);
     RUN_TEST(pylsp_issue1527_memo_allocation_failure_is_reported);
+    RUN_TEST(pylsp_issue1527_long_binary_chain_is_not_nesting);
+    RUN_TEST(pylsp_issue1527_long_receiver_chain_is_not_nesting);
     RUN_TEST(pylsp_scale_work_is_linear);
     /* Phase 2 — smoke */
     RUN_TEST(pylsp_smoke_empty);
