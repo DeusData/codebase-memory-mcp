@@ -1168,6 +1168,42 @@ TEST(clsp_macro_wrapped_call) {
     PASS();
 }
 
+/* #946: `Cls::__API_HOOK(Name)(params)` — the C LSP walked the macro-wrapped
+ * declarator to the macro, so every hook's caller QN was Cls.__API_HOOK (no such
+ * definition exists once the def walk names the hook), and it bound the MACRO's
+ * argument list as the function's parameters, so `pOther` was untyped and the
+ * member call through it went unresolved. */
+TEST(clsp_macro_wrapped_declarator_caller_qn_issue946) {
+    CBMFileResult *r = extract_cpp("void helper();\n"
+                                   "class CBaseEntity {\n"
+                                   "public:\n"
+                                   "    void Touch();\n"
+                                   "};\n"
+                                   "class CBasePlayer {\n"
+                                   "public:\n"
+                                   "    void ReloadWeapons(int slot);\n"
+                                   "    void Spawn();\n"
+                                   "    void Use(CBaseEntity *pOther);\n"
+                                   "};\n"
+                                   "void CBasePlayer::__API_HOOK(ReloadWeapons)(int slot) {\n"
+                                   "    helper();\n"
+                                   "}\n"
+                                   "void CBasePlayer::__API_HOOK(Spawn)() {\n"
+                                   "    ReloadWeapons(0);\n"
+                                   "}\n"
+                                   "void CBasePlayer::__API_HOOK(Use)(CBaseEntity *pOther) {\n"
+                                   "    pOther->Touch();\n"
+                                   "}\n"
+                                   "void helper() {}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_resolved(r, "__API_HOOK", ""), 0);
+    ASSERT_GTE(find_resolved(r, "CBasePlayer.ReloadWeapons", "helper"), 0);
+    ASSERT_GTE(find_resolved(r, "CBasePlayer.Spawn", "CBasePlayer.ReloadWeapons"), 0);
+    ASSERT_GTE(find_resolved(r, "CBasePlayer.Use", "CBaseEntity.Touch"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(clsp_macro_with_args) {
     CBMFileResult *r = extract_c("\n"
                                  "int printf(const char* fmt, ...);\n"
@@ -16578,6 +16614,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_dependent_member_access);
     RUN_TEST(clsp_nocrash_try_catch);
     RUN_TEST(clsp_macro_wrapped_call);
+    RUN_TEST(clsp_macro_wrapped_declarator_caller_qn_issue946);
     RUN_TEST(clsp_macro_with_args);
     RUN_TEST(clsp_recursive_macro);
     RUN_TEST(clsp_conditional_macro);

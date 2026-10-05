@@ -988,6 +988,42 @@ static TSNode resolve_qualified_name(TSNode decl) {
     return null_node;
 }
 
+// Macro-wrapped definition name — see the header for the full rationale (#946).
+TSNode cbm_c_macro_wrapped_name_node(TSNode decl) {
+    TSNode null_node = {0};
+    if (ts_node_is_null(decl) || strcmp(ts_node_type(decl), "function_declarator") != 0) {
+        return null_node;
+    }
+    TSNode macro = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+    if (ts_node_is_null(macro) || strcmp(ts_node_type(macro), "function_declarator") != 0) {
+        return null_node;
+    }
+    // The macro itself is a plain or class-qualified name: FNAME / Cls::__API_HOOK.
+    TSNode macro_name = ts_node_child_by_field_name(macro, TS_FIELD("declarator"));
+    const char *mk = ts_node_is_null(macro_name) ? "" : ts_node_type(macro_name);
+    if (strcmp(mk, "identifier") != 0 && strcmp(mk, "qualified_identifier") != 0) {
+        return null_node;
+    }
+    // Exactly one argument, and that argument is a bare name: the grammar reads
+    // it as a parameter whose type is the name, with no declarator or qualifier.
+    // A multi-argument wrapper does not say which argument names the function.
+    TSNode args = ts_node_child_by_field_name(macro, TS_FIELD("parameters"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) != SKIP_ONE) {
+        return null_node;
+    }
+    TSNode arg = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(arg), "parameter_declaration") != 0 ||
+        ts_node_named_child_count(arg) != SKIP_ONE) {
+        return null_node;
+    }
+    TSNode name = ts_node_child_by_field_name(arg, TS_FIELD("type"));
+    const char *nk = ts_node_is_null(name) ? "" : ts_node_type(name);
+    if (strcmp(nk, "type_identifier") != 0 && strcmp(nk, "identifier") != 0) {
+        return null_node;
+    }
+    return name;
+}
+
 // Resolve function name from C/C++/CUDA/GLSL declarator chain. Shared canonical
 // implementation — see the header for the full rationale (#438).
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
@@ -999,6 +1035,12 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
         }
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
             return resolve_qualified_name(decl);
+        }
+        /* #946: `FNAME(first)(void)` names the def `first`, not `FNAME` — every
+         * definition wrapped by the same macro otherwise shares one QN. */
+        TSNode wrapped = cbm_c_macro_wrapped_name_node(decl);
+        if (!ts_node_is_null(wrapped)) {
+            return wrapped;
         }
         TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
         if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
