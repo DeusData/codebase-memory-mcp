@@ -173,6 +173,120 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
+/* --- Scala companion cache (CBMScalaCompanionCache) --- */
+
+static uint64_t scc_hash(const void *scope, const char *bytes, uint32_t len) {
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char *p = (const unsigned char *)&scope;
+    for (size_t i = 0; i < sizeof(scope); i++) {
+        h = (h ^ p[i]) * 1099511628211ULL;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        h = (h ^ (unsigned char)bytes[i]) * 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Slot holding (scope, name), or the empty slot where it would go. */
+static CBMScalaScopeName *scc_find(const CBMScalaCompanionCache *c, const char *source,
+                                   const void *scope, uint32_t off, uint32_t len) {
+    uint32_t mask = c->cap - 1;
+    uint32_t i = (uint32_t)scc_hash(scope, source + off, len) & mask;
+    for (;;) {
+        CBMScalaScopeName *s = &c->slots[i];
+        if (!s->scope) {
+            return s;
+        }
+        if (s->scope == scope && s->len == len &&
+            (len == 0 || memcmp(source + s->off, source + off, len) == 0)) {
+            return s;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static bool scc_insert(CBMScalaCompanionCache *c, CBMArena *a, const char *source,
+                       const void *scope, uint32_t off, uint32_t len) {
+    if ((c->count + 1) * 2 > c->cap) {
+        uint32_t new_cap = c->cap ? c->cap * 2 : 64;
+        CBMScalaScopeName *old = c->slots;
+        uint32_t old_cap = c->cap;
+        c->slots = cbm_arena_calloc(a, (size_t)new_cap * sizeof(*c->slots));
+        if (!c->slots) {
+            c->slots = old;
+            return false;
+        }
+        c->cap = new_cap;
+        for (uint32_t i = 0; i < old_cap; i++) {
+            if (old[i].scope) {
+                *scc_find(c, source, old[i].scope, old[i].off, old[i].len) = old[i];
+            }
+        }
+    }
+    CBMScalaScopeName *s = scc_find(c, source, scope, off, len);
+    if (!s->scope) {
+        s->scope = scope;
+        s->off = off;
+        s->len = len;
+        c->count++;
+    }
+    return true;
+}
+
+/* First query in a scope: record its class/trait/enum names, plus the
+ * (scope, "") marker that says the scope has been scanned. */
+static bool scc_scan_scope(CBMScalaCompanionCache *c, CBMArena *a, const char *source,
+                           TSNode scope) {
+    const void *id = scope.id;
+    if (c->cap && scc_find(c, source, id, 0, 0)->scope) {
+        return true;
+    }
+    if (!scc_insert(c, a, source, id, 0, 0)) {
+        return false;
+    }
+    uint32_t count = ts_node_named_child_count(scope);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode sibling = ts_node_named_child(scope, i);
+        const char *kind = ts_node_type(sibling);
+        if (strcmp(kind, "class_definition") != 0 && strcmp(kind, "trait_definition") != 0 &&
+            strcmp(kind, "enum_definition") != 0) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(sibling, TS_FIELD("name"));
+        if (ts_node_is_null(name)) {
+            continue;
+        }
+        uint32_t off = ts_node_start_byte(name);
+        uint32_t len = ts_node_end_byte(name) - off;
+        if (len && !scc_insert(c, a, source, id, off, len)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cbm_scala_is_companion_object(CBMExtractCtx *ctx, TSNode node) {
+    if (!ctx || !ctx->source || strcmp(ts_node_type(node), "object_definition") != 0) {
+        return false;
+    }
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(name_node) || ts_node_is_null(parent)) {
+        return false;
+    }
+    uint32_t off = ts_node_start_byte(name_node);
+    uint32_t len = ts_node_end_byte(name_node) - off;
+    if (len == 0 || ts_node_end_byte(name_node) > (uint32_t)ctx->source_len) {
+        return false;
+    }
+    CBMArena *a = ctx->scratch ? ctx->scratch : ctx->arena;
+    CBMScalaCompanionCache *c = &ctx->scala_companions;
+    if (!a || !scc_scan_scope(c, a, ctx->source, parent)) {
+        return false;
+    }
+    return scc_find(c, ctx->source, parent.id, off, len)->scope != NULL;
+}
+
 // True when `label` names a data relation: SQL CREATE TABLE / CREATE VIEW, and
 // a dbt Model (a Jinja-templated .sql file, which materializes as a warehouse
 // table or view). Relations live in the registry so FROM/JOIN and dbt ref()

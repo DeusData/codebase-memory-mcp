@@ -26,6 +26,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #define DEFAULT_CONFIDENCE 0.5
 #include "pipeline/pipeline.h"
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
+#include "discover/discover.h" /* cbm_language_for_filename — Scala companion gate */
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
@@ -97,6 +98,12 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+
+    /* Scala companion owners (`pkg.Foo$`), recorded by cbm_registry_add_def
+     * for type-like definitions in Scala files only. Keys borrow `exact`'s
+     * owned QN. NULL until the first companion, so every other language's
+     * registry never allocates it and every `$` probe below is one NULL test. */
+    CBMHashTable *companions;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -865,6 +872,7 @@ void cbm_registry_free(cbm_registry_t *r) {
     /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    cbm_ht_free(r->companions); /* keys borrow exact's */
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -982,6 +990,54 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     }
 }
 
+static bool path_is_scala(const char *path) {
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    return cbm_language_for_filename(base) == CBM_LANG_SCALA;
+}
+
+void cbm_registry_add_def(cbm_registry_t *r, const char *name, const char *qualified_name,
+                          const char *label, const char *file_path) {
+    cbm_registry_add(r, name, qualified_name, label);
+    if (!r || !qualified_name || !label || !file_path) {
+        return;
+    }
+    size_t len = strlen(qualified_name);
+    if (len < 2 || qualified_name[len - 1] != '$' || !cbm_label_is_type_like(label) ||
+        !path_is_scala(file_path)) {
+        return;
+    }
+    const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
+    if (!owned_qn) {
+        return;
+    }
+    if (!r->companions) {
+        r->companions = cbm_ht_create(CBM_SZ_256);
+        if (!r->companions) {
+            return;
+        }
+    }
+    cbm_ht_set(r->companions, owned_qn, (void *)owned_qn);
+}
+
+/* True when the first `owner_len` bytes of `owner` name a class whose Scala
+ * companion (`<owner>$`) is registered. The only gate on every `$` probe in
+ * the resolver: a Java or JS `Foo$` next to `Foo` is never a companion. */
+static bool companion_known(const cbm_registry_t *r, const char *owner, size_t owner_len) {
+    if (!r->companions || owner_len == 0 || owner_len + 2 > CBM_SZ_512) {
+        return false;
+    }
+    char key[CBM_SZ_512];
+    memcpy(key, owner, owner_len);
+    key[owner_len] = '$';
+    key[owner_len + 1] = '\0';
+    return cbm_ht_has(r->companions, key);
+}
+
 /* ── Lookup ──────────────────────────────────────────────────────── */
 
 bool cbm_registry_exists(const cbm_registry_t *r, const char *qn) {
@@ -1079,26 +1135,46 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     if (stored_key) {
         return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
     }
-
-    /* import_map_suffix fallback: find a QN starting with resolved+"." and
-     * ending with "."+suffix. Any such QN's last segment equals the last
-     * segment of suffix, so probe the by_name index and tail-check the (few)
-     * candidates instead of cbm_ht_foreach over the WHOLE exact table — that
-     * scan ran per unresolved call and dominated elasticsearch's resolve
-     * phase (94% of samples: 700k-entry foreach + strlen per entry). */
     if (suffix && suffix[0]) {
+        /* Scala: an import binds the class, but `Foo.method()` on a class name
+         * is a call into the companion object, whose QN carries a trailing `$`.
+         * Probed only when `<resolved>$` is a registered Scala companion, so a
+         * Java or JS class that happens to be named `Foo$` never takes part. */
+        bool companion = companion_known(r, resolved, strlen(resolved));
+        if (companion) {
+            snprintf(candidate, sizeof(candidate), "%s$.%s", resolved, suffix);
+            stored_key = cbm_ht_get_key(r->exact, candidate);
+            if (stored_key) {
+                return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+            }
+        }
+
+        /* import_map_suffix fallback: find a QN starting with resolved+"." and
+         * ending with "."+suffix. Any such QN's last segment equals the last
+         * segment of suffix, so probe the by_name index and tail-check the
+         * (few) candidates instead of cbm_ht_foreach over the WHOLE exact
+         * table — that scan ran per unresolved call and dominated
+         * elasticsearch's resolve phase (94% of samples: 700k-entry foreach +
+         * strlen per entry). */
         char resolved_dot[CBM_SZ_512];
+        char companion_dot[CBM_SZ_512];
         char dot_suffix[CBM_SZ_256];
         snprintf(resolved_dot, sizeof(resolved_dot), "%s.", resolved);
+        snprintf(companion_dot, sizeof(companion_dot), "%s$.", resolved);
         snprintf(dot_suffix, sizeof(dot_suffix), ".%s", suffix);
         qn_array_t *arr = cbm_ht_get(r->by_name, simple_name(suffix));
         if (arr) {
             size_t rd_len = strlen(resolved_dot);
+            size_t cd_len = strlen(companion_dot);
             size_t ds_len = strlen(dot_suffix);
             for (int i = 0; i < arr->count; i++) {
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
-                if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
+                bool under_owner =
+                    klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0;
+                bool under_companion =
+                    companion && klen >= cd_len + ds_len && strncmp(qn, companion_dot, cd_len) == 0;
+                if ((under_owner || under_companion) &&
                     strcmp(qn + klen - ds_len, dot_suffix) == 0) {
                     return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
@@ -1117,6 +1193,23 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
     if (stored_key) {
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+    }
+    /* Scala `Owner.member` in the declaring file: the member may live under
+     * the companion `Owner$`. Each owner segment is tried once, and only when
+     * `<module>.<owner>$` is a registered Scala companion. */
+    for (const char *dot = r->companions ? strchr(callee_name, '.') : NULL; dot;
+         dot = strchr(dot + 1, '.')) {
+        int owner_len = snprintf(candidate, sizeof(candidate), "%s.%.*s", module_qn,
+                                 (int)(dot - callee_name), callee_name);
+        if (owner_len < 0 || owner_len >= (int)sizeof(candidate) ||
+            !companion_known(r, candidate, (size_t)owner_len)) {
+            continue;
+        }
+        snprintf(candidate + owner_len, sizeof(candidate) - (size_t)owner_len, "$%s", dot);
+        stored_key = cbm_ht_get_key(r->exact, candidate);
+        if (stored_key) {
+            return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+        }
     }
     if (suffix && suffix[0]) {
         snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
@@ -1171,6 +1264,49 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
  * as trustworthy as a same-module hit. */
 #define CONF_QUALIFIED_SUFFIX 0.90
 
+/* Segment equality that lets a Scala companion object stand in for its class:
+ * a call written `Foo.make` reaches the method declared under `Foo$`. `cand`
+ * points into `cand_qn`; the `$` form is accepted only when the candidate QN
+ * up to and including that segment is a registered Scala companion, so a
+ * Java or JS segment `Foo$` is plain text that does not equal `Foo`. */
+static bool qn_seg_matches(const cbm_registry_t *r, const char *cand_qn, const char *seg,
+                           size_t seg_len, const char *cand, size_t cand_len) {
+    if (cand_len == seg_len) {
+        return strncmp(seg, cand, seg_len) == 0;
+    }
+    return cand_len == seg_len + 1 && cand[seg_len] == '$' && strncmp(seg, cand, seg_len) == 0 &&
+           companion_known(r, cand_qn, (size_t)(cand - cand_qn) + seg_len);
+}
+
+/* True when `qn` equals `dotted` or ends with ".<dotted>", compared segment by
+ * segment from the right so companion segments (`Foo$`) match `Foo`. */
+static bool qn_tail_matches(const cbm_registry_t *r, const char *qn, const char *dotted) {
+    const char *q_end = qn + strlen(qn);
+    const char *d_end = dotted + strlen(dotted);
+    for (;;) {
+        const char *q_dot = q_end;
+        while (q_dot > qn && q_dot[-1] != '.') {
+            q_dot--;
+        }
+        const char *d_dot = d_end;
+        while (d_dot > dotted && d_dot[-1] != '.') {
+            d_dot--;
+        }
+        if (!qn_seg_matches(r, qn, d_dot, (size_t)(d_end - d_dot), q_dot,
+                            (size_t)(q_end - q_dot))) {
+            return false;
+        }
+        if (d_dot == dotted) {
+            return true; /* every callee segment matched at a segment boundary */
+        }
+        if (q_dot == qn) {
+            return false; /* callee has more segments than the candidate */
+        }
+        q_end = q_dot - 1;
+        d_end = d_dot - 1;
+    }
+}
+
 /* When a callee is package/namespace-qualified (Foo::Bar::sub or Foo.Bar.sub),
  * disambiguate among same-simple-name candidates by matching the FULL qualified
  * tail against each candidate QN at a segment boundary. Returns the sole
@@ -1182,7 +1318,8 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
  * both reduce to "run", so the bare-name scorer would route every caller to a
  * single winner. Language agnostic: callees with no separator return NULL and
  * leave behavior unchanged. */
-static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name) {
+static const char *qualified_suffix_match(const cbm_registry_t *r, const qn_array_t *arr,
+                                          const char *callee_name) {
     /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
     char dotted[CBM_SZ_512];
     size_t w = 0;
@@ -1203,16 +1340,7 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     const char *match = NULL;
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i];
-        size_t qlen = strlen(qn);
-        if (qlen < w) {
-            continue;
-        }
-        const char *tail = qn + (qlen - w);
-        if (strcmp(tail, dotted) != 0) {
-            continue;
-        }
-        /* Segment boundary: tail is the whole QN or is preceded by '.'. */
-        if (tail != qn && tail[-1] != '.') {
+        if (!qn_tail_matches(r, qn, dotted)) {
             continue;
         }
         if (match) {
@@ -1238,7 +1366,8 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
  *
  * Language agnostic by design: the registry holds no language, and every
  * language that writes receiver chains gains the same protection. */
-static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+static bool receiver_chain_admits(const cbm_registry_t *r, const char *callee_name,
+                                  const char *candidate_qn) {
     /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
      * the same way qualified_suffix_match does. */
     char dotted[CBM_SZ_512];
@@ -1304,7 +1433,7 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
         for (const char *anc = candidate_qn; anc < cand_last;) {
             const char *anc_end = strchr(anc, '.');
             size_t anc_len = (size_t)(anc_end - anc);
-            if (anc_len == len && len > 0 && strncmp(seg, anc, len) == 0) {
+            if (len > 0 && qn_seg_matches(r, candidate_qn, seg, len, anc, anc_len)) {
                 return true;
             }
             anc = anc_end + SKIP_ONE;
@@ -1331,7 +1460,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
     if (arr->count > 1) {
-        const char *q = qualified_suffix_match(arr, callee_name);
+        const char *q = qualified_suffix_match(r, arr, callee_name);
         if (q) {
             return (cbm_resolution_t){q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED};
         }
@@ -1339,7 +1468,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 3: unique name */
     if (arr->count == SKIP_ONE) {
-        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+        if (!receiver_chain_admits(r, callee_name, arr->items[0])) {
             return empty_result();
         }
         double conf = CONF_UNIQUE_NAME;
@@ -1357,7 +1486,7 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     const char *best = best_by_import_distance((const char **)arr->items, qn_test_flags(arr),
                                                arr->count, module_qn);
     if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
+        if (!receiver_chain_admits(r, callee_name, best)) {
             return empty_result();
         }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
