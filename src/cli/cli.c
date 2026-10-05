@@ -3295,6 +3295,9 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_grok_config_dir(home_dir, path, sizeof(path));
     agents.grok = dir_exists(path) || cbm_agent_cli_exists("grok", home_dir);
 
+    snprintf(path, sizeof(path), "%s/.agentty", home_dir);
+    agents.agentty = dir_exists(path) || cbm_agent_cli_exists("agentty", home_dir);
+
     return agents;
 }
 
@@ -10524,6 +10527,15 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
                    "contract)\n");
         }
     }
+    if (agents->agentty) {
+        char cp[CLI_BUF_1K];
+        char skills_dir[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.agentty/mcp.json", home);
+        snprintf(skills_dir, sizeof(skills_dir), "%s/.agentty/skills", home);
+        install_generic_agent_config("agentty", binary_path, cp, NULL, dry_run,
+                                     cbm_install_editor_mcp);
+        install_agent_skill("agentty", skills_dir, force, dry_run);
+    }
 }
 
 static int cbm_install_agent_configs_in_scope(const char *home, const char *binary_path, bool force,
@@ -10706,6 +10718,7 @@ static const cli_client_def_t CLI_CLIENTS[] = {
     CLI_CLIENT(goose, "goose", "Goose"),
     CLI_CLIENT(mistral_vibe, "mistral-vibe", "Mistral Vibe"),
     CLI_CLIENT(grok, "grok", "Grok Build"),
+    CLI_CLIENT(agentty, "agentty", "agentty"),
 };
 
 enum { CLI_CLIENT_COUNT = sizeof(CLI_CLIENTS) / sizeof(CLI_CLIENTS[0]) };
@@ -11006,6 +11019,7 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
         {det.goose, "goose"},
         {det.mistral_vibe, "mistral-vibe"},
         {det.grok, "grok"},
+        {det.agentty, "agentty"},
     };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -12784,6 +12798,15 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
                 .dialect = CBM_GRAPH_DIALECT_GROK,
             },
             dry_run);
+    }
+    if (agents->agentty) {
+        char cp[CLI_BUF_1K];
+        char skills_dir[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.agentty/mcp.json", home);
+        snprintf(skills_dir, sizeof(skills_dir), "%s/.agentty/skills", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"agentty", cp, NULL}, dry_run,
+                                  cbm_remove_editor_mcp_owned);
+        uninstall_agent_skill("agentty", skills_dir, dry_run);
     }
 }
 

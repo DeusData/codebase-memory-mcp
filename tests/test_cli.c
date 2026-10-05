@@ -6743,6 +6743,23 @@ TEST(cli_detect_agents_finds_cursor_issue222) {
     PASS();
 }
 
+TEST(cli_detect_agents_finds_agentty) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.agentty", tmpdir);
+    test_mkdirp(dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.agentty);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* issue #388: `install --plan` must emit a machine-readable receipt of planned
  * writes WITHOUT mutating any config (the pre-mutation trust primitive). */
 TEST(cli_install_plan_receipt_no_mutation_issue388) {
@@ -6860,14 +6877,15 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Pi",
         "Sourcegraph Cody",
         "Oh My Pi (omp)",
+        "agentty",
     };
-    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 45U);
+    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 46U);
     char *data = read_test_file_alloc("README.md");
     if (!data)
         FAIL("could not read README.md for supported-agent contract");
-    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "46 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("README must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("README must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -6880,9 +6898,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("pkg/npm/README.md");
     if (!data)
         FAIL("could not read npm README for supported-agent contract");
-    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "46 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("npm README must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("npm README must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -6895,9 +6913,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/index.html");
     if (!data)
         FAIL("could not read docs/index.html for supported-agent contract");
-    if (!strstr(data, "configures 45 automatic/conditional client surfaces")) {
+    if (!strstr(data, "configures 46 automatic/conditional client surfaces")) {
         free(data);
-        FAIL("landing page must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("landing page must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -6916,7 +6934,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
             FAIL("CLI help must list every automatic/conditional client surface");
         }
     }
-    if (!strstr(data, "Supported automatic/conditional client surfaces (45)")) {
+    if (!strstr(data, "Supported automatic/conditional client surfaces (46)")) {
         free(data);
         FAIL("CLI help must not describe all conditional surfaces as auto-detected");
     }
@@ -6925,10 +6943,10 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/llms.txt");
     if (!data)
         FAIL("could not read docs/llms.txt for supported-agent contract");
-    if (!strstr(data, "45 automatic/conditional client surfaces") ||
-        !strstr(data, "39 automatically detected") || !strstr(data, "6 conditional/explicit")) {
+    if (!strstr(data, "46 automatic/conditional client surfaces") ||
+        !strstr(data, "40 automatically detected") || !strstr(data, "6 conditional/explicit")) {
         free(data);
-        FAIL("llms.txt must describe the 45-surface 39+6 support matrix accurately");
+        FAIL("llms.txt must describe the 46-surface 40+6 support matrix accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -6976,6 +6994,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
 #endif
         ".vibe",
         ".grok",
+        ".agentty",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -7026,6 +7045,9 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         "/.grok/rules/codebase-memory.md",
         "/.grok/skills/codebase-memory/SKILL.md",
         "/.grok/agents/codebase-memory.md",
+        "\"agentty\"",
+        "/.agentty/mcp.json",
+        "/.agentty/skills/codebase-memory/SKILL.md",
     };
     const char *missing = NULL;
     for (size_t i = 0; json && i < sizeof(expected) / sizeof(expected[0]); i++) {
@@ -7085,6 +7107,7 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
 #endif
         ".vibe",
         ".grok",
+        ".agentty",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -7193,12 +7216,102 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
     snprintf(path, sizeof(path), "%s/.grok/rules/codebase-memory.md", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, durable_hint, 3);
 
+    /* agentty consumes the standard mcpServers shape and Claude-compatible
+     * SKILL.md — same fixtures as OpenHands/Cline. */
+    snprintf(path, sizeof(path), "%s/.agentty/mcp.json", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, standard_json, 3);
+    snprintf(path, sizeof(path), "%s/.agentty/skills/codebase-memory/SKILL.md", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, shared_skill, 3);
+
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         restore_test_env(env_names[i], saved_env[i]);
     }
     test_rmdir_r(tmpdir);
     if (!schemas_ok)
         FAIL("new agent installs must write every documented MCP schema");
+    PASS();
+}
+
+TEST(cli_agentty_install_then_uninstall_roundtrip) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-agentty-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CBM_CACHE_DIR");
+
+    char agentty_dir[512];
+    char mcp_path[512];
+    char skills_dir[512];
+    char skill_path[640];
+    char user_dir[512];
+    char user_file[640];
+    char binary[512];
+    snprintf(agentty_dir, sizeof(agentty_dir), "%s/.agentty", tmpdir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/mcp.json", agentty_dir);
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", agentty_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/codebase-memory/SKILL.md", skills_dir);
+    snprintf(user_dir, sizeof(user_dir), "%s/keepme", skills_dir);
+    snprintf(user_file, sizeof(user_file), "%s/SKILL.md", user_dir);
+#ifdef _WIN32
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+
+    test_mkdirp(agentty_dir);
+    test_mkdirp(user_dir);
+    write_test_file(user_file, "user-owned skill\n");
+    write_test_file(binary, "");
+    /* Seed a foreign server so install/uninstall must preserve it. */
+    write_test_file(mcp_path, "{\"mcpServers\":{\"other-mcp\":{\"command\":\"/opt/other\"}}}\n");
+
+    cbm_install_agent_configs(tmpdir, binary, false, false);
+
+    struct stat state;
+    const char *const installed_markers[] = {"mcpServers", "codebase-memory-mcp", binary};
+    bool installed = test_file_contains_all(mcp_path, installed_markers, 3) &&
+                     stat(skill_path, &state) == 0;
+    char *mcp_after_install = read_test_file_alloc(mcp_path);
+    bool foreign_survives_install = mcp_after_install &&
+                                    strstr(mcp_after_install, "\"other-mcp\"") != NULL;
+
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+
+    bool skill_removed = stat(skill_path, &state) != 0;
+    char *mcp_after_uninstall = read_test_file_alloc(mcp_path);
+    bool mcp_entry_removed =
+        mcp_after_uninstall && strstr(mcp_after_uninstall, "codebase-memory-mcp") == NULL;
+    bool user_kept = stat(user_file, &state) == 0;
+    bool foreign_kept = mcp_after_uninstall && strstr(mcp_after_uninstall, "\"other-mcp\"") != NULL;
+
+    free(mcp_after_install);
+    free(mcp_after_uninstall);
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    test_rmdir_r(tmpdir);
+
+    if (!installed)
+        FAIL("install must register the codebase-memory server and skill for agentty");
+    if (!foreign_survives_install)
+        FAIL("install must preserve a pre-existing foreign server in ~/.agentty/mcp.json");
+    if (!skill_removed)
+        FAIL("uninstall must remove the codebase-memory skill directory");
+    if (!mcp_entry_removed)
+        FAIL("uninstall must remove the owned codebase-memory MCP entry");
+    if (!user_kept)
+        FAIL("uninstall must not touch user-owned skills in ~/.agentty/skills/");
+    if (!foreign_kept)
+        FAIL("uninstall must preserve foreign servers in ~/.agentty/mcp.json");
+    if (uninstall_rc != 0)
+        FAIL("uninstall must exit successfully for the agentty roundtrip");
     PASS();
 }
 
@@ -17332,6 +17445,16 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
     ASSERT_FALSE(registry.claude_code);
     ASSERT_FALSE(registry.cursor);
 
+    /* agentty is a detected agent, but it must still be selectable and
+     * filtered: a selection that omits it must zero it, or a user asking for
+     * "claude,codex" silently gets agentty configured too. */
+    cbm_detected_agents_t agentty = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("agentty", &agentty));
+    ASSERT_TRUE(agentty.agentty);
+    cbm_detected_agents_t leak = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("claude,codex", &leak));
+    ASSERT_FALSE(leak.agentty);
+
     /* Every token in the table must resolve — a client added to detection but
      * forgotten here is invisible to the selector. */
     for (size_t i = 0; i < cbm_cli_clients_count_for_testing(); i++) {
@@ -17846,7 +17969,7 @@ SUITE(cli) {
     RUN_TEST(cli_yaml_parse_empty);
     RUN_TEST(cli_yaml_has);
 
-    /* Agent detection (6 tests — group A) */
+    /* Agent detection (7 tests — group A) */
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_claude_empty_dir_not_detected_issue1180);
@@ -17859,6 +17982,8 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_grok);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
+    RUN_TEST(cli_detect_agents_finds_agentty);
+    RUN_TEST(cli_agentty_install_then_uninstall_roundtrip);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_supported_agent_surfaces_match_installers);
     RUN_TEST(cli_new_agent_install_plans_use_documented_paths);
