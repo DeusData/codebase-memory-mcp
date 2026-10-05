@@ -2206,6 +2206,239 @@ TEST(pipeline_env_access_configures_sequential_parallel_parity) {
     PASS();
 }
 
+/* ── google/wire BINDS edges ─────────────────────────────────────── */
+
+typedef struct {
+    const char *rel;
+    const char *content;
+} WireFile;
+
+typedef struct {
+    int run_rc;
+    int total;        /* all BINDS edges in the project */
+    int props_ok;     /* strategy + resolved ObjectWriter in interfaces, none unresolved */
+    int named[3];     /* BINDS edge count for each requested (src, dst) pair */
+    char props0[512]; /* properties_json of the first BINDS edge */
+} WireObservation;
+
+typedef struct {
+    const char *src;
+    const char *dst;
+} WirePair;
+
+static void wire_write_files(const char *root, const WireFile *files, int n) {
+    for (int i = 0; i < n; i++) {
+        write_temp_file(root, files[i].rel, files[i].content);
+    }
+}
+
+/* Padding files keep the incremental run below the full-reindex threshold. */
+static void wire_write_pad(const char *root, int sign) {
+    for (int i = 0; i < 50; i++) {
+        char name[64];
+        char src[128];
+        snprintf(name, sizeof(name), "pad/wire_pad_%02d.ts", i);
+        snprintf(src, sizeof(src), "export function wirePad%02d(): number { return %d; }\n", i,
+                 sign * i);
+        write_temp_file(root, name, src);
+    }
+}
+
+static void wire_restore_env(const char *name, char *saved) {
+    if (saved) {
+        cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv(name);
+    }
+}
+
+/* Run a pipeline over `repo` (single_thread: sequential, else 4 workers) and
+ * observe BINDS edges; env vars are restored afterwards. */
+static WireObservation wire_observe(const char *repo, const char *db_name, bool single_thread,
+                                    const WirePair *pairs, int npairs) {
+    WireObservation o = {.run_rc = -1, .total = -1, .named = {-1, -1, -1}};
+    char *w = getenv("CBM_WORKERS");
+    char *saved_w = w ? strdup(w) : NULL;
+    char *st = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_st = st ? strdup(st) : NULL;
+    if (single_thread) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", repo, db_name);
+    cbm_pipeline_t *pl = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (pl) {
+        o.run_rc = cbm_pipeline_run(pl);
+        const char *project = cbm_pipeline_project_name(pl);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        cbm_edge_t *edges = NULL;
+        int n = 0;
+        if (store && project &&
+            cbm_store_find_edges_by_type(store, project, "BINDS", &edges, &n) == CBM_STORE_OK) {
+            o.total = n;
+            o.props_ok = 0;
+            for (int i = 0; i < n; i++) {
+                const char *pj = edges[i].properties_json;
+                o.props_ok += pj && strstr(pj, "\"strategy\":\"wire_bind\"") &&
+                              strstr(pj, "ObjectWriter\"],\"unresolved_interfaces\":[]}");
+            }
+            if (n > 0 && edges[0].properties_json) {
+                snprintf(o.props0, sizeof(o.props0), "%s", edges[0].properties_json);
+            }
+            cbm_store_free_edges(edges, n);
+            for (int i = 0; i < npairs; i++) {
+                o.named[i] = named_edge_count(store, project, "BINDS", pairs[i].src, pairs[i].dst);
+            }
+        }
+        if (store) {
+            cbm_store_close(store);
+        }
+        cbm_pipeline_free(pl);
+    }
+    wire_restore_env("CBM_WORKERS", saved_w);
+    wire_restore_env("CBM_INDEX_SINGLE_THREAD", saved_st);
+    return o;
+}
+
+static const char WIRE_TYPES_GO[] = "package store\n\n"
+                                    "type ObjectWriter interface{ Write() }\n"
+                                    "type LocalWriter struct{}\n"
+                                    "type S3Writer struct{}\n"
+                                    "func (l *LocalWriter) Write() {}\n"
+                                    "func (s *S3Writer) Write() {}\n";
+
+static const WireFile WIRE_FIXTURE[] = {
+    {"store/types.go", WIRE_TYPES_GO},
+    {"store/set.go", "package store\n\nimport \"github.com/google/wire\"\n\n"
+                     "func NewLocalWriter() *LocalWriter { return &LocalWriter{} }\n\n"
+                     "var LocalSet = wire.NewSet(\n\tNewLocalWriter,\n"
+                     "\twire.Bind(new(ObjectWriter), new(*LocalWriter)),\n)\n"},
+    /* Primary real-world shape: multi-line NewSet, cross-package qualified Bind. */
+    {"providers/set.go", "package providers\n\nimport (\n\t\"github.com/google/wire\"\n"
+                         "\t\"example.com/app/store\"\n)\n\n"
+                         "func NewS3() *store.S3Writer { return &store.S3Writer{} }\n\n"
+                         "var RemoteSet = wire.NewSet(\n\tNewS3,\n\twire.Bind(\n"
+                         "\t\tnew(store.ObjectWriter),\n\t\tnew(*store.S3Writer),\n\t),\n)\n"},
+    {"cmd/api/wire.go", "//go:build wireinject\n\npackage api\n\n"
+                        "import (\n\t\"github.com/google/wire\"\n\t\"example.com/app/store\"\n)\n\n"
+                        "type Handler struct{}\n\n"
+                        "func InitializeAPI() *Handler {\n\twire.Build(store.LocalSet)\n"
+                        "\treturn nil\n}\n"},
+    {"cmd/worker/wire.go",
+     "//go:build wireinject\n\npackage worker\n\n"
+     "import (\n\t\"github.com/google/wire\"\n\t\"example.com/app/store\"\n)\n\n"
+     "type Worker struct{}\n\n"
+     "func InitializeWorker() *Worker {\n"
+     "\twire.Build(wire.Bind(new(store.ObjectWriter), new(*store.S3Writer)))\n\treturn nil\n}\n"},
+    {"go.mod", "module example.com/app\n\ngo 1.21\n"},
+};
+
+/* BINDS must be identical for sequential, parallel and incremental runs. */
+TEST(pipeline_wire_bind_edges_sequential_parallel_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_wire_bind_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    wire_write_files(tmp, WIRE_FIXTURE, (int)(sizeof(WIRE_FIXTURE) / sizeof(*WIRE_FIXTURE)));
+    wire_write_pad(tmp, 1);
+    static const WirePair pairs[] = {
+        {"LocalSet", "LocalWriter"}, {"InitializeWorker", "S3Writer"}, {"RemoteSet", "S3Writer"}};
+    WireObservation seq = wire_observe(tmp, "wire-seq.db", true, pairs, 3);
+    WireObservation par = wire_observe(tmp, "wire-par.db", false, pairs, 3);
+    /* Incremental: touch the file defining the targets so its nodes are
+     * re-created while the injector files stay unchanged, plus padding. */
+    write_temp_file(tmp, "store/types.go", WIRE_TYPES_GO);
+    write_temp_file(tmp, "store/extra.go", "package store\n\nfunc Extra() {}\n");
+    wire_write_pad(tmp, -1);
+    WireObservation inc = wire_observe(tmp, "wire-par.db", false, pairs, 3);
+    th_rmtree(tmp);
+
+    const WireObservation *all[] = {&seq, &par, &inc};
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(all[i]->run_rc, 0);
+        ASSERT_EQ(all[i]->total, 3);
+        for (int k = 0; k < 3; k++) {
+            ASSERT_EQ(all[i]->named[k], 1);
+        }
+        ASSERT_EQ(all[i]->props_ok, 3);
+    }
+    PASS();
+}
+
+/* One Variable binding the same concrete type to two interfaces (one in-repo,
+ * one external, one repeated) must yield exactly ONE BINDS edge that keeps
+ * every interface: resolved QNs in `interfaces`, raw names in
+ * `unresolved_interfaces`. */
+TEST(pipeline_wire_bind_multi_interface_single_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_wire_multi_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    const WireFile files[] = {
+        {"multi/types.go", "package multi\n\ntype Reader interface{ Read() }\ntype T struct{}\n"
+                           "func (t *T) Read() {}\nfunc (t *T) Write(p []byte) {}\n"},
+        {"multi/set.go", "package multi\n\nimport (\n\t\"io\"\n\t\"github.com/google/wire\"\n)\n\n"
+                         "var RW = wire.NewSet(\n"
+                         "\twire.Bind(new(io.Writer), new(*T)),\n"
+                         "\twire.Bind(new(Reader), new(*T)),\n"
+                         "\twire.Bind(new(Reader), new(*T)),\n)\n"},
+    };
+    wire_write_files(tmp, files, 2);
+    WireObservation o = wire_observe(tmp, "wire-multi.db", true, NULL, 0);
+    th_rmtree(tmp);
+    ASSERT_EQ(o.run_rc, 0);
+    ASSERT_EQ(o.total, 1);
+    ASSERT_NOT_NULL(strstr(o.props0, "\"strategy\":\"wire_bind\""));
+    ASSERT_NOT_NULL(strstr(o.props0, "\"interfaces\":[\""));
+    ASSERT_NOT_NULL(strstr(o.props0, ".multi.Reader\"]"));
+    ASSERT_NOT_NULL(strstr(o.props0, "\"unresolved_interfaces\":[\"io.Writer\"]}"));
+    PASS();
+}
+
+/* Negative controls: each must yield no BINDS edge; only `di.Bind` (aliased
+ * import, correct local name) may emit. */
+TEST(pipeline_wire_bind_negative_controls) {
+    static const WireFile files[] = {
+        /* (a) local `wire` value, no google/wire import */
+        {"nega/a.go", "package nega\n\ntype A interface{}\ntype B struct{}\n"
+                      "type binder struct{}\nfunc (binder) Bind(x, y any) {}\nvar wire binder\n"
+                      "func NegA() { wire.Bind(new(A), new(*B)) }\n"},
+        /* (b) aliased import: `wire.Bind` is the wrong name, `di.Bind` is right */
+        {"negb/b.go", "package negb\n\nimport di \"github.com/google/wire\"\n\n"
+                      "type I interface{}\ntype C struct{}\n"
+                      "func NegBWrong() { wire.Bind(new(I), new(*C)) }\n"
+                      "var GoodSet = di.NewSet(di.Bind(new(I), new(*C)))\n"},
+        /* (c) non-new args */
+        {"negc/c.go", "package negc\n\nimport \"github.com/google/wire\"\n\n"
+                      "type I interface{}\ntype D struct{}\nvar x, y int\n"
+                      "func NegC() { wire.Bind(x, y) }\n"
+                      "func NegC2() { wire.Bind(new(I), new(D), new(D)) }\n"
+                      "func NegC3() { wire.Bind(new(I), new(Gen[D])) }\n"},
+        /* (d) concrete type not defined in the repo */
+        {"negd/d.go", "package negd\n\nimport \"github.com/google/wire\"\n\ntype I interface{}\n"
+                      "func NegD() { wire.Bind(new(I), new(*Missing)) }\n"
+                      "func NegD2() { wire.Bind(new(I), new(*other.Missing)) }\n"},
+        /* (e) non-Go file with the same text; a real Go type E sits in the same
+         * directory so only the language gate can stop an edge */
+        {"nege/types.go", "package nege\n\ntype I interface{}\ntype E struct{}\n"},
+        {"nege/e.ts", "import wire from \"github.com/google/wire\";\n"
+                      "export function negE() { return wire.Bind(new(I), new(E)); }\n"},
+    };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_wire_neg_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    wire_write_files(tmp, files, (int)(sizeof(files) / sizeof(*files)));
+    WireObservation o = wire_observe(tmp, "wire-neg.db", true, &(WirePair){"GoodSet", "C"}, 1);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(o.run_rc, 0);
+    ASSERT_EQ(o.named[0], 1); /* di.Bind emits */
+    ASSERT_EQ(o.total, 1);    /* every negative control emits nothing */
+    PASS();
+}
+
 /* Sequential and fused-parallel resolution must materialize the same precise
  * CALL_REFERENCE edge set.  The table covers each independently implemented
  * resolver family involved in callable-value/reference semantics; sibling
@@ -17638,6 +17871,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker);
 #endif
     RUN_TEST(pipeline_env_access_configures_sequential_parallel_parity);
+    RUN_TEST(pipeline_wire_bind_edges_sequential_parallel_incremental);
+    RUN_TEST(pipeline_wire_bind_negative_controls);
+    RUN_TEST(pipeline_wire_bind_multi_interface_single_edge);
     RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
     RUN_TEST(pipeline_complexity_props_independent_of_worker_order);
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
