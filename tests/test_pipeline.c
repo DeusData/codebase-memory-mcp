@@ -8158,6 +8158,40 @@ TEST(pipeline_native_fetch_classified_as_http_calls) {
     PASS();
 }
 
+TEST(pipeline_native_fetch_template_base_url_makes_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fetch_template_base_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/api.ts",
+                    "const BASE_URL = \"http://payments:8080\";\n"
+                    "export async function createPayment(body: unknown) {\n"
+                    "  return fetch(`${BASE_URL}/v1/payments`, { method: 'POST', body });\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fetch_template_base.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int http_call_count = cbm_store_count_edges_by_type(s, project, "HTTP_CALLS");
+    int matching_route_count =
+        http_calls_to_route(s, project, "createPayment", "/v1/payments");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_EQ(http_call_count, 1);
+    ASSERT_EQ(matching_route_count, 1);
+    PASS();
+}
+
 /* #1892: Swift produced no Route node and no HTTP_CALLS edge, because the
  * Swift grammar has no "arguments" field and the generic lookup therefore read
  * no call arguments at all. Alamofire/URLSession were already in the service
@@ -17671,6 +17705,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ts_config_object_url_http_calls_issue2235);
     RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
+    RUN_TEST(pipeline_native_fetch_template_base_url_makes_route);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);

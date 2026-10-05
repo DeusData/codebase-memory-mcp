@@ -1212,7 +1212,7 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
     const char *value_kind = ts_node_type(value_node);
     const char *flat_value = NULL;
     if (strcmp(value_kind, "template_string") == 0) {
-        flat_value = cbm_template_string_text(ctx->arena, value_node, ctx->source);
+        flat_value = cbm_template_string_text(ctx->arena, value_node, ctx->source, NULL);
         if (!flat_value) {
             return;
         }
@@ -1263,7 +1263,7 @@ static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState 
      * template strings become string_refs with the canonical placeholder shape
      * shared with server route paths (issue #1006). */
     if (strcmp(kind, "template_string") == 0) {
-        const char *flat = cbm_template_string_text(ctx->arena, node, ctx->source);
+        const char *flat = cbm_template_string_text(ctx->arena, node, ctx->source, NULL);
         if (!flat) {
             return;
         }

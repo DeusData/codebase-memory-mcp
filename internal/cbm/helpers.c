@@ -1803,13 +1803,10 @@ int cbm_classify_string(const char *str, int len) {
     return NOT_FOUND;
 }
 
-/* Flatten a JS/TS `template_string` node into plain text (issue #1006).
- * String fragments are kept verbatim; each ${...} substitution becomes the
- * "{}" placeholder so client URLs built from template literals share the
- * canonical parameter shape of server-side route paths
- * (`/things/${id}/x` -> "/things/{}/x"). Returns NULL when the node yields
- * no text or exceeds the route-sized buffer. */
-const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source) {
+/* Flatten a JS/TS template string, resolving known string constants and
+ * replacing other substitutions with the route placeholder. */
+const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source,
+                                     const CBMStringConstantMap *string_constants) {
     enum { TPL_BUF = 512 };
     char buf[TPL_BUF];
     size_t pos = 0;
@@ -1829,6 +1826,29 @@ const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *sourc
             memcpy(buf + pos, frag, fl);
             pos += fl;
         } else if (strcmp(k, "template_substitution") == 0) {
+            const char *resolved = NULL;
+            TSNode expr = ts_node_named_child(c, 0);
+            if (string_constants && !ts_node_is_null(expr) &&
+                strcmp(ts_node_type(expr), "identifier") == 0) {
+                char *name = cbm_node_text(a, expr, source);
+                for (int j = 0; name && j < string_constants->count; j++) {
+                    if (!string_constants->is_url_builder[j] && string_constants->names[j] &&
+                        string_constants->values[j] &&
+                        strcmp(string_constants->names[j], name) == 0) {
+                        resolved = string_constants->values[j];
+                        break;
+                    }
+                }
+            }
+            if (resolved) {
+                size_t rl = strlen(resolved);
+                if (pos + rl >= TPL_BUF) {
+                    return NULL;
+                }
+                memcpy(buf + pos, resolved, rl);
+                pos += rl;
+                continue;
+            }
             if (pos + PAIR_LEN >= TPL_BUF) {
                 return NULL;
             }

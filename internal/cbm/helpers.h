@@ -253,10 +253,9 @@ char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
 
-/* Flatten a JS/TS `template_string` node into plain text: string fragments are
- * kept verbatim and each ${...} substitution becomes the "{}" placeholder, so
- * client-side URLs built from template literals share the canonical parameter
- * shape that server-side route paths already use. NULL when empty/oversized. */
-const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source);
+/* Flatten JS/TS template strings for URL extraction. Known string constants
+ * resolve; other substitutions become "{}". NULL when empty/oversized. */
+const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source,
+                                     const CBMStringConstantMap *string_constants);
 
 #endif // CBM_HELPERS_H
