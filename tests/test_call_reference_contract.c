@@ -35,6 +35,40 @@ static int crc_edge_count(cbm_store_t *store, const char *project, const char *t
     return matches;
 }
 
+/* Edges of `type` out of `source_name` whose target's qualified name ends with
+ * `target_qn_suffix`. Two methods in one project can share a short name, and
+ * then only the qualified name tells them apart. */
+static int crc_edge_count_to_qn(cbm_store_t *store, const char *project, const char *type,
+                                const char *source_name, const char *target_qn_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(store, project, type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    size_t suffix_len = strlen(target_qn_suffix);
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        bool source_ok =
+            cbm_store_find_node_by_id(store, edges[i].source_id, &source) == CBM_STORE_OK;
+        bool target_ok =
+            cbm_store_find_node_by_id(store, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.qualified_name &&
+            strcmp(source.name, source_name) == 0) {
+            size_t qn_len = strlen(target.qualified_name);
+            if (qn_len >= suffix_len &&
+                strcmp(target.qualified_name + qn_len - suffix_len, target_qn_suffix) == 0) {
+                matches++;
+            }
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    return matches;
+}
+
 static int crc_global_handler_edge_count(cbm_store_t *store, const char *project,
                                          const char *caller) {
     int references =
@@ -423,6 +457,56 @@ TEST(call_reference_go_ambiguous_promoted_method_stays_usage) {
     PASS();
 }
 
+TEST(call_java_record_accessor_binds_the_record) {
+    /* A record's accessors are implicit, so `record Point(double x, ...)`
+     * declares no `x()` in its source. Extraction emits them, and `other.x()`
+     * binds to the record's own accessor.
+     *
+     * Two things must not happen instead. The call must not reach the
+     * project-wide short-name registry and land on the first `x` in the tree —
+     * here an unrelated class's private field. And the guard that refuses such
+     * data binds must not swallow a real method that merely shares the
+     * spelling: the builder's `x(int)`, declared beside its own `x` field,
+     * keeps its edge. */
+    static const RFile files[] = {
+        {"Point.java", "package com.example;\n"
+                       "public record Point(double x, double y, double z) {\n"
+                       "    public double first(Point other) {\n"
+                       "        return Maths.abs(other.x()) + new Builder().x(5).made();\n"
+                       "    }\n"
+                       "}\n"},
+        {"Spring.java", "package com.example;\n"
+                        "public final class Spring {\n"
+                        "    private double x;\n"
+                        "    public void put(double v) { this.x = v; }\n"
+                        "}\n"},
+        {"Builder.java", "package com.example;\n"
+                         "public final class Builder {\n"
+                         "    private int x;\n"
+                         "    public Builder x(int v) { this.x = v; return this; }\n"
+                         "    public int made() { return x; }\n"
+                         "}\n"},
+        {"Maths.java", "package com.example;\n"
+                       "public final class Maths {\n"
+                       "    public static double abs(double v) { return v < 0 ? -v : v; }\n"
+                       "}\n"}};
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 4);
+    ASSERT_NOT_NULL(store);
+    int fabricated_field = crc_edge_count(store, project.project, "CALLS", "first", "Field", "x");
+    int fabricated_var = crc_edge_count(store, project.project, "CALLS", "first", "Variable", "x");
+    int genuine = crc_edge_count(store, project.project, "CALLS", "first", "Method", "abs");
+    int accessor = crc_edge_count_to_qn(store, project.project, "CALLS", "first", ".Point.x");
+    int builder = crc_edge_count_to_qn(store, project.project, "CALLS", "first", ".Builder.x");
+    rh_cleanup(&project, store);
+    ASSERT_EQ(fabricated_field, 0);
+    ASSERT_EQ(fabricated_var, 0);
+    ASSERT_EQ(genuine, 1);
+    ASSERT_EQ(accessor, 1);
+    ASSERT_EQ(builder, 1);
+    PASS();
+}
+
 SUITE(call_reference_contract) {
     RUN_TEST(call_reference_typescript_direct_argument_is_exact);
     RUN_TEST(call_reference_kotlin_alias_argument_is_exact);
@@ -439,4 +523,5 @@ SUITE(call_reference_contract) {
     RUN_TEST(call_reference_python_later_decorated_method_rebinding_stays_usage);
     RUN_TEST(call_reference_go_bound_method_argument_is_exact);
     RUN_TEST(call_reference_go_ambiguous_promoted_method_stays_usage);
+    RUN_TEST(call_java_record_accessor_binds_the_record);
 }
