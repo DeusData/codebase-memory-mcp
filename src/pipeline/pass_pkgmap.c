@@ -2134,11 +2134,163 @@ static psr4_outcome_t resolve_php_psr4_class(const cbm_pipeline_ctx_t *ctx,
     return covered ? PSR4_UNRESOLVED : PSR4_NOT_APPLICABLE;
 }
 
+/* ── Scala top-level index ───────────────────────────────────────── */
+
+/* The two File nodes with the lexicographically smallest QNs declaring a
+ * package, borrowed from the graph buffer. The smallest is the `import pkg._`
+ * target on every platform regardless of directory-walk order; the runner-up
+ * serves when the smallest is the importing file itself. */
+typedef struct {
+    const cbm_gbuf_node_t *first;
+    const cbm_gbuf_node_t *second; /* NULL for a single-file package */
+} scala_package_files_t;
+
+struct cbm_scala_index {
+    CBMHashTable *symbols;  /* "pkg.Name" → node, or &scala_toplevel_ambiguous */
+    CBMHashTable *packages; /* "pkg" → scala_package_files_t */
+};
+
+/* Marker value in the Scala top-level index: two files of a split package
+ * declare different top-level symbols under the same name, so an import of
+ * that name is ambiguous and must not bind. */
+static const cbm_gbuf_node_t scala_toplevel_ambiguous;
+
+static const cbm_gbuf_node_t *scala_toplevel_lookup(const cbm_scala_index_t *scala_index,
+                                                    const char *package, const char *name) {
+    if (!scala_index || !scala_index->symbols || !package || !name || !name[0]) {
+        return NULL;
+    }
+    char key[PKGMAP_PATH_BUF];
+    if (snprintf(key, sizeof(key), "%s.%s", package, name) >= (int)sizeof(key)) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *node = (const cbm_gbuf_node_t *)cbm_ht_get(scala_index->symbols, key);
+    return node == &scala_toplevel_ambiguous ? NULL : node;
+}
+
+/* `import pkg._` binds the package itself: its smallest declaring file, or
+ * the runner-up when that is the importer. */
+static const cbm_gbuf_node_t *scala_package_file(const cbm_scala_index_t *scala_index,
+                                                 const char *package, const char *source_file_qn) {
+    if (!scala_index || !scala_index->packages) {
+        return NULL;
+    }
+    const scala_package_files_t *pf = cbm_ht_get(scala_index->packages, package);
+    if (!pf) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *pick = pf->first;
+    if (source_file_qn && pick && strcmp(pick->qualified_name, source_file_qn) == 0) {
+        pick = pf->second;
+    }
+    return pick;
+}
+
+/* Scala source packages are independent of the repository layout. Resolve the
+ * longest declared package prefix first, then the imported top-level symbol
+ * through the (package, name) index, then an optional member under that
+ * owner's QN. Every step fails closed: generic suffix fallback is unsafe for
+ * JVM FQNs because common names such as api/get/app occur throughout a
+ * monorepo, and a member import that binds the owner instead would turn
+ * `member()` into a CALLS edge to the owner class via resolve_import_map. */
+static const cbm_gbuf_node_t *resolve_scala_namespace_import(const cbm_pipeline_ctx_t *ctx,
+                                                             const char *source_file_qn,
+                                                             const CBMImport *imp,
+                                                             const CBMHashTable *namespace_map,
+                                                             const cbm_scala_index_t *scala_index) {
+    if (!namespace_map || !imp || !imp->module_path || !imp->module_path[0]) {
+        return NULL;
+    }
+    char full[PKGMAP_PATH_BUF];
+    snprintf(full, sizeof(full), "%s", imp->module_path);
+    for (char *p = full; *p; p++) {
+        if (*p == '\\' || *p == ':' || *p == '/') {
+            *p = '.';
+        }
+    }
+    size_t full_len = strlen(full);
+    while (full_len > 0 && (full[full_len - 1] == '*' || full[full_len - 1] == '.')) {
+        full[--full_len] = '\0';
+    }
+
+    bool wildcard = imp->local_name && strcmp(imp->local_name, "*") == 0;
+    if (wildcard && cbm_ht_has(namespace_map, full)) {
+        return scala_package_file(scala_index, full, source_file_qn);
+    }
+
+    char package[PKGMAP_PATH_BUF];
+    snprintf(package, sizeof(package), "%s", full);
+    for (;;) {
+        char *dot = strrchr(package, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+        if (!cbm_ht_has(namespace_map, package)) {
+            continue;
+        }
+        const char *remainder = full + strlen(package) + 1;
+        char top_level[CBM_SZ_256];
+        size_t top_len = strcspn(remainder, ".");
+        if (top_len == 0 || top_len >= sizeof(top_level)) {
+            return NULL;
+        }
+        memcpy(top_level, remainder, top_len);
+        top_level[top_len] = '\0';
+        /* Only a top-level symbol of a file declaring this package qualifies;
+         * a nested class or method of the same name is not importable by
+         * `pkg.Name` and an ambiguous split-package name yields no edge. */
+        const cbm_gbuf_node_t *owner = scala_toplevel_lookup(scala_index, package, top_level);
+        if (!owner || !owner->qualified_name) {
+            return NULL;
+        }
+        if (wildcard || !strchr(remainder, '.')) {
+            return owner;
+        }
+        /* `import pkg.Owner.member`: the member must exist under the owner's
+         * QN. Binding the owner instead would mislabel the edge. Only object
+         * members are importable, so when Owner has a companion the `Owner$`
+         * scope is tried before the class. */
+        static const char *const scopes[] = {"$", ""};
+        for (size_t si = 0; si < sizeof(scopes) / sizeof(scopes[0]); si++) {
+            char member_qn[CBM_SZ_512];
+            if (snprintf(member_qn, sizeof(member_qn), "%s%s.%s", owner->qualified_name, scopes[si],
+                         remainder + top_len + 1) >= (int)sizeof(member_qn)) {
+                return NULL;
+            }
+            const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+            if (scoped && scoped->label && import_targetable_label(scoped->label)) {
+                return scoped;
+            }
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+/* Scala `package` clauses are resolved only by the fail-closed resolver above.
+ * Letting them feed the generic first-declaring-file walk would bind Java or
+ * Kotlin imports of a shared package prefix to an arbitrary Scala file. */
+static bool path_is_scala(const char *path) {
+    const char *base = path;
+    for (const char *p = base; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    return cbm_language_for_filename(base) == CBM_LANG_SCALA;
+}
+
+static bool declaring_file_is_scala(const cbm_gbuf_node_t *node) {
+    return node && node->file_path && path_is_scala(node->file_path);
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
-                                                        const CBMImport *imp,
-                                                        CBMHashTable *namespace_map) {
+                                                        CBMLanguage language, const CBMImport *imp,
+                                                        CBMHashTable *namespace_map,
+                                                        const cbm_scala_index_t *scala_index) {
     if (!ctx || !imp || !imp->module_path) {
         return NULL;
     }
@@ -2226,6 +2378,10 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         }
     }
 
+    if (language == CBM_LANG_SCALA) {
+        return resolve_scala_namespace_import(ctx, source_file_qn, imp, namespace_map, scala_index);
+    }
+
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,
      * `use App\Utils\Helper` name a NAMESPACE (or a member of it) that the
      * path-based QN cannot express.  Try the full module path and progressively
@@ -2279,7 +2435,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                     memcpy(qbuf, seg, len);
                     qbuf[len] = '\0';
                     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
-                    if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+                    if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0) &&
+                        !declaring_file_is_scala(n)) {
                         return n;
                     }
                 }
@@ -2471,17 +2628,45 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     return NULL;
 }
 
+/* ── File node package property ──────────────────────────────────── */
+
+/* Persist a file's package clause on its File node so an incremental run
+ * can rebuild the namespace map and the Scala index for the files it does
+ * not re-extract (see incr_load_stored_namespaces). */
+static void file_node_set_package(const cbm_pipeline_ctx_t *ctx, const char *file_qn,
+                                  const char *namespace_name) {
+    cbm_gbuf_node_t *node = (cbm_gbuf_node_t *)cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+    if (!node || !node->label || strcmp(node->label, "File") != 0) {
+        return;
+    }
+    /* Append to the existing object ({"extension":".scala"}); the previous
+     * generation's value is gone with the purge of a changed file, so a
+     * `package` key already present means this pass set it, or the file is
+     * one the pass does not re-extract. */
+    const char *props = node->properties_json ? node->properties_json : "{}";
+    if (strstr(props, "\"package\"")) {
+        return;
+    }
+    size_t props_len = strlen(props);
+    if (props_len < 2 || props[props_len - 1] != '}') {
+        return;
+    }
+    char escaped[PKGMAP_PATH_BUF];
+    cbm_json_escape(escaped, sizeof(escaped), namespace_name);
+    char json[PKGMAP_PATH_BUF * 2];
+    int n = snprintf(json, sizeof(json), "%.*s%s\"package\":\"%s\"}", (int)props_len - 1, props,
+                     props_len > 2 ? "," : "", escaped);
+    if (n < 0 || n >= (int)sizeof(json)) {
+        return;
+    }
+    cbm_gbuf_node_set_properties_json(node, json);
+}
+
 /* ── Namespace map ───────────────────────────────────────────────── */
 
-/* The namespace names themselves, so a caller that has parked some results on
- * disk can still contribute their namespaces (see
- * cbm_result_spill_namespace). A file missing from this map does not fail to
- * resolve -- it resolves DIFFERENTLY, through the looser fallback, which is why
- * an incomplete map changed edge counts in both directions rather than only
- * losing edges. */
-CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
-                                                     const char *const *namespaces,
-                                                     const char *const *rels, int count) {
+static CBMHashTable *namespace_map_build(const cbm_pipeline_ctx_t *ctx,
+                                         const char *const *namespaces, const char *const *rels,
+                                         int count) {
     CBMHashTable *map = NULL;
     for (int i = 0; i < count; i++) {
         const char *namespace_name = namespaces[i];
@@ -2494,14 +2679,15 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
                 return NULL;
             }
         }
-        char *file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rels[i], "__file__");
         if (!file_qn) {
             continue;
         }
+        file_node_set_package(ctx, file_qn, namespace_name);
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(namespace_name);
+        char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, namespace_name);
         if (!key) {
             free(file_qn);
             continue;
@@ -2534,42 +2720,267 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
                     free(prev); /* old value string */
                 }
             }
-            free(key);     /* our fresh strdup — never stored */
-            free(file_qn); /* content copied into combined */
+            cbm_free(CBM_MEM_CLASS_OTHER, key); /* our fresh copy — never stored */
+            free(file_qn);                      /* content copied into combined */
         }
     }
     return map;
 }
 
-/* Convenience for callers whose results are all in memory (the sequential
- * definitions pass). A caller that can SPILL must use the _names variant and
- * fill the parked slots from cbm_result_spill_namespace, or its map silently
- * loses those files. */
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count) {
-    const char **names = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(char *));
-    if (!names) {
-        return NULL;
-    }
-    for (int i = 0; i < count; i++) {
-        names[i] = results[i] ? results[i]->namespace_name : NULL;
-    }
-    CBMHashTable *map = cbm_pipeline_namespace_map_build_names(project_name, names, rels, count);
-    cbm_free(CBM_MEM_CLASS_OTHER, names);
-    return map;
-}
-
 static void ns_map_free_entry(const char *key, void *value, void *ud) {
     (void)ud;
-    free((void *)key); /* strdup'd in cbm_pipeline_namespace_map_build */
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key); /* cbm_mem_strdup'd in namespace_map_build */
     free(value);
 }
 
-void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
+static void namespace_map_free(CBMHashTable *map) {
     if (!map) {
         return;
     }
     cbm_ht_foreach(map, ns_map_free_entry, NULL);
     cbm_ht_free(map);
+}
+
+/* ── Scala top-level index ───────────────────────────────────────── */
+
+typedef struct {
+    char *namespace_name; /* dot-normalized package clause */
+    char *module_qn;      /* language-aware module QN of the declaring file */
+} scala_file_entry_t;
+
+typedef struct {
+    CBMHashTable *files; /* rel path -> scala_file_entry_t (build-time only) */
+    cbm_scala_index_t *index;
+} scala_index_build_t;
+
+/* The module QN a file's top-level symbols hang off. Directory-module
+ * languages (Java, Go) put `class Outer` in Outer.java at <dir>.Outer, so
+ * <dir> is the module and Outer's methods and nested types sit two segments
+ * below it; stem-module languages (Scala `object Foo` in Foo.scala is
+ * Foo.Foo) use the file stem. MUST match cbm_lang_module_is_dir()
+ * (internal/cbm/helpers.c). */
+static bool pkgmap_module_is_dir(const char *rel) {
+    const char *base = rel;
+    for (const char *p = rel; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    CBMLanguage lang = cbm_language_for_filename(base);
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
+/* Keep the two smallest File nodes of a package (see scala_package_files_t). */
+static void scala_index_note_package_file(cbm_scala_index_t *index, const char *package,
+                                          const cbm_gbuf_node_t *file_node) {
+    if (!index->packages) {
+        index->packages = cbm_ht_create(CBM_SZ_64);
+        if (!index->packages) {
+            return;
+        }
+    }
+    scala_package_files_t *pf = cbm_ht_get(index->packages, package);
+    if (!pf) {
+        pf = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*pf));
+        char *key = pf ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, package) : NULL;
+        if (!key) {
+            cbm_free(CBM_MEM_CLASS_OTHER, pf);
+            return;
+        }
+        pf->first = file_node;
+        cbm_ht_set(index->packages, key, pf); /* index owns key + pf */
+        return;
+    }
+    int c = strcmp(file_node->qualified_name, pf->first->qualified_name);
+    if (c < 0) {
+        pf->second = pf->first;
+        pf->first = file_node;
+    } else if (c > 0 &&
+               (!pf->second || strcmp(file_node->qualified_name, pf->second->qualified_name) < 0)) {
+        pf->second = file_node;
+    }
+}
+
+/* A node is top-level when its QN is exactly <module QN>.<Name>, one segment
+ * below the declaring file's module. Nested classes and methods carry deeper
+ * QNs. Module and File nodes share those QN shapes but declare nothing
+ * importable; a File node of a declaring file is instead a candidate for the
+ * package's `import pkg._` target. */
+static void scala_index_visit_node(const cbm_gbuf_node_t *node, void *ud) {
+    scala_index_build_t *b = ud;
+    if (!node || !node->qualified_name || !node->file_path || !node->name ||
+        !import_targetable_label(node->label) || strcmp(node->label, "Module") == 0) {
+        return;
+    }
+    const scala_file_entry_t *fe =
+        (const scala_file_entry_t *)cbm_ht_get(b->files, node->file_path);
+    if (!fe) {
+        return;
+    }
+    if (strcmp(node->label, "File") == 0) {
+        scala_index_note_package_file(b->index, fe->namespace_name, node);
+        return;
+    }
+    size_t mod_len = strlen(fe->module_qn);
+    const char *qn = node->qualified_name;
+    if (strncmp(qn, fe->module_qn, mod_len) != 0 || qn[mod_len] != '.' || !qn[mod_len + 1] ||
+        strchr(qn + mod_len + 1, '.')) {
+        return;
+    }
+    const char *tail = qn + mod_len + 1;
+    char key[PKGMAP_PATH_BUF];
+    if (snprintf(key, sizeof(key), "%s.%s", fe->namespace_name, tail) >= (int)sizeof(key)) {
+        return;
+    }
+    if (!b->index->symbols) {
+        b->index->symbols = cbm_ht_create(CBM_SZ_256);
+        if (!b->index->symbols) {
+            return;
+        }
+    }
+    const char *stored_key = cbm_ht_get_key(b->index->symbols, key);
+    if (!stored_key) {
+        char *owned = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
+        if (owned) {
+            cbm_ht_set(b->index->symbols, owned, (void *)node); /* index owns key */
+        }
+        return;
+    }
+    if (cbm_ht_get(b->index->symbols, stored_key) != node) {
+        cbm_ht_set(b->index->symbols, stored_key, (void *)&scala_toplevel_ambiguous);
+    }
+}
+
+static void scala_index_free_file_entry(const char *key, void *value, void *ud) {
+    (void)key; /* borrowed from the caller's rels array */
+    (void)ud;
+    scala_file_entry_t *fe = value;
+    cbm_free(CBM_MEM_CLASS_OTHER, fe->namespace_name);
+    free(fe->module_qn); /* malloc'd by cbm_pipeline_fqn_module_dir */
+    cbm_free(CBM_MEM_CLASS_OTHER, fe);
+}
+
+static void scala_index_free_symbol(const char *key, void *value, void *ud) {
+    (void)value; /* borrowed gbuf node or the ambiguity marker */
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key); /* cbm_mem_strdup'd in scala_index_visit_node */
+}
+
+static void scala_index_free_package(const char *key, void *value, void *ud) {
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, value); /* File nodes are borrowed */
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static void scala_index_free(cbm_scala_index_t *index) {
+    if (!index) {
+        return;
+    }
+    if (index->symbols) {
+        cbm_ht_foreach(index->symbols, scala_index_free_symbol, NULL);
+        cbm_ht_free(index->symbols);
+    }
+    if (index->packages) {
+        cbm_ht_foreach(index->packages, scala_index_free_package, NULL);
+        cbm_ht_free(index->packages);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, index);
+}
+
+/* Every file declaring a namespace contributes, not only Scala ones: a Scala
+ * import routinely names a Java class of the same (mixed) package. */
+static cbm_scala_index_t *scala_index_build(const cbm_pipeline_ctx_t *ctx,
+                                            const char *const *namespaces, const char *const *rels,
+                                            int count) {
+    scala_index_build_t b = {0};
+    b.index = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*b.index));
+    if (!b.index) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!namespaces[i] || !namespaces[i][0] || !rels[i]) {
+            continue;
+        }
+        if (!b.files) {
+            b.files = cbm_ht_create(CBM_SZ_64);
+            if (!b.files) {
+                break;
+            }
+        }
+        scala_file_entry_t *fe = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*fe));
+        if (!fe) {
+            continue;
+        }
+        fe->namespace_name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, namespaces[i]);
+        fe->module_qn =
+            cbm_pipeline_fqn_module_dir(ctx->project_name, rels[i], pkgmap_module_is_dir(rels[i]));
+        if (!fe->namespace_name || !fe->module_qn) {
+            scala_index_free_file_entry(rels[i], fe, NULL);
+            continue;
+        }
+        for (char *p = fe->namespace_name; *p; p++) {
+            if (*p == '\\' || *p == ':' || *p == '/') {
+                *p = '.';
+            }
+        }
+        void *prev = cbm_ht_set(b.files, rels[i], fe);
+        if (prev) {
+            scala_index_free_file_entry(rels[i], prev, NULL);
+        }
+    }
+    if (!b.files) {
+        scala_index_free(b.index);
+        return NULL;
+    }
+    cbm_gbuf_foreach_node(ctx->gbuf, scala_index_visit_node, &b);
+    cbm_ht_foreach(b.files, scala_index_free_file_entry, NULL);
+    cbm_ht_free(b.files);
+    return b.index;
+}
+
+/* ── Import maps ─────────────────────────────────────────────────── */
+
+void cbm_pipeline_import_maps_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                    int file_count, const char *const *namespaces,
+                                    CBMHashTable **namespace_map, cbm_scala_index_t **scala_index) {
+    *namespace_map = NULL;
+    *scala_index = NULL;
+    if (!ctx || !ctx->gbuf || !files || !namespaces) {
+        return;
+    }
+    /* The fresh files first, then the previous generation's clauses for the
+     * files this pass does not re-extract (incremental routes only; the
+     * caller guarantees the two sets are disjoint). */
+    int stored = ctx->stored_namespaces ? ctx->stored_namespace_count : 0;
+    size_t total = (size_t)file_count + (size_t)stored;
+    const char **all_ns = cbm_calloc(CBM_MEM_CLASS_OTHER, (total ? total : 1) * sizeof(char *));
+    const char **all_rels = cbm_calloc(CBM_MEM_CLASS_OTHER, (total ? total : 1) * sizeof(char *));
+    if (!all_ns || !all_rels) {
+        cbm_free(CBM_MEM_CLASS_OTHER, all_ns);
+        cbm_free(CBM_MEM_CLASS_OTHER, all_rels);
+        return;
+    }
+    bool scala_importer = false;
+    for (int i = 0; i < file_count; i++) {
+        all_ns[i] = namespaces[i];
+        all_rels[i] = files[i].rel_path;
+        scala_importer = scala_importer || files[i].language == CBM_LANG_SCALA;
+    }
+    for (int i = 0; i < stored; i++) {
+        all_ns[file_count + i] = ctx->stored_namespaces[i].namespace_name;
+        all_rels[file_count + i] = ctx->stored_namespaces[i].rel_path;
+    }
+    *namespace_map = namespace_map_build(ctx, all_ns, all_rels, (int)total);
+    /* Only the Scala resolver reads the index; a corpus without a Scala
+     * importer pays nothing for it. */
+    if (scala_importer) {
+        *scala_index = scala_index_build(ctx, all_ns, all_rels, (int)total);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, all_ns);
+    cbm_free(CBM_MEM_CLASS_OTHER, all_rels);
+}
+
+void cbm_pipeline_import_maps_free(CBMHashTable *namespace_map, cbm_scala_index_t *scala_index) {
+    scala_index_free(scala_index);
+    namespace_map_free(namespace_map);
 }
