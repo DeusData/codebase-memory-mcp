@@ -40,7 +40,7 @@ jobs:
           CORE_UNIX='[
             {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
             {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
-            {"os":"macos-14","cc":"cc","cxx":"c++"},
+            {"os":"macos-15","cc":"cc","cxx":"c++"},
             {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
           ]'
           # Broad matrix legs are REQUIRED gates (no optional/continue-on-error
@@ -378,7 +378,7 @@ jobs:
         include:
           - { os: ubuntu-latest, cc: clang, cxx: clang++ }
           - { os: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
-          - { os: macos-14, cc: cc, cxx: c++ }
+          - { os: macos-15, cc: cc, cxx: c++ }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
