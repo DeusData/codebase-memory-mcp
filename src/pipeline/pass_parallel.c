@@ -1750,7 +1750,8 @@ static void pp_add_file_doc(const cbm_gbuf_node_t *file_node, const char *doc) {
 
 /* Create IMPORTS edges for one file's imports (parallel path). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                const char *rel, CBMHashTable *namespace_map) {
+                                const char *rel, CBMLanguage language, CBMHashTable *namespace_map,
+                                const cbm_scala_index_t *scala_index) {
     int count = 0;
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1763,8 +1764,8 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
         if (!imp->module_path) {
             continue;
         }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+        const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+            ctx, rel, file_qn, language, imp, namespace_map, scala_index);
         if (target && target->id != source_node->id) {
             char esc_ln[CBM_SZ_128];
             cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
@@ -1831,36 +1832,30 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     int imports_edges = 0;
 
     /* Namespace/package → File-QN map for namespace imports (C# `using`,
-     * Java/Kotlin `import`, PHP `use`). Built from the full result cache so
-     * every declaring file is visible regardless of loop order. */
-    const char **rels = (const char **)calloc((size_t)file_count, sizeof(char *));
-    if (rels) {
-        for (int i = 0; i < file_count; i++) {
-            rels[i] = files[i].rel_path;
-        }
-    }
-    /* Built from every file, including the ones already parked on disk: their
-     * results are NULL in result_cache, and a file absent from this map does
-     * not fail to resolve, it resolves through the looser fallback. Spilling
-     * therefore used to CHANGE the graph rather than merely delay it -- php
-     * measured 57,182 edges in memory against 59,379 while spilling, the same
-     * binary and corpus (2026-09-18), differing in both directions. */
+     * Java/Kotlin `import`, PHP `use`) and the Scala top-level index. Built
+     * from the full result cache so every declaring file is visible
+     * regardless of loop order, including the files already parked on disk:
+     * their results are NULL in result_cache, and a file absent from this map
+     * does not fail to resolve, it resolves through the looser fallback.
+     * Spilling therefore used to CHANGE the graph rather than merely delay it
+     * -- php measured 57,182 edges in memory against 59,379 while spilling,
+     * the same binary and corpus (2026-09-18), differing in both directions. */
     const char **namespaces = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(char *));
     CBMHashTable *namespace_map = NULL;
+    cbm_scala_index_t *scala_index = NULL;
     if (namespaces) {
         for (int i = 0; i < file_count; i++) {
             namespaces[i] = result_cache[i] ? result_cache[i]->namespace_name
                                             : cbm_result_spill_namespace(ctx->spill, i);
         }
-        namespace_map =
-            cbm_pipeline_namespace_map_build_names(ctx->project_name, namespaces, rels, file_count);
+        cbm_pipeline_import_maps_build(ctx, files, file_count, namespaces, &namespace_map,
+                                       &scala_index);
         cbm_free(CBM_MEM_CLASS_OTHER, namespaces);
     }
-    free(rels);
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
-            cbm_pipeline_namespace_map_free(namespace_map);
+            cbm_pipeline_import_maps_free(namespace_map, scala_index);
             return CBM_NOT_FOUND;
         }
 
@@ -1889,7 +1884,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
         }
 
-        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        imports_edges +=
+            create_imports_edges(ctx, result, rel, files[i].language, namespace_map, scala_index);
         create_channel_edges(ctx, result, rel);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
         if (loaded) {
@@ -1897,7 +1893,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
     }
 
-    cbm_pipeline_namespace_map_free(namespace_map);
+    cbm_pipeline_import_maps_free(namespace_map, scala_index);
 
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
                  itoa_log(defines_edges), "imports", itoa_log(imports_edges));
