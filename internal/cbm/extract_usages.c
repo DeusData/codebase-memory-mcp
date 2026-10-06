@@ -617,6 +617,11 @@ static bool is_elixir_def_binding(CBMExtractCtx *ctx, TSNode node) {
         TSNode signature = ts_node_named_child_count(arguments) > 0
                                ? ts_node_named_child(arguments, 0)
                                : arguments;
+        /* A guard makes that signature the whole `when` operator, which spans the
+         * guard expression as well as the head. Unwrapped to the head, only the
+         * parameters being BOUND are excluded here; a parameter READ inside the
+         * guard stays a usage, as the same read in the body already is. */
+        signature = cbm_elixir_def_head_unwrap_guard(signature);
         return node_contains(head, node) || node_contains(signature, node);
     }
     return false;

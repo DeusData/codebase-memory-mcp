@@ -103,6 +103,26 @@ const char *cbm_nix_binding_scope_qn(CBMExtractCtx *ctx, TSNode node, const char
 // attrpath and an enclosing attrset compose into one qualified name.
 const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, const char *name);
 
+// ── Elixir def-head guards ──
+// `def f(x) when g` parses its WHOLE head as a `when` binary_operator, so the
+// `f(x)` call naming the function is the operator's left operand, and more than
+// one guard (`when a when b`) nests those operators right-associatively, so the
+// head stays the outermost operator's left operand in either shape. Four
+// walks read that same first argument — the defs walk names the function from
+// it, the unified walk opens the function's call scope from it, the calls walk
+// tells a head apart from an invocation by it, and the usages walk excludes the
+// head's identifiers from the usage set by it — so a private copy in one of
+// them makes the rest disagree about what a guarded clause is.
+// cbm_elixir_is_when_guard answers "is this node a guarded head"; the unwrap
+// returns the head under every guard, or the node unchanged when it carries
+// none; cbm_elixir_def_head_is answers whether a node is that head or one of
+// the guard operators above it, which is the question the calls walk asks.
+// All three test the operator token, so an operator definition (`def a + b`) is
+// left alone rather than mis-read as a guard.
+bool cbm_elixir_is_when_guard(TSNode node);
+TSNode cbm_elixir_def_head_unwrap_guard(TSNode first_arg);
+bool cbm_elixir_def_head_is(TSNode signature, TSNode node);
+
 // Resolve a function/method definition node's NAME node across all ~130 grammars
 // (generic `name` field, arrow→declarator, C/C++ declarator chain, plus the many
 // per-language quirks: Fortran subroutine, SCSS mixin, SQL create_function, R,
