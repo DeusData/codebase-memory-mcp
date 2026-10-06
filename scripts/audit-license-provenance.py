@@ -39,6 +39,9 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     # javascript / tsx: our JSX lone-ampersand forks (#1736) of the pins we vendored
     # before; same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
     "javascript": "tree-sitter/tree-sitter-javascript",
+    # pascal: our Unicode-identifier fork (#2211) of the pin we vendored before;
+    # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "pascal": "Isopod/tree-sitter-pascal",
     "qml": "yuja/tree-sitter-qmljs",
     "tsx": "tree-sitter/tree-sitter-typescript",
 }
