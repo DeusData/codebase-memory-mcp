@@ -3556,12 +3556,6 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     return result;
 }
 
-/* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
- * attributes both parse as distinct function_item nodes and otherwise receive
- * the SAME qualified_name, so the second graph upsert silently overwrites the
- * first and one branch is lost (#495). Fold the cfg predicate into the QN so
- * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
- * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
 /* Rust: mark a function as a test when it carries a test attribute (#855).
  * cbm's test detection is otherwise file-path-based (cbm_is_test_file:
  * *_test.rs / test_*), so inline #[test]/#[tokio::test] functions inside a
@@ -3591,25 +3585,58 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
+/* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
+ * attributes both parse as distinct function_item nodes and otherwise receive
+ * the SAME qualified_name, so the second graph upsert silently overwrites the
+ * first and one branch is lost (#495). Fold the cfg predicate into the QN so
+ * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
+ * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
+enum { ATTR_OPEN_CHARS = 2 }; /* the "#[" a bracketed attribute opens with */
+
 static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
                                            const char *const *decorators) {
     if (!decorators) {
         return base_qn;
     }
     for (int i = 0; decorators[i]; i++) {
-        const char *cfg = strstr(decorators[i], "cfg(");
+        /* The attribute must BE `cfg`, not merely contain that text. `cfg_attr`
+         * carries its own nested `cfg(...)`, and in the common
+         * `#[cfg_attr(docsrs, doc(cfg(feature = "x")))]` that inner predicate
+         * gates DOCUMENTATION, not compilation: the function is compiled
+         * unconditionally and has no twin to be told apart from. Anchor on the
+         * bracketed path, which is the convention rust_def_is_test above already
+         * follows for the same reason. */
+        const char *cfg = strstr(decorators[i], "#[cfg(");
         if (!cfg) {
             continue;
         }
-        /* Build a compact predicate suffix from the cfg(...) text, dropping
-         * whitespace and quotes so the QN stays readable and stable. */
+        cfg += ATTR_OPEN_CHARS;
+        /* Copy the BALANCED cfg(...) span, dropping whitespace and quotes so the
+         * QN stays readable and stable. Running to the end of the decorator text
+         * instead cost two things. It appended the attribute's own ']' to every
+         * QN. And on a multi-line attribute the copied text carried the newline,
+         * which cbm_defs_push cuts the QN at by design, leaving the suffix
+         * truncated mid-predicate: two twins whose predicates differ only past
+         * that newline then computed ONE qualified name and the second upsert
+         * overwrote the first, which is the loss this function exists to
+         * prevent (#495).
+         *
+         * A predicate longer than the buffer still truncates, as before. It
+         * stays distinct for the first 255 characters, which is what keeps the
+         * twins apart. */
         char buf[CBM_SZ_256];
         size_t bi = 0;
+        int depth = 0;
         for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
-            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
+            if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '"' || *p == '\'') {
                 continue;
             }
             buf[bi++] = *p;
+            if (*p == '(') {
+                depth++;
+            } else if (*p == ')' && --depth == 0) {
+                break;
+            }
         }
         buf[bi] = '\0';
         return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);

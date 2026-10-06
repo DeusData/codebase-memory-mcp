@@ -985,6 +985,63 @@ TEST(rust_function) {
     PASS();
 }
 
+/* The cfg fence exists so two mutually-exclusive #[cfg(...)] twins get distinct
+ * qualified names instead of one overwriting the other (#495). Three ways it
+ * misread the attribute, all visible in the QN it mints. */
+TEST(rust_cfg_fence_is_the_balanced_predicate_only) {
+    CBMFileResult *r = extract("#[cfg(test)]\n"
+                               "pub fn gated() {}\n"
+                               "\n"
+                               "#[cfg(target_os = \"linux\")]\n"
+                               "pub fn gated_os() {}\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The attribute's own closing bracket is not part of the predicate. */
+    ASSERT_TRUE(has_def_qn(r, "t.src.lib.gated#cfg(test)"));
+    ASSERT_TRUE(has_def_qn(r, "t.src.lib.gated_os#cfg(target_os=linux)"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `#[cfg_attr(docsrs, doc(cfg(...)))]` gates documentation, not compilation, so
+ * the function is compiled unconditionally and has no twin. An unanchored search
+ * for "cfg(" found the nested predicate and fenced it anyway. */
+TEST(rust_cfg_attr_doc_gate_mints_no_fence) {
+    CBMFileResult *r = extract("#[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))]\n"
+                               "pub async fn yield_now() {}\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(has_def_qn(r, "t.src.lib.yield_now"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A multi-line attribute carried its newline into the QN, and cbm_defs_push cuts
+ * a qualified name at a line break by design, so both twins were left with the
+ * same truncated `#cfg(all(` and the second upsert overwrote the first. */
+TEST(rust_multiline_cfg_twins_stay_distinct) {
+    CBMFileResult *r = extract("#[cfg(all(\n"
+                               "    unix,\n"
+                               "    feature = \"alpha\"\n"
+                               "))]\n"
+                               "pub fn twin() -> u32 { 1 }\n"
+                               "\n"
+                               "#[cfg(all(\n"
+                               "    unix,\n"
+                               "    feature = \"beta\"\n"
+                               "))]\n"
+                               "pub fn twin() -> u32 { 2 }\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(has_def_qn(r, "t.src.lib.twin#cfg(all(unix,feature=alpha))"));
+    ASSERT_TRUE(has_def_qn(r, "t.src.lib.twin#cfg(all(unix,feature=beta))"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(rust_struct) {
     CBMFileResult *r = extract("pub struct Point { pub x: f64, pub y: f64 }\nimpl Point { pub fn "
                                "new(x: f64, y: f64) -> Self { Point { x, y } } }\n",
@@ -9324,6 +9381,9 @@ SUITE(extraction) {
 
     /* Systems */
     RUN_TEST(rust_function);
+    RUN_TEST(rust_cfg_fence_is_the_balanced_predicate_only);
+    RUN_TEST(rust_cfg_attr_doc_gate_mints_no_fence);
+    RUN_TEST(rust_multiline_cfg_twins_stay_distinct);
     RUN_TEST(rust_struct);
     RUN_TEST(go_function);
     RUN_TEST(go_struct);
