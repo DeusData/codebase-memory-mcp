@@ -1605,10 +1605,10 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
     ASSERT_TRUE(yyjson_is_arr(enum_arr));
 
     /* The enum must be exactly the valid-token set — no more, no less. */
-    static const char *expected[] = {"all",      "overview",   "structure", "dependencies",
-                                     "routes",   "languages",  "packages",  "entry_points",
-                                     "hotspots", "boundaries", "layers",    "file_tree",
-                                     "clusters", "cycles"};
+    static const char *expected[] = {"all",      "overview",   "structure",       "dependencies",
+                                     "routes",   "languages",  "packages",        "entry_points",
+                                     "hotspots", "boundaries", "layers",          "file_tree",
+                                     "clusters", "cycles",     "system_structure"};
     size_t expected_count = sizeof(expected) / sizeof(expected[0]);
     ASSERT_EQ(yyjson_arr_size(enum_arr), expected_count);
     for (size_t i = 0; i < expected_count; i++) {
@@ -1627,6 +1627,28 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
 
     yyjson_doc_free(doc);
     free(json);
+    PASS();
+}
+
+TEST(mcp_get_architecture_behavior_evidence_schema) {
+    const char *schema = cbm_mcp_tool_input_schema("get_architecture");
+    ASSERT_NOT_NULL(schema);
+    yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *properties = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+    yyjson_val *flag = yyjson_obj_get(properties, "include_behavior_evidence");
+    ASSERT_NOT_NULL(flag);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(flag, "type")), "boolean");
+    ASSERT_TRUE(yyjson_is_false(yyjson_obj_get(flag, "default")));
+    const char *description = cbm_mcp_tool_description("get_architecture");
+    ASSERT_NOT_NULL(description);
+    ASSERT_NOT_NULL(strstr(description, "include_behavior_evidence=true"));
+    ASSERT_NOT_NULL(strstr(description, "indexed"));
+    ASSERT_NOT_NULL(strstr(description, "call arguments"));
+    ASSERT_NOT_NULL(strstr(description, "parameter declarations"));
+    ASSERT_NOT_NULL(strstr(description, "return types"));
+    ASSERT_NOT_NULL(strstr(description, "not full dataflow"));
+    yyjson_doc_free(doc);
     PASS();
 }
 
@@ -7907,6 +7929,143 @@ TEST(tool_get_architecture_empty) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_architecture_behavior_evidence_validation) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "arch-flag");
+    ASSERT_EQ(cbm_store_upsert_project(store, "arch-flag", "/tmp/arch-flag"), CBM_STORE_OK);
+
+    const char *invalid[] = {"\"true\"", "1", "0", "null", "[]", "{}"};
+    const char *aspects[] = {"", ",\"aspects\":[\"system_structure\"]"};
+    for (size_t a = 0; a < sizeof(aspects) / sizeof(aspects[0]); a++) {
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            char args[256];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"arch-flag\"%s,\"include_behavior_evidence\":%s}", aspects[a],
+                     invalid[i]);
+            char *response = cbm_mcp_handle_tool(srv, "get_architecture", args);
+            ASSERT_NOT_NULL(response);
+            ASSERT_TRUE(response_contains_json_fragment(response, "\"isError\":true"));
+            ASSERT_NOT_NULL(strstr(response, "include_behavior_evidence must be a boolean"));
+            free(response);
+        }
+    }
+    char *wrong_scope = cbm_mcp_handle_tool(
+        srv, "get_architecture", "{\"project\":\"arch-flag\",\"include_behavior_evidence\":true}");
+    ASSERT_NOT_NULL(wrong_scope);
+    ASSERT_TRUE(response_contains_json_fragment(wrong_scope, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(wrong_scope, "requires aspects"));
+    free(wrong_scope);
+
+    char *implicit = cbm_mcp_handle_tool(srv, "get_architecture", "{\"project\":\"arch-flag\"}");
+    char *explicit_false = cbm_mcp_handle_tool(
+        srv, "get_architecture", "{\"project\":\"arch-flag\",\"include_behavior_evidence\":false}");
+    ASSERT_NOT_NULL(implicit);
+    ASSERT_NOT_NULL(explicit_false);
+    ASSERT_STR_EQ(implicit, explicit_false);
+    free(implicit);
+    free(explicit_false);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Wait for the stable terminal job state, without asserting a transient pending
+ * window or a particular number of worker polls. */
+static char *architecture_wait_for_result(cbm_mcp_server_t *srv, const char *args) {
+    uint64_t deadline = cbm_now_ms() + 10000;
+    for (;;) {
+        char *response = cbm_mcp_handle_tool(srv, "get_architecture", args);
+        char *text = extract_text_content(response);
+        free(response);
+        yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+        yyjson_val *status = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "status") : NULL;
+        const char *value = yyjson_get_str(status);
+        bool pending = value && strcmp(value, "pending") == 0;
+        yyjson_doc_free(doc);
+        if (!pending || cbm_now_ms() >= deadline) {
+            return text;
+        }
+        free(text);
+        sqlite3_sleep(1);
+    }
+}
+
+TEST(tool_get_architecture_behavior_evidence_cache_isolation) {
+    char cache[CBM_SZ_1K];
+    snprintf(cache, sizeof(cache), "%s/cbm-arch-flag-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "arch-evidence-cache";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, cache), CBM_STORE_OK);
+    cbm_node_t entry = {.project = project,
+                        .label = "Function",
+                        .name = "entry",
+                        .qualified_name = "arch-evidence-cache.entry",
+                        .file_path = "src/entry.c",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = "{\"return_type\":\"EvidenceCacheSentinel\"}"};
+    int64_t entry_id = cbm_store_upsert_node(store, &entry);
+    ASSERT_GT(entry_id, 0);
+    cbm_node_t target = {.project = project,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "arch-evidence-cache.target",
+                         .file_path = "src/target.c",
+                         .start_line = 1,
+                         .end_line = 3,
+                         .properties_json = "{\"return_type\":\"EvidenceCacheSentinel\"}"};
+    int64_t target_id = cbm_store_upsert_node(store, &target);
+    ASSERT_GT(target_id, 0);
+    cbm_edge_t edge = {.project = project,
+                       .source_id = entry_id,
+                       .target_id = target_id,
+                       .type = "CALLS",
+                       .properties_json = "{\"line\":2}"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char args[512];
+    const char *flags[] = {"", ",\"include_behavior_evidence\":true",
+                           ",\"include_behavior_evidence\":false",
+                           ",\"include_behavior_evidence\":true"};
+    char *results[4] = {0};
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"aspects\":[\"system_structure\"],"
+                 "\"entry_node_id\":%lld%s}",
+                 project, (long long)entry_id, flags[i]);
+        results[i] = architecture_wait_for_result(srv, args);
+        ASSERT_NOT_NULL(results[i]);
+        ASSERT_TRUE(response_contains_json_fragment(results[i], "\"status\":\"ready\""));
+        if (i % 2 == 0) {
+            ASSERT_NULL(strstr(results[i], "EvidenceCacheSentinel"));
+            ASSERT_NULL(strstr(results[i], "\"return_type\""));
+        } else {
+            ASSERT_NOT_NULL(strstr(results[i], "EvidenceCacheSentinel"));
+            ASSERT_NOT_NULL(strstr(results[i], "\"return_type\""));
+        }
+    }
+    ASSERT_STR_EQ(results[0], results[2]);
+    ASSERT_STR_EQ(results[1], results[3]);
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
+        free(results[i]);
+    }
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
     PASS();
 }
 
@@ -19996,6 +20155,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
+    RUN_TEST(mcp_get_architecture_behavior_evidence_schema);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_omits_structured_content_for_plain_text);
     RUN_TEST(mcp_text_result_reversibly_encodes_invalid_utf8_as_standard_json);
@@ -20134,6 +20294,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
+    RUN_TEST(tool_get_architecture_behavior_evidence_validation);
+    RUN_TEST(tool_get_architecture_behavior_evidence_cache_isolation);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);

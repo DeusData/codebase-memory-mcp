@@ -1,0 +1,518 @@
+{
+  "answered": true,
+  "citationsInAnswer": 4,
+  "citationClickNavigates": true,
+  "cardsShown": 11,
+  "offHonest": true,
+  "noCardHonest": true,
+  "neighborDepthDefault": 1,
+  "neighborDepthAdjustable": true,
+  "neighborQualityNoteShown": true,
+  "refineGuarded": true,
+  "port": 4311,
+  "leftoverProcesses": 0,
+  "sidecarPort": 4141,
+  "project": "codeatlasweb-w5b",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "question": "Wer ruft createUser?",
+  "noCardQuestion": "Was macht @nichtsDergleichenImIndex?",
+  "timings": {
+    "buildMs": 10730,
+    "readyMs": 3577,
+    "answerMs": 2272,
+    "totalMs": 45520
+  },
+  "generatedAt": "2026-08-30T18:45:43.024Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [
+      "Failed to load resource: the server responded with a status of 503 (Service Unavailable)"
+    ],
+    "pageErrors": [],
+    "sidecarRequests": [
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 32323
+      },
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 35324
+      },
+      {
+        "url": "http://127.0.0.1:4141/props",
+        "atMs": 35326
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/models",
+        "atMs": 35328
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/chat/completions",
+        "atMs": 36391
+      },
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 38325
+      },
+      {
+        "url": "http://127.0.0.1:4141/props",
+        "atMs": 38327
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/models",
+        "atMs": 38329
+      },
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 41322
+      },
+      {
+        "url": "http://127.0.0.1:4141/props",
+        "atMs": 41325
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/models",
+        "atMs": 41326
+      }
+    ],
+    "winner": {
+      "name": "Qwen3.5-2B",
+      "choice": "class-a",
+      "passRate": 0.682,
+      "citationCompliance": 0.932
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4310,
+    "sidecarListenersBefore": 0,
+    "off": {
+      "dom": {
+        "present": true,
+        "turns": 1,
+        "questions": [
+          "> Wer ruft createUser?"
+        ],
+        "answerLines": [],
+        "citations": [],
+        "unknownCitations": [],
+        "messages": [
+          "the local model is off, so nothing was sent to 127.0.0.1:4141. Turn it on in the [a]tlas menu or on the LOCAL LLM card, then ask again."
+        ],
+        "warnings": [],
+        "cardsToggle": "",
+        "cardsShown": 0,
+        "provenance": [],
+        "depthPresent": true,
+        "depthValue": "1",
+        "depthOptions": [
+          {
+            "value": "0",
+            "on": false,
+            "title": ""
+          },
+          {
+            "value": "1",
+            "on": true,
+            "title": ""
+          },
+          {
+            "value": "2",
+            "on": false,
+            "title": ""
+          }
+        ],
+        "depthNote": "How much of the neighbourhood goes into the cards. More neighbours change the answer and can make it worse: a small model has more to confuse, and the token budget cuts the furthest cards first."
+      },
+      "seam": {
+        "turns": [
+          {
+            "id": 1,
+            "question": "Wer ruft createUser?",
+            "status": "refused",
+            "klass": "",
+            "rule": "",
+            "depth": 1,
+            "cards": 0,
+            "cardIds": [],
+            "sources": 0,
+            "citations": [],
+            "unknownCitations": [],
+            "uncitedLines": 0,
+            "answer": "",
+            "refusal": "off",
+            "tokens": 0,
+            "budget": 0,
+            "tokensPerSecond": 0,
+            "candidates": [],
+            "askedName": "",
+            "focusFallbackUsed": ""
+          }
+        ],
+        "open": true,
+        "height": 340,
+        "maxHeight": 578,
+        "depth": 1,
+        "depthDefault": 1,
+        "depthOptions": [
+          0,
+          1,
+          2
+        ],
+        "refineAvailable": false,
+        "refineState": "idle",
+        "refineMessage": ""
+      },
+      "llm": {
+        "state": "off",
+        "preferenceOn": false,
+        "policyVerdict": "absent",
+        "policyPath": ".codeatlas/policy.json",
+        "policyDetail": "",
+        "model": "",
+        "chip": "off",
+        "probes": 0
+      }
+    },
+    "refineOff": {
+      "buttonPresent": false,
+      "rowPresent": false,
+      "note": ""
+    },
+    "startScript": {
+      "exit": 0,
+      "out": [
+        "Sidecar gestartet: pid 67107, Qwen3.5-2B-Q4_K_M.gguf (Reproduktionsgriff class-a), Kontext 3072, http://127.0.0.1:4141",
+        "Bereitschaft: curl -s http://127.0.0.1:4141/health  ->  {\"status\":\"ok\"}",
+        "Log: /Users/bernhard/Desktop/CodeAtlasWeb/llm/llama-server.log",
+        "Beenden: /Users/bernhard/Desktop/CodeAtlasWeb/llm/stop.sh"
+      ]
+    },
+    "answeredTurn": {
+      "id": 2,
+      "question": "Wer ruft createUser?",
+      "status": "answered",
+      "klass": "who-calls",
+      "rule": "who-calls-words",
+      "depth": 1,
+      "cards": 11,
+      "cardIds": [
+        "K1",
+        "K2",
+        "K3",
+        "K4",
+        "K5",
+        "K6",
+        "K7",
+        "K8",
+        "K9",
+        "K10",
+        "K11"
+      ],
+      "sources": 3,
+      "citations": [
+        "K2",
+        "K3",
+        "K9",
+        "K10"
+      ],
+      "unknownCitations": [],
+      "uncitedLines": 0,
+      "answer": "[1] registerUserRoutes (src/routes/users.ts:15) [K2]\n[K3] create (src/services/userService.ts:41) [K3]\n[K9] createUser constructs UserEntity (src/types.ts:37) [K9]\n[K10] createUser constructs ValidationError (src/util/validate.ts:4) [K10]",
+      "refusal": "",
+      "tokens": 283,
+      "budget": 2300,
+      "tokensPerSecond": 67.44379683597002,
+      "candidates": [],
+      "askedName": "",
+      "focusFallbackUsed": ""
+    },
+    "answeredDom": {
+      "present": true,
+      "turns": 2,
+      "questions": [
+        "> Wer ruft createUser?",
+        "> Wer ruft createUser?"
+      ],
+      "answerLines": [
+        "[1] registerUserRoutes (src/routes/users.ts:15) [K2]",
+        "[K3] create (src/services/userService.ts:41) [K3]",
+        "[K9] createUser constructs UserEntity (src/types.ts:37) [K9]",
+        "[K10] createUser constructs ValidationError (src/util/validate.ts:4) [K10]"
+      ],
+      "citations": [
+        "K2",
+        "K3",
+        "K3",
+        "K9",
+        "K9",
+        "K10",
+        "K10"
+      ],
+      "unknownCitations": [],
+      "messages": [
+        "the local model is off, so nothing was sent to 127.0.0.1:4141. Turn it on in the [a]tlas menu or on the LOCAL LLM card, then ask again."
+      ],
+      "warnings": [],
+      "cardsToggle": "collapse the 11 cards this answer was given",
+      "cardsShown": 11,
+      "provenance": [
+        "question class who-calls (rule who-calls-words); the cards cost about 283 of 2300 tokens, estimated at four characters per token."
+      ],
+      "depthPresent": true,
+      "depthValue": "1",
+      "depthOptions": [
+        {
+          "value": "0",
+          "on": false,
+          "title": ""
+        },
+        {
+          "value": "1",
+          "on": true,
+          "title": ""
+        },
+        {
+          "value": "2",
+          "on": false,
+          "title": ""
+        }
+      ],
+      "depthNote": "How much of the neighbourhood goes into the cards. More neighbours change the answer and can make it worse: a small model has more to confuse, and the token budget cuts the furthest cards first."
+    },
+    "citationClick": {
+      "citedCard": "K2",
+      "before": {
+        "path": "src/services/userService.ts",
+        "line": 24
+      },
+      "after": {
+        "path": "src/routes/users.ts",
+        "line": 15
+      }
+    },
+    "depth": {
+      "dom": {
+        "present": true,
+        "turns": 2,
+        "questions": [
+          "> Wer ruft createUser?",
+          "> Wer ruft createUser?"
+        ],
+        "answerLines": [
+          "[1] registerUserRoutes (src/routes/users.ts:15) [K2]",
+          "[K3] create (src/services/userService.ts:41) [K3]",
+          "[K9] createUser constructs UserEntity (src/types.ts:37) [K9]",
+          "[K10] createUser constructs ValidationError (src/util/validate.ts:4) [K10]"
+        ],
+        "citations": [
+          "K2",
+          "K3",
+          "K3",
+          "K9",
+          "K9",
+          "K10",
+          "K10"
+        ],
+        "unknownCitations": [],
+        "messages": [
+          "the local model is off, so nothing was sent to 127.0.0.1:4141. Turn it on in the [a]tlas menu or on the LOCAL LLM card, then ask again."
+        ],
+        "warnings": [],
+        "cardsToggle": "collapse the 11 cards this answer was given",
+        "cardsShown": 11,
+        "provenance": [
+          "question class who-calls (rule who-calls-words); the cards cost about 283 of 2300 tokens, estimated at four characters per token."
+        ],
+        "depthPresent": true,
+        "depthValue": "1",
+        "depthOptions": [
+          {
+            "value": "0",
+            "on": false,
+            "title": ""
+          },
+          {
+            "value": "1",
+            "on": true,
+            "title": ""
+          },
+          {
+            "value": "2",
+            "on": false,
+            "title": ""
+          }
+        ],
+        "depthNote": "How much of the neighbourhood goes into the cards. More neighbours change the answer and can make it worse: a small model has more to confuse, and the token budget cuts the furthest cards first."
+      }
+    },
+    "depthAfter": {
+      "dom": {
+        "present": true,
+        "turns": 2,
+        "questions": [
+          "> Wer ruft createUser?",
+          "> Wer ruft createUser?"
+        ],
+        "answerLines": [
+          "[1] registerUserRoutes (src/routes/users.ts:15) [K2]",
+          "[K3] create (src/services/userService.ts:41) [K3]",
+          "[K9] createUser constructs UserEntity (src/types.ts:37) [K9]",
+          "[K10] createUser constructs ValidationError (src/util/validate.ts:4) [K10]"
+        ],
+        "citations": [
+          "K2",
+          "K3",
+          "K3",
+          "K9",
+          "K9",
+          "K10",
+          "K10"
+        ],
+        "unknownCitations": [],
+        "messages": [
+          "the local model is off, so nothing was sent to 127.0.0.1:4141. Turn it on in the [a]tlas menu or on the LOCAL LLM card, then ask again."
+        ],
+        "warnings": [],
+        "cardsToggle": "collapse the 11 cards this answer was given",
+        "cardsShown": 11,
+        "provenance": [
+          "question class who-calls (rule who-calls-words); the cards cost about 283 of 2300 tokens, estimated at four characters per token."
+        ],
+        "depthPresent": true,
+        "depthValue": "2",
+        "depthOptions": [
+          {
+            "value": "0",
+            "on": false,
+            "title": ""
+          },
+          {
+            "value": "1",
+            "on": false,
+            "title": ""
+          },
+          {
+            "value": "2",
+            "on": true,
+            "title": ""
+          }
+        ],
+        "depthNote": "How much of the neighbourhood goes into the cards. More neighbours change the answer and can make it worse: a small model has more to confuse, and the token budget cuts the furthest cards first."
+      },
+      "seam": {
+        "depth": 2
+      }
+    },
+    "blockLines": [
+      "1. call listUsersuserService.ts:18makes 1 call of its own",
+      "2. call createUseruserService.ts:23may raise ValidationErrorreads DB_URL from the environmentmakes 6 calls of its own"
+    ],
+    "refine": {
+      "off": {
+        "buttonPresent": false,
+        "rowPresent": false,
+        "note": ""
+      },
+      "ready": {
+        "buttonPresent": true,
+        "rowPresent": true,
+        "note": ""
+      },
+      "validation": {
+        "brokenCount": {
+          "applied": false,
+          "reason": "the answer holds a different number of lines than were sent (1 instead of 2)"
+        },
+        "brokenNumbers": {
+          "applied": false,
+          "reason": "a line came back with a different number than it was sent with (line 1: expected 1 and got 99)"
+        },
+        "empty": {
+          "applied": false,
+          "reason": "the model returned nothing to put back"
+        },
+        "goodEnough": {
+          "applied": true,
+          "reason": ""
+        }
+      }
+    },
+    "noCard": {
+      "twinBefore": {
+        "symbol": "no symbol",
+        "qualifiedName": "",
+        "sections": 0,
+        "domStatus": "empty",
+        "domSubject": "flow (no symbol)open flow",
+        "domEmpty": "Place the cursor inside a function, method, or class.CodeAtlas follows the caret and explains whatever it lands in.",
+        "path": "src/services/userService.ts",
+        "caretLine": 3
+      },
+      "turn": {
+        "id": 3,
+        "question": "Was macht @nichtsDergleichenImIndex?",
+        "status": "no-cards",
+        "klass": "what-is",
+        "rule": "what-is-words",
+        "depth": 1,
+        "cards": 0,
+        "cardIds": [],
+        "sources": 2,
+        "citations": [],
+        "unknownCitations": [],
+        "uncitedLines": 0,
+        "answer": "No card covers this. Fetch it with @name.",
+        "refusal": "",
+        "tokens": 0,
+        "budget": 2300,
+        "tokensPerSecond": 0,
+        "candidates": [],
+        "askedName": "",
+        "focusFallbackUsed": ""
+      },
+      "completions": 1,
+      "messages": [
+        "the local model is off, so nothing was sent to 127.0.0.1:4141. Turn it on in the [a]tlas menu or on the LOCAL LLM card, then ask again.",
+        "The index holds nothing this question could be answered from, so the model was not asked. Name a symbol with @name to fetch its facts."
+      ]
+    },
+    "apiRoutes": {
+      "/api/layout": 1,
+      "/api/tree": 7,
+      "/api/trace": 2
+    },
+    "rpcTools": {
+      "index_status": 2,
+      "query_graph": 129,
+      "check_index_coverage": 4,
+      "search_graph": 16,
+      "get_code_snippet": 6
+    },
+    "stopScript": {
+      "exit": 0,
+      "out": [
+        "Sidecar beendet (pid 67107)."
+      ]
+    },
+    "leftovers": [
+      {
+        "port": 4310,
+        "listeners": 0,
+        "waitedMs": 101
+      },
+      {
+        "port": 4311,
+        "listeners": 0,
+        "waitedMs": 97
+      },
+      {
+        "port": 4141,
+        "listeners": 0,
+        "waitedMs": 98
+      }
+    ]
+  }
+}

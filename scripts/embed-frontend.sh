@@ -30,7 +30,8 @@ content_type_for() {
     local f="$1"
     case "$f" in
         *.html) echo "text/html" ;;
-        *.js)   echo "application/javascript" ;;
+        *.js|*.mjs) echo "application/javascript" ;;
+        *.wasm) echo "application/wasm" ;;
         *.css)  echo "text/css" ;;
         *.json) echo "application/json" ;;
         *.svg)  echo "image/svg+xml" ;;

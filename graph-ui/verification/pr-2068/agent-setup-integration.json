@@ -1,0 +1,37 @@
+{
+  "at": "2026-09-09T21:21:25Z",
+  "type": "Explicit TEST fixture; actual local hook process, no agent or model session",
+  "daemon": "http://127.0.0.1:9749",
+  "hook_sha256": "d5bca292d9398ec6103954cf5cb21e82fea1af6638df219a9f938be794856291",
+  "project": "TEST-pr2068-hook-install-e87f2114",
+  "setup": {
+    "preserves_unrelated_settings": true,
+    "repeat_is_idempotent": true,
+    "shell_command_runs_with_spaces_and_quotes": true,
+    "only_temporary_configuration_written": true
+  },
+  "event": {
+    "ts": 1788988885549,
+    "agent": "TEST local hook process; no agent session",
+    "run": "TEST-hook-integration-a90a7e36474949bcb9e3e58c3ccb084d",
+    "seq": 1,
+    "phase": "end",
+    "tool": "Read",
+    "path": "TEST source with 'spaces'.c",
+    "lines": [
+      3,
+      4
+    ],
+    "detail": "TEST local process verification, no model or agent session",
+    "source": "tool-hook"
+  },
+  "stored_event_id": 8,
+  "process_exit": 0,
+  "process_duration_seconds": 0.074,
+  "duplicate_retry_retained_rows": 1,
+  "pending_after_initial_attempt": 0,
+  "pending_after_ack_and_retry": 0,
+  "runtime_endpoint": "http://127.0.0.1:9749/api/agent-events",
+  "status": "passed",
+  "temporary_configuration_removed": true
+}

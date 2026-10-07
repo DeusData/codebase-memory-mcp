@@ -1,0 +1,433 @@
+{
+  "startedAt": "2026-09-09T19:31:16.392Z",
+  "origin": "http://127.0.0.1:9749",
+  "fixture": "/tmp/cbm-2068-error-fixture",
+  "project": "pr2068-error-fixture",
+  "syntheticFixture": true,
+  "actions": [
+    {
+      "action": "Created synthetic C fixtures initially readable, including malformed partial.c and excluded.c",
+      "path": "/tmp/cbm-2068-error-fixture"
+    },
+    {
+      "action": "POST /api/index",
+      "project": "pr2068-error-fixture",
+      "root": "/tmp/cbm-2068-error-fixture",
+      "acknowledgement": {
+        "status": "indexing",
+        "slot": 0,
+        "path": "/tmp/cbm-2068-error-fixture"
+      }
+    },
+    {
+      "action": "Index terminal state",
+      "project": "pr2068-error-fixture",
+      "job": {
+        "slot": 0,
+        "status": "done",
+        "path": "/tmp/cbm-2068-error-fixture",
+        "error": ""
+      }
+    },
+    {
+      "action": "Set unreadable.c chmod 000; real EACCES verified; next reindex must fail",
+      "path": "/tmp/cbm-2068-error-fixture"
+    },
+    {
+      "action": "Closed first-visit welcome via its normal start button"
+    },
+    {
+      "action": "POST /api/index",
+      "project": "pr2068-error-fixture",
+      "root": "/tmp/cbm-2068-error-fixture",
+      "acknowledgement": {
+        "status": "indexing",
+        "slot": 0,
+        "path": "/tmp/cbm-2068-error-fixture"
+      }
+    },
+    {
+      "action": "Index terminal state",
+      "project": "pr2068-error-fixture",
+      "job": {
+        "slot": 0,
+        "status": "done",
+        "path": "/tmp/cbm-2068-error-fixture",
+        "error": ""
+      }
+    }
+  ],
+  "directRequests": [
+    {
+      "at": "2026-09-09T19:31:16.422Z",
+      "method": "POST",
+      "path": "/api/index",
+      "status": 202
+    },
+    {
+      "at": "2026-09-09T19:31:16.424Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:16.927Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:17.429Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:17.931Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:18.476Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:18.978Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:18.981Z",
+      "method": "POST",
+      "path": "/rpc",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:18.984Z",
+      "method": "POST",
+      "path": "/rpc",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:23.626Z",
+      "method": "GET",
+      "path": "/api/logs?lines=500&min_level=error",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:23.628Z",
+      "method": "POST",
+      "path": "/api/index",
+      "status": 202
+    },
+    {
+      "at": "2026-09-09T19:31:23.630Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:24.135Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:24.641Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    },
+    {
+      "at": "2026-09-09T19:31:27.049Z",
+      "method": "GET",
+      "path": "/api/index-status",
+      "status": 200
+    }
+  ],
+  "browserRequests": [
+    {
+      "at": "2026-09-09T19:31:20.013Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/?project=pr2068-error-fixture"
+    },
+    {
+      "at": "2026-09-09T19:31:20.041Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/assets/index-BLSH1buz.js"
+    },
+    {
+      "at": "2026-09-09T19:31:20.042Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/assets/index-D2YGlcrX.css"
+    },
+    {
+      "at": "2026-09-09T19:31:20.439Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:31:20.453Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/layout?project=pr2068-error-fixture&max_nodes=5000"
+    },
+    {
+      "at": "2026-09-09T19:31:20.454Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/repository-map?project=pr2068-error-fixture"
+    },
+    {
+      "at": "2026-09-09T19:31:20.455Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "at": "2026-09-09T19:31:20.456Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=pr2068-error-fixture"
+    },
+    {
+      "at": "2026-09-09T19:31:20.457Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "at": "2026-09-09T19:31:20.458Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:31:20.458Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "get_architecture"
+    },
+    {
+      "at": "2026-09-09T19:31:20.486Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "check_index_coverage"
+    },
+    {
+      "at": "2026-09-09T19:31:20.486Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:31:20.487Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:31:20.495Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:31:20.499Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "at": "2026-09-09T19:31:23.491Z",
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/api/ui-log"
+    },
+    {
+      "at": "2026-09-09T19:31:23.492Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:31:23.565Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/processes"
+    },
+    {
+      "at": "2026-09-09T19:31:26.507Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn"
+    },
+    {
+      "at": "2026-09-09T19:31:26.628Z",
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/processes"
+    }
+  ],
+  "blockedExternalRequests": [],
+  "screenshots": [],
+  "checks": {
+    "coverageContainsPartial": true,
+    "coverageContainsExclusion": true
+  },
+  "cleanup": [
+    "unreadable.c restored to 0600"
+  ],
+  "indexWithCoverage": {
+    "slot": 0,
+    "status": "done",
+    "path": "/tmp/cbm-2068-error-fixture",
+    "error": ""
+  },
+  "indexStatus": {
+    "project": "pr2068-error-fixture",
+    "nodes": 10,
+    "edges": 9,
+    "status": "ready",
+    "root_path": "/private/tmp/cbm-2068-error-fixture",
+    "indexed_at": "2026-09-09T19:29:28Z",
+    "parse_partial": {
+      "files": [],
+      "count": 1,
+      "truncated": true,
+      "omitted": 1
+    },
+    "skipped": {
+      "files": [],
+      "count": 0,
+      "truncated": false
+    },
+    "not_indexed": {
+      "dirs": [],
+      "dirs_count": 0,
+      "files": [],
+      "files_count": 1,
+      "truncated": true,
+      "files_omitted": 1
+    }
+  },
+  "coverage": {
+    "project": "pr2068-error-fixture",
+    "signal": "best_effort",
+    "indexed_at": "2026-09-09T19:29:28Z",
+    "metadata": {
+      "generation": "2026-09-09T19:29:28Z",
+      "index_mode": "full",
+      "recorded_at": "2026-09-09T19:29:28Z",
+      "recording_status": "complete",
+      "ignored_files_stored": 1,
+      "ignored_files_total": 1,
+      "hash_records_complete": true,
+      "coverage_version": 3,
+      "generation_matches": true
+    },
+    "paths": [
+      {
+        "requested_path": "unreadable.c",
+        "path": "unreadable.c",
+        "status": "no_recorded_issue",
+        "freshness": "metadata_changed",
+        "recommended_action": "read_source_and_reindex",
+        "coverage": []
+      },
+      {
+        "requested_path": "partial.c",
+        "path": "partial.c",
+        "status": "partial",
+        "freshness": "metadata_changed",
+        "recommended_action": "read_source_and_reindex",
+        "coverage": [
+          {
+            "path": "partial.c",
+            "kind": "parse_partial",
+            "match": "exact",
+            "ranges": [
+              {
+                "start": 2,
+                "end": 2
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "requested_path": "excluded.c",
+        "path": "excluded.c",
+        "status": "excluded",
+        "freshness": "not_tracked",
+        "recommended_action": "read_source_and_reindex",
+        "coverage": [
+          {
+            "path": "excluded.c",
+            "kind": "not_indexed_file",
+            "match": "exact",
+            "detail": "cbmignore"
+          }
+        ]
+      }
+    ],
+    "path_total": 3,
+    "path_returned": 3,
+    "path_has_more": false,
+    "scopes": [
+      {
+        "requested_scope": ".",
+        "scope": ".",
+        "total": 2,
+        "returned": 2,
+        "truncated": false,
+        "entries": [
+          {
+            "path": "excluded.c",
+            "kind": "not_indexed_file",
+            "detail": "cbmignore"
+          },
+          {
+            "path": "partial.c",
+            "kind": "parse_partial",
+            "ranges": [
+              {
+                "start": 2,
+                "end": 2
+              }
+            ]
+          }
+        ],
+        "status": "known_gaps"
+      }
+    ],
+    "scope_total": 2,
+    "scope_returned": 2,
+    "scope_truncated": false,
+    "has_more": false,
+    "caveat": "Best-effort signal only. No recorded issue does not prove graph or source completeness; read flagged source and qualify claims when metadata is changed or unavailable."
+  },
+  "failure": "AssertionError [ERR_ASSERTION]: Unreadable fixture input must fail a real daemon index job\n+ actual - expected\n\n+ 'done'\n- 'error'\n    at failedJobWhileWatching (file:///Users/bernhard/Desktop/codebasememorymcp_branch%202068/graph-ui/tools/pr-2068-errors-e2e.mjs:83:12)\n    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    at async main (file:///Users/bernhard/Desktop/codebasememorymcp_branch%202068/graph-ui/tools/pr-2068-errors-e2e.mjs:134:5)\n    at async file:///Users/bernhard/Desktop/codebasememorymcp_branch%202068/graph-ui/tools/pr-2068-errors-e2e.mjs:162:7",
+  "confirmedProductBug": {
+    "observation": "Unreadable file triggered real worker ERROR but job reported done/rc=ok",
+    "sqliteRows": [
+      [
+        747,
+        "2026-09-09T19:31:26.163Z",
+        3,
+        "index.worker",
+        "level=error msg=index.worker record=level=error_msg=semantic_manifest.err_path=/private/tmp/cbm-2068-error-fixture/unreadable.c"
+      ],
+      [
+        748,
+        "2026-09-09T19:31:26.163Z",
+        1,
+        "index.supervisor.reap",
+        "level=info msg=index.supervisor.reap outcome=clean exit_code=0 signal=0"
+      ],
+      [
+        749,
+        "2026-09-09T19:31:26.173Z",
+        1,
+        "ui.index.done",
+        "level=info msg=ui.index.done path=/tmp/cbm-2068-error-fixture rc=ok"
+      ]
+    ]
+  }
+}

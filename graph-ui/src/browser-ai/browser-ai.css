@@ -1,0 +1,37 @@
+.atlas-browser-ai { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 48px); padding: 0; border: 1px solid var(--atlas-line); border-radius: 14px; background: var(--atlas-panel); color: var(--atlas-fg); font: 13px/1.6 var(--atlas-ui-font, system-ui, sans-serif); box-shadow: 0 28px 90px #0008; }
+.atlas-browser-ai::backdrop { background: #05070bcc; }
+.atlas-browser-ai * { box-sizing: border-box; }
+.atlas-browser-ai header { padding: 22px 24px; border-bottom: 1px solid var(--atlas-line); display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.atlas-browser-ai h2, .atlas-browser-ai h3, .atlas-browser-ai p { margin: 0; }
+.atlas-browser-ai h2 { font-size: 21px; font-weight: 650; }
+.atlas-browser-ai header p { color: var(--atlas-dim); margin-top: 3px; }
+.atlas-browser-ai button { cursor: pointer; font: inherit; color: var(--atlas-fg); border: 1px solid var(--atlas-line); border-radius: 7px; background: var(--atlas-panel-raised); padding: 7px 11px; }
+.atlas-browser-ai button:hover { border-color: var(--atlas-dim); }
+.atlas-browser-ai button:disabled { opacity: .5; cursor: default; }
+.atlas-browser-ai button:focus-visible, .atlas-browser-ai a:focus-visible, .atlas-browser-ai summary:focus-visible { outline: 2px solid var(--atlas-cyan); outline-offset: 3px; }
+.atlas-browser-ai .atlas-browser-ai-close { padding: 0 6px; border: 0; background: transparent; font-size: 24px; line-height: 1; }
+.atlas-browser-ai-body { padding: 24px; display: grid; gap: 17px; }
+.atlas-browser-ai-model { display: flex; align-items: center; gap: 12px; }
+.atlas-browser-ai-model strong { font-size: 15px; font-weight: 600; }
+.atlas-browser-ai-model p { color: var(--atlas-dim); font-size: 11px; }
+.atlas-browser-ai-icon { height: 40px; width: 40px; flex: 0 0 40px; display: grid; place-items: center; background: var(--atlas-select); color: var(--atlas-phosphor); border-radius: 10px; font-size: 25px; }
+.atlas-browser-ai-status { margin-left: auto; color: var(--atlas-dim); font-size: 11px; text-align: right; }
+.atlas-browser-ai-status[data-phase="ready"] { color: var(--atlas-phosphor); }
+.atlas-browser-ai-muted, .atlas-browser-ai-privacy, .atlas-browser-ai-details, .atlas-browser-ai-output > p { color: var(--atlas-dim); font-size: 12px; }
+.atlas-browser-ai-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.atlas-browser-ai .atlas-browser-ai-primary { border-color: var(--atlas-phosphor-mute); background: var(--atlas-select); color: var(--atlas-phosphor); }
+.atlas-browser-ai-error { padding: 12px; border: 1px solid var(--atlas-alarm); border-radius: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.atlas-browser-ai-progress progress { display: block; width: 100%; height: 5px; margin: 12px 0; accent-color: var(--atlas-phosphor); }
+.atlas-browser-ai-progress span { color: var(--atlas-dim); font-family: var(--atlas-font); font-size: 11px; overflow-wrap: anywhere; }
+.atlas-browser-ai summary { cursor: pointer; }
+.atlas-browser-ai-source { border-top: 1px solid var(--atlas-line); padding-top: 14px; font-size: 12px; overflow-wrap: anywhere; }
+.atlas-browser-ai-source pre { overflow: auto; max-height: 240px; padding: 12px; border: 1px solid var(--atlas-line); border-radius: 7px; background: var(--atlas-bg); color: var(--atlas-fg); font: 11px/1.6 var(--atlas-font); }
+.atlas-browser-ai-source p { color: var(--atlas-dim); margin-top: 8px; }
+.atlas-browser-ai-output { border: 1px solid var(--atlas-line); border-radius: 9px; padding: 16px; background: var(--atlas-bg); }
+.atlas-browser-ai-output h3 { font-size: 13px; font-weight: 600; }
+.atlas-browser-ai-output > div { white-space: pre-wrap; margin: 12px 0; overflow-wrap: anywhere; }
+.atlas-browser-ai-empty { color: var(--atlas-dim); font-size: 12px; }
+.atlas-browser-ai-details dl { margin-bottom: 10px; }
+.atlas-browser-ai-details dd { margin: 3px 0 10px; font-family: var(--atlas-font); font-size: 11px; overflow-wrap: anywhere; }
+.atlas-browser-ai a { color: var(--atlas-cyan); }
+@media (max-width: 560px) { .atlas-browser-ai header, .atlas-browser-ai-body { padding: 18px; } .atlas-browser-ai-model { flex-wrap: wrap; } }

@@ -1,0 +1,222 @@
+CODEATLAS
+v0.0.1
+Explore
+Galaxy
+Architecture
+Agents
+System
+Daemon
+Chat
+Search
+⌘ / Ctrl K
+Tools
+Brief
+Explained
+sym 39335
+edg 171798
+Project
+cbm-pr2068
+⌄
+cbm-pr2068
+Architecture
+
+Understand the structure. Follow the evidence.
+
+Refresh
+Overview
+Dependencies
+Entry points
+Routes
+Hotspots
+View saved on this device
+Reset view
+39,335
+SYMBOLS
+171,798
+RELATIONS
+15
+MODULES
+924
+FILES LISTED
+MODULES
+
+Groups reported by the index. Select one to focus its relationships.
+
+src
+2,489 symbols
+cbm
+2,048 symbols
+cli
+1,025 symbols
+repro
+1,011 symbols
+pipeline
+949 symbols
+tools
+762 symbols
+daemon
+757 symbols
+foundation
+535 symbols
+mcp
+497 symbols
+test_cli
+352 symbols
+store
+320 symbols
+tree-sitter-arkts
+311 symbols
+12 of 15 shown
+Show more
+ARCHITECTURE LAYERS
+
+Inferred assignments from the provider.
+
+has HTTP route definitions
+
+api
+agents
+
+fan-in=0, fan-out=0
+
+internal
+cbm
+
+high fan-in (189 in, 180 out)
+
+core
+cli
+
+only outbound calls
+
+entry
+daemon
+
+only outbound calls
+
+entry
+fixtures
+
+fan-in=0, fan-out=0
+
+internal
+foundation
+
+high fan-in (1301 in, 0 out)
+
+core
+go
+
+has HTTP route definitions
+
+api
+8 of 15 shown
+Show more
+RELATED COMMUNITIES
+
+Groups inferred from call relationships.
+
+tests
+
+cbm_free_result, find_resolved, extract_cpp, extract, extract_c
+
+88% cohesion
+
+1,116 members
+tests
+
+cbm_store_close, cbm_store_open_memory, setup_cypher_store, cbm_mkdtemp, cbm_store_upsert_project
+
+91% cohesion
+
+692 members
+src
+
+cbm_gbuf_free, cbm_ht_get, cbm_pipeline_run_incremental, cbm_gbuf_upsert_node, cbm_gbuf_insert_edge
+
+90% cohesion
+
+537 members
+internal
+
+cbm_arena_alloc, cbm_arena_sprintf, cbm_arena_strdup, c_resolve_calls_in_node_inner, java_eval_expr_type
+
+98% cohesion
+
+455 members
+tests
+
+lrp_assert_calls, cbm_store_count_edges_by_type, et_edge_present, es_edge_present, cbm_store_free_nodes
+
+90% cohesion
+
+371 members
+src
+
+cbm_daemon_ipc_endpoint_new, cbm_daemon_ipc_endpoint_free, ipc_test_parent_new, cbm_daemon_ipc_endpoint_runtime_dir, cbm_daemon_ipc_startup_lock_try_acquire
+
+95% cohesion
+
+344 members
+graph-ui
+
+App, GalaxyPanel, buildIr, SettingsPanel, refAt
+
+99% cohesion
+
+323 members
+graph-ui
+
+node, main, main, main, main
+
+100% cohesion
+
+319 members
+8 of 12 shown
+Show more
+INDEXED FILES
+.gitattributes
+.github/ISSUE_TEMPLATE/bug_report.yml
+.github/ISSUE_TEMPLATE/config.yml
+.github/ISSUE_TEMPLATE/feature_request.yml
+.github/dependabot.yml
+.github/issue-labeler.yml
+.github/label-actions.yml
+.github/pr-acknowledgement.md
+8 of 924 shown
+Show more
+LANGUAGES
+C · 674
+TypeScript · 357
+Bash · 116
+Python · 36
+YAML · 32
+JavaScript · 11
+CSS · 10
+Go · 6
+HTML · 4
+C++ · 4
+SYMBOL KINDS
+Function · 20,721
+Variable · 11,526
+File · 1,505
+Module · 1,393
+Macro · 1,276
+Field · 1,030
+Section · 605
+Interface · 450
+Class · 211
+Method · 189
+Folder · 152
+Type · 114
+EnvVar · 76
+Route · 65
+Enum · 10
+Struct · 6
+Decorator · 3
+Branch · 1
+Channel · 1
+Project · 1
+About this view
+server ready
+Connection details

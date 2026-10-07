@@ -93,7 +93,18 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
 /* Request the run loop to stop (thread-safe). */
 void cbm_watcher_stop(cbm_watcher_t *w);
 
-/* ── Introspection (for testing) ────────────────────────────────── */
+/* ── Introspection ─────────────────────────────────────────────── */
+
+typedef struct {
+    bool registered; /* this project's physical registration exists */
+    bool running;    /* run loop entered and stop has not been requested */
+} cbm_watcher_project_status_t;
+
+/* Thread-safe snapshot with a constant-time registry lookup. A NULL watcher
+ * reports both fields false; a NULL project reports only the run-loop state.
+ * Registrations can remain present after the watcher has stopped. */
+cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w,
+                                                       const char *project_name);
 
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);

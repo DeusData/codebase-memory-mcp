@@ -1,0 +1,2142 @@
+{
+  "startedAt": "2026-09-09T20:26:35.532Z",
+  "project": "cbm-pr2068",
+  "viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "comparability": "Different frontend revisions; same current daemon/index. No storage seeding or fixtures.",
+  "versions": [
+    {
+      "label": "before",
+      "port": 9751,
+      "actions": [
+        {
+          "description": "Dismiss standard welcome: Start exploring",
+          "boundsBefore": {
+            "x": 903.9375,
+            "y": 729.984375,
+            "width": 119.0625,
+            "height": 42.796875
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture workspace",
+          "boundsBefore": {
+            "x": 346.21875,
+            "y": 12,
+            "width": 100.703125,
+            "height": 36.796875
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture Overview",
+          "boundsBefore": {
+            "x": 32,
+            "y": 244.09375,
+            "width": 82.40625,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Dependencies",
+          "boundsBefore": {
+            "x": 118.40625,
+            "y": 244.09375,
+            "width": 112.625,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Entry points",
+          "boundsBefore": {
+            "x": 235.03125,
+            "y": 244.09375,
+            "width": 98.6875,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Routes",
+          "boundsBefore": {
+            "x": 337.71875,
+            "y": 244.09375,
+            "width": 67.984375,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Hotspots",
+          "boundsBefore": {
+            "x": 409.703125,
+            "y": 244.09375,
+            "width": 81.140625,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Galaxy workspace",
+          "boundsBefore": {
+            "x": 275.453125,
+            "y": 12,
+            "width": 66.765625,
+            "height": 36.796875
+          },
+          "requiresScroll": false
+        }
+      ],
+      "stages": [
+        {
+          "name": "first-open",
+          "screenshot": "audit-before-first-open.png",
+          "at": "2026-09-09T20:26:39.200Z",
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\n40,226\nSYMBOLS\n173,902\nRELATIONS\n15\nMODULES\n928\nFILES LISTED\nMODULES\n\nGroups reported by the index. Select one to focus its relationships.\n\nsrc\n2,576 symbols\ncbm\n2,048 symbols\ncli\n1,025 symbols\nrepro\n1,011 symbols\npipeline\n949 symbols\ntools\n782 symbols\ndaemon\n759 symbols\nfoundation\n535 symbols\nmcp\n497 symbols\ntest_cli\n352 symbols\nstore\n320 symbols\ntree-sitter-arkts\n311 symbols\n12 of 15 shown\nShow more\nARCHITECTURE LAYERS\n\nInferred assignments from the provider.\n\nhas HTTP route definitions\n\napi\nagents\n\nfan-in=0, fan-out=0\n\ninternal\ncbm\n\nfan-in=22, fan-out=180\n\ninternal\ncli\n\nfan-in=47, fan-out=160\n\ninternal\ndaemon\n\nfan-in=19, fan-out=387\n\ninternal\nfixtures\n\nfan-in=0, fan-out=0\n\ninternal\nfoundation\n\nhigh fan-in (727 in, 0 out)\n\ncore\ngo\n\nhas HTTP route definitions\n\napi\n8 of 16 shown\nShow more\nRELATED COMMUNITIES\n\nGroups inferred from call relationships.\n\ntests\n\nfind_resolved, extract_cpp, extract_c, count_resolved, clsp_pattern_method_call_in_ternary_branch\n\n100% cohesion\n\n744 members\ntests\n\nextract_rust, require_resolved, find_resolved, count_resolved, rustlsp_definition_has_decorator\n\n99% cohesion\n\n497 members\ntests\n\nextract, has_def, count_defs_with_label, has_call, find_def\n\n100% cohesion\n\n354 members\ngraph-ui\n\nnode, main, path, main, main\n\n100% cohesion\n\n326 members\nsrc\n\nruntime_test_self_build, cbm_daemon_runtime_client_connect, runtime_test_fixture_finish, cbm_mutex_lock, cbm_mutex_unlock\n\n92% cohesion\n\n310 members\nsrc\n\ncbm_mkdir_p, record_agent_config_error, install_additional_agent_configs, uninstall_additional_agents, cbm_detect_agents\n\n92% cohesion\n\n299 members\ntests\n\ncov_extract, cov_require, cov_lit_char, cov_lit_string_method, cov_lit_bool_method\n\n100% cohesion\n\n284 members\ninternal\n\ncbm_node_text, extract_callee_lang_specific, handle_calls, cbm_find_child_by_kind, push_channel\n\n100% cohesion\n\n226 members\n8 of 12 shown\nShow more\nINDEXED FILES\n.gitattributes\n.github/ISSUE_TEMPLATE/bug_report.yml\n.github/ISSUE_TEMPLATE/config.yml\n.github/ISSUE_TEMPLATE/feature_request.yml\n.github/dependabot.yml\n.github/issue-labeler.yml\n.github/label-actions.yml\n.github/pr-acknowledgement.md\n8 of 928 shown\nShow more\nLANGUAGES\nC · 678\nTypeScript · 377\nBash · 116\nPython · 37\nYAML · 32\nCSS · 13\nJavaScript · 11\nGo · 6\nHTML · 4\nC++ · 4\nSYMBOL KINDS\nFunction · 20,856\nVariable · 12,113\nFile · 1,555\nModule · 1,440\nMacro · 1,284\nField · 1,030\nSection · 633\nInterface · 467\nClass · 212\nMethod · 195\nFolder · 155\nType · 117\nEnvVar · 79\nRoute · 68\nEnum · 10\nStruct · 6\nDecorator · 3\nBranch · 1\nChannel · 1\nProject · 1\nAbout this view\nserver ready\nConnection details\n\nCODEBASE MEMORY\n\nA clearer view of your code.\n\nExplore the source, understand its architecture, and follow your agents.\n\nExplore\nRead source with graph context.\nGalaxy\nExplore the whole graph and its coverage shadow.\nArchitecture\nSee modules, dependencies, and entry points.\nAgents\nInspect recorded activity and touched code.\nSystem\nMonitor the daemon, indexes, and logs.\nExplanation depth\nBrief\nExplained\n\nSwitch workspaces and explanation depth at any time. Every feature stays available.\n\nSet up browser AI\nStart exploring\n\nBrowser AI is optional and off. Setup asks before downloading a model.",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Why are you here?",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 156
+            },
+            {
+              "text": "Modules",
+              "y": 484
+            },
+            {
+              "text": "Architecture layers",
+              "y": 800
+            },
+            {
+              "text": "Related communities",
+              "y": 800
+            },
+            {
+              "text": "Indexed files",
+              "y": 1634
+            },
+            {
+              "text": "Languages",
+              "y": 1988
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 1988
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            },
+            {
+              "text": "A clearer view of your code.",
+              "y": 225
+            }
+          ],
+          "landmarks": []
+        },
+        {
+          "name": "architecture-overview",
+          "screenshot": "audit-before-architecture-overview.png",
+          "at": "2026-09-09T20:26:39.400Z",
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\n40,226\nSYMBOLS\n173,902\nRELATIONS\n15\nMODULES\n928\nFILES LISTED\nMODULES\n\nGroups reported by the index. Select one to focus its relationships.\n\nsrc\n2,576 symbols\ncbm\n2,048 symbols\ncli\n1,025 symbols\nrepro\n1,011 symbols\npipeline\n949 symbols\ntools\n782 symbols\ndaemon\n759 symbols\nfoundation\n535 symbols\nmcp\n497 symbols\ntest_cli\n352 symbols\nstore\n320 symbols\ntree-sitter-arkts\n311 symbols\n12 of 15 shown\nShow more\nARCHITECTURE LAYERS\n\nInferred assignments from the provider.\n\nhas HTTP route definitions\n\napi\nagents\n\nfan-in=0, fan-out=0\n\ninternal\ncbm\n\nfan-in=22, fan-out=180\n\ninternal\ncli\n\nfan-in=47, fan-out=160\n\ninternal\ndaemon\n\nfan-in=19, fan-out=387\n\ninternal\nfixtures\n\nfan-in=0, fan-out=0\n\ninternal\nfoundation\n\nhigh fan-in (727 in, 0 out)\n\ncore\ngo\n\nhas HTTP route definitions\n\napi\n8 of 16 shown\nShow more\nRELATED COMMUNITIES\n\nGroups inferred from call relationships.\n\ntests\n\nfind_resolved, extract_cpp, extract_c, count_resolved, clsp_pattern_method_call_in_ternary_branch\n\n100% cohesion\n\n744 members\ntests\n\nextract_rust, require_resolved, find_resolved, count_resolved, rustlsp_definition_has_decorator\n\n99% cohesion\n\n497 members\ntests\n\nextract, has_def, count_defs_with_label, has_call, find_def\n\n100% cohesion\n\n354 members\ngraph-ui\n\nnode, main, path, main, main\n\n100% cohesion\n\n326 members\nsrc\n\nruntime_test_self_build, cbm_daemon_runtime_client_connect, runtime_test_fixture_finish, cbm_mutex_lock, cbm_mutex_unlock\n\n92% cohesion\n\n310 members\nsrc\n\ncbm_mkdir_p, record_agent_config_error, install_additional_agent_configs, uninstall_additional_agents, cbm_detect_agents\n\n92% cohesion\n\n299 members\ntests\n\ncov_extract, cov_require, cov_lit_char, cov_lit_string_method, cov_lit_bool_method\n\n100% cohesion\n\n284 members\ninternal\n\ncbm_node_text, extract_callee_lang_specific, handle_calls, cbm_find_child_by_kind, push_channel\n\n100% cohesion\n\n226 members\n8 of 12 shown\nShow more\nINDEXED FILES\n.gitattributes\n.github/ISSUE_TEMPLATE/bug_report.yml\n.github/ISSUE_TEMPLATE/config.yml\n.github/ISSUE_TEMPLATE/feature_request.yml\n.github/dependabot.yml\n.github/issue-labeler.yml\n.github/label-actions.yml\n.github/pr-acknowledgement.md\n8 of 928 shown\nShow more\nLANGUAGES\nC · 678\nTypeScript · 377\nBash · 116\nPython · 37\nYAML · 32\nCSS · 13\nJavaScript · 11\nGo · 6\nHTML · 4\nC++ · 4\nSYMBOL KINDS\nFunction · 20,856\nVariable · 12,113\nFile · 1,555\nModule · 1,440\nMacro · 1,284\nField · 1,030\nSection · 633\nInterface · 467\nClass · 212\nMethod · 195\nFolder · 155\nType · 117\nEnvVar · 79\nRoute · 68\nEnum · 10\nStruct · 6\nDecorator · 3\nBranch · 1\nChannel · 1\nProject · 1\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 156
+            },
+            {
+              "text": "Modules",
+              "y": 484
+            },
+            {
+              "text": "Architecture layers",
+              "y": 800
+            },
+            {
+              "text": "Related communities",
+              "y": 800
+            },
+            {
+              "text": "Indexed files",
+              "y": 1634
+            },
+            {
+              "text": "Languages",
+              "y": 1988
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 1988
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": []
+        },
+        {
+          "name": "architecture-dependencies",
+          "screenshot": "audit-before-architecture-dependencies.png",
+          "at": "2026-09-09T20:26:39.840Z",
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nCALLS BETWEEN GROUPS\n\nArrows follow indexed calls. Select a group to filter its relationships.\n\nfou\nfoundation\ndae\ndaemon\ncli\ncli\ncbm\ncbm\ntes\ntest_ui\nsto\nstore\nui\nui\ntes\ntest_config_text_edit\n\n8 groups in map · 2 more groups in the table\n\nRECORDED RELATIONSHIPS\nFrom\tTo\tCalls\ndaemon\tfoundation\t387\ncbm\tfoundation\t180\ncli\tfoundation\t141\ntest_ui\tstore\t94\ntest_ui\tui\t89\ntest_config_text_edit\tcli\t47\ntest_config_text_edit\ttest_helpers\t36\ntest_grammar_probe_b\tcbm\t22\ncli\tdaemon\t19\ntest_ui\tfoundation\t19\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 156
+            },
+            {
+              "text": "Calls between groups",
+              "y": 363
+            },
+            {
+              "text": "Recorded relationships",
+              "y": 789
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": []
+        },
+        {
+          "name": "architecture-entry-points",
+          "screenshot": "audit-before-architecture-entry-points.png",
+          "at": "2026-09-09T20:26:40.280Z",
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nENTRY POINTS\n\nStarting points identified by the index.\n\nName\tSource\nmain\tgraph-ui/agents/hooks/atlas-trace.py\nstep001\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep002\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep003\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep004\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep005\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep006\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep007\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep008\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep009\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep010\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep011\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep012\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep013\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep014\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep015\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep016\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep017\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep018\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep019\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 156
+            },
+            {
+              "text": "Entry points",
+              "y": 363
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": []
+        },
+        {
+          "name": "architecture-routes",
+          "screenshot": "audit-before-architecture-routes.png",
+          "at": "2026-09-09T20:26:40.705Z",
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nROUTES\n\nRoute discovery depends on the indexed language. Source matches are labeled separately.\n\nMethod\tRoute\tHandler\tEvidence\tSource\nNot reported\t/{pk}/%s\tNot reported\tIndex\tNot reported\nNot reported\t/old/path\tNot reported\tIndex\tNot reported\nNot reported\t/new/path\tNot reported\tIndex\tNot reported\nNot reported\t/locations/\tNot reported\tIndex\tNot reported\nNot reported\t/html/g\tNot reported\tIndex\tNot reported\nNot reported\t/api/orders\tNot reported\tIndex\tNot reported\nNot reported\t/api/layout\tNot reported\tIndex\tNot reported\nNot reported\t/assets/index-abc.js\tNot reported\tIndex\tNot reported\nNot reported\t/api/browse\tNot reported\tIndex\tNot reported\nNot reported\t/api/project\tNot reported\tIndex\tNot reported\nNot reported\t/src/config.ts\tNot reported\tIndex\tNot reported\nNot reported\t/api/index\tNot reported\tIndex\tNot reported\nNot reported\t/api/index-status\tNot reported\tIndex\tNot reported\nNot reported\t/api/logs\tNot reported\tIndex\tNot reported\nNot reported\t/api/agent-events\tNot reported\tIndex\tNot reported\nNot reported\t/api/processes\tNot reported\tIndex\tNot reported\nNot reported\t/src/main.go\tNot reported\tIndex\tNot reported\nNot reported\t/src/pkg\tNot reported\tIndex\tNot reported\nNot reported\t/foo/bar/\tNot reported\tIndex\tNot reported\nNot reported\t/a/b/c/d/e/f/g\tNot reported\tIndex\tNot reported\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 156
+            },
+            {
+              "text": "Routes",
+              "y": 363
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": []
+        },
+        {
+          "name": "architecture-hotspots",
+          "screenshot": "audit-before-architecture-hotspots.png",
+          "at": "2026-09-09T20:26:41.137Z",
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nHOTSPOTS\n\nMeasured signals to help choose what to inspect. These are not a quality score.\n\nName\tCallers\tComplexity\tCognitive\tLoop depth\tSignals\tSource\ncbm_free_result\t3,089\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_close\t704\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_mkdtemp\t615\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_mcp_server_free\t311\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_upsert_project\t309\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_node_text\t291\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_mcp_server_new\t253\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_open_memory\t244\tNot reported\tNot reported\tNot reported\t\n\tNot reported\npath\t228\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_upsert_node\t226\tNot reported\tNot reported\tNot reported\t\n\tNot reported\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 156
+            },
+            {
+              "text": "Hotspots",
+              "y": 363
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": []
+        },
+        {
+          "name": "galaxy-overview",
+          "screenshot": "audit-before-galaxy-overview.png",
+          "at": "2026-09-09T20:26:45.773Z",
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "workspace": "galaxy",
+          "text": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\ngalaxy\nhierarchy\nshow legend\nFind node / entry point\nCoverage shadow: 85 files, 41 folders with index gaps\n5,000 of 40,226 nodes · 1,268 relationships loaded\n10 edge kinds\nfit view\n\nSelect a node or entry point to attach graph context to chat.\n\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 0
+            },
+            {
+              "text": "Hotspots",
+              "y": 0
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": []
+        }
+      ],
+      "pageErrors": [],
+      "failedRequests": [],
+      "completed": true
+    },
+    {
+      "label": "after",
+      "port": 9749,
+      "actions": [
+        {
+          "description": "Dismiss standard welcome: Start exploring",
+          "boundsBefore": {
+            "x": 903.9375,
+            "y": 729.984375,
+            "width": 119.0625,
+            "height": 42.796875
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture workspace",
+          "boundsBefore": {
+            "x": 383.390625,
+            "y": 12,
+            "width": 100.703125,
+            "height": 36.796875
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture Overview",
+          "boundsBefore": {
+            "x": 32,
+            "y": 306.09375,
+            "width": 82.40625,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Connected area: src/daemon",
+          "boundsBefore": {
+            "x": 1073,
+            "y": 857.28125,
+            "width": 335,
+            "height": 197.5
+          },
+          "requiresScroll": true
+        },
+        {
+          "description": "Inspect first recorded cross-area relationship",
+          "boundsBefore": {
+            "x": 649.453125,
+            "y": 1250.78125,
+            "width": 120,
+            "height": 27.5
+          },
+          "requiresScroll": true
+        },
+        {
+          "description": "Scroll to relationship evidence after click"
+        },
+        {
+          "description": "Open exact recorded call site",
+          "boundsBefore": {
+            "x": 707.375,
+            "y": 150.625,
+            "width": 57.296875,
+            "height": 18
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Return to Architecture",
+          "boundsBefore": {
+            "x": 383.390625,
+            "y": 12,
+            "width": 100.703125,
+            "height": 36.796875
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Repository breadcrumb",
+          "boundsBefore": {
+            "x": 32,
+            "y": -1009.40625,
+            "width": 64.984375,
+            "height": 27.5
+          },
+          "requiresScroll": true
+        },
+        {
+          "description": "Read project README",
+          "boundsBefore": {
+            "x": 53,
+            "y": 654.09375,
+            "width": 157.4375,
+            "height": 32
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Return to Architecture",
+          "boundsBefore": {
+            "x": 383.390625,
+            "y": 12,
+            "width": 100.703125,
+            "height": 36.796875
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Dependencies",
+          "boundsBefore": {
+            "x": 118.40625,
+            "y": 332.59375,
+            "width": 112.625,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Entry points",
+          "boundsBefore": {
+            "x": 235.03125,
+            "y": 332.59375,
+            "width": 98.6875,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Routes",
+          "boundsBefore": {
+            "x": 337.71875,
+            "y": 332.59375,
+            "width": 67.984375,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Architecture tab: Hotspots",
+          "boundsBefore": {
+            "x": 409.703125,
+            "y": 332.59375,
+            "width": 81.140625,
+            "height": 41.5
+          },
+          "requiresScroll": false
+        },
+        {
+          "description": "Galaxy workspace",
+          "boundsBefore": {
+            "x": 312.625,
+            "y": 12,
+            "width": 66.765625,
+            "height": 36.796875
+          },
+          "requiresScroll": false
+        }
+      ],
+      "stages": [
+        {
+          "name": "first-open",
+          "screenshot": "audit-after-first-open.png",
+          "at": "2026-09-09T20:26:48.429Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym no count\nedg no count\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nReading events…\nHistory (0 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage unknown.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nReading project architecture...\nserver contacting\nConnection details\n\nCODEBASE MEMORY\n\nA clearer view of your code.\n\nExplore the source, understand its architecture, and follow your agents.\n\nExplore\nRead source with graph context.\nGalaxy\nExplore the whole graph and its coverage shadow.\nArchitecture\nSee modules, dependencies, and entry points.\nAgents\nInspect recorded activity and touched code.\nSystem\nMonitor the daemon, indexes, and logs.\nExplanation depth\nBrief\nExplained\n\nSwitch workspaces and explanation depth at any time. Every feature stays available.\n\nSet up browser AI\nStart exploring\n\nBrowser AI is optional and off. Setup asks before downloading a model.",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Choose a starting point",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 218
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            },
+            {
+              "text": "A clearer view of your code.",
+              "y": 225
+            }
+          ],
+          "landmarks": []
+        },
+        {
+          "name": "architecture-overview",
+          "screenshot": "audit-after-architecture-overview.png",
+          "at": "2026-09-09T20:26:49.859Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:26:48 PM\nHistory (11 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nREPOSITORY MAP\n\nStart at an entry point, follow a component boundary, then inspect the symbols behind it.\n\nEvidence legend\n1,427 indexed files · 62,273 retained edges · snapshot and limits\nRepository\nWhere to start\n\nEntry candidates identified by the index; these are declarations, not a verified execution order.\n\nRead project README\nApp\nFunction · graph-ui/src/App.tsx:750\nmain\nFunction · src/main.c:2546\nGalaxyPanel\nFunction · graph-ui/src/galaxy/GalaxyPanel.tsx:729\nmain\nFunction · graph-ui/tools/smoke-w10.mjs:1187\nConnected areas\n\nGrouped by source location, ranked by recorded links across areas. Open an area to see its responsibilities through entry symbols, interfaces and connections.\n\nSOURCE AREA · INFERRED BOUNDARY\ntests\n174 files · 5 entry candidates · 9 exported symbols\nIncoming 54 ← · → Outgoing 11557\nmain · main · main\nSOURCE AREA · INFERRED BOUNDARY\ninternal/cbm\n248 files · 0 entry candidates · 2268 exported symbols\nIncoming 4553 ← · → Outgoing 1435\ncbm_free_result · cbm_node_text · cbm_arena_alloc\nSOURCE AREA · INFERRED BOUNDARY\nsrc/foundation\n65 files · 0 entry candidates · 574 exported symbols\nIncoming 4109 ← · → Outgoing 31\ncbm_mkdtemp · cbm_mutex_unlock · cbm_mutex_lock\nSOURCE AREA · INFERRED BOUNDARY\nsrc/daemon\n24 files · 0 entry candidates · 773 exported symbols\nIncoming 1382 ← · → Outgoing 570\ncbm_daemon_ipc_endpoint_free · cbm_daemon_ipc_endpoint_new · cbm_daemon_ipc_endpoint_runtime_dir\nSOURCE AREA · INFERRED BOUNDARY\nsrc/pipeline\n43 files · 0 entry candidates · 984 exported symbols\nIncoming 435 ← · → Outgoing 1442\ncbm_project_name_from_path · cbm_pipeline_fqn_compute · cbm_pipeline_fqn_module\nSOURCE AREA · INFERRED BOUNDARY\nsrc/store\n2 files · 0 entry candidates · 321 exported symbols\nIncoming 1308 ← · → Outgoing 99\ncbm_store_close · store_set_error_sqlite · bind_text\nSOURCE AREA · INFERRED BOUNDARY\nsrc/cli\n21 files · 0 entry candidates · 1036 exported symbols\nIncoming 1165 ← · → Outgoing 241\ncbm_install_agent_configs · stat · record_agent_config_error\nSOURCE AREA · INFERRED BOUNDARY\nsrc/semantic\n6 files · 0 entry candidates · 83 exported symbols\nIncoming 1137 ← · → Outgoing 36\ncbm_sem_normalize · cbm_ast_profile_from_str · cbm_ast_profile_to_vector\nSOURCE AREA · INFERRED BOUNDARY\ngraph-ui\n610 files · 967 entry candidates · 2399 exported symbols\nIncoming 579 ← · → Outgoing 212\nnormalize · sleep · weigh\nSOURCE AREA · INFERRED BOUNDARY\nsrc/mcp\n7 files · 0 entry candidates · 501 exported symbols\nIncoming 335 ← · → Outgoing 413\ncbm_mcp_handle_tool · cbm_mcp_server_new · cbm_mcp_server_free\nSOURCE AREA · INFERRED BOUNDARY\nsrc/graph_buffer\n2 files · 0 entry candidates · 76 exported symbols\nIncoming 611 ← · → Outgoing 101\ncbm_gbuf_upsert_node · cbm_gbuf_insert_edge · cbm_gbuf_free\nSOURCE AREA · INFERRED BOUNDARY\nsrc/ui\n22 files · 0 entry candidates · 312 exported symbols\nIncoming 218 ← · → Outgoing 352\ncbm_http_server_port · cbm_http_replyf · cbm_http_query_param\nAll 25 areas\nIndex summary, layers and communities\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 245
+            },
+            {
+              "text": "Repository map",
+              "y": 451
+            },
+            {
+              "text": "Where to start",
+              "y": 607
+            },
+            {
+              "text": "Connected areas",
+              "y": 797
+            },
+            {
+              "text": "Modules",
+              "y": 1628
+            },
+            {
+              "text": "Architecture layers",
+              "y": 1920
+            },
+            {
+              "text": "Related communities",
+              "y": 1920
+            },
+            {
+              "text": "Indexed files",
+              "y": 2730
+            },
+            {
+              "text": "Languages",
+              "y": 3060
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 3060
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "repo-map",
+              "y": 451,
+              "height": 1036
+            }
+          ]
+        },
+        {
+          "name": "architecture-area",
+          "screenshot": "audit-after-architecture-area.png",
+          "at": "2026-09-09T20:26:50.016Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:26:48 PM\nHistory (11 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nREPOSITORY MAP\n\nStart at an entry point, follow a component boundary, then inspect the symbols behind it.\n\nEvidence legend\n1,427 indexed files · 62,273 retained edges · snapshot and limits\nRepository\n›\nsrc/daemon\nSRC/DAEMON\n\n24 files · 797 indexed nodes\n\nInferred role: internal. fan-in=19, fan-out=387\n\nEntry points and interfaces\ncbm_daemon_ipc_endpoint_free\nFunction · src/daemon/ipc.c:4814\ncbm_daemon_ipc_endpoint_new\nFunction · src/daemon/ipc.c:4722\ncbm_daemon_ipc_endpoint_runtime_dir\nFunction · src/daemon/ipc.c:4841\ncbm_daemon_application_new\nFunction · src/daemon/application.c:2909\ncbm_daemon_application_free\nFunction · src/daemon/application.c:3128\ncbm_daemon_application_shutdown\nFunction · src/daemon/application.c:2999\ncbm_daemon_ipc_startup_lock_try_acquire\nFunction · src/daemon/ipc.c:6087\ncbm_daemon_runtime_client_connect\nFunction · src/daemon/runtime.c:2752\nHow this area connects\nDepends on →\nUsed by ←\n\nCross-area edges grouped by relation kind. Counts are retained graph edges, not call frequency.\n\nsrc/foundation\nCALLS\n387 edges · inspect\nsrc/mcp\nCALLS\n55 edges · inspect\nsrc/foundation\nIMPORTS\n51 edges · inspect\nsrc/ui\nCALLS\n21 edges · inspect\nsrc/cli\nCALLS\n12 edges · inspect\ngraph-ui\nIMPORTS\n10 edges · inspect\nsrc/watcher\nCALLS\n9 edges · inspect\ngraph-ui\nCALLS\n5 edges · inspect\nsrc/mcp\nIMPORTS\n5 edges · inspect\nsrc/ui\nIMPORTS\n4 edges · inspect\nsrc/cli\nIMPORTS\n3 edges · inspect\nsrc/pipeline\nCALLS\n2 edges · inspect\nsrc/store\nCALLS\n2 edges · inspect\nsrc/watcher\nIMPORTS\n2 edges · inspect\nsrc/pipeline\nIMPORTS\n1 edges · inspect\nsrc/store\nIMPORTS\n1 edges · inspect\nFiles\nsrc/daemon/application.c\nsrc/daemon/application.h\nsrc/daemon/application_internal.h\nsrc/daemon/bootstrap.c\nsrc/daemon/bootstrap.h\nsrc/daemon/daemon.c\nsrc/daemon/daemon.h\nsrc/daemon/frontend.c\nsrc/daemon/frontend.h\nsrc/daemon/host.c\nsrc/daemon/host.h\nsrc/daemon/host_internal.h\nsrc/daemon/ipc.c\nsrc/daemon/ipc.h\nsrc/daemon/ipc_internal.h\nsrc/daemon/project_lock.c\nsrc/daemon/project_lock.h\nsrc/daemon/runtime.c\nsrc/daemon/runtime.h\nsrc/daemon/service.c\nsrc/daemon/service.h\nsrc/daemon/service_internal.h\nsrc/daemon/version_cohort.c\nsrc/daemon/version_cohort.h\nIndex summary, layers and communities\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 163
+            },
+            {
+              "text": "Repository map",
+              "y": 369
+            },
+            {
+              "text": "src/daemon",
+              "y": 506
+            },
+            {
+              "text": "Entry points and interfaces",
+              "y": 563
+            },
+            {
+              "text": "How this area connects",
+              "y": 1133
+            },
+            {
+              "text": "Files",
+              "y": 1133
+            },
+            {
+              "text": "Modules",
+              "y": 2078
+            },
+            {
+              "text": "Architecture layers",
+              "y": 2370
+            },
+            {
+              "text": "Related communities",
+              "y": 2370
+            },
+            {
+              "text": "Indexed files",
+              "y": 3180
+            },
+            {
+              "text": "Languages",
+              "y": 3510
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 3510
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "repo-map",
+              "y": 369,
+              "height": 1568
+            }
+          ]
+        },
+        {
+          "name": "relationship-immediate",
+          "screenshot": "audit-after-relationship-immediate.png",
+          "at": "2026-09-09T20:26:50.132Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:26:48 PM\nHistory (11 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nREPOSITORY MAP\n\nStart at an entry point, follow a component boundary, then inspect the symbols behind it.\n\nEvidence legend\n1,427 indexed files · 62,273 retained edges · snapshot and limits\nRepository\n›\nsrc/daemon\nSRC/DAEMON\n\n24 files · 797 indexed nodes\n\nInferred role: internal. fan-in=19, fan-out=387\n\nEntry points and interfaces\ncbm_daemon_ipc_endpoint_free\nFunction · src/daemon/ipc.c:4814\ncbm_daemon_ipc_endpoint_new\nFunction · src/daemon/ipc.c:4722\ncbm_daemon_ipc_endpoint_runtime_dir\nFunction · src/daemon/ipc.c:4841\ncbm_daemon_application_new\nFunction · src/daemon/application.c:2909\ncbm_daemon_application_free\nFunction · src/daemon/application.c:3128\ncbm_daemon_application_shutdown\nFunction · src/daemon/application.c:2999\ncbm_daemon_ipc_startup_lock_try_acquire\nFunction · src/daemon/ipc.c:6087\ncbm_daemon_runtime_client_connect\nFunction · src/daemon/runtime.c:2752\nHow this area connects\nDepends on →\nUsed by ←\n\nCross-area edges grouped by relation kind. Counts are retained graph edges, not call frequency.\n\nsrc/foundation\nCALLS\n387 edges · inspect\nsrc/mcp\nCALLS\n55 edges · inspect\nsrc/foundation\nIMPORTS\n51 edges · inspect\nsrc/ui\nCALLS\n21 edges · inspect\nsrc/cli\nCALLS\n12 edges · inspect\ngraph-ui\nIMPORTS\n10 edges · inspect\nsrc/watcher\nCALLS\n9 edges · inspect\ngraph-ui\nCALLS\n5 edges · inspect\nsrc/mcp\nIMPORTS\n5 edges · inspect\nsrc/ui\nIMPORTS\n4 edges · inspect\nsrc/cli\nIMPORTS\n3 edges · inspect\nsrc/pipeline\nCALLS\n2 edges · inspect\nsrc/store\nCALLS\n2 edges · inspect\nsrc/watcher\nIMPORTS\n2 edges · inspect\nsrc/pipeline\nIMPORTS\n1 edges · inspect\nsrc/store\nIMPORTS\n1 edges · inspect\nFiles\nsrc/daemon/application.c\nsrc/daemon/application.h\nsrc/daemon/application_internal.h\nsrc/daemon/bootstrap.c\nsrc/daemon/bootstrap.h\nsrc/daemon/daemon.c\nsrc/daemon/daemon.h\nsrc/daemon/frontend.c\nsrc/daemon/frontend.h\nsrc/daemon/host.c\nsrc/daemon/host.h\nsrc/daemon/host_internal.h\nsrc/daemon/ipc.c\nsrc/daemon/ipc.h\nsrc/daemon/ipc_internal.h\nsrc/daemon/project_lock.c\nsrc/daemon/project_lock.h\nsrc/daemon/runtime.c\nsrc/daemon/runtime.h\nsrc/daemon/service.c\nsrc/daemon/service.h\nsrc/daemon/service_internal.h\nsrc/daemon/version_cohort.c\nsrc/daemon/version_cohort.h\nsrc/daemon → src/foundation\n\nStatic index edges. Open either declaration to inspect the source; a call edge does not prove runtime execution.\n\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48267Site :701\ncbm_sha256_init\nFunction · src/foundation/sha256.c:63\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48268Site :711\ncbm_sha256_update\nFunction · src/foundation/sha256.c:76\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48269Site :728\ncbm_sha256_final\nFunction · src/foundation/sha256.c:88\ncbm_daemon_build_fingerprint_file\nFunction · src/daemon/service.c:733\nCALLS →Edge #48292Site :743\ncbm_path_to_wide\nFunction · src/foundation/win_utf8.h:120\nwindows_log_path_open\nFunction · src/daemon/service.c:806\nCALLS →Edge #48295Site :832\ncbm_path_to_wide\nFunction · src/foundation/win_utf8.h:120\ncbm_project_lock_manager_new\nFunction · src/daemon/project_lock.c:43\nCALLS →Edge #48337Site :61\ncbm_private_lock_directory_close\nFunction · src/foundation/private_file_lock.c:1503\ncbm_project_lock_manager_new\nFunction · src/daemon/project_lock.c:43\nCALLS →Edge #48338Site :57\ncbm_lock_registry_new\nFunction · src/foundation/lock_registry.c:319\ncbm_project_lock_lease_release\nFunction · src/daemon/project_lock.c:67\nCALLS →Edge #48339Site :80\ncbm_lock_lease_release\nFunction · src/foundation/lock_registry.c:772\nproject_lock_acquire_internal\nFunction · src/daemon/project_lock.c:109\nCALLS →Edge #48342Site :141\ncbm_lock_registry_try_acquire\nFunction · src/foundation/lock_registry.c:682\nproject_lock_acquire_internal\nFunction · src/daemon/project_lock.c:109\nCALLS →Edge #48343Site :143\ncbm_lock_registry_acquire\nFunction · src/foundation/lock_registry.c:674\ncbm_project_lock_request_cancel\nFunction · src/daemon/project_lock.c:168\nCALLS →Edge #48347Site :170\ncbm_lock_registry_request_cancel\nFunction · src/foundation/lock_registry.c:348\ncbm_project_lock_manager_free\nFunction · src/daemon/project_lock.c:174\nCALLS →Edge #48348Site :180\ncbm_lock_registry_free\nFunction · src/foundation/lock_registry.c:861\n\n12 of 387 retained edges\n\nMore evidence\nIndex summary, layers and communities\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": -517
+            },
+            {
+              "text": "Repository map",
+              "y": -311
+            },
+            {
+              "text": "src/daemon",
+              "y": -174
+            },
+            {
+              "text": "Entry points and interfaces",
+              "y": -117
+            },
+            {
+              "text": "How this area connects",
+              "y": 453
+            },
+            {
+              "text": "Files",
+              "y": 453
+            },
+            {
+              "text": "src/daemon → src/foundation",
+              "y": 1273
+            },
+            {
+              "text": "Modules",
+              "y": 2441
+            },
+            {
+              "text": "Architecture layers",
+              "y": 2733
+            },
+            {
+              "text": "Related communities",
+              "y": 2733
+            },
+            {
+              "text": "Indexed files",
+              "y": 3543
+            },
+            {
+              "text": "Languages",
+              "y": 3873
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 3873
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "repo-map",
+              "y": -311,
+              "height": 2611
+            },
+            {
+              "type": "repo-map-evidence",
+              "y": 1302,
+              "height": 998
+            }
+          ]
+        },
+        {
+          "name": "relationship-scrolled",
+          "screenshot": "audit-after-relationship-scrolled.png",
+          "at": "2026-09-09T20:26:50.248Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:26:48 PM\nHistory (11 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nREPOSITORY MAP\n\nStart at an entry point, follow a component boundary, then inspect the symbols behind it.\n\nEvidence legend\n1,427 indexed files · 62,273 retained edges · snapshot and limits\nRepository\n›\nsrc/daemon\nSRC/DAEMON\n\n24 files · 797 indexed nodes\n\nInferred role: internal. fan-in=19, fan-out=387\n\nEntry points and interfaces\ncbm_daemon_ipc_endpoint_free\nFunction · src/daemon/ipc.c:4814\ncbm_daemon_ipc_endpoint_new\nFunction · src/daemon/ipc.c:4722\ncbm_daemon_ipc_endpoint_runtime_dir\nFunction · src/daemon/ipc.c:4841\ncbm_daemon_application_new\nFunction · src/daemon/application.c:2909\ncbm_daemon_application_free\nFunction · src/daemon/application.c:3128\ncbm_daemon_application_shutdown\nFunction · src/daemon/application.c:2999\ncbm_daemon_ipc_startup_lock_try_acquire\nFunction · src/daemon/ipc.c:6087\ncbm_daemon_runtime_client_connect\nFunction · src/daemon/runtime.c:2752\nHow this area connects\nDepends on →\nUsed by ←\n\nCross-area edges grouped by relation kind. Counts are retained graph edges, not call frequency.\n\nsrc/foundation\nCALLS\n387 edges · inspect\nsrc/mcp\nCALLS\n55 edges · inspect\nsrc/foundation\nIMPORTS\n51 edges · inspect\nsrc/ui\nCALLS\n21 edges · inspect\nsrc/cli\nCALLS\n12 edges · inspect\ngraph-ui\nIMPORTS\n10 edges · inspect\nsrc/watcher\nCALLS\n9 edges · inspect\ngraph-ui\nCALLS\n5 edges · inspect\nsrc/mcp\nIMPORTS\n5 edges · inspect\nsrc/ui\nIMPORTS\n4 edges · inspect\nsrc/cli\nIMPORTS\n3 edges · inspect\nsrc/pipeline\nCALLS\n2 edges · inspect\nsrc/store\nCALLS\n2 edges · inspect\nsrc/watcher\nIMPORTS\n2 edges · inspect\nsrc/pipeline\nIMPORTS\n1 edges · inspect\nsrc/store\nIMPORTS\n1 edges · inspect\nFiles\nsrc/daemon/application.c\nsrc/daemon/application.h\nsrc/daemon/application_internal.h\nsrc/daemon/bootstrap.c\nsrc/daemon/bootstrap.h\nsrc/daemon/daemon.c\nsrc/daemon/daemon.h\nsrc/daemon/frontend.c\nsrc/daemon/frontend.h\nsrc/daemon/host.c\nsrc/daemon/host.h\nsrc/daemon/host_internal.h\nsrc/daemon/ipc.c\nsrc/daemon/ipc.h\nsrc/daemon/ipc_internal.h\nsrc/daemon/project_lock.c\nsrc/daemon/project_lock.h\nsrc/daemon/runtime.c\nsrc/daemon/runtime.h\nsrc/daemon/service.c\nsrc/daemon/service.h\nsrc/daemon/service_internal.h\nsrc/daemon/version_cohort.c\nsrc/daemon/version_cohort.h\nsrc/daemon → src/foundation\n\nStatic index edges. Open either declaration to inspect the source; a call edge does not prove runtime execution.\n\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48267Site :701\ncbm_sha256_init\nFunction · src/foundation/sha256.c:63\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48268Site :711\ncbm_sha256_update\nFunction · src/foundation/sha256.c:76\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48269Site :728\ncbm_sha256_final\nFunction · src/foundation/sha256.c:88\ncbm_daemon_build_fingerprint_file\nFunction · src/daemon/service.c:733\nCALLS →Edge #48292Site :743\ncbm_path_to_wide\nFunction · src/foundation/win_utf8.h:120\nwindows_log_path_open\nFunction · src/daemon/service.c:806\nCALLS →Edge #48295Site :832\ncbm_path_to_wide\nFunction · src/foundation/win_utf8.h:120\ncbm_project_lock_manager_new\nFunction · src/daemon/project_lock.c:43\nCALLS →Edge #48337Site :61\ncbm_private_lock_directory_close\nFunction · src/foundation/private_file_lock.c:1503\ncbm_project_lock_manager_new\nFunction · src/daemon/project_lock.c:43\nCALLS →Edge #48338Site :57\ncbm_lock_registry_new\nFunction · src/foundation/lock_registry.c:319\ncbm_project_lock_lease_release\nFunction · src/daemon/project_lock.c:67\nCALLS →Edge #48339Site :80\ncbm_lock_lease_release\nFunction · src/foundation/lock_registry.c:772\nproject_lock_acquire_internal\nFunction · src/daemon/project_lock.c:109\nCALLS →Edge #48342Site :141\ncbm_lock_registry_try_acquire\nFunction · src/foundation/lock_registry.c:682\nproject_lock_acquire_internal\nFunction · src/daemon/project_lock.c:109\nCALLS →Edge #48343Site :143\ncbm_lock_registry_acquire\nFunction · src/foundation/lock_registry.c:674\ncbm_project_lock_request_cancel\nFunction · src/daemon/project_lock.c:168\nCALLS →Edge #48347Site :170\ncbm_lock_registry_request_cancel\nFunction · src/foundation/lock_registry.c:348\ncbm_project_lock_manager_free\nFunction · src/daemon/project_lock.c:174\nCALLS →Edge #48348Site :180\ncbm_lock_registry_free\nFunction · src/foundation/lock_registry.c:861\n\n12 of 387 retained edges\n\nMore evidence\nIndex summary, layers and communities\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": -1734
+            },
+            {
+              "text": "Repository map",
+              "y": -1528
+            },
+            {
+              "text": "src/daemon",
+              "y": -1391
+            },
+            {
+              "text": "Entry points and interfaces",
+              "y": -1334
+            },
+            {
+              "text": "How this area connects",
+              "y": -764
+            },
+            {
+              "text": "Files",
+              "y": -764
+            },
+            {
+              "text": "src/daemon → src/foundation",
+              "y": 56
+            },
+            {
+              "text": "Modules",
+              "y": 1224
+            },
+            {
+              "text": "Architecture layers",
+              "y": 1516
+            },
+            {
+              "text": "Related communities",
+              "y": 1516
+            },
+            {
+              "text": "Indexed files",
+              "y": 2326
+            },
+            {
+              "text": "Languages",
+              "y": 2656
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 2656
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "repo-map",
+              "y": -1528,
+              "height": 2611
+            },
+            {
+              "type": "repo-map-evidence",
+              "y": 85,
+              "height": 998
+            }
+          ]
+        },
+        {
+          "name": "source-from-relationship",
+          "screenshot": "audit-after-source-from-relationship.png",
+          "at": "2026-09-09T20:26:54.504Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "explore",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:26:51 PM\nHistory (12 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\nservice.c\n●\nx\nEXPLORER\n▾\ncbm-pr2068/\n▸\n.git/\n●\n0\n▾\n.github/\n177\n▾\nISSUE_TEMPLATE/\n16\nbug_report.yml\n6\nconfig.yml\n4\nfeature_request.yml\n6\n▾\nworkflows/\n136\n_build.yml\n6\n_lint.yml\n6\n_security.yml\n6\n_smoke.yml\n6\n_soak.yml\n6\n_test.yml\n6\nbug-repro.yml\n6\ncache-warm.yml\n6\ncodeql.yml\n7\ndco.yml\n7\ndry-run.yml\n6\nfast-repro.yml\n6\nissue-labeler.yml\n6\nlabel-actions.yml\n6\nnightly-soak.yml\n6\npages.yml\n7\npr-acknowledgement.yml\n6\npr.yml\n7\nrelease.yml\n6\nscorecard.yml\n6\nsmoke.yml\n6\nstale.yml\n6\ndependabot.yml\n4\nissue-labeler.yml\n9\nlabel-actions.yml\n4\npr-acknowledgement.md\n2\npull_request_template.md\n4\n▸\nbuild/\n●\n0\n▾\ndocs/\n●\n386\n▾\ndevelopment/\n37\npr-2068-delivery.md\n9\npr-2068-error-repro.md\n7\npr-2068-research.md\n15\npr-2068-worklog.md\n6\nBENCHMARK.md\n52\ncbmignore.md\n7\nCONFIGURATION.md\n14\nEVALUATION_PLAN.md\n209\ngraph-ui-screenshot.png\n-\n0\nindex.html\n2\nMEASURING_SAVINGS.md\n11\nRUNTIME_TRACE_MODEL.md\n37\nSECURITY-DISCLOSURE.md\n9\nsitemap.xml\n7\n▾\ngraph-ui/\n●\n14168\n▾\nagents/\n33\n▸\nhooks/\n32\n▸\ndesign/\n●\n0\n▸\ndist/\n●\n0\n▾\ndocs/\n15\n▸\nadr/\n14\n▾\neval/\n9\nquestions.json\n9\n▾\nfixtures/\n195\n▸\nagent-events/\n9\n▸\natlas-sample/\n69\n▸\natlas-sample-large/\n114\n▾\nllm/\n35\nfetch-model.sh\n10\nstart.sh\n19\nstop.sh\n6\n▸\nnode_modules/\n●\n0\n▾\nspike/\n12\nindex.html\n2\nspike.js\n10\n▾\nsrc/\n●\n5236\n▸\nagents/\n312\n▸\napp/\n332\n▸\narchitecture/\n98\n▸\nbrowser-ai/\n195\n▸\nchat/\n112\n▸\nchecklist/\n35\n▸\ncompiler/\n180\n▸\ncore/\n113\n▸\ndiagnostics/\n44\n▸\nentry/\n30\n▸\ngalaxy/\n●\n463\n▸\nhelp/\n19\n▸\ni18n/\n82\n▸\nimpact/\n204\n▸\nir/\n55\n▸\nlayout/\n82\n▸\nllm/\n91\n▸\nprojects/\n103\n▸\nprovider/\n341\n▸\npseudocode/\n385\n▸\nreader/\n76\n▸\nsearch/\n107\n▸\nsettings/\n61\n▸\nstyles/\n6\n▸\nsystem/\n48\n▸\ntest-support/\n32\n▸\ntours/\n111\n▸\ntraces/\n136\n▸\ntwin/\n1187\n▸\nui/\n47\n▸\nwhy/\n53\nApp.tsx\n62\nmain.tsx\n3\n▾\ntests/\n180\n▸\nscaffold/\n179\n▾\ntools/\n1665\n▸\nlib/\n118\nagent-bridge.mjs\n21\nagent-bridge.test.mjs\n9\ncapture-pr2068-baseline.mjs\n6\ncapture-pr2068-current.mjs\n5\neval-check.mjs\n20\neval-llm.mjs\n20\nfreshclone-check.mjs\n12\nnet-deny-gate.mjs\n15\nnet-deny-gate.test.mjs\n9\npr-2068-agents-e2e.mjs\n21\npr-2068-errors-e2e.mjs\n22\npr-2068-map-e2e.mjs\n9\npromise-scan.mjs\n18\nrecord-demo.mjs\n56\nrelease-gate.mjs\n28\nsmoke-spike.mjs\n32\nsmoke-w1.mjs\n15\nsmoke-w10.mjs\n87\nsmoke-w10b.mjs\n49\nsmoke-w11a.mjs\n58\nsmoke-w11b.mjs\n72\nsmoke-w12.mjs\n112\nsmoke-w12a.mjs\n18\nsmoke-w13.mjs\n36\nsmoke-w14.mjs\n40\nsmoke-w15.mjs\n21\nsmoke-w1b.mjs\n18\nsmoke-w2a.mjs\n25\nsmoke-w2b.mjs\n25\nsmoke-w3.mjs\n22\nsmoke-w4a.mjs\n28\nsmoke-w4b.mjs\n36\nsmoke-w4c.mjs\n27\nsmoke-w4d.mjs\n35\nsmoke-w4e.mjs\n30\nsmoke-w5a.mjs\n30\nsmoke-w5b.mjs\n41\nsmoke-w5c.mjs\n43\nsmoke-w6-full.mjs\n53\nsmoke-w7a.mjs\n29\nsmoke-w7b.mjs\n37\nsmoke-w7c.mjs\n45\nsmoke-w8.mjs\n50\nsmoke-w8b.mjs\n51\nsmoke-w8c.mjs\n31\nsmoke-w9.mjs\n48\nstyle-gate.mjs\n13\nverify-models.mjs\n18\n▸\nvendor/\n●\n0\n▾\nverification/\n●\n6693\n▸\npr-2068/\n●\n558\n▸\nw0/\n●\n31\n▸\nw1/\n113\n▸\nw10/\n●\n448\n▸\nw10b/\n●\n215\n▸\nw11/\n●\n646\n▸\nw12/\n●\n567\n▸\nw12a/\n●\n44\n▸\nw13/\n●\n184\n▸\nw14/\n●\n106\n▸\nw15/\n●\n87\n▸\nw2/\n●\n199\n▸\nw3/\n●\n94\n▸\nw4/\n●\n729\n▸\nw5/\n●\n579\n▸\nw6/\n●\n732\n▸\nw7/\n●\n542\n▸\nw8/\n●\n219\n▸\nw8b/\n●\n244\n▸\nw8c/\n●\n158\n▸\nw9/\n●\n177\nindex.html\n2\nINVENTAR.md\n12\nPLAN.md\n14\nREADME.md\n9\nTHIRD_PARTY.md\n11\ntsconfig.node.json\n17\ntsconfig.node.tsbuildinfo\n-\n0\ntsconfig.tsbuildinfo\n-\n0\nUPSTREAM-ASKS.md\n11\nvite.config.ts\n9\n▾\ninternal/\n●\n2917\n▾\ncbm/\n●\n2916\n▸\nlsp/\n●\n1256\n▸\nvendored/\n●\n0\nac.c\n39\nac.h\n2\narena.c\n9\narena.h\n4\ncbm.c\n96\ncbm.h\n43\nextract_calls.c\n139\nextract_channels.c\n42\nextract_dbt.c\n8\nextract_defs.c\n221\nextract_env_accesses.c\n9\nextract_imports.c\n105\nextract_k8s.c\n14\nextract_node_stack.h\n7\nextract_semantic.c\n15\nextract_type_assigns.c\n13\nextract_type_refs.c\n18\nextract_unified.c\n81\nextract_unified.h\n17\nextract_usages.c\n108\ngrammar_ada.c\n2\ngrammar_agda.c\n2\ngrammar_apex.c\n2\ngrammar_arkts.c\n2\ngrammar_assembly.c\n2\ngrammar_astro.c\n2\ngrammar_awk.c\n2\ngrammar_bash.c\n2\ngrammar_beancount.c\n2\ngrammar_bibtex.c\n2\ngrammar_bicep.c\n2\ngrammar_bitbake.c\n2\ngrammar_blade.c\n2\ngrammar_c_sharp.c\n2\ngrammar_c.c\n2\ngrammar_cairo.c\n2\ngrammar_capnp.c\n2\ngrammar_cfml.c\n2\ngrammar_cfscript.c\n2\ngrammar_chialisp.c\n2\ngrammar_clojure.c\n2\ngrammar_cmake.c\n2\ngrammar_cobol.c\n2\ngrammar_commonlisp.c\n2\ngrammar_cpp.c\n2\ngrammar_crystal.c\n2\ngrammar_css.c\n2\ngrammar_csv.c\n2\ngrammar_cuda.c\n2\ngrammar_d.c\n2\ngrammar_dart.c\n2\ngrammar_devicetree.c\n2\ngrammar_diff.c\n2\ngrammar_dockerfile.c\n2\ngrammar_dotenv.c\n2\ngrammar_elisp.c\n2\ngrammar_elixir.c\n2\ngrammar_elm.c\n2\ngrammar_erlang.c\n2\ngrammar_fennel.c\n2\ngrammar_fish.c\n2\ngrammar_form.c\n2\ngrammar_fortran.c\n2\ngrammar_fsharp.c\n2\ngrammar_func.c\n2\ngrammar_gdscript.c\n2\ngrammar_gitattributes.c\n2\ngrammar_gitignore.c\n2\ngrammar_gleam.c\n2\ngrammar_glsl.c\n2\ngrammar_gn.c\n2\ngrammar_go.c\n2\ngrammar_gomod.c\n2\ngrammar_gotemplate.c\n2\ngrammar_graphql.c\n2\ngrammar_groovy.c\n2\ngrammar_hare.c\n2\ngrammar_haskell.c\n2\ngrammar_hcl.c\n2\ngrammar_hlsl.c\n2\ngrammar_html.c\n2\ngrammar_hyprlang.c\n2\ngrammar_ini.c\n2\ngrammar_ispc.c\n2\ngrammar_janet.c\n2\ngrammar_java.c\n2\ngrammar_javascript.c\n2\ngrammar_jinja2.c\n2\ngrammar_jsdoc.c\n2\ngrammar_json.c\n2\ngrammar_json5.c\n2\ngrammar_jsonnet.c\n2\ngrammar_julia.c\n2\ngrammar_just.c\n2\ngrammar_kconfig.c\n2\ngrammar_kdl.c\n2\ngrammar_kotlin.c\n2\ngrammar_lean.c\n2\ngrammar_linkerscript.c\n2\ngrammar_liquid.c\n2\ngrammar_llvm.c\n2\ngrammar_lua.c\n2\ngrammar_luau.c\n2\ngrammar_magma.c\n2\ngrammar_makefile.c\n2\ngrammar_markdown.c\n2\ngrammar_matlab.c\n2\ngrammar_mermaid.c\n2\ngrammar_meson.c\n2\ngrammar_mojo.c\n2\ngrammar_move.c\n2\ngrammar_nasm.c\n2\ngrammar_nickel.c\n2\ngrammar_nix.c\n2\ngrammar_objc.c\n2\ngrammar_objectscript_routine.c\n2\ngrammar_objectscript_udl.c\n2\ngrammar_ocaml.c\n2\ngrammar_odin.c\n2\ngrammar_pascal.c\n2\ngrammar_perl.c\n2\ngrammar_php.c\n2\ngrammar_pine.c\n2\ngrammar_pkl.c\n2\ngrammar_plsql.c\n2\ngrammar_po.c\n2\ngrammar_pony.c\n2\ngrammar_powershell.c\n2\ngrammar_prisma.c\n2\ngrammar_properties.c\n2\ngrammar_protobuf.c\n2\ngrammar_puppet.c\n2\ngrammar_purescript.c\n2\ngrammar_python.c\n2\ngrammar_qml.c\n2\ngrammar_r.c\n2\ngrammar_racket.c\n2\ngrammar_regex.c\n2\ngrammar_requirements.c\n2\ngrammar_rescript.c\n2\ngrammar_ron.c\n2\ngrammar_rst.c\n2\ngrammar_ruby.c\n2\ngrammar_rust.c\n2\ngrammar_scala.c\n2\ngrammar_scheme.c\n2\ngrammar_scss.c\n2\ngrammar_slang.c\n2\ngrammar_smali.c\n2\ngrammar_smithy.c\n2\ngrammar_solidity.c\n2\ngrammar_soql.c\n2\ngrammar_sosl.c\n2\ngrammar_sql.c\n2\ngrammar_squirrel.c\n2\ngrammar_sshconfig.c\n2\ngrammar_starlark.c\n2\ngrammar_svelte.c\n2\ngrammar_sway.c\n2\ngrammar_swift.c\n2\ngrammar_systemverilog.c\n2\ngrammar_tablegen.c\n2\ngrammar_tcl.c\n2\ngrammar_teal.c\n2\ngrammar_templ.c\n2\ngrammar_thrift.c\n2\ngrammar_tlaplus.c\n2\ngrammar_toml.c\n2\ngrammar_tsx.c\n2\ngrammar_typescript.c\n2\ngrammar_typst.c\n2\ngrammar_verilog.c\n2\ngrammar_vhdl.c\n2\ngrammar_vim.c\n2\ngrammar_vue.c\n2\ngrammar_wgsl.c\n2\ngrammar_wit.c\n2\ngrammar_wolfram.c\n2\ngrammar_xml.c\n2\ngrammar_yaml.c\n2\ngrammar_zig.c\n2\ngrammar_zsh.c\n2\nhelpers.c\n!\n69\nhelpers.h\n3\niris_export_xml.c\n25\niris_export_xml.h\n1\nlang_specs.c\n4\nlang_specs.h\n2\nlsp_all.c\n2\nlz4_store.c\n5\nlz4_store.h\n2\nmacro_table.c\n9\nmacro_table.h\n7\npreprocessor.cpp\n10\npreprocessor.h\n!\n2\nservice_patterns.c\n26\nservice_patterns.h\n2\nsqlite_writer.c\n164\nsqlite_writer.h\n2\nts_runtime.c\n2\nzstd_store.c\n6\nzstd_store.h\n2\n▸\nnode_modules/\n●\n0\n▾\npkg/\n●\n534\n▾\nchocolatey/\n●\n5\n▸\ntools/\n●\n4\n▾\nglama/\n12\nDockerfile\n4\nverify.sh\n8\n▾\ngo/\n187\n▸\ncmd/\n184\ngo.mod\n2\n▾\nhomebrew/\n6\n▸\nFormula/\n5\n▾\nnpm/\n97\n▸\ntest/\n28\nbin.js\n11\ninstall.js\n45\nREADME.md\n12\n▾\npypi/\n157\n▸\nsrc/\n92\n▸\ntests/\n34\npyproject.toml\n22\nREADME.md\n7\n▾\nscoop/\n15\ncodebase-memory-mcp.json\n15\n▾\nwinget/\n47\n▸\nmanifests/\n46\n▸\nprivate/\n●\n0\n▾\nscripts/\n●\n1180\n▾\nci/\n●\n257\nappend-legacy-alias-checksums.sh\n4\nappend-vt-notes.sh\n6\ncheck-binary-composition.sh\n!\n26\ncheck-glibc-compat.sh\n5\ncheck-virustotal.sh\n2\nclean-test-residue.ps1\n!\n4\nensure-defender.ps1\n3\nexclude-rescanned-selected-objects.sh\n9\nextract-release-archives.sh\n2\ngen-mcpb-registry-entries.sh\n2\ngenerate-sbom.py\n5\nlint-mem.sh\n3\nmsan-lane.sh\n8\nnew-protected-temp-root.ps1\n3\npreflight-docker.sh\n9\nprepare-release-candidates.sh\n38\npublish-legacy-aliases.sh\n6\npublish-vt-evidence.sh\n7\nREADME.md\n3\nrequire-all-green.sh\n2\nselect-release-candidates.py\n27\nsmoke-artifact.sh\n20\nstage-release-candidates.py\n24\ntest-package-wrappers.sh\n5\ntest-ui.sh\n3\nverify-release-selection.py\n26\nverify-shard-union.sh\n5\n▾\ngit-hooks/\n2\ncommit-msg\n2\n▾\nhooks/\n2\npre-commit\n2\naudit-grammar-security.sh\n13\naudit-license-provenance.py\n16\nbenchmark-index.sh\n16\nbenchmark-search-graph.sh\n6\nbuild.sh\n10\ncheck-dco.sh\n5\ncheck-lsp-originality.sh\n21\ncheck-no-test-skips.sh\n4\ncheck-nolint-whitelist.sh\n6\nclean.sh\n4\nclone-bench-repos.sh\n5\nembed-frontend.sh\n10\nenv.sh\n9\nextract_nomic_vectors.py\n20\ngen-py-stdlib.py\n20\ngen-third-party-notices.sh\n5\ngen-ui-licenses.py\n6\ngenerate-lang-code.py\n11\ninstall-git-hooks.sh\n4\nlicense-gate-check-npm.py\n6\nlicense-gate-check.py\n3\nlicense-gate.sh\n6\nlicense-policy.json\n6\nlint-mem-gate.py\n12\nlint-tidy-diff.sh\n11\nlint.sh\n6\nmemlab-drive.py\n4\nmemlab-report.py\n8\nmemlab.sh\n17\nmsan.sh\n8\nnew-languages.json\n12\npackage-release.sh\n26\npath-safety.sh\n4\nREADME.md\n6\nrepro.sh\n11\nrun-test-wave.py\n24\nrun-tests-parallel.sh\n32\nsecurity-audit.sh\n17\nsecurity-fuzz-random.sh\n12\nsecurity-fuzz.sh\n11\nsecurity-install.sh\n10\nsecurity-network-source-audit.py\n25\nsecurity-network.sh\n6\nsecurity-strings.sh\n11\nsecurity-ui.sh\n9\nsecurity-vendored.sh\n24\nsetup-windows.ps1\n!\n11\nsetup.sh\n23\nsmoke-fixture-server.py\n6\nsmoke-invariants.sh\n!\n54\nsmoke-local.sh\n21\nsmoke-test.sh\n150\nsoak-legs.sh\n8\nsoak-test.sh\n67\ntest_mcp_interactive.py\n15\ntest_mcp_rapid_init.py\n5\ntest-runtime.sh\n13\ntest-windows.ps1\n!\n3\ntest.sh\n11\nvendor-grammar.sh\n11\n▾\nsrc/\n●\n6871\n▾\ncli/\n●\n1222\nactivation_transaction.c\n!\n104\nactivation_transaction.h\n2\nagent_clients.c\n47\nagent_clients.h\n!\n2\nagent_profiles.c\n29\nagent_profiles.h\n!\n2\ncli.c\n!\n492\ncli.h\n11\nclient_adapter.c\n8\nclient_adapter.h\n4\nconfig_json_like.c\n!\n88\nconfig_json_like.h\n!\n2\nconfig_text_edit.c\n!\n65\nconfig_text_edit.h\n2\nconfig_toml_edit.c\n!\n106\nconfig_toml_edit.h\n!\n2\nconfig_yaml_edit.c\n!\n140\nconfig_yaml_edit.h\n!\n2\nhook_augment.c\n!\n80\nprogress_sink.c\n32\nprogress_sink.h\n2\n▾\ncypher/\n●\n218\ncypher.c\n!\n197\ncypher.h\n21\n▾\ndaemon/\n●\n1206\napplication_internal.h\n3\napplication.c\n241\napplication.h\n4\nbootstrap.c\n44\nbootstrap.h\n5\ndaemon.c\n88\ndaemon.h\n8\nfrontend.c\n41\nfrontend.h\n2\nhost_internal.h\n4\nhost.c\n88\nhost.h\n2\nipc_internal.h\n7\nipc.c\n!\n319\nipc.h\n3\nproject_lock.c\n17\nproject_lock.h\n2\nruntime.c\n!\n194\nruntime.h\n19\nservice_internal.h\n3\nservice.c\n46\nservice.h\n5\nversion_cohort.c\n59\nversion_cohort.h\n2\n▾\ndiscover/\n●\n112\ndiscover.c\n!\n49\ndiscover.h\n4\ngitignore.c\n21\nlanguage.c\n23\nuserconfig.c\n13\nuserconfig.h\n2\n▸\nfoundation/\n●\n968\n▸\ngit/\n●\n20\n▸\ngraph_buffer/\n103\n▸\nmcp/\n●\n605\n▸\npipeline/\n●\n1211\n▸\nsemantic/\n129\n▸\nsimhash/\n47\n▸\nstore/\n●\n383\n▸\ntraces/\n13\n▸\nui/\n●\n444\n▸\nwatcher/\n●\n79\nmain.c\n96\n▾\ntest-infrastructure/\n151\n▸\nvm/\n116\ndocker-compose.yml\n4\nDockerfile\n4\nladder.sh\n12\nREADME.md\n6\nrun.sh\n8\n▾\ntests/\n●\n11279\n▸\nfixtures/\n●\n30\n▸\nrepro/\n●\n1345\n▸\nwindows/\n109\ngrammar_cases.h\n3\nscale_contract.sh\n13\nsmoke_guard.sh\n9\ntest_ac.c\n24\ntest_activation_transaction.c\n41\ntest_agent_clients.c\n49\ntest_agent_profiles.c\n16\ntest_arena.c\n34\ntest_artifact.c\n46\ntest_ast_profile.c\n14\ntest_build_dir_safety.sh\n5\ntest_c_lsp.c\n770\ntest_call_reference_contract.c\n21\ntest_cli.c\n!\n357\ntest_complexity.c\n33\ntest_config_json_like.c\n42\ntest_config_text_edit.c\n36\ntest_config_toml_edit.c\n68\ntest_config_yaml_edit.c\n74\ntest_configlink.c\n19\ntest_convergence_probe.c\n60\ntest_cpp_index_hang.sh\n14\ntest_cross_repo.c\n21\ntest_cs_lsp_bench.c\n6\ntest_cs_lsp.c\n68\ntest_cypher.c\n204\ntest_daemon_application.c\n103\ntest_daemon_bootstrap.c\n44\ntest_daemon_frontend.c\n53\ntest_daemon_ipc.c\n!\n108\ntest_daemon_open_readiness.py\n22\ntest_daemon_runtime_contract.h\n6\ntest_daemon_runtime.c\n!\n124\ntest_daemon_smoke.py\n51\ntest_daemon_version.c\n28\ntest_daemon.c\n20\ntest_destructive_ordering_contract.sh\n4\ntest_diagnostics.c\n29\ntest_discover.c\n123\ntest_dump_verify_io.c\n11\ntest_dump_verify.c\n16\ntest_dyn_array.c\n29\ntest_edge_imports.c\n73\ntest_edge_structural.c\n43\ntest_edge_types_probe.c\n68\ntest_extraction_imports.c\n30\ntest_extraction_inheritance.c\n24\ntest_extraction.c\n370\ntest_fqn.c\n95\ntest_framework.h\n31\ntest_git_context.c\n8\ntest_gitignore.c\n28\ntest_go_lsp.c\n61\ntest_grammar_imports.c\n4\ntest_grammar_labels.c\n8\ntest_grammar_probe_a.c\n57\ntest_grammar_probe_b.c\n54\ntest_grammar_probe_c.c\n55\ntest_grammar_probe_d.c\n86\ntest_grammar_probe_e.c\n67\ntest_grammar_probe_f.c\n72\ntest_grammar_probe_g.c\n55\ntest_grammar_regression.c\n7\ntest_graph_buffer.c\n57\ntest_hash_table.c\n33\ntest_helpers.h\n14\ntest_hook_conflict_notice.sh\n10\ntest_httpd.c\n126\ntest_importance.c\n27\ntest_incremental.c\n196\ntest_index_format.c\n11\ntest_index_resilience.c\n!\n15\ntest_index_supervisor.c\n23\ntest_infrascan.c\n7\ntest_integration.c\n36\ntest_java_lsp_coverage.c\n293\ntest_java_lsp.c\n103\ntest_kotlin_lsp.c\n96\ntest_lang_contract.c\n68\ntest_language_count_contract.sh\n10\ntest_language.c\n234\ntest_lock_registry.c\n35\ntest_log.c\n25\ntest_lsp_resolution_probe.c\n103\ntest_lz4.c\n12\ntest_main.c\n32\ntest_makefile_ts_runtime_dependencies.sh\n7\ntest_matrix_known_classes.c\n52\ntest_matrix_new_constructs.c\n78\ntest_mcp.c\n!\n437\ntest_mcpb_bundle_contract.sh\n11\ntest_mcpb_registry_entries_contract.sh\n5\ntest_mem.c\n64\ntest_node_creation_probe.c\n92\ntest_nomic_blob_generator_contract.sh\n5\ntest_parallel_harness_contract.sh\n7\ntest_parallel.c\n125\ntest_parent_watchdog.sh\n9\ntest_parse_coverage.c\n35\ntest_path_alias.c\n!\n18\ntest_perl_lsp.c\n25\ntest_php_lsp.c\n289\ntest_pipeline.c\n372\ntest_platform.c\n44\ntest_private_file_lock.c\n22\ntest_project_lock.c\n5\ntest_py_lsp_bench.c\n6\ntest_py_lsp_scale.c\n7\ntest_py_lsp_stress.c\n49\ntest_py_lsp.c\n89\ntest_registry.c\n66\ntest_release_archive_extractor_contract.sh\n4\ntest_release_candidate_derivation_contract.sh\n14\ntest_release_gate_chain_contract.sh\n7\ntest_route_canon.c\n14\ntest_runtime_isolation_contract.sh\n17\ntest_rust_lsp.c\n535\ntest_scope.c\n17\ntest_script_exec_bit_contract.sh\n3\ntest_security_fuzz_harness.sh\n15\ntest_security_strings_allowlist.sh\n19\ntest_security.c\n60\ntest_semantic.c\n39\ntest_shell_line_endings.sh\n5\ntest_simhash.c\n37\ntest_slab_alloc.c\n17\ntest_smoke_fixture_contract.sh\n3\ntest_soak_daemon_recovery_contract.sh\n4\ntest_spawn_no_window_contract.sh\n3\ntest_sqlite_writer.c\n20\ntest_stack_overflow.c\n29\ntest_store_arch.c\n74\ntest_store_bulk.c\n9\ntest_store_checkpoint.c\n15\ntest_store_edges.c\n29\ntest_store_nodes.c\n74\ntest_store_pragmas.c\n15\ntest_store_search.c\n82\ntest_str_intern.c\n22\ntest_str_util.c\n70\ntest_subprocess.c\n49\ntest_traces.c\n35\ntest_ts_lsp.c\n316\ntest_type_rep.c\n22\ntest_ui_dev_proxy_security.sh\n4\ntest_ui.c\n!\n49\ntest_userconfig.c\n11\ntest_vendored_integrity_contract.sh\n8\ntest_venue_parity_contract.sh\n3\ntest_version_cohort.c\n31\ntest_version_metadata_contract.sh\n16\ntest_vm_worktree_manifest.sh\n15\ntest_vmem.c\n37\ntest_vt_candidate_selection_contract.sh\n7\ntest_vt_gate_policy_contract.sh\n21\ntest_vt_release_notes_contract.sh\n7\ntest_watcher_disabled.sh\n22\ntest_watcher.c\n111\ntest_windows_bundle_contract.sh\n3\ntest_worker_error_response.sh\n10\ntest_worker_pool.c\n!\n41\ntest_worker_watchdog.sh\n13\ntest_workspace.c\n26\ntest_yaml.c\n76\ntest_zstd.c\n8\n▾\ntools/\n●\n2221\n▸\ntree-sitter-arkts/\n●\n1197\n▸\ntree-sitter-chialisp/\n●\n203\n▸\ntree-sitter-form/\n●\n389\n▸\ntree-sitter-magma/\n●\n428\n▸\nvendored/\n●\n0\n.gitattributes\n2\n<python-builtins>\n12\nCODE_OF_CONDUCT.md\n14\nCONTRIBUTING.md\n19\nflake.nix\n8\nglama.json\n4\ninstall.ps1\n3\ninstall.sh\n2\nMAINTAINERS.md\n11\nREADME.md\n56\nSECURITY.md\n23\nserver.json\n17\nTHIRD_PARTY.md\n12\nIndex details\nsrc\n› daemon\n› service.c\nAsk about selection\n684\n685\n686\n687\n688\n689\n690\n691\n692\n693\n694\n695\n696\n697\n698\n699\n700\n701\n702\n703\n704\n705\n706\n707\n708\n709\n710\n711\n712\n713\n714\n715\n716\n717\n    }\n    BY_HANDLE_FILE_INFORMATION original_info;\n    HANDLE file = ReOpenFile(original, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,\n                             FILE_FLAG_SEQUENTIAL_SCAN);\n    BY_HANDLE_FILE_INFORMATION info;\n    LARGE_INTEGER before;\n    bool ok =\n        GetFileType(original) == FILE_TYPE_DISK &&\n        GetFileInformationByHandle(original, &original_info) != 0 &&\n        (original_info.dwFileAttributes &\n         (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&\n        file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK &&\n        GetFileInformationByHandle(file, &info) != 0 &&\n        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&\n        windows_same_file_identity(&original_info, &info) && GetFileSizeEx(file, &before) != 0 &&\n        before.QuadPart >= 0;\n    cbm_sha256_ctx context;\n    cbm_sha256_init(&context);\n    unsigned char buffer[DAEMON_SERVICE_IO_CAP];\n    uint64_t total = 0;\n    while (ok) {\n        DWORD count = 0;\n        if (!ReadFile(file, buffer, sizeof(buffer), &count, NULL)) {\n            ok = false;\n        } else if (count == 0) {\n            break;\n        } else {\n            cbm_sha256_update(&context, buffer, count);\n            total += count;\n        }\n    }\n    LARGE_INTEGER after;\n    BY_HANDLE_FILE_INFORMATION after_info;\n    ok = ok && GetFileSizeEx(file, &after) != 0 &&\nflow\nwalk\nchat\nbug hunt\nchange scope\nflow of cbm_daemon_build_fingerprint_native_file\nunfold\nSelected code\nPin\ncbm_daemon_build_fingerprint_native_file\nfunction\nsrc/daemon/service.c:675-730\nAsk about this\nShow in graph\nSelection context\n\ncbm_daemon_build_fingerprint_native_file\n\nGRAPH EVIDENCE\n\n2 indexed caller edges from 2 files reach this selection. Check these callers when changing its contract.\n\nStatic call path from main\n\nThis selection is reachable from an indexed entry candidate. This is static reachability, not an observed execution or data flow.\n\nStatic index edges. Open either declaration to inspect the source; a call edge does not prove runtime execution.\n\nmain\nFunction · src/main.c:2546\nCALLS →Edge #78123Site :2951\nhandle_subcommand\nFunction · src/main.c:1093\nhandle_subcommand\nFunction · src/main.c:1093\nCALLS →Edge #77986Site :5265\ncbm_cmd_install\nFunction · src/cli/cli.c:10426\ncbm_cmd_install\nFunction · src/cli/cli.c:10426\nCALLS →Edge #49212Site :10677\ncbm_daemon_build_fingerprint_file\nFunction · src/daemon/service.c:733\ncbm_daemon_build_fingerprint_file\nFunction · src/daemon/service.c:733\nCALLS →Edge #48273Site :418\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\n\n4 of 4 retained edges\n\nIncoming relationships · 2\nOutgoing relationships · 6\nOBSERVED AGENT ACTIVITY\n\nNo retained agent event names this file. Enable live activity to read the daemon's local event store.\n\nRead source evidence\nAssess change impact\nOutgoing calls\n6\nCalled by\n2\nReferences and environment\nNone found\nError types\nNone found\nRelated tests\nNone found\nFile imports\nNone found\nCall outline\nIndex limits\ngalaxy\nhierarchy\nshow legend\ncollapse galaxy\n5000 nodes, 1268 edges from /api/layout; 40226 nodes indexed, 5000 fit the 5000 node budget\n10 edge kinds\nfit view\n\nsrc/daemon/service.c is not in the loaded graph layout.\n\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 227
+            },
+            {
+              "text": "Selected code",
+              "y": 242
+            },
+            {
+              "text": "Selection context",
+              "y": 390
+            },
+            {
+              "text": "Outgoing calls",
+              "y": 0
+            },
+            {
+              "text": "Called by",
+              "y": 0
+            },
+            {
+              "text": "References and environment",
+              "y": 0
+            },
+            {
+              "text": "Error types",
+              "y": 0
+            },
+            {
+              "text": "Related tests",
+              "y": 0
+            },
+            {
+              "text": "File imports",
+              "y": 0
+            },
+            {
+              "text": "Steps in cbm_daemon_build_fingerprint_native_file",
+              "y": 1704
+            },
+            {
+              "text": "Architecture",
+              "y": 0
+            },
+            {
+              "text": "Repository map",
+              "y": 0
+            },
+            {
+              "text": "src/daemon",
+              "y": 0
+            },
+            {
+              "text": "Entry points and interfaces",
+              "y": 0
+            },
+            {
+              "text": "How this area connects",
+              "y": 0
+            },
+            {
+              "text": "Files",
+              "y": 0
+            },
+            {
+              "text": "src/daemon → src/foundation",
+              "y": 0
+            },
+            {
+              "text": "Modules",
+              "y": 0
+            },
+            {
+              "text": "Architecture layers",
+              "y": 0
+            },
+            {
+              "text": "Related communities",
+              "y": 0
+            },
+            {
+              "text": "Indexed files",
+              "y": 0
+            },
+            {
+              "text": "Languages",
+              "y": 0
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 0
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "selection-context",
+              "y": 375,
+              "height": 943
+            },
+            {
+              "type": "repo-map-evidence",
+              "y": 584,
+              "height": 548
+            },
+            {
+              "type": "repo-map-evidence",
+              "y": 1168,
+              "height": 366
+            },
+            {
+              "type": "repo-map-evidence",
+              "y": 1195,
+              "height": 901
+            },
+            {
+              "type": "repo-map",
+              "y": 0,
+              "height": 0
+            },
+            {
+              "type": "repo-map-evidence",
+              "y": 0,
+              "height": 0
+            }
+          ]
+        },
+        {
+          "name": "readme-entry",
+          "screenshot": "audit-after-readme-entry.png",
+          "at": "2026-09-09T20:27:03.049Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "explore",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:27:00 PM\nHistory (13 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\nservice.c\nx\nREADME.md\n●\nx\nEXPLORER\n▾\ncbm-pr2068/\n▸\n.git/\n●\n0\n▾\n.github/\n177\n▾\nISSUE_TEMPLATE/\n16\nbug_report.yml\n6\nconfig.yml\n4\nfeature_request.yml\n6\n▾\nworkflows/\n136\n_build.yml\n6\n_lint.yml\n6\n_security.yml\n6\n_smoke.yml\n6\n_soak.yml\n6\n_test.yml\n6\nbug-repro.yml\n6\ncache-warm.yml\n6\ncodeql.yml\n7\ndco.yml\n7\ndry-run.yml\n6\nfast-repro.yml\n6\nissue-labeler.yml\n6\nlabel-actions.yml\n6\nnightly-soak.yml\n6\npages.yml\n7\npr-acknowledgement.yml\n6\npr.yml\n7\nrelease.yml\n6\nscorecard.yml\n6\nsmoke.yml\n6\nstale.yml\n6\ndependabot.yml\n4\nissue-labeler.yml\n9\nlabel-actions.yml\n4\npr-acknowledgement.md\n2\npull_request_template.md\n4\n▸\nbuild/\n●\n0\n▾\ndocs/\n●\n386\n▾\ndevelopment/\n37\npr-2068-delivery.md\n9\npr-2068-error-repro.md\n7\npr-2068-research.md\n15\npr-2068-worklog.md\n6\nBENCHMARK.md\n52\ncbmignore.md\n7\nCONFIGURATION.md\n14\nEVALUATION_PLAN.md\n209\ngraph-ui-screenshot.png\n-\n0\nindex.html\n2\nMEASURING_SAVINGS.md\n11\nRUNTIME_TRACE_MODEL.md\n37\nSECURITY-DISCLOSURE.md\n9\nsitemap.xml\n7\n▾\ngraph-ui/\n●\n14168\n▾\nagents/\n33\n▸\nhooks/\n32\n▸\ndesign/\n●\n0\n▸\ndist/\n●\n0\n▾\ndocs/\n15\n▸\nadr/\n14\n▾\neval/\n9\nquestions.json\n9\n▾\nfixtures/\n195\n▸\nagent-events/\n9\n▸\natlas-sample/\n69\n▸\natlas-sample-large/\n114\n▾\nllm/\n35\nfetch-model.sh\n10\nstart.sh\n19\nstop.sh\n6\n▸\nnode_modules/\n●\n0\n▾\nspike/\n12\nindex.html\n2\nspike.js\n10\n▾\nsrc/\n●\n5236\n▸\nagents/\n312\n▸\napp/\n332\n▸\narchitecture/\n98\n▸\nbrowser-ai/\n195\n▸\nchat/\n112\n▸\nchecklist/\n35\n▸\ncompiler/\n180\n▸\ncore/\n113\n▸\ndiagnostics/\n44\n▸\nentry/\n30\n▸\ngalaxy/\n●\n463\n▸\nhelp/\n19\n▸\ni18n/\n82\n▸\nimpact/\n204\n▸\nir/\n55\n▸\nlayout/\n82\n▸\nllm/\n91\n▸\nprojects/\n103\n▸\nprovider/\n341\n▸\npseudocode/\n385\n▸\nreader/\n76\n▸\nsearch/\n107\n▸\nsettings/\n61\n▸\nstyles/\n6\n▸\nsystem/\n48\n▸\ntest-support/\n32\n▸\ntours/\n111\n▸\ntraces/\n136\n▸\ntwin/\n1187\n▸\nui/\n47\n▸\nwhy/\n53\nApp.tsx\n62\nmain.tsx\n3\n▾\ntests/\n180\n▸\nscaffold/\n179\n▾\ntools/\n1665\n▸\nlib/\n118\nagent-bridge.mjs\n21\nagent-bridge.test.mjs\n9\ncapture-pr2068-baseline.mjs\n6\ncapture-pr2068-current.mjs\n5\neval-check.mjs\n20\neval-llm.mjs\n20\nfreshclone-check.mjs\n12\nnet-deny-gate.mjs\n15\nnet-deny-gate.test.mjs\n9\npr-2068-agents-e2e.mjs\n21\npr-2068-errors-e2e.mjs\n22\npr-2068-map-e2e.mjs\n9\npromise-scan.mjs\n18\nrecord-demo.mjs\n56\nrelease-gate.mjs\n28\nsmoke-spike.mjs\n32\nsmoke-w1.mjs\n15\nsmoke-w10.mjs\n87\nsmoke-w10b.mjs\n49\nsmoke-w11a.mjs\n58\nsmoke-w11b.mjs\n72\nsmoke-w12.mjs\n112\nsmoke-w12a.mjs\n18\nsmoke-w13.mjs\n36\nsmoke-w14.mjs\n40\nsmoke-w15.mjs\n21\nsmoke-w1b.mjs\n18\nsmoke-w2a.mjs\n25\nsmoke-w2b.mjs\n25\nsmoke-w3.mjs\n22\nsmoke-w4a.mjs\n28\nsmoke-w4b.mjs\n36\nsmoke-w4c.mjs\n27\nsmoke-w4d.mjs\n35\nsmoke-w4e.mjs\n30\nsmoke-w5a.mjs\n30\nsmoke-w5b.mjs\n41\nsmoke-w5c.mjs\n43\nsmoke-w6-full.mjs\n53\nsmoke-w7a.mjs\n29\nsmoke-w7b.mjs\n37\nsmoke-w7c.mjs\n45\nsmoke-w8.mjs\n50\nsmoke-w8b.mjs\n51\nsmoke-w8c.mjs\n31\nsmoke-w9.mjs\n48\nstyle-gate.mjs\n13\nverify-models.mjs\n18\n▸\nvendor/\n●\n0\n▾\nverification/\n●\n6693\n▸\npr-2068/\n●\n558\n▸\nw0/\n●\n31\n▸\nw1/\n113\n▸\nw10/\n●\n448\n▸\nw10b/\n●\n215\n▸\nw11/\n●\n646\n▸\nw12/\n●\n567\n▸\nw12a/\n●\n44\n▸\nw13/\n●\n184\n▸\nw14/\n●\n106\n▸\nw15/\n●\n87\n▸\nw2/\n●\n199\n▸\nw3/\n●\n94\n▸\nw4/\n●\n729\n▸\nw5/\n●\n579\n▸\nw6/\n●\n732\n▸\nw7/\n●\n542\n▸\nw8/\n●\n219\n▸\nw8b/\n●\n244\n▸\nw8c/\n●\n158\n▸\nw9/\n●\n177\nindex.html\n2\nINVENTAR.md\n12\nPLAN.md\n14\nREADME.md\n9\nTHIRD_PARTY.md\n11\ntsconfig.node.json\n17\ntsconfig.node.tsbuildinfo\n-\n0\ntsconfig.tsbuildinfo\n-\n0\nUPSTREAM-ASKS.md\n11\nvite.config.ts\n9\n▾\ninternal/\n●\n2917\n▾\ncbm/\n●\n2916\n▸\nlsp/\n●\n1256\n▸\nvendored/\n●\n0\nac.c\n39\nac.h\n2\narena.c\n9\narena.h\n4\ncbm.c\n96\ncbm.h\n43\nextract_calls.c\n139\nextract_channels.c\n42\nextract_dbt.c\n8\nextract_defs.c\n221\nextract_env_accesses.c\n9\nextract_imports.c\n105\nextract_k8s.c\n14\nextract_node_stack.h\n7\nextract_semantic.c\n15\nextract_type_assigns.c\n13\nextract_type_refs.c\n18\nextract_unified.c\n81\nextract_unified.h\n17\nextract_usages.c\n108\ngrammar_ada.c\n2\ngrammar_agda.c\n2\ngrammar_apex.c\n2\ngrammar_arkts.c\n2\ngrammar_assembly.c\n2\ngrammar_astro.c\n2\ngrammar_awk.c\n2\ngrammar_bash.c\n2\ngrammar_beancount.c\n2\ngrammar_bibtex.c\n2\ngrammar_bicep.c\n2\ngrammar_bitbake.c\n2\ngrammar_blade.c\n2\ngrammar_c_sharp.c\n2\ngrammar_c.c\n2\ngrammar_cairo.c\n2\ngrammar_capnp.c\n2\ngrammar_cfml.c\n2\ngrammar_cfscript.c\n2\ngrammar_chialisp.c\n2\ngrammar_clojure.c\n2\ngrammar_cmake.c\n2\ngrammar_cobol.c\n2\ngrammar_commonlisp.c\n2\ngrammar_cpp.c\n2\ngrammar_crystal.c\n2\ngrammar_css.c\n2\ngrammar_csv.c\n2\ngrammar_cuda.c\n2\ngrammar_d.c\n2\ngrammar_dart.c\n2\ngrammar_devicetree.c\n2\ngrammar_diff.c\n2\ngrammar_dockerfile.c\n2\ngrammar_dotenv.c\n2\ngrammar_elisp.c\n2\ngrammar_elixir.c\n2\ngrammar_elm.c\n2\ngrammar_erlang.c\n2\ngrammar_fennel.c\n2\ngrammar_fish.c\n2\ngrammar_form.c\n2\ngrammar_fortran.c\n2\ngrammar_fsharp.c\n2\ngrammar_func.c\n2\ngrammar_gdscript.c\n2\ngrammar_gitattributes.c\n2\ngrammar_gitignore.c\n2\ngrammar_gleam.c\n2\ngrammar_glsl.c\n2\ngrammar_gn.c\n2\ngrammar_go.c\n2\ngrammar_gomod.c\n2\ngrammar_gotemplate.c\n2\ngrammar_graphql.c\n2\ngrammar_groovy.c\n2\ngrammar_hare.c\n2\ngrammar_haskell.c\n2\ngrammar_hcl.c\n2\ngrammar_hlsl.c\n2\ngrammar_html.c\n2\ngrammar_hyprlang.c\n2\ngrammar_ini.c\n2\ngrammar_ispc.c\n2\ngrammar_janet.c\n2\ngrammar_java.c\n2\ngrammar_javascript.c\n2\ngrammar_jinja2.c\n2\ngrammar_jsdoc.c\n2\ngrammar_json.c\n2\ngrammar_json5.c\n2\ngrammar_jsonnet.c\n2\ngrammar_julia.c\n2\ngrammar_just.c\n2\ngrammar_kconfig.c\n2\ngrammar_kdl.c\n2\ngrammar_kotlin.c\n2\ngrammar_lean.c\n2\ngrammar_linkerscript.c\n2\ngrammar_liquid.c\n2\ngrammar_llvm.c\n2\ngrammar_lua.c\n2\ngrammar_luau.c\n2\ngrammar_magma.c\n2\ngrammar_makefile.c\n2\ngrammar_markdown.c\n2\ngrammar_matlab.c\n2\ngrammar_mermaid.c\n2\ngrammar_meson.c\n2\ngrammar_mojo.c\n2\ngrammar_move.c\n2\ngrammar_nasm.c\n2\ngrammar_nickel.c\n2\ngrammar_nix.c\n2\ngrammar_objc.c\n2\ngrammar_objectscript_routine.c\n2\ngrammar_objectscript_udl.c\n2\ngrammar_ocaml.c\n2\ngrammar_odin.c\n2\ngrammar_pascal.c\n2\ngrammar_perl.c\n2\ngrammar_php.c\n2\ngrammar_pine.c\n2\ngrammar_pkl.c\n2\ngrammar_plsql.c\n2\ngrammar_po.c\n2\ngrammar_pony.c\n2\ngrammar_powershell.c\n2\ngrammar_prisma.c\n2\ngrammar_properties.c\n2\ngrammar_protobuf.c\n2\ngrammar_puppet.c\n2\ngrammar_purescript.c\n2\ngrammar_python.c\n2\ngrammar_qml.c\n2\ngrammar_r.c\n2\ngrammar_racket.c\n2\ngrammar_regex.c\n2\ngrammar_requirements.c\n2\ngrammar_rescript.c\n2\ngrammar_ron.c\n2\ngrammar_rst.c\n2\ngrammar_ruby.c\n2\ngrammar_rust.c\n2\ngrammar_scala.c\n2\ngrammar_scheme.c\n2\ngrammar_scss.c\n2\ngrammar_slang.c\n2\ngrammar_smali.c\n2\ngrammar_smithy.c\n2\ngrammar_solidity.c\n2\ngrammar_soql.c\n2\ngrammar_sosl.c\n2\ngrammar_sql.c\n2\ngrammar_squirrel.c\n2\ngrammar_sshconfig.c\n2\ngrammar_starlark.c\n2\ngrammar_svelte.c\n2\ngrammar_sway.c\n2\ngrammar_swift.c\n2\ngrammar_systemverilog.c\n2\ngrammar_tablegen.c\n2\ngrammar_tcl.c\n2\ngrammar_teal.c\n2\ngrammar_templ.c\n2\ngrammar_thrift.c\n2\ngrammar_tlaplus.c\n2\ngrammar_toml.c\n2\ngrammar_tsx.c\n2\ngrammar_typescript.c\n2\ngrammar_typst.c\n2\ngrammar_verilog.c\n2\ngrammar_vhdl.c\n2\ngrammar_vim.c\n2\ngrammar_vue.c\n2\ngrammar_wgsl.c\n2\ngrammar_wit.c\n2\ngrammar_wolfram.c\n2\ngrammar_xml.c\n2\ngrammar_yaml.c\n2\ngrammar_zig.c\n2\ngrammar_zsh.c\n2\nhelpers.c\n!\n69\nhelpers.h\n3\niris_export_xml.c\n25\niris_export_xml.h\n1\nlang_specs.c\n4\nlang_specs.h\n2\nlsp_all.c\n2\nlz4_store.c\n5\nlz4_store.h\n2\nmacro_table.c\n9\nmacro_table.h\n7\npreprocessor.cpp\n10\npreprocessor.h\n!\n2\nservice_patterns.c\n26\nservice_patterns.h\n2\nsqlite_writer.c\n164\nsqlite_writer.h\n2\nts_runtime.c\n2\nzstd_store.c\n6\nzstd_store.h\n2\n▸\nnode_modules/\n●\n0\n▾\npkg/\n●\n534\n▾\nchocolatey/\n●\n5\n▸\ntools/\n●\n4\n▾\nglama/\n12\nDockerfile\n4\nverify.sh\n8\n▾\ngo/\n187\n▸\ncmd/\n184\ngo.mod\n2\n▾\nhomebrew/\n6\n▸\nFormula/\n5\n▾\nnpm/\n97\n▸\ntest/\n28\nbin.js\n11\ninstall.js\n45\nREADME.md\n12\n▾\npypi/\n157\n▸\nsrc/\n92\n▸\ntests/\n34\npyproject.toml\n22\nREADME.md\n7\n▾\nscoop/\n15\ncodebase-memory-mcp.json\n15\n▾\nwinget/\n47\n▸\nmanifests/\n46\n▸\nprivate/\n●\n0\n▾\nscripts/\n●\n1180\n▾\nci/\n●\n257\nappend-legacy-alias-checksums.sh\n4\nappend-vt-notes.sh\n6\ncheck-binary-composition.sh\n!\n26\ncheck-glibc-compat.sh\n5\ncheck-virustotal.sh\n2\nclean-test-residue.ps1\n!\n4\nensure-defender.ps1\n3\nexclude-rescanned-selected-objects.sh\n9\nextract-release-archives.sh\n2\ngen-mcpb-registry-entries.sh\n2\ngenerate-sbom.py\n5\nlint-mem.sh\n3\nmsan-lane.sh\n8\nnew-protected-temp-root.ps1\n3\npreflight-docker.sh\n9\nprepare-release-candidates.sh\n38\npublish-legacy-aliases.sh\n6\npublish-vt-evidence.sh\n7\nREADME.md\n3\nrequire-all-green.sh\n2\nselect-release-candidates.py\n27\nsmoke-artifact.sh\n20\nstage-release-candidates.py\n24\ntest-package-wrappers.sh\n5\ntest-ui.sh\n3\nverify-release-selection.py\n26\nverify-shard-union.sh\n5\n▾\ngit-hooks/\n2\ncommit-msg\n2\n▾\nhooks/\n2\npre-commit\n2\naudit-grammar-security.sh\n13\naudit-license-provenance.py\n16\nbenchmark-index.sh\n16\nbenchmark-search-graph.sh\n6\nbuild.sh\n10\ncheck-dco.sh\n5\ncheck-lsp-originality.sh\n21\ncheck-no-test-skips.sh\n4\ncheck-nolint-whitelist.sh\n6\nclean.sh\n4\nclone-bench-repos.sh\n5\nembed-frontend.sh\n10\nenv.sh\n9\nextract_nomic_vectors.py\n20\ngen-py-stdlib.py\n20\ngen-third-party-notices.sh\n5\ngen-ui-licenses.py\n6\ngenerate-lang-code.py\n11\ninstall-git-hooks.sh\n4\nlicense-gate-check-npm.py\n6\nlicense-gate-check.py\n3\nlicense-gate.sh\n6\nlicense-policy.json\n6\nlint-mem-gate.py\n12\nlint-tidy-diff.sh\n11\nlint.sh\n6\nmemlab-drive.py\n4\nmemlab-report.py\n8\nmemlab.sh\n17\nmsan.sh\n8\nnew-languages.json\n12\npackage-release.sh\n26\npath-safety.sh\n4\nREADME.md\n6\nrepro.sh\n11\nrun-test-wave.py\n24\nrun-tests-parallel.sh\n32\nsecurity-audit.sh\n17\nsecurity-fuzz-random.sh\n12\nsecurity-fuzz.sh\n11\nsecurity-install.sh\n10\nsecurity-network-source-audit.py\n25\nsecurity-network.sh\n6\nsecurity-strings.sh\n11\nsecurity-ui.sh\n9\nsecurity-vendored.sh\n24\nsetup-windows.ps1\n!\n11\nsetup.sh\n23\nsmoke-fixture-server.py\n6\nsmoke-invariants.sh\n!\n54\nsmoke-local.sh\n21\nsmoke-test.sh\n150\nsoak-legs.sh\n8\nsoak-test.sh\n67\ntest_mcp_interactive.py\n15\ntest_mcp_rapid_init.py\n5\ntest-runtime.sh\n13\ntest-windows.ps1\n!\n3\ntest.sh\n11\nvendor-grammar.sh\n11\n▾\nsrc/\n●\n6871\n▾\ncli/\n●\n1222\nactivation_transaction.c\n!\n104\nactivation_transaction.h\n2\nagent_clients.c\n47\nagent_clients.h\n!\n2\nagent_profiles.c\n29\nagent_profiles.h\n!\n2\ncli.c\n!\n492\ncli.h\n11\nclient_adapter.c\n8\nclient_adapter.h\n4\nconfig_json_like.c\n!\n88\nconfig_json_like.h\n!\n2\nconfig_text_edit.c\n!\n65\nconfig_text_edit.h\n2\nconfig_toml_edit.c\n!\n106\nconfig_toml_edit.h\n!\n2\nconfig_yaml_edit.c\n!\n140\nconfig_yaml_edit.h\n!\n2\nhook_augment.c\n!\n80\nprogress_sink.c\n32\nprogress_sink.h\n2\n▾\ncypher/\n●\n218\ncypher.c\n!\n197\ncypher.h\n21\n▾\ndaemon/\n●\n1206\napplication_internal.h\n3\napplication.c\n241\napplication.h\n4\nbootstrap.c\n44\nbootstrap.h\n5\ndaemon.c\n88\ndaemon.h\n8\nfrontend.c\n41\nfrontend.h\n2\nhost_internal.h\n4\nhost.c\n88\nhost.h\n2\nipc_internal.h\n7\nipc.c\n!\n319\nipc.h\n3\nproject_lock.c\n17\nproject_lock.h\n2\nruntime.c\n!\n194\nruntime.h\n19\nservice_internal.h\n3\nservice.c\n46\nservice.h\n5\nversion_cohort.c\n59\nversion_cohort.h\n2\n▾\ndiscover/\n●\n112\ndiscover.c\n!\n49\ndiscover.h\n4\ngitignore.c\n21\nlanguage.c\n23\nuserconfig.c\n13\nuserconfig.h\n2\n▸\nfoundation/\n●\n968\n▸\ngit/\n●\n20\n▸\ngraph_buffer/\n103\n▸\nmcp/\n●\n605\n▸\npipeline/\n●\n1211\n▸\nsemantic/\n129\n▸\nsimhash/\n47\n▸\nstore/\n●\n383\n▸\ntraces/\n13\n▸\nui/\n●\n444\n▸\nwatcher/\n●\n79\nmain.c\n96\n▾\ntest-infrastructure/\n151\n▸\nvm/\n116\ndocker-compose.yml\n4\nDockerfile\n4\nladder.sh\n12\nREADME.md\n6\nrun.sh\n8\n▾\ntests/\n●\n11279\n▸\nfixtures/\n●\n30\n▸\nrepro/\n●\n1345\n▸\nwindows/\n109\ngrammar_cases.h\n3\nscale_contract.sh\n13\nsmoke_guard.sh\n9\ntest_ac.c\n24\ntest_activation_transaction.c\n41\ntest_agent_clients.c\n49\ntest_agent_profiles.c\n16\ntest_arena.c\n34\ntest_artifact.c\n46\ntest_ast_profile.c\n14\ntest_build_dir_safety.sh\n5\ntest_c_lsp.c\n770\ntest_call_reference_contract.c\n21\ntest_cli.c\n!\n357\ntest_complexity.c\n33\ntest_config_json_like.c\n42\ntest_config_text_edit.c\n36\ntest_config_toml_edit.c\n68\ntest_config_yaml_edit.c\n74\ntest_configlink.c\n19\ntest_convergence_probe.c\n60\ntest_cpp_index_hang.sh\n14\ntest_cross_repo.c\n21\ntest_cs_lsp_bench.c\n6\ntest_cs_lsp.c\n68\ntest_cypher.c\n204\ntest_daemon_application.c\n103\ntest_daemon_bootstrap.c\n44\ntest_daemon_frontend.c\n53\ntest_daemon_ipc.c\n!\n108\ntest_daemon_open_readiness.py\n22\ntest_daemon_runtime_contract.h\n6\ntest_daemon_runtime.c\n!\n124\ntest_daemon_smoke.py\n51\ntest_daemon_version.c\n28\ntest_daemon.c\n20\ntest_destructive_ordering_contract.sh\n4\ntest_diagnostics.c\n29\ntest_discover.c\n123\ntest_dump_verify_io.c\n11\ntest_dump_verify.c\n16\ntest_dyn_array.c\n29\ntest_edge_imports.c\n73\ntest_edge_structural.c\n43\ntest_edge_types_probe.c\n68\ntest_extraction_imports.c\n30\ntest_extraction_inheritance.c\n24\ntest_extraction.c\n370\ntest_fqn.c\n95\ntest_framework.h\n31\ntest_git_context.c\n8\ntest_gitignore.c\n28\ntest_go_lsp.c\n61\ntest_grammar_imports.c\n4\ntest_grammar_labels.c\n8\ntest_grammar_probe_a.c\n57\ntest_grammar_probe_b.c\n54\ntest_grammar_probe_c.c\n55\ntest_grammar_probe_d.c\n86\ntest_grammar_probe_e.c\n67\ntest_grammar_probe_f.c\n72\ntest_grammar_probe_g.c\n55\ntest_grammar_regression.c\n7\ntest_graph_buffer.c\n57\ntest_hash_table.c\n33\ntest_helpers.h\n14\ntest_hook_conflict_notice.sh\n10\ntest_httpd.c\n126\ntest_importance.c\n27\ntest_incremental.c\n196\ntest_index_format.c\n11\ntest_index_resilience.c\n!\n15\ntest_index_supervisor.c\n23\ntest_infrascan.c\n7\ntest_integration.c\n36\ntest_java_lsp_coverage.c\n293\ntest_java_lsp.c\n103\ntest_kotlin_lsp.c\n96\ntest_lang_contract.c\n68\ntest_language_count_contract.sh\n10\ntest_language.c\n234\ntest_lock_registry.c\n35\ntest_log.c\n25\ntest_lsp_resolution_probe.c\n103\ntest_lz4.c\n12\ntest_main.c\n32\ntest_makefile_ts_runtime_dependencies.sh\n7\ntest_matrix_known_classes.c\n52\ntest_matrix_new_constructs.c\n78\ntest_mcp.c\n!\n437\ntest_mcpb_bundle_contract.sh\n11\ntest_mcpb_registry_entries_contract.sh\n5\ntest_mem.c\n64\ntest_node_creation_probe.c\n92\ntest_nomic_blob_generator_contract.sh\n5\ntest_parallel_harness_contract.sh\n7\ntest_parallel.c\n125\ntest_parent_watchdog.sh\n9\ntest_parse_coverage.c\n35\ntest_path_alias.c\n!\n18\ntest_perl_lsp.c\n25\ntest_php_lsp.c\n289\ntest_pipeline.c\n372\ntest_platform.c\n44\ntest_private_file_lock.c\n22\ntest_project_lock.c\n5\ntest_py_lsp_bench.c\n6\ntest_py_lsp_scale.c\n7\ntest_py_lsp_stress.c\n49\ntest_py_lsp.c\n89\ntest_registry.c\n66\ntest_release_archive_extractor_contract.sh\n4\ntest_release_candidate_derivation_contract.sh\n14\ntest_release_gate_chain_contract.sh\n7\ntest_route_canon.c\n14\ntest_runtime_isolation_contract.sh\n17\ntest_rust_lsp.c\n535\ntest_scope.c\n17\ntest_script_exec_bit_contract.sh\n3\ntest_security_fuzz_harness.sh\n15\ntest_security_strings_allowlist.sh\n19\ntest_security.c\n60\ntest_semantic.c\n39\ntest_shell_line_endings.sh\n5\ntest_simhash.c\n37\ntest_slab_alloc.c\n17\ntest_smoke_fixture_contract.sh\n3\ntest_soak_daemon_recovery_contract.sh\n4\ntest_spawn_no_window_contract.sh\n3\ntest_sqlite_writer.c\n20\ntest_stack_overflow.c\n29\ntest_store_arch.c\n74\ntest_store_bulk.c\n9\ntest_store_checkpoint.c\n15\ntest_store_edges.c\n29\ntest_store_nodes.c\n74\ntest_store_pragmas.c\n15\ntest_store_search.c\n82\ntest_str_intern.c\n22\ntest_str_util.c\n70\ntest_subprocess.c\n49\ntest_traces.c\n35\ntest_ts_lsp.c\n316\ntest_type_rep.c\n22\ntest_ui_dev_proxy_security.sh\n4\ntest_ui.c\n!\n49\ntest_userconfig.c\n11\ntest_vendored_integrity_contract.sh\n8\ntest_venue_parity_contract.sh\n3\ntest_version_cohort.c\n31\ntest_version_metadata_contract.sh\n16\ntest_vm_worktree_manifest.sh\n15\ntest_vmem.c\n37\ntest_vt_candidate_selection_contract.sh\n7\ntest_vt_gate_policy_contract.sh\n21\ntest_vt_release_notes_contract.sh\n7\ntest_watcher_disabled.sh\n22\ntest_watcher.c\n111\ntest_windows_bundle_contract.sh\n3\ntest_worker_error_response.sh\n10\ntest_worker_pool.c\n!\n41\ntest_worker_watchdog.sh\n13\ntest_workspace.c\n26\ntest_yaml.c\n76\ntest_zstd.c\n8\n▾\ntools/\n●\n2221\n▸\ntree-sitter-arkts/\n●\n1197\n▸\ntree-sitter-chialisp/\n●\n203\n▸\ntree-sitter-form/\n●\n389\n▸\ntree-sitter-magma/\n●\n428\n▸\nvendored/\n●\n0\n.gitattributes\n2\n<python-builtins>\n12\nCODE_OF_CONDUCT.md\n14\nCONTRIBUTING.md\n19\nflake.nix\n8\nglama.json\n4\ninstall.ps1\n3\ninstall.sh\n2\nMAINTAINERS.md\n11\nREADME.md\n56\nSECURITY.md\n23\nserver.json\n17\nTHIRD_PARTY.md\n12\nIndex details\nREADME.md\nAsk about selection\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n# codebase-memory-mcp\n[![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)\n[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)\n[![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)\n[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)\n[![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)\n[![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)\n[![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)\n[![Pure C](https://img.shields.io/badge/pure_C-no_language_runtime-blue)](https://github.com/DeusData/codebase-memory-mcp)\n[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)\n[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)\n[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)\n[![VirusTotal](https://img.shields.io/badge/VirusTotal-scanned_every_release-brightgreen?logo=virustotal)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)\n[![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)\n**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a native executable with a small verified runtime-asset set for macOS, Linux, and Windows — download, run `install`, done.\nHigh-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 162 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No language runtime, hosted service, or API key. Plug and play across 45 supported automatic/conditional client surfaces.\n> **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.\n> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp). For each release product, three behaviourally identical executable candidates (unstripped, debug-stripped, stripped) are submitted to VirusTotal before testing; the selected candidate is then packaged with its SHA-256 unchanged. Release notes link every measured candidate result. Publication permits only the narrowly documented single-Microsoft `!ml` tolerance in [SECURITY.md](SECURITY.md#our-release-policy). All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.\n<p align=\"center\">\n  <img src=\"docs/graph-ui-screenshot.png\" alt=\"Graph visualization UI showing the codebase-memory-mcp knowledge graph\" width=\"800\">\n  <br>\n  <em>Built-in 3D graph visualization — explore your knowledge graph at localhost:9749</em>\n</p>\n## Why codebase-memory-mcp\n- **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.\nflow\nwalk\nchat\nbug hunt\nchange scope\nno symbol in the twin\nunfold\nSelected code\nPin\nREADME.md\nAsk about this\nShow in graph\nSelection context\n\nREADME.md\n\nGRAPH EVIDENCE\n\nNo supported dependency edge for this selection is present in the loaded graph. Missing indexing or unresolved calls can hide connections; this does not establish low risk.\n\nOBSERVED AGENT ACTIVITY\n\nNo retained agent event names this file. Enable live activity to read the daemon's local event store.\n\nRead source evidence\nAssess change impact\nSymbols in this file\n\nNo symbols found in the current index.\n\nFile imports\nNone found\ngalaxy\nhierarchy\nshow legend\ncollapse galaxy\n5000 nodes, 1268 edges from /api/layout; 40226 nodes indexed, 5000 fit the 5000 node budget\n10 edge kinds\nfit view\nserver ready\nConnection details\nindexed: the graph carries this file and no source recorded an issue",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 227
+            },
+            {
+              "text": "Selected code",
+              "y": 242
+            },
+            {
+              "text": "Selection context",
+              "y": 368
+            },
+            {
+              "text": "Symbols in this file",
+              "y": 685
+            },
+            {
+              "text": "File imports",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 0
+            },
+            {
+              "text": "Repository map",
+              "y": 0
+            },
+            {
+              "text": "Where to start",
+              "y": 0
+            },
+            {
+              "text": "Connected areas",
+              "y": 0
+            },
+            {
+              "text": "Modules",
+              "y": 0
+            },
+            {
+              "text": "Architecture layers",
+              "y": 0
+            },
+            {
+              "text": "Related communities",
+              "y": 0
+            },
+            {
+              "text": "Indexed files",
+              "y": 0
+            },
+            {
+              "text": "Languages",
+              "y": 0
+            },
+            {
+              "text": "Symbol kinds",
+              "y": 0
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "selection-context",
+              "y": 353,
+              "height": 282
+            },
+            {
+              "type": "repo-map",
+              "y": 0,
+              "height": 0
+            }
+          ]
+        },
+        {
+          "name": "architecture-dependencies",
+          "screenshot": "audit-after-architecture-dependencies.png",
+          "at": "2026-09-09T20:27:06.725Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:27:03 PM\nHistory (13 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nCALLS BETWEEN GROUPS\n\nArrows follow indexed calls. Select a group to filter its relationships.\n\nfou\nfoundation\ndae\ndaemon\ncli\ncli\ncbm\ncbm\ntes\ntest_ui\nsto\nstore\nui\nui\ntes\ntest_config_text_edit\n\n8 groups in map · 2 more groups in the table\n\nRECORDED RELATIONSHIPS\nFrom\tTo\tCalls\tEvidence\ndaemon\tfoundation\t387\tInspect edges\ncbm\tfoundation\t180\tInspect edges\ncli\tfoundation\t141\tInspect edges\ntest_ui\tstore\t94\tInspect edges\ntest_ui\tui\t89\tInspect edges\ntest_config_text_edit\tcli\t47\tInspect edges\ntest_config_text_edit\ttest_helpers\t36\tInspect edges\ntest_grammar_probe_b\tcbm\t22\tInspect edges\ncli\tdaemon\t19\tInspect edges\ntest_ui\tfoundation\t19\tInspect edges\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Selection context",
+              "y": 0
+            },
+            {
+              "text": "Symbols in this file",
+              "y": 0
+            },
+            {
+              "text": "File imports",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 245
+            },
+            {
+              "text": "Calls between groups",
+              "y": 451
+            },
+            {
+              "text": "Recorded relationships",
+              "y": 878
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "selection-context",
+              "y": 0,
+              "height": 0
+            }
+          ]
+        },
+        {
+          "name": "architecture-entry-points",
+          "screenshot": "audit-after-architecture-entry-points.png",
+          "at": "2026-09-09T20:27:07.328Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:27:06 PM\nHistory (13 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nENTRY POINTS\n\nStarting points identified by the index.\n\nName\tSource\nmain\tgraph-ui/agents/hooks/atlas-trace.py\nstep001\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep002\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep003\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep004\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep005\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep006\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep007\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep008\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep009\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep010\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep011\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep012\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep013\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep014\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep015\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep016\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep017\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep018\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nstep019\tgraph-ui/fixtures/atlas-sample-large/src/big.ts\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Selection context",
+              "y": 0
+            },
+            {
+              "text": "Symbols in this file",
+              "y": 0
+            },
+            {
+              "text": "File imports",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 245
+            },
+            {
+              "text": "Entry points",
+              "y": 451
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "selection-context",
+              "y": 0,
+              "height": 0
+            }
+          ]
+        },
+        {
+          "name": "architecture-routes",
+          "screenshot": "audit-after-architecture-routes.png",
+          "at": "2026-09-09T20:27:07.772Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:27:06 PM\nHistory (13 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nROUTES\n\nRoute discovery depends on the indexed language. Source matches are labeled separately.\n\nMethod\tRoute\tHandler\tEvidence\tSource\nNot reported\t/{pk}/%s\tNot reported\tIndex\tNot reported\nNot reported\t/old/path\tNot reported\tIndex\tNot reported\nNot reported\t/new/path\tNot reported\tIndex\tNot reported\nNot reported\t/locations/\tNot reported\tIndex\tNot reported\nNot reported\t/html/g\tNot reported\tIndex\tNot reported\nNot reported\t/api/orders\tNot reported\tIndex\tNot reported\nNot reported\t/api/layout\tNot reported\tIndex\tNot reported\nNot reported\t/assets/index-abc.js\tNot reported\tIndex\tNot reported\nNot reported\t/api/browse\tNot reported\tIndex\tNot reported\nNot reported\t/api/project\tNot reported\tIndex\tNot reported\nNot reported\t/src/config.ts\tNot reported\tIndex\tNot reported\nNot reported\t/api/index\tNot reported\tIndex\tNot reported\nNot reported\t/api/index-status\tNot reported\tIndex\tNot reported\nNot reported\t/api/logs\tNot reported\tIndex\tNot reported\nNot reported\t/api/agent-events\tNot reported\tIndex\tNot reported\nNot reported\t/api/processes\tNot reported\tIndex\tNot reported\nNot reported\t/src/main.go\tNot reported\tIndex\tNot reported\nNot reported\t/src/pkg\tNot reported\tIndex\tNot reported\nNot reported\t/foo/bar/\tNot reported\tIndex\tNot reported\nNot reported\t/a/b/c/d/e/f/g\tNot reported\tIndex\tNot reported\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Selection context",
+              "y": 0
+            },
+            {
+              "text": "Symbols in this file",
+              "y": 0
+            },
+            {
+              "text": "File imports",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 245
+            },
+            {
+              "text": "Routes",
+              "y": 451
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "selection-context",
+              "y": 0,
+              "height": 0
+            }
+          ]
+        },
+        {
+          "name": "architecture-hotspots",
+          "screenshot": "audit-after-architecture-hotspots.png",
+          "at": "2026-09-09T20:27:08.297Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "architecture",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:27:06 PM\nHistory (13 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ncbm-pr2068\nArchitecture\n\nUnderstand the structure. Follow the evidence.\n\nRead by import order\nRefresh\nOverview\nDependencies\nEntry points\nRoutes\nHotspots\nView saved on this device\nReset view\nHOTSPOTS\n\nMeasured signals to help choose what to inspect. These are not a quality score.\n\nName\tCallers\tComplexity\tCognitive\tLoop depth\tSignals\tSource\ncbm_free_result\t3,089\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_close\t704\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_mkdtemp\t615\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_mcp_server_free\t311\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_upsert_project\t309\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_node_text\t291\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_mcp_server_new\t253\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_open_memory\t244\tNot reported\tNot reported\tNot reported\t\n\tNot reported\npath\t228\tNot reported\tNot reported\tNot reported\t\n\tNot reported\ncbm_store_upsert_node\t226\tNot reported\tNot reported\tNot reported\t\n\tNot reported\nAbout this view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Selection context",
+              "y": 0
+            },
+            {
+              "text": "Symbols in this file",
+              "y": 0
+            },
+            {
+              "text": "File imports",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 245
+            },
+            {
+              "text": "Hotspots",
+              "y": 451
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "selection-context",
+              "y": 0,
+              "height": 0
+            }
+          ]
+        },
+        {
+          "name": "galaxy-overview",
+          "screenshot": "audit-after-galaxy-overview.png",
+          "at": "2026-09-09T20:27:12.807Z",
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "workspace": "galaxy",
+          "text": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n⌘ / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n⌄\nProject events · cbm-pr2068\nLast checked 10:27:10 PM\nHistory (13 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\ngalaxy\nhierarchy\nshow legend\nFind node / entry point\nCoverage shadow: 85 files, 41 folders with index gaps\n5,000 of 40,226 nodes · 1,268 relationships loaded\n10 edge kinds\nfit view\nserver ready\nConnection details",
+          "headings": [
+            {
+              "text": "CODEATLAS",
+              "y": 18
+            },
+            {
+              "text": "EXPLORER",
+              "y": 0
+            },
+            {
+              "text": "Selected code",
+              "y": 0
+            },
+            {
+              "text": "Selection context",
+              "y": 0
+            },
+            {
+              "text": "Symbols in this file",
+              "y": 0
+            },
+            {
+              "text": "File imports",
+              "y": 0
+            },
+            {
+              "text": "Architecture",
+              "y": 0
+            },
+            {
+              "text": "Hotspots",
+              "y": 0
+            },
+            {
+              "text": "Agent activity",
+              "y": 0
+            },
+            {
+              "text": "Event evidence",
+              "y": 0
+            },
+            {
+              "text": "System",
+              "y": 0
+            },
+            {
+              "text": "Processes",
+              "y": 0
+            },
+            {
+              "text": "Indexes",
+              "y": 0
+            },
+            {
+              "text": "Index activity",
+              "y": 0
+            },
+            {
+              "text": "Daemon log",
+              "y": 0
+            },
+            {
+              "text": "Local chat",
+              "y": 0
+            },
+            {
+              "text": "Ask about the code.",
+              "y": 0
+            },
+            {
+              "text": "Search and commands",
+              "y": 0
+            }
+          ],
+          "landmarks": [
+            {
+              "type": "selection-context",
+              "y": 0,
+              "height": 0
+            }
+          ]
+        }
+      ],
+      "pageErrors": [],
+      "failedRequests": [],
+      "entries": [
+        "AppFunction · graph-ui/src/App.tsx:750",
+        "mainFunction · src/main.c:2546",
+        "GalaxyPanelFunction · graph-ui/src/galaxy/GalaxyPanel.tsx:729",
+        "mainFunction · graph-ui/tools/smoke-w10.mjs:1187"
+      ],
+      "topAreas": [
+        "tests",
+        "internal/cbm",
+        "src/foundation",
+        "src/daemon",
+        "src/pipeline",
+        "src/store",
+        "src/cli",
+        "src/semantic",
+        "graph-ui",
+        "src/mcp",
+        "src/graph_buffer",
+        "src/ui"
+      ],
+      "completed": true
+    }
+  ],
+  "finishedAt": "2026-09-09T20:27:14.098Z"
+}

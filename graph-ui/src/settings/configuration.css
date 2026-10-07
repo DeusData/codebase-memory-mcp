@@ -1,0 +1,64 @@
+.atlas-config-action { border: 1px solid #9db4a92b; border-radius: 7px; padding: 8px 12px; background: #b7d6c609; color: #c5d8ce; font: inherit; cursor: pointer; }
+.atlas-config-action:hover, .atlas-config-action[aria-expanded="true"] { background: #a6d9c01a; border-color: #a6d9c05c; }
+.cbm-config-backdrop { position: fixed; inset: 0; z-index: 160; display: grid; place-items: center; padding: 32px; background: #030a07b8; backdrop-filter: blur(10px); }
+.cbm-config-dialog { width: min(100%, 1040px); height: min(88dvh, 920px); display: flex; flex-direction: column; min-height: 0; border: 1px solid #bfd3c933; border-radius: 16px; background: #111b17; color: #dce6e0; box-shadow: 0 28px 100px #0008; overflow: hidden; font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.cbm-config-dialog * { box-sizing: border-box; }
+.cbm-config-dialog :is(button,input,select) { font: inherit; }
+.cbm-config-dialog button { color: #d1dfd7; border: 1px solid #a2c0b330; border-radius: 6px; padding: 7px 11px; background: #bedbc60a; cursor: pointer; }
+.cbm-config-dialog button:hover:not(:disabled) { background: #bedbc61a; border-color: #a2c0b360; }
+.cbm-config-dialog button:disabled { opacity: .4; cursor: default; }
+.cbm-config-dialog :is(button,input,select,summary):focus-visible { outline: 2px solid #92bdaa; outline-offset: 3px; }
+.cbm-config-dialog :is(h2,h3,p) { margin: 0; }
+.cbm-config-heading { display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; padding: 23px 27px 17px; }
+.cbm-config-heading h2 { font: 500 23px/1.3 -apple-system, BlinkMacSystemFont, sans-serif; letter-spacing: -.5px; }
+.cbm-config-heading p { margin-top: 4px; color: #8fa69a; }
+.cbm-config-heading > button { font-size: 23px; padding: 0 10px; }
+.cbm-config-categories { display: flex; flex-wrap: wrap; gap: 5px; flex-shrink: 0; padding: 0 25px 16px; border-bottom: 1px solid #b2cbbc1a; }
+.cbm-config-categories button { border-color: transparent; background: transparent; color: #a0b5a9; }
+.cbm-config-categories button[aria-pressed="true"] { background: #a6d9c014; color: #d5eee1; border-color: #a6d9c028; }
+.cbm-config-content { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 21px 27px; }
+.cbm-config-scope { color: #92a99d; font-size: 12px; padding-bottom: 14px; }
+.cbm-config-setting { border-bottom: 1px solid #b2cbbc1a; padding: 18px 0; }
+.cbm-config-setting.is-changed { border-left: 2px solid #9cceb480; padding-left: 13px; }
+.cbm-config-setting-main { display: grid; grid-template-columns: minmax(0,1fr) minmax(150px, 240px); gap: 22px; align-items: start; }
+.cbm-config-setting-main label { font-size: 14px; font-weight: 500; color: #e2ece6; }
+.cbm-config-setting-main p { max-width: 63ch; color: #9aafa3; margin-top: 4px; font-size: 12px; }
+.cbm-config-value { display: flex; gap: 7px; align-items: center; justify-content: flex-end; }
+.cbm-config-dialog :is(input:not([type="checkbox"]),select) { color: #d8e4dd; background: #0a140f; border: 1px solid #abc7b733; border-radius: 6px; padding: 8px; width: 100%; min-width: 0; }
+.cbm-config-dialog input[type="checkbox"] { accent-color: #9ebdac; width: 15px; height: 15px; vertical-align: middle; margin: 0 7px 0 0; }
+.cbm-config-value > span { color: #9cb0a4; overflow-wrap: anywhere; }
+.cbm-config-value button { font-size: 11px; padding: 6px 8px; }
+.cbm-config-setting-meta { display: flex; flex-wrap: wrap; gap: 6px 13px; margin-top: 11px; font-size: 10px; color: #8aa195; }
+.cbm-config-setting-meta span:first-child { color: #b6cdbf; }
+.cbm-config-setting-details { margin-top: 9px; font-size: 11px; }
+.cbm-config-setting-details summary { color: #829b8d; cursor: pointer; width: fit-content; }
+.cbm-config-dialog dl { margin: 10px 0 0; }
+.cbm-config-dialog dl > div { display: grid; grid-template-columns: minmax(90px, 25%) 1fr; gap: 15px; padding: 5px 0; }
+.cbm-config-dialog dt { color: #96b0a1; overflow-wrap: anywhere; }
+.cbm-config-dialog dd { margin: 0; color: #b3c7bb; overflow-wrap: anywhere; white-space: pre-wrap; }
+.cbm-config-readonly { margin-top: 8px !important; color: #97a99e; font-size: 11px; }
+.cbm-config-error, .cbm-config-notice, .cbm-config-unsaved { padding: 12px; margin-bottom: 14px !important; background: #bc8e7010; color: #d1b8a7; border: 1px solid #ccac8330; border-radius: 7px; overflow-wrap: anywhere; }
+.cbm-config-error p { margin-top: 7px; font-size: 11px; }
+.cbm-config-notice { color: #b9d7c7; border-color: #a6d9c030; background: #a6d9c009; }
+.cbm-config-unsaved button { margin: 9px 8px 0 0; }
+.cbm-config-footer { display: flex; flex-shrink: 0; justify-content: space-between; gap: 12px; align-items: center; padding: 15px 25px; border-top: 1px solid #b2cbbc24; background: #0c1511; }
+.cbm-config-footer > span { color: #8aa194; font-size: 11px; }
+.cbm-config-footer > div { display: flex; gap: 9px; }
+.cbm-config-dialog .cbm-config-save { background: #a6d9c018; color: #cce8db; border-color: #a6d9c04d; }
+.cbm-config-browser > section { padding: 6px 0 22px; margin-bottom: 18px; border-bottom: 1px solid #b2cbbc1a; }
+.cbm-config-browser h3 { font-size: 16px; font-weight: 500; }
+.cbm-config-browser p, .cbm-config-reference p { color: #8fa69a; margin: 6px 0 13px; font-size: 12px; }
+.cbm-config-control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px 25px; margin: 16px 0; }
+.cbm-config-control-grid label { display: block; color: #b7cbbf; }
+.cbm-config-control-grid select { display: block; margin-top: 6px; }
+.cbm-config-control-grid small { display: block; color: #899f93; margin-top: 4px; }
+.cbm-config-reference details { margin: 13px 0; padding: 12px 15px; border: 1px solid #b2cbbc24; border-radius: 7px; }
+.cbm-config-reference summary { cursor: pointer; color: #c6d9ce; }
+.cbm-config-reference summary span { float: right; color: #839e8e; font-size: 10px; }
+.cbm-config-reference dl { font-size: 11px; }
+@media (max-width: 700px) { .cbm-config-backdrop { padding: 8px; } .cbm-config-dialog { height: 96dvh; border-radius: 10px; } .cbm-config-heading,.cbm-config-content { padding: 17px; } .cbm-config-categories { padding: 0 14px 12px; gap: 2px; } .cbm-config-setting-main { grid-template-columns: 1fr; gap: 11px; } .cbm-config-value { justify-content: flex-start; } .cbm-config-control-grid { grid-template-columns: 1fr; } .cbm-config-reference summary span { float: none; display: block; margin-top: 3px; } .cbm-config-footer { padding: 12px; } }
+.cbm-config-dialog.cbm-config-embedded { width: 100%; height: auto; min-height: 480px; border-radius: 9px; box-shadow: none; }
+.cbm-config-embedded .cbm-config-content { overflow: visible; }
+.cbm-config-embedded .cbm-config-footer { flex-wrap: wrap; }
+@media (max-width: 1000px) { .cbm-config-embedded .cbm-config-setting-main { grid-template-columns: 1fr; gap: 11px; }.cbm-config-embedded .cbm-config-value { justify-content: flex-start; }.cbm-config-embedded .cbm-config-control-grid { grid-template-columns: 1fr; } }
+@media (max-width: 550px) { .cbm-config-embedded .cbm-config-heading, .cbm-config-embedded .cbm-config-content { padding: 13px; }.cbm-config-embedded .cbm-config-categories { padding: 0 10px 10px; }.cbm-config-embedded .cbm-config-footer > div { flex-wrap: wrap; } }

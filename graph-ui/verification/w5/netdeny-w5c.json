@@ -1,0 +1,25 @@
+{
+  "command": "node tools/smoke-w5c.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 93,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 52678,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4361",
+      "seen": 4
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:54756",
+      "seen": 4
+    }
+  ],
+  "generatedAt": "2026-08-29T17:18:00.897Z"
+}

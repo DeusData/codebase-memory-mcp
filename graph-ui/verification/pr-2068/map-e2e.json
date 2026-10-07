@@ -1,0 +1,570 @@
+{
+  "origin": "http://127.0.0.1:9749",
+  "project": "cbm-pr2068",
+  "startedAt": "2026-09-09T19:55:00.021Z",
+  "screenshots": [
+    {
+      "file": "after-architecture.png",
+      "at": "2026-09-09T19:55:03.053Z"
+    },
+    {
+      "file": "after-project-readme.png",
+      "at": "2026-09-09T19:55:07.856Z"
+    },
+    {
+      "file": "after-architecture-relationship.png",
+      "at": "2026-09-09T19:55:13.642Z"
+    },
+    {
+      "file": "after-selection-context.png",
+      "at": "2026-09-09T19:55:15.457Z"
+    },
+    {
+      "file": "after-context-and-impact.png",
+      "at": "2026-09-09T19:55:15.521Z"
+    },
+    {
+      "file": "after-source-evidence.png",
+      "at": "2026-09-09T19:55:21.034Z"
+    }
+  ],
+  "checks": {
+    "realMap": "REPOSITORY MAP\n\nStart at an entry point, follow a component boundary, then inspect the symbols behind it.\n\nEvidence legend\n1,427 indexed files · 62,273 retained edges · snapshot and limits\nRepository\nWhere to start\n\nEntry candidates identified by the index; these are declarations, not a verified execution order.\n\nRead project README\nApp\nFunction · graph-ui/src/App.tsx:750\nmain\nFunction · src/main.c:2546\nGalaxyPanel\nFunction · graph-ui/src/galaxy/GalaxyPanel.tsx:729\nmain\nFunction · graph-ui/tools/smoke-w10.mjs:1187\nConnected areas\n\nGrouped by source location, ranked by recorded links across areas. Open an area to see its responsibilities through entry symbols, interfaces and connections.\n\nSOURCE AREA · INFERRED BOUNDARY\ntests\n174 files · 5 entry candidates · 9 exported symbols\nIncoming 54 ← · → Outgoing 11557\nmain · main · main\nSOURCE AREA · INFERRED BOUNDARY\ninternal/cbm\n248 files · 0 entry candidates · 2268 exported symbols\nIncoming 4553 ← · → Outgoing 1435\ncbm_free_result · cbm_node_text · cbm_arena_alloc\nSOURCE AREA · INFERRED BOUNDARY\nsrc/foundation\n65 files · 0 entry candidates · 574 exported symbols\nIncoming 4109 ← · → Outgoing 31\ncbm_mkdtemp · cbm_mutex_unlock · cbm_mutex_lock\nSOURCE AREA · INFERRED BOUNDARY\nsrc/daemon\n24 files · 0 entry candidates · 773 exported symbols\nIncoming 1382 ← · → Outgoing 570\ncbm_daemon_ipc_endpoint_free · cbm_daemon_ipc_endpoint_new · cbm_daemon_ipc_endpoint_runtime_dir\nSOURCE AREA · INFERRED BOUNDARY\nsrc/pipeline\n43 files · 0 entry candidates · 984 exported symbols\nIncoming 435 ← · → Outgoing 1442\ncbm_project_name_from_path · cbm_pipeline_fqn_compute · cbm_pipeline_fqn_module\nSOURCE AREA · INFERRED BOUNDARY\nsrc/store\n2 files · 0 entry candidates · 321 exported symbols\nIncoming 1308 ← · → Outgoing 99\ncbm_store_close · store_set_error_sqlite · bind_text\nSOURCE AREA · INFERRED BOUNDARY\nsrc/cli\n21 files · 0 entry candidates · 1036 exported symbols\nIncoming 1165 ← · → Outgoing 241\ncbm_install_agent_configs · stat · record_agent_config_error\nSOURCE AREA · INFERRED BOUNDARY\nsrc/semantic\n6 files · 0 entry candidates · 83 exported symbols\nIncoming 1137 ← · → Outgoing 36\ncbm_sem_normalize · cbm_ast_profile_from_str · cbm_ast_profile_to_vector\nSOURCE AREA · INFERRED BOUNDARY\ngraph-ui\n610 files · 967 entry candidates · 2399 exported symbols\nIncoming 579 ← · → Outgoing 212\nnormalize · sleep · weigh\nSOURCE AREA · INFERRED BOUNDARY\nsrc/mcp\n7 files · 0 entry candidates · 501 exported symbols\nIncoming 335 ← · → Outgoing 413\ncbm_mcp_handle_tool · cbm_mcp_server_new · cbm_mcp_server_free\nSOURCE AREA · INFERRED BOUNDARY\nsrc/graph_buffer\n2 files · 0 entry candidates · 76 exported symbols\nIncoming 611 ← · → Outgoing 101\ncbm_gbuf_upsert_node · cbm_gbuf_insert_edge · cbm_gbuf_free\nSOURCE AREA · INFERRED BOUNDARY\nsrc/ui\n22 files · 0 entry candidates · 312 exported symbols\nIncoming 218 ← · → Outgoing 352\ncbm_http_server_port · cbm_http_replyf · cbm_http_query_param\nAll 25 areas",
+    "readme": "Selected code\nPin\nREADME.md\nAsk about this\nShow in graph\nSelection context\n\nREADME.md\n\nGRAPH EVIDENCE\n\nNo supported dependency edge for this selection is present in the loaded graph. Missing indexing or unresolved calls can hide connections; this does not establish low risk.\n\nOBSERVED AGENT ACTIVITY\n\nNo retained agent event names this file. Enable live activity to read the daemon's local event store.\n\nRead source evidence\nAssess change impact\n\nReading selected code...\n\nSymbols in this file\n\nNo symbols found in the current index.",
+    "area": "REPOSITORY MAP\n\nStart at an entry point, follow a component boundary, then inspect the symbols behind it.\n\nEvidence legend\n1,427 indexed files · 62,273 retained edges · snapshot and limits\nRepository\n›\nsrc/daemon\nSRC/DAEMON\n\n24 files · 797 indexed nodes\n\nInferred role: internal. fan-in=19, fan-out=387\n\nEntry points and interfaces\ncbm_daemon_ipc_endpoint_free\nFunction · src/daemon/ipc.c:4814\ncbm_daemon_ipc_endpoint_new\nFunction · src/daemon/ipc.c:4722\ncbm_daemon_ipc_endpoint_runtime_dir\nFunction · src/daemon/ipc.c:4841\ncbm_daemon_application_new\nFunction · src/daemon/application.c:2909\ncbm_daemon_application_free\nFunction · src/daemon/application.c:3128\ncbm_daemon_application_shutdown\nFunction · src/daemon/application.c:2999\ncbm_daemon_ipc_startup_lock_try_acquire\nFunction · src/daemon/ipc.c:6087\ncbm_daemon_runtime_client_connect\nFunction · src/daemon/runtime.c:2752\nHow this area connects\nDepends on →\nUsed by ←\n\nCross-area edges grouped by relation kind. Counts are retained graph edges, not call frequency.\n\nsrc/foundation\nCALLS\n387 edges · inspect\nsrc/mcp\nCALLS\n55 edges · inspect\nsrc/foundation\nIMPORTS\n51 edges · inspect\nsrc/ui\nCALLS\n21 edges · inspect\nsrc/cli\nCALLS\n12 edges · inspect\ngraph-ui\nIMPORTS\n10 edges · inspect\nsrc/watcher\nCALLS\n9 edges · inspect\ngraph-ui\nCALLS\n5 edges · inspect\nsrc/mcp\nIMPORTS\n5 edges · inspect\nsrc/ui\nIMPORTS\n4 edges · inspect\nsrc/cli\nIMPORTS\n3 edges · inspect\nsrc/pipeline\nCALLS\n2 edges · inspect\nsrc/store\nCALLS\n2 edges · inspect\nsrc/watcher\nIMPORTS\n2 edges · inspect\nsrc/pipeline\nIMPORTS\n1 edges · inspect\nsrc/store\nIMPORTS\n1 edges · inspect\nFiles\nsrc/daemon/application.c\nsrc/daemon/application.h\nsrc/daemon/application_internal.h\nsrc/daemon/bootstrap.c\nsrc/daemon/bootstrap.h\nsrc/daemon/daemon.c\nsrc/daemon/daemon.h\nsrc/daemon/frontend.c\nsrc/daemon/frontend.h\nsrc/daemon/host.c\nsrc/daemon/host.h\nsrc/daemon/host_internal.h\nsrc/daemon/ipc.c\nsrc/daemon/ipc.h\nsrc/daemon/ipc_internal.h\nsrc/daemon/project_lock.c\nsrc/daemon/project_lock.h\nsrc/daemon/runtime.c\nsrc/daemon/runtime.h\nsrc/daemon/service.c\nsrc/daemon/service.h\nsrc/daemon/service_internal.h\nsrc/daemon/version_cohort.c\nsrc/daemon/version_cohort.h",
+    "relationship": "Static index edges. Open either declaration to inspect the source; a call edge does not prove runtime execution.\n\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48267Site :701\ncbm_sha256_init\nFunction · src/foundation/sha256.c:63\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48268Site :711\ncbm_sha256_update\nFunction · src/foundation/sha256.c:76\ncbm_daemon_build_fingerprint_native_file\nFunction · src/daemon/service.c:675\nCALLS →Edge #48269Site :728\ncbm_sha256_final\nFunction · src/foundation/sha256.c:88\ncbm_daemon_build_fingerprint_file\nFunction · src/daemon/service.c:733\nCALLS →Edge #48292Site :743\ncbm_path_to_wide\nFunction · src/foundation/win_utf8.h:120\nwindows_log_path_open\nFunction · src/daemon/service.c:806\nCALLS →Edge #48295Site :832\ncbm_path_to_wide\nFunction · src/foundation/win_utf8.h:120\ncbm_project_lock_manager_new\nFunction · src/daemon/project_lock.c:43\nCALLS →Edge #48337Site :61\ncbm_private_lock_directory_close\nFunction · src/foundation/private_file_lock.c:1503\ncbm_project_lock_manager_new\nFunction · src/daemon/project_lock.c:43\nCALLS →Edge #48338Site :57\ncbm_lock_registry_new\nFunction · src/foundation/lock_registry.c:319\ncbm_project_lock_lease_release\nFunction · src/daemon/project_lock.c:67\nCALLS →Edge #48339Site :80\ncbm_lock_lease_release\nFunction · src/foundation/lock_registry.c:772\nproject_lock_acquire_internal\nFunction · src/daemon/project_lock.c:109\nCALLS →Edge #48342Site :141\ncbm_lock_registry_try_acquire\nFunction · src/foundation/lock_registry.c:682\nproject_lock_acquire_internal\nFunction · src/daemon/project_lock.c:109\nCALLS →Edge #48343Site :143\ncbm_lock_registry_acquire\nFunction · src/foundation/lock_registry.c:674\ncbm_project_lock_request_cancel\nFunction · src/daemon/project_lock.c:168\nCALLS →Edge #48347Site :170\ncbm_lock_registry_request_cancel\nFunction · src/foundation/lock_registry.c:348\ncbm_project_lock_manager_free\nFunction · src/daemon/project_lock.c:174\nCALLS →Edge #48348Site :180\ncbm_lock_registry_free\nFunction · src/foundation/lock_registry.c:861\n\n12 of 387 retained edges\n\nMore evidence",
+    "selected": "SELECTED SYMBOL · SRC/DAEMON\nCBM_DAEMON_APPLICATION_NEW\nOpen source · src/daemon/application.c:2909\nSelection context\n\ncbm_daemon_application_new\n\nGRAPH EVIDENCE\n\n48 indexed caller edges from 3 files reach this selection. Check these callers when changing its contract.\n\nStatic call path from main\n\nThis selection is reachable from an indexed entry candidate. This is static reachability, not an observed execution or data flow.\n\nStatic index edges. Open either declaration to inspect the source; a call edge does not prove runtime execution.\n\nmain\nFunction · src/main.c:2546\nCALLS →Edge #78163Site :3002\ncbm_daemon_host_run\nFunction · src/daemon/host.c:948\ncbm_daemon_host_run\nFunction · src/daemon/host.c:948\nCALLS →Edge #58551Site :1028\nhost_state_prepare\nFunction · src/daemon/host.c:568\nhost_state_prepare\nFunction · src/daemon/host.c:568\nCALLS →Edge #58502Site :610\ncbm_daemon_application_new\nFunction · src/daemon/application.c:2909\n\n3 of 3 retained edges\n\nIncoming relationships · 48\nOutgoing relationships · 10\nOBSERVED AGENT ACTIVITY\n\nNo retained agent event names this file. Enable live activity to read the daemon's local event store.\n\nRead source evidence\nChange impact\n\nWho could be affected, and what to check next?\n\nRefresh analysis\n\ncbm_daemon_application_new\nsrc/daemon/application.c · selected symbol\n\nBroad impact · high review priority\n\nTransparent heuristic; no defect probability.\n\n50 direct and 64 total indexed dependents meet the broad-impact rule (10 direct or 25 total).\nData quality and revision · 6 limitations\n\nComputed 9/9/2026, 9:55:14 PM · cached for up to 30s.\nIndex: 2026-09-09T19:51:51Z · generation u0911bd5153455afeg2\nGit HEAD: 80f4f41f9bcb9daf60afc5f607bcbcba24a4b196\nScope: selected symbol; Git evidence is file-level.\nGraph scope: 1 starting nodes · at most 600 visited nodes · 60 returned findings.\n\nThe graph walk or evidence list reached a bound; further dependents may exist.\n281 persisted index coverage records identify excluded, unsupported, or partially indexed paths; inspect Diagnostics.\nThe index does not record a Git revision; equivalence to HEAD or the worktree is unverified.\nThe history scan reached a count, time, or file bound.\nFewer than 3 sampled ordinary commits touch this file; historical evidence is sparse.\nThe selected file has uncommitted changes; Git history describes committed versions, and graph freshness is unverified.\nInspect local indexing diagnostics\nStructural impact · indexed dependencies\n\n50 direct · 64 total dependents within 4 hops. CALLS means a static call relation; IMPORTS means an import dependency. Neither proves runtime execution or data flow.\n\nShowing 8 of 60 returned evidence paths.\n\nhost_state_preparedirect dependency\nsrc/daemon/host.c:568\nShow indexed path (1 edge)\ndaemon_application_new_session_does_not_retain_initial_storedirect dependency · test candidate (path heuristic)\ntests/test_daemon_application.c:291\nShow indexed path (1 edge)\ndaemon_application_request_cancel_is_scoped_to_exact_tokendirect dependency · test candidate (path heuristic)\ntests/test_daemon_application.c:312\nShow indexed path (1 edge)\ndaemon_application_ui_config_updates_are_masked_and_serializeddirect dependency · test candidate (path heuristic)\ntests/test_daemon_application.c:372\nShow indexed path (1 edge)\ndaemon_application_ui_config_rejects_noncanonical_framesdirect dependency · test candidate (path heuristic)\ntests/test_daemon_application.c:448\nShow indexed path (1 edge)\ndaemon_application_ui_readiness_proof_is_generation_bound_before_contextdirect dependency · test candidate (path heuristic)\ntests/test_daemon_application.c:520\nShow indexed path (1 edge)\ndaemon_application_requires_immutable_explicit_contextdirect dependency · test candidate (path heuristic)\ntests/test_daemon_application.c:659\nShow indexed path (1 edge)\ndaemon_application_accepts_utf8_session_context_rootdirect dependency · test candidate (path heuristic)\ntests/test_daemon_application.c:717\nShow indexed path (1 edge)\nShow more affected symbols (8 of 60)\nHistorical evidence · files changed together\n\n1 ordinary commits touched this file in a sample of 200 commits, up to 548 days. Excluded: 98 merges and 4 changes touching more than 30 files. Rename history is not followed.\n\nCo-changes are historical association, not functional dependency or evidence of a later defect.\n\nShowing 2 of 2 returned files.\n\ntests/test_daemon_application.c · 1 shared commit\nInspect local Git evidence\ntests/windows/test_non_ascii_path.py · 1 shared commit\nInspect local Git evidence\nNext checks\nInspect the nearest dependent paths and check the interfaces used by their callers or importers.\nReview and run the 60 indexed test candidates that reach the selection. Test-file classification is heuristic.\nCompare the local change with the indexed source and reindex before relying on absence of downstream findings.\nInspect the linked local commit evidence for repeated co-changes; shared commits alone do not establish a dependency.",
+    "realUncommittedChange": "src/daemon/application.c",
+    "sourceTarget": {
+      "subject": "cbm_daemon_application_new",
+      "source": "Open source · src/daemon/application.c:2909"
+    },
+    "reader": "Selected code\nPin\ncbm_daemon_application_new\nfunction\nsrc/daemon/application.c:2909-2997\nAsk about this\nShow in graph\nSelection context\n\ncbm_daemon_application_new\n\nGRAPH EVIDENCE\n\n48 indexed caller edges from 3 files reach this selection. Check these callers when changing its contract.\n\nStatic call path from main\n\nThis selection is reachable from an indexed entry candidate. This is static reachability, not an observed execution or data flow.\n\nStatic index edges. Open either declaration to inspect the source; a call edge does not prove runtime execution.\n\nmain\nFunction · src/main.c:2546\nCALLS →Edge #78163Site :3002\ncbm_daemon_host_run\nFunction · src/daemon/host.c:948\ncbm_daemon_host_run\nFunction · src/daemon/host.c:948\nCALLS →Edge #58551Site :1028\nhost_state_prepare\nFunction · src/daemon/host.c:568\nhost_state_prepare\nFunction · src/daemon/host.c:568\nCALLS →Edge #58502Site :610\ncbm_daemon_application_new\nFunction · src/daemon/application.c:2909\n\n3 of 3 retained edges\n\nIncoming relationships · 48\nOutgoing relationships · 10\nOBSERVED AGENT ACTIVITY\n\nNo retained agent event names this file. Enable live activity to read the daemon's local event store.\n\nRead source evidence\nAssess change impact\n\nReading selected code...",
+    "selectionSurvivesWorkspaceNavigation": true
+  },
+  "pageErrors": [],
+  "externalRequests": [],
+  "rpc": [
+    {
+      "method": "tools/call",
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "index_status",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Module) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_architecture",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "aspects": [
+          "all"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "check_index_coverage",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "scopes": [
+          "."
+        ],
+        "scope_limit": 1000,
+        "scope_offset": 0,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) WHERE n.file_path = \".codeatlas/policy.json\" RETURN n.qualified_name LIMIT 1"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Module) WHERE n.file_path = \"README.md\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"README.md\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"README.md\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"README.md\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Interface) WHERE n.file_path = \"README.md\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Type) WHERE n.file_path = \"README.md\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "check_index_coverage",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "paths": [
+          "README.md"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.README",
+        "source_mode": "full",
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.README",
+        "source_mode": "full",
+        "start_line": 501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_architecture",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "aspects": [
+          "all"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Module) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.qualified_name, n.start_line, n.end_line LIMIT 1"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Interface) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Type) WHERE n.file_path = \"src/daemon/application.c\" RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, n.is_test LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CALLS]->(b) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.cbm_daemon_application_new\" RETURN b.name, b.qualified_name, b.file_path, b.start_line, r.line ORDER BY r.line LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "check_index_coverage",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "paths": [
+          "src/daemon/application.c"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:CALLS]->(b:Class) WHERE a.qualified_name = \"cbm-pr2068.src.daemon.application.cbm_daemon_application_new\" RETURN b.name, b.qualified_name LIMIT 200"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/foundation/compat_thread.c\" AND n.start_line <= 232 AND n.end_line >= 232 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 1001,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/foundation/compat_thread.c\" AND n.start_line <= 232 AND n.end_line >= 232 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 1501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/foundation/compat_thread.c\" AND n.start_line <= 232 AND n.end_line >= 232 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 2001,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/foundation/compat_thread.c\" AND n.start_line <= 220 AND n.end_line >= 220 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 2501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_architecture",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "aspects": [
+          "all"
+        ],
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/foundation/compat_thread.c\" AND n.start_line <= 220 AND n.end_line >= 220 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 3001,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:File) RETURN n.file_path LIMIT 5000"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/foundation/compat_thread.c\" AND n.start_line <= 220 AND n.end_line >= 220 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "get_code_snippet",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "qualified_name": "cbm-pr2068.src.daemon.application",
+        "source_mode": "full",
+        "start_line": 3501,
+        "max_lines": 500,
+        "format": "json"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/foundation/mem.c\" AND n.start_line <= 503 AND n.end_line >= 503 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (a)-[r:IMPORTS]->(b) RETURN a.file_path, b.file_path LIMIT 5000"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) RETURN n.name, n.qualified_name, n.file_path, n.start_line, n.complexity, n.cognitive, n.loop_depth, n.alloc_in_loop, n.linear_scan_in_loop, n.unguarded_recursion LIMIT 1500"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/foundation/mem.c\" AND n.start_line <= 503 AND n.end_line >= 503 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Method) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 2909 AND n.end_line >= 2909 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Class) WHERE n.file_path = \"src/foundation/mem.c\" AND n.start_line <= 503 AND n.end_line >= 503 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    },
+    {
+      "method": "tools/call",
+      "tool": "query_graph",
+      "arguments": {
+        "project": "cbm-pr2068",
+        "query": "MATCH (n:Function) WHERE n.file_path = \"src/daemon/application.c\" AND n.start_line <= 2909 AND n.end_line >= 2909 RETURN n.name, n.qualified_name, n.start_line, n.end_line ORDER BY n.start_line DESC LIMIT 10"
+      }
+    }
+  ],
+  "success": true
+}

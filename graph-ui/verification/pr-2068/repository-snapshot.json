@@ -1,0 +1,15 @@
+{
+  "project": "cbm-pr2068",
+  "node_scope": "files, modules, callables, types and routes; variables omitted",
+  "indexed_at": "2026-09-09T19:51:51Z",
+  "total_nodes": 24809,
+  "total_edges": 107285,
+  "indexed_total_nodes": 40226,
+  "generation": "u0911bd5153455afeg2",
+  "nodes_truncated": true,
+  "edges_truncated": true,
+  "edge_scope": "recorded relation types between retained semantic nodes; other endpoints omitted",
+  "returned_nodes": 20000,
+  "returned_edges": 65172,
+  "url": "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068"
+}

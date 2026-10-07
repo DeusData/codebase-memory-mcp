@@ -3,8 +3,9 @@
 
 #include "type_rep.h"
 #include "../arena.h"
+#include "../../../src/foundation/platform.h"
 #include <stdatomic.h> /* relaxed cache for cbm_lsp_max_walk_depth */
-#include <stdlib.h>     /* getenv, atoi (cbm_lsp_max_walk_depth) */
+#include <stdlib.h>     /* atoi (cbm_lsp_max_walk_depth) */
 
 typedef struct {
     const char* name;
@@ -56,7 +57,7 @@ static inline int cbm_lsp_max_walk_depth(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (value < 0) {
-        const char* e = getenv("CBM_LSP_MAX_WALK_DEPTH");
+        const char* e = cbm_runtime_getenv("CBM_LSP_MAX_WALK_DEPTH");
         int v = (e && *e) ? atoi(e) : 0;
         value = (v > 0) ? v : CBM_LSP_MAX_WALK_DEPTH;
         atomic_store_explicit(&cached, value, memory_order_relaxed);

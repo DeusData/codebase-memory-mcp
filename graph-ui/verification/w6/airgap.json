@@ -1,0 +1,1681 @@
+{
+  "outboundViolations": 0,
+  "samples": 93,
+  "clickSteps": 37,
+  "pageErrors": 0,
+  "consoleErrors": 0,
+  "leftoverProcesses": 0,
+  "chatCitationClicked": true,
+  "atlasRowShortcutsShown": true,
+  "atlasRowOpenedByKey": true,
+  "tourDiagramOpened": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "scrolledRegions": 7,
+  "versionChipShown": "v0.0.1",
+  "versionChipExpected": "v0.0.1",
+  "buildSuffixShown": "dirty",
+  "screenshots": 30,
+  "projects": {
+    "main": "codeatlasweb-w6",
+    "large": "codeatlasweb-w6-large",
+    "impact": "codeatlasweb-w6-impact"
+  },
+  "fixture": "fixtures/atlas-sample und fixtures/atlas-sample-large (nur gelesen), plus eine Kopie mit eigenem git-Repository fuer die Aenderungsansicht",
+  "sidecarPort": 4141,
+  "question": "Wer ruft createUser?",
+  "readability": {
+    "exclusions": [
+      {
+        "selector": ".monaco-editor",
+        "reason": "Der Editor setzt Zeilen, Zeilennummern und Dekorationen selbst, absolut positioniert und in eigenen Ebenen. Gemessen wird seine Flaeche gegen die Nachbarn, nicht sein Innenleben: das waere eine Pruefung einer fremden Bibliothek gegen die Layoutregeln dieses Produkts."
+      }
+    ],
+    "deliberateOverlays": [
+      {
+        "selector": "[data-testid=\"atlas-search-results\"]",
+        "reason": "Das Suchfenster liegt ueber der Kommandozeile."
+      },
+      {
+        "selector": "[data-testid=\"atlas-entry\"]",
+        "reason": "Der Einstiegsdialog liegt ueber der Editorflaeche."
+      },
+      {
+        "selector": "[data-testid=\"atlas-why\"]",
+        "reason": "Die Frage nach dem Warum fuellt die leere Editorflaeche."
+      },
+      {
+        "selector": "[data-testid=\"codeatlas-evidence-popover\"]",
+        "reason": "Ein Beleg klappt ueber die Zeile auf, zu der er gehoert."
+      },
+      {
+        "selector": "[data-testid=\"atlas-help\"]",
+        "reason": "Die Hilfeseite liegt ueber der Editorflaeche."
+      }
+    ],
+    "scrolledRegionNames": [
+      "atlas-twin-body",
+      "atlas-flow-overlay",
+      "atlas-flow-step-list",
+      "atlas-galaxy-legend",
+      "atlas-bugwizard",
+      "atlas-impact",
+      "atlas-chat-scroll"
+    ],
+    "overlaps": [],
+    "clipped": []
+  },
+  "steps": [
+    {
+      "step": 1,
+      "name": "app-open",
+      "atMs": 45923,
+      "candidates": 148,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 2,
+      "name": "explorer-expanded",
+      "atMs": 46657,
+      "candidates": 148,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 3,
+      "name": "explorer-coverage-legend",
+      "atMs": 46815,
+      "candidates": 148,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 4,
+      "name": "reader-open-file",
+      "atMs": 47045,
+      "candidates": 137,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 5,
+      "name": "reader-capped-file",
+      "atMs": 48366,
+      "candidates": 108,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 6,
+      "name": "search-overlay-open",
+      "atMs": 50321,
+      "candidates": 189,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+        "div > .atlas-shell > [atlas-command] > [atlas-search-results]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 7,
+      "name": "twin-depth-0",
+      "atMs": 51777,
+      "candidates": 147,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "[atlas-hint]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 8,
+      "name": "twin-depth-1",
+      "atMs": 52353,
+      "candidates": 145,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "[atlas-hint]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 9,
+      "name": "twin-depth-2",
+      "atMs": 52931,
+      "candidates": 167,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "[atlas-hint]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 10,
+      "name": "twin-depth-3",
+      "atMs": 53510,
+      "candidates": 147,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "[atlas-hint]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 11,
+      "name": "twin-evidence",
+      "atMs": 54020,
+      "candidates": 147,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 12,
+      "name": "flow-overlay-open",
+      "atMs": 54989,
+      "candidates": 169,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-flow-overlay",
+        "atlas-flow-step-list",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 13,
+      "name": "flow-stepper-second-step",
+      "atMs": 57008,
+      "candidates": 170,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-flow-overlay",
+        "atlas-flow-step-list",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 14,
+      "name": "pseudocode-view",
+      "atMs": 57530,
+      "candidates": 146,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 15,
+      "name": "search-enter-opens",
+      "atMs": 58596,
+      "candidates": 142,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "div > .atlas-shell > [atlas-command] > [atlas-command-examples]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 16,
+      "name": "twin-warm-budget",
+      "atMs": 72038,
+      "candidates": 163,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "div > .atlas-shell > [atlas-command] > [atlas-command-examples]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 17,
+      "name": "galaxy-legend-open",
+      "atMs": 72960,
+      "candidates": 171,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-legend-frame] > [atlas-galaxy-legend-more]",
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body",
+        "atlas-galaxy-legend"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 18,
+      "name": "atlas-row-shortcuts",
+      "atMs": 74210,
+      "candidates": 172,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 19,
+      "name": "why-answered-tour-start",
+      "atMs": 75466,
+      "candidates": 153,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 20,
+      "name": "tour-step-2",
+      "atMs": 76878,
+      "candidates": 164,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 21,
+      "name": "tour-step-3",
+      "atMs": 78139,
+      "candidates": 166,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 22,
+      "name": "entry-dialog-open",
+      "atMs": 78699,
+      "candidates": 224,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-entry]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 23,
+      "name": "entry-walk-hierarchy",
+      "atMs": 82144,
+      "candidates": 189,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 24,
+      "name": "tour-card-diagram",
+      "atMs": 83185,
+      "candidates": 203,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-flow-overlay",
+        "atlas-flow-step-list",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 25,
+      "name": "entry-walk-step-2",
+      "atMs": 84841,
+      "candidates": 167,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 26,
+      "name": "galaxy-mode-toggle",
+      "atMs": 85785,
+      "candidates": 167,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 27,
+      "name": "hierarchy-mode-toggle",
+      "atMs": 86902,
+      "candidates": 167,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 28,
+      "name": "bugwizard-without-traces",
+      "atMs": 89779,
+      "candidates": 199,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-bugwizard",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 29,
+      "name": "bugwizard-divergence",
+      "atMs": 95406,
+      "candidates": 165,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-bugwizard",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 30,
+      "name": "impact-open",
+      "atMs": 96492,
+      "candidates": 147,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 31,
+      "name": "impact-reading",
+      "atMs": 97584,
+      "candidates": 164,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-impact"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 32,
+      "name": "sidecar-off",
+      "atMs": 98611,
+      "candidates": 132,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 33,
+      "name": "sidecar-ready",
+      "atMs": 100880,
+      "candidates": 140,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "document"
+      ],
+      "scrolledRegions": [],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 34,
+      "name": "chat-answered",
+      "atMs": 104008,
+      "candidates": 173,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+        "div > .atlas-shell > [atlas-command] > [atlas-command-examples]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-chat-scroll"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 35,
+      "name": "chat-citation-followed",
+      "atMs": 107002,
+      "candidates": 176,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-chat-scroll",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 36,
+      "name": "chat-cards-open",
+      "atMs": 107910,
+      "candidates": 180,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-chat-scroll",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    },
+    {
+      "step": 37,
+      "name": "sidecar-off-again",
+      "atMs": 108406,
+      "candidates": 172,
+      "layers": [
+        ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+        "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+        "document"
+      ],
+      "scrolledRegions": [
+        "atlas-chat-scroll",
+        "atlas-twin-body"
+      ],
+      "overlaps": 0,
+      "clipped": 0
+    }
+  ],
+  "timings": {
+    "buildMs": 11080,
+    "serverStartMs": 6929,
+    "sidecarReadyMs": 1685,
+    "answerMs": 1957,
+    "totalMs": 111041
+  },
+  "generatedAt": "2026-08-30T18:50:56.032Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "sidecarRequests": [
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 100844
+      },
+      {
+        "url": "http://127.0.0.1:4141/props",
+        "atMs": 100857
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/models",
+        "atMs": 100859
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/chat/completions",
+        "atMs": 102233
+      },
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 103844
+      },
+      {
+        "url": "http://127.0.0.1:4141/props",
+        "atMs": 103846
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/models",
+        "atMs": 103848
+      },
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 106844
+      },
+      {
+        "url": "http://127.0.0.1:4141/props",
+        "atMs": 106846
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/models",
+        "atMs": 106847
+      }
+    ],
+    "failedResponses": [],
+    "steps": [
+      {
+        "step": 1,
+        "name": "app-open",
+        "atMs": 45923,
+        "candidates": 148,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 2,
+        "name": "explorer-expanded",
+        "atMs": 46657,
+        "candidates": 148,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 3,
+        "name": "explorer-coverage-legend",
+        "atMs": 46815,
+        "candidates": 148,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 4,
+        "name": "reader-open-file",
+        "atMs": 47045,
+        "candidates": 137,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 5,
+        "name": "reader-capped-file",
+        "atMs": 48366,
+        "candidates": 108,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 6,
+        "name": "search-overlay-open",
+        "atMs": 50321,
+        "candidates": 189,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+          "div > .atlas-shell > [atlas-command] > [atlas-search-results]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 7,
+        "name": "twin-depth-0",
+        "atMs": 51777,
+        "candidates": 147,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "[atlas-hint]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 8,
+        "name": "twin-depth-1",
+        "atMs": 52353,
+        "candidates": 145,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "[atlas-hint]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 9,
+        "name": "twin-depth-2",
+        "atMs": 52931,
+        "candidates": 167,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "[atlas-hint]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 10,
+        "name": "twin-depth-3",
+        "atMs": 53510,
+        "candidates": 147,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "[atlas-hint]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 11,
+        "name": "twin-evidence",
+        "atMs": 54020,
+        "candidates": 147,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 12,
+        "name": "flow-overlay-open",
+        "atMs": 54989,
+        "candidates": 169,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-flow-overlay",
+          "atlas-flow-step-list",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 13,
+        "name": "flow-stepper-second-step",
+        "atMs": 57008,
+        "candidates": 170,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-flow-overlay",
+          "atlas-flow-step-list",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 14,
+        "name": "pseudocode-view",
+        "atMs": 57530,
+        "candidates": 146,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 15,
+        "name": "search-enter-opens",
+        "atMs": 58596,
+        "candidates": 142,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "div > .atlas-shell > [atlas-command] > [atlas-command-examples]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 16,
+        "name": "twin-warm-budget",
+        "atMs": 72038,
+        "candidates": 163,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "div > .atlas-shell > [atlas-command] > [atlas-command-examples]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 17,
+        "name": "galaxy-legend-open",
+        "atMs": 72960,
+        "candidates": 171,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-legend-frame] > [atlas-galaxy-legend-more]",
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body",
+          "atlas-galaxy-legend"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 18,
+        "name": "atlas-row-shortcuts",
+        "atMs": 74210,
+        "candidates": 172,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 19,
+        "name": "why-answered-tour-start",
+        "atMs": 75466,
+        "candidates": 153,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 20,
+        "name": "tour-step-2",
+        "atMs": 76878,
+        "candidates": 164,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 21,
+        "name": "tour-step-3",
+        "atMs": 78139,
+        "candidates": 166,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 22,
+        "name": "entry-dialog-open",
+        "atMs": 78699,
+        "candidates": 224,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-entry]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 23,
+        "name": "entry-walk-hierarchy",
+        "atMs": 82144,
+        "candidates": 189,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 24,
+        "name": "tour-card-diagram",
+        "atMs": 83185,
+        "candidates": 203,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-flow-overlay",
+          "atlas-flow-step-list",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 25,
+        "name": "entry-walk-step-2",
+        "atMs": 84841,
+        "candidates": 167,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 26,
+        "name": "galaxy-mode-toggle",
+        "atMs": 85785,
+        "candidates": 167,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 27,
+        "name": "hierarchy-mode-toggle",
+        "atMs": 86902,
+        "candidates": 167,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 28,
+        "name": "bugwizard-without-traces",
+        "atMs": 89779,
+        "candidates": 199,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-bugwizard",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 29,
+        "name": "bugwizard-divergence",
+        "atMs": 95406,
+        "candidates": 165,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-bugwizard",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 30,
+        "name": "impact-open",
+        "atMs": 96492,
+        "candidates": 147,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 31,
+        "name": "impact-reading",
+        "atMs": 97584,
+        "candidates": 164,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-impact"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 32,
+        "name": "sidecar-off",
+        "atMs": 98611,
+        "candidates": 132,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 33,
+        "name": "sidecar-ready",
+        "atMs": 100880,
+        "candidates": 140,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "document"
+        ],
+        "scrolledRegions": [],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 34,
+        "name": "chat-answered",
+        "atMs": 104008,
+        "candidates": 173,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+          "div > .atlas-shell > [atlas-command] > [atlas-command-examples]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-chat-scroll"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 35,
+        "name": "chat-citation-followed",
+        "atMs": 107002,
+        "candidates": 176,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-chat-scroll",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 36,
+        "name": "chat-cards-open",
+        "atMs": 107910,
+        "candidates": 180,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-chat-scroll",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      },
+      {
+        "step": 37,
+        "name": "sidecar-off-again",
+        "atMs": 108406,
+        "candidates": 172,
+        "layers": [
+          ".atlas-side > [atlas-galaxy] > [atlas-galaxy-scene] > [atlas-galaxy-fit]",
+          "[atlas-body] > .atlas-side > [atlas-twin] > [atlas-twin-more]",
+          "document"
+        ],
+        "scrolledRegions": [
+          "atlas-chat-scroll",
+          "atlas-twin-body"
+        ],
+        "overlaps": 0,
+        "clipped": 0
+      }
+    ],
+    "overlaps": [],
+    "clipped": [],
+    "scrolledRegionNames": [
+      "atlas-twin-body",
+      "atlas-flow-overlay",
+      "atlas-flow-step-list",
+      "atlas-galaxy-legend",
+      "atlas-bugwizard",
+      "atlas-impact",
+      "atlas-chat-scroll"
+    ],
+    "warmSamples": [
+      {
+        "symbol": "listUsers",
+        "ms": 411
+      },
+      {
+        "symbol": "validateUser",
+        "ms": 331
+      },
+      {
+        "symbol": "getOrder",
+        "ms": 348
+      },
+      {
+        "symbol": "hotspotScan",
+        "ms": 342
+      },
+      {
+        "symbol": "insert",
+        "ms": 337
+      },
+      {
+        "symbol": "query",
+        "ms": 343
+      },
+      {
+        "symbol": "walk",
+        "ms": 328
+      },
+      {
+        "symbol": "registerUserRoutes",
+        "ms": 427
+      },
+      {
+        "symbol": "main",
+        "ms": 345
+      },
+      {
+        "symbol": "createUser",
+        "ms": 419
+      }
+    ],
+    "winner": {
+      "name": "Qwen3.5-2B",
+      "choice": "class-a"
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "indexedLarge": {
+      "nodes": 116,
+      "edges": 549
+    },
+    "indexedImpact": {
+      "nodes": 77,
+      "edges": 180
+    },
+    "serverPort": 4340,
+    "uiPort": 4341,
+    "sidecarListenersBefore": 0,
+    "expandRounds": 0,
+    "legend": {
+      "entries": [
+        "indexed in the graph, no recorded issue"
+      ],
+      "dots": 11,
+      "source": "files as the index discovery saw them; files it never met are invisible until the server lists directories"
+    },
+    "cappedFile": {
+      "truncated": true,
+      "note": "incomplete: lines 501-718 not loaded: server snippet cap of 500 lines (get_code_snippet). The window arguments are ignored by this server, so there is nothing to load them with."
+    },
+    "evidenceButtons": 18,
+    "evidenceText": "raisevalidate.ts:4cbm, index generation 1",
+    "flow": {
+      "arrows": 6,
+      "steps": 11,
+      "lifelines": 4,
+      "title": "Flow from createUser"
+    },
+    "flowStepper": {
+      "position": "2 of 11",
+      "readerLine": 27,
+      "readerPath": "src/services/userService.ts"
+    },
+    "pseudocode": {
+      "lines": 8,
+      "imports": 7,
+      "title": "Steps in createUser"
+    },
+    "enterOpened": {
+      "path": "src/config.ts",
+      "twin": ""
+    },
+    "galaxyLegend": {
+      "entries": [
+        "edge colourDEFINES 52USAGE 37IMPORTS 26CALLS 25CONTAINS_FILE 11CONFIGURES 6CONTAINS_FOLDER 6DEFINES_METHOD 6IMPLEMENTS 4RAISES 3CALL_REFERENCE 1HAS_BRANCH 1one colour per edge type, from the table that draws the lines. Counted in this layout, most frequent first. Click a kind to take it out; it stays here, dimmed.",
+        "node colourthe server maps a symbol degree to a stellar spectral colour (layout3d.c, stellar_color): few edges give a red dwarf, many a blue giant. This panel paints what the layout sent.",
+        "node sizea base size per node label plus a boost from the same degree, both computed by the server. A bigger dot means more edges, not more importance.",
+        "focusthe focused symbol and its direct neighbours stay bright, everything else dims. The focus follows the twin, and a click in the sky sends it back.",
+        "positionsa deterministic layout computed by the server, not by this browser: the same index gives the same sky.",
+        "agent trail (dashed)a dashed line behind a live agent is the path it walked: the last symbols one actor touched, newest first, drawn UNDER the real edges. It is not a relation in the code. The solid coloured lines above come from the index and stay; this one comes from events and fades with the window picked at the timeline."
+      ],
+      "headline": "76 nodes, 178 edges from /api/layout"
+    },
+    "atlasRow": [
+      {
+        "menu": "a-why",
+        "label": "[w]hy am I here",
+        "letter": "w",
+        "title": ""
+      },
+      {
+        "menu": "a-bug",
+        "label": "[b]ug hunt",
+        "letter": "b",
+        "title": ""
+      },
+      {
+        "menu": "a-impact",
+        "label": "[c]hange scope",
+        "letter": "c",
+        "title": ""
+      },
+      {
+        "menu": "a-layout",
+        "label": "[r]eset layout",
+        "letter": "r",
+        "title": ""
+      },
+      {
+        "menu": "a-llm",
+        "label": "[l]ocal llm off",
+        "letter": "l",
+        "title": ""
+      },
+      {
+        "menu": "a-settings",
+        "label": "[s]ettings",
+        "letter": "s",
+        "title": ""
+      },
+      {
+        "menu": "a-agents",
+        "label": "[g] live agents off",
+        "letter": "g",
+        "title": ""
+      }
+    ],
+    "tour": {
+      "kind": "project",
+      "steps": 11,
+      "index": 2,
+      "title": "Getting started"
+    },
+    "walk": {
+      "mode": "hierarchy",
+      "nodes": 8,
+      "depth": 3
+    },
+    "tourDiagram": {
+      "present": true,
+      "label": "[d] diagram",
+      "available": "true",
+      "disabled": false,
+      "title": ""
+    },
+    "tourDiagramFlow": {
+      "arrows": 6,
+      "steps": 11,
+      "title": "Flow from createUser",
+      "tourStillOpen": true,
+      "tourStepIndex": 0
+    },
+    "wizardBeforeIngest": {
+      "events": 0,
+      "staticPaths": 2,
+      "noTraces": true
+    },
+    "ingest": {
+      "status": "stored",
+      "label": "w6-run",
+      "pairs_stored": 3,
+      "paths_stored": 1,
+      "pairs_unmatched": 0,
+      "unmatched_sample": [],
+      "pair_total": 3
+    },
+    "wizardAfterIngest": {
+      "events": 2,
+      "staticPaths": 2,
+      "observedPaths": 1,
+      "staticOnly": 4,
+      "runtimeOnly": 1
+    },
+    "impact": {
+      "badge": "high",
+      "direct": 5,
+      "downstream": 2,
+      "endpoints": 2,
+      "tiles": 7
+    },
+    "llmOff": {
+      "state": "off",
+      "preferenceOn": false,
+      "policyVerdict": "absent",
+      "policyPath": ".codeatlas/policy.json",
+      "policyDetail": "",
+      "model": "",
+      "chip": "off",
+      "probes": 0
+    },
+    "startScript": {
+      "exit": 0,
+      "out": [
+        "Sidecar gestartet: pid 22929, Qwen3.5-2B-Q4_K_M.gguf (Reproduktionsgriff class-a), Kontext 3072, http://127.0.0.1:4141",
+        "Bereitschaft: curl -s http://127.0.0.1:4141/health  ->  {\"status\":\"ok\"}",
+        "Log: /Users/bernhard/Desktop/CodeAtlasWeb/llm/llama-server.log",
+        "Beenden: /Users/bernhard/Desktop/CodeAtlasWeb/llm/stop.sh"
+      ]
+    },
+    "sidecarHealth": [
+      {
+        "atMs": 118,
+        "status": 0
+      },
+      {
+        "atMs": 622,
+        "status": 503
+      },
+      {
+        "atMs": 1128,
+        "status": 503
+      },
+      {
+        "atMs": 1630,
+        "status": 200
+      }
+    ],
+    "llmReady": {
+      "state": "ready",
+      "preferenceOn": true,
+      "policyVerdict": "absent",
+      "policyPath": ".codeatlas/policy.json",
+      "policyDetail": "",
+      "model": "Qwen3.5-2B",
+      "chip": "ready: Qwen3.5-2B",
+      "probes": 1
+    },
+    "answer": {
+      "status": "answered",
+      "klass": "who-calls",
+      "cards": 12,
+      "citations": [
+        "K3",
+        "K5",
+        "K6",
+        "K7",
+        "K8",
+        "K9",
+        "K10",
+        "K12"
+      ],
+      "answerLength": 96,
+      "tokensPerSecond": 50.70754716981132
+    },
+    "citedCard": "K3",
+    "citationClick": {
+      "before": {
+        "path": "",
+        "line": 0
+      },
+      "after": {
+        "path": "src/services/userService.ts",
+        "line": 41
+      }
+    },
+    "cardsShown": 12,
+    "llmOffAgain": {
+      "state": "off",
+      "preferenceOn": false,
+      "policyVerdict": "absent",
+      "policyPath": ".codeatlas/policy.json",
+      "policyDetail": "",
+      "model": "",
+      "chip": "off",
+      "probes": 3
+    },
+    "apiRoutes": {
+      "/api/layout": 7,
+      "/api/tree": 44,
+      "/api/trace": 8,
+      "/api/flows": 2,
+      "/api/flow": 14
+    },
+    "rpcTools": {
+      "index_status": 14,
+      "query_graph": 773,
+      "check_index_coverage": 26,
+      "get_code_snippet": 53,
+      "search_graph": 32,
+      "get_architecture": 3,
+      "detect_changes": 1
+    },
+    "stopScript": {
+      "exit": 0,
+      "out": [
+        "Sidecar beendet (pid 22929)."
+      ]
+    },
+    "leftovers": [
+      {
+        "port": 4340,
+        "listeners": 0,
+        "waitedMs": 96
+      },
+      {
+        "port": 4341,
+        "listeners": 0,
+        "waitedMs": 94
+      },
+      {
+        "port": 4141,
+        "listeners": 0,
+        "waitedMs": 96
+      }
+    ],
+    "net": {
+      "samples": 93,
+      "intervalMs": 1000,
+      "durationMs": 111033,
+      "maxProcessTreeSize": 8,
+      "lsofErrors": 0,
+      "outboundViolations": 0,
+      "violations": [],
+      "loopbackConnections": [
+        {
+          "endpoint": "TCP 127.0.0.1:4141",
+          "seen": 8
+        },
+        {
+          "endpoint": "TCP 127.0.0.1:4341",
+          "seen": 3
+        },
+        {
+          "endpoint": "TCP 127.0.0.1:61947",
+          "seen": 1
+        },
+        {
+          "endpoint": "TCP 127.0.0.1:62299",
+          "seen": 1
+        }
+      ]
+    }
+  }
+}
