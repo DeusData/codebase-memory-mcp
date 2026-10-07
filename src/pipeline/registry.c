@@ -84,7 +84,13 @@ typedef struct {
     int cap;
     uint8_t *is_test; /* is_test_qn(items[i]), one byte per entry */
     int is_test_cap;
+    /* Language of the file that defined items[i] (a CBMLanguage; CBM_LANG_COUNT
+     * = unknown, compatible with every caller), one byte per entry. Grown in
+     * lockstep with is_test, so is_test_cap bounds it too. */
+    uint8_t *lang;
 } qn_array_t;
+
+_Static_assert(CBM_LANG_COUNT <= UINT8_MAX, "CBMLanguage must fit the per-entry lang byte");
 
 struct cbm_registry {
     /* Interned label strings (<=~30 distinct labels; owned here, freed in
@@ -724,6 +730,152 @@ static bool c_cpp_family(CBMLanguage lang) {
     return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
 }
 
+/* ── Cross-language resolution compatibility ─────────────────────────
+ * A name-based registry guess (qualified_suffix / unique_name / suffix_match)
+ * carries no import or type evidence, so its answer only stands when the
+ * caller's language can actually call the target by that name
+ * (cbm_registry_name_guess_vetoed). same_module joins them: module QNs drop
+ * the extension, so tests/x.c and tests/x.py share one module, and a call in
+ * the C file found the Python function by name inside it. Families are the interop
+ * groups the resolvers already honour, plus the well-known interop pairs:
+ *   - JS family: JS/TS/TSX/ArkTS (the #725 and #1928 guards) and the script
+ *     hosts whose calls ARE JS/TS (HTML/Vue/Svelte/Astro, the weak-member
+ *     guard's embedded-script set; QML embeds JS and imports .js files).
+ *   - C family: C/C++ (.h maps to C++, the #1928 guard), plus CUDA and ObjC,
+ *     which call C/C++ declarations from shared headers directly.
+ *   - JVM: Java/Kotlin/Scala/Groovy call each other's classes directly (the
+ *     JVM cross-file LSP pairs Java with Kotlin).
+ *   - .NET: C#/F#. PHP: PHP/Blade. Go: Go/templ (templ compiles to Go).
+ *     Lua: Lua/Luau/Teal. BEAM: Erlang/Elixir/Gleam. Shell: Bash/Zsh.
+ *     SQL: SQL/PL-SQL. Salesforce: Apex/SOQL/SOSL. HDL: Verilog/SystemVerilog.
+ *     CFML: tag and script dialects. ObjectScript: UDL/routine/export.
+ *   - Swift additionally calls the C family (C and ObjC headers import into
+ *     Swift as native declarations), and Python calls ObjectScript (IRIS
+ *     Embedded Python, iris.cls(...), #1260) and back.
+ * Every other language is its own family. An unknown language on either side
+ * (CBM_LANG_COUNT) is compatible with everything: without evidence, no filter.
+ * The languages are the DETECTED languages of the calling file and of the
+ * defining file (not a filename guess: .m is MATLAB by extension but ObjC by
+ * content), so full, parallel and incremental registries agree. */
+enum {
+    XL_FAM_NONE = 0,
+    XL_FAM_JS,
+    XL_FAM_C,
+    XL_FAM_JVM,
+    XL_FAM_DOTNET,
+    XL_FAM_PHP,
+    XL_FAM_GO,
+    XL_FAM_LUA,
+    XL_FAM_BEAM,
+    XL_FAM_SHELL,
+    XL_FAM_SQL,
+    XL_FAM_SALESFORCE,
+    XL_FAM_HDL,
+    XL_FAM_CFML,
+    XL_FAM_OBJECTSCRIPT,
+};
+
+static int xl_family(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
+    case CBM_LANG_HTML:
+    case CBM_LANG_VUE:
+    case CBM_LANG_SVELTE:
+    case CBM_LANG_ASTRO:
+    case CBM_LANG_QML:
+        return XL_FAM_JS;
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+        return XL_FAM_C;
+    case CBM_LANG_JAVA:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_SCALA:
+    case CBM_LANG_GROOVY:
+        return XL_FAM_JVM;
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_FSHARP:
+        return XL_FAM_DOTNET;
+    case CBM_LANG_PHP:
+    case CBM_LANG_BLADE:
+        return XL_FAM_PHP;
+    case CBM_LANG_GO:
+    case CBM_LANG_TEMPL:
+        return XL_FAM_GO;
+    case CBM_LANG_LUA:
+    case CBM_LANG_LUAU:
+    case CBM_LANG_TEAL:
+        return XL_FAM_LUA;
+    case CBM_LANG_ERLANG:
+    case CBM_LANG_ELIXIR:
+    case CBM_LANG_GLEAM:
+        return XL_FAM_BEAM;
+    case CBM_LANG_BASH:
+    case CBM_LANG_ZSH:
+        return XL_FAM_SHELL;
+    case CBM_LANG_SQL:
+    case CBM_LANG_PLSQL:
+        return XL_FAM_SQL;
+    case CBM_LANG_APEX:
+    case CBM_LANG_SOQL:
+    case CBM_LANG_SOSL:
+        return XL_FAM_SALESFORCE;
+    case CBM_LANG_VERILOG:
+    case CBM_LANG_SYSTEMVERILOG:
+        return XL_FAM_HDL;
+    case CBM_LANG_CFML:
+    case CBM_LANG_CFSCRIPT:
+        return XL_FAM_CFML;
+    case CBM_LANG_OBJECTSCRIPT_UDL:
+    case CBM_LANG_OBJECTSCRIPT_ROUTINE:
+    case CBM_LANG_OBJECTSCRIPT_EXPORT:
+        return XL_FAM_OBJECTSCRIPT;
+    default:
+        return XL_FAM_NONE;
+    }
+}
+
+bool cbm_lang_resolution_compatible(CBMLanguage caller, CBMLanguage target) {
+    if (caller < 0 || caller >= CBM_LANG_COUNT || target < 0 || target >= CBM_LANG_COUNT) {
+        return true; /* unknown on either side: no evidence to filter on */
+    }
+    if (caller == target) {
+        return true;
+    }
+    int cf = xl_family(caller);
+    int tf = xl_family(target);
+    if (cf != XL_FAM_NONE && cf == tf) {
+        return true;
+    }
+    /* Swift imports C and ObjC headers as native declarations. IRIS Embedded
+     * Python and ObjectScript call each other's classes by name
+     * (iris.cls("Pkg.A").Run(), #1260). */
+    return (caller == CBM_LANG_SWIFT && tf == XL_FAM_C) ||
+           (target == CBM_LANG_SWIFT && cf == XL_FAM_C) ||
+           (caller == CBM_LANG_PYTHON && tf == XL_FAM_OBJECTSCRIPT) ||
+           (target == CBM_LANG_PYTHON && cf == XL_FAM_OBJECTSCRIPT);
+}
+
+/* Synthetic definition sources minted by a language's own LSP layer
+ * (py_builtins.c, kotlin_builtins.c). They have no real file to detect, but
+ * their language is a fact of the injecting LSP. */
+CBMLanguage cbm_registry_synthetic_path_language(const char *file_path) {
+    if (!file_path) {
+        return CBM_LANG_COUNT;
+    }
+    if (strcmp(file_path, "<python-builtins>") == 0) {
+        return CBM_LANG_PYTHON;
+    }
+    if (strcmp(file_path, "<kotlin-builtins>") == 0) {
+        return CBM_LANG_KOTLIN;
+    }
+    return CBM_LANG_COUNT;
+}
+
 static const char *path_basename(const char *path) {
     if (!path || !path[0]) {
         return path;
@@ -828,6 +980,72 @@ bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const cha
     return strcmp(target_label, "Field") == 0;
 }
 
+cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
+                                                   const char *target_label,
+                                                   const char *target_file_path) {
+    /* The short-name registry holds Field nodes, so a call spelled like some
+     * struct member can resolve onto that Field. Three shapes are decided here:
+     *   - a caller in another language: nothing but the spelling connects a
+     *     Bash `command` or a Python `sorted()` to a C struct member. The
+     *     unique_name exemption of the CALLS guard (#1572) is about functions;
+     *     for a Field the #1928 reference rule applies, with its JS/TS and
+     *     C/C++ family exemptions;
+     *   - a bare C call (`socket(...)`, a function-pointer parameter
+     *     `want(x)`): a bare C name is never a struct member;
+     *   - a C or C++ member call (`cb.close(ctx)`, `text.size()`): the type of
+     *     the object decides which struct's member is called, never the
+     *     member name alone. The C LSP publishes owners in both modes.
+     * A bare C++ call keeps its resolution (a method body reaches its own
+     * members without a selector), and so does every other language. */
+    if (!target_label || strcmp(target_label, "Field") != 0) {
+        return CBM_FIELD_CALL_KEEP;
+    }
+    if (cbm_suppress_cross_language_ref(caller_lang, target_file_path)) {
+        return CBM_FIELD_CALL_DROP;
+    }
+    if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
+        return CBM_FIELD_CALL_KEEP;
+    }
+    if (callee_text && (strchr(callee_text, '.') || strstr(callee_text, "->"))) {
+        return CBM_FIELD_CALL_BY_OWNER;
+    }
+    return caller_lang == CBM_LANG_C ? CBM_FIELD_CALL_DROP : CBM_FIELD_CALL_KEEP;
+}
+
+bool cbm_c_arrow_member_call(CBMLanguage caller_lang, const char *callee_text) {
+    if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {
+        return false;
+    }
+    return callee_text != NULL && strstr(callee_text, "->") != NULL;
+}
+
+bool cbm_c_member_rule_file(CBMLanguage lang, const char *rel_path) {
+    if (lang == CBM_LANG_C) {
+        return true;
+    }
+    if (lang != CBM_LANG_CPP || !rel_path) {
+        return false;
+    }
+    size_t len = strlen(rel_path);
+    return len > PAIR_LEN && strcmp(rel_path + len - PAIR_LEN, ".h") == 0;
+}
+
+bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access) {
+    /* The member half of `a.b` / `a->b` is not a name in any C scope: only the
+     * type of `a` gives `b` a meaning. Handing the bare `b` to the short-name
+     * registry bound whichever Field (or function, or variable) was called
+     * `b` -- on this repository 9,150 USAGE and 2,810 WRITES edges onto
+     * Fields, 3,976 of the USAGE edges on a name several structs share. Such a
+     * reference binds through the C LSP's field-owner rows; an object the LSP
+     * could not type binds only a member name that is unique in the project
+     * (cbm_registry_unique_field_qn), never one of several.
+     *
+     * C-gated like the Go rule above: a C++ or Objective-C method body
+     * reaches its own members without a selector, and their member accesses
+     * keep the existing resolution until their LSPs publish owners too. */
+    return is_c && is_member_access;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
@@ -852,6 +1070,7 @@ static void free_qn_array(const char *key, void *value, void *ud) {
     if (arr) {
         /* items borrow the exact map's keys — freed there, not here */
         cbm_free(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test);
+        cbm_free(CBM_MEM_CLASS_DYN_ARRAY, arr->lang);
         cbm_da_free(arr);
         free(arr);
     }
@@ -880,7 +1099,8 @@ void cbm_registry_free(cbm_registry_t *r) {
  *
  * No array dedup needed: cbm_registry_add's exact-map check guarantees the QN
  * is new, and it calls this at most once per distinct key. */
-static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn) {
+static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn,
+                             CBMLanguage lang) {
     qn_array_t *arr = cbm_ht_get(r->by_name, key);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
@@ -897,16 +1117,31 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
             cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test, (size_t)want * sizeof(uint8_t));
         if (grown) {
             arr->is_test = grown;
-            arr->is_test_cap = want;
+            uint8_t *grown_lang =
+                cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->lang, (size_t)want * sizeof(uint8_t));
+            /* Both side arrays share is_test_cap: on failure it stays below
+             * count, so this name serves neither cached test verdicts nor
+             * language filtering, exactly the unfiltered answer. */
+            if (grown_lang) {
+                arr->lang = grown_lang;
+                arr->is_test_cap = want;
+            }
         }
     }
     if (arr->count <= arr->is_test_cap) {
         arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
+        arr->lang[arr->count - SKIP_ONE] =
+            (uint8_t)(lang >= 0 && lang < CBM_LANG_COUNT ? lang : CBM_LANG_COUNT);
     }
 }
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
+    cbm_registry_add_lang(r, name, qualified_name, label, CBM_LANG_COUNT);
+}
+
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang) {
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -945,10 +1180,11 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
      * The derived key is the one every language has always used and it stays
      * unconditional, so a grammar whose QNs carry no '#' is byte-identical to
      * before this commit. The second key exists for one shape: a fenced tail is
-     * a literal string no bare callee is ever written as. rust_cfg_qualified_name
-     * mints a `#[cfg(test)]` twin as "proj.lib.add#cfg(test)", simple_name() has
-     * no '#' handling, so the derived key filed that function under the whole
-     * string "add#cfg(test)" where no bare `add` callee could reach it.
+     * a literal string no bare callee is ever written as. A QN such as
+     * "proj.lib.add#cfg(test)" (Rust cfg twins were minted that way until they
+     * became variants of one definition) would otherwise be filed under the
+     * whole string "add#cfg(test)" — simple_name() has no '#' handling — where
+     * no bare `add` callee could reach it.
      *
      * Gating on the fence rather than on the file's language is what makes
      * "unchanged for every other grammar" checkable instead of asserted. Every
@@ -968,9 +1204,9 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     const char *derived = simple_name(qualified_name);
     const char *primary =
         name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
-    index_under_name(r, primary, owned_qn);
-    /* '#' is a QN fence, and extract_defs.c's rust_cfg_qualified_name is the
-     * only thing in the tree that mints one today. A grammar that starts
+    index_under_name(r, primary, owned_qn, lang);
+    /* '#' is a QN fence; no extractor mints one for a definition today (Rust
+     * cfg twins are variants of one plain QN). A grammar that starts
      * minting a '#' opts into this second key by doing so, whatever it means by
      * the fence: its symbols become reachable under the passed name as well,
      * and they share that name's bucket with everything else filed under it.
@@ -978,7 +1214,7 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
      * signature-qualified callable is filed under `name` already, and its
      * capped suffix may carry a '#' of its own. */
     if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
-        index_under_name(r, name, owned_qn);
+        index_under_name(r, name, owned_qn, lang);
     }
 }
 
@@ -1012,6 +1248,33 @@ int cbm_registry_find_by_name(const cbm_registry_t *r, const char *name, const c
         *count = 0;
     }
     return 0;
+}
+
+const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name) {
+    /* A member name that exactly one Field in the whole project carries names
+     * that Field without any choice being made. This is what an untyped C
+     * member access may still bind: the defect in bare-name member resolution
+     * was the arbitrary pick among SEVERAL same-named members (kernel: 359,236
+     * of the edges a typed-only rule dropped were onto such a unique name).
+     * Only Fields are candidates -- a function or variable of the same name
+     * can never be what `a.b` means -- and two of them bind nothing. */
+    const char **qns = NULL;
+    int count = 0;
+    if (!member_name || cbm_registry_find_by_name(r, member_name, &qns, &count) != 0 || !qns) {
+        return NULL;
+    }
+    const char *only = NULL;
+    for (int i = 0; i < count; i++) {
+        const char *label = qns[i] ? cbm_registry_label_of(r, qns[i]) : NULL;
+        if (!label || strcmp(label, "Field") != 0) {
+            continue;
+        }
+        if (only) {
+            return NULL;
+        }
+        only = qns[i];
+    }
+    return only;
 }
 
 int cbm_registry_size(const cbm_registry_t *r) {
@@ -1410,6 +1673,49 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
     }
     return res;
+}
+
+/* The recorded language of the registry entry `qn` (the owned key pointer a
+ * resolution returns), or CBM_LANG_COUNT when unknown. The by-name bucket is
+ * at most REG_MAX_CANDIDATES long whenever a name strategy produced `qn`. */
+static CBMLanguage registry_entry_language(const cbm_registry_t *r, const char *qn) {
+    const qn_array_t *arr = cbm_ht_get(r->by_name, simple_name(qn));
+    if (!arr || !arr->lang || arr->is_test_cap < arr->count) {
+        return CBM_LANG_COUNT;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (arr->items[i] == qn || strcmp(arr->items[i], qn) == 0) {
+            return (CBMLanguage)arr->lang[i];
+        }
+    }
+    return CBM_LANG_COUNT;
+}
+
+/* The cross-language veto (see cbm_lang_resolution_compatible). A name-only
+ * answer carries no import or module evidence, so it only stands when the
+ * caller's language can call the target: a JS `app.get` must not bind
+ * Python's builtins.dict.get because it is the one "get" in the project.
+ * Callers turn a vetoed answer into an EMPTY resolution BEFORE their empty-
+ * resolution fallbacks, so route registration / HTTP classification still
+ * run. A veto, not a re-pick among the remaining candidates: re-picking
+ * promotes the next same-language short-name guess (measured on n8n: +3.1k
+ * CALLS, 88% of them jest `describe()` bound to a project method).
+ * field_type_hint is included: it re-picks by type-name substring across ALL
+ * candidates, language-blind. */
+bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_lang,
+                                    const cbm_resolution_t *res) {
+    if (!r || !res || caller_lang < 0 || caller_lang >= CBM_LANG_COUNT || !res->qualified_name ||
+        !res->qualified_name[0] || !res->strategy) {
+        return false;
+    }
+    if (strcmp(res->strategy, "unique_name") != 0 && strcmp(res->strategy, "suffix_match") != 0 &&
+        strcmp(res->strategy, "qualified_suffix") != 0 &&
+        strcmp(res->strategy, "field_type_hint") != 0 &&
+        strcmp(res->strategy, "same_module") != 0) {
+        return false;
+    }
+    return !cbm_lang_resolution_compatible(caller_lang,
+                                           registry_entry_language(r, res->qualified_name));
 }
 
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,

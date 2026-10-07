@@ -229,6 +229,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - `USAGE` — an identifier is used, but a unique callable target is not proven (including ambiguous or complex expressions)
 - `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
 - `HTTP_CALLS`, `ASYNC_CALLS` (cross-service)
+- `SPAWNS` — the caller starts another program (`subprocess.run`, `exec.Command`, `posix_spawn`, `Process.Start`, ...); the target is a `Process` node named after the program, or `<dynamic>` when the program is not a literal
 - `EMITS`, `LISTENS_ON` (channels)
 - `DATA_FLOWS` with arg-to-param mapping + field access chains
 - `SIMILAR_TO` (MinHash + LSH near-clone detection, Jaccard scored)
@@ -740,7 +741,7 @@ mode. `index_status` keeps describing the published graph and its freshness.
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `SPAWNS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
 
 ### Qualified Names
 

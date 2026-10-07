@@ -44,10 +44,15 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "result_spill.h"
 #include "cbm.h"
 #include "foundation/secure_random.h"
+/* C11 guarantees stdbool.h; keep yyjson's Boolean types aligned with ours. */
+#ifndef YYJSON_HAS_STDBOOL_H
+#define YYJSON_HAS_STDBOOL_H 1
+#endif
 #include "yyjson/yyjson.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,6 +188,7 @@ void cbm_pipeline_unlock(void) {
 /* ── Internal state ──────────────────────────────────────────────── */
 
 struct cbm_pipeline {
+    cbm_pipeline_frozen_t *frozen; /* NULL for every ordinary caller */
     char *repo_path;
     char *db_path;
     char *project_name;
@@ -231,6 +237,10 @@ struct cbm_pipeline {
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
+    cbm_test_declarations_t *test_declarations; /* same project bytes, run-owned */
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    unsigned test_fault_mask;
+#endif
 
     /* Committed graph size at dump time (-1 = dump did not run). #334 gate axis. */
     int committed_nodes;
@@ -277,6 +287,476 @@ struct cbm_pipeline {
     int (*rename_hook)(const char *, const char *, void *);
     void *rename_hook_ctx;
 };
+
+/* Private, single-use candidate owner; never a provenance certificate. */
+enum { FROZEN_READY, FROZEN_BUILDING, FROZEN_CANDIDATE, FROZEN_FAILED };
+struct cbm_pipeline_frozen {
+    CBMArena arena;
+    cbm_pipeline_t *pipeline;
+    const char *git_props; /* owned, complete JSON for frozen Branch/HAS_BRANCH */
+    atomic_int *external_cancelled;
+    int state;
+    unsigned diagnostic_flags; /* monotone; independent of record storage */
+    cbm_pipeline_frozen_status_t failure;
+    cbm_file_hash_t *baseline;
+    int baseline_count;
+    /* The classified file list, owned by the arena, sorted by path; has_list
+     * false: discover the source root. */
+    bool has_list;
+    cbm_pipeline_frozen_file_t *listed;
+    size_t listed_count;
+    /* Arena copy of inputs->base_db_path; NULL builds from scratch. */
+    const char *base_db_path;
+    cbm_pipeline_frozen_route_t route;
+    char canonical_root[CBM_SZ_4K];
+    char canonical_parent[CBM_SZ_4K];
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    cbm_pipeline_frozen_route_observer_t observer;
+    void *observer_context;
+    cbm_pipeline_frozen_diag_fault_t diagnostic_fault;
+#endif
+};
+
+bool cbm_pipeline_is_frozen(const cbm_pipeline_t *p) {
+    return p && p->frozen;
+}
+
+int cbm_pipeline_frozen_checkpoint(cbm_pipeline_t *p) {
+    if (!p || !p->frozen)
+        return 0;
+    atomic_int *external = p->frozen->external_cancelled;
+    if (external && atomic_load(external))
+        atomic_store(p->cancelled, 1);
+    return atomic_load(p->cancelled) ? CBM_NOT_FOUND : 0;
+}
+
+const cbm_git_context_t *cbm_pipeline_frozen_git(const cbm_pipeline_t *p) {
+    return cbm_pipeline_is_frozen(p) ? &p->git_ctx : NULL;
+}
+
+const cbm_userconfig_t *cbm_pipeline_frozen_config(const cbm_pipeline_t *p) {
+    return cbm_pipeline_is_frozen(p) ? p->userconfig : NULL;
+}
+
+static void frozen_observe(cbm_pipeline_t *p, unsigned kind, unsigned workers) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (p->frozen && p->frozen->observer) {
+        cbm_pipeline_frozen_route_event_t event = {.kind = (cbm_pipeline_frozen_route_kind_t)kind,
+                                                   .worker_count = workers};
+        p->frozen->observer(&event, p->frozen->observer_context);
+    }
+#else
+    (void)p;
+    (void)kind;
+    (void)workers;
+#endif
+}
+
+void cbm_pipeline_frozen_manifest_dispatch(cbm_pipeline_t *p) {
+    if (cbm_pipeline_is_frozen(p))
+        frozen_observe(p, 1, 1);
+}
+
+static bool frozen_string(const char *s, bool nonempty) {
+    if (!s || (nonempty && !s[0]))
+        return false;
+    for (size_t i = 0; i < CBM_SZ_4K; i++) {
+        if (s[i] == '\0')
+            return true;
+    }
+    return false;
+}
+
+static bool frozen_absolute(const char *s) {
+    if (!frozen_string(s, true))
+        return false;
+#ifdef _WIN32
+    if ((s[0] == '\\' && s[1] == '\\') || (s[0] == '/' && s[1] == '/'))
+        return true;
+    bool drive_letter = (s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z');
+    return drive_letter && s[1] == ':' && (s[2] == '/' || s[2] == '\\');
+#else
+    return s[0] == '/';
+#endif
+}
+
+static bool frozen_oid(const char *oid) {
+    if (!frozen_string(oid, true))
+        return false;
+    size_t len = strlen(oid);
+    if (len != 40 && len != 64)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)oid[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+static bool frozen_git_valid(const cbm_git_context_t *git) {
+    if (!git || !git->is_git || !git->root_exists)
+        return false;
+    const char *strings[] = {git->input_path,     git->worktree_root,  git->git_dir,
+                             git->git_common_dir, git->canonical_root, git->branch,
+                             git->branch_slug};
+    for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
+        if (!frozen_string(strings[i], i >= 4))
+            return false;
+    }
+    return frozen_oid(git->head_sha) && frozen_oid(git->base_sha) &&
+           strlen(git->head_sha) == strlen(git->base_sha);
+}
+
+static bool frozen_policy_valid(const cbm_index_resource_policy_t *policy) {
+    if (policy->max_files.enabled &&
+        (policy->max_files.value == 0 || policy->max_files.value > CBM_INDEX_MAX_FILES_VALUE))
+        return false;
+    if (policy->max_source_bytes.enabled &&
+        (policy->max_source_bytes.value == 0 ||
+         policy->max_source_bytes.value > CBM_INDEX_MAX_SOURCE_MB_VALUE * CBM_INDEX_MIB_BYTES))
+        return false;
+    return true;
+}
+
+static bool frozen_config_span_valid(const cbm_pipeline_frozen_inputs_t *in) {
+    if (in->config_state == CBM_USERCONFIG_SOURCE_ABSENT)
+        return !in->config_bytes && in->config_len == 0;
+    return in->config_state == CBM_USERCONFIG_SOURCE_PRESENT && in->config_bytes;
+}
+
+/* A relative path made of non-empty segments other than "." and "..", with
+ * '/' as the only separator. */
+static bool frozen_rel_path_valid(const char *rel) {
+    if (!rel || !rel[0] || strlen(rel) >= CBM_SZ_4K || strchr(rel, '\\')) {
+        return false;
+    }
+    const char *segment = rel;
+    for (;;) {
+        const char *slash = strchr(segment, '/');
+        size_t len = slash ? (size_t)(slash - segment) : strlen(segment);
+        if (len == 0 || (len == 1 && segment[0] == '.') ||
+            (len == 2 && segment[0] == '.' && segment[1] == '.')) {
+            return false;
+        }
+        if (!slash) {
+            return true;
+        }
+        segment = slash + 1;
+    }
+}
+
+static bool frozen_files_valid(const cbm_pipeline_frozen_inputs_t *in) {
+    if (!in->files) {
+        return in->file_count == 0;
+    }
+    if (in->file_count > (size_t)INT_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < in->file_count; i++) {
+        if (!frozen_rel_path_valid(in->files[i].rel_path) || in->files[i].language < 0 ||
+            in->files[i].language > CBM_LANG_COUNT) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool frozen_inputs_valid(const cbm_pipeline_frozen_inputs_t *in) {
+    return in && frozen_absolute(in->source_root) && frozen_absolute(in->candidate_db_path) &&
+           frozen_string(in->project, true) && cbm_validate_project_name(in->project) &&
+           frozen_git_valid(in->pinned_git) && frozen_policy_valid(&in->resource_policy) &&
+           frozen_config_span_valid(in) && frozen_files_valid(in) &&
+           (!in->base_db_path || frozen_absolute(in->base_db_path));
+}
+
+static int frozen_listed_cmp(const void *left, const void *right) {
+    const cbm_pipeline_frozen_file_t *a = left;
+    const cbm_pipeline_frozen_file_t *b = right;
+    return strcmp(a->rel_path, b->rel_path);
+}
+
+/* Copy the list into the owner's arena, sorted; a path listed twice is
+ * INVALID (two languages for one file have no single meaning). */
+static cbm_pipeline_frozen_status_t frozen_copy_list(cbm_pipeline_frozen_t *owner,
+                                                     const cbm_pipeline_frozen_inputs_t *in) {
+    owner->has_list = in->files != NULL;
+    if (!owner->has_list || in->file_count == 0) {
+        return CBM_PIPELINE_FROZEN_OK;
+    }
+    owner->listed = cbm_arena_calloc(&owner->arena, in->file_count * sizeof(*owner->listed));
+    if (!owner->listed) {
+        return CBM_PIPELINE_FROZEN_OOM;
+    }
+    for (size_t i = 0; i < in->file_count; i++) {
+        owner->listed[i].language = in->files[i].language;
+        owner->listed[i].rel_path = cbm_arena_strdup(&owner->arena, in->files[i].rel_path);
+        if (!owner->listed[i].rel_path) {
+            return CBM_PIPELINE_FROZEN_OOM;
+        }
+    }
+    owner->listed_count = in->file_count;
+    qsort(owner->listed, owner->listed_count, sizeof(*owner->listed), frozen_listed_cmp);
+    for (size_t i = 1; i < owner->listed_count; i++) {
+        if (strcmp(owner->listed[i - 1].rel_path, owner->listed[i].rel_path) == 0) {
+            return CBM_PIPELINE_FROZEN_INVALID;
+        }
+    }
+    return CBM_PIPELINE_FROZEN_OK;
+}
+
+bool cbm_pipeline_frozen_has_file_list(const cbm_pipeline_t *p) {
+    return cbm_pipeline_is_frozen(p) && p->frozen->has_list;
+}
+
+int cbm_pipeline_frozen_listed_files(cbm_pipeline_t *p, cbm_file_info_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!cbm_pipeline_frozen_has_file_list(p)) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_pipeline_frozen_t *owner = p->frozen;
+    cbm_file_info_t *files =
+        owner->listed_count ? calloc(owner->listed_count, sizeof(*files)) : NULL;
+    if (owner->listed_count && !files) {
+        owner->failure = CBM_PIPELINE_FROZEN_OOM;
+        return CBM_NOT_FOUND;
+    }
+    int n = 0;
+    for (size_t i = 0; i < owner->listed_count; i++) {
+        const cbm_pipeline_frozen_file_t *listed = &owner->listed[i];
+        if (listed->language == CBM_LANG_COUNT) {
+            continue; /* no supported language: discovery does not index it either */
+        }
+        char path[CBM_SZ_4K];
+        int len = snprintf(path, sizeof(path), "%s/%s", p->repo_path, listed->rel_path);
+        /* The UTF-8-safe size probe; a directory is not a listed file. */
+        int64_t size =
+            len > 0 && (size_t)len < sizeof(path) && !cbm_is_dir(path) ? cbm_file_size(path) : -1;
+        bool regular = size >= 0;
+        if (!regular || cbm_pipeline_frozen_checkpoint(p)) {
+            if (!regular && owner->failure == CBM_PIPELINE_FROZEN_OK) {
+                owner->failure = CBM_PIPELINE_FROZEN_INPUT_CHANGED;
+            }
+            cbm_discover_free(files, n);
+            return CBM_NOT_FOUND;
+        }
+        files[n].path = strdup(path);
+        files[n].rel_path = strdup(listed->rel_path);
+        files[n].language = listed->language;
+        files[n].size = size;
+        if (!files[n].path || !files[n].rel_path) {
+            n++;
+            cbm_discover_free(files, n);
+            owner->failure = CBM_PIPELINE_FROZEN_OOM;
+            return CBM_NOT_FOUND;
+        }
+        n++;
+    }
+    *out = files;
+    *count = n;
+    return 0;
+}
+
+static bool frozen_copy_git(cbm_git_context_t *to, const cbm_git_context_t *from) {
+    to->is_git = from->is_git;
+    to->is_worktree = from->is_worktree;
+    to->is_detached = from->is_detached;
+    to->root_exists = from->root_exists;
+    char **targets[] = {&to->input_path,     &to->worktree_root,  &to->git_dir,
+                        &to->git_common_dir, &to->canonical_root, &to->branch,
+                        &to->branch_slug,    &to->head_sha,       &to->base_sha};
+    const char *sources[] = {from->input_path,     from->worktree_root,  from->git_dir,
+                             from->git_common_dir, from->canonical_root, from->branch,
+                             from->branch_slug,    from->head_sha,       from->base_sha};
+    for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        *targets[i] = strdup(sources[i]);
+        if (!*targets[i])
+            return false;
+    }
+    for (size_t i = 0; to->head_sha[i]; i++) {
+        to->head_sha[i] = (char)tolower((unsigned char)to->head_sha[i]);
+        to->base_sha[i] = (char)tolower((unsigned char)to->base_sha[i]);
+    }
+    return true;
+}
+
+static cbm_pipeline_frozen_status_t frozen_config(cbm_pipeline_t *p,
+                                                  const cbm_pipeline_frozen_inputs_t *in) {
+    cbm_userconfig_snapshot_status_t status = cbm_userconfig_from_project_bytes(
+        in->config_state, in->config_bytes, in->config_len, &p->userconfig);
+    switch (status) {
+    case CBM_USERCONFIG_SNAPSHOT_OOM:
+        return CBM_PIPELINE_FROZEN_OOM;
+    case CBM_USERCONFIG_SNAPSHOT_LIMIT:
+        return CBM_PIPELINE_FROZEN_LIMIT;
+    case CBM_USERCONFIG_SNAPSHOT_UNSUPPORTED:
+        return CBM_PIPELINE_FROZEN_UNSUPPORTED;
+    case CBM_USERCONFIG_SNAPSHOT_INVALID:
+        return CBM_PIPELINE_FROZEN_CONFIG;
+    case CBM_USERCONFIG_SNAPSHOT_OK:
+        break;
+    default:
+        return CBM_PIPELINE_FROZEN_CONFIG;
+    }
+    const char *bytes = NULL;
+    size_t len = 0;
+    cbm_userconfig_source_state_t state =
+        cbm_userconfig_project_source(p->userconfig, &bytes, &len);
+    p->test_declarations =
+        cbm_test_declarations_parse(bytes, len, state == CBM_USERCONFIG_SOURCE_ABSENT);
+    if (!p->test_declarations)
+        return CBM_PIPELINE_FROZEN_CONFIG;
+    CBMFileResult validation = {0};
+    cbm_arena_init_lazy(&validation.arena, CBM_SZ_4K);
+    bool valid = cbm_test_declarations_validate(&validation, p->test_declarations);
+    CBMTestExtractStatus validation_status = validation.test_declarations_status;
+    cbm_arena_destroy(&validation.arena);
+    if (validation_status == CBM_TEST_EXTRACT_OOM)
+        return CBM_PIPELINE_FROZEN_OOM;
+    return valid ? CBM_PIPELINE_FROZEN_OK : CBM_PIPELINE_FROZEN_UNSUPPORTED;
+}
+
+static cbm_pipeline_frozen_status_t frozen_git_props(cbm_pipeline_frozen_t *owner) {
+    /* Six serialized string values, worst-case six-byte JSON escaping, plus
+     * fixed keys/booleans. Input validation caps each string below 4096 bytes. */
+    enum { FROZEN_GIT_PROPS_CAP = 6 * CBM_SZ_4K * 6 + CBM_SZ_4K };
+    char *json = cbm_arena_alloc(&owner->arena, FROZEN_GIT_PROPS_CAP);
+    if (!json)
+        return CBM_PIPELINE_FROZEN_OOM;
+    if (cbm_git_context_props_json(&owner->pipeline->git_ctx, json, FROZEN_GIT_PROPS_CAP) <= 0)
+        return CBM_PIPELINE_FROZEN_PIPELINE_ERROR;
+    owner->git_props = json;
+    return CBM_PIPELINE_FROZEN_OK;
+}
+
+static cbm_pipeline_frozen_status_t frozen_allocate_pipeline(
+    cbm_pipeline_frozen_t *owner, const cbm_pipeline_frozen_inputs_t *in) {
+    cbm_pipeline_t *p = calloc(1, sizeof(*p));
+    if (!p)
+        return CBM_PIPELINE_FROZEN_OOM;
+    owner->pipeline = p;
+    p->frozen = owner;
+    p->repo_path = strdup(in->source_root);
+    p->db_path = strdup(in->candidate_db_path);
+    p->project_name = strdup(in->project);
+    p->requested_mode = CBM_MODE_FULL;
+    p->mode = CBM_MODE_FULL;
+    p->committed_nodes = -1;
+    p->committed_edges = -1;
+    p->resource_policy = in->resource_policy;
+    atomic_init(&p->cancelled_storage, 0);
+    p->cancelled = &p->cancelled_storage;
+    if (!p->repo_path || !p->db_path || !p->project_name ||
+        !frozen_copy_git(&p->git_ctx, in->pinned_git))
+        return CBM_PIPELINE_FROZEN_OOM;
+    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+    if (!p->branch_qn)
+        return CBM_PIPELINE_FROZEN_OOM;
+    cbm_pipeline_frozen_status_t status = frozen_git_props(owner);
+    return status == CBM_PIPELINE_FROZEN_OK ? frozen_config(p, in) : status;
+}
+
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_create(const cbm_pipeline_frozen_inputs_t *inputs,
+                                                        cbm_pipeline_frozen_t **out) {
+    if (!out)
+        return CBM_PIPELINE_FROZEN_INVALID;
+    *out = NULL;
+    if (!frozen_inputs_valid(inputs))
+        return CBM_PIPELINE_FROZEN_INVALID;
+    CBMArena arena;
+    cbm_arena_init_lazy(&arena, CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    cbm_pipeline_frozen_t *owner = cbm_arena_calloc(&arena, sizeof(*owner));
+    if (!owner) {
+        cbm_arena_destroy(&arena);
+        return CBM_PIPELINE_FROZEN_OOM;
+    }
+    owner->arena = arena;
+    owner->external_cancelled = inputs->cancelled;
+    cbm_pipeline_frozen_status_t status = frozen_copy_list(owner, inputs);
+    if (status == CBM_PIPELINE_FROZEN_OK && inputs->base_db_path) {
+        owner->base_db_path = cbm_arena_strdup(&owner->arena, inputs->base_db_path);
+        if (!owner->base_db_path) {
+            status = CBM_PIPELINE_FROZEN_OOM;
+        }
+    }
+    if (status == CBM_PIPELINE_FROZEN_OK) {
+        status = frozen_allocate_pipeline(owner, inputs);
+    }
+    if (status != CBM_PIPELINE_FROZEN_OK) {
+        cbm_pipeline_frozen_free(owner);
+        return status;
+    }
+    *out = owner;
+    return CBM_PIPELINE_FROZEN_OK;
+}
+
+void cbm_pipeline_frozen_cancel(cbm_pipeline_frozen_t *owner) {
+    if (owner)
+        cbm_pipeline_cancel(owner->pipeline);
+}
+
+const cbm_pipeline_t *cbm_pipeline_frozen_diagnostics(const cbm_pipeline_frozen_t *owner) {
+    return owner ? owner->pipeline : NULL;
+}
+
+cbm_pipeline_frozen_route_t cbm_pipeline_frozen_route(const cbm_pipeline_frozen_t *owner) {
+    return owner && owner->state == FROZEN_CANDIDATE ? owner->route
+                                                     : CBM_PIPELINE_FROZEN_ROUTE_FULL;
+}
+
+bool cbm_pipeline_frozen_negative_evidence(const cbm_pipeline_frozen_t *owner,
+                                           unsigned *out_flags) {
+    if (out_flags)
+        *out_flags = 0;
+    if (!owner || !out_flags || owner->state == FROZEN_BUILDING)
+        return false;
+    *out_flags = owner->diagnostic_flags;
+    return true;
+}
+
+const char *cbm_pipeline_frozen_candidate_path(const cbm_pipeline_frozen_t *owner) {
+    return owner && owner->state == FROZEN_CANDIDATE ? owner->pipeline->db_path : NULL;
+}
+
+void cbm_pipeline_frozen_free(cbm_pipeline_frozen_t *owner) {
+    if (!owner)
+        return;
+    cbm_pipeline_free_semantic_manifest(owner->baseline, owner->baseline_count);
+    cbm_pipeline_free(owner->pipeline);
+    CBMArena arena = owner->arena;
+    cbm_arena_destroy(&arena);
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_set_diagnostic_fault_for_tests(
+    cbm_pipeline_frozen_t *owner, cbm_pipeline_frozen_diag_fault_t fault) {
+    if (!owner || owner->state != FROZEN_READY ||
+        (unsigned)fault > CBM_PIPELINE_FROZEN_DIAG_FAULT_PHASE)
+        return CBM_PIPELINE_FROZEN_INVALID;
+    owner->diagnostic_fault = fault;
+    return CBM_PIPELINE_FROZEN_OK;
+}
+
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_set_route_observer_for_tests(
+    cbm_pipeline_frozen_t *owner, cbm_pipeline_frozen_route_observer_t observer, void *context) {
+    if (!owner || owner->state != FROZEN_READY)
+        return CBM_PIPELINE_FROZEN_INVALID;
+    owner->observer = observer;
+    owner->observer_context = observer ? context : NULL;
+    return CBM_PIPELINE_FROZEN_OK;
+}
+
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_set_publish_hooks_for_tests(
+    cbm_pipeline_frozen_t *owner, void (*before_publish)(cbm_pipeline_t *, const char *, void *),
+    int (*rename_stage)(const char *, const char *, void *), void *context) {
+    if (!owner || owner->state != FROZEN_READY)
+        return CBM_PIPELINE_FROZEN_INVALID;
+    cbm_pipeline_set_before_publish_hook_for_tests(owner->pipeline, before_publish, context);
+    cbm_pipeline_set_rename_hook_for_tests(owner->pipeline, rename_stage, context);
+    return CBM_PIPELINE_FROZEN_OK;
+}
+#endif
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
 
@@ -706,6 +1186,19 @@ void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **r
         *complete = p && !p->unresolved_capture_failed;
 }
 
+static void pipeline_release_test_config(cbm_pipeline_t *p) {
+    if (!p) {
+        return;
+    }
+    if (p->userconfig && cbm_get_user_lang_config() == p->userconfig) {
+        cbm_set_user_lang_config(NULL);
+    }
+    cbm_test_declarations_free(p->test_declarations);
+    p->test_declarations = NULL;
+    cbm_userconfig_free(p->userconfig);
+    p->userconfig = NULL;
+}
+
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -721,11 +1214,11 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->ignored_count = 0;
     p->ignored_total = 0;
     for (int i = 0; i < p->file_errors_count; i++) {
-        free(p->file_errors[i].path);
-        free(p->file_errors[i].reason);
-        free(p->file_errors[i].phase);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->file_errors[i].path);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->file_errors[i].reason);
+        cbm_free(CBM_MEM_CLASS_OTHER, p->file_errors[i].phase);
     }
-    free(p->file_errors);
+    cbm_free(CBM_MEM_CLASS_OTHER, p->file_errors);
     p->file_errors = NULL;
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
@@ -744,12 +1237,8 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     cbm_mutex_destroy(&p->unresolved_mutex);
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
-    /* Defensively free userconfig in case run() was never called or panicked */
-    if (p->userconfig) {
-        cbm_set_user_lang_config(NULL);
-        cbm_userconfig_free(p->userconfig);
-        p->userconfig = NULL;
-    }
+    /* Defensive owner cleanup; normal runs release after publication. */
+    pipeline_release_test_config(p);
     free(p);
 }
 
@@ -784,6 +1273,64 @@ void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
 
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
     return p ? p->project_name : NULL;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_test_set_fault_mask(cbm_pipeline_t *p, unsigned mask) {
+    if (p) {
+        p->test_fault_mask = mask;
+    }
+}
+unsigned cbm_pipeline_test_fault_mask(const cbm_pipeline_t *p) {
+    return p ? p->test_fault_mask : 0;
+}
+#endif
+
+const cbm_test_declarations_t *cbm_pipeline_test_declarations(const cbm_pipeline_t *p) {
+    return p ? p->test_declarations : NULL;
+}
+
+bool cbm_pipeline_project_source_matches(const cbm_pipeline_t *p, const cbm_userconfig_t *fresh) {
+    const char *current = NULL;
+    size_t current_len = 0;
+    cbm_userconfig_source_state_t current_state =
+        cbm_userconfig_project_source(fresh, &current, &current_len);
+    if (!p || current_state == CBM_USERCONFIG_SOURCE_ERROR) {
+        return false;
+    }
+    if (!p->userconfig) {
+        return true; /* standalone manifest inspection, no active run */
+    }
+    const char *original = NULL;
+    size_t original_len = 0;
+    cbm_userconfig_source_state_t original_state =
+        cbm_userconfig_project_source(p->userconfig, &original, &original_len);
+    return original_state != CBM_USERCONFIG_SOURCE_ERROR && original_state == current_state &&
+           original_len == current_len &&
+           (original_len == 0 || memcmp(original, current, original_len) == 0);
+}
+
+static bool pipeline_load_test_config(cbm_pipeline_t *p) {
+    p->userconfig = cbm_userconfig_load_with_source(p->repo_path);
+    const char *bytes = NULL;
+    size_t len = 0;
+    cbm_userconfig_source_state_t state =
+        cbm_userconfig_project_source(p->userconfig, &bytes, &len);
+    if (state == CBM_USERCONFIG_SOURCE_ERROR) {
+        return false;
+    }
+    p->test_declarations =
+        cbm_test_declarations_parse(bytes, len, state == CBM_USERCONFIG_SOURCE_ABSENT);
+    if (!p->test_declarations) {
+        return false;
+    }
+    /* Validate even for an empty repository: unsupported consumed requests
+     * cannot disappear merely because discovery finds no source files. */
+    CBMFileResult validation = {0};
+    cbm_arena_init(&validation.arena);
+    bool valid = cbm_test_declarations_validate(&validation, p->test_declarations);
+    cbm_arena_destroy(&validation.arena);
+    return valid;
 }
 
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
@@ -821,11 +1368,115 @@ static char *fe_strdup(const char *s) {
         return NULL;
     }
     size_t n = strlen(s) + 1;
-    char *d = (char *)malloc(n);
+    char *d = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, n);
     if (d) {
         memcpy(d, s, n);
     }
     return d;
+}
+
+/* Private indices select only the frozen recorder's allocation boundaries. */
+enum { FROZEN_DIAG_GROW, FROZEN_DIAG_PATH, FROZEN_DIAG_REASON, FROZEN_DIAG_PHASE };
+
+static bool frozen_diag_fail_allocation(cbm_pipeline_t *p, unsigned allocation) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    static const cbm_pipeline_frozen_diag_fault_t faults[] = {
+        CBM_PIPELINE_FROZEN_DIAG_FAULT_GROW, CBM_PIPELINE_FROZEN_DIAG_FAULT_PATH,
+        CBM_PIPELINE_FROZEN_DIAG_FAULT_REASON, CBM_PIPELINE_FROZEN_DIAG_FAULT_PHASE};
+    if (p->frozen->diagnostic_fault == faults[allocation]) {
+        p->frozen->diagnostic_fault = CBM_PIPELINE_FROZEN_DIAG_FAULT_NONE;
+        return true;
+    }
+#else
+    (void)p;
+    (void)allocation;
+#endif
+    return false;
+}
+
+static void frozen_diag_incomplete(cbm_pipeline_t *p, bool oom) {
+    p->frozen->diagnostic_flags |= CBM_PIPELINE_FROZEN_DIAGNOSTIC_INCOMPLETE;
+    if (oom)
+        p->frozen->diagnostic_flags |= CBM_PIPELINE_FROZEN_DIAGNOSTIC_OOM;
+}
+
+static bool frozen_diag_reserve(cbm_pipeline_t *p) {
+    if (p->file_errors_count < 0 || p->file_errors_cap < 0 ||
+        p->file_errors_count > p->file_errors_cap) {
+        frozen_diag_incomplete(p, false);
+        return false;
+    }
+    if (p->file_errors_count < p->file_errors_cap)
+        return true;
+    if (p->file_errors_cap > INT_MAX / 2) {
+        frozen_diag_incomplete(p, false);
+        return false;
+    }
+    int capacity = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
+    if ((size_t)capacity > SIZE_MAX / sizeof(*p->file_errors)) {
+        frozen_diag_incomplete(p, false);
+        return false;
+    }
+    cbm_file_error_t *grown = frozen_diag_fail_allocation(p, FROZEN_DIAG_GROW)
+                                  ? NULL
+                                  : cbm_realloc(CBM_MEM_CLASS_OTHER, p->file_errors,
+                                                (size_t)capacity * sizeof(*p->file_errors));
+    if (!grown) {
+        frozen_diag_incomplete(p, true);
+        return false;
+    }
+    p->file_errors = grown;
+    p->file_errors_cap = capacity;
+    return true;
+}
+
+static char *frozen_diag_copy(cbm_pipeline_t *p, const char *source, unsigned allocation) {
+    size_t length = strlen(source);
+    if (length == SIZE_MAX) {
+        frozen_diag_incomplete(p, false);
+        return NULL;
+    }
+    char *copy = frozen_diag_fail_allocation(p, allocation)
+                     ? NULL
+                     : cbm_alloc(CBM_MEM_CLASS_OTHER, length + 1);
+    if (!copy) {
+        frozen_diag_incomplete(p, true);
+        return NULL;
+    }
+    memcpy(copy, source, length + 1);
+    return copy;
+}
+
+static void frozen_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+                                  const char *phase) {
+    /* A partial parse is a parse gap the selection handles per file (user
+     * decision 2026-10-04); every other file diagnostic refuses the candidate. */
+    bool parse_gap = phase && strcmp(phase, "parse_partial") == 0;
+    /* A file indexed without configured test roles is not refused either
+     * (user decision 2026-10-04): the selection reads tests by its own model. */
+    bool test_gap = phase && strcmp(phase, "test_declarations") == 0;
+    p->frozen->diagnostic_flags |= parse_gap  ? CBM_PIPELINE_FROZEN_PARSE_GAP
+                                   : test_gap ? CBM_PIPELINE_FROZEN_TEST_DECLARATION_GAP
+                                              : CBM_PIPELINE_FROZEN_FILE_DIAGNOSTIC;
+    if (!path || !reason || !phase) {
+        frozen_diag_incomplete(p, false);
+        return;
+    }
+    if (!frozen_diag_reserve(p))
+        return;
+    cbm_file_error_t row = {0};
+    char **copies[] = {&row.path, &row.reason, &row.phase};
+    const char *sources[] = {path, reason, phase};
+    for (unsigned i = 0; i < 3; i++) {
+        *copies[i] = frozen_diag_copy(p, sources[i], FROZEN_DIAG_PATH + i);
+        if (!*copies[i]) {
+            cbm_free(CBM_MEM_CLASS_OTHER, row.path);
+            cbm_free(CBM_MEM_CLASS_OTHER, row.reason);
+            cbm_free(CBM_MEM_CLASS_OTHER, row.phase);
+            return;
+        }
+    }
+    p->file_errors[p->file_errors_count++] = row;
 }
 
 void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
@@ -833,10 +1484,14 @@ void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char
     if (!p) {
         return;
     }
+    if (p->frozen) {
+        frozen_add_file_error(p, path, reason, phase);
+        return;
+    }
     if (p->file_errors_count >= p->file_errors_cap) {
         int ncap = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
-        cbm_file_error_t *grown =
-            (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown));
+        cbm_file_error_t *grown = (cbm_file_error_t *)cbm_realloc(
+            CBM_MEM_CLASS_OTHER, p->file_errors, (size_t)ncap * sizeof(*grown));
         if (!grown) {
             /* Never abort indexing just to record a skip — drop this record. */
             return;
@@ -939,6 +1594,8 @@ static char *resolve_db_path(const cbm_pipeline_t *p) {
 }
 
 static int check_cancel(const cbm_pipeline_t *p) {
+    if (p->frozen && p->frozen->external_cancelled && atomic_load(p->frozen->external_cancelled))
+        atomic_store(p->cancelled, 1);
     return atomic_load(p->cancelled) ? CBM_NOT_FOUND : 0;
 }
 
@@ -1005,8 +1662,9 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
     const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
     char branch_props[CBM_SZ_2K];
-    const char *branch_props_json = "{}";
-    if (cbm_git_context_props_json(&p->git_ctx, branch_props, sizeof(branch_props)) > 0) {
+    const char *branch_props_json = p->frozen ? p->frozen->git_props : "{}";
+    if (!p->frozen &&
+        cbm_git_context_props_json(&p->git_ctx, branch_props, sizeof(branch_props)) > 0) {
         branch_props_json = branch_props;
     }
     if (p->branch_qn) {
@@ -1627,8 +2285,16 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
  * no extracted results to feed cross-file resolution. */
 static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                        int file_count) {
-    if (!ctx || !ctx->result_cache)
+    if (!ctx) {
         return 0;
+    }
+    if (!ctx->result_cache) {
+        if (atomic_load(&ctx->test_definition_owners_seen)) {
+            atomic_store(&ctx->test_declarations_failed, 1);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+        return 0;
+    }
     /* Cross-file LSP runs in every mode. */
     return cbm_pipeline_pass_lsp_cross(ctx, files, file_count, ctx->result_cache);
 }
@@ -1731,13 +2397,15 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
         cbm_clock_gettime(CLOCK_MONOTONIC, t);
         int pr = seq_passes[si].fn(ctx, files, file_count);
-        if (pr != 0 && !seq_passes[si].ignore_err) {
+        if (pr == CBM_PIPELINE_ABORT_PRESERVE_DB || atomic_load(&ctx->test_declarations_failed)) {
+            rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        } else if (pr != 0 && !seq_passes[si].ignore_err) {
             rc = pr;
         }
         cbm_log_info("pass.timing", "pass", seq_passes[si].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(*t)));
         pipeline_phase_mark(seq_passes[si].name);
-        if (check_cancel(p)) {
+        if (rc != CBM_PIPELINE_ABORT_PRESERVE_DB && check_cancel(p)) {
             rc = CBM_NOT_FOUND;
         }
     }
@@ -1901,6 +2569,10 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                                           file_count, ctx->project_name,
                                                           def_modules, &def_count, def_starts)
                                : NULL;
+    }
+    if (def_count < 0) {
+        atomic_store(&ctx->test_declarations_failed, 1);
+        def_count = 0; /* keep metric counts valid; the fatal latch survives */
     }
     CBM_PROF_END_N("lsp_cross_prepare", "1_collect_all_defs", t_collect_defs, def_count);
     /* Serialize per-file LSP surfaces NOW — the result cache dies with this
@@ -2190,6 +2862,16 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
 
 /* Defined below, next to the other publication helpers. */
 static char *create_staging_path(const char *final_path);
+static char *create_staging_path_impl(const char *final_path, cbm_pipeline_t *frozen);
+static int publish_staged_impl(char *path, const cbm_pipeline_generation_t *generation,
+                               bool fts_wholesale, bool healthy, cbm_pipeline_t *frozen);
+static int finalize_staged_impl(char *path, const char *destination, atomic_int *cancelled,
+                                bool healthy, cbm_pipeline_t *frozen);
+
+static void frozen_cleanup_note(cbm_pipeline_t *p, int status) {
+    if (p && p->frozen && status != 0)
+        p->frozen->failure = CBM_PIPELINE_FROZEN_IO;
+}
 
 /* ── Stage ownership (#1839) ─────────────────────────────────────
  *
@@ -2233,7 +2915,7 @@ static char *stage_lock_sidecar_path(const char *stage_path) {
     if (len > SIZE_MAX - sizeof(suffix)) {
         return NULL;
     }
-    char *sidecar = (char *)malloc(len + sizeof(suffix));
+    char *sidecar = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, len + sizeof(suffix));
     if (!sidecar) {
         return NULL;
     }
@@ -2251,7 +2933,7 @@ int cbm_pipeline_stage_lock_hold(const char *stage_path) {
         return -1;
     }
     int fd = cbm_lockfile_open(sidecar, true);
-    free(sidecar);
+    cbm_free(CBM_MEM_CLASS_OTHER, sidecar);
     return fd;
 }
 
@@ -2267,8 +2949,19 @@ void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd) {
     cbm_lockfile_close(lock_fd);
     if (sidecar) {
         (void)cbm_unlink(sidecar);
-        free(sidecar);
+        cbm_free(CBM_MEM_CLASS_OTHER, sidecar);
     }
+}
+
+static int stage_lock_drop_checked(const char *path, int fd) {
+    char *sidecar = stage_lock_sidecar_path(path);
+    cbm_pipeline_stage_lock_drop(path, fd);
+    if (!sidecar)
+        return CBM_NOT_FOUND;
+    cbm_path_info_t info;
+    bool absent = cbm_path_info_utf8(sidecar, &info) == CBM_PATH_INFO_ABSENT;
+    cbm_free(CBM_MEM_CLASS_OTHER, sidecar);
+    return absent ? 0 : CBM_NOT_FOUND;
 }
 
 /* Record an already-held stage lock in the per-process owner table, keyed by
@@ -2299,10 +2992,9 @@ static bool stage_owner_adopt(const char *stage_path, int lock_fd) {
 
 /* Release ownership of a stage that no longer exists under this name. A path
  * this process never registered is a no-op. */
-static void stage_owner_release(const char *stage_path) {
-    if (!stage_path) {
-        return;
-    }
+static int stage_owner_release(const char *stage_path) {
+    if (!stage_path)
+        return 0;
     stage_owner_t *found = NULL;
     stage_owners_lock();
     for (stage_owner_t **link = &g_stage_owners; *link; link = &(*link)->next) {
@@ -2313,26 +3005,35 @@ static void stage_owner_release(const char *stage_path) {
         }
     }
     stage_owners_unlock();
-    if (!found) {
-        return;
-    }
-    cbm_pipeline_stage_lock_drop(found->stage_path, found->lock_fd);
+    if (!found)
+        return 0;
+    int rc = stage_lock_drop_checked(found->stage_path, found->lock_fd);
     free(found->stage_path);
     free(found);
+    return rc;
 }
 
-/* Remove a stage's main file and SQLite sidecars, keeping ownership. */
-static void remove_stage_files(const char *stage_path) {
-    (void)cbm_unlink(stage_path);
-    (void)cbm_remove_db_sidecars(stage_path);
-}
-
-static void discard_generation_stage(const char *stage_path) {
-    if (!stage_path) {
-        return;
+/* Remove only owned stage files; status is consumed by the frozen path. */
+static int remove_stage_files(const char *stage_path) {
+    int rc = cbm_unlink(stage_path);
+    if (rc != 0) {
+        cbm_path_info_t info;
+        rc = cbm_path_info_utf8(stage_path, &info) == CBM_PATH_INFO_ABSENT ? 0 : CBM_NOT_FOUND;
     }
-    remove_stage_files(stage_path);
-    stage_owner_release(stage_path);
+    int sidecars = cbm_remove_db_sidecars(stage_path);
+    return rc == 0 && sidecars == 0 ? 0 : CBM_NOT_FOUND;
+}
+
+static int discard_generation_stage(const char *stage_path) {
+    if (!stage_path)
+        return 0;
+    int rc = remove_stage_files(stage_path);
+    int release = stage_owner_release(stage_path);
+    return rc == 0 && release == 0 ? 0 : CBM_NOT_FOUND;
+}
+
+static void discard_generation_frozen(const char *path, cbm_pipeline_t *frozen) {
+    frozen_cleanup_note(frozen, discard_generation_stage(path));
 }
 
 typedef struct {
@@ -2487,7 +3188,8 @@ static int prepare_existing_generation_for_replace(const char *db_path,
     return 0;
 }
 
-int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation) {
+static int publish_generation_impl(const cbm_pipeline_generation_t *generation,
+                                   cbm_pipeline_t *frozen) {
     if (!generation || !generation->gbuf || !generation->final_db_path || !generation->project ||
         generation->manifest_count < 0 ||
         (generation->manifest_count > 0 && !generation->manifest) ||
@@ -2510,31 +3212,31 @@ int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation)
      * The old unlink-first step goes with it. It existed to clear a leftover
      * file at a name we might reuse; a freshly minted name cannot collide,
      * and its sidecars cannot pre-exist either. */
-    char *stage_path = create_staging_path(generation->final_db_path);
+    char *stage_path = create_staging_path_impl(generation->final_db_path, frozen);
     if (!stage_path) {
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
     int dump_rc = cbm_gbuf_dump_to_sqlite(generation->gbuf, stage_path);
     if (dump_rc != 0) {
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (cbm_pipeline_persist_test_take_failure_after_stage_dump()) {
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 #endif
     if (generation->cancelled && atomic_load(generation->cancelled)) {
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
-    return cbm_pipeline_publish_staged(stage_path, generation, true, false);
+    return publish_staged_impl(stage_path, generation, true, false, frozen);
 }
 
 /* Complete and publish an already-materialized staging database: metadata
@@ -2543,13 +3245,14 @@ int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation)
  * the dump path's delete-all-and-rebuild; the delta path passes false
  * because its patch step already wrote row-level FTS inserts for exactly
  * the nodes it created. */
-int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_t *generation,
-                                bool fts_wholesale, bool destination_known_healthy) {
+static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t *generation,
+                               bool fts_wholesale, bool destination_known_healthy,
+                               cbm_pipeline_t *frozen) {
     struct timespec t_pub;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
     cbm_store_t *store = cbm_store_open_path(stage_path);
     if (!store) {
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
@@ -2639,14 +3342,23 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     cbm_log_info("publish.timing", "block", "seal", "elapsed_ms", itoa_buf((int)elapsed_ms(t_pub)));
     cbm_store_close(store);
     if (!ok) {
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
-    int fin_rc = cbm_pipeline_finalize_staged_generation(
-        stage_path, generation->final_db_path, generation->cancelled, destination_known_healthy);
+    int fin_rc = finalize_staged_impl(stage_path, generation->final_db_path, generation->cancelled,
+                                      destination_known_healthy, frozen);
     free(stage_path);
     return fin_rc;
+}
+
+int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation) {
+    return publish_generation_impl(generation, NULL);
+}
+
+int cbm_pipeline_publish_staged(char *path, const cbm_pipeline_generation_t *generation,
+                                bool fts_wholesale, bool healthy) {
+    return publish_staged_impl(path, generation, fts_wholesale, healthy, NULL);
 }
 
 char *cbm_pipeline_create_staging_path(const char *final_path) {
@@ -2662,8 +3374,8 @@ void cbm_pipeline_discard_stage(const char *stage_path) {
  * previous generation, and atomically rename. Owns discarding the stage on
  * every failure path. The store handle must already be CLOSED — sidecar
  * removal and rename act on the bare file. */
-int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_db_path,
-                                            atomic_int *cancelled, bool destination_known_healthy) {
+static int finalize_staged_impl(char *stage_path, const char *final_db_path, atomic_int *cancelled,
+                                bool destination_known_healthy, cbm_pipeline_t *frozen) {
     struct timespec t_fin;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_fin);
     if (cbm_remove_db_sidecars(stage_path) != 0) {
@@ -2676,11 +3388,11 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
         char errno_text[16];
         (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
         cbm_log_error("finalize.sidecar_removal_failed", "errno", errno_text, "stage", stage_path);
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
     if (cancelled && atomic_load(cancelled)) {
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
     cbm_log_info("finalize.timing", "block", "stage_sidecars", "elapsed_ms",
@@ -2702,11 +3414,11 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
             (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
             cbm_log_error("finalize.prepare_failed", "reason", "healthy_sidecar_cleanup", "errno",
                           errno_text, "path", final_db_path);
-            cbm_pipeline_discard_stage(stage_path);
+            discard_generation_frozen(stage_path, frozen);
             return CBM_PIPELINE_PERSIST_FAILED;
         }
     } else if (prepare_existing_generation_for_replace(final_db_path, &prepared, false) != 0) {
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
@@ -2716,7 +3428,7 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
 #endif
     if (cancelled && atomic_load(cancelled)) {
         int rollback_rc = rollback_quarantined_generation(final_db_path, &prepared);
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         return rollback_rc == 0 ? CBM_PIPELINE_ABORT_PRESERVE_DB : CBM_PIPELINE_PERSIST_FAILED;
     }
     cbm_log_info("finalize.timing", "block", "prepare_live", "elapsed_ms",
@@ -2728,13 +3440,18 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
         cbm_log_error("finalize.rename_failed", "errno", errno_text, "stage", stage_path, "dest",
                       final_db_path);
         (void)rollback_quarantined_generation(final_db_path, &prepared);
-        discard_generation_stage(stage_path);
+        discard_generation_frozen(stage_path, frozen);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
-    stage_owner_release(stage_path);
+    frozen_cleanup_note(frozen, stage_owner_release(stage_path));
     cbm_log_info("finalize.timing", "block", "rename", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_fin)));
     return 0;
+}
+
+int cbm_pipeline_finalize_staged_generation(char *path, const char *destination,
+                                            atomic_int *cancelled, bool healthy) {
+    return finalize_staged_impl(path, destination, cancelled, healthy, NULL);
 }
 
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
@@ -2779,8 +3496,14 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
                                                           : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
-    if (!cbm_pipeline_semantic_manifests_equal(baseline_manifest, baseline_count, manifest,
-                                               manifest_count)) {
+    bool manifests_equal =
+        p->frozen ? cbm_pipeline_frozen_manifests_equal(p, baseline_manifest, baseline_count,
+                                                        manifest, manifest_count)
+                  : cbm_pipeline_semantic_manifests_equal(baseline_manifest, baseline_count,
+                                                          manifest, manifest_count);
+    if (!manifests_equal) {
+        if (p->frozen)
+            p->frozen->failure = CBM_PIPELINE_FROZEN_INPUT_CHANGED;
         cbm_log_warn("pipeline.abort", "reason", "semantic_inputs_changed");
         cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
         free(db_dir);
@@ -2850,7 +3573,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
      * committed_nodes at 0, so the #334 plausibility gate never fired. */
     p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
     p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
-    int rc = cbm_pipeline_publish_generation(&generation);
+    int rc = publish_generation_impl(&generation, p->frozen ? p : NULL);
     free(cov);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     if (rc != 0) {
@@ -2876,6 +3599,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
 
 /* Run githistory pass. */
 static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+    if (p->frozen) {
+        if (check_cancel(p))
+            return CBM_NOT_FOUND;
+        frozen_observe(p, 2, 0);
+        return 0;
+    }
     struct timespec t_gh;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_gh);
 
@@ -2985,12 +3714,17 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = effective_worker_count(true);
+    int worker_count = p->frozen ? 1 : effective_worker_count(true);
+    if (p->frozen)
+        frozen_observe(p, 0, 1);
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
                  : run_sequential_pipeline(p, ctx, files, file_count, &t);
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
+    if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
+        return rc;
+    }
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
@@ -3016,12 +3750,12 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     bool restore_requested_discovery = false;
 
     p->mode = p->requested_mode;
-    bool mode_promoted = promote_mode_to_existing_coverage(p);
+    bool mode_promoted = p->frozen ? false : promote_mode_to_existing_coverage(p);
 
     /* cbm_pipeline_new() may precede the actual run by an arbitrary interval.
      * Refresh once here, then use this exact snapshot for both Branch graph
      * construction and the baseline semantic manifest. */
-    if (pipeline_refresh_git_context(p) != 0) {
+    if (!p->frozen && pipeline_refresh_git_context(p) != 0) {
         return CBM_NOT_FOUND;
     }
 
@@ -3030,9 +3764,13 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * and fast skip them entirely. Set before any extraction dispatch. */
     cbm_set_macro_extraction(p->mode == CBM_MODE_FULL);
 
-    /* Load user-defined extension overrides (fail-open: NULL on error) */
+    /* One project read supplies extensions, declarations and manifest digest.
+     * Snapshot ownership extends through the outer publication guard. */
     CBM_PROF_START(t_userconfig);
-    p->userconfig = cbm_userconfig_load(p->repo_path);
+    if (!p->frozen && !pipeline_load_test_config(p)) {
+        cbm_log_error("pipeline.err", "phase", "test_declarations_config");
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     cbm_set_user_lang_config(p->userconfig);
     CBM_PROF_END("pipeline", "0_userconfig_load", t_userconfig);
 
@@ -3060,9 +3798,12 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     p->ignored_files = NULL;
     p->ignored_count = 0;
     p->ignored_total = 0;
-    int rc = cbm_discover_ex2(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
-                              &p->excluded_count, &p->ignored_files, &p->ignored_count,
-                              &p->ignored_total);
+    /* A frozen build with a classified file list walks no directory. */
+    int rc = cbm_pipeline_frozen_has_file_list(p)
+                 ? cbm_pipeline_frozen_listed_files(p, &files, &file_count)
+                 : cbm_discover_ex2(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
+                                    &p->excluded_count, &p->ignored_files, &p->ignored_count,
+                                    &p->ignored_total);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "discover", "rc", itoa_buf(rc));
     }
@@ -3077,7 +3818,10 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     /* Snapshot every semantic input once before routing/extraction. The same
      * bytes drive exact no-op comparison and are checked against a fresh
      * rediscovery immediately before any replacement is published. */
-    rc = mode_promoted
+    rc = p->frozen ? cbm_pipeline_build_frozen_manifest(p, files, file_count, p->excluded_dirs,
+                                                        p->excluded_count, &baseline_manifest,
+                                                        &baseline_count)
+         : mode_promoted
              ? cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &baseline_manifest,
                                                           &baseline_count)
              : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
@@ -3091,8 +3835,13 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     }
 
     /* Check for existing DB → try incremental or delete for reindex */
-    rc = try_incremental_or_delete_db(p, files, file_count, baseline_manifest, baseline_count,
-                                      mode_promoted);
+    rc = p->frozen && !p->frozen->base_db_path
+             ? CBM_PIPELINE_FORCE_FULL_REINDEX
+             : try_incremental_or_delete_db(p, files, file_count, baseline_manifest, baseline_count,
+                                            mode_promoted);
+    if (p->frozen && rc >= 0) {
+        p->frozen->route = CBM_PIPELINE_FROZEN_ROUTE_INCREMENTAL;
+    }
     if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB || rc == CBM_PIPELINE_PERSIST_FAILED) {
         goto cleanup;
     }
@@ -3124,9 +3873,11 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         p->ignored_total = 0;
 
         opts.mode = p->mode;
-        rc = cbm_discover_ex2(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
-                              &p->excluded_count, &p->ignored_files, &p->ignored_count,
-                              &p->ignored_total);
+        rc = cbm_pipeline_frozen_has_file_list(p)
+                 ? cbm_pipeline_frozen_listed_files(p, &files, &file_count)
+                 : cbm_discover_ex2(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
+                                    &p->excluded_count, &p->ignored_files, &p->ignored_count,
+                                    &p->ignored_total);
         cbm_log_info("pipeline.rediscover", "requested_mode", pipeline_mode_name(p->requested_mode),
                      "effective_mode", pipeline_mode_name(p->mode), "files", itoa_buf(file_count));
         if (rc != 0 || check_cancel(p)) {
@@ -3139,6 +3890,11 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);
     p->registry = cbm_registry_new();
+    if (p->frozen && (!p->gbuf || !p->registry)) {
+        p->frozen->failure = CBM_PIPELINE_FROZEN_OOM;
+        rc = CBM_NOT_FOUND;
+        goto cleanup;
+    }
 
     /* Phase 2b: Load build-tool path aliases (tsconfig/jsconfig today). NULL
      * when no usable configs are found — non-TS projects pay nothing. */
@@ -3153,6 +3909,10 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         .registry = p->registry,
         .cancelled = p->cancelled,
         .pipeline = p, /* so passes can record per-file skips (Track B) */
+        .test_declarations = p->test_declarations,
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        .test_fault_mask = p->test_fault_mask,
+#endif
         .mode = (int)p->mode,
         .path_aliases = path_aliases,
         .excluded_dirs = p->excluded_dirs,
@@ -3177,7 +3937,12 @@ cleanup:
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     cbm_discover_free(files, file_count);
-    cbm_pipeline_free_semantic_manifest(baseline_manifest, baseline_count);
+    if (p->frozen) {
+        p->frozen->baseline = baseline_manifest;
+        p->frozen->baseline_count = baseline_count;
+    } else {
+        cbm_pipeline_free_semantic_manifest(baseline_manifest, baseline_count);
+    }
     cbm_gbuf_free(p->gbuf);
     p->gbuf = NULL;
     cbm_registry_free(p->registry);
@@ -3192,10 +3957,9 @@ cleanup:
         p->ignored_count = requested_ignored_count;
         p->ignored_total = requested_ignored_total;
     }
-    /* Clear and free user extension config */
+    /* Workers have joined. Stop publishing the extension override, but keep
+     * both immutable owners for the outer final source comparison. */
     cbm_set_user_lang_config(NULL);
-    cbm_userconfig_free(p->userconfig);
-    p->userconfig = NULL;
     return rc;
 }
 
@@ -3276,104 +4040,96 @@ static size_t stage_root_length(const char *path) {
     return stage_suffix_at(path + root_len) ? root_len : len;
 }
 
-static char *create_staging_path(const char *final_path) {
-    if (!final_path) {
+static char *stage_allocate_template(const char *final_path) {
+    if (!final_path)
         return NULL;
-    }
     static const char suffix[] = ".stage.XXXXXX";
     size_t final_len = stage_root_length(final_path);
-    if (final_len > SIZE_MAX - sizeof(suffix)) {
+    if (final_len > SIZE_MAX - sizeof(suffix))
         return NULL;
-    }
     size_t path_size = final_len + sizeof(suffix);
 #ifdef _WIN32
-    /* The Windows cbm_mkstemp compatibility contract may expand a /tmp/
-     * prefix in-place and copies through a 4 KiB scratch path. Give it that
-     * full capacity, and reject longer inputs exactly rather than truncating. */
-    if (path_size > CBM_SZ_4K) {
+    if (path_size > CBM_SZ_4K)
         return NULL;
-    }
     path_size = CBM_SZ_4K;
 #endif
-    char *path = (char *)malloc(path_size);
-    if (!path) {
-        return NULL;
+    char *path = malloc(path_size);
+    if (path) {
+        memcpy(path, final_path, final_len);
+        memcpy(path + final_len, suffix, sizeof(suffix));
     }
-    memcpy(path, final_path, final_len);
-    memcpy(path + final_len, suffix, sizeof(suffix));
-    /* The six random chars sit directly after the ".stage." marker; each
-     * attempt overwrites the "XXXXXX" template in place. Alphanumerics only,
-     * matching stage_suffix_at()/stage_entry_stage_length() so the sweep
-     * recognises the minted name and its sidecars. */
-    char *random_at = path + final_len + (sizeof(cbm_stage_marker) - 1);
-    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    return path;
+}
 
-    /* Lock BEFORE the stage becomes visible: take the sidecar lock first, then
-     * create the stage's main file with O_EXCL. The main file is therefore
-     * never present on disk without its lock already held, so a concurrent
-     * run's sweep_orphan_stages() against the same final_path can only ever
-     * find this stage lock-held -- it reaches the stage through the .lock
-     * sidecar too (stage_entry_stage_length() matches it), probes the lock,
-     * sees a live holder, and keeps it. That closes the old create->register
-     * window that let a racing sweep delete a live-but-unlocked stage (POSIX)
-     * or collide on the sidecar with EACCES (Windows) -- #2111's windows-guards
-     * red. A pre-lock-era orphan minted by an OLDER binary still carries no
-     * lock, so the sweep's ENOENT path still removes it (#1839 preserved).
-     *
-     * A minted suffix collides with an existing stage only about 1 in 62^6;
-     * retry a bounded number of times, the way mkstemp/mkdtemp do, then fail. */
-    for (int attempt = 0; attempt < 128; attempt++) {
-        unsigned char rnd[CBM_STAGE_SUFFIX_RANDOM_CHARS];
-        if (!cbm_secure_random(rnd, sizeof(rnd))) {
-            free(path);
-            errno = EIO;
-            return NULL;
-        }
-        for (size_t i = 0; i < sizeof(rnd); i++) {
-            random_at[i] = alphabet[rnd[i] % (sizeof(alphabet) - 1)];
-        }
-        errno = 0;
-        int lock_fd = cbm_pipeline_stage_lock_hold(path);
-        if (lock_fd < 0) {
-            /* A live twin already owns this exact suffix's sidecar (EAGAIN /
-             * EACCES), or the sidecar could not be created. Mint a fresh suffix
-             * and try again rather than contend for this one. */
-            continue;
-        }
-        FILE *main_file = cbm_fopen(path, "wbx");
-        if (!main_file) {
-            /* The suffix collided with a lock-less orphan's main file -- its
-             * sidecar was takeable, so it is not a live writer. Never inherit a
-             * stranger's bytes: drop the lock, remove the sidecar we just took,
-             * and mint a fresh suffix. The orphan's main file is left for a
-             * later sweep, which removes it as a pre-lock-era orphan. */
-            cbm_pipeline_stage_lock_drop(path, lock_fd);
-            continue;
-        }
-        (void)fclose(main_file);
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-        /* Main file now exists and its lock is already held. Under the OLD
-         * create-then-lock ordering this was the unlocked window; the
-         * concurrent-sweep test fires here to prove the stage now survives a
-         * racing sweep, and to bind RED if that ordering ever regresses. */
-        cbm_pipeline_persist_test_run_after_stage_created();
-#endif
-        if (!stage_owner_adopt(path, lock_fd)) {
-            cbm_pipeline_stage_lock_drop(path, lock_fd);
-            (void)cbm_unlink(path);
-            free(path);
-            return NULL;
-        }
-        return path;
+static int stage_abandon_creation(const char *path, int fd, cbm_pipeline_t *frozen) {
+    if (frozen) {
+        frozen_cleanup_note(frozen, remove_stage_files(path));
+        frozen_cleanup_note(frozen, stage_lock_drop_checked(path, fd));
+    } else {
+        cbm_pipeline_stage_lock_drop(path, fd);
+        (void)cbm_unlink(path);
     }
-    /* Every attempt failed to take a lock -- keep the observability the old
-     * stage_owner_register() emitted for a lock failure. */
+    return -1;
+}
+
+/* 1: adopted; 0: collision/retry; -1: stop. Lock precedes O_EXCL visibility. */
+static int stage_create_attempt(char *path, char *random_at, cbm_pipeline_t *frozen) {
+    unsigned char random[CBM_STAGE_SUFFIX_RANDOM_CHARS];
+    if (!cbm_secure_random(random, sizeof(random))) {
+        errno = EIO;
+        return -1;
+    }
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (size_t i = 0; i < sizeof(random); i++)
+        random_at[i] = alphabet[random[i] % (sizeof(alphabet) - 1)];
+    errno = 0;
+    int fd = cbm_pipeline_stage_lock_hold(path);
+    if (fd < 0) {
+        if (frozen)
+            frozen->frozen->failure = CBM_PIPELINE_FROZEN_IO;
+        return frozen ? -1 : 0;
+    }
+    FILE *file = cbm_fopen(path, "wbx");
+    if (!file) {
+        int rc = stage_lock_drop_checked(path, fd);
+        frozen_cleanup_note(frozen, rc);
+        return frozen && rc != 0 ? -1 : 0;
+    }
+    int close_rc = fclose(file);
+    if (frozen && close_rc != 0)
+        return stage_abandon_creation(path, fd, frozen);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    cbm_pipeline_persist_test_run_after_stage_created();
+#endif
+    if (!stage_owner_adopt(path, fd))
+        return stage_abandon_creation(path, fd, frozen);
+    return 1;
+}
+
+static char *create_staging_path_impl(const char *final_path, cbm_pipeline_t *frozen) {
+    char *path = stage_allocate_template(final_path);
+    if (!path)
+        return NULL;
+    char *random_at = path + stage_root_length(final_path) + sizeof(cbm_stage_marker) - 1;
+    for (int attempt = 0; attempt < 128; attempt++) {
+        int rc = stage_create_attempt(path, random_at, frozen);
+        if (rc > 0)
+            return path;
+        if (rc < 0) {
+            free(path);
+            return NULL;
+        }
+    }
     char errno_text[16];
     (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
     cbm_log_warn("pipeline.stage", "action", "lock_failed", "errno", errno_text, "path", path);
     free(path);
     errno = EEXIST;
     return NULL;
+}
+
+static char *create_staging_path(const char *final_path) {
+    return create_staging_path_impl(final_path, NULL);
 }
 
 /* A backup-failed destination may still have the only recoverable WAL or
@@ -3601,7 +4357,7 @@ static void sweep_one_stage(const char *stage_path) {
     errno = 0;
     int lock_fd = cbm_lockfile_open(sidecar, false);
     int probe_errno = errno;
-    free(sidecar);
+    cbm_free(CBM_MEM_CLASS_OTHER, sidecar);
     if (lock_fd < 0 && probe_errno != ENOENT) {
         bool live = probe_errno == EAGAIN || probe_errno == EACCES;
 #if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
@@ -3709,6 +4465,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    pipeline_release_test_config(p);
     p->export_error[0] = '\0';
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
@@ -3761,18 +4518,21 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
+        pipeline_release_test_config(p);
         return rc;
     }
     if (check_cancel(p)) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
+        pipeline_release_test_config(p);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
     if (seal_staging_db(staging_path) != 0) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
+        pipeline_release_test_config(p);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
@@ -3783,6 +4543,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
+        pipeline_release_test_config(p);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
@@ -3792,7 +4553,22 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
+        pipeline_release_test_config(p);
         return CBM_PIPELINE_PERSIST_FAILED;
+    }
+
+    /* Check after the before-publish hook and the final seal, while the
+     * original bytes are still owned. ERROR and absent/present changes abort. */
+    cbm_userconfig_t *fresh_config = cbm_userconfig_load_with_source(p->repo_path);
+    bool source_matches = cbm_pipeline_project_source_matches(p, fresh_config);
+    cbm_userconfig_free(fresh_config);
+    if (!source_matches) {
+        cbm_log_error("pipeline.err", "phase", "test_declarations_source_changed");
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        pipeline_release_test_config(p);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
     cbm_replacement_prepare_t prepared = {0};
@@ -3803,6 +4579,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
+        pipeline_release_test_config(p);
         return prepare_rc;
     }
     if ((p->rename_hook ? p->rename_hook(staging_path, final_path, p->rename_hook_ctx)
@@ -3815,6 +4592,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
+        pipeline_release_test_config(p);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
@@ -3822,5 +4600,241 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     rc = export_after_publish(p, final_path);
     free(staging_path);
     free(final_path);
+    pipeline_release_test_config(p);
     return rc;
+}
+
+/* Frozen candidate publication: a private destination, never artifact export. */
+static bool frozen_separator(char c) {
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+static unsigned char frozen_path_char(unsigned char c) {
+#ifdef _WIN32
+    if (c == '\\')
+        return '/';
+    if (c >= 'A' && c <= 'Z')
+        return (unsigned char)(c + ('a' - 'A'));
+#endif
+    return c;
+}
+
+static bool frozen_same_path(const char *a, const char *b) {
+    while (*a && *b && frozen_path_char((unsigned char)*a) == frozen_path_char((unsigned char)*b)) {
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static bool frozen_under_root(const char *root, const char *path) {
+    size_t i = 0;
+    while (root[i] && path[i] &&
+           frozen_path_char((unsigned char)root[i]) == frozen_path_char((unsigned char)path[i]))
+        i++;
+    return root[i] == '\0' && (path[i] == '\0' || frozen_separator(path[i]) ||
+                               (i > 0 && frozen_separator(root[i - 1])));
+}
+
+static bool frozen_parent_path(const char *path, char out[CBM_SZ_4K]) {
+    const char *last = NULL;
+    for (const char *at = path; *at; at++) {
+        if (frozen_separator(*at))
+            last = at;
+    }
+    if (!last || !last[1] || strcmp(last + 1, ".") == 0 || strcmp(last + 1, "..") == 0)
+        return false;
+    size_t len = (size_t)(last - path);
+    if (len == 0)
+        len = 1;
+#ifdef _WIN32
+    if (len == 2 && path[1] == ':')
+        len = 3;
+#endif
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return true;
+}
+
+static cbm_pipeline_frozen_status_t frozen_absent_destination(const char *path) {
+    static const char *const suffixes[] = {"", "-wal", "-shm", "-journal"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char buffer[CBM_SZ_4K + 16];
+        int n = snprintf(buffer, sizeof(buffer), "%s%s", path, suffixes[i]);
+        if (n < 0 || (size_t)n >= sizeof(buffer))
+            return CBM_PIPELINE_FROZEN_INVALID;
+        cbm_path_info_t info;
+        int rc = cbm_path_info_utf8(buffer, &info);
+        if (rc == CBM_PATH_INFO_OK)
+            return CBM_PIPELINE_FROZEN_DEST_EXISTS;
+        if (rc != CBM_PATH_INFO_ABSENT)
+            return CBM_PIPELINE_FROZEN_IO;
+    }
+    return CBM_PIPELINE_FROZEN_OK;
+}
+
+static cbm_pipeline_frozen_status_t frozen_check_directories(cbm_pipeline_frozen_t *owner,
+                                                             bool initial) {
+    cbm_pipeline_t *p = owner->pipeline;
+    char parent[CBM_SZ_4K];
+    if (!frozen_parent_path(p->db_path, parent))
+        return CBM_PIPELINE_FROZEN_INVALID;
+    cbm_path_info_t root_info, parent_info;
+    if (cbm_path_info_utf8(p->repo_path, &root_info) != CBM_PATH_INFO_OK ||
+        cbm_path_info_utf8(parent, &parent_info) != CBM_PATH_INFO_OK)
+        return CBM_PIPELINE_FROZEN_IO;
+    if (!root_info.is_directory || root_info.is_symlink || !parent_info.is_directory ||
+        parent_info.is_symlink)
+        return CBM_PIPELINE_FROZEN_INVALID;
+    char canonical_root[CBM_SZ_4K], canonical_parent[CBM_SZ_4K];
+    if (!cbm_canonical_path(p->repo_path, canonical_root, sizeof(canonical_root)) ||
+        !cbm_canonical_path(parent, canonical_parent, sizeof(canonical_parent)))
+        return CBM_PIPELINE_FROZEN_IO;
+    if (frozen_under_root(canonical_root, canonical_parent))
+        return CBM_PIPELINE_FROZEN_INVALID;
+    if (!initial && (!frozen_same_path(canonical_root, owner->canonical_root) ||
+                     !frozen_same_path(canonical_parent, owner->canonical_parent)))
+        return CBM_PIPELINE_FROZEN_INPUT_CHANGED;
+    if (initial) {
+        memcpy(owner->canonical_root, canonical_root, strlen(canonical_root) + 1);
+        memcpy(owner->canonical_parent, canonical_parent, strlen(canonical_parent) + 1);
+    }
+    return frozen_absent_destination(p->db_path);
+}
+
+static cbm_pipeline_frozen_status_t frozen_diagnostic_status(const cbm_pipeline_t *p) {
+    unsigned flags = p->frozen->diagnostic_flags;
+    if (flags & CBM_PIPELINE_FROZEN_DIAGNOSTIC_OOM)
+        return CBM_PIPELINE_FROZEN_OOM;
+    unsigned recorded = (unsigned)CBM_PIPELINE_FROZEN_PARSE_GAP |
+                        (unsigned)CBM_PIPELINE_FROZEN_TEST_DECLARATION_GAP;
+    return (flags & ~recorded) ? CBM_PIPELINE_FROZEN_PIPELINE_ERROR : CBM_PIPELINE_FROZEN_OK;
+}
+
+static cbm_pipeline_frozen_status_t frozen_run_status(cbm_pipeline_t *p, int rc) {
+    if (p->frozen->failure == CBM_PIPELINE_FROZEN_IO)
+        return CBM_PIPELINE_FROZEN_IO;
+    if (check_cancel(p))
+        return CBM_PIPELINE_FROZEN_CANCELLED;
+    if (p->frozen->failure != CBM_PIPELINE_FROZEN_OK)
+        return p->frozen->failure;
+    if (rc == CBM_PIPELINE_RESOURCE_LIMIT || rc == CBM_PIPELINE_ABORT_OVER_BUDGET)
+        return CBM_PIPELINE_FROZEN_LIMIT;
+    if (rc == CBM_PIPELINE_PERSIST_FAILED)
+        return CBM_PIPELINE_FROZEN_IO;
+    return rc == 0 ? frozen_diagnostic_status(p) : CBM_PIPELINE_FROZEN_PIPELINE_ERROR;
+}
+
+static cbm_pipeline_frozen_status_t frozen_run_stage(cbm_pipeline_t *p, const char *stage) {
+    char *destination = p->db_path;
+    char *stage_copy = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, stage);
+    if (!stage_copy)
+        return CBM_PIPELINE_FROZEN_OOM;
+    p->db_path = stage_copy;
+    /* A base candidate becomes the stage's existing generation, so the route
+     * below may repair it instead of rebuilding. */
+    bool based = p->frozen->base_db_path != NULL;
+    if (based && cbm_store_backup_path(p->frozen->base_db_path, stage_copy) != CBM_STORE_OK) {
+        p->db_path = destination;
+        cbm_free(CBM_MEM_CLASS_OTHER, stage_copy);
+        return CBM_PIPELINE_FROZEN_IO;
+    }
+    p->existing_generation = based;
+    p->final_existed = based;
+    int rc = cbm_pipeline_run_staged(p);
+    p->db_path = destination;
+    cbm_free(CBM_MEM_CLASS_OTHER, stage_copy);
+    return frozen_run_status(p, rc);
+}
+
+static cbm_pipeline_frozen_status_t frozen_reconcile(cbm_pipeline_t *p) {
+    cbm_file_hash_t *fresh = NULL;
+    int count = 0;
+    int rc = cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &fresh, &count);
+    bool equal = rc == 0 && cbm_pipeline_frozen_manifests_equal(
+                                p, p->frozen->baseline, p->frozen->baseline_count, fresh, count);
+    cbm_pipeline_free_semantic_manifest(fresh, count);
+    if (check_cancel(p))
+        return CBM_PIPELINE_FROZEN_CANCELLED;
+    if (rc == CBM_DISCOVER_LIMIT_EXCEEDED)
+        return CBM_PIPELINE_FROZEN_LIMIT;
+    if (rc != 0)
+        return CBM_PIPELINE_FROZEN_IO;
+    return equal ? CBM_PIPELINE_FROZEN_OK : CBM_PIPELINE_FROZEN_INPUT_CHANGED;
+}
+
+static cbm_pipeline_frozen_status_t frozen_before_commit(cbm_pipeline_t *p, const char *stage) {
+    if (check_cancel(p))
+        return CBM_PIPELINE_FROZEN_CANCELLED;
+    if (seal_staging_db(stage) != 0)
+        return CBM_PIPELINE_FROZEN_IO;
+    if (p->before_publish_hook)
+        p->before_publish_hook(p, stage, p->before_publish_hook_ctx);
+    if (check_cancel(p))
+        return CBM_PIPELINE_FROZEN_CANCELLED;
+    if (seal_staging_db(stage) != 0)
+        return CBM_PIPELINE_FROZEN_IO;
+    cbm_pipeline_frozen_status_t status = frozen_reconcile(p);
+    if (status != CBM_PIPELINE_FROZEN_OK)
+        return status;
+    status = frozen_check_directories(p->frozen, false);
+    if (status != CBM_PIPELINE_FROZEN_OK)
+        return status;
+    return check_cancel(p) ? CBM_PIPELINE_FROZEN_CANCELLED : frozen_diagnostic_status(p);
+}
+
+static cbm_pipeline_frozen_status_t frozen_commit(cbm_pipeline_t *p, const char *stage) {
+    int rc = p->rename_hook ? p->rename_hook(stage, p->db_path, p->rename_hook_ctx)
+                            : cbm_rename_noreplace(stage, p->db_path);
+    if (rc != 0) {
+        cbm_pipeline_frozen_status_t absence = frozen_absent_destination(p->db_path);
+        return absence == CBM_PIPELINE_FROZEN_DEST_EXISTS ? absence : CBM_PIPELINE_FROZEN_IO;
+    }
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(p->db_path, &info) != CBM_PATH_INFO_OK || !info.is_regular ||
+        info.is_symlink || cbm_path_info_utf8(stage, &info) != CBM_PATH_INFO_ABSENT)
+        return CBM_PIPELINE_FROZEN_IO;
+    return stage_owner_release(stage) == 0 ? CBM_PIPELINE_FROZEN_OK : CBM_PIPELINE_FROZEN_IO;
+}
+
+static cbm_pipeline_frozen_status_t frozen_build_locked(cbm_pipeline_frozen_t *owner) {
+    cbm_pipeline_t *p = owner->pipeline;
+    if (check_cancel(p))
+        return CBM_PIPELINE_FROZEN_CANCELLED;
+    cbm_pipeline_frozen_status_t status = frozen_check_directories(owner, true);
+    if (status != CBM_PIPELINE_FROZEN_OK)
+        return status;
+    char *stage = create_staging_path_impl(p->db_path, p);
+    if (!stage)
+        return CBM_PIPELINE_FROZEN_IO;
+    if (owner->failure == CBM_PIPELINE_FROZEN_IO)
+        status = CBM_PIPELINE_FROZEN_IO;
+    if (status == CBM_PIPELINE_FROZEN_OK)
+        status = frozen_run_stage(p, stage);
+    if (status == CBM_PIPELINE_FROZEN_OK)
+        status = frozen_before_commit(p, stage);
+    if (status == CBM_PIPELINE_FROZEN_OK)
+        status = frozen_commit(p, stage);
+    if (status != CBM_PIPELINE_FROZEN_OK && discard_generation_stage(stage) != 0)
+        status = CBM_PIPELINE_FROZEN_IO;
+    free(stage);
+    return status;
+}
+
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_build(cbm_pipeline_frozen_t *owner) {
+    if (!owner || owner->state != FROZEN_READY)
+        return CBM_PIPELINE_FROZEN_INVALID;
+    if (!cbm_pipeline_try_lock())
+        return CBM_PIPELINE_FROZEN_BUSY;
+    owner->state = FROZEN_BUILDING;
+    const cbm_userconfig_t *previous = cbm_get_user_lang_config();
+    cbm_pipeline_frozen_status_t status = frozen_build_locked(owner);
+    cbm_set_user_lang_config(previous);
+    cbm_pipeline_unlock();
+    owner->state = status == CBM_PIPELINE_FROZEN_OK ? FROZEN_CANDIDATE : FROZEN_FAILED;
+    return status;
 }

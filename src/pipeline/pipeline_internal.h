@@ -14,12 +14,237 @@
 #include "store/store.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
+#include "discover/test_conventions.h"
 #include "git/git_context.h"
 #include "foundation/hash_table.h"
+#include "spawn_patterns.h"
 #include "cbm.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
+
+typedef struct cbm_pipeline_frozen cbm_pipeline_frozen_t;
+
+typedef enum {
+    CBM_PIPELINE_FROZEN_OK = 0,
+    CBM_PIPELINE_FROZEN_INVALID,
+    CBM_PIPELINE_FROZEN_CONFIG,
+    CBM_PIPELINE_FROZEN_UNSUPPORTED,
+    CBM_PIPELINE_FROZEN_BUSY,
+    CBM_PIPELINE_FROZEN_DEST_EXISTS,
+    CBM_PIPELINE_FROZEN_INPUT_CHANGED,
+    CBM_PIPELINE_FROZEN_CANCELLED,
+    CBM_PIPELINE_FROZEN_LIMIT,
+    CBM_PIPELINE_FROZEN_OOM,
+    CBM_PIPELINE_FROZEN_IO,
+    CBM_PIPELINE_FROZEN_PIPELINE_ERROR
+} cbm_pipeline_frozen_status_t;
+
+/* One file of a classified pinned ledger: a path relative to source_root
+ * ('/'-separated; no empty, "." or ".." segment) and the language the ledger
+ * gave it. CBM_LANG_COUNT: the file has no supported language and is not
+ * indexed, as discovery does not index it. */
+typedef struct {
+    const char *rel_path;
+    CBMLanguage language;
+} cbm_pipeline_frozen_file_t;
+
+typedef struct {
+    /* Explicit native absolute paths. Source root and destination parent are
+     * private, caller-owned directories for the entire owner lifetime.
+     * DB is outside source_root and must not exist (including sidecars).
+     */
+    const char *source_root;
+    const char *candidate_db_path;
+    const char *project; /* exact accepted project label; never silently renamed */
+
+    cbm_userconfig_source_state_t config_state; /* ABSENT or PRESENT */
+    const void *config_bytes;
+    size_t config_len; /* PRESENT: strict JSON object, 1..65536 bytes */
+
+    /* Display/semantic-input data, NOT authenticated facts. All nine string
+     * members are required non-NULL and copied. head_sha is pinned H and
+     * base_sha is actual pinned merge-base M, each full 40/64 hex characters.
+     * Their lengths must match; copied OIDs normalize to lowercase.
+     * No resolver is invoked and no path in this context is traversed.
+     */
+    const cbm_git_context_t *pinned_git;
+
+    /* Existing discovery policy value, copied. Existing disabled/finite-limit
+     * semantics remain; this is not a new whole-process memory/time budget.
+     */
+    cbm_index_resource_policy_t resource_policy;
+
+    /* Optional external cancellation flag. Borrowed until owner free, including
+     * after build returns; caller initializes it and keeps it alive. Observed
+     * cancellation is latched internally even if caller later clears the flag.
+     * Sampled at owner/orchestration/manifest checkpoints. Nested existing
+     * consumers may see only the internal latch until the next such sample.
+     */
+    atomic_int *cancelled;
+
+    /* Optional: the files to index, from a classified pinned ledger (see
+     * test_impact_classify.h). With a list the build walks no directory: it
+     * indexes exactly these files under these languages, and the pre-commit
+     * reconciliation re-hashes exactly them, so a file added to source_root
+     * after the ledger was made is never indexed and a listed file that is not
+     * there is INPUT_CHANGED. NULL with 0 discovers source_root. Copied. */
+    const cbm_pipeline_frozen_file_t *files;
+    size_t file_count;
+
+    /* Optional: an earlier candidate of the SAME project label (the team
+     * artifact's graph, imported). The build copies it into its stage and routes
+     * through the incremental closure repair; every doubt there declines to the
+     * full build, so the candidate is the full build's graph either way.
+     * Absolute, a regular SQLite file outside source_root; never modified.
+     * NULL builds from scratch. Copied. */
+    const char *base_db_path;
+} cbm_pipeline_frozen_inputs_t;
+
+/* Which route built the candidate. A base whose repair declined is FULL. */
+typedef enum {
+    CBM_PIPELINE_FROZEN_ROUTE_FULL = 0,
+    CBM_PIPELINE_FROZEN_ROUTE_INCREMENTAL = 1,
+} cbm_pipeline_frozen_route_t;
+
+/* Clear *out first. Deep-copy/validate all input; no Git/config filesystem
+ * reads, no pipeline/global changes, no directory/DB creation. Caller input
+ * buffers may be destroyed after return. NULL result on any failure.
+ */
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_create(const cbm_pipeline_frozen_inputs_t *inputs,
+                                                        cbm_pipeline_frozen_t **out);
+
+/* Synchronous, single-use after successful start. Internally try-acquires the
+ * existing global pipeline lock; BUSY leaves the owner READY and may retry.
+ * Fixed FULL / one worker / no Git history / no artifact export; no existing DB
+ * backup, incremental route or mode promotion. Final reconciliation compares
+ * the retained baseline with freshly read tree inputs using the OWNED config
+ * and Git context. OK means a sealed private candidate exists, not admission.
+ * No call is allowed to overlap build except cancel. Ordinary setters/run are
+ * never exposed on this owner's pipeline. See text for downstream limits.
+ */
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_build(cbm_pipeline_frozen_t *owner);
+
+/* Inside a frozen build: whether the owner was given a file list, and that
+ * list as discovery records (absolute path under the source root, the listed
+ * language, the size on disk), sorted by relative path, files without a
+ * language left out. A listed file that is not a regular file records
+ * INPUT_CHANGED and returns CBM_NOT_FOUND. Free with cbm_discover_free. */
+bool cbm_pipeline_frozen_has_file_list(const cbm_pipeline_t *p);
+int cbm_pipeline_frozen_listed_files(cbm_pipeline_t *p, cbm_file_info_t **out, int *count);
+
+/* Thread-safe while owner is alive; sets the internal atomic immediately.
+ * No concurrent free. This does not await a sample of the external flag. */
+void cbm_pipeline_frozen_cancel(cbm_pipeline_frozen_t *owner);
+
+/* Borrowed immutable diagnostic source, only before/after (not during) build.
+ * Valid until owner free. Use existing const getters for file errors, ignored
+ * paths, exclusions, counts and resource violations. Never cast away const or
+ * pass this to a mutating ordinary-pipeline API. No completeness getter exists.
+ */
+const cbm_pipeline_t *cbm_pipeline_frozen_diagnostics(const cbm_pipeline_frozen_t *owner);
+/* FULL until a build produced a candidate; then the route that built it. */
+cbm_pipeline_frozen_route_t cbm_pipeline_frozen_route(const cbm_pipeline_frozen_t *owner);
+
+/* Monotone negative observations; zero is NOT a completeness certificate.
+ * PARSE_GAP alone does not refuse the candidate: a file that parsed only
+ * partially stays in the graph with its unparsed ranges recorded, and the
+ * selection treats a change to it as a parse gap (the file is seeded whole and
+ * its language's lane runs whole). Every other bit refuses publication. */
+enum {
+    CBM_PIPELINE_FROZEN_FILE_DIAGNOSTIC = 1,
+    CBM_PIPELINE_FROZEN_DIAGNOSTIC_INCOMPLETE = 2,
+    CBM_PIPELINE_FROZEN_DIAGNOSTIC_OOM = 4,
+    CBM_PIPELINE_FROZEN_PARSE_GAP = 8,
+    /* A file indexed without configured test roles (degraded per file). */
+    CBM_PIPELINE_FROZEN_TEST_DECLARATION_GAP = 16
+};
+
+/* Clears supplied output first. Returns false for NULL owner/output or while
+ * BUILDING; otherwise copies the mask. No overlap with build is permitted.
+ * Evidence survives failed/invalid retries until owner free; no reset API.
+ */
+bool cbm_pipeline_frozen_negative_evidence(const cbm_pipeline_frozen_t *owner, unsigned *out_flags);
+
+/* Borrowed copied path only after build returned OK; otherwise NULL. */
+const char *cbm_pipeline_frozen_candidate_path(const cbm_pipeline_frozen_t *owner);
+
+/* NULL-safe; never concurrent with build/cancel. Does not delete the caller's
+ * source tree, candidate DB or destination directory. Build cleans its own
+ * temporary stages; caller owns final namespace cleanup and later publication.
+ */
+void cbm_pipeline_frozen_free(cbm_pipeline_frozen_t *owner);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* One-shot failures at the frozen recorder's allocation boundaries only. */
+typedef enum {
+    CBM_PIPELINE_FROZEN_DIAG_FAULT_NONE = 0,
+    CBM_PIPELINE_FROZEN_DIAG_FAULT_GROW = 1,
+    CBM_PIPELINE_FROZEN_DIAG_FAULT_PATH = 2,
+    CBM_PIPELINE_FROZEN_DIAG_FAULT_REASON = 3,
+    CBM_PIPELINE_FROZEN_DIAG_FAULT_PHASE = 4
+} cbm_pipeline_frozen_diag_fault_t;
+
+/* READY-only. Invalid input leaves the prior setting unchanged; NONE clears.
+ * A fault is consumed only at its matching allocation, not by other records
+ * or allocations. This simulates NULL, not physical allocator exhaustion.
+ */
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_set_diagnostic_fault_for_tests(
+    cbm_pipeline_frozen_t *owner, cbm_pipeline_frozen_diag_fault_t fault);
+
+/* Actual dispatch observations, emitted only when the corresponding frozen
+ * orchestration branch is reached. worker_count includes the calling thread
+ * for a serial dispatch (1); it is 0 for HISTORY_SKIPPED. It says nothing about
+ * nested pass threads or successful completion of the dispatched work.
+ */
+typedef enum {
+    CBM_PIPELINE_FROZEN_ROUTE_EXTRACTION_WORKERS = 0,
+    CBM_PIPELINE_FROZEN_ROUTE_MANIFEST_WORKERS,
+    CBM_PIPELINE_FROZEN_ROUTE_HISTORY_SKIPPED
+} cbm_pipeline_frozen_route_kind_t;
+
+typedef struct {
+    cbm_pipeline_frozen_route_kind_t kind;
+    unsigned worker_count;
+} cbm_pipeline_frozen_route_event_t;
+
+typedef void (*cbm_pipeline_frozen_route_observer_t)(const cbm_pipeline_frozen_route_event_t *event,
+                                                     void *context);
+
+/* READY-only, instance-local, synchronous observer. NULL clears it/context.
+ * The event is borrowed only during the callback; copy it to retain it.
+ * Context remains borrowed until cleared or owner free. The callback only
+ * records observations: no pipeline/store/scope reentry, mutation or freeing.
+ * No callback-count/order promise; repeated reconciliation may emit repeated
+ * manifest events. No globals and no effect on production routing or results.
+ */
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_set_route_observer_for_tests(
+    cbm_pipeline_frozen_t *owner, cbm_pipeline_frozen_route_observer_t observer, void *context);
+
+/* A READY-only adapter to existing per-instance publication/rename hooks.
+ * No new fault allocator or phase/callback-count contract. These hooks may
+ * mutate fixture inputs/cancel or simulate rename failure. The before-publish
+ * hook may also invoke cbm_pipeline_add_file_error on its supplied pipeline.
+ * They cannot run a pipeline, free owner, install config/options, or
+ * publish/admit a witness.
+ */
+cbm_pipeline_frozen_status_t cbm_pipeline_frozen_set_publish_hooks_for_tests(
+    cbm_pipeline_frozen_t *owner, void (*before_publish)(cbm_pipeline_t *, const char *, void *),
+    int (*rename_stage)(const char *, const char *, void *), void *context);
+#endif
+
+/* Frozen-only orchestration/manifest bridge; NULL/ordinary p are no-ops. */
+bool cbm_pipeline_is_frozen(const cbm_pipeline_t *p);
+int cbm_pipeline_frozen_checkpoint(cbm_pipeline_t *p);
+const cbm_git_context_t *cbm_pipeline_frozen_git(const cbm_pipeline_t *p);
+const cbm_userconfig_t *cbm_pipeline_frozen_config(const cbm_pipeline_t *p);
+void cbm_pipeline_frozen_manifest_dispatch(cbm_pipeline_t *p);
+int cbm_pipeline_build_frozen_manifest(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                       int file_count, char **excluded, int excluded_count,
+                                       cbm_file_hash_t **out, int *out_count);
+bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_t *left,
+                                         int left_count, const cbm_file_hash_t *right,
+                                         int right_count);
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -104,6 +329,17 @@ typedef struct {
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
 
+    /* Run-owned immutable snapshot; direct borrow also works for probe contexts
+     * whose pipeline back-pointer is NULL. Workers only write the fatal latch. */
+    const cbm_test_declarations_t *test_declarations;
+    _Atomic int test_declarations_failed;
+    /* Negative-obligation witness, not a completeness certificate: at least
+     * one extracted definition needs the configured-owner cross walk. */
+    _Atomic int test_definition_owners_seen;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    unsigned test_fault_mask; /* copied from one pipeline instance, immutable */
+#endif
+
     /* Build-tool path aliases (tsconfig/jsconfig today; webpack/vite-style
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
@@ -157,6 +393,114 @@ typedef struct {
      * that index it directly, so they keep results in memory (follow-up). */
     bool spill_allowed;
 } cbm_pipeline_ctx_t;
+
+/* Origin-aware LSP returns only success/failure. Never retain partial output
+ * when its configured owner proof cannot be applied to current source. */
+static inline void cbm_pipeline_test_owner_error(CBMFileResult *result) {
+    if (!result || result->test_declarations_status != CBM_TEST_EXTRACT_OK) {
+        return;
+    }
+    result->test_declarations_status = CBM_TEST_EXTRACT_UNSUPPORTED_FORM;
+    result->test_declaration_index = -1;
+    result->test_declaration_line = 0;
+    if (!result->has_error) {
+        result->test_error_only = true;
+    }
+    result->has_error = true;
+    result->error_msg =
+        cbm_arena_strdup(&result->arena, "configured test body ownership could not be verified");
+    if (!result->error_msg) {
+        result->test_declarations_status = CBM_TEST_EXTRACT_OOM;
+    }
+    cbm_test_declarations_degrade(result); /* per file, not the index */
+}
+
+static inline bool cbm_pipeline_test_result_ok(cbm_pipeline_ctx_t *ctx,
+                                               const CBMFileResult *result) {
+    if (result && result->test_declarations_status != CBM_TEST_EXTRACT_OK) {
+        atomic_store(&ctx->test_declarations_failed, 1);
+        return false;
+    }
+    if (result && result->has_test_definition_owners) {
+        atomic_store(&ctx->test_definition_owners_seen, 1);
+    }
+    return true;
+}
+
+/* Mirror the extractor's consumed definition language/preset activation.
+ * Registration records and the legacy native presets do not activate the
+ * configured-definition adapter. NULL/default snapshots keep legacy skips. */
+static inline bool cbm_pipeline_test_definitions_apply(const cbm_pipeline_ctx_t *ctx,
+                                                       CBMLanguage language) {
+    const cbm_test_declarations_t *snapshot = ctx ? ctx->test_declarations : NULL;
+    if (!snapshot ||
+        (language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA)) {
+        return false;
+    }
+    bool enabled = false;
+    if (language == CBM_LANG_C &&
+        cbm_test_declarations_preset(snapshot, CBM_TEST_PRESET_C_CBM, &enabled) && enabled) {
+        return true;
+    }
+    int count = 0;
+    const cbm_test_declaration_t *items = cbm_test_declarations_items(snapshot, &count);
+    for (int i = 0; i < count; i++) {
+        if (items[i].role != CBM_TEST_DECL_CASE && items[i].role != CBM_TEST_DECL_SUITE) {
+            continue;
+        }
+        const char *name = items[i].language;
+        if (name &&
+            ((language == CBM_LANG_C && (strcmp(name, "c") == 0 || strcmp(name, "C") == 0)) ||
+             (language == CBM_LANG_CPP &&
+              (strcmp(name, "cpp") == 0 || strcmp(name, "c++") == 0 || strcmp(name, "C++") == 0)) ||
+             (language == CBM_LANG_CUDA &&
+              (strcmp(name, "cuda") == 0 || strcmp(name, "CUDA") == 0)))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool cbm_pipeline_test_extraction_ok(cbm_pipeline_ctx_t *ctx, CBMLanguage language,
+                                                   const CBMFileResult *result) {
+    if (!result && cbm_pipeline_test_definitions_apply(ctx, language)) {
+        atomic_store(&ctx->test_declarations_failed, 1);
+        return false;
+    }
+    return cbm_pipeline_test_result_ok(ctx, result);
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+enum {
+    CBM_PIPELINE_TEST_FAULT_EXTRACT_NULL = 1u << 0,
+    CBM_PIPELINE_TEST_FAULT_DEF_MODULES_NULL = 1u << 1,
+    CBM_PIPELINE_TEST_FAULT_COLLECT_SPILL_NULL = 1u << 2
+};
+void cbm_pipeline_test_set_fault_mask(cbm_pipeline_t *p, unsigned mask);
+unsigned cbm_pipeline_test_fault_mask(const cbm_pipeline_t *p);
+#endif
+
+static inline bool cbm_pipeline_test_force_extract_null(const cbm_pipeline_ctx_t *ctx,
+                                                        CBMLanguage language) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    return ctx && (ctx->test_fault_mask & CBM_PIPELINE_TEST_FAULT_EXTRACT_NULL) &&
+           cbm_pipeline_test_definitions_apply(ctx, language);
+#else
+    (void)ctx;
+    (void)language;
+    return false;
+#endif
+}
+
+static inline bool cbm_pipeline_test_force_def_modules_null(const cbm_pipeline_ctx_t *ctx) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    return ctx && (ctx->test_fault_mask & CBM_PIPELINE_TEST_FAULT_DEF_MODULES_NULL) &&
+           atomic_load(&ctx->test_definition_owners_seen);
+#else
+    (void)ctx;
+    return false;
+#endif
+}
 
 /* ── Result-cache access contract (spill mode) ────────────────────────
  * After extraction a slot of the result cache is either the in-memory result
@@ -228,6 +572,29 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
                                        const CBMFileResult *result, const char **imp_keys,
                                        const char **imp_vals, int imp_count, const CBMCall *call,
                                        char *out, size_t out_sz);
+
+/* A spawn site (pass_spawns.c): the API the call names and the program it
+ * starts (CBM_SPAWN_DYNAMIC when not a literal). */
+typedef struct {
+    const char *api;
+    char program[CBM_SPAWN_PROGRAM_MAX];
+} cbm_pipeline_spawn_t;
+
+/* True when `call` starts another program (spawn_patterns.h) and `res`, the
+ * registry answer after the cross-language veto, does not make it a call into
+ * the project's own code. `imports` are the file's extracted imports, not the
+ * resolver's import map: that one holds only imports that resolved to project
+ * nodes, and subprocess or os/exec never do. Both call resolvers ask at the
+ * same point and, on true, emit cbm_pipeline_emit_spawn INSTEAD of a CALLS
+ * edge. */
+bool cbm_pipeline_spawn_site(const cbm_gbuf_t *gbuf, CBMLanguage lang, const CBMCall *call,
+                             const CBMImportArray *imports, const cbm_resolution_t *res,
+                             cbm_pipeline_spawn_t *out);
+
+/* The Process node of the spawned program (QN __process__<program>, one per
+ * program) and the SPAWNS edge from `source` to it. */
+void cbm_pipeline_emit_spawn(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+                             const cbm_pipeline_spawn_t *spawn);
 
 /* Resolve an import to its in-graph target node, or NULL if unresolvable.
  *
@@ -760,6 +1127,11 @@ void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score);
  * a delta-route failure and falls back to a full rebuild. */
 int cbm_pipeline_importance_recompute_store(cbm_store_t *store, const char *project);
 
+/* transitive_loop_depth/recursive over the complete staging store of the
+ * closure-delta route (the in-memory pass's traversal, gathered from SQL).
+ * Runs before the importance rescore. 0 on success. */
+int cbm_pipeline_complexity_recompute_store(cbm_store_t *store, const char *project);
+
 /* Work counters for the importance pass (pass_importance.c). Deltas are read
  * by the complexity suite's linearity gate; never reset by the pass itself, so
  * nested/repeated runs compose. g_importance_name_visits counts same-name-group
@@ -917,6 +1289,9 @@ void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **r
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+const cbm_test_declarations_t *cbm_pipeline_test_declarations(const cbm_pipeline_t *p);
+/* Without an active run snapshot this only validates fresh's source state. */
+bool cbm_pipeline_project_source_matches(const cbm_pipeline_t *p, const cbm_userconfig_t *fresh);
 const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
 cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);

@@ -16,6 +16,18 @@ on:
         description: 'Split each C-suite leg across parallel shard jobs (ubuntu x3, windows x2); off = one job per leg, byte-identical to the pre-shard topology'
         type: boolean
         default: false
+      shard_profile:
+        description: 'Shard counts when shard_suites is on: standard = ubuntu x3, windows x2 (dry run, release); pr = ubuntu x86 x1, ubuntu arm64 x2, windows x1 (fewer jobs re-paying setup)'
+        type: string
+        default: standard
+      lanes:
+        description: 'PR lane selection (scripts/ci/select-lanes.sh JSON list): only those legs and jobs run; "all" = every one (dry run, release)'
+        type: string
+        default: all
+      test_selection:
+        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the test-unix and test-windows legs run only its tests. Empty = every test (dry run, release, and any PR the selection does not narrow)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -30,18 +42,26 @@ jobs:
     outputs:
       unix: ${{ steps.set.outputs.unix }}
       windows: ${{ steps.set.outputs.windows }}
+      tsan: ${{ steps.set.outputs.tsan }}
+      has_unix: ${{ steps.set.outputs.has_unix }}
+      has_windows: ${{ steps.set.outputs.has_windows }}
+      has_tsan: ${{ steps.set.outputs.has_tsan }}
     steps:
       - name: Compute matrices
         id: set
         env:
           BROAD: ${{ inputs.broad_platforms }}
           SHARDS: ${{ inputs.shard_suites }}
+          SHARD_PROFILE: ${{ inputs.shard_profile }}
+          LANES: ${{ inputs.lanes }}
         run: |
+          # Every CORE leg is tagged with the lane (scripts/ci/select-lanes.sh)
+          # it serves; the tag is what lane selection filters on below.
           CORE_UNIX='[
-            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
-            {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
-            {"os":"macos-14","cc":"cc","cxx":"c++"},
-            {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
+            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++","lane":"unix-x86"},
+            {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++","lane":"unix-arm64"},
+            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"unix-macos14"},
+            {"os":"macos-15-intel","cc":"cc","cxx":"c++","lane":"unix-macos-intel"}
           ]'
           # Broad matrix legs are REQUIRED gates (no optional/continue-on-error
           # escape hatches): the release dry run must be all-green, every platform.
@@ -59,7 +79,7 @@ jobs:
           # interception crashed (interception_win: unhandled instruction). With
           # the native ARM64 toolchain ASan instruments native ARM64 code, so it
           # is a real (non-optional) gate, not a tolerated emulated-flake.
-          CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64"}]'
+          CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64","lane":"windows"}]'
           BROAD_WIN='[{"os":"windows-2025","msystem":"CLANG64","pkg":"x86_64"},{"os":"windows-11-arm","msystem":"CLANGARM64","pkg":"aarch64"}]'
           if [ "$BROAD" = "true" ]; then
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
@@ -67,6 +87,30 @@ jobs:
           else
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" '$a')
             WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
+          fi
+          # The ThreadSanitizer legs (test-tsan), tagged the same way.
+          TSAN='[
+            {"os":"ubuntu-latest","cc":"clang","cxx":"clang++","lane":"tsan-x86"},
+            {"os":"ubuntu-24.04-arm","cc":"clang","cxx":"clang++","lane":"tsan-arm"},
+            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"tsan-mac"}
+          ]'
+          # Lane selection. "all" (dry run, release) keeps every leg and drops
+          # the tags, so those matrices -- and their job names -- stay exactly
+          # as before lane selection. A PR keeps only its selected legs, and
+          # the tag stays in the job name, where ci-ok reads it back. An
+          # untagged leg could never be selected: that is a configuration
+          # error here, never a leg silently dropped.
+          if [ "$LANES" = "all" ]; then
+            UNIX=$(jq -c 'map(del(.lane))' <<< "$UNIX")
+            WIN=$(jq -c 'map(del(.lane))' <<< "$WIN")
+            TSAN=$(jq -c 'map(del(.lane))' <<< "$TSAN")
+          else
+            for M in "$UNIX" "$WIN" "$TSAN"; do
+              jq -e 'all(.[]; has("lane"))' <<< "$M" > /dev/null || { echo "::error::untagged test leg in $M"; exit 1; }
+            done
+            UNIX=$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$UNIX")
+            WIN=$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$WIN")
+            TSAN=$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$TSAN")
           fi
           # Suite sharding (opt-in via the shard_suites input): each platform's
           # C-suite run is split across N runner jobs. CBM_TEST_SHARD="i/N"
@@ -78,20 +122,37 @@ jobs:
           # shards); Windows gets 2 (every extra shard re-pays ~5 min of
           # MSYS2 setup); macOS stays at 1 — mac legs are not the critical
           # path and mac runner concurrency ceilings are the tightest.
+          # The pr profile shards less: a PR runs few legs and every shard
+          # re-pays its setup, so x86 and Windows run whole and only arm64,
+          # the slowest leg (~72 min unsharded), splits in two.
+          case "$SHARD_PROFILE" in
+            standard) N_X86=3; N_ARM=3; N_WIN=2 ;;
+            pr) N_X86=1; N_ARM=2; N_WIN=1 ;;
+            *) echo "::error::unknown shard_profile '$SHARD_PROFILE'"; exit 1 ;;
+          esac
           if [ "$SHARDS" = "true" ]; then
-            UNIX=$(jq -c '[.[] | . as $e
-              | (if ($e.os | startswith("ubuntu")) then 3 else 1 end) as $n
+            UNIX=$(jq -c --argjson x86 "$N_X86" --argjson arm "$N_ARM" '[.[] | . as $e
+              | (if ($e.os | startswith("ubuntu")) then
+                   (if ($e.os | endswith("-arm")) then $arm else $x86 end)
+                 else 1 end) as $n
               | range(1; $n + 1) as $i
               | $e + {shard: "\($i)/\($n)"}]' <<< "$UNIX")
-            WIN=$(jq -c '[.[] | . as $e
-              | range(1; 3) as $i
-              | $e + {shard: "\($i)/2"}]' <<< "$WIN")
+            WIN=$(jq -c --argjson n "$N_WIN" '[.[] | . as $e
+              | range(1; $n + 1) as $i
+              | $e + {shard: "\($i)/\($n)"}]' <<< "$WIN")
           fi
           echo "unix={\"include\":$UNIX}" >> "$GITHUB_OUTPUT"
           echo "windows={\"include\":$WIN}" >> "$GITHUB_OUTPUT"
+          echo "tsan={\"include\":$TSAN}" >> "$GITHUB_OUTPUT"
+          # GitHub rejects an empty matrix, so a job whose legs were all
+          # deselected is skipped through these flags instead.
+          echo "has_unix=$(jq 'length > 0' <<< "$UNIX")" >> "$GITHUB_OUTPUT"
+          echo "has_windows=$(jq 'length > 0' <<< "$WIN")" >> "$GITHUB_OUTPUT"
+          echo "has_tsan=$(jq 'length > 0' <<< "$TSAN")" >> "$GITHUB_OUTPUT"
 
   test-unix:
     needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_unix == 'true' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
@@ -160,12 +221,20 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-
             ccache-test-${{ matrix.os }}-${{ matrix.cc }}-
 
+      - name: Fetch the test selection
+        if: ${{ inputs.test_selection != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.test_selection }}
+          path: ${{ runner.temp }}/test-selection
+
       - name: Test
         run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
         env:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.cc }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && format('{0}/test-selection', runner.temp) || '' }}
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -205,6 +274,7 @@ jobs:
   # inode/flock behavior and Windows handle/link behavior are each gating,
   # without adding Node/Go provisioning to every sanitizer/container leg.
   test-package-wrappers:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'pkg-wrappers') }}
     strategy:
       fail-fast: false
       matrix:
@@ -245,6 +315,7 @@ jobs:
   # parallel suite — catches what an older compiler-rt can miss. Same
   # canonical scripts/test.sh wave as every other leg.
   test-diag:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'diag') }}
     # Pinned for the same reason as the lint jobs: the pinned diagnostic
     # toolchain below installs from llvm-toolchain-noble-21.
     runs-on: ubuntu-24.04
@@ -310,6 +381,7 @@ jobs:
   # list both venues now share. Zero use-of-uninitialized-value findings were
   # reported across the lane on either architecture.
   test-msan:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'msan') }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -334,6 +406,7 @@ jobs:
   # so this leg is the ordinary ASan suite built with that toolchain and run
   # with detect_leaks=1. Mirrors the local `make -f Makefile.cbm test-lsan`.
   test-lsan-macos:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'lsan-macos') }}
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
@@ -372,13 +445,11 @@ jobs:
           key: ccache-lsan-${{ github.ref }}-${{ github.sha }}
 
   test-tsan:
+    needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_tsan == 'true' }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, cc: clang, cxx: clang++ }
-          - { os: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
-          - { os: macos-14, cc: cc, cxx: c++ }
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.tsan) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
@@ -431,6 +502,7 @@ jobs:
 
   test-windows:
     needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_windows == 'true' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
@@ -481,6 +553,13 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-
 
+      - name: Fetch the test selection
+        if: ${{ inputs.test_selection != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.test_selection }}
+          path: ${{ runner.temp }}/test-selection
+
       - name: Test
         shell: msys2 {0}
         # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
@@ -508,6 +587,7 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && format('{0}/test-selection', runner.temp) || '' }}
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -564,8 +644,12 @@ jobs:
         with:
           pattern: shard-manifest-*
           path: manifests
+      # A PR with no test leg selected uploads no manifest; the script
+      # accepts that only when the selection really holds no leg.
       - name: Verify cross-shard union per leg
-        run: repo/scripts/ci/verify-shard-union.sh manifests
+        env:
+          LANES: ${{ inputs.lanes }}
+        run: repo/scripts/ci/verify-shard-union.sh manifests --lanes "$LANES"
 
   # Windows product-surface regression guards. Distinct from test-windows above
   # (the sanitizer C suite): these drive a real product binary + external UI pack
@@ -576,6 +660,7 @@ jobs:
   # CLI arguments being mangled by the narrow-argv main() (#423/#20, fixed by the
   # wide-argv entrypoint that reads GetCommandLineW).
   test-windows-guards:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'windows-guards') }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:

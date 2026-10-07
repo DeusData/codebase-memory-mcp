@@ -1,3 +1,4 @@
+#include "foundation/arena.h" /* public lazy-arena declarations before cbm.h */
 /*
  * userconfig.c — User-defined extension→language mappings.
  *
@@ -15,6 +16,7 @@
 #include "foundation/platform.h" /* cbm_safe_getenv */
 #include "foundation/compat_fs.h"
 #include "foundation/sha256.h"
+#include "foundation/arena.h"
 
 enum { MAX_CONFIG_SIZE = 65536 };
 #include "foundation/log.h"
@@ -29,6 +31,21 @@ enum { MAX_CONFIG_SIZE = 65536 };
 /* ── Process-global user config pointer ──────────────────────────── */
 
 static const cbm_userconfig_t *g_userconfig = NULL;
+
+struct cbm_userconfig_source {
+    CBMArena arena;
+    cbm_userconfig_source_state_t state;
+    const char *bytes;
+    size_t len;
+    bool owns_config_arena; /* false for both legacy loaders */
+};
+
+static void userconfig_source_free(cbm_userconfig_source_t *source) {
+    if (source) {
+        CBMArena arena = source->arena;
+        cbm_arena_destroy(&arena);
+    }
+}
 
 static void userconfig_source_digest(const char *state, const void *bytes, size_t len,
                                      char out[CBM_SHA256_HEX_LEN + 1]) {
@@ -315,13 +332,76 @@ static int load_config_file(const char *path, cbm_userext_t **entries, int *coun
     return rc;
 }
 
+/* Retain the project input before parsing it; never reopen for declarations. */
+static int load_project_source(const char *path, cbm_userconfig_t *cfg, cbm_userext_t **entries,
+                               int *count) {
+    cbm_userconfig_source_t *source = cfg->project_source;
+    source->state = CBM_USERCONFIG_SOURCE_ERROR;
+    userconfig_source_digest("read-error", NULL, 0, cfg->project_source_sha256);
+    cbm_path_info_t info = {0};
+    int status = cbm_path_info_utf8(path, &info);
+    if (status == CBM_PATH_INFO_ABSENT) {
+        source->state = CBM_USERCONFIG_SOURCE_ABSENT;
+        /* Preserve the existing digest for actual absence. */
+        userconfig_source_digest("missing-or-unreadable", NULL, 0, cfg->project_source_sha256);
+        return 0;
+    }
+    if (status != CBM_PATH_INFO_OK || !info.is_regular || info.size > MAX_CONFIG_SIZE)
+        return 0;
+    char *bytes = cbm_arena_alloc(&source->arena, MAX_CONFIG_SIZE + 1U);
+    if (!bytes)
+        return CBM_NOT_FOUND;
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file)
+        return 0;
+    size_t len = fread(bytes, 1, MAX_CONFIG_SIZE + 1U, file);
+    bool valid = !ferror(file) && feof(file) && len <= MAX_CONFIG_SIZE;
+    if (fclose(file) != 0)
+        valid = false;
+    if (!valid)
+        return 0;
+    bytes[len] = '\0';
+    source->state = CBM_USERCONFIG_SOURCE_PRESENT;
+    source->bytes = bytes;
+    source->len = len;
+    userconfig_source_digest(len ? "present" : "empty", bytes, len, cfg->project_source_sha256);
+    if (!len)
+        return 0;
+    yyjson_read_err error = {0};
+    yyjson_doc *doc = yyjson_read_opts(bytes, len, 0, NULL, &error);
+    if (!doc) {
+        if (error.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION)
+            return CBM_NOT_FOUND;
+        cbm_log_warn("userconfig.corrupt_json", "path", path);
+        return 0;
+    }
+    int rc = parse_extra_extensions(yyjson_doc_get_root(doc), entries, count, path);
+    yyjson_doc_free(doc);
+    return rc;
+}
+
 /* ── Public API ──────────────────────────────────────────────────── */
 
-cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
+static cbm_userconfig_t *userconfig_load(const char *repo_path, bool retain_source) {
+    /* The retained source first: a failure here has nothing else to undo. */
+    cbm_userconfig_source_t *source = NULL;
+    if (retain_source) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        source = cbm_arena_calloc(&arena, sizeof(*source));
+        if (!source) {
+            cbm_arena_destroy(&arena);
+            return NULL;
+        }
+        source->arena = arena;
+        source->state = CBM_USERCONFIG_SOURCE_ABSENT;
+    }
     cbm_userconfig_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(cbm_userconfig_t));
     if (!cfg) {
+        userconfig_source_free(source);
         return NULL;
     }
+    cfg->project_source = source;
 
     cbm_userext_t *entries = NULL;
     int count = 0;
@@ -338,6 +418,7 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
             free(entries[i].ext);
         }
         free(entries);
+        userconfig_source_free(cfg->project_source);
         free(cfg);
         return NULL;
     }
@@ -348,14 +429,27 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
     userconfig_source_digest("not-applicable", NULL, 0, cfg->project_source_sha256);
     if (repo_path && repo_path[0]) {
         char project_path[PATH_BUF_SZ];
-        snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", repo_path);
-
-        if (load_config_file(project_path, &entries, &count, cfg->project_source_sha256) != 0) {
+        int path_len =
+            snprintf(project_path, sizeof(project_path), "%s/.codebase-memory.json", repo_path);
+        int rc;
+        if (retain_source) {
+            if (path_len < 0 || (size_t)path_len >= sizeof(project_path)) {
+                cfg->project_source->state = CBM_USERCONFIG_SOURCE_ERROR;
+                userconfig_source_digest("path-error", NULL, 0, cfg->project_source_sha256);
+                rc = 0;
+            } else {
+                rc = load_project_source(project_path, cfg, &entries, &count);
+            }
+        } else {
+            rc = load_config_file(project_path, &entries, &count, cfg->project_source_sha256);
+        }
+        if (rc != 0) {
             /* Free already-allocated entries */
             for (int i = 0; i < count; i++) {
                 free(entries[i].ext);
             }
             free(entries);
+            userconfig_source_free(cfg->project_source);
             free(cfg);
             return NULL;
         }
@@ -398,6 +492,32 @@ cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
     return cfg;
 }
 
+cbm_userconfig_t *cbm_userconfig_load(const char *repo_path) {
+    return userconfig_load(repo_path, false);
+}
+
+cbm_userconfig_t *cbm_userconfig_load_with_source(const char *repo_path) {
+    return userconfig_load(repo_path, true);
+}
+
+cbm_userconfig_source_state_t cbm_userconfig_project_source(const cbm_userconfig_t *cfg,
+                                                            const char **bytes, size_t *len) {
+    if (bytes)
+        *bytes = NULL;
+    if (len)
+        *len = 0;
+    if (!cfg || !cfg->project_source)
+        return CBM_USERCONFIG_SOURCE_ERROR;
+    const cbm_userconfig_source_t *source = cfg->project_source;
+    if (source->state == CBM_USERCONFIG_SOURCE_PRESENT) {
+        if (bytes)
+            *bytes = source->bytes;
+        if (len)
+            *len = source->len;
+    }
+    return source->state;
+}
+
 CBMLanguage cbm_userconfig_lookup(const cbm_userconfig_t *cfg, const char *ext) {
     if (!cfg || !ext || !ext[0]) {
         return CBM_LANG_COUNT;
@@ -414,9 +534,165 @@ void cbm_userconfig_free(cbm_userconfig_t *cfg) {
     if (!cfg) {
         return;
     }
+    if (cfg->project_source && cfg->project_source->owns_config_arena) {
+        CBMArena arena = cfg->project_source->arena;
+        cbm_arena_destroy(&arena);
+        return;
+    }
     for (int i = 0; i < cfg->count; i++) {
         free(cfg->entries[i].ext);
     }
     free(cfg->entries);
+    userconfig_source_free(cfg->project_source);
     free(cfg);
+}
+
+/* Frozen project-only input. The legacy pathname loaders remain fail-open. */
+static bool snapshot_key_is(yyjson_val *key, const char *name) {
+    size_t len = strlen(name);
+    return yyjson_get_len(key) == len && memcmp(yyjson_get_str(key), name, len) == 0;
+}
+
+static cbm_userconfig_snapshot_status_t snapshot_extensions(yyjson_val *root, yyjson_val **out) {
+    *out = NULL;
+    if (!yyjson_is_obj(root))
+        return CBM_USERCONFIG_SNAPSHOT_INVALID;
+    yyjson_obj_iter iter;
+    yyjson_obj_iter_init(root, &iter);
+    yyjson_val *key;
+    while ((key = yyjson_obj_iter_next(&iter)) != NULL) {
+        if (!snapshot_key_is(key, "extra_extensions"))
+            continue;
+        if (*out)
+            return CBM_USERCONFIG_SNAPSHOT_INVALID;
+        *out = yyjson_obj_iter_get_val(key);
+        if (!yyjson_is_obj(*out))
+            return CBM_USERCONFIG_SNAPSHOT_INVALID;
+    }
+    return CBM_USERCONFIG_SNAPSHOT_OK;
+}
+
+static bool snapshot_string(yyjson_val *value) {
+    if (!yyjson_is_str(value) || yyjson_get_len(value) == 0)
+        return false;
+    return memchr(yyjson_get_str(value), 0, yyjson_get_len(value)) == NULL;
+}
+
+/* Frozen config matching must not depend on the process locale. */
+static CBMLanguage snapshot_language(yyjson_val *value) {
+    const unsigned char *name = (const unsigned char *)yyjson_get_str(value);
+    size_t len = yyjson_get_len(value);
+    for (size_t i = 0; i < LANG_NAME_TABLE_SIZE; i++) {
+        const char *alias = LANG_NAME_TABLE[i].name;
+        if (strlen(alias) != len)
+            continue;
+        size_t j = 0;
+        for (; j < len; j++) {
+            unsigned char byte = name[j];
+            if (byte >= 'A' && byte <= 'Z')
+                byte = (unsigned char)(byte + ('a' - 'A'));
+            if (byte != (unsigned char)alias[j])
+                break;
+        }
+        if (j == len)
+            return LANG_NAME_TABLE[i].lang;
+    }
+    return CBM_LANG_COUNT;
+}
+
+static cbm_userconfig_snapshot_status_t snapshot_entry(CBMArena *arena, cbm_userconfig_t *cfg,
+                                                       yyjson_val *key, yyjson_val *value) {
+    if (!snapshot_string(key) || !snapshot_string(value) || yyjson_get_str(key)[0] != '.')
+        return CBM_USERCONFIG_SNAPSHOT_INVALID;
+    const char *ext = yyjson_get_str(key);
+    for (int i = 0; i < cfg->count; i++) {
+        if (strcmp(cfg->entries[i].ext, ext) == 0)
+            return CBM_USERCONFIG_SNAPSHOT_INVALID;
+    }
+    CBMLanguage language = snapshot_language(value);
+    if (language == CBM_LANG_COUNT)
+        return CBM_USERCONFIG_SNAPSHOT_UNSUPPORTED;
+    char *copy = cbm_arena_strndup(arena, ext, yyjson_get_len(key));
+    if (!copy)
+        return CBM_USERCONFIG_SNAPSHOT_OOM;
+    cfg->entries[cfg->count++] = (cbm_userext_t){.ext = copy, .lang = language};
+    return CBM_USERCONFIG_SNAPSHOT_OK;
+}
+
+static cbm_userconfig_snapshot_status_t snapshot_parse(CBMArena *arena, cbm_userconfig_t *cfg) {
+    cbm_userconfig_source_t *source = cfg->project_source;
+    yyjson_read_err error = {0};
+    yyjson_doc *doc = yyjson_read_opts((char *)source->bytes, source->len, 0, NULL, &error);
+    if (!doc)
+        return error.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION ? CBM_USERCONFIG_SNAPSHOT_OOM
+                                                                 : CBM_USERCONFIG_SNAPSHOT_INVALID;
+    yyjson_val *extra = NULL;
+    cbm_userconfig_snapshot_status_t status = snapshot_extensions(yyjson_doc_get_root(doc), &extra);
+    size_t count = extra ? yyjson_obj_size(extra) : 0;
+    /* The 64 KiB source cap already bounds count; keep allocation math explicit. */
+    if (count > MAX_CONFIG_SIZE || count > SIZE_MAX / sizeof(*cfg->entries))
+        status = CBM_USERCONFIG_SNAPSHOT_LIMIT;
+    if (status == CBM_USERCONFIG_SNAPSHOT_OK && count > 0) {
+        cfg->entries = cbm_arena_calloc(arena, count * sizeof(*cfg->entries));
+        if (!cfg->entries)
+            status = CBM_USERCONFIG_SNAPSHOT_OOM;
+    }
+    if (status == CBM_USERCONFIG_SNAPSHOT_OK && extra) {
+        yyjson_obj_iter iter;
+        yyjson_obj_iter_init(extra, &iter);
+        yyjson_val *key;
+        while ((key = yyjson_obj_iter_next(&iter)) != NULL) {
+            status = snapshot_entry(arena, cfg, key, yyjson_obj_iter_get_val(key));
+            if (status != CBM_USERCONFIG_SNAPSHOT_OK)
+                break;
+        }
+    }
+    yyjson_doc_free(doc);
+    return status;
+}
+
+static cbm_userconfig_snapshot_status_t snapshot_input(cbm_userconfig_source_state_t state,
+                                                       const void *bytes, size_t len) {
+    if (state == CBM_USERCONFIG_SOURCE_ABSENT)
+        return (!bytes && len == 0) ? CBM_USERCONFIG_SNAPSHOT_OK : CBM_USERCONFIG_SNAPSHOT_INVALID;
+    if (state != CBM_USERCONFIG_SOURCE_PRESENT || !bytes || len == 0)
+        return CBM_USERCONFIG_SNAPSHOT_INVALID;
+    return len > MAX_CONFIG_SIZE ? CBM_USERCONFIG_SNAPSHOT_LIMIT : CBM_USERCONFIG_SNAPSHOT_OK;
+}
+
+cbm_userconfig_snapshot_status_t cbm_userconfig_from_project_bytes(
+    cbm_userconfig_source_state_t state, const void *bytes, size_t len, cbm_userconfig_t **out) {
+    if (!out)
+        return CBM_USERCONFIG_SNAPSHOT_INVALID;
+    *out = NULL;
+    cbm_userconfig_snapshot_status_t status = snapshot_input(state, bytes, len);
+    if (status != CBM_USERCONFIG_SNAPSHOT_OK)
+        return status;
+    CBMArena arena;
+    cbm_arena_init_lazy(&arena, CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    cbm_userconfig_t *cfg = cbm_arena_calloc(&arena, sizeof(*cfg));
+    cbm_userconfig_source_t *source = cbm_arena_calloc(&arena, sizeof(*source));
+    if (!cfg || !source) {
+        cbm_arena_destroy(&arena);
+        return CBM_USERCONFIG_SNAPSHOT_OOM;
+    }
+    cfg->project_source = source;
+    source->state = state;
+    source->len = len;
+    if (state == CBM_USERCONFIG_SOURCE_PRESENT) {
+        source->bytes = cbm_arena_strndup(&arena, bytes, len);
+        status = source->bytes ? snapshot_parse(&arena, cfg) : CBM_USERCONFIG_SNAPSHOT_OOM;
+    }
+    if (status != CBM_USERCONFIG_SNAPSHOT_OK) {
+        cbm_arena_destroy(&arena);
+        return status;
+    }
+    userconfig_source_digest("disabled-frozen-v1", NULL, 0, cfg->global_source_sha256);
+    userconfig_source_digest(state == CBM_USERCONFIG_SOURCE_ABSENT ? "missing-or-unreadable"
+                                                                   : "present",
+                             source->bytes, len, cfg->project_source_sha256);
+    source->owns_config_arena = true;
+    source->arena = arena;
+    *out = cfg;
+    return CBM_USERCONFIG_SNAPSHOT_OK;
 }

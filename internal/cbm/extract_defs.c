@@ -3,7 +3,9 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
-#include "foundation/log.h"      // cbm_log_error
+#include "foundation/log.h" // cbm_log_error
+#include "discover/test_conventions.h"
+#include "foundation/sha256.h"
 #include "foundation/mem_core.h" // cbm_realloc/cbm_free -- walk_defs stack
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
@@ -40,6 +42,9 @@ enum {
     NIX_HEADER_HOP_MAX = 8,
     DECORATOR_SCAN_LIMIT = 3,
     C_RETURN_WALK_DEPTH = 5,
+    /* Declarator nesting around a member name: `char *(*(*tbl[4])(int))(void)`
+     * is pointer, function, parens, pointer, function, parens, pointer, array. */
+    C_FIELD_DECL_WALK_DEPTH = 16,
     VAR_RECURSION_LIMIT = 8,
     NESTED_CLASS_STACK_CAP = 128,
     FP_HASH_MUL = 31,    /* FNV-like hash multiplier for identifier dedup */
@@ -3556,12 +3561,6 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     return result;
 }
 
-/* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
- * attributes both parse as distinct function_item nodes and otherwise receive
- * the SAME qualified_name, so the second graph upsert silently overwrites the
- * first and one branch is lost (#495). Fold the cfg predicate into the QN so
- * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
- * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
 /* Rust: mark a function as a test when it carries a test attribute (#855).
  * cbm's test detection is otherwise file-path-based (cbm_is_test_file:
  * *_test.rs / test_*), so inline #[test]/#[tokio::test] functions inside a
@@ -3589,32 +3588,6 @@ static bool rust_def_is_test(const char *const *decorators) {
         }
     }
     return false;
-}
-
-static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
-                                           const char *const *decorators) {
-    if (!decorators) {
-        return base_qn;
-    }
-    for (int i = 0; decorators[i]; i++) {
-        const char *cfg = strstr(decorators[i], "cfg(");
-        if (!cfg) {
-            continue;
-        }
-        /* Build a compact predicate suffix from the cfg(...) text, dropping
-         * whitespace and quotes so the QN stays readable and stable. */
-        char buf[CBM_SZ_256];
-        size_t bi = 0;
-        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
-            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
-                continue;
-            }
-            buf[bi++] = *p;
-        }
-        buf[bi] = '\0';
-        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
-    }
-    return base_qn;
 }
 
 // Extract base class name text from a single base_class child node.
@@ -5077,9 +5050,10 @@ static bool is_c_declarator_lang(CBMLanguage lang) {
  * O(depth) with no recursion and needs no depth cap. It stops at the first node
  * that is neither a pointer nor a reference declarator: for a function returning
  * a function pointer (`int (*f(void))(int)`) that is the outer
- * function_declarator, which leaves the base type as it was. */
+ * function_declarator, which leaves the base type as it was. That node is
+ * handed back through `rest` when the caller asks for it. */
 static size_t c_rt_render(c_rt_out_t *out, TSNode func_node, TSNode type_node, TSNode declarator,
-                          const char *source) {
+                          const char *source, TSNode *rest) {
     size_t added = 0;
     uint32_t decl_start = ts_node_start_byte(declarator);
     uint32_t nc = ts_node_named_child_count(func_node);
@@ -5133,6 +5107,9 @@ static size_t c_rt_render(c_rt_out_t *out, TSNode func_node, TSNode type_node, T
         }
         decl = inner;
     }
+    if (rest) {
+        *rest = decl; /* the declarator the markers wrap; null when none is left */
+    }
     return added;
 }
 
@@ -5146,7 +5123,7 @@ static char *c_declared_return_type(CBMExtractCtx *ctx, TSNode func_node, TSNode
         return cbm_node_text(a, type_node, ctx->source);
     }
     c_rt_out_t out = {NULL, 0};
-    if (c_rt_render(&out, func_node, type_node, declarator, ctx->source) == 0) {
+    if (c_rt_render(&out, func_node, type_node, declarator, ctx->source, NULL) == 0) {
         return cbm_node_text(a, type_node, ctx->source);
     }
     out.buf = (char *)cbm_arena_alloc(a, out.len + NULL_TERM);
@@ -5154,7 +5131,7 @@ static char *c_declared_return_type(CBMExtractCtx *ctx, TSNode func_node, TSNode
         return cbm_node_text(a, type_node, ctx->source);
     }
     out.len = 0;
-    (void)c_rt_render(&out, func_node, type_node, declarator, ctx->source);
+    (void)c_rt_render(&out, func_node, type_node, declarator, ctx->source, NULL);
     out.buf[out.len] = '\0';
     return out.buf;
 }
@@ -5284,10 +5261,898 @@ static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode 
     return NULL;
 }
 
+/* Configured macro definitions are interpreted only in their raw source.
+ * The map lives in traversal scratch; its QNs live in the result arena. */
+struct CBMTestDefinitionMatch {
+    uint32_t name_byte;
+    TSNode name_node;  /* same raw tree; never retained beyond extraction */
+    TSNode scope_node; /* function, or split invocation's compound body */
+    uint32_t line;
+    int declaration;
+    const char *qn;
+};
+
+typedef struct {
+    CBMTestDefinitionRole role;
+    int argument;
+    int declaration;
+    bool valid;
+} TDXRule;
+
+static int tdx_language(const char *name) {
+    if (!name)
+        return 0;
+    if (strcmp(name, "c") == 0 || strcmp(name, "C") == 0)
+        return 1;
+    if (strcmp(name, "cpp") == 0 || strcmp(name, "c++") == 0 || strcmp(name, "C++") == 0)
+        return 2;
+    if (strcmp(name, "cuda") == 0 || strcmp(name, "CUDA") == 0)
+        return 3;
+    return 0;
+}
+
+static int tdx_source_language(CBMLanguage language) {
+    return language == CBM_LANG_C      ? 1
+           : language == CBM_LANG_CPP  ? 2
+           : language == CBM_LANG_CUDA ? 3
+                                       : 0;
+}
+
+const char *cbm_test_extract_status_message(CBMTestExtractStatus status) {
+    static const char *const messages[] = {"",
+                                           "unsupported configured definition language",
+                                           "unsupported disabled native test preset",
+                                           "unsupported configured definition name",
+                                           "configured definition argument is missing",
+                                           "configured definition argument is not an identifier",
+                                           "ambiguous configured definition mapping",
+                                           "unsupported configured definition form",
+                                           "configured definition allocation failed"};
+    size_t count = sizeof(messages) / sizeof(messages[0]);
+    return (size_t)status < count ? messages[status] : "configured definition issue";
+}
+
+static bool tdx_issue(CBMFileResult *result, CBMTestExtractStatus status, int declaration,
+                      uint32_t line) {
+    if (result->test_declarations_status == CBM_TEST_EXTRACT_OOM)
+        return false;
+    bool earlier =
+        result->test_declarations_status == CBM_TEST_EXTRACT_OK || status == CBM_TEST_EXTRACT_OOM ||
+        line < result->test_declaration_line ||
+        (line == result->test_declaration_line && (declaration < result->test_declaration_index ||
+                                                   (declaration == result->test_declaration_index &&
+                                                    status < result->test_declarations_status)));
+    if (!earlier)
+        return false;
+    if (!result->has_error)
+        result->test_error_only = true;
+
+    result->has_error = true;
+    result->test_declarations_status = status;
+    result->test_declaration_index = declaration;
+    result->test_declaration_line = line;
+    result->error_msg = cbm_arena_strdup(&result->arena, cbm_test_extract_status_message(status));
+    if (!result->error_msg)
+        result->test_declarations_status = CBM_TEST_EXTRACT_OOM;
+    return false;
+}
+
+void cbm_test_declarations_degrade(CBMFileResult *result) {
+    if (!result || result->test_declarations_status == CBM_TEST_EXTRACT_OK ||
+        result->test_declarations_status == CBM_TEST_EXTRACT_OOM)
+        return;
+    result->test_declarations_degraded = true;
+    result->test_declarations_degraded_status = result->test_declarations_status;
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *def = &result->defs.items[i];
+        def->test_role = CBM_TEST_ROLE_NONE;
+        def->test_name_start_byte = def->test_name_end_byte = 0;
+        def->test_body_start_byte = def->test_body_end_byte = 0;
+    }
+    result->has_test_definition_owners = false;
+    result->test_declarations_status = CBM_TEST_EXTRACT_OK;
+    if (result->test_error_only) {
+        result->has_error = false;
+        result->error_msg = NULL;
+        result->test_error_only = false;
+    }
+}
+
+bool cbm_test_declarations_validate(CBMFileResult *result,
+                                    const cbm_test_declarations_t *declarations) {
+    if (!declarations)
+        return true;
+    for (int i = 0; i < CBM_TEST_PRESET_COUNT; i++) {
+        bool enabled = false;
+        if (!cbm_test_declarations_preset(declarations, (cbm_test_preset_t)i, &enabled))
+            return tdx_issue(result, CBM_TEST_EXTRACT_UNSUPPORTED_PRESET, -1, 0);
+        if (!enabled && i != CBM_TEST_PRESET_C_CBM && i != CBM_TEST_PRESET_GTEST)
+            tdx_issue(result, CBM_TEST_EXTRACT_UNSUPPORTED_PRESET, -1, 0);
+    }
+    int count = 0;
+    const cbm_test_declaration_t *items = cbm_test_declarations_items(declarations, &count);
+    for (int i = 0; i < count; i++) {
+        const cbm_test_declaration_t *rule = &items[i];
+        if (rule->role != CBM_TEST_DECL_CASE && rule->role != CBM_TEST_DECL_SUITE)
+            continue;
+        if (!tdx_language(rule->language))
+            tdx_issue(result, CBM_TEST_EXTRACT_UNSUPPORTED_LANGUAGE, i, 0);
+        if (rule->name_arg_count != 1 || !rule->name_args || rule->name_args[0] < 0)
+            tdx_issue(result, CBM_TEST_EXTRACT_UNSUPPORTED_NAME, i, 0);
+    }
+    return result->test_declarations_status == CBM_TEST_EXTRACT_OK;
+}
+
+static bool tdx_preset(const CBMExtractCtx *ctx, cbm_test_preset_t preset) {
+    if (!ctx->test_declarations)
+        return preset != CBM_TEST_PRESET_C_CBM;
+    bool enabled = false;
+    return cbm_test_declarations_preset(ctx->test_declarations, preset, &enabled) && enabled;
+}
+
+static bool tdx_equal(const char *name, const char *text, size_t size) {
+    return name && strlen(name) == size && memcmp(name, text, size) == 0;
+}
+
+static bool tdx_match(CBMExtractCtx *ctx, const char *text, size_t size, uint32_t line,
+                      TDXRule *chosen) {
+    *chosen = (TDXRule){.argument = -1, .declaration = -1};
+    if (!ctx->test_declarations || !ctx->test_declarations_raw_source)
+        return false;
+    int language = tdx_source_language(ctx->language), count = 0;
+    if (!language)
+        return false;
+    const cbm_test_declaration_t *items =
+        cbm_test_declarations_items(ctx->test_declarations, &count);
+    bool matched = false, valid = true;
+    for (int i = 0; i < count; i++) {
+        const cbm_test_declaration_t *rule = &items[i];
+        if ((rule->role != CBM_TEST_DECL_CASE && rule->role != CBM_TEST_DECL_SUITE) ||
+            tdx_language(rule->language) != language || !tdx_equal(rule->define_macro, text, size))
+            continue;
+        CBMTestDefinitionRole role =
+            rule->role == CBM_TEST_DECL_CASE ? CBM_TEST_ROLE_CASE : CBM_TEST_ROLE_SUITE;
+        if (rule->name_arg_count != 1 || !rule->name_args || rule->name_args[0] < 0) {
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_NAME, i, line);
+            valid = false;
+            matched = true;
+            continue;
+        }
+        if (matched && (chosen->role != role || chosen->argument != rule->name_args[0])) {
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_AMBIGUOUS, i, line);
+            valid = false;
+        }
+        if (!matched)
+            *chosen = (TDXRule){role, rule->name_args[0], i, true};
+        matched = true;
+    }
+    if (language == 1 && tdx_preset(ctx, CBM_TEST_PRESET_C_CBM)) {
+        CBMTestDefinitionRole role = tdx_equal("TEST", text, size)    ? CBM_TEST_ROLE_CASE
+                                     : tdx_equal("SUITE", text, size) ? CBM_TEST_ROLE_SUITE
+                                                                      : CBM_TEST_ROLE_NONE;
+        if (role != CBM_TEST_ROLE_NONE) {
+            if (matched && (chosen->role != role || chosen->argument != 0)) {
+                tdx_issue(ctx->result, CBM_TEST_EXTRACT_AMBIGUOUS, -1, line);
+                valid = false;
+            }
+            if (!matched)
+                *chosen = (TDXRule){role, 0, -1, true};
+            matched = true;
+        }
+    }
+    /* The enabled native GTest detector consumes its own argument tuple.
+     * A custom single-name mapping must explicitly disable that overlap. */
+    if (matched && language != 1 && tdx_preset(ctx, CBM_TEST_PRESET_GTEST) &&
+        (tdx_equal("TEST", text, size) || tdx_equal("TEST_F", text, size) ||
+         tdx_equal("TEST_P", text, size) || tdx_equal("TYPED_TEST", text, size) ||
+         tdx_equal("TYPED_TEST_P", text, size))) {
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_AMBIGUOUS, -1, line);
+        valid = false;
+    }
+    chosen->valid = valid;
+    return matched;
+}
+
+static bool tdx_ident_first(unsigned char c) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static bool tdx_ident(unsigned char c) {
+    return tdx_ident_first(c) || (c >= '0' && c <= '9');
+}
+
+/* C/C++ preprocessing-number maximal munch; no numeric evaluation. This
+ * protects digit separators and user-defined suffixes from quote/identifier
+ * scanning, while a selected numeric argument still fails the identifier rule. */
+static bool tdx_pp_number(const char *s, size_t n, size_t *at) {
+    size_t i = *at;
+    if (i == n || !((s[i] >= '0' && s[i] <= '9') ||
+                    (s[i] == '.' && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '9')))
+        return false;
+    i++;
+    while (i < n) {
+        unsigned char c = (unsigned char)s[i];
+        if (tdx_ident(c) || c == '.') {
+            i++;
+            continue;
+        }
+        if (c == '\'' && i + 1 < n && tdx_ident((unsigned char)s[i + 1])) {
+            i += 2;
+            continue;
+        }
+        if ((c == '+' || c == '-') &&
+            (s[i - 1] == 'e' || s[i - 1] == 'E' || s[i - 1] == 'p' || s[i - 1] == 'P')) {
+            i++;
+            continue;
+        }
+        break;
+    }
+    *at = i;
+    return true;
+}
+
+static bool tdx_space(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
+}
+
+static bool tdx_splice(const char *s, size_t n, size_t at) {
+    return at < n && s[at] == '\\' && at + 1 < n &&
+           (s[at + 1] == '\n' || (s[at + 1] == '\r' && at + 2 < n && s[at + 2] == '\n'));
+}
+
+/* Trivia and literals are read as bytes, never as C expressions. Unsupported
+ * line splicing/raw strings are explicit uncertainty, not token guesses. */
+static bool tdx_trivia(const char *s, size_t n, size_t *at) {
+    for (;;) {
+        while (*at < n && tdx_space((unsigned char)s[*at]))
+            (*at)++;
+        if (*at + 1 >= n || s[*at] != '/')
+            return true;
+        if (s[*at + 1] == '/') {
+            *at += 2;
+            while (*at < n && s[*at] != '\n') {
+                if (tdx_splice(s, n, *at))
+                    return false;
+                (*at)++;
+            }
+        } else if (s[*at + 1] == '*') {
+            *at += 2;
+            while (*at + 1 < n && !(s[*at] == '*' && s[*at + 1] == '/')) {
+                if (tdx_splice(s, n, *at))
+                    return false;
+                (*at)++;
+            }
+            if (*at + 1 >= n)
+                return false;
+            *at += 2;
+        } else
+            return true;
+    }
+}
+
+static bool tdx_literal(const char *s, size_t n, size_t *at) {
+    char quote = s[*at];
+    if (quote == '"' && *at && s[*at - 1] == 'R')
+        return false;
+    (*at)++;
+    while (*at < n) {
+        char c = s[*at];
+        if (c == quote) {
+            (*at)++;
+            return true;
+        }
+        if (c == '\0' || c == '\n' || c == '\r' || tdx_splice(s, n, *at))
+            return false;
+        if (c == '\\') {
+            if (*at + 1 >= n)
+                return false;
+            *at += 2;
+        } else
+            (*at)++;
+    }
+    return false;
+}
+
+/* The audit skips complete raw strings outside consumed invocations. The
+ * invocation adapter remains deliberately stricter (tdx_literal above). */
+static bool tdx_audit_literal(const char *s, size_t n, size_t *at) {
+    if (s[*at] != '"' || !*at || s[*at - 1] != 'R')
+        return tdx_literal(s, n, at);
+    size_t delimiter = *at + 1, open = delimiter;
+    while (open < n && s[open] != '(') {
+        unsigned char c = (unsigned char)s[open];
+        if (open - delimiter == 16 || c <= ' ' || c == ')' || c == '\\' || c == 127)
+            return false;
+        open++;
+    }
+    if (open == n)
+        return false;
+    size_t length = open - delimiter;
+    for (size_t end = open + 1; end < n; end++) {
+        if (s[end] == ')' && length + 2 <= n - end &&
+            memcmp(s + end + 1, s + delimiter, length) == 0 && s[end + length + 1] == '"') {
+            *at = end + length + 2;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool tdx_argument(CBMExtractCtx *ctx, size_t at, int wanted, size_t *name_at,
+                         size_t *name_length, size_t *after, const TDXRule *rule, uint32_t line) {
+    const char *s = ctx->source;
+    size_t n = (size_t)ctx->source_len;
+    if (!tdx_trivia(s, n, &at) || at >= n || s[at] != '(')
+        return tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, rule->declaration, line);
+    char closing[64] = {')'};
+    size_t depth = 1, begin = ++at, selected_begin = 0, selected_end = 0;
+    int argument = 0;
+    bool selected = false, closed = false;
+    while (at < n && depth) {
+        if (!tdx_trivia(s, n, &at) || at >= n || s[at] == '\0' || tdx_splice(s, n, at))
+            break;
+        if (tdx_pp_number(s, n, &at))
+            continue;
+        char c = s[at];
+        if (c == '"' || c == '\'') {
+            if (!tdx_literal(s, n, &at))
+                break;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            if (depth == sizeof(closing))
+                break;
+            closing[depth++] = c == '(' ? ')' : c == '[' ? ']' : '}';
+        } else if (c == ')' || c == ']' || c == '}') {
+            if (c != closing[depth - 1])
+                break;
+            if (--depth == 0) {
+                if (argument == wanted) {
+                    selected_begin = begin;
+                    selected_end = at;
+                    selected = true;
+                }
+                *after = at + 1;
+                closed = true;
+                break;
+            }
+        } else if (c == ',' && depth == 1) {
+            if (argument == wanted) {
+                selected_begin = begin;
+                selected_end = at;
+                selected = true;
+            }
+            argument++;
+            begin = at + 1;
+        }
+        at++;
+    }
+    if (!closed)
+        return tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, rule->declaration, line);
+    if (!selected)
+        return tdx_issue(ctx->result, CBM_TEST_EXTRACT_MISSING_ARGUMENT, rule->declaration, line);
+    at = selected_begin;
+    if (!tdx_trivia(s, selected_end, &at) || at == selected_end)
+        return tdx_issue(ctx->result, CBM_TEST_EXTRACT_MISSING_ARGUMENT, rule->declaration, line);
+    if (!tdx_ident_first((unsigned char)s[at]))
+        return tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_ARGUMENT, rule->declaration,
+                         line);
+    *name_at = at++;
+    while (at < selected_end && tdx_ident((unsigned char)s[at]))
+        at++;
+    *name_length = at - *name_at;
+    if (!tdx_trivia(s, selected_end, &at) || at != selected_end)
+        return tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_ARGUMENT, rule->declaration,
+                         line);
+    return true;
+}
+
+/* The C grammar represents an unexpanded macro body in two additional
+ * ways: TYPE(identifier) { ... }, or a call statement with a missing semicolon
+ * followed by a sibling compound statement. Keep these candidates local to
+ * configured extraction; they never change the language's function kinds. */
+bool cbm_test_definition_candidate(TSNode scope, CBMLanguage language, TSNode *name, TSNode *body) {
+    *name = (TSNode){0};
+    *body = (TSNode){0};
+    if (ts_node_is_null(scope))
+        return false;
+    const char *kind = ts_node_type(scope);
+    if (language == CBM_LANG_C && strcmp(kind, "compound_statement") == 0) {
+        TSNode previous = ts_node_prev_named_sibling(scope);
+        while (!ts_node_is_null(previous) && strcmp(ts_node_type(previous), "comment") == 0)
+            previous = ts_node_prev_named_sibling(previous);
+        if (ts_node_is_null(previous) || ts_node_named_child_count(previous) != 1)
+            return false;
+        const char *previous_kind = ts_node_type(previous);
+        bool error_wrapper = strcmp(previous_kind, "ERROR") == 0;
+        if (!error_wrapper && strcmp(previous_kind, "expression_statement") != 0)
+            return false;
+        TSNode call = ts_node_named_child(previous, 0);
+        if (strcmp(ts_node_type(call), "call_expression") != 0)
+            return false;
+        /* An empty invocation such as A(){} is an ERROR wrapping exactly the
+         * call. Recover only that byte-exact shape; the argument validator then
+         * reports MISSING_ARGUMENT for A, rather than the audit's generic form
+         * error. Never consume an error region with extra unparsed content. */
+        if (error_wrapper && (ts_node_start_byte(previous) != ts_node_start_byte(call) ||
+                              ts_node_end_byte(previous) != ts_node_end_byte(call)))
+            return false;
+        TSNode callee = ts_node_child_by_field_name(call, TS_FIELD("function"));
+        if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "identifier") != 0)
+            return false;
+        *name = callee;
+        *body = scope;
+        return true;
+    }
+    TSNode inner = unwrap_template_inner(scope, language);
+    *body = ts_node_child_by_field_name(inner, TS_FIELD("body"));
+    if (language == CBM_LANG_C && strcmp(kind, "function_definition") == 0) {
+        TSNode type = ts_node_child_by_field_name(scope, TS_FIELD("type"));
+        TSNode declarator = ts_node_child_by_field_name(scope, TS_FIELD("declarator"));
+        if (!ts_node_is_null(type) && strcmp(ts_node_type(type), "type_identifier") == 0 &&
+            !ts_node_is_null(declarator) &&
+            strcmp(ts_node_type(declarator), "parenthesized_declarator") == 0) {
+            *name = type;
+            return true;
+        }
+    }
+    *name = cbm_resolve_func_name(scope, language);
+    return !ts_node_is_null(*name);
+}
+
+static bool tdx_observe(CBMExtractCtx *ctx, TSNode name_node, TSNode scope_node, const char *qn,
+                        const TDXRule *rule);
+
+static bool tdx_resolve(CBMExtractCtx *ctx, TSNode node, TSNode name_node, const char *macro,
+                        const char **name, TDXRule *rule) {
+    *name = NULL;
+    uint32_t line = ts_node_start_point(name_node).row + 1;
+    if (!tdx_match(ctx, macro, strlen(macro), line, rule))
+        return false;
+    if (ctx->result->test_declarations_status == CBM_TEST_EXTRACT_OOM)
+        return true;
+    if (!tdx_observe(ctx, name_node, node, NULL, rule) || !rule->valid)
+        return true;
+    uint32_t end = ts_node_end_byte(name_node);
+    size_t id_at = 0, id_length = 0, after = 0;
+    if (!ctx->source || ctx->source_len < 0 || end > (uint32_t)ctx->source_len) {
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, rule->declaration, line);
+        return true;
+    }
+    if (!tdx_argument(ctx, end, rule->argument, &id_at, &id_length, &after, rule, line))
+        return true;
+    TSNode candidate_name, body;
+    if (!cbm_test_definition_candidate(node, ctx->language, &candidate_name, &body) ||
+        !ts_node_eq(candidate_name, name_node)) {
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, rule->declaration, line);
+        return true;
+    }
+    if (!tdx_trivia(ctx->source, (size_t)ctx->source_len, &after) ||
+        after >= (size_t)ctx->source_len || ctx->source[after] != '{' || ts_node_is_null(body) ||
+        ts_node_has_error(body) || ts_node_is_missing(body) || ts_node_start_byte(body) != after ||
+        ts_node_end_byte(body) <= after || ts_node_end_byte(body) > (uint32_t)ctx->source_len ||
+        ctx->source[ts_node_end_byte(body) - 1] != '}') {
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, rule->declaration, line);
+        return true;
+    }
+    *name = cbm_arena_sprintf(ctx->arena, "%s_%.*s", macro, (int)id_length, ctx->source + id_at);
+    if (!*name)
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_OOM, rule->declaration, line);
+    return true;
+}
+
+/* NULL qn records a recognized attempt, not a graph definition. A later
+ * successful extraction fills its QN; the audit must not invent a second,
+ * synthetic error for an invocation whose local validation already failed. */
+static bool tdx_observe(CBMExtractCtx *ctx, TSNode name_node, TSNode scope_node, const char *qn,
+                        const TDXRule *rule) {
+    uint32_t line = ts_node_start_point(name_node).row + 1;
+    int count = ctx->test_definition_match_count;
+    for (int i = 0; i < count; i++) {
+        struct CBMTestDefinitionMatch *match = &ctx->test_definition_matches[i];
+        if (ts_node_eq(match->name_node, name_node)) {
+            if (qn)
+                match->qn = qn;
+            return true;
+        }
+    }
+    if (count == ctx->test_definition_match_cap) {
+        int cap = ctx->test_definition_match_cap;
+        if (cap > INT_MAX / 2)
+            return tdx_issue(ctx->result, CBM_TEST_EXTRACT_OOM, rule->declaration, line);
+        int next = cap ? cap * 2 : 16;
+        if ((size_t)next > SIZE_MAX / sizeof(struct CBMTestDefinitionMatch))
+            return tdx_issue(ctx->result, CBM_TEST_EXTRACT_OOM, rule->declaration, line);
+        CBMArena *scratch = ctx->scratch ? ctx->scratch : ctx->arena;
+        struct CBMTestDefinitionMatch *items =
+            cbm_arena_alloc(scratch, (size_t)next * sizeof(*items));
+        if (!items)
+            return tdx_issue(ctx->result, CBM_TEST_EXTRACT_OOM, rule->declaration, line);
+        if (count)
+            memcpy(items, ctx->test_definition_matches, (size_t)count * sizeof(*items));
+        ctx->test_definition_matches = items;
+        ctx->test_definition_match_cap = next;
+    }
+    ctx->test_definition_matches[count] = (struct CBMTestDefinitionMatch){
+        ts_node_start_byte(name_node), name_node, scope_node, line, rule->declaration, qn};
+    ctx->test_definition_match_count++;
+    return true;
+}
+
+const char *cbm_test_definition_qn(CBMExtractCtx *ctx, TSNode function) {
+    if (!ctx->test_declarations_raw_source || ctx->test_definition_match_count == 0 ||
+        ts_node_is_null(function))
+        return NULL;
+    for (int i = 0; i < ctx->test_definition_match_count; i++)
+        if (ts_node_eq(ctx->test_definition_matches[i].scope_node, function))
+            return ctx->test_definition_matches[i].qn;
+    return NULL;
+}
+
+/* Bind the immutable owner rows to these exact raw bytes once per LSP pass.
+ * A local digest is identity evidence only, never artifact authentication. */
+bool cbm_test_definition_owners_match(const CBMFileResult *owners, const char *source,
+                                      int source_len, bool cpp_mode, const char *module_qn) {
+    if (!owners)
+        return true;
+    if (owners->test_declarations_status != CBM_TEST_EXTRACT_OK)
+        return false;
+    if (!owners->has_test_definition_owners)
+        return true;
+    if (!source || source_len < 0 || source_len != owners->test_owner_source_len || !module_qn ||
+        !owners->module_qn || strcmp(module_qn, owners->module_qn) != 0 ||
+        !tdx_source_language(owners->test_owner_language) ||
+        cpp_mode != (owners->test_owner_language != CBM_LANG_C))
+        return false;
+    char digest[65];
+    cbm_sha256_hex(source, (size_t)source_len, digest);
+    return memcmp(digest, owners->test_owner_source_sha256, sizeof(digest)) == 0;
+}
+
+/* The caller has already bound this result to source bytes and RAW origin.
+ * Exact name AND body spans distinguish nodes, including nested definitions;
+ * never infer an owner from a line window or a guessed macro name. */
+const char *cbm_test_definition_owner_qn(const CBMFileResult *owners, TSNode function) {
+    if (!owners || !owners->has_test_definition_owners || ts_node_is_null(function))
+        return NULL;
+    TSNode name, body;
+    if (!cbm_test_definition_candidate(function, owners->test_owner_language, &name, &body) ||
+        ts_node_is_null(body))
+        return NULL;
+    const char *found = NULL;
+    for (int i = 0; i < owners->defs.count; i++) {
+        const CBMDefinition *def = &owners->defs.items[i];
+        if (def->test_role == CBM_TEST_ROLE_NONE ||
+            def->test_name_start_byte != ts_node_start_byte(name) ||
+            def->test_name_end_byte != ts_node_end_byte(name) ||
+            def->test_body_start_byte != ts_node_start_byte(body) ||
+            def->test_body_end_byte != ts_node_end_byte(body))
+            continue;
+        if (found)
+            return NULL; /* duplicate rows are rejected by finish */
+        found = def->qualified_name;
+    }
+    return found;
+}
+
+/* Bound a directive only after complete comments/literals, not at a physical
+ * newline inside a block comment. The audit view already has line splices
+ * removed. This locates its extent; tdx_directive validates consumed content. */
+static bool tdx_directive_end(const char *s, size_t n, size_t *at, uint32_t *line) {
+    while (*at < n) {
+        if (s[*at] == '\0')
+            return false;
+        if (s[*at] == '\n') {
+            (*at)++;
+            (*line)++;
+            return true;
+        }
+        if (*at + 1 < n && s[*at] == '/' && s[*at + 1] == '*') {
+            *at += 2;
+            while (*at + 1 < n && !(s[*at] == '*' && s[*at + 1] == '/')) {
+                if (s[*at] == '\0')
+                    return false;
+                if (s[*at] == '\n')
+                    (*line)++;
+                (*at)++;
+            }
+            if (*at + 1 >= n)
+                return false;
+            *at += 2;
+            continue;
+        }
+        if (*at + 1 < n && s[*at] == '/' && s[*at + 1] == '/') {
+            *at += 2;
+            while (*at < n && s[*at] != '\n') {
+                if (s[*at] == '\0')
+                    return false;
+                (*at)++;
+            }
+            continue;
+        }
+        if (tdx_pp_number(s, n, at))
+            continue;
+        if (s[*at] == '"' || s[*at] == '\'') {
+            size_t before = *at;
+            if (!tdx_audit_literal(s, n, at)) {
+                /* Let the consumed-directive parser report malformed literal
+                 * content. Do not reinterpret its comment punctuation here. */
+                *at = before + 1;
+                while (*at < n && s[*at] != '\n') {
+                    if (s[*at] == '\0')
+                        return false;
+                    (*at)++;
+                }
+            }
+            for (size_t i = before; i < *at; i++)
+                if (s[i] == '\n')
+                    (*line)++;
+            continue;
+        }
+        (*at)++;
+    }
+    return true;
+}
+
+/* A replacement list referring to a configured definition is not a raw test
+ * declaration. Surface it as unsupported instead of certifying only the
+ * handwritten subset. The macro being defined is deliberately skipped. */
+static void tdx_directive(CBMExtractCtx *ctx, size_t begin, size_t end, uint32_t line) {
+    const char *s = ctx->source + begin;
+    end -= begin;
+    /* Joining physical directive lines only detects opaque generated tests;
+     * the joined bytes never become declaration or graph source evidence. */
+    bool spliced = false;
+    for (size_t i = 0; i < end; i++)
+        if (tdx_splice(s, end, i)) {
+            spliced = true;
+            break;
+        }
+    if (spliced) {
+        CBMArena *scratch = ctx->scratch ? ctx->scratch : ctx->arena;
+        char *joined = cbm_arena_alloc(scratch, end + 1);
+        if (!joined) {
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_OOM, -1, line);
+            return;
+        }
+        size_t used = 0;
+        for (size_t i = 0; i < end;) {
+            if (tdx_splice(s, end, i))
+                i += s[i + 1] == '\r' ? 3 : 2;
+            else
+                joined[used++] = s[i++];
+        }
+        joined[used] = '\0';
+        s = joined;
+        end = used;
+    }
+    size_t at = 1;
+    if (!tdx_trivia(s, end, &at)) {
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, -1, line);
+        return;
+    }
+    size_t word = at;
+    while (at < end && tdx_ident((unsigned char)s[at]))
+        at++;
+    if (!tdx_equal("define", s + word, at - word))
+        return;
+    if (!tdx_trivia(s, end, &at) || at == end || !tdx_ident_first((unsigned char)s[at])) {
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, -1, line);
+        return;
+    }
+    while (at < end && tdx_ident((unsigned char)s[at]))
+        at++;
+    /* A function-like macro's formal parameters are not its replacement. */
+    if (at < end && s[at] == '(') {
+        while (at < end && s[at] != ')')
+            at++;
+        if (at == end) {
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, -1, line);
+            return;
+        }
+        at++;
+    }
+    while (at < end) {
+        if (tdx_splice(s, end, at)) {
+            at += s[at + 1] == '\r' ? 3 : 2;
+            continue;
+        }
+        if (!tdx_trivia(s, end, &at)) {
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, -1, line);
+            return;
+        }
+        if (at == end)
+            return;
+        if (tdx_pp_number(s, end, &at))
+            continue;
+        if (s[at] == '"' || s[at] == '\'') {
+            if (!tdx_audit_literal(s, end, &at)) {
+                tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, -1, line);
+                return;
+            }
+            continue;
+        }
+        if (!tdx_ident_first((unsigned char)s[at])) {
+            at++;
+            continue;
+        }
+        word = at++;
+        while (at < end && tdx_ident((unsigned char)s[at]))
+            at++;
+        TDXRule rule;
+        if (tdx_match(ctx, s + word, at - word, line, &rule))
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, rule.declaration, line);
+    }
+}
+
+void cbm_test_declarations_finish(CBMExtractCtx *ctx) {
+    if (!ctx->test_declarations || !ctx->test_declarations_raw_source ||
+        ctx->result->test_declarations_status == CBM_TEST_EXTRACT_OOM)
+        return;
+    int language = tdx_source_language(ctx->language), count = 0;
+    if (!language)
+        return;
+    const cbm_test_declaration_t *items =
+        cbm_test_declarations_items(ctx->test_declarations, &count);
+    bool active = language == 1 && tdx_preset(ctx, CBM_TEST_PRESET_C_CBM);
+    for (int i = 0; i < count && !active; i++)
+        active = (items[i].role == CBM_TEST_DECL_CASE || items[i].role == CBM_TEST_DECL_SUITE) &&
+                 tdx_language(items[i].language) == language;
+    if (!active)
+        return;
+    /* Detect configured invocations dropped by a grammar/error region. Never
+     * invent definitions here; an unmatched raw invocation is uncertainty.
+     * Normalize line splices for AUDIT ONLY, so a split macro cannot disappear.
+     * If that view contains a consumed invocation, decline the file; do not
+     * use normalized offsets as raw graph/owner evidence. A complete audit of
+     * unrelated code succeeds; an incomplete applicable audit is uncertainty
+     * even if no configured invocation was reached before it stopped. */
+    const char *s = ctx->source;
+    size_t n = ctx->source_len > 0 ? (size_t)ctx->source_len : 0, at = 0;
+    uint32_t splice_line = 0, physical_line = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (!splice_line && tdx_splice(s, n, i))
+            splice_line = physical_line;
+        if (s[i] == '\n')
+            physical_line++;
+    }
+    if (splice_line) {
+        CBMArena *scratch = ctx->scratch ? ctx->scratch : ctx->arena;
+        char *joined = cbm_arena_alloc(scratch, n + 1);
+        if (!joined) {
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_OOM, -1, splice_line);
+            return;
+        }
+        size_t used = 0;
+        for (size_t i = 0; i < n;) {
+            if (tdx_splice(s, n, i))
+                i += s[i + 1] == '\r' ? 3 : 2;
+            else
+                joined[used++] = s[i++];
+        }
+        joined[used] = '\0';
+        s = joined;
+        n = used;
+    }
+    CBMExtractCtx audit = *ctx;
+    audit.source = s;
+    audit.source_len = (int)n;
+    uint32_t line = 1, uncertain_line = 0;
+    bool line_start = true;
+    while (at < n) {
+        size_t before = at;
+        if (!tdx_trivia(s, n, &at)) {
+            uncertain_line = line;
+            break;
+        }
+        for (size_t i = before; i < at; i++)
+            if (s[i] == '\n') {
+                line++;
+                line_start = true;
+            }
+        if (at == n)
+            break;
+        if (s[at] == '\0') {
+            uncertain_line = line;
+            break;
+        }
+        if (line_start && s[at] == '#') {
+            size_t directive_begin = at;
+            uint32_t directive_line = splice_line ? splice_line : line;
+            if (!tdx_directive_end(s, n, &at, &line)) {
+                uncertain_line = directive_line;
+                break;
+            }
+            tdx_directive(&audit, directive_begin, at, directive_line);
+            line_start = true;
+            continue;
+        }
+        line_start = false;
+        if (tdx_pp_number(s, n, &at))
+            continue;
+        if (s[at] == '"' || s[at] == '\'') {
+            before = at;
+            if (!tdx_audit_literal(s, n, &at)) {
+                uncertain_line = line;
+                break;
+            }
+            for (size_t i = before; i < at; i++)
+                if (s[i] == '\n')
+                    line++;
+            continue;
+        }
+        if (!tdx_ident_first((unsigned char)s[at])) {
+            at++;
+            continue;
+        }
+        size_t begin = at++;
+        while (at < n && tdx_ident((unsigned char)s[at]))
+            at++;
+        size_t after = at;
+        if (!tdx_trivia(s, n, &after)) {
+            uncertain_line = line;
+            break;
+        }
+        if (after == n || s[after] != '(')
+            continue;
+        TDXRule rule;
+        uint32_t issue_line = splice_line ? splice_line : line;
+        if (!tdx_match(ctx, s + begin, at - begin, issue_line, &rule))
+            continue;
+        bool found = false;
+        if (!splice_line) {
+            for (int i = 0; i < ctx->test_definition_match_count; i++)
+                if (ctx->test_definition_matches[i].name_byte == begin) {
+                    found = true;
+                    break;
+                }
+        }
+        if (!found)
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, rule.declaration, issue_line);
+    }
+    if (uncertain_line)
+        tdx_issue(ctx->result, CBM_TEST_EXTRACT_UNSUPPORTED_FORM, -1,
+                  splice_line ? splice_line : uncertain_line);
+    /* A configured QN collision is explicit rather than a later upsert loss. */
+    for (int i = 0; i < ctx->test_definition_match_count; i++) {
+        const struct CBMTestDefinitionMatch *match = &ctx->test_definition_matches[i];
+        if (!match->qn)
+            continue; /* failed invocation; diagnostic already retained */
+        int found = 0;
+        for (int j = 0; j < ctx->result->defs.count; j++) {
+            const char *qn = ctx->result->defs.items[j].qualified_name;
+            if (qn && strcmp(qn, match->qn) == 0)
+                found++;
+        }
+        if (found != 1)
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_AMBIGUOUS, match->declaration, match->line);
+    }
+    if (ctx->test_definition_match_count &&
+        ctx->result->test_declarations_status == CBM_TEST_EXTRACT_OK) {
+        ctx->result->has_test_definition_owners = true;
+        ctx->result->test_owner_source_len = ctx->source_len;
+        ctx->result->test_owner_language = ctx->language;
+        cbm_sha256_hex(ctx->source, (size_t)ctx->source_len, ctx->result->test_owner_source_sha256);
+    }
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
     TSNode name_node = cbm_resolve_func_name(node, ctx->language);
+    if (ctx->language == CBM_LANG_C && ctx->test_declarations &&
+        ctx->test_declarations_raw_source) {
+        TSNode candidate_name, candidate_body;
+        if (cbm_test_definition_candidate(node, ctx->language, &candidate_name, &candidate_body)) {
+            uint32_t begin = ts_node_start_byte(candidate_name);
+            uint32_t end = ts_node_end_byte(candidate_name);
+            TDXRule rule;
+            if (end > begin && end <= (uint32_t)ctx->source_len &&
+                tdx_match(ctx, ctx->source + begin, end - begin,
+                          ts_node_start_point(candidate_name).row + 1, &rule))
+                name_node = candidate_name;
+        }
+    }
     if (ts_node_is_null(name_node)) {
         return;
     }
@@ -5310,7 +6175,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * Multiple test cases per file collide on qualified name; derive a unique
      * name from the macro arguments so each gets its own graph node (#1266). */
     bool is_gtest = false;
-    if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
+    const char *configured_name = NULL;
+    TDXRule configured_rule;
+    bool configured = tdx_resolve(ctx, node, name_node, name, &configured_name, &configured_rule);
+    if (configured) {
+        if (!configured_name)
+            return;
+        name = (char *)configured_name;
+    }
+    if (!configured && tdx_preset(ctx, CBM_TEST_PRESET_GTEST) &&
+        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
         is_cpp_test_macro(name)) {
         char *gtest_name = resolve_cpp_test_macro_name(a, name, node, ctx->source);
         if (gtest_name) {
@@ -5333,6 +6207,15 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     memset(&def, 0, sizeof(def));
 
     def.name = name;
+    def.test_role = configured ? configured_rule.role : CBM_TEST_ROLE_NONE;
+    if (configured) {
+        TSNode candidate_name, body;
+        (void)cbm_test_definition_candidate(node, ctx->language, &candidate_name, &body);
+        def.test_name_start_byte = ts_node_start_byte(name_node);
+        def.test_name_end_byte = ts_node_end_byte(name_node);
+        def.test_body_start_byte = ts_node_start_byte(body);
+        def.test_body_end_byte = ts_node_end_byte(body);
+    }
     /* Nix: a binding's name is a path. The leaf is the name; the leading segments
      * are scope, so `a.b.fn = …` gets the same QN as `a = { b = { fn = …; }; }`.
      * Without this every binding whose path shares a leaf name collapsed onto one
@@ -5346,6 +6229,14 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
     def.qualified_name =
         cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name, ctx->language);
+    /* C-family platform variants (foo_win.c / foo_posix.c, src/unix/ vs
+     * src/win/): an external-linkage file-scope function takes its
+     * platform-neutral QN, so its variants are one definition. The call-scope
+     * twin in extract_unified.c applies the same rule. */
+    if (!ctx->enclosing_class_qn) {
+        def.qualified_name = cbm_platform_variant_qn(a, ctx->language, ctx->project, ctx->rel_path,
+                                                     qn_name, def.qualified_name, node);
+    }
     /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
      * the namespace scope the def walk carries (enclosing_class_qn was extended
      * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
@@ -5370,7 +6261,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
     def.label = "Function";
     def.file_path = ctx->rel_path;
-    def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    def.start_line =
+        ts_node_start_point(configured && ctx->language == CBM_LANG_C ? name_node : node).row +
+        TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
@@ -5380,7 +6273,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     }
 
     // Parameters — use func_node (inner function for templates)
-    TSNode params = find_function_params(func_node, ctx->language);
+    TSNode params = configured && ctx->language == CBM_LANG_C
+                        ? (TSNode){0}
+                        : find_function_params(func_node, ctx->language);
     if (!ts_node_is_null(params)) {
         def.signature = cbm_node_text(a, params, ctx->source);
         def.param_names = extract_param_names(a, params, ctx->source, ctx->language);
@@ -5391,7 +6286,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // Return type — use func_node (inner function for templates)
     static const char *rt_fields[] = {"result", "return_type", "type", NULL};
-    for (const char **f = rt_fields; *f; f++) {
+    for (const char **f = rt_fields; *f && !(configured && ctx->language == CBM_LANG_C); f++) {
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
             def.return_type = c_declared_return_type(ctx, func_node, rt);
@@ -5466,15 +6361,18 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
 
-    // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
-    // predicate into the QN so both branches survive the graph upsert (#495).
+    // Rust: cfg-gated twins (#[cfg(windows)] fn f / #[cfg(not(windows))] fn f)
+    // keep the plain QN: they are variants of ONE definition, and the graph
+    // keeps every twin's span and the union of their bodies' calls on one node
+    // (graph_buffer.c, "Definition variants"). #495's lost branch is a variant
+    // now; the old per-twin `f#cfg(...)` QNs left the bodies' calls without a
+    // source node (calls are scoped to the plain QN).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
         def.is_test = rust_def_is_test(def.decorators);
     }
 
     // C++/CUDA: GoogleTest macros are test functions (#1266).
-    if (is_gtest) {
+    if (is_gtest || def.test_role == CBM_TEST_ROLE_CASE) {
         def.is_test = true;
     }
 
@@ -5510,6 +6408,15 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_entry_point = true;
     }
 
+    if (configured) {
+        if (!def.qualified_name) {
+            tdx_issue(ctx->result, CBM_TEST_EXTRACT_OOM, configured_rule.declaration,
+                      ts_node_start_point(name_node).row + 1);
+            return;
+        }
+        if (!tdx_observe(ctx, name_node, node, def.qualified_name, &configured_rule))
+            return;
+    }
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
@@ -6372,6 +7279,27 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             }
             break;
         }
+        case CBM_LANG_C:
+        case CBM_LANG_CPP: { // `typedef struct { … } Name;`: the aggregate is
+                             // anonymous and the typedef's declarator names it.
+                             // A pointer/array/function declarator names another
+                             // type, not the aggregate, so only a plain
+                             // type_identifier counts.
+            if (strcmp(kind, "struct_specifier") != 0 && strcmp(kind, "union_specifier") != 0 &&
+                strcmp(kind, "enum_specifier") != 0) {
+                break;
+            }
+            TSNode parent = ts_node_parent(node);
+            if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "type_definition") != 0) {
+                break;
+            }
+            TSNode declarator = ts_node_child_by_field_name(parent, TS_FIELD("declarator"));
+            if (!ts_node_is_null(declarator) &&
+                strcmp(ts_node_type(declarator), "type_identifier") == 0) {
+                name_node = declarator;
+            }
+            break;
+        }
         default:
             break;
         }
@@ -6871,20 +7799,94 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 }
 
 // Extract methods from an ObjC implementation_definition node.
-static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, const char *class_qn,
-                                      const CBMLangSpec *spec) {
-    uint32_t nc = ts_node_child_count(impl_node);
-    for (uint32_t j = 0; j < nc; j++) {
-        TSNode inner = ts_node_child(impl_node, j);
-        if (ts_node_is_null(inner)) {
+/* Members of a class body, flattened through conditional blocks: a method,
+ * field or variable inside #if/#ifdef/#else/#elif (cbm_conditional_block_types:
+ * C, C++, CUDA, Objective-C, C#, ...) is still a member of its class, and its
+ * #else twin is a variant of the same member (graph_buffer.c, "Definition
+ * variants"). One tree cursor: linear in the body's width, no recursion. */
+enum { MEMBER_CONDITIONAL_DEPTH_MAX = 16 };
+
+typedef struct {
+    TSTreeCursor cursor;
+    const char **conditional;
+    int depth; /* conditional blocks entered below the body */
+    bool started;
+    bool named;
+} member_iter_t;
+
+static void member_iter_init(member_iter_t *it, TSNode body, CBMLanguage lang, bool named) {
+    it->cursor = ts_tree_cursor_new(body);
+    it->conditional = cbm_conditional_block_types(lang);
+    it->depth = 0;
+    it->started = false;
+    it->named = named;
+}
+
+static void member_iter_done(member_iter_t *it) {
+    ts_tree_cursor_delete(&it->cursor);
+}
+
+static bool member_iter_advance(member_iter_t *it) {
+    if (!it->started) {
+        it->started = true;
+        return ts_tree_cursor_goto_first_child(&it->cursor);
+    }
+    while (!ts_tree_cursor_goto_next_sibling(&it->cursor)) {
+        if (it->depth == 0) {
+            return false;
+        }
+        ts_tree_cursor_goto_parent(&it->cursor);
+        it->depth--;
+    }
+    return true;
+}
+
+static bool member_iter_next(member_iter_t *it, TSNode *out) {
+    for (bool have = member_iter_advance(it); have; have = member_iter_advance(it)) {
+        TSNode node = ts_tree_cursor_current_node(&it->cursor);
+        while (it->conditional && it->depth < MEMBER_CONDITIONAL_DEPTH_MAX &&
+               cbm_kind_in_set(node, it->conditional) &&
+               ts_tree_cursor_goto_first_child(&it->cursor)) {
+            it->depth++;
+            node = ts_tree_cursor_current_node(&it->cursor);
+        }
+        if (it->conditional && cbm_kind_in_set(node, it->conditional)) {
+            continue; /* an empty (or too deeply nested) block holds no member */
+        }
+        if (it->named && !ts_node_is_named(node)) {
             continue;
         }
-        if (cbm_kind_in_set(inner, spec->function_node_types)) {
-            TSNode nm = resolve_method_name(inner, ctx->language);
-            if (!ts_node_is_null(nm)) {
-                push_method_def(ctx, inner, impl_node, class_qn, spec, nm);
+        *out = node;
+        return true;
+    }
+    return false;
+}
+
+/* Objective-C wraps every @implementation member in an implementation_definition,
+ * and a #if/#else block inside @implementation wraps each branch's members in
+ * another one: walk those nested wrappers too (worklist, no recursion). */
+static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, const char *class_qn,
+                                      const CBMLangSpec *spec) {
+    TSNode pending[MEMBER_CONDITIONAL_DEPTH_MAX];
+    int count = 0;
+    pending[count++] = impl_node;
+    while (count > 0) {
+        TSNode cur = pending[--count];
+        member_iter_t it;
+        member_iter_init(&it, cur, ctx->language, false);
+        TSNode inner;
+        while (member_iter_next(&it, &inner)) {
+            if (cbm_kind_in_set(inner, spec->function_node_types)) {
+                TSNode nm = resolve_method_name(inner, ctx->language);
+                if (!ts_node_is_null(nm)) {
+                    push_method_def(ctx, inner, impl_node, class_qn, spec, nm);
+                }
+            } else if (count < MEMBER_CONDITIONAL_DEPTH_MAX &&
+                       strcmp(ts_node_type(inner), "implementation_definition") == 0) {
+                pending[count++] = inner;
             }
         }
+        member_iter_done(&it);
     }
 }
 
@@ -6896,12 +7898,10 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
         return;
     }
 
-    uint32_t count = ts_node_child_count(body);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_child(body, i);
-        if (ts_node_is_null(child)) {
-            continue;
-        }
+    member_iter_t it;
+    member_iter_init(&it, body, ctx->language, false);
+    TSNode child;
+    while (member_iter_next(&it, &child)) {
 
         if (ctx->language == CBM_LANG_OBJC &&
             strcmp(ts_node_type(child), "implementation_definition") == 0) {
@@ -6990,6 +7990,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
 
         push_method_def(ctx, method_node, class_node, class_qn, spec, name_node);
     }
+    member_iter_done(&it);
 }
 
 // --- Rust impl block extraction ---
@@ -7204,6 +8205,22 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
         if (strcmp(macro, "def") == 0 || strcmp(macro, "defp") == 0 ||
             strcmp(macro, "defmacro") == 0) {
             extract_elixir_func_def(ctx, cur, macro);
+        } else if (strcmp(macro, "if") == 0 || strcmp(macro, "unless") == 0) {
+            /* A compile-time if/unless in a module body defines functions
+             * under a condition: its do and else branches hold variants of the
+             * same definitions (graph_buffer.c, "Definition variants"). The
+             * grammar nests the else_block inside the do_block. */
+            TSNode branch = cbm_find_child_by_kind(cur, "do_block");
+            for (int pass = 0; pass < 2 && !ts_node_is_null(branch); pass++) {
+                uint32_t bc = ts_node_child_count(branch);
+                for (int bi = (int)bc - SKIP_CHAR; bi >= 0; bi--) {
+                    TSNode bchild = ts_node_child(branch, (uint32_t)bi);
+                    if (!ts_node_is_null(bchild) && strcmp(ts_node_type(bchild), "call") == 0) {
+                        ts_nstack_push(&stack, bchild);
+                    }
+                }
+                branch = cbm_find_child_by_kind(branch, "else_block");
+            }
         } else if (strcmp(macro, "defmodule") == 0) {
             TSNode do_block = emit_elixir_module_class(ctx, cur);
             if (!ts_node_is_null(do_block)) {
@@ -8583,6 +9600,196 @@ static bool is_func_ptr_field(TSNode field) {
     return false;
 }
 
+/* ── C-family member declarations ───────────────────────────────────
+ * `type declarator, declarator;` in a struct/union/class body. Each declarator
+ * is one member: its name is the identifier at the bottom of the declarator,
+ * its type everything around that identifier. */
+
+/* The name of one member declarator, or a null node when the declarator is not
+ * a data member. A member FUNCTION declaration has the same field_declaration
+ * + function_declarator shape as a pointer-to-function member; the two differ
+ * in what the function_declarator wraps: `(*open)` is a parenthesized pointer
+ * declarator, `resize` (or `(resize)`) a name. */
+static TSNode c_member_declarator_name(TSNode decl) {
+    TSNode null_node = {0};
+    bool need_pointer = false;
+    for (int depth = 0; depth < C_FIELD_DECL_WALK_DEPTH && !ts_node_is_null(decl); depth++) {
+        const char *kind = ts_node_type(decl);
+        if (strcmp(kind, "field_identifier") == 0 || strcmp(kind, "identifier") == 0) {
+            return need_pointer ? null_node : decl;
+        }
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        bool first_child = false;
+        if (strcmp(kind, "function_declarator") == 0) {
+            if (ts_node_is_null(inner) ||
+                strcmp(ts_node_type(inner), "parenthesized_declarator") != 0) {
+                return null_node; /* a member function declaration */
+            }
+            need_pointer = true;
+        } else if (strstr(kind, "pointer_declarator") != NULL ||
+                   strcmp(kind, "reference_declarator") == 0) {
+            need_pointer = false;
+        } else if (strcmp(kind, "attributed_declarator") == 0) {
+            first_child = true; /* the declarator, then its attributes */
+        } else if (strcmp(kind, "array_declarator") != 0 &&
+                   strcmp(kind, "parenthesized_declarator") != 0) {
+            return null_node; /* operator, destructor, qualified name, ... */
+        }
+        if (ts_node_is_null(inner)) {
+            /* No `declarator` field: a parenthesized declarator holds it last
+             * (after an optional calling-convention modifier), a reference
+             * declarator as its only named child. */
+            uint32_t named = ts_node_named_child_count(decl);
+            for (uint32_t k = 0; k < named; k++) {
+                TSNode cand = ts_node_named_child(decl, first_child ? k : named - SKIP_ONE - k);
+                if (strcmp(ts_node_type(cand), "comment") != 0) {
+                    inner = cand;
+                    break;
+                }
+            }
+        }
+        decl = inner;
+    }
+    return null_node;
+}
+
+/* Type of one member declarator: the canonical prefix a return type gets from
+ * c_rt_render (cv-qualifiers, base type, pointer/reference markers), then the
+ * declarator that is left with the member name cut out, which is how C spells
+ * an abstract declarator: `int [8]`, `char *[4]`, `void (*)(int fd)`.
+ * Whitespace runs in that remainder collapse to one space; a `|` in it (the
+ * separator of the field list the cross-file registry is fed) drops it. */
+static char *c_member_type_text(CBMExtractCtx *ctx, TSNode field, TSNode type_node, TSNode decl,
+                                TSNode name_node) {
+    CBMArena *a = ctx->arena;
+    const char *src = ctx->source;
+    TSNode rest = decl;
+    c_rt_out_t out = {NULL, 0};
+    (void)c_rt_render(&out, field, type_node, decl, src, &rest);
+    uint32_t rest_start = ts_node_is_null(rest) ? 0 : ts_node_start_byte(rest);
+    uint32_t rest_end = ts_node_is_null(rest) ? 0 : ts_node_end_byte(rest);
+    uint32_t cut_start = ts_node_start_byte(name_node);
+    uint32_t cut_end = ts_node_end_byte(name_node);
+    /* prefix + one separating space + remainder + NUL */
+    char *buf = (char *)cbm_arena_alloc(a, out.len + (size_t)(rest_end - rest_start) + PAIR_LEN);
+    if (!buf) {
+        return cbm_node_text(a, type_node, src);
+    }
+    out.buf = buf;
+    out.len = 0;
+    (void)c_rt_render(&out, field, type_node, decl, src, NULL);
+    size_t prefix_len = out.len;
+    size_t n = prefix_len;
+    bool pending_space = n > 0 && buf[n - SKIP_ONE] != '*' && buf[n - SKIP_ONE] != '&';
+    bool wrote_rest = false;
+    for (uint32_t i = rest_start; i < rest_end; i++) {
+        if (i >= cut_start && i < cut_end) {
+            continue;
+        }
+        char c = src[i];
+        if (c == '|') {
+            n = prefix_len;
+            break;
+        }
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            pending_space = pending_space || wrote_rest;
+            continue;
+        }
+        if (pending_space) {
+            buf[n++] = ' ';
+            pending_space = false;
+        }
+        buf[n++] = c;
+        wrote_rest = true;
+    }
+    buf[n] = '\0';
+    return buf;
+}
+
+/* True when `field` is a C-family member declaration: a type and at least one
+ * declarator. An anonymous struct/union member has no declarator and is left
+ * to the caller. */
+static bool is_c_member_declaration(CBMExtractCtx *ctx, TSNode field) {
+    if (!is_c_declarator_lang(ctx->language) ||
+        strcmp(ts_node_type(field), "field_declaration") != 0) {
+        return false;
+    }
+    return !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("type"))) &&
+           !ts_node_is_null(ts_node_child_by_field_name(field, TS_FIELD("declarator")));
+}
+
+/* A member whose type is a macro invocation (`ql_head(tcache_slow_t)
+ * tcache_ql;`). The C grammar reads the type as a macro_type_specifier; the
+ * C++ grammar, which every header gets, reads `(tcache_slow_t)` as a
+ * parenthesized declarator and leaves the member's real name in an ERROR node
+ * behind it. Returns that name, or a null node for any other shape. */
+static TSNode c_macro_typed_member_name(TSNode decl) {
+    TSNode null_node = {0};
+    if (strcmp(ts_node_type(decl), "parenthesized_declarator") != 0) {
+        return null_node;
+    }
+    TSNode err = ts_node_next_sibling(decl);
+    if (ts_node_is_null(err) || strcmp(ts_node_type(err), "ERROR") != 0 ||
+        ts_node_named_child_count(err) != SKIP_ONE) {
+        return null_node;
+    }
+    TSNode name = ts_node_named_child(err, 0);
+    const char *kind = ts_node_type(name);
+    if (strcmp(kind, "identifier") != 0 && strcmp(kind, "field_identifier") != 0) {
+        return null_node;
+    }
+    return name;
+}
+
+/* One Field per data-member declarator of a C-family member declaration. */
+static void extract_c_member_fields(CBMExtractCtx *ctx, TSNode field, const char *class_qn,
+                                    const CBMLangSpec *spec) {
+    CBMArena *a = ctx->arena;
+    TSNode type_node = ts_node_child_by_field_name(field, TS_FIELD("type"));
+    uint32_t nc = ts_node_child_count(field);
+    for (uint32_t i = 0; i < nc; i++) {
+        const char *field_name = ts_node_field_name_for_child(field, i);
+        if (!field_name || strcmp(field_name, "declarator") != 0) {
+            continue;
+        }
+        TSNode decl = ts_node_child(field, i);
+        char *name = NULL;
+        char *type_text = NULL;
+        TSNode macro_name = c_macro_typed_member_name(decl);
+        if (!ts_node_is_null(macro_name)) {
+            /* The type is the macro invocation: the `type` node through the
+             * misread declarator. */
+            uint32_t start = ts_node_start_byte(type_node);
+            uint32_t end = ts_node_end_byte(decl);
+            name = cbm_node_text(a, macro_name, ctx->source);
+            type_text = end > start ? cbm_arena_strndup(a, ctx->source + start, end - start) : NULL;
+        } else {
+            TSNode name_node = c_member_declarator_name(decl);
+            if (ts_node_is_null(name_node)) {
+                continue;
+            }
+            name = cbm_node_text(a, name_node, ctx->source);
+            type_text = c_member_type_text(ctx, field, type_node, decl, name_node);
+        }
+        if (!name || !name[0] || !type_text || !type_text[0]) {
+            continue;
+        }
+        CBMDefinition def;
+        memset(&def, 0, sizeof(def));
+        def.name = name;
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+        def.label = "Field";
+        def.file_path = ctx->rel_path;
+        def.parent_class = class_qn;
+        def.return_type = type_text;
+        def.start_line = ts_node_start_point(field).row + TS_LINE_OFFSET;
+        def.end_line = ts_node_end_point(field).row + TS_LINE_OFFSET;
+        def.is_exported = cbm_is_exported(name, ctx->language);
+        def.decorators = extract_decorators(a, field, ctx->source, ctx->language, spec);
+        cbm_defs_push(&ctx->result->defs, a, def);
+    }
+}
+
 // Resolve the name node for a field declaration, unwrapping C pointer/array declarators.
 static TSNode resolve_field_name_node(TSNode child) {
     TSNode name_node = ts_node_child_by_field_name(child, TS_FIELD("declarator"));
@@ -8672,10 +9879,10 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
     }
 
     CBMArena *a = ctx->arena;
-    uint32_t count = ts_node_named_child_count(body);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(body, i);
-
+    member_iter_t it;
+    member_iter_init(&it, body, ctx->language, true);
+    TSNode child;
+    while (member_iter_next(&it, &child)) {
         // ObjectScript UDL wraps each member in a class_statement node.
         if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL &&
             strcmp(ts_node_type(child), "class_statement") == 0 &&
@@ -8684,6 +9891,11 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         }
 
         if (!cbm_kind_in_set(child, spec->field_node_types)) {
+            continue;
+        }
+
+        if (is_c_member_declaration(ctx, child)) {
+            extract_c_member_fields(ctx, child, class_qn, spec);
             continue;
         }
 
@@ -8984,6 +10196,7 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
 
         cbm_defs_push(&ctx->result->defs, a, def);
     }
+    member_iter_done(&it);
 }
 
 // Extract class-level variables (field declarations inside class bodies)
@@ -9002,13 +10215,15 @@ static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const
      * push_var_def_qn); saved/restored so module-level minting stays bare. */
     const char *saved_parent = ctx->var_parent_class;
     ctx->var_parent_class = class_qn;
-    uint32_t count = ts_node_named_child_count(body);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode child = ts_node_named_child(body, i);
+    member_iter_t it;
+    member_iter_init(&it, body, ctx->language, true);
+    TSNode child;
+    while (member_iter_next(&it, &child)) {
         if (cbm_kind_in_set(child, spec->variable_node_types)) {
             extract_var_names(ctx, child, spec);
         }
     }
+    member_iter_done(&it);
     ctx->var_parent_class = saved_parent;
 }
 
@@ -9168,8 +10383,10 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
                 wd_push(s, child, enclosing_qn);
             } else {
                 const char *ck = ts_node_type(child);
+                /* A nested class inside #if/#else is still nested here. */
                 if (strcmp(ck, "field_declaration") == 0 ||
-                    strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0) {
+                    strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0 ||
+                    cbm_kind_in_set(child, cbm_conditional_block_types(spec->language))) {
                     ts_nstack_push(&nc_stack, child);
                 }
             }
@@ -9870,6 +11087,14 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             continue;
         }
 
+        /* A split C invocation's body is its scope node. Candidate matching
+         * and raw argument/body validation remain inside extract_func_def. */
+        bool split_c_candidate = ctx->language == CBM_LANG_C && ctx->test_declarations &&
+                                 ctx->test_declarations_raw_source &&
+                                 strcmp(kind, "compound_statement") == 0;
+        if (split_c_candidate) {
+            extract_func_def(ctx, node, spec);
+        }
         if (cbm_kind_in_set(node, spec->function_node_types)) {
             if (!is_template_class_node(node, ctx->language)) {
                 extract_func_def(ctx, node, spec);
@@ -9888,6 +11113,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 // lambdas (`f = a: b: ...`) resolve no name and mint nothing, so the
                 // extra descent adds defs without adding noise.
                 bool descend_into_func =
+                    (ctx->language == CBM_LANG_C && cbm_test_definition_qn(ctx, node) != NULL) ||
                     (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX ||
                      ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_ADA ||
