@@ -6937,6 +6937,7 @@ TEST(tool_trace_budget_never_slices_identifiers) {
                                          .recorded_at = "2026-09-24T00:00:00Z",
                                          .recording_status = "complete",
                                          .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                         .unresolved_calls_complete = true,
                                          .hash_records_complete = true};
     ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &coverage_meta), CBM_STORE_OK);
 
@@ -7289,6 +7290,7 @@ TEST(tool_trace_reports_engine_saturation_as_lower_bound) {
                                          .recorded_at = "2026-09-24T00:00:00Z",
                                          .recording_status = "complete",
                                          .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                         .unresolved_calls_complete = true,
                                          .hash_records_complete = true};
     ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &coverage_meta), CBM_STORE_OK);
     cbm_node_t hub = {.project = project,
@@ -7781,6 +7783,99 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     PASS();
 }
 
+/* Unrelated file evidence must not poison a clean caller's exact outbound
+ * count. Inbound checks use their materialized candidate index, so corrupting
+ * an unrelated JSON payload after publication must not trigger a full scan. */
+TEST(tool_trace_path_reads_only_relevant_unresolved_evidence) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "bounded-trace";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bounded-trace"), CBM_STORE_OK);
+    cbm_node_t root = {.project = project,
+                       .label = "Function",
+                       .name = "run",
+                       .qualified_name = "bounded-trace.run",
+                       .file_path = "clean.js",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(store, &root), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "unrelated.js", "fixture", 0, 0),
+              CBM_STORE_OK);
+    cbm_coverage_row_t row = {.rel_path = "unrelated.js",
+                              .kind = "unresolved_calls",
+                              .detail = "[{\"caller\":\"bounded-trace.other\",\"leaf\":\"other\","
+                                        "\"candidate\":\"bounded-trace.other\"}]"};
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
+                                .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, &row, 1, &meta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "UPDATE index_coverage SET detail='broken json' "
+                                    "WHERE project='bounded-trace';"),
+              CBM_STORE_OK);
+    const char *directions[] = {"outbound", "inbound"};
+    const char *fields[] = {"callees_total_relation", "callers_total_relation"};
+    for (int i = 0; i < 2; i++) {
+        char args[256], expected[80];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"run\","
+                 "\"direction\":\"%s\",\"format\":\"json\"}",
+                 project, directions[i]);
+        char *out = cbm_mcp_handle_tool(srv, "trace_path", args);
+        ASSERT_NOT_NULL(out);
+        snprintf(expected, sizeof(expected), "\"%s\":\"eq\"", fields[i]);
+        ASSERT(response_contains_json_fragment(out, expected));
+        free(out);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_truncated_evidence_is_conservative) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "truncated-trace";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/truncated-trace"), CBM_STORE_OK);
+    cbm_node_t root = {.project = project, .label = "Function", .name = "run",
+                      .qualified_name = "truncated-trace.run", .file_path = "clean.js",
+                      .start_line = 1, .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(store, &root), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "unrelated.js", "fixture", 0, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "clean.js", "fixture", 0, 0), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = "fixture", .index_mode = "full",
+        .recording_status = "complete", .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+        .unresolved_calls_complete = true, .hash_records_complete = true};
+    const char *details[] = {"[{\"truncated\":true}]", "[null]", "broken json"};
+    const char *directions[] = {"outbound", "inbound"};
+    const char *fields[] = {"callees_total_relation", "callers_total_relation"};
+    for (size_t detail = 0; detail < sizeof(details) / sizeof(details[0]); detail++) {
+        for (int relevant = 0; relevant < 2; relevant++) {
+            cbm_coverage_row_t row = {.rel_path = relevant ? "clean.js" : "unrelated.js",
+                                     .kind = "unresolved_calls", .detail = details[detail]};
+            ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, &row, 1, &meta), CBM_STORE_OK);
+            for (int direction = 0; direction < 2; direction++) {
+                char args[256], expected[80];
+                snprintf(args, sizeof(args), "{\"project\":\"%s\",\"function_name\":\"run\","
+                                             "\"direction\":\"%s\",\"format\":\"json\"}", project, directions[direction]);
+                char *out = cbm_mcp_handle_tool(srv, "trace_path", args);
+                ASSERT_NOT_NULL(out);
+                snprintf(expected, sizeof(expected), "\"%s\":\"%s\"", fields[direction],
+                         relevant || direction == 1 ? "unknown" : "eq");
+                ASSERT(response_contains_json_fragment(out, expected));
+                free(out);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -7825,6 +7920,7 @@ TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
                                 .recorded_at = "2026-09-24T00:00:00Z",
                                 .recording_status = "complete",
                                 .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
                                 .hash_records_complete = true};
     ASSERT_EQ(cbm_store_coverage_replace_ex(st, proj, &row, 1, &meta), CBM_STORE_OK);
 
@@ -7931,6 +8027,7 @@ TEST(tool_trace_path_outbound_requires_project_symbol) {
                                 .recorded_at = "2026-09-29T00:00:00Z",
                                 .recording_status = "complete",
                                 .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
                                 .hash_records_complete = true};
     const struct {
         const char *leaf;
@@ -23282,7 +23379,44 @@ TEST(search_code_rejects_quote_in_file_pattern) {
     PASS();
 }
 
+TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "coverage-priority";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/coverage-priority"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "mixed.js", "fixture", 0, 0),
+              CBM_STORE_OK);
+    const char *kinds[] = {"parse_partial", "parse_unusable", "oversized", "not_indexed_file"};
+    const char *statuses[] = {"partial", "unusable", "skipped", "excluded"};
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        cbm_coverage_row_t rows[] = {
+            {.rel_path = "mixed.js", .kind = "unresolved_calls", .detail = "[]"},
+            {.rel_path = "mixed.js", .kind = kinds[i], .detail = "1-2"},
+        };
+        ASSERT_EQ(cbm_store_coverage_replace(store, project, rows, 2), CBM_STORE_OK);
+        char *response = cbm_mcp_handle_tool(
+            srv, "check_index_coverage",
+            "{\"project\":\"coverage-priority\",\"paths\":[\"mixed.js\"],\"format\":\"json\"}");
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *path = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "paths"), 0);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "status")), statuses[i]);
+        ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(path, "coverage")), 2);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls);
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
     RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
@@ -23474,6 +23608,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
+    RUN_TEST(tool_trace_path_reads_only_relevant_unresolved_evidence);
+    RUN_TEST(tool_trace_path_truncated_evidence_is_conservative);
     RUN_TEST(tool_trace_path_marks_unresolved_call_totals_unknown);
     RUN_TEST(tool_trace_path_outbound_requires_project_symbol);
     RUN_TEST(tool_index_unresolved_nested_functions_are_indexed);

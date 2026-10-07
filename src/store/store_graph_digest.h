@@ -33,7 +33,8 @@ typedef struct {
 } cbm_store_graph_digest_t;
 
 /* Borrow a live, exclusive D5 scope. Hash the version-1 canonical stream of
- * all nine known tables, including their exact CREATE SQL and explicit project
+ * the nine legacy tables and the unresolved candidate index when present,
+ * including their exact CREATE SQL and explicit project
  * identity. The database must use UTF-8. No new handler or transaction is used.
  * Independent scopes/connections may run concurrently; no mutable state is
  * shared. The callback/connection restrictions of D5 continue to apply.

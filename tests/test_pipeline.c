@@ -857,6 +857,65 @@ static int pipeline_unresolved_review_case(int padding, bool spill) {
     PASS();
 }
 
+/* A noisy semantic resolver must retain an explicit bounded-coverage marker,
+ * including when a single reason would exceed the entire detail budget. */
+TEST(pipeline_unresolved_capture_bounds_count_and_json_bytes) {
+    char tmp[256] = "/tmp/cbm_unresolved_cap_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db[512];
+    snprintf(db, sizeof(db), "%s/index.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    CBMResolvedCall *sites = calloc(1001, sizeof(*sites));
+    ASSERT_NOT_NULL(sites);
+    for (int i = 0; i < 1001; i++) {
+        sites[i] = (CBMResolvedCall){.kind = CBM_RESOLVED_INVOCATION,
+                                     .caller_qn = "cap.run",
+                                     .callee_qn = "missing",
+                                     .strategy = "lsp_unresolved",
+                                     .site_start_byte = (uint32_t)i * 2,
+                                     .site_end_byte = (uint32_t)i * 2 + 1};
+    }
+    CBMFileResult result = {.resolved_calls = {.items = sites, .count = 1001}};
+    cbm_pipeline_record_unresolved_calls(p, "many.js", &result, NULL);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    bool complete = false;
+    cbm_pipeline_get_unresolved_calls(p, &rows, &count, &complete);
+    ASSERT_TRUE(complete);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strlen(rows[0].detail) <= 128 * 1024);
+    yyjson_doc *doc = yyjson_read(rows[0].detail, strlen(rows[0].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *array = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_arr_size(array) <= 1001);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(yyjson_arr_get_last(array), "truncated")));
+    yyjson_doc_free(doc);
+
+    char *reason = malloc(200000);
+    ASSERT_NOT_NULL(reason);
+    memset(reason, '"', 199999);
+    reason[199999] = '\0';
+    sites[0].reason = reason;
+    result.resolved_calls.count = 1;
+    cbm_pipeline_record_unresolved_calls(p, "huge.js", &result, NULL);
+    cbm_pipeline_get_unresolved_calls(p, &rows, &count, &complete);
+    ASSERT_TRUE(complete);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(strlen(rows[1].detail) <= 128 * 1024);
+    doc = yyjson_read(rows[1].detail, strlen(rows[1].detail), 0);
+    ASSERT_NOT_NULL(doc);
+    array = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_arr_size(array), 1);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(yyjson_arr_get_last(array), "truncated")));
+    yyjson_doc_free(doc);
+    free(reason);
+    free(sites);
+    cbm_pipeline_free(p);
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_unresolved_review_sequential) {
     return pipeline_unresolved_review_case(0, false);
 }
@@ -5248,6 +5307,81 @@ TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation
     ASSERT_EQ(retry_extracted_usage, 0);
     ASSERT_EQ(retry_extracted_calls, 0);
     ASSERT_EQ(retry_stage_count, 0);
+    PASS();
+}
+
+static void fail_unresolved_capture_before_publication(void *userdata) {
+    cbm_pipeline_mark_unresolved_capture_failed(userdata);
+    cbm_pipeline_add_file_error(userdata, "generation.py", "1-1", "parse_partial");
+}
+
+TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds) {
+    char tmp[256] = "/tmp/cbm_capture_metadata_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def GeneralCoverage():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(first);
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        fail_unresolved_capture_before_publication, first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
+    cbm_pipeline_free(first);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.recording_status, "complete");
+    ASSERT_FALSE(meta.unresolved_calls_complete);
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(store, project, "generation.py", &rows, &row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(row_count, 1);
+    ASSERT_STR_EQ(rows[0].kind, "parse_partial");
+    cbm_store_free_coverage(rows, row_count);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_store_close(store);
+    /* A partial repair cannot fill an omitted signal for unchanged files. */
+    write_temp_file(tmp, "changed.py", "def NewCoverage():\n    return 2\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    cbm_pipeline_t *partial = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(partial);
+    ASSERT_EQ(cbm_pipeline_run(partial), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    cbm_pipeline_free(partial);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, project, &meta), CBM_STORE_OK);
+    ASSERT_STR_EQ(meta.recording_status, "complete");
+    ASSERT_FALSE(meta.unresolved_calls_complete);
+    cbm_store_coverage_meta_clear(&meta);
+    rows = NULL;
+    row_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(store, project, "generation.py", &rows, &row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(row_count, 1);
+    ASSERT_STR_EQ(rows[0].kind, "parse_partial");
+    cbm_store_free_coverage(rows, row_count);
+    cbm_store_close(store);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *repair = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(repair);
+    ASSERT_EQ(cbm_pipeline_run(repair), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    cbm_pipeline_free(repair);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *unchanged = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(unchanged);
+    ASSERT_EQ(cbm_pipeline_run(unchanged), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_NOOP);
+    cbm_pipeline_free(unchanged);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -18603,6 +18737,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_export_error_snapshot_on_artifact_failure);
     RUN_TEST(pipeline_records_unresolved_injected_call_sites);
     RUN_TEST(pipeline_unresolved_review_sequential);
+    RUN_TEST(pipeline_unresolved_capture_bounds_count_and_json_bytes);
     RUN_TEST(pipeline_unresolved_review_parallel);
     RUN_TEST(pipeline_unresolved_review_spill);
     RUN_TEST(pipeline_structure_edges);
@@ -18990,6 +19125,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
+    RUN_TEST(pipeline_capture_failure_preserves_general_coverage_and_rebuilds);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);
     RUN_TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation);

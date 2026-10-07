@@ -347,6 +347,18 @@ static int init_schema(cbm_store_t *s) {
         ");"
         "CREATE INDEX IF NOT EXISTS idx_index_coverage_project_kind "
         "ON index_coverage(project, kind);"
+        /* Derived candidate lookup: inbound traces read only this index, not
+         * every file's diagnostic JSON. An empty candidate marks truncated or
+         * malformed evidence, whose omitted candidates cannot be ruled out. */
+        "CREATE TABLE IF NOT EXISTS index_unresolved_candidates ("
+        "  project TEXT NOT NULL,"
+        "  candidate TEXT NOT NULL,"
+        "  rel_path TEXT NOT NULL,"
+        "  kind TEXT NOT NULL DEFAULT 'unresolved_calls' CHECK(kind='unresolved_calls'),"
+        "  PRIMARY KEY(project, candidate, rel_path),"
+        "  FOREIGN KEY(project, rel_path, kind) "
+        "    REFERENCES index_coverage(project, rel_path, kind) ON DELETE CASCADE"
+        ");"
         /* One row per completed coverage persistence attempt. Kept separate
          * from projects so existing graph/artifact schema stays compatible and
          * a missing row unambiguously means coverage metadata is unavailable. */
@@ -359,12 +371,40 @@ static int init_schema(cbm_store_t *s) {
         "  ignored_files_stored INTEGER NOT NULL DEFAULT 0,"
         "  ignored_files_total INTEGER NOT NULL DEFAULT 0,"
         "  coverage_version INTEGER NOT NULL DEFAULT 1,"
-        "  hash_records_complete INTEGER NOT NULL DEFAULT 0"
+        "  hash_records_complete INTEGER NOT NULL DEFAULT 0,"
+        "  unresolved_calls_complete INTEGER NOT NULL DEFAULT 0"
         ");";
 
     int rc = exec_sql(s, ddl);
     if (rc != CBM_STORE_OK) {
         return rc;
+    }
+
+    /* Existing writable stores retain their ordinary coverage metadata, but
+     * unresolved capture is untrusted until a full generation records it. */
+    sqlite3_stmt *coverage_columns = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA table_info(index_coverage_meta);", CBM_NOT_FOUND,
+                           &coverage_columns, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "coverage meta schema prepare");
+        return CBM_STORE_ERR;
+    }
+    bool have_unresolved_complete = false;
+    int column_rc;
+    while ((column_rc = sqlite3_step(coverage_columns)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(coverage_columns, SKIP_ONE);
+        if (name && strcmp(name, "unresolved_calls_complete") == 0) {
+            have_unresolved_complete = true;
+        }
+    }
+    sqlite3_finalize(coverage_columns);
+    if (column_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "coverage meta schema scan");
+        return CBM_STORE_ERR;
+    }
+    if (!have_unresolved_complete &&
+        exec_sql(s, "ALTER TABLE index_coverage_meta ADD COLUMN "
+                    "unresolved_calls_complete INTEGER NOT NULL DEFAULT 0;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
 
     /* Schema-compat probe (#768): DBs created before the local_name_gen
@@ -4208,6 +4248,114 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     return CBM_STORE_OK;
 }
 
+/* Materialize once at publication, after replacement and deleted-file pruning.
+ * json_each sees a safe marker array for malformed/legacy non-array payloads.
+ * The side table cascades with its authoritative coverage rows. */
+static int coverage_index_unresolved_candidates(cbm_store_t *s, const char *project) {
+    static const char sql[] =
+        "INSERT OR IGNORE INTO index_unresolved_candidates(project, candidate, rel_path) "
+        "SELECT c.project, CASE WHEN j.type != 'object' OR "
+        "json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, '$.truncated') = 1 "
+        "THEN '' "
+        "ELSE json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, '$.candidate') "
+        "END, c.rel_path "
+        "FROM index_coverage c, json_each(CASE "
+        "WHEN json_valid(c.detail) THEN CASE WHEN json_type(c.detail) = 'array' "
+        "THEN c.detail ELSE '[{\"truncated\":true}]' END "
+        "ELSE '[{\"truncated\":true}]' END) j "
+        "WHERE c.project = ?1 AND c.kind = 'unresolved_calls' AND "
+        "(j.type != 'object' OR json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' "
+        "END, '$.truncated') = 1 OR "
+        "(json_type(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, '$.candidate') = "
+        "'text' AND "
+        "length(json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, "
+        "'$.candidate')) > 0));";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "unresolved candidate index prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "unresolved candidate index");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+/* The caller owns the coverage transaction and rolls it back on failure. */
+static int coverage_write_metadata(cbm_store_t *s, const char *project,
+                                   const cbm_coverage_meta_t *meta) {
+    enum { COVERAGE_META_INITIAL_VERSION = 1 };
+    if (!meta) {
+        sqlite3_stmt *del_meta = NULL;
+        if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage_meta WHERE project = ?1;",
+                               CBM_NOT_FOUND, &del_meta, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta delete prepare");
+            return CBM_STORE_ERR;
+        }
+        bind_text(del_meta, SKIP_ONE, project);
+        int meta_rc = sqlite3_step(del_meta);
+        sqlite3_finalize(del_meta);
+        if (meta_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "coverage meta delete");
+            return CBM_STORE_ERR;
+        }
+        return CBM_STORE_OK;
+    }
+    char recorded_at[CBM_SZ_64];
+    if (meta->recorded_at && meta->recorded_at[0]) {
+        (void)snprintf(recorded_at, sizeof(recorded_at), "%s", meta->recorded_at);
+    } else {
+        iso_now(recorded_at, sizeof(recorded_at));
+    }
+    const char *generation =
+        meta->generation && meta->generation[0] ? meta->generation : recorded_at;
+    const char *index_mode = meta->index_mode && meta->index_mode[0] ? meta->index_mode : "unknown";
+    const char *recording_status = meta->recording_status && meta->recording_status[0]
+                                       ? meta->recording_status
+                                       : "unavailable";
+    int ignored_stored = meta->ignored_files_stored > 0 ? meta->ignored_files_stored : 0;
+    int ignored_total = meta->ignored_files_total > 0 ? meta->ignored_files_total : 0;
+    int coverage_version =
+        meta->coverage_version > 0 ? meta->coverage_version : COVERAGE_META_INITIAL_VERSION;
+
+    sqlite3_stmt *up_meta = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "INSERT INTO index_coverage_meta "
+                           "(project, generation, index_mode, recorded_at, recording_status, "
+                           " ignored_files_stored, ignored_files_total, coverage_version, "
+                           " hash_records_complete, unresolved_calls_complete) "
+                           "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
+                           "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
+                           "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
+                           "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9, "
+                           "unresolved_calls_complete=?10;",
+                           CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "coverage meta upsert prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(up_meta, SKIP_ONE, project);
+    bind_text(up_meta, ST_COL_2, generation);
+    bind_text(up_meta, ST_COL_3, index_mode);
+    bind_text(up_meta, CBM_SZ_4, recorded_at);
+    bind_text(up_meta, CBM_SZ_5, recording_status);
+    sqlite3_bind_int(up_meta, ST_COL_6, ignored_stored);
+    sqlite3_bind_int(up_meta, ST_COL_7, ignored_total);
+    sqlite3_bind_int(up_meta, ST_COL_8, coverage_version);
+    sqlite3_bind_int(up_meta, ST_COL_9, meta->hash_records_complete);
+    sqlite3_bind_int(up_meta, ST_COL_10, meta->unresolved_calls_complete);
+    int meta_rc = sqlite3_step(up_meta);
+    sqlite3_finalize(up_meta);
+    if (meta_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "coverage meta upsert");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                                   const cbm_coverage_row_t *rows, int count,
                                   const cbm_coverage_meta_t *meta) {
@@ -4305,72 +4453,14 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         (cov_t1.tv_sec - cov_t0.tv_sec) * 1000 + (cov_t1.tv_nsec - cov_t0.tv_nsec) / 1000000;
     cov_t0 = cov_t1;
 
-    if (meta) {
-        char recorded_at[CBM_SZ_64];
-        if (meta->recorded_at && meta->recorded_at[0]) {
-            snprintf(recorded_at, sizeof(recorded_at), "%s", meta->recorded_at);
-        } else {
-            iso_now(recorded_at, sizeof(recorded_at));
-        }
-        const char *generation =
-            meta->generation && meta->generation[0] ? meta->generation : recorded_at;
-        const char *index_mode =
-            meta->index_mode && meta->index_mode[0] ? meta->index_mode : "unknown";
-        const char *recording_status = meta->recording_status && meta->recording_status[0]
-                                           ? meta->recording_status
-                                           : "unavailable";
-        int ignored_stored = meta->ignored_files_stored > 0 ? meta->ignored_files_stored : 0;
-        int ignored_total = meta->ignored_files_total > 0 ? meta->ignored_files_total : 0;
-        int coverage_version = meta->coverage_version > 0 ? meta->coverage_version : 1;
+    if (coverage_index_unresolved_candidates(s, project) != CBM_STORE_OK) {
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
 
-        sqlite3_stmt *up_meta = NULL;
-        if (sqlite3_prepare_v2(
-                s->db,
-                "INSERT INTO index_coverage_meta "
-                "(project, generation, index_mode, recorded_at, recording_status, "
-                " ignored_files_stored, ignored_files_total, coverage_version, "
-                " hash_records_complete) "
-                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
-                "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
-                "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
-                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9;",
-                CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
-            store_set_error_sqlite(s, "coverage meta upsert prepare");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
-        bind_text(up_meta, SKIP_ONE, project);
-        bind_text(up_meta, ST_COL_2, generation);
-        bind_text(up_meta, ST_COL_3, index_mode);
-        bind_text(up_meta, CBM_SZ_4, recorded_at);
-        bind_text(up_meta, CBM_SZ_5, recording_status);
-        sqlite3_bind_int(up_meta, 6, ignored_stored);
-        sqlite3_bind_int(up_meta, 7, ignored_total);
-        sqlite3_bind_int(up_meta, 8, coverage_version);
-        sqlite3_bind_int(up_meta, 9, meta->hash_records_complete ? 1 : 0);
-        int meta_rc = sqlite3_step(up_meta);
-        sqlite3_finalize(up_meta);
-        if (meta_rc != SQLITE_DONE) {
-            store_set_error_sqlite(s, "coverage meta upsert");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
-    } else {
-        sqlite3_stmt *del_meta = NULL;
-        if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage_meta WHERE project = ?1;",
-                               CBM_NOT_FOUND, &del_meta, NULL) != SQLITE_OK) {
-            store_set_error_sqlite(s, "coverage meta delete prepare");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
-        bind_text(del_meta, SKIP_ONE, project);
-        int meta_rc = sqlite3_step(del_meta);
-        sqlite3_finalize(del_meta);
-        if (meta_rc != SQLITE_DONE) {
-            store_set_error_sqlite(s, "coverage meta delete");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
+    if (coverage_write_metadata(s, project, meta) != CBM_STORE_OK) {
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
     }
 
     /* Rebuild the derived miss-graph view from the now-authoritative table
@@ -4492,12 +4582,41 @@ int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char
     return coverage_query_rows(s, project, scope, sql, out, count);
 }
 
-int cbm_store_coverage_get_unresolved_calls(cbm_store_t *s, const char *project,
-                                            cbm_coverage_row_t **out, int *count) {
+int cbm_store_coverage_get_unresolved_path(cbm_store_t *s, const char *project,
+                                           const char *rel_path, cbm_coverage_row_t **out,
+                                           int *count) {
     static const char sql[] = "SELECT rel_path, kind, detail FROM index_coverage "
-                              "WHERE project = ?1 AND kind = ?2 "
-                              "ORDER BY rel_path;";
-    return coverage_query_rows(s, project, "unresolved_calls", sql, out, count);
+                              "WHERE project = ?1 AND rel_path = ?2 "
+                              "AND kind = 'unresolved_calls';";
+    return coverage_query_rows(s, project, rel_path, sql, out, count);
+}
+
+int cbm_store_coverage_has_unresolved_candidate(cbm_store_t *s, const char *project,
+                                                const char *candidate, bool *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    *out = false;
+    if (!s || !s->db || !project || !candidate) {
+        return CBM_STORE_ERR;
+    }
+    static const char sql[] = "SELECT 1 FROM index_unresolved_candidates "
+                              "WHERE project = ?1 AND candidate IN ('', ?2) LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "unresolved candidate lookup prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, candidate);
+    int rc = sqlite3_step(stmt);
+    *out = rc == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "unresolved candidate lookup");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
@@ -4524,10 +4643,20 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
     if (sqlite3_prepare_v2(s->db,
                            "SELECT project, generation, index_mode, recorded_at, recording_status, "
                            "ignored_files_stored, ignored_files_total, coverage_version, "
-                           "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
+                           "hash_records_complete, unresolved_calls_complete "
+                           "FROM index_coverage_meta WHERE project = ?1;",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "coverage meta get prepare");
-        return CBM_STORE_ERR;
+        /* Query opens never migrate a legacy database. Preserve its ordinary
+         * report while the absent new signal remains explicitly incomplete. */
+        if (sqlite3_prepare_v2(
+                s->db,
+                "SELECT project, generation, index_mode, recorded_at, recording_status, "
+                "ignored_files_stored, ignored_files_total, coverage_version, "
+                "hash_records_complete, 0 FROM index_coverage_meta WHERE project = ?1;",
+                CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta get prepare");
+            return CBM_STORE_ERR;
+        }
     }
     bind_text(stmt, SKIP_ONE, project);
     int rc = sqlite3_step(stmt);
@@ -4541,6 +4670,7 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
+        out->unresolved_calls_complete = sqlite3_column_int(stmt, ST_COL_9) != 0;
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
             !out->recording_status) {
