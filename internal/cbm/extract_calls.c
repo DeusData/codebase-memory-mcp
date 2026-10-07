@@ -1763,6 +1763,59 @@ static const char *php_chain_prefix_arg(CBMArena *a, TSNode call_node, const cha
     return NULL;
 }
 
+/* The value of a plain PHP string literal ('...' or "..." with no
+ * interpolation or escapes), "" for an empty one; NULL for anything else. */
+static const char *php_plain_string_value(CBMArena *a, TSNode node, const char *source) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "string") != 0 && strcmp(kind, "encapsed_string") != 0) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (strcmp(ts_node_type(ts_node_named_child(node, i)), "string_content") != 0) {
+            return NULL;
+        }
+    }
+    return nc == 0 ? "" : cbm_node_text(a, ts_node_named_child(node, 0), source);
+}
+
+/* The first argument's value node of a PHP call (unwrapping `argument`). */
+static TSNode php_first_arg_value(TSNode call_node) {
+    TSNode none = {0};
+    TSNode args = ts_node_child_by_field_name(call_node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return none;
+    }
+    TSNode arg = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(arg), "argument") == 0) {
+        return ts_node_named_child_count(arg) == SKIP_ONE ? ts_node_named_child(arg, 0) : none;
+    }
+    return arg;
+}
+
+/* The literal 'prefix' of an attribute-array group (#1146):
+ * Route::group(['prefix' => 'v1/autocomplete', 'as' => ...], function () {...}),
+ * the form Firefly III's whole API is written in. */
+static const char *php_group_array_prefix(CBMArena *a, TSNode group_call, const char *source) {
+    TSNode attrs = php_first_arg_value(group_call);
+    if (ts_node_is_null(attrs) || strcmp(ts_node_type(attrs), "array_creation_expression") != 0) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(attrs);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode el = ts_node_named_child(attrs, i);
+        if (strcmp(ts_node_type(el), "array_element_initializer") != 0 ||
+            ts_node_named_child_count(el) != PAIR_LEN) {
+            continue;
+        }
+        const char *key = php_plain_string_value(a, ts_node_named_child(el, 0), source);
+        if (key && strcmp(key, "prefix") == 0) {
+            return php_plain_string_value(a, ts_node_named_child(el, SKIP_ONE), source);
+        }
+    }
+    return NULL;
+}
+
 static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const char *source) {
     const char *parts[PHP_PREFIX_PARTS_MAX];
     int part_count = 0;
@@ -1785,7 +1838,14 @@ static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const cha
                                         strcmp(ts_node_type(p), "scoped_call_expression") == 0)) {
                 TSNode gname = ts_node_child_by_field_name(p, TS_FIELD("name"));
                 char *gtxt = ts_node_is_null(gname) ? NULL : cbm_node_text(a, gname, source);
-                if (gtxt && strcmp(gtxt, "group") == 0) {
+                const char *array_prefix = gtxt && strcmp(gtxt, "group") == 0
+                                               ? php_group_array_prefix(a, p, source)
+                                               : NULL;
+                if (array_prefix) {
+                    if (part_count < PHP_PREFIX_PARTS_MAX) {
+                        parts[part_count++] = array_prefix; /* inner-first */
+                    }
+                } else if (gtxt && strcmp(gtxt, "group") == 0) {
                     /* Scan the receiver chain for prefix('...'). */
                     TSNode recv = ts_node_child_by_field_name(p, TS_FIELD("object"));
                     for (int hops = 0; hops < PHP_GROUP_WALK_MAX && !ts_node_is_null(recv);
@@ -1841,6 +1901,81 @@ static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const cha
     }
     buf[pos] = '\0';
     return pos ? cbm_arena_strndup(a, buf, pos) : NULL;
+}
+
+/* A Laravel route registrar receiver (#1146): the Route facade — also at the
+ * root of a registrar chain, Route::middleware('auth')->get(...) — or the
+ * $router instance route files are loaded with (RouteServiceProvider, Lumen).
+ * The same literal `Route` scope the #952 callee qualification accepts. */
+static bool php_is_laravel_registrar(CBMArena *a, TSNode call_node, const char *source) {
+    TSNode cur = call_node;
+    for (int hops = 0; hops < PHP_GROUP_WALK_MAX && !ts_node_is_null(cur); hops++) {
+        const char *kind = ts_node_type(cur);
+        if (strcmp(kind, "scoped_call_expression") == 0) {
+            TSNode scope = ts_node_child_by_field_name(cur, TS_FIELD("scope"));
+            const char *st = ts_node_is_null(scope) ? NULL : cbm_node_text(a, scope, source);
+            return st && strcmp(st, "Route") == 0;
+        }
+        if (strcmp(kind, "variable_name") == 0) {
+            const char *vt = cbm_node_text(a, cur, source);
+            return vt && strcmp(vt, "$router") == 0;
+        }
+        if (strcmp(kind, "member_call_expression") != 0) {
+            return false;
+        }
+        cur = ts_node_child_by_field_name(cur, TS_FIELD("object"));
+    }
+    return false;
+}
+
+/* Laravel accepts a route URI with or without its leading slash and trims
+ * '/' from both ends: Route::get('users', ...) serves /users, and '' is the
+ * group root. The route passes only mint a Route for a path that starts with
+ * '/', so give a recognised registration's literal URI its slash here, where
+ * the first argument is still at hand (#1146). Returns NULL — leave the call
+ * alone — for any other call, any non-literal URI, or one already slashed:
+ * `$request->get('name')`, `Cache::get('key')` and a collection's get('k')
+ * keep their argument. */
+static const char *php_laravel_route_uri(CBMArena *a, TSNode call_node, const char *source) {
+    static const char *const verbs[] = {"get", "post", "put", "patch", "delete", NULL};
+    TSNode mname = ts_node_child_by_field_name(call_node, TS_FIELD("name"));
+    const char *verb = ts_node_is_null(mname) ? NULL : cbm_node_text(a, mname, source);
+    bool is_verb = false;
+    for (int i = 0; verb && verbs[i] && !is_verb; i++) {
+        is_verb = strcmp(verb, verbs[i]) == 0;
+    }
+    if (!is_verb || !php_is_laravel_registrar(a, call_node, source)) {
+        return NULL;
+    }
+    TSNode arg0 = php_first_arg_value(call_node);
+    const char *uri = ts_node_is_null(arg0) ? NULL : php_plain_string_value(a, arg0, source);
+    if (!uri || uri[0] == '/') {
+        return NULL;
+    }
+    size_t len = strlen(uri);
+    while (len > 0 && uri[len - SKIP_ONE] == '/') {
+        len--;
+    }
+    return cbm_arena_sprintf(a, "/%.*s", (int)len, uri);
+}
+
+/* Is a Laravel registration's action (its last argument) a string — 'index'
+ * inside a Route::controller() group, 'UserController@show'? Such an action
+ * does not say which class owns the method, so resolving it could only guess a
+ * same-named function anywhere in the repo. */
+static bool php_route_action_is_string(TSNode call_node) {
+    TSNode args = ts_node_child_by_field_name(call_node, TS_FIELD("arguments"));
+    uint32_t nc = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
+    if (nc < PAIR_LEN) {
+        return false;
+    }
+    TSNode action = ts_node_named_child(args, nc - SKIP_ONE);
+    if (strcmp(ts_node_type(action), "argument") == 0 &&
+        ts_node_named_child_count(action) == SKIP_ONE) {
+        action = ts_node_named_child(action, 0);
+    }
+    const char *kind = ts_node_type(action);
+    return strcmp(kind, "string") == 0 || strcmp(kind, "encapsed_string") == 0;
 }
 
 static bool is_nested_verilog_call_wrapper(CBMLanguage lang, TSNode node) {
@@ -3941,6 +4076,16 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args, call.callee_name);
+                /* #1146: a Laravel registration's slashless URI ('users', '')
+                 * becomes '/users' / '/' so it mints and composes below. */
+                const char *laravel_uri = NULL;
+                if (ctx->language == CBM_LANG_PHP && call.callee_name &&
+                    cbm_service_pattern_route_method(call.callee_name) != NULL) {
+                    laravel_uri = php_laravel_route_uri(ctx->arena, node, ctx->source);
+                    if (laravel_uri) {
+                        call.first_string_arg = laravel_uri;
+                    }
+                }
                 /* #952: routes registered inside Laravel `prefix()->group()`
                  * closures must carry the composed path — the resolve passes
                  * only see the flat CBMCall, so the enclosing chain can only
@@ -3959,7 +4104,10 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                                    : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
                     }
                 }
-                if (call.first_string_arg && call.first_string_arg[0] == '/') {
+                /* A slashless registration's string action would only be
+                 * guessed at (#1146): mint its Route without a handler. */
+                if (call.first_string_arg && call.first_string_arg[0] == '/' &&
+                    !(laravel_uri && php_route_action_is_string(node))) {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }
                 if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
