@@ -250,6 +250,17 @@ char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *r
 char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
                                   const char *name, CBMLanguage lang);
 
+// C-family platform variants: the same external-linkage function defined in
+// files that differ only by a platform token (foo_win.c / foo_posix.c,
+// src/unix/fs.c / src/win/fs.c) is ONE function with platform variants — two
+// external definitions of one name cannot link into one program, so they are
+// alternatives by construction. Returns the platform-neutral QN (the path with
+// its platform tokens removed) for a non-static file-scope function of
+// C/C++/CUDA/ObjC whose `qn` is the plain file-stem form; otherwise `qn`.
+const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+                                    const char *rel_path, const char *name, const char *qn,
+                                    TSNode func_node);
+
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
 

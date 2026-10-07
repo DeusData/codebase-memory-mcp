@@ -961,6 +961,113 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     PASS();
 }
 
+TEST(lang_resolution_compatible_families) {
+    /* Same language and the interop families the resolvers already honour. */
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_PYTHON, CBM_LANG_PYTHON));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_JAVASCRIPT, CBM_LANG_TYPESCRIPT));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_VUE, CBM_LANG_TSX));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_C, CBM_LANG_CPP));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_OBJC, CBM_LANG_C));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_KOTLIN, CBM_LANG_JAVA));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_SWIFT, CBM_LANG_OBJC));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_OBJC, CBM_LANG_SWIFT));
+    /* Unknown on either side: no evidence, no filter. */
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_COUNT, CBM_LANG_PYTHON));
+    ASSERT_TRUE(cbm_lang_resolution_compatible(CBM_LANG_JAVASCRIPT, CBM_LANG_COUNT));
+    /* Across families: never by name alone. */
+    ASSERT_FALSE(cbm_lang_resolution_compatible(CBM_LANG_JAVASCRIPT, CBM_LANG_PYTHON));
+    ASSERT_FALSE(cbm_lang_resolution_compatible(CBM_LANG_PYTHON, CBM_LANG_TSX));
+    ASSERT_FALSE(cbm_lang_resolution_compatible(CBM_LANG_GO, CBM_LANG_C));
+    ASSERT_FALSE(cbm_lang_resolution_compatible(CBM_LANG_SWIFT, CBM_LANG_KOTLIN));
+    ASSERT_FALSE(cbm_lang_resolution_compatible(CBM_LANG_MAKEFILE, CBM_LANG_C));
+    /* Synthetic LSP sources carry their language. */
+    ASSERT_EQ(cbm_registry_synthetic_path_language("<python-builtins>"), CBM_LANG_PYTHON);
+    ASSERT_EQ(cbm_registry_synthetic_path_language("<kotlin-builtins>"), CBM_LANG_KOTLIN);
+    ASSERT_EQ(cbm_registry_synthetic_path_language("app.py"), CBM_LANG_COUNT);
+    ASSERT_EQ(cbm_registry_synthetic_path_language(NULL), CBM_LANG_COUNT);
+    PASS();
+}
+
+/* Resolve with the unfiltered chain, then apply the cross-language veto the
+ * way pass_calls.c / pass_parallel.c do. */
+static cbm_resolution_t xl_resolve(const cbm_registry_t *r, CBMLanguage lang, const char *callee,
+                                   const char *module_qn) {
+    cbm_resolution_t res = cbm_registry_resolve(r, callee, module_qn, NULL, NULL, 0);
+    if (cbm_registry_name_guess_vetoed(r, lang, &res)) {
+        res = (cbm_resolution_t){0};
+    }
+    return res;
+}
+
+TEST(name_guess_vetoed_across_languages) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "get", "builtins.dict.get", "Method", CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "patch", "proj.web.Panel.patch", "Function", CBM_LANG_TSX);
+    cbm_registry_add_lang(r, "patch", "proj.api.client.patch", "Function", CBM_LANG_PYTHON);
+    cbm_registry_add(r, "legacy", "proj.x.legacy", "Function"); /* unknown language */
+
+    /* JS `app.get`: the only "get" is Python's -> EMPTY, not unique_name. */
+    cbm_resolution_t res = xl_resolve(r, CBM_LANG_JAVASCRIPT, "app.get", "proj.app");
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    /* Python keeps its own builtin. */
+    res = xl_resolve(r, CBM_LANG_PYTHON, "d.get", "proj.tool");
+    ASSERT_STR_EQ(res.qualified_name, "builtins.dict.get");
+    ASSERT_STR_EQ(res.strategy, "unique_name");
+    /* Two same-named candidates: the chain still picks by import distance;
+     * the answer stands only for a caller that can call the winner. */
+    res = xl_resolve(r, CBM_LANG_PYTHON, "patch", "proj.api.x");
+    ASSERT_STR_EQ(res.qualified_name, "proj.api.client.patch");
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    res = xl_resolve(r, CBM_LANG_TYPESCRIPT, "patch", "proj.api.x");
+    ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    res = xl_resolve(r, CBM_LANG_TYPESCRIPT, "patch", "proj.web.ui");
+    ASSERT_STR_EQ(res.qualified_name, "proj.web.Panel.patch");
+    /* Unknown-language entries and an unknown caller are never vetoed. */
+    res = xl_resolve(r, CBM_LANG_GO, "legacy", "proj.go");
+    ASSERT_STR_EQ(res.qualified_name, "proj.x.legacy");
+    res = xl_resolve(r, CBM_LANG_COUNT, "app.get", "proj.app");
+    ASSERT_STR_EQ(res.qualified_name, "builtins.dict.get");
+
+    /* Evidence-backed strategies are never vetoed, whatever the language. */
+    cbm_resolution_t imp = {.qualified_name = "builtins.dict.get",
+                            .strategy = "import_map",
+                            .confidence = 0.95,
+                            .candidate_count = 1};
+    ASSERT_FALSE(cbm_registry_name_guess_vetoed(r, CBM_LANG_JAVASCRIPT, &imp));
+    imp.strategy = "lsp_generic_method";
+    ASSERT_FALSE(cbm_registry_name_guess_vetoed(r, CBM_LANG_JAVASCRIPT, &imp));
+    /* The parallel field-type hint re-picks language-blind: vetoed too. */
+    imp.strategy = "field_type_hint";
+    ASSERT_TRUE(cbm_registry_name_guess_vetoed(r, CBM_LANG_JAVASCRIPT, &imp));
+    ASSERT_FALSE(cbm_registry_name_guess_vetoed(r, CBM_LANG_PYTHON, &imp));
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* tests/cov.c and tests/cov.py share the module QN proj.tests.cov (module QNs
+ * drop the extension): a same_module answer across languages is that
+ * collision, not evidence. Within the caller's language it stands. */
+TEST(same_module_vetoed_across_languages) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "reducer_worker", "proj.tests.cov.reducer_worker", "Function",
+                          CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "reducer_worker", "proj.other.reducer_worker", "Function",
+                          CBM_LANG_PYTHON);
+    cbm_registry_add_lang(r, "stat_child", "proj.tests.cov.stat_child", "Function", CBM_LANG_C);
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "reducer_worker", "proj.tests.cov", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.strategy, "same_module");
+    ASSERT_TRUE(cbm_registry_name_guess_vetoed(r, CBM_LANG_C, &res));
+    ASSERT_FALSE(cbm_registry_name_guess_vetoed(r, CBM_LANG_PYTHON, &res));
+
+    res = cbm_registry_resolve(r, "stat_child", "proj.tests.cov", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.tests.cov.stat_child");
+    ASSERT_FALSE(cbm_registry_name_guess_vetoed(r, CBM_LANG_C, &res));
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(cross_language_suffix_match_drops_py_vs_js) {
     /* #725: two same-named symbols in different languages. suffix_match is the
      * strategy that collapses them; unique_name is #1572 and must stay. */
@@ -1035,6 +1142,120 @@ TEST(go_bare_ref_never_binds_field) {
     ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
     /* Degenerate input → nothing to judge. */
     ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
+    PASS();
+}
+
+TEST(call_onto_field_follows_language_and_shape) {
+    /* A call the registry resolved onto a Field node. */
+    /* Another language: only the spelling connects them. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_BASH, "command", "Field", "src/probe.h"),
+              CBM_FIELD_CALL_DROP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_PYTHON, "sorted", "Field", "src/pool.c"),
+              CBM_FIELD_CALL_DROP);
+    /* A bare C call is never a struct member. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "socket", "Field", "tests/t.c"),
+              CBM_FIELD_CALL_DROP);
+    /* A C member call is decided by its object's type, in a .c or a .h. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "cb.close", "Field", "src/cb.h"),
+              CBM_FIELD_CALL_BY_OWNER);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "w->svc->app.cancel", "Field", "src/a.c"),
+              CBM_FIELD_CALL_BY_OWNER);
+    /* C++ reaches its own members bare, so a bare call keeps its resolution;
+     * a member call is typed like C's (`text.size()` is not some struct's
+     * `size` member). */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_CPP, "handler", "Field", "src/a.h"),
+              CBM_FIELD_CALL_KEEP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_CPP, "text.size", "Field", "src/a.h"),
+              CBM_FIELD_CALL_BY_OWNER);
+    /* The same language as the Field keeps its resolution too. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_GO, "s.fn", "Field", "pkg/s.go"),
+              CBM_FIELD_CALL_KEEP);
+    /* Not a Field target: not this rule's business. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_BASH, "main", "Function", "src/main.c"),
+              CBM_FIELD_CALL_KEEP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_C, "socket", NULL, "tests/t.c"),
+              CBM_FIELD_CALL_KEEP);
+    PASS();
+}
+
+TEST(c_arrow_member_call_is_c_family_and_arrow_only) {
+    /* The registry returns nothing for an arrow callee; these are the calls
+     * the resolvers then hand to the object's type. */
+    ASSERT_TRUE(cbm_c_arrow_member_call(CBM_LANG_C, "o->open"));
+    ASSERT_TRUE(cbm_c_arrow_member_call(CBM_LANG_C, "d->ops->shut"));
+    ASSERT_TRUE(cbm_c_arrow_member_call(CBM_LANG_CPP, "self->hook"));
+    /* A dot call resolves through the registry and its Field policy. */
+    ASSERT_FALSE(cbm_c_arrow_member_call(CBM_LANG_C, "cb.close"));
+    ASSERT_FALSE(cbm_c_arrow_member_call(CBM_LANG_C, "socket"));
+    ASSERT_FALSE(cbm_c_arrow_member_call(CBM_LANG_C, NULL));
+    /* Perl and PHP spell method calls with an arrow too: not this rule. */
+    ASSERT_FALSE(cbm_c_arrow_member_call(CBM_LANG_PERL, "$obj->method"));
+    ASSERT_FALSE(cbm_c_arrow_member_call(CBM_LANG_PHP, "$this->save"));
+    PASS();
+}
+
+TEST(unique_field_qn_needs_exactly_one_field_of_that_name) {
+    /* What an untyped C member access may still bind: a name exactly one
+     * Field carries. Two Fields would be a choice; a function or variable of
+     * the same name is not a candidate for a member at all. */
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "only_here", "proj.a.Alpha.only_here", "Field");
+    cbm_registry_add(r, "count", "proj.a.Alpha.count", "Field");
+    cbm_registry_add(r, "count", "proj.b.Beta.count", "Field");
+    cbm_registry_add(r, "close", "proj.cb.Callbacks.close", "Field");
+    cbm_registry_add(r, "close", "proj.io.close", "Function");
+    cbm_registry_add(r, "lonely_fn", "proj.io.lonely_fn", "Function");
+
+    const char *only = cbm_registry_unique_field_qn(r, "only_here");
+    ASSERT_NOT_NULL(only);
+    ASSERT_STR_EQ(only, "proj.a.Alpha.only_here");
+    /* Two fields share the name: no pick. */
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, "count"));
+    /* One field and one function share the name: the function is not a
+     * candidate for a member, so the field is still the only one. */
+    const char *member = cbm_registry_unique_field_qn(r, "close");
+    ASSERT_NOT_NULL(member);
+    ASSERT_STR_EQ(member, "proj.cb.Callbacks.close");
+    /* Unique, but not a field. */
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, "lonely_fn"));
+    /* Unknown name and degenerate input. */
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, "absent"));
+    ASSERT_NULL(cbm_registry_unique_field_qn(r, NULL));
+    ASSERT_NULL(cbm_registry_unique_field_qn(NULL, "count"));
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(c_member_access_binds_by_owner_only) {
+    /* The member half of a C `a.b` / `a->b` means nothing without the type of
+     * `a`: it binds through the C LSP's field-owner rows and never through a
+     * bare-name lookup. The selector shape arrives as is_member_access. */
+    ASSERT_TRUE(cbm_c_member_binds_by_owner(true, true));
+    /* A bare C identifier keeps the ordinary resolution. */
+    ASSERT_FALSE(cbm_c_member_binds_by_owner(true, false));
+    /* Other languages keep theirs: a C++ or Objective-C method body reaches its
+     * own members without a selector, and Go has its own rule above. */
+    ASSERT_FALSE(cbm_c_member_binds_by_owner(false, true));
+    ASSERT_FALSE(cbm_c_member_binds_by_owner(false, false));
+    PASS();
+}
+
+TEST(c_member_rule_covers_c_files_and_every_dot_h) {
+    ASSERT_TRUE(cbm_c_member_rule_file(CBM_LANG_C, "src/a.c"));
+    ASSERT_TRUE(cbm_c_member_rule_file(CBM_LANG_C, NULL));
+    /* A header is classified C++ whatever it holds; its inline functions
+     * access members like the .c files that include it. */
+    ASSERT_TRUE(cbm_c_member_rule_file(CBM_LANG_CPP, "include/linux/list.h"));
+    /* Other C++ files keep their own resolution. */
+    ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_CPP, "src/widget.cpp"));
+    ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_CPP, "src/widget.hpp"));
+    ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_CPP, "src/match.hh"));
+    ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_CPP, ".h"));
+    ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_CPP, NULL));
+    /* No other language, whatever the file is called. */
+    ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_OBJC, "ui/View.h"));
+    ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_GO, "pkg/a.go"));
     PASS();
 }
 
@@ -1395,10 +1616,18 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
+    RUN_TEST(lang_resolution_compatible_families);
+    RUN_TEST(name_guess_vetoed_across_languages);
+    RUN_TEST(same_module_vetoed_across_languages);
     RUN_TEST(cross_language_config_caller_drops_unique_name_too);
     RUN_TEST(registry_tie_break_is_independent_of_registration_order);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(call_onto_field_follows_language_and_shape);
+    RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);
+    RUN_TEST(unique_field_qn_needs_exactly_one_field_of_that_name);
+    RUN_TEST(c_member_access_binds_by_owner_only);
+    RUN_TEST(c_member_rule_covers_c_files_and_every_dot_h);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);

@@ -1370,10 +1370,10 @@ TEST(mcp_metadata_byte_budget) {
 
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* 15 KiB covered the lean surface at the branch point; get_file_outline,
-     * compare_graphs, manage_adr set_sections, and the search_code debug and
-     * list_projects include_details parameters landed on main since. */
-    ASSERT_LT((int)strlen(json), 18 * 1024);
+    /* Seed discovery and independent pagination have a reviewed budget:
+     * 20 KiB overall; only detect_changes may exceed the 3200-byte per-tool
+     * ceiling, with its own 4096-byte bound. */
+    ASSERT_LT((int)strlen(json), 20 * 1024);
 
     yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
     ASSERT_NOT_NULL(doc);
@@ -1386,7 +1386,9 @@ TEST(mcp_metadata_byte_budget) {
     yyjson_arr_foreach(tools, idx, max, tool) {
         char *serialized = yyjson_val_write(tool, 0, NULL);
         ASSERT_NOT_NULL(serialized);
-        ASSERT_LT((int)strlen(serialized), 3200);
+        const char *name = yyjson_get_str(yyjson_obj_get(tool, "name"));
+        ASSERT_LT((int)strlen(serialized),
+                  name && strcmp(name, "detect_changes") == 0 ? 4096 : 3200);
         free(serialized);
     }
     yyjson_doc_free(doc);
@@ -1859,6 +1861,23 @@ TEST(mcp_get_int_arg) {
     ASSERT_EQ(val, 5);
     val = cbm_mcp_get_int_arg(args, "missing", 42);
     ASSERT_EQ(val, 42);
+    /* Out-of-int-range integers return the default instead of truncating:
+     * 2^32 + 1 used to read back as 1 through yyjson_get_int's int cast. */
+    val = cbm_mcp_get_int_arg("{\"limit\":4294967297}", "limit", 17);
+    ASSERT_EQ(val, 17);
+    val = cbm_mcp_get_int_arg("{\"limit\":-4294967297}", "limit", 19);
+    ASSERT_EQ(val, 19);
+    val = cbm_mcp_get_int_arg("{\"limit\":2147483648}", "limit", 23);
+    ASSERT_EQ(val, 23);
+    val = cbm_mcp_get_int_arg("{\"limit\":-9223372036854775808}", "limit", 29);
+    ASSERT_EQ(val, 29);
+    /* Boundary values and a negative in-range value still pass through. */
+    val = cbm_mcp_get_int_arg("{\"limit\":2147483647}", "limit", 0);
+    ASSERT_EQ(val, 2147483647);
+    val = cbm_mcp_get_int_arg("{\"limit\":-2147483648}", "limit", 0);
+    ASSERT_EQ(val, -2147483648);
+    val = cbm_mcp_get_int_arg("{\"limit\":-7}", "limit", 0);
+    ASSERT_EQ(val, -7);
     PASS();
 }
 
@@ -6246,9 +6265,9 @@ TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714) {
     ASSERT_EQ(cbm_path_info_utf8(source_path, &info), 0);
 
     /* The hash exactly as the indexer writes it: same source, ns precision. */
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", info.mtime_ns,
-                                         info.size),
-              CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_store_upsert_file_hash(store, "test-project", "main.go", "", info.mtime_ns, info.size),
+        CBM_STORE_OK);
 
     /* format=json, like every other coverage test here: the DEFAULT response is
      * the compact table, in which a field name never appears. Keeping the
@@ -6265,11 +6284,11 @@ TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714) {
     /* A hash stored at seconds precision — what a stat-based reader previously
      * compared against — must NOT match an unchanged file: the comparison must
      * stay nanosecond-exact, or part of mtime resolution is silently dropped. */
-    int64_t seconds_mtime_ns = (info.mtime_ns / (int64_t)CBM_NSEC_PER_SEC) *
-                               (int64_t)CBM_NSEC_PER_SEC;
+    int64_t seconds_mtime_ns =
+        (info.mtime_ns / (int64_t)CBM_NSEC_PER_SEC) * (int64_t)CBM_NSEC_PER_SEC;
     if (seconds_mtime_ns != info.mtime_ns) {
-        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "",
-                                             seconds_mtime_ns, info.size),
+        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", seconds_mtime_ns,
+                                             info.size),
                   CBM_STORE_OK);
         response = cbm_mcp_handle_tool(srv, "check_index_coverage",
                                        "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
@@ -16355,6 +16374,782 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
     PASS();
 }
 
+/* ── detect_changes: opt-in impact walk (edge_types / fixpoint / via) ──
+ *
+ * One git fixture for the tests below. `leaf` is the changed function; a call
+ * chain four deep sits on top of it, and `holder` only names it. */
+typedef struct {
+    char repo[512];
+    cbm_mcp_server_t *srv;
+    char *project;
+} dc_walk_fixture_t;
+
+#define DC_WALK_SRC_HEAD "def leaf():\n"
+#define DC_WALK_SRC_TAIL  \
+    "    return x\n"      \
+    "\n"                  \
+    "\n"                  \
+    "def mid1():\n"       \
+    "    return leaf()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def mid2():\n"       \
+    "    return mid1()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def mid3():\n"       \
+    "    return mid2()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def top():\n"        \
+    "    return mid3()\n" \
+    "\n"                  \
+    "\n"                  \
+    "def holder():\n"     \
+    "    f = leaf\n"      \
+    "    return f\n"
+
+static bool dc_walk_fixture_open(dc_walk_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    snprintf(fx->repo, sizeof(fx->repo), "%s/cbm-detect-walk-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(fx->repo)) {
+        return false;
+    }
+    char src[600];
+    snprintf(src, sizeof(src), "%s/mod.py", fx->repo);
+    if (th_write_file(src, DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL) != 0) {
+        return false;
+    }
+    /* Same git invocation rules as the #1363 fixture above. */
+    char cmd[1200];
+    const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
+    for (size_t s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
+        snprintf(cmd, sizeof(cmd),
+                 "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=main "
+                 "-c commit.gpgsign=false %s",
+                 fx->repo, steps[s]);
+        if (system(cmd) != 0) {
+            return false;
+        }
+    }
+    fx->srv = cbm_mcp_server_new(NULL);
+    if (!fx->srv) {
+        return false;
+    }
+    char idx_args[700];
+    snprintf(idx_args, sizeof(idx_args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", fx->repo);
+    char *idx_resp = cbm_mcp_handle_tool(fx->srv, "index_repository", idx_args);
+    free(idx_resp);
+    /* The change: one line inside leaf(), line count unchanged. */
+    if (th_write_file(src, DC_WALK_SRC_HEAD "    x = 11\n" DC_WALK_SRC_TAIL) != 0) {
+        return false;
+    }
+    fx->project = cbm_project_name_from_path(fx->repo);
+    return fx->project != NULL;
+}
+
+static void dc_walk_fixture_close(dc_walk_fixture_t *fx) {
+    free(fx->project);
+    if (fx->srv) {
+        cbm_mcp_server_free(fx->srv);
+    }
+    if (fx->repo[0]) {
+        th_rmtree(fx->repo);
+    }
+}
+
+/* detect_changes on the fixture; `extra` is appended to the argument object
+ * (start it with a comma). Returns the tool's text content. */
+static char *dc_walk_call(dc_walk_fixture_t *fx, const char *extra) {
+    char args[900];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"%s}", fx->project, extra ? extra : "");
+    char *resp = cbm_mcp_handle_tool(fx->srv, "detect_changes", args);
+    char *text = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return text;
+}
+
+/* The impacted row whose qualified name ends in `.name`, from a format:"json"
+ * answer. NULL when the row is absent. */
+static yyjson_val *dc_walk_row(yyjson_doc *doc, const char *name) {
+    yyjson_val *rows = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "impacted") : NULL;
+    size_t want = strlen(name);
+    size_t idx;
+    size_t max;
+    yyjson_val *row;
+    yyjson_arr_foreach(rows, idx, max, row) {
+        const char *qn = yyjson_get_str(yyjson_obj_get(row, "qn"));
+        size_t len = qn ? strlen(qn) : 0;
+        if (len > want && qn[len - want - 1U] == '.' && strcmp(qn + len - want, name) == 0) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+static int dc_walk_total(yyjson_doc *doc) {
+    return doc ? (int)yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "impacted_total"))
+               : -1;
+}
+
+/* The default answer stops at `depth` (2). fixpoint:true walks until nothing
+ * new is reached, and spelling the new parameters out as false changes not one
+ * byte of the default answer. */
+/* Seed rows describe the actual walk inputs and page independently. */
+TEST(detect_changes_seed_list_reports_hunk_without_walk) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char *text = dc_walk_call(&fx, ",\"format\":\"json\",\"scope\":\"files\",\"seeds\":\"list\"");
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_total")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_symbols")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_returned")), 1);
+    ASSERT_EQ(dc_walk_total(doc), 0);
+    yyjson_val *row = yyjson_arr_get_first(yyjson_obj_get(root, "seeds"));
+    ASSERT_NOT_NULL(row);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "seed_reason")), "hunk");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "file")), "mod.py");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(row, "label")), "Function");
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(row, "qn")), ".leaf"));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(row, "start")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(row, "end")), 3);
+    yyjson_doc_free(doc);
+    free(text);
+    const char *formats[] = {"json", "tree"};
+    for (int i = 0; i < 2; i++) {
+        char extra[200];
+        snprintf(extra, sizeof(extra), ",\"format\":\"%s\"", formats[i]);
+        char *normal = dc_walk_call(&fx, extra);
+        snprintf(extra, sizeof(extra),
+                 ",\"format\":\"%s\",\"seeds\":\"none\",\"seed_filter\":\"all\"", formats[i]);
+        char *explicit_defaults = dc_walk_call(&fx, extra);
+        ASSERT_STR_EQ(normal, explicit_defaults);
+        free(normal);
+        free(explicit_defaults);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_seed_pages_bind_semantics_and_snapshot) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char path[600];
+    snprintf(path, sizeof(path), "%s/mod.py", fx.repo);
+    /* No definition overlaps this insertion: whole-file fallback. */
+    ASSERT_EQ(th_write_file(path, "import os\n" DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL),
+              0);
+    /* Move indexed definitions past the import so this is truly zero overlap. */
+    cbm_store_t *store = cbm_store_open(fx.project);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_file(store, fx.project, "mod.py", &nodes, &count),
+              CBM_STORE_OK);
+    for (int i = 0; i < count; i++) {
+        nodes[i].start_line += 1;
+        nodes[i].end_line += 1;
+        ASSERT_GT(cbm_store_upsert_node(store, &nodes[i]), 0);
+    }
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(store);
+    const char *base = ",\"format\":\"json\",\"scope\":\"files\",\"seeds\":\"list\"";
+    char extra[500];
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":2", base);
+    char *first = dc_walk_call(&fx, extra);
+    yyjson_doc *doc = yyjson_read(first, strlen(first), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_total")), 6);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_returned")), 2);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "seed_has_more")));
+    const char *cursor = yyjson_get_str(yyjson_obj_get(root, "seed_next_cursor"));
+    ASSERT_NOT_NULL(cursor);
+    yyjson_val *rows = yyjson_obj_get(root, "seeds");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get_first(rows), "seed_reason")),
+                  "whole_file");
+    const char *last = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(rows, 1), "qn"));
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":3,\"seed_cursor\":\"%s\"", base, cursor);
+    char *next = dc_walk_call(&fx, extra);
+    yyjson_doc *ndoc = yyjson_read(next, strlen(next), 0);
+    ASSERT_NOT_NULL(ndoc);
+    yyjson_val *nroot = yyjson_doc_get_root(ndoc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(nroot, "seed_returned")), 3);
+    const char *next_qn =
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get_first(yyjson_obj_get(nroot, "seeds")), "qn"));
+    ASSERT_LT(strcmp(last, next_qn), 0);
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":3,\"seed_offset\":2", base);
+    char *offset = dc_walk_call(&fx, extra);
+    ASSERT_STR_EQ(next, offset);
+    free(offset);
+    yyjson_doc_free(ndoc);
+    free(next);
+    const char *mismatches[] = {",\"seed_filter\":\"product\"", ",\"seed_offset\":1",
+                                ",\"depth\":3"};
+    for (int i = 0; i < 3; i++) {
+        snprintf(extra, sizeof(extra), "%s%s,\"seed_cursor\":\"%s\"", base, mismatches[i], cursor);
+        char *bad = dc_walk_call(&fx, extra);
+        ASSERT_NOT_NULL(strstr(bad, "cursor_params_mismatch"));
+        free(bad);
+    }
+    snprintf(extra, sizeof(extra), "%s,\"seed_limit\":0", base);
+    char *zero = dc_walk_call(&fx, extra);
+    ASSERT_NOT_NULL(strstr(zero, "seed_continuation_requires_positive_limit"));
+    free(zero);
+
+    int token_budget = (int)((strlen(first) + 3) / 4);
+    snprintf(extra, sizeof(extra), "%s,\"max_output_tokens\":%d", base, token_budget);
+    char *budget = dc_walk_call(&fx, extra);
+    ASSERT_LTE(strlen(budget), (size_t)token_budget * 4);
+    yyjson_doc *bdoc = yyjson_read(budget, strlen(budget), 0);
+    ASSERT_NOT_NULL(bdoc);
+    yyjson_val *broot = yyjson_doc_get_root(bdoc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(broot, "seed_total")), 6);
+    int returned = (int)yyjson_get_int(yyjson_obj_get(broot, "seed_returned"));
+    ASSERT_LT(returned, 6);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(broot, "seed_has_more")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(broot, "truncation_reason")), "output_budget");
+    ASSERT_NOT_NULL(yyjson_obj_get(broot, returned ? "seed_next_cursor"
+                                                   : "seed_continuation_requires_higher_budget"));
+    yyjson_doc_free(bdoc);
+    free(budget);
+    char *tree = dc_walk_call(
+        &fx, ",\"format\":\"tree\",\"scope\":\"files\",\"seeds\":\"list\",\"seed_limit\":1");
+    ASSERT_NOT_NULL(strstr(tree, "seed_total: 6"));
+    ASSERT_NOT_NULL(strstr(tree, "seed_returned: 1"));
+    ASSERT_NOT_NULL(strstr(tree, "seed_next_cursor:"));
+    ASSERT_NOT_NULL(strstr(tree, "whole_file"));
+    free(tree);
+    ASSERT_EQ(th_write_file(path, "import sys\n" DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL),
+              0);
+    snprintf(extra, sizeof(extra), "%s,\"seed_cursor\":\"%s\"", base, cursor);
+    char *stale = dc_walk_call(&fx, extra);
+    ASSERT_NOT_NULL(strstr(stale, "snapshot_changed"));
+    free(stale);
+    yyjson_doc_free(doc);
+    free(first);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_product_filter_does_not_inflate_fallback) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    cbm_store_t *store = cbm_store_open(fx.project);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_file(store, fx.project, "mod.py", &nodes, &count),
+              CBM_STORE_OK);
+    int leaf = -1;
+    for (int i = 0; i < count; i++)
+        if (strcmp(nodes[i].name, "leaf") == 0)
+            leaf = i;
+    ASSERT_GTE(leaf, 0);
+    const char *props[] = {"{\"is_test\":true}", "{\"test_role\":\"case\"}",
+                           "{\"test_role\":\"suite\"}", "{\"test_role\":\"helper\"}"};
+    const char *saved = nodes[leaf].properties_json;
+    for (int i = 0; i < 4; i++) {
+        nodes[leaf].properties_json = props[i];
+        ASSERT_GT(cbm_store_upsert_node(store, &nodes[leaf]), 0);
+        char *text = dc_walk_call(
+            &fx, ",\"format\":\"json\",\"seeds\":\"list\",\"seed_filter\":\"product\"");
+        yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        ASSERT_NOT_NULL(yyjson_obj_get(root, "seed_total"));
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_total")), 0);
+        ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "seed_symbols")), 0);
+        ASSERT_EQ(dc_walk_total(doc), 0);
+        yyjson_doc_free(doc);
+        free(text);
+    }
+    nodes[leaf].properties_json = saved;
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(store);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_seed_params_reject_misuse) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    const char *extras[] = {
+        ",\"seeds\":\"yes\"",          ",\"seeds\":1",         ",\"seed_filter\":\"tests\"",
+        ",\"seed_limit\":-1",          ",\"seed_limit\":1001", ",\"seed_limit\":1.5",
+        ",\"seed_offset\":2147483648", ",\"seed_cursor\":7",   ",\"seed_cursor\":\"invalid\""};
+    for (size_t i = 0; i < sizeof(extras) / sizeof(extras[0]); i++) {
+        char args[900];
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"seeds\":\"list\"%s}", fx.project,
+                 extras[i]);
+        /* Avoid duplicate seeds keys in the enum/type cases. */
+        if (i < 2)
+            snprintf(args, sizeof(args), "{\"project\":\"%s\"%s}", fx.project, extras[i]);
+        char *response = cbm_mcp_handle_tool(fx.srv, "detect_changes", args);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        free(response);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_product_filter_uses_project_config_and_override) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char path[600];
+    snprintf(path, sizeof(path), "%s/.codebase-memory.json", fx.repo);
+    ASSERT_EQ(
+        th_write_file(path,
+                      "{\"test_impact\":{\"version\":1,\"tests\":{\"test_globs\":[\"mod.py\"]}}}"),
+        0);
+    char *text =
+        dc_walk_call(&fx, ",\"format\":\"json\",\"seeds\":\"list\",\"seed_filter\":\"product\"");
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "seed_total")), 0);
+    yyjson_doc_free(doc);
+    free(text);
+    snprintf(path, sizeof(path), "%s/selection.json", fx.repo);
+    ASSERT_EQ(
+        th_write_file(path,
+                      "{\"test_impact\":{\"version\":1,\"tests\":{\"test_globs\":[\"spec/**\"]}}}"),
+        0);
+    text = dc_walk_call(&fx, ",\"format\":\"json\",\"seeds\":\"list\",\"seed_filter\":\"product\","
+                             "\"config_path\":\"selection.json\"");
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "seed_total")), 1);
+    yyjson_doc_free(doc);
+    free(text);
+    const char *invalid[] = {
+        ",\"config_path\":\"missing.json\"",
+        ",\"config_path\":7",
+        ",\"config_path\":\"\"",
+        ",\"config_path\":\"selection.json\\u0000ignored\"",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        char args[1200];
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"seed_filter\":\"product\"%s}",
+                 fx.project, invalid[i]);
+        char *response = cbm_mcp_handle_tool(fx.srv, "detect_changes", args);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        free(response);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* scope:"tests" answers with the test_impact object (mcp/test_impact_engine.h).
+ * The selection reads committed changes only: the fixture's edit is in the
+ * worktree, so against main nothing changed. A config_path that does not
+ * exist is evidence missing, never a narrower answer: everything runs. */
+TEST(detect_changes_scope_tests_answers_test_impact) {
+    dc_walk_fixture_t fx;
+    ASSERT_TRUE(dc_walk_fixture_open(&fx));
+    char *text = dc_walk_call(&fx, ",\"scope\":\"tests\"");
+    ASSERT_NOT_NULL(text);
+    if (!strstr(text, "\"decision\":\"nothing\"")) {
+        printf("  %.400s\n", text);
+    }
+    ASSERT_TRUE(strncmp(text, "{\"test_impact\":{", 16) == 0);
+    ASSERT_NOT_NULL(strstr(text, "\"decision\":\"nothing\""));
+    free(text);
+    text = dc_walk_call(&fx, ",\"scope\":\"tests\",\"config_path\":\"missing/config.json\"");
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "\"decision\":\"run_all\""));
+    ASSERT_NOT_NULL(strstr(text, "CONFIG_INVALID"));
+    free(text);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+TEST(detect_changes_fixpoint_walks_past_depth) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *plain = dc_walk_call(&fx, ",\"format\":\"json\"");
+    char *spelled = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":false,\"via\":false");
+    char *fixed = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":true");
+    ASSERT_NOT_NULL(plain);
+    ASSERT_NOT_NULL(spelled);
+    ASSERT_NOT_NULL(fixed);
+    ASSERT_STR_EQ(plain, spelled);
+
+    yyjson_doc *pdoc = yyjson_read(plain, strlen(plain), 0);
+    ASSERT_NOT_NULL(pdoc);
+    ASSERT_EQ(dc_walk_total(pdoc), 2);
+    ASSERT_NOT_NULL(dc_walk_row(pdoc, "mid2"));
+    ASSERT_NULL(dc_walk_row(pdoc, "mid3"));
+    ASSERT_NULL(yyjson_obj_get(yyjson_doc_get_root(pdoc), "fixpoint"));
+    ASSERT_NULL(yyjson_obj_get(yyjson_doc_get_root(pdoc), "edge_types"));
+
+    yyjson_doc *fdoc = yyjson_read(fixed, strlen(fixed), 0);
+    ASSERT_NOT_NULL(fdoc);
+    yyjson_val *froot = yyjson_doc_get_root(fdoc);
+    ASSERT_EQ(dc_walk_total(fdoc), 4);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(froot, "impacted_total_relation")), "eq");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(froot, "fixpoint")));
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(froot, "edge_types")), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get_first(yyjson_obj_get(froot, "edge_types"))),
+                  "CALLS");
+    yyjson_val *top = dc_walk_row(fdoc, "top");
+    ASSERT_NOT_NULL(top);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(top, "hop")), 4);
+    /* The changed function is the seed, never its own impact; a name is not a
+     * call. */
+    ASSERT_NULL(dc_walk_row(fdoc, "leaf"));
+    ASSERT_NULL(dc_walk_row(fdoc, "holder"));
+    /* Without `via` the rows keep their four columns. */
+    ASSERT_NULL(yyjson_obj_get(top, "via_qn"));
+
+    /* fixpoint ignores depth: the fixpoint holds every bounded answer. */
+    char *deep = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":true,\"depth\":1");
+    ASSERT_NOT_NULL(deep);
+    yyjson_doc *ddoc = yyjson_read(deep, strlen(deep), 0);
+    ASSERT_EQ(dc_walk_total(ddoc), 4);
+    yyjson_doc_free(ddoc);
+    free(deep);
+
+    /* A bounded walk through the same engine gives the bounded answer. */
+    char *bounded = dc_walk_call(&fx, ",\"format\":\"json\",\"edge_types\":[\"CALLS\"],"
+                                      "\"depth\":3");
+    ASSERT_NOT_NULL(bounded);
+    yyjson_doc *bdoc = yyjson_read(bounded, strlen(bounded), 0);
+    ASSERT_EQ(dc_walk_total(bdoc), 3);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(bdoc), "fixpoint")));
+    ASSERT_NOT_NULL(dc_walk_row(bdoc, "mid3"));
+    ASSERT_NULL(dc_walk_row(bdoc, "top"));
+
+    yyjson_doc_free(bdoc);
+    yyjson_doc_free(fdoc);
+    yyjson_doc_free(pdoc);
+    free(bounded);
+    free(fixed);
+    free(spelled);
+    free(plain);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* edge_types widens what counts as "depends on": a function that only names
+ * the changed one is reached over CALL_REFERENCE, never over CALLS. */
+TEST(detect_changes_edge_types_reach_references) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *calls = dc_walk_call(&fx, ",\"format\":\"json\",\"edge_types\":[\"CALLS\"]");
+    char *both =
+        dc_walk_call(&fx, ",\"format\":\"json\",\"edge_types\":[\"CALLS\",\"CALL_REFERENCE\"]");
+    ASSERT_NOT_NULL(calls);
+    ASSERT_NOT_NULL(both);
+    yyjson_doc *cdoc = yyjson_read(calls, strlen(calls), 0);
+    yyjson_doc *bdoc = yyjson_read(both, strlen(both), 0);
+    ASSERT_NOT_NULL(cdoc);
+    ASSERT_NOT_NULL(bdoc);
+    ASSERT_NULL(dc_walk_row(cdoc, "holder"));
+    yyjson_val *holder = dc_walk_row(bdoc, "holder");
+    ASSERT_NOT_NULL(holder);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(holder, "hop")), 1);
+    ASSERT_NOT_NULL(dc_walk_row(bdoc, "mid1"));
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(bdoc), "edge_types")), 2);
+
+    yyjson_doc_free(bdoc);
+    yyjson_doc_free(cdoc);
+    free(both);
+    free(calls);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* via:true says how each row was reached: the parent one hop closer and the
+ * edge type that led there. Both encodings carry it. */
+TEST(detect_changes_via_names_the_parent) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *json = dc_walk_call(&fx, ",\"format\":\"json\",\"via\":true,\"fixpoint\":true,"
+                                   "\"edge_types\":[\"CALLS\",\"CALL_REFERENCE\"]");
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *mid1 = dc_walk_row(doc, "mid1");
+    yyjson_val *mid2 = dc_walk_row(doc, "mid2");
+    yyjson_val *holder = dc_walk_row(doc, "holder");
+    ASSERT_NOT_NULL(mid1);
+    ASSERT_NOT_NULL(mid2);
+    ASSERT_NOT_NULL(holder);
+    /* A row one hop out names the seed, though seeds are not rows. */
+    const char *leaf_qn = yyjson_get_str(yyjson_obj_get(mid1, "via_qn"));
+    ASSERT_NOT_NULL(leaf_qn);
+    ASSERT_NOT_NULL(strstr(leaf_qn, ".leaf"));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mid1, "via_edge")), "CALLS");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mid2, "via_qn")),
+                  yyjson_get_str(yyjson_obj_get(mid1, "qn")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(mid2, "via_edge")), "CALLS");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(holder, "via_qn")), leaf_qn);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(holder, "via_edge")), "CALL_REFERENCE");
+
+    char *tree = dc_walk_call(&fx, ",\"via\":true");
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(strstr(tree, "via_qn"));
+    ASSERT_NOT_NULL(strstr(tree, "via_edge"));
+    char *plain_tree = dc_walk_call(&fx, "");
+    ASSERT_NOT_NULL(plain_tree);
+    ASSERT_NULL(strstr(plain_tree, "via_qn"));
+
+    free(plain_tree);
+    free(tree);
+    yyjson_doc_free(doc);
+    free(json);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* Every misuse is a teaching error; none of them is corrected silently, because
+ * a walk over the wrong edges reads as "nothing depends on this". */
+TEST(detect_changes_walk_params_teach_on_misuse) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    static const struct {
+        const char *extra;
+        const char *expect;
+    } cases[] = {
+        {",\"edge_types\":[\"CALL\"]", "unknown edge type \"CALL\""},
+        {",\"edge_types\":[\"CALL\"]", "CALLS"}, /* the error lists what the index has */
+        {",\"edge_types\":[]", "edge_types must be"},
+        {",\"edge_types\":\"CALLS\"", "edge_types must be"},
+        {",\"edge_types\":[\"CALLS\",7]", "edge_types must be"},
+        {",\"edge_types\":[\"CALLS\",\"CALLS\"]", "listed twice"},
+        {",\"fixpoint\":\"yes\"", "fixpoint must be true or false"},
+        {",\"via\":1", "via must be true or false"},
+        {",\"fixpoint\":true,\"direction\":\"outbound\"", "direction \"inbound\""},
+        {",\"via\":true,\"direction\":\"both\"", "direction \"inbound\""},
+        {",\"edge_types\":[\"CALLS\"],\"direction\":\"outbound\"", "direction \"inbound\""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char args[900];
+        snprintf(args, sizeof(args), "{\"project\":\"%s\"%s}", fx.project, cases[i].extra);
+        char *resp = cbm_mcp_handle_tool(fx.srv, "detect_changes", args);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+        char *text = extract_text_content(resp);
+        ASSERT_NOT_NULL(text);
+        if (!strstr(text, cases[i].expect)) {
+            printf("  case %zu: expected \"%s\" in: %s\n", i, cases[i].expect, text);
+        }
+        ASSERT_NOT_NULL(strstr(text, cases[i].expect));
+        free(text);
+        free(resp);
+    }
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* A cursor continues the question it was minted for. The walk parameters are
+ * part of that question. */
+TEST(detect_changes_cursor_bound_to_walk_params) {
+    dc_walk_fixture_t fx;
+    if (!dc_walk_fixture_open(&fx)) {
+        dc_walk_fixture_close(&fx);
+        FAIL("fixture setup failed");
+    }
+    char *first = dc_walk_call(&fx, ",\"format\":\"json\",\"fixpoint\":true,\"limit\":1");
+    ASSERT_NOT_NULL(first);
+    yyjson_doc *doc = yyjson_read(first, strlen(first), 0);
+    ASSERT_NOT_NULL(doc);
+    const char *cursor =
+        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "impacted_next_cursor"));
+    ASSERT_NOT_NULL(cursor);
+
+    char extra[400];
+    snprintf(extra, sizeof(extra),
+             ",\"format\":\"json\",\"fixpoint\":true,\"limit\":1,\"impact_cursor\":\"%s\"", cursor);
+    char *second = dc_walk_call(&fx, extra);
+    ASSERT_NOT_NULL(second);
+    yyjson_doc *sdoc = yyjson_read(second, strlen(second), 0);
+    ASSERT_NOT_NULL(sdoc);
+    /* Rows come in (hop, qualified name) order: the second page is hop 2. */
+    ASSERT_EQ(dc_walk_total(sdoc), 4);
+    yyjson_val *mid2 = dc_walk_row(sdoc, "mid2");
+    ASSERT_NOT_NULL(mid2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(mid2, "hop")), 2);
+
+    static const char *const other_questions[] = {
+        ",\"format\":\"json\",\"limit\":1",
+        ",\"format\":\"json\",\"fixpoint\":true,\"via\":true,\"limit\":1",
+        ",\"format\":\"json\",\"fixpoint\":true,\"limit\":1,\"edge_types\":[\"CALL_REFERENCE\"]",
+    };
+    for (size_t i = 0; i < sizeof(other_questions) / sizeof(other_questions[0]); i++) {
+        snprintf(extra, sizeof(extra), "%s,\"impact_cursor\":\"%s\"", other_questions[i], cursor);
+        char *refused = dc_walk_call(&fx, extra);
+        ASSERT_NOT_NULL(refused);
+        ASSERT_NOT_NULL(strstr(refused, "cursor_params_mismatch"));
+        free(refused);
+    }
+
+    yyjson_doc_free(sdoc);
+    free(second);
+    yyjson_doc_free(doc);
+    free(first);
+    dc_walk_fixture_close(&fx);
+    PASS();
+}
+
+/* Golden: a request that names none of the walk parameters gets the answer it
+ * got before they existed, byte for byte, in both encodings. The project name
+ * and every qualified name are fixed, so the only varying bytes are the commit
+ * id of the fixture, which is replaced before comparing. */
+static void dc_golden_blank_oids(char *text) {
+    for (char *p = text; *p;) {
+        size_t run = 0;
+        while (isxdigit((unsigned char)p[run])) {
+            run++;
+        }
+        if (run == 40) {
+            memset(p, '#', run);
+        }
+        p += run ? run : 1;
+    }
+}
+
+TEST(detect_changes_default_output_is_byte_identical_golden) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-golden-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-golden-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    char src[CBM_SZ_4K];
+    snprintf(src, sizeof(src), "%s/mod.py", repo);
+    ASSERT_EQ(th_write_file(src, DC_WALK_SRC_HEAD "    x = 1\n" DC_WALK_SRC_TAIL), 0);
+
+    const char *const init_args[] = {"-c", "init.defaultBranch=main", "init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+    ASSERT_EQ(th_write_file(src, DC_WALK_SRC_HEAD "    x = 11\n" DC_WALK_SRC_TAIL), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-golden";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    /* The graph of DC_WALK_SRC: leaf <- mid1 <- mid2 <- mid3 <- top. */
+    static const struct {
+        const char *name;
+        int start;
+        int end;
+    } defs[] = {
+        {"leaf", 1, 3}, {"mid1", 6, 7}, {"mid2", 10, 11}, {"mid3", 14, 15}, {"top", 18, 19}};
+    int64_t ids[5];
+    for (int i = 0; i < 5; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "detect-golden.mod.%s", defs[i].name);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = defs[i].name,
+                           .qualified_name = qn,
+                           .file_path = "mod.py",
+                           .start_line = defs[i].start,
+                           .end_line = defs[i].end};
+        ids[i] = cbm_store_upsert_node(store, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    for (int i = 1; i < 5; i++) {
+        cbm_edge_t edge = {
+            .project = project, .source_id = ids[i], .target_id = ids[i - 1], .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+    }
+
+    char *tree_response = cbm_mcp_handle_tool(
+        srv, "detect_changes", "{\"project\":\"detect-golden\",\"base_branch\":\"HEAD\"}");
+    char *tree = extract_text_content(tree_response);
+    char *json_response = cbm_mcp_handle_tool(
+        srv, "detect_changes",
+        "{\"project\":\"detect-golden\",\"base_branch\":\"HEAD\",\"format\":\"json\"}");
+    char *json = extract_text_content(json_response);
+    ASSERT_NOT_NULL(tree);
+    ASSERT_NOT_NULL(json);
+    dc_golden_blank_oids(tree);
+    dc_golden_blank_oids(json);
+    if (getenv("CBM_PRINT_DETECT_GOLDEN")) {
+        printf("GOLDEN-TREE<<%s>>\nGOLDEN-JSON<<%s>>\n", tree, json);
+    }
+    static const char *const golden_tree = "base: HEAD\n"
+                                           "merge_base: ########################################\n"
+                                           "direction: inbound\n"
+                                           "changed_total: 1\n"
+                                           "changed_returned: 1\n"
+                                           "changed_has_more: false\n"
+                                           "changed_files: 1  (cols: path)\n"
+                                           "  mod.py\n"
+                                           "seed_symbols: 1\n"
+                                           "impacted_total: 2\n"
+                                           "impacted_total_relation: eq\n"
+                                           "impacted_shown: 2\n"
+                                           "impacted: 2  (cols: qn label file hop)\n"
+                                           "  detect-golden.mod.mid1 Function mod.py 1\n"
+                                           "  detect-golden.mod.mid2 Function mod.py 2\n"
+                                           "impacted_has_more: false\n"
+                                           "module_total: 1\n"
+                                           "module_total_relation: eq\n"
+                                           "module_returned: 1\n"
+                                           "module_has_more: false\n"
+                                           "impacted_modules: 1  (cols: module count)\n"
+                                           "  mod.py 2\n";
+    static const char *const golden_json =
+        "{\"base\":\"HEAD\",\"merge_base\":\"########################################\",\"dir"
+        "ection\":\"inbound\",\"changed_total\":1,\"changed_returned\":1,\"changed_has_more\""
+        ":false,\"changed_files\":[\"mod.py\"],\"seed_symbols\":1,\"impacted_total\":2,\"impa"
+        "cted_total_relation\":\"eq\",\"impacted_shown\":2,\"impacted\":[{\"qn\":\"detect-gol"
+        "den.mod.mid1\",\"label\":\"Function\",\"file\":\"mod.py\",\"hop\":1},{\"qn\":\"detec"
+        "t-golden.mod.mid2\",\"label\":\"Function\",\"file\":\"mod.py\",\"hop\":2}],\"impacte"
+        "d_has_more\":false,\"module_total\":1,\"module_total_relation\":\"eq\",\"module_retu"
+        "rned\":1,\"module_has_more\":false,\"impacted_modules\":[{\"module\":\"mod.py\",\"co"
+        "unt\":2}],\"truncated\":false}";
+    ASSERT_STR_EQ(tree, golden_tree);
+    ASSERT_STR_EQ(json, golden_json);
+
+    free(json);
+    free(json_response);
+    free(tree);
+    free(tree_response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+    PASS();
+}
+
 TEST(tool_ingest_traces_basic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -22558,6 +23353,18 @@ SUITE(mcp) {
     RUN_TEST(detect_changes_node_in_hunks_overlap_issue1363);
     RUN_TEST(detect_changes_seeds_only_touched_symbol_issue1363);
     RUN_TEST(detect_changes_zero_overlap_falls_back_issue1363);
+    RUN_TEST(detect_changes_seed_list_reports_hunk_without_walk);
+    RUN_TEST(detect_changes_seed_pages_bind_semantics_and_snapshot);
+    RUN_TEST(detect_changes_product_filter_does_not_inflate_fallback);
+    RUN_TEST(detect_changes_seed_params_reject_misuse);
+    RUN_TEST(detect_changes_product_filter_uses_project_config_and_override);
+    RUN_TEST(detect_changes_scope_tests_answers_test_impact);
+    RUN_TEST(detect_changes_fixpoint_walks_past_depth);
+    RUN_TEST(detect_changes_edge_types_reach_references);
+    RUN_TEST(detect_changes_via_names_the_parent);
+    RUN_TEST(detect_changes_walk_params_teach_on_misuse);
+    RUN_TEST(detect_changes_cursor_bound_to_walk_params);
+    RUN_TEST(detect_changes_default_output_is_byte_identical_golden);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 

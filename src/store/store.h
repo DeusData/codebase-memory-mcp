@@ -17,6 +17,7 @@
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_store cbm_store_t;
+typedef struct cbm_store_read_scope cbm_store_read_scope_t;
 
 /* ── Result codes ───────────────────────────────────────────────── */
 
@@ -27,6 +28,8 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
+/* Read-scope cleanup could not restore the connection: close/discard it. */
+#define CBM_STORE_SCOPE_DISCARD (-6)
 
 #define CBM_STORE_FILE_OUTLINE_MAX_LIMIT 200
 #define CBM_STORE_FILE_OUTLINE_MAX_LABELS 16
@@ -95,6 +98,14 @@ typedef struct {
     int ref_bloom_len;
     const char *config_ctx; /* governing-config context hash ("" = none) */
 } cbm_lsp_surface_row_t;
+
+/* The definition variants that lie in a file (graph_buffer.c "Definition
+ * variants"): one row per variant span in `file_path`, as the node it
+ * belongs to with start_line/end_line set to that span. Covers the file's
+ * own nodes (their other #if branches) and nodes whose file_path names
+ * another file that the file writes a variant of. */
+int cbm_store_find_variant_spans_by_file(cbm_store_t *s, const char *project, const char *file_path,
+                                         cbm_node_t **out, int *count);
 
 /* Find nodes overlapping a line range in a file (excludes Module/Package). */
 int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, const char *file_path,
@@ -166,6 +177,16 @@ int cbm_store_get_dependent_files(cbm_store_t *s, const char *project,
                                   const char *const *target_files, int target_count, char ***out,
                                   int *out_count);
 void cbm_store_free_dependent_files(char **files, int count);
+
+/* Variant partners for closure-repair routing: the files that write another
+ * variant of a definition written in any of `files` (one node for a
+ * definition's platform files, header declaration and source definition, Go
+ * build-tagged files; a DEFINES edge from each file's File node). Excludes
+ * `files` themselves; served by idx_nodes_file + the edge source/target
+ * indexes. Free with cbm_store_free_dependent_files. */
+int cbm_store_get_variant_partner_files(cbm_store_t *s, const char *project,
+                                        const char *const *files, int count, char ***out,
+                                        int *out_count);
 
 /* Find edges whose properties contain a url_path matching the keyword. */
 int cbm_store_find_edges_by_url_path(cbm_store_t *s, const char *project, const char *keyword,
@@ -418,6 +439,16 @@ void cbm_store_close(cbm_store_t *s);
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
 
+/* The digest of a project's graph CONTENT (store_content_digest.c): rows keyed
+ * by what they say, never by row id, database identity, generation or mtime.
+ * Two graphs of the same tree, built incrementally or in full, are equal
+ * exactly when their content digests are. out: 32 raw SHA-256 bytes. */
+int cbm_store_graph_content_digest(cbm_store_t *s, const char *project, unsigned char out[32]);
+/* The part of the content test selection reads: node identity, every edge by
+ * endpoints and type without properties, except the corpus-statistical
+ * SIMILAR_TO / SEMANTICALLY_RELATED; file hashes; index coverage. */
+int cbm_store_graph_topology_digest(cbm_store_t *s, const char *project, unsigned char out[32]);
+
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);
 
@@ -431,6 +462,28 @@ int cbm_store_commit(cbm_store_t *s);
 
 /* Rollback the current transaction. */
 int cbm_store_rollback(cbm_store_t *s);
+
+/* Stable request read scope. Borrows an exclusively owned, single-thread
+ * store and callback context. Refuses a transaction, busy statement or owned
+ * progress handler; idle cached statements are allowed. Saves query_only and
+ * busy_timeout, sets ON/0, begins DEFERRED and pins main.nodes before returning.
+ * The cancellation callback is a pure predicate: no SQLite/store/scope/walk
+ * calls. Do not replace connection handlers, transactions or close the store
+ * during the borrow. Close walks first, then the scope, then the store.
+ *
+ * Open clears *out. Any cleanup/restoration failure, including failed open,
+ * returns SCOPE_DISCARD: the caller MUST discard this connection. */
+int cbm_store_read_scope_open(cbm_store_t *s, cbm_store_cancel_fn cancel, void *context,
+                              cbm_store_read_scope_t **out);
+/* First cancellation/error is sticky. Check also rejects a lost transaction. */
+int cbm_store_read_scope_check(cbm_store_read_scope_t *scope);
+/* Consumer failure: accepts ERR or CANCELLED; other values latch ERR. */
+int cbm_store_read_scope_fail(cbm_store_read_scope_t *scope, int status);
+/* Borrowed store binding, not a health check or certification. */
+cbm_store_t *cbm_store_read_scope_store(const cbm_store_read_scope_t *scope);
+/* Disables its handler before cleanup. Returns latched status unless cleanup
+ * fails (SCOPE_DISCARD). NULL is OK. Frees scope on every non-NULL call. */
+int cbm_store_read_scope_close(cbm_store_read_scope_t *scope);
 
 /* ── Bulk write optimization ────────────────────────────────────── */
 

@@ -178,6 +178,10 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
          * project, so it needs no daemon. Listed here rather than routed through
          * the daemon so enrolling a root cannot depend on daemon state. */
         "allow-root",
+        /* test-impact runs its own frozen index of a pinned tree in process
+         * (CI: publish the team artifact, select tests); it never reads or
+         * writes the daemon's projects, so it needs no daemon. */
+        "test-impact",
     };
     /* Stop at the first top-level mode token. Tool names, flag values, and JSON
      * following `cli` are opaque user input: a search query named "install"

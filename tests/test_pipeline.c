@@ -1999,6 +1999,231 @@ TEST(pipeline_objectscript_export_incremental_matches_full_relationships) {
     PASS();
 }
 
+/* Cross-language unique_name leak. Every Python file injects a few builtin
+ * stub definitions (builtins.dict.get, builtins.len, ...; see
+ * internal/cbm/lsp/py_builtins.c) into the project registry. A JS Express
+ * registration `app.get('/users', listUsers)` has no LSP target, falls
+ * through to the registry, and its short name "get" had exactly one
+ * candidate project-wide: Python's builtins.dict.get (strategy unique_name).
+ * The non-empty resolution skipped the route-registration fallback (it runs
+ * only on an EMPTY resolution), and the weak-member guard then dropped the
+ * plain CALLS edge, so the Route node and its HANDLES edge vanished -- on the
+ * sequential and the parallel path alike, and on an incremental reindex whose
+ * registry is re-seeded from stored nodes (the builtin stubs survive there
+ * even after the last .py file is gone).
+ *
+ * The same leak fabricates CALLS edges on both paths: a bare JS `print(msg)`
+ * bound to Python's builtins.print by unique_name. `cache.get(key)` guards the
+ * other side of the veto: an unresolved route verb without a route path must
+ * not become a CALLS self-loop on the parallel path.
+ *
+ * The Python control proves the builtins stay reachable from Python itself:
+ * lookup() -> builtins.dict.get (lsp_generic_method) and -> builtins.len. */
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int routes;      /* Route node "/users" */
+    int handles;     /* listUsers -[HANDLES]-> "/users" */
+    int py_dict_get; /* lookup -[CALLS]-> get */
+    int py_len;      /* lookup -[CALLS]-> len */
+    int js_print;    /* report -[CALLS]-> print (JS global, never Python's) */
+    int self_loop;   /* readCache -[CALLS]-> readCache (unresolved route verb) */
+} XlangRouteObservation;
+
+static XlangRouteObservation observe_xlang_route(const char *repo_path, const char *db_name) {
+    XlangRouteObservation o = {.run_rc = -1,
+                               .routes = -1,
+                               .handles = -1,
+                               .py_dict_get = -1,
+                               .py_len = -1,
+                               .js_print = -1,
+                               .self_loop = -1};
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", repo_path, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FULL);
+    if (!pipeline) {
+        return o;
+    }
+    o.run_rc = cbm_pipeline_run(pipeline);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    o.store_opened = store != NULL;
+    if (store && project) {
+        o.routes = named_node_count(store, project, "/users");
+        o.handles = named_edge_count(store, project, "HANDLES", "listUsers", "/users");
+        o.py_dict_get = named_edge_count(store, project, "CALLS", "lookup", "get");
+        o.py_len = named_edge_count(store, project, "CALLS", "lookup", "len");
+        o.js_print = named_edge_count(store, project, "CALLS", "report", "print");
+        o.self_loop = named_edge_count(store, project, "CALLS", "readCache", "readCache");
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return o;
+}
+
+static const char XLANG_APP_JS[] = "const express = require('express');\n"
+                                   "const app = express();\n"
+                                   "\n"
+                                   "function listUsers(req, res) {\n"
+                                   "  res.json([]);\n"
+                                   "}\n"
+                                   "\n"
+                                   "app.get('/users', listUsers);\n"
+                                   "\n"
+                                   "function report(msg) {\n"
+                                   "  print(msg);\n"
+                                   "}\n"
+                                   "\n"
+                                   "function readCache(cache, key) {\n"
+                                   "  return cache.get(key);\n"
+                                   "}\n"
+                                   "module.exports = { app, report, readCache };\n";
+
+static const char XLANG_TOOL_PY[] = "def lookup(xs):\n"
+                                    "    d = {\"k\": 1}\n"
+                                    "    n = len(xs)\n"
+                                    "    return d.get(\"k\"), n\n";
+
+/* Writes app.js + tool.py + `pad` JS filler files (the fillers only select the
+ * parallel path: more than MIN_FILES_FOR_PARALLEL files). 0 on success. */
+static int write_xlang_route_fixture(const char *dir, int pad) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/app.js", dir);
+    if (th_write_file(path, XLANG_APP_JS) != 0) {
+        return -1;
+    }
+    snprintf(path, sizeof(path), "%s/tool.py", dir);
+    if (th_write_file(path, XLANG_TOOL_PY) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < pad; i++) {
+        char source[128];
+        snprintf(path, sizeof(path), "%s/xlang_pad_%02d.js", dir, i);
+        snprintf(source, sizeof(source), "function xlangPad%02d() { return %d; }\n", i, i);
+        if (th_write_file(path, source) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Saves and overrides the two worker-selection variables. */
+typedef struct {
+    char *workers;
+    char *single;
+} XlangEnvSave;
+
+static XlangEnvSave xlang_env_select(bool parallel) {
+    XlangEnvSave save = {0};
+    const char *w = getenv("CBM_WORKERS");
+    const char *s = getenv("CBM_INDEX_SINGLE_THREAD");
+    save.workers = w ? strdup(w) : NULL;
+    save.single = s ? strdup(s) : NULL;
+    if (parallel) {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    } else {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    }
+    return save;
+}
+
+static void xlang_env_restore(XlangEnvSave *save) {
+    if (save->workers) {
+        cbm_setenv("CBM_WORKERS", save->workers, 1);
+        free(save->workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (save->single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", save->single, 1);
+        free(save->single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    save->workers = NULL;
+    save->single = NULL;
+}
+
+static XlangRouteObservation run_xlang_route_case(bool parallel, int pad) {
+    XlangRouteObservation o = {.run_rc = -1};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_xlang_route_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return o;
+    }
+    if (write_xlang_route_fixture(tmp, pad) == 0) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        o = observe_xlang_route(tmp, "xlang.db");
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return o;
+}
+
+TEST(pipeline_js_route_not_bound_to_python_builtin_sequential) {
+    XlangRouteObservation o = run_xlang_route_case(false, 0);
+    ASSERT_EQ(o.run_rc, 0);
+    ASSERT_TRUE(o.store_opened);
+    ASSERT_EQ(o.routes, 1);
+    ASSERT_EQ(o.handles, 1);
+    ASSERT_EQ(o.py_dict_get, 1);
+    ASSERT_EQ(o.py_len, 1);
+    ASSERT_EQ(o.js_print, 0);
+    ASSERT_EQ(o.self_loop, 0);
+    PASS();
+}
+
+TEST(pipeline_js_route_not_bound_to_python_builtin_parallel) {
+    XlangRouteObservation o = run_xlang_route_case(true, 55);
+    ASSERT_EQ(o.run_rc, 0);
+    ASSERT_TRUE(o.store_opened);
+    ASSERT_EQ(o.routes, 1);
+    ASSERT_EQ(o.handles, 1);
+    ASSERT_EQ(o.py_dict_get, 1);
+    ASSERT_EQ(o.py_len, 1);
+    ASSERT_EQ(o.js_print, 0);
+    ASSERT_EQ(o.self_loop, 0);
+    PASS();
+}
+
+/* Incremental: the registry is re-seeded from stored nodes, where the Python
+ * builtin stubs outlive the last .py file (their file_path is synthetic). */
+TEST(pipeline_js_route_not_bound_to_python_builtin_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_xlang_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    if (write_xlang_route_fixture(tmp, 0) != 0) {
+        th_rmtree(tmp);
+        FAIL("fixture");
+    }
+    XlangEnvSave save = xlang_env_select(false);
+    XlangRouteObservation initial = observe_xlang_route(tmp, "xlang-incr.db");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/tool.py", tmp);
+    int rm_rc = remove(path);
+    snprintf(path, sizeof(path), "%s/app.js", tmp);
+    int append_rc = th_append_file(path, "// edited: re-resolve this file\n");
+    XlangRouteObservation incremental = observe_xlang_route(tmp, "xlang-incr.db");
+    xlang_env_restore(&save);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rm_rc, 0);
+    ASSERT_EQ(append_rc, 0);
+    ASSERT_EQ(initial.run_rc, 0);
+    ASSERT_EQ(incremental.run_rc, 0);
+    ASSERT_TRUE(incremental.store_opened);
+    ASSERT_EQ(incremental.routes, 1);
+    ASSERT_EQ(incremental.handles, 1);
+    ASSERT_EQ(incremental.js_print, 0);
+    ASSERT_EQ(incremental.self_loop, 0);
+    PASS();
+}
+
 static bool test_buffer_appendf(char *buffer, size_t capacity, size_t *used, const char *format,
                                 ...) {
     if (!buffer || !used || *used >= capacity) {
@@ -7218,6 +7443,524 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     PASS();
 }
 
+/* True when a node named src_name has an edge of edge_type to the Field
+ * `field` OWNED BY `owner` (qualified name ends in ".owner.field"). The
+ * name-only cross_file_edge_exists cannot tell two same-named fields apart,
+ * which is exactly what the C member-access probes below must do. */
+static bool field_edge_exists(cbm_store_t *s, const char *project, const char *src_name,
+                              const char *owner, const char *field, const char *edge_type) {
+    char suffix[256];
+    snprintf(suffix, sizeof(suffix), ".%s.%s", owner, field);
+    size_t suffix_len = strlen(suffix);
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, field, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, edge_type, &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc && !found; k++) {
+                const char *qn = tgts[k].qualified_name;
+                size_t qn_len = qn ? strlen(qn) : 0;
+                found = edges[j].target_id == tgts[k].id && tgts[k].label &&
+                        strcmp(tgts[k].label, "Field") == 0 && qn_len >= suffix_len &&
+                        strcmp(qn + qn_len - suffix_len, suffix) == 0;
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
+/* Number of edges of edge_type that END on the Field `field` owned by `owner`,
+ * whatever their source: the call probes below must hold for a caller in any
+ * language, including a shell script whose source node has no stable name. */
+static int field_inbound_edge_count(cbm_store_t *s, const char *project, const char *owner,
+                                    const char *field, const char *edge_type) {
+    char suffix[256];
+    snprintf(suffix, sizeof(suffix), ".%s.%s", owner, field);
+    size_t suffix_len = strlen(suffix);
+    cbm_node_t *tgts = NULL;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, field, &tgts, &tc);
+    int total = 0;
+    for (int k = 0; k < tc; k++) {
+        const char *qn = tgts[k].qualified_name;
+        size_t qn_len = qn ? strlen(qn) : 0;
+        if (!tgts[k].label || strcmp(tgts[k].label, "Field") != 0 || qn_len < suffix_len ||
+            strcmp(qn + qn_len - suffix_len, suffix) != 0) {
+            continue;
+        }
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_target_type(s, tgts[k].id, edge_type, &edges, &ec);
+        total += ec;
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return total;
+}
+
+/* Fixture for the C member-access probes: two structs share the field name
+ * `count`, and each function touches exactly one of them. A bare-name lookup
+ * of `count` can only pick one Field for both functions; only the type of the
+ * object expression says which struct is meant. `use_opaque` reaches `count`
+ * through a type the project never defines, so no Field may be bound at all;
+ * `beta_only` through that same untyped object is the one Field of that name
+ * in the project, so nothing has to be picked and it binds.
+ *
+ * Calls follow the same rule. The structs carry a function-pointer member
+ * `notify` (declared through a typedef: a member spelled `void (*notify)(int)`
+ * has no Field node today, a separate extraction gap). `use_remote` calls
+ * Beta's `notify` from a file that declares its own struct with a `notify`
+ * member -- the candidate a bare-name lookup prefers, being in the same
+ * module. `call_param` calls a PARAMETER named like the field `alpha_only`,
+ * and `tool.sh` runs a command of that name: neither calls a struct member. */
+static void write_c_member_field_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "alpha.h",
+                    "#ifndef ALPHA_H\n"
+                    "#define ALPHA_H\n"
+                    "typedef void (*alpha_notify_fn)(int);\n"
+                    "struct Alpha {\n"
+                    "    int count;\n"
+                    "    int alpha_only;\n"
+                    "    alpha_notify_fn notify;\n"
+                    "};\n"
+                    "#endif\n");
+    write_temp_file(tmp, "beta.h",
+                    "#ifndef BETA_H\n"
+                    "#define BETA_H\n"
+                    "typedef void (*beta_notify_fn)(int);\n"
+                    "typedef struct {\n"
+                    "    int count;\n"
+                    "    int beta_only;\n"
+                    "    beta_notify_fn notify;\n"
+                    "} Beta;\n"
+                    "#endif\n");
+    write_temp_file(tmp, "use_alpha.c",
+                    "#include \"alpha.h\"\n"
+                    "\n"
+                    "int use_alpha(struct Alpha *a) {\n"
+                    "    a->count = 1;\n"
+                    "    return a->count + a->alpha_only;\n"
+                    "}\n"
+                    "\n"
+                    "int call_param(int (*alpha_only)(void)) {\n"
+                    "    return alpha_only();\n"
+                    "}\n");
+    write_temp_file(tmp, "mix.c",
+                    "#include \"beta.h\"\n"
+                    "\n"
+                    "typedef void (*local_notify_fn)(int);\n"
+                    "struct Local {\n"
+                    "    local_notify_fn notify;\n"
+                    "};\n"
+                    "\n"
+                    "void use_remote(Beta b) {\n"
+                    "    b.notify(3);\n"
+                    "}\n");
+    write_temp_file(tmp, "tool.sh",
+                    "#!/bin/sh\n"
+                    "alpha_only --check\n");
+    write_temp_file(tmp, "use_beta.c",
+                    "#include \"beta.h\"\n"
+                    "\n"
+                    "int use_beta(Beta b) {\n"
+                    "    b.count = 2;\n"
+                    "    return b.count + b.beta_only;\n"
+                    "}\n");
+    write_temp_file(tmp, "use_opaque.c",
+                    "struct Opaque;\n"
+                    "\n"
+                    "int use_opaque(struct Opaque *o) {\n"
+                    "    return o->count + o->beta_only;\n"
+                    "}\n");
+    /* Inline functions in a header. A `.h` is parsed as C++, and its member
+     * accesses mean what they mean in the .c files that include it. */
+    write_temp_file(tmp, "inline.h",
+                    "#ifndef INLINE_H\n"
+                    "#define INLINE_H\n"
+                    "#include \"alpha.h\"\n"
+                    "#include \"beta.h\"\n"
+                    "static inline int hdr_alpha(struct Alpha *a) {\n"
+                    "    return a->count;\n"
+                    "}\n"
+                    "static inline int hdr_beta(Beta *b) {\n"
+                    "    b->count = 1;\n"
+                    "    return b->count;\n"
+                    "}\n"
+                    "/* A struct the header itself declares, through a typedef. */\n"
+                    "typedef struct {\n"
+                    "    int count;\n"
+                    "    char *buf;\n"
+                    "} HdrBuf;\n"
+                    "struct HdrNode {\n"
+                    "    int count;\n"
+                    "};\n"
+                    "static inline int hdr_own_typedef(HdrBuf *s) {\n"
+                    "    return s->count;\n"
+                    "}\n"
+                    "static inline int hdr_own_struct(struct HdrNode *n) {\n"
+                    "    return n->count;\n"
+                    "}\n"
+                    "#endif\n");
+    /* Functions inside preprocessor branches of a .c file are functions like
+     * any other. */
+    write_temp_file(tmp, "guarded.c",
+                    "#include \"alpha.h\"\n"
+                    "#include \"beta.h\"\n"
+                    "\n"
+                    "#ifdef SOME_CONFIG\n"
+                    "int guarded_alpha(struct Alpha *a) {\n"
+                    "    return a->count;\n"
+                    "}\n"
+                    "#else\n"
+                    "int guarded_beta(Beta *b) {\n"
+                    "    return b->count;\n"
+                    "}\n"
+                    "#endif\n");
+    /* A member call on an object nothing types. In C the one member of that
+     * name in the project may still bind; in a C++ source such a call is a
+     * method of some type the project does not hold, and binds nothing. */
+    write_temp_file(tmp, "cb.h",
+                    "#ifndef CB_H\n"
+                    "#define CB_H\n"
+                    "struct CbTable {\n"
+                    "    int (*only_cb)(int);\n"
+                    "};\n"
+                    "#endif\n");
+    write_temp_file(tmp, "untyped_c.c",
+                    "struct Hidden;\n"
+                    "\n"
+                    "int c_untyped_call(struct Hidden *h) {\n"
+                    "    return h->only_cb(1);\n"
+                    "}\n");
+    write_temp_file(tmp, "untyped_cpp.cpp",
+                    "template <class T> int cpp_untyped_call(T *h) {\n"
+                    "    return h->only_cb(1);\n"
+                    "}\n");
+    /* A global variable declared behind an `#ifndef` types the accesses made
+     * through it, whether its type is spelled with `struct` or a typedef. */
+    write_temp_file(tmp, "globals.c",
+                    "#include \"alpha.h\"\n"
+                    "#include \"beta.h\"\n"
+                    "\n"
+                    "#ifndef NO_GLOBALS\n"
+                    "static struct Alpha g_alpha;\n"
+                    "static Beta g_beta;\n"
+                    "#endif\n"
+                    "\n"
+                    "int read_alpha_global(void) {\n"
+                    "    return g_alpha.count;\n"
+                    "}\n"
+                    "\n"
+                    "int read_beta_global(void) {\n"
+                    "    return g_beta.count;\n"
+                    "}\n");
+    /* Ops tables: pointer-to-function members written inline, called through
+     * `->`. Two tables share both member names, so only the object's type
+     * says which is called; `arrow_chain` reaches its table through a member
+     * whose type is spelled `struct Ops *`. */
+    write_temp_file(tmp, "ops.h",
+                    "#ifndef OPS_H\n"
+                    "#define OPS_H\n"
+                    "struct Dev;\n"
+                    "struct Ops {\n"
+                    "    void (*open)(int fd);\n"
+                    "    int (*shut)(int fd);\n"
+                    "    struct Dev *(*owner)(int fd);\n"
+                    "};\n"
+                    "struct Dev {\n"
+                    "    struct Ops *ops;\n"
+                    "    int id;\n"
+                    "};\n"
+                    "struct Bank {\n"
+                    "    struct Dev *devs, *spare;\n"
+                    "    struct Dev fixed[2];\n"
+                    "    int id;\n"
+                    "};\n"
+                    "#endif\n");
+    write_temp_file(tmp, "other_ops.h",
+                    "#ifndef OTHER_OPS_H\n"
+                    "#define OTHER_OPS_H\n"
+                    "struct OtherOps {\n"
+                    "    void (*open)(int fd);\n"
+                    "    int (*shut)(int fd);\n"
+                    "    int id;\n"
+                    "};\n"
+                    "#endif\n");
+    write_temp_file(tmp, "use_ops.c",
+                    "#include \"ops.h\"\n"
+                    "#include \"other_ops.h\"\n"
+                    "\n"
+                    "void arrow_ops(struct Ops *o) {\n"
+                    "    o->open(1);\n"
+                    "}\n"
+                    "\n"
+                    "void arrow_other(struct OtherOps *x) {\n"
+                    "    x->open(2);\n"
+                    "}\n"
+                    "\n"
+                    "int arrow_chain(struct Dev *d) {\n"
+                    "    return d->ops->shut(3);\n"
+                    "}\n"
+                    "\n"
+                    "int arrow_ret(struct Ops *o) {\n"
+                    "    return o->owner(4)->id;\n"
+                    "}\n"
+                    "\n"
+                    "int index_ptr(struct Bank *b) {\n"
+                    "    return b->devs[1].id;\n"
+                    "}\n"
+                    "\n"
+                    "int index_arr(struct Bank *b) {\n"
+                    "    return b->fixed[0].id;\n"
+                    "}\n"
+                    "\n"
+                    "int second_decl(struct Bank *b) {\n"
+                    "    return b->spare->id;\n"
+                    "}\n");
+    /* Designated initializers name members with no object expression at all:
+     * the type being initialized says whose member `.open` is. At file scope
+     * (the usual ops table), nested, through an array, in a block and in a
+     * compound literal. Each table file initializes ONE of the two tables. */
+    write_temp_file(tmp, "table_ops.c",
+                    "#include \"ops.h\"\n"
+                    "\n"
+                    "static void my_open(int fd) { (void)fd; }\n"
+                    "static int my_shut(int fd) { return fd; }\n"
+                    "\n"
+                    "static struct Ops table_ops = {\n"
+                    "    .open = my_open,\n"
+                    "    .shut = my_shut,\n"
+                    "};\n"
+                    "\n"
+                    "static struct Bank bank_init = {\n"
+                    "    .fixed = { [0] = { .ops = &table_ops } },\n"
+                    "    .id = 3,\n"
+                    "};\n");
+    write_temp_file(tmp, "table_other.c",
+                    "#include \"other_ops.h\"\n"
+                    "\n"
+                    "static void their_open(int fd) { (void)fd; }\n"
+                    "\n"
+                    "static struct OtherOps other_table = {\n"
+                    "    .open = their_open,\n"
+                    "};\n");
+    write_temp_file(tmp, "init_local.c",
+                    "#include \"ops.h\"\n"
+                    "#include \"other_ops.h\"\n"
+                    "\n"
+                    "int init_block(void) {\n"
+                    "    struct Dev d = { .id = 1 };\n"
+                    "    return d.id;\n"
+                    "}\n"
+                    "\n"
+                    "void init_literal(struct Bank *b) {\n"
+                    "    *b->devs = (struct Dev){ .id = 2 };\n"
+                    "}\n"
+                    "\n"
+                    "void init_array(void) {\n"
+                    "    struct OtherOps pair[2] = { { .id = 1 }, { .id = 2 } };\n"
+                    "    (void)pair;\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.c", i);
+        snprintf(body, sizeof(body), "int filler%d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* Shared assertions for the sequential and the parallel twin. */
+static int assert_c_member_fields_bind_by_type(cbm_store_t *s, const char *project) {
+    /* The probe means nothing unless both same-named fields exist. */
+    ASSERT_GTE(fixture_node_count(s, project, "alpha.h", "count", "Field"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "beta.h", "count", "Field"), 1);
+    /* Reproduce-first: RED while `count` resolves by bare name — both
+     * functions then bind the SAME Field, so one of each pair is wrong. */
+    ASSERT_TRUE(field_edge_exists(s, project, "use_alpha", "Alpha", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_alpha", "Beta", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "use_beta", "Beta", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_beta", "Alpha", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "use_alpha", "Alpha", "count", "WRITES"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_alpha", "Beta", "count", "WRITES"));
+    ASSERT_TRUE(field_edge_exists(s, project, "use_beta", "Beta", "count", "WRITES"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_beta", "Alpha", "count", "WRITES"));
+    /* A field whose name is unique keeps its edge. */
+    ASSERT_TRUE(field_edge_exists(s, project, "use_alpha", "Alpha", "alpha_only", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "use_beta", "Beta", "beta_only", "USAGE"));
+    /* An object whose type the project never defines binds no Field by a
+     * name several structs share... */
+    ASSERT_FALSE(field_edge_exists(s, project, "use_opaque", "Alpha", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_opaque", "Beta", "count", "USAGE"));
+    /* ...and still binds a member name the project holds exactly once. */
+    ASSERT_TRUE(field_edge_exists(s, project, "use_opaque", "Beta", "beta_only", "USAGE"));
+    /* A call through a function-pointer member lands on the member of its
+     * object's type, not on the same-named member its own file declares. */
+    ASSERT_GTE(fixture_node_count(s, project, "mix.c", "notify", "Field"), 1);
+    ASSERT_TRUE(field_edge_exists(s, project, "use_remote", "Beta", "notify", "CALLS"));
+    ASSERT_FALSE(field_edge_exists(s, project, "use_remote", "Local", "notify", "CALLS"));
+    /* A bare C call of a parameter named `alpha_only` and a shell command of
+     * that name are not calls of the struct member, however unique the name. */
+    ASSERT_EQ(field_inbound_edge_count(s, project, "Alpha", "alpha_only", "CALLS"), 0);
+    /* `p->f(...)` through an inline pointer-to-function member: the call lands
+     * on the member of the pointed-to struct, never on the same-named member
+     * of the other table. */
+    ASSERT_GTE(fixture_node_count(s, project, "ops.h", "open", "Field"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "other_ops.h", "open", "Field"), 1);
+    ASSERT_TRUE(field_edge_exists(s, project, "arrow_ops", "Ops", "open", "CALLS"));
+    ASSERT_FALSE(field_edge_exists(s, project, "arrow_ops", "OtherOps", "open", "CALLS"));
+    ASSERT_TRUE(field_edge_exists(s, project, "arrow_other", "OtherOps", "open", "CALLS"));
+    ASSERT_FALSE(field_edge_exists(s, project, "arrow_other", "Ops", "open", "CALLS"));
+    /* The object of the call is itself a member access whose member is typed
+     * `struct Ops *`: both steps of the chain are typed. */
+    ASSERT_TRUE(field_edge_exists(s, project, "arrow_chain", "Dev", "ops", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "arrow_chain", "Ops", "shut", "CALLS"));
+    ASSERT_FALSE(field_edge_exists(s, project, "arrow_chain", "OtherOps", "shut", "CALLS"));
+    /* A call through a pointer-to-function member has that member's return
+     * type: `o->owner(4)->id` is the `id` of struct Dev. */
+    ASSERT_TRUE(field_edge_exists(s, project, "arrow_ret", "Ops", "owner", "CALLS"));
+    ASSERT_TRUE(field_edge_exists(s, project, "arrow_ret", "Dev", "id", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "arrow_ret", "OtherOps", "id", "USAGE"));
+    /* A pointer member and an array member have an element type, and the
+     * second declarator of `struct Dev *devs, *spare;` is a member too. `id`
+     * is a name three structs share, so each of these needs the full chain. */
+    ASSERT_TRUE(field_edge_exists(s, project, "index_ptr", "Bank", "devs", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "index_ptr", "Dev", "id", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "index_ptr", "Bank", "id", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "index_arr", "Bank", "fixed", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "index_arr", "Dev", "id", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "second_decl", "Bank", "spare", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "second_decl", "Dev", "id", "USAGE"));
+    /* The same rule inside a header's inline functions. */
+    ASSERT_TRUE(field_edge_exists(s, project, "hdr_alpha", "Alpha", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "hdr_alpha", "Beta", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "hdr_beta", "Beta", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "hdr_beta", "Alpha", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "hdr_beta", "Beta", "count", "WRITES"));
+    ASSERT_FALSE(field_edge_exists(s, project, "hdr_beta", "Alpha", "count", "WRITES"));
+    /* A struct the header declares itself, by typedef or by tag. */
+    ASSERT_TRUE(field_edge_exists(s, project, "hdr_own_typedef", "HdrBuf", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "hdr_own_typedef", "Alpha", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "hdr_own_struct", "HdrNode", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "hdr_own_struct", "Beta", "count", "USAGE"));
+    /* ...and inside `#ifdef` / `#else` branches. */
+    ASSERT_TRUE(field_edge_exists(s, project, "guarded_alpha", "Alpha", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "guarded_alpha", "Beta", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "guarded_beta", "Beta", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "guarded_beta", "Alpha", "count", "USAGE"));
+    /* An untyped member call binds the project's one member of that name in
+     * C, and nothing in a C++ source. */
+    ASSERT_GTE(fixture_node_count(s, project, "cb.h", "only_cb", "Field"), 1);
+    ASSERT_TRUE(field_edge_exists(s, project, "c_untyped_call", "CbTable", "only_cb", "CALLS"));
+    ASSERT_FALSE(field_edge_exists(s, project, "cpp_untyped_call", "CbTable", "only_cb", "CALLS"));
+    /* A global behind `#ifndef` types the accesses through it. */
+    ASSERT_TRUE(field_edge_exists(s, project, "read_alpha_global", "Alpha", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "read_alpha_global", "Beta", "count", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "read_beta_global", "Beta", "count", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "read_beta_global", "Alpha", "count", "USAGE"));
+    /* Designated initializers at file scope: the source is the file. */
+    ASSERT_TRUE(field_edge_exists(s, project, "table_ops.c", "Ops", "open", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "table_ops.c", "Ops", "shut", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "table_ops.c", "OtherOps", "open", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "table_other.c", "OtherOps", "open", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "table_other.c", "Ops", "open", "USAGE"));
+    /* Nested: `.fixed = { [0] = { .ops = ... } }` initializes a Dev. */
+    ASSERT_TRUE(field_edge_exists(s, project, "table_ops.c", "Bank", "fixed", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "table_ops.c", "Dev", "ops", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "table_ops.c", "Bank", "id", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "table_ops.c", "Dev", "id", "USAGE"));
+    /* In a block, in a compound literal, and per element of an array. */
+    ASSERT_TRUE(field_edge_exists(s, project, "init_block", "Dev", "id", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "init_block", "Bank", "id", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "init_literal", "Dev", "id", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "init_literal", "OtherOps", "id", "USAGE"));
+    ASSERT_TRUE(field_edge_exists(s, project, "init_array", "OtherOps", "id", "USAGE"));
+    ASSERT_FALSE(field_edge_exists(s, project, "init_array", "Dev", "id", "USAGE"));
+    return 0;
+}
+
+TEST(pipeline_c_member_access_binds_field_by_object_type) {
+    /* `x.f` / `x->f` handed only the member name `f` to the short-name
+     * registry, which returned whichever Field was called `f`: 9,150 USAGE
+     * and 2,810 WRITES edges onto Fields on this repository, 3,976 of the
+     * USAGE edges onto a name several structs share. Sequential-path twin. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_field_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_member_field_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_field.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int rc = assert_c_member_fields_bind_by_type(s, project);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    if (rc != 0) {
+        return rc;
+    }
+    PASS();
+}
+
+TEST(pipeline_c_member_access_binds_field_by_object_type_parallel) {
+    /* Parallel twin: resolve_file_usages / resolve_file_rw are independent
+     * resolvers and must take the same typed join (#1928's lesson). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_c_fieldp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_member_field_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_fieldp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int rc = assert_c_member_fields_bind_by_type(s, project);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    if (rc != 0) {
+        return rc;
+    }
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -8007,6 +8750,100 @@ TEST(pipeline_ts_config_object_url_http_calls_issue2235) {
     ASSERT_EQ(named_edge_count(s, project, "HTTP_CALLS", "get1", "/api/customers/{}"), 1);
     /* Only the `url` key names the request URL. */
     ASSERT_EQ(count_nodes_named(s, project, "/api/ignored/x"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Count HTTP_CALLS-style edges whose url_path property contains `keyword`. */
+static int count_edges_with_url_path(cbm_store_t *s, const char *project, const char *keyword) {
+    cbm_edge_t *es = NULL;
+    int n = 0;
+    cbm_store_find_edges_by_url_path(s, project, keyword, &es, &n);
+    if (es) {
+        cbm_store_free_edges(es, n);
+    }
+    return n;
+}
+
+/* Distilled from PR #1245: detect_url_in_args (parallel resolver, >= 50 files)
+ * runs for EVERY resolved call with no callee gating, so a filesystem path
+ * with a document/log extension passed to a project-defined open/read/write
+ * helper passed normalize_url_arg (second slash, no space) and the route
+ * literal guard, minting a Route node + an HTTP_CALLS edge for a file. The
+ * callees are project functions on purpose: a bare builtin `open(...)` never
+ * resolves to a target and so never reaches emit_service_edge at all. The
+ * first path segments avoid the filesystem-root list (etc/var/tmp/...) so
+ * only the extension guard can reject them. requests.get('/api/items') is
+ * the positive control that must keep its Route + HTTP_CALLS. */
+TEST(pipeline_arg_url_rejects_document_file_paths) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_arg_url_docs_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/files.py",
+                    "import requests\n"
+                    "def open_file(path):\n"
+                    "    return path\n"
+                    "def read_file(path):\n"
+                    "    return path\n"
+                    "def write_file(path):\n"
+                    "    return path\n"
+                    "def load_docs():\n"
+                    "    open_file('/new/file.txt')\n"
+                    "    read_file('/docs/guide.md')\n"
+                    "    write_file('/data/app.log')\n"
+                    "    read_file('/reports/summary.pdf')\n"
+                    "    open_file('/docs/index.rst')\n"
+                    "def fetch_items():\n"
+                    "    return requests.get('/api/items')\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/arg_url_docs.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Positive control first: the genuine HTTP call still mints its route. */
+    ASSERT_GTE(count_nodes_named(s, project, "/api/items"), 1);
+    ASSERT_GTE(count_edges_with_url_path(s, project, "/api/items"), 1);
+    /* No Route node for any filesystem document path... */
+    ASSERT_EQ(count_nodes_named(s, project, "/new/file.txt"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/docs/guide.md"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/data/app.log"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/reports/summary.pdf"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/docs/index.rst"), 0);
+    /* ...and no HTTP_CALLS edge carrying one as its url_path either. */
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/new/file.txt"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/docs/guide.md"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/data/app.log"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/reports/summary.pdf"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/docs/index.rst"), 0);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -17539,6 +18376,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
+    RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
+    RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_parallel);
+    RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_incremental);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
     RUN_TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker);
@@ -17565,6 +18405,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
+    RUN_TEST(pipeline_c_member_access_binds_field_by_object_type);
+    RUN_TEST(pipeline_c_member_access_binds_field_by_object_type_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_capitalized_axios_import_is_http_client);
     RUN_TEST(pipeline_capitalized_axios_import_is_http_client_sequential);
@@ -17575,6 +18417,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_ts_config_object_url_http_calls_issue2235);
+    RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);

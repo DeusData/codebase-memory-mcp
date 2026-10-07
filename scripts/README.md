@@ -17,7 +17,7 @@ codes) and rejects unknown flags with exit 2 + `Please consult --help.`
 
 | leg | entry | what a run gives you |
 |---|---|---|
-| **test** | `test.sh` | DEFAULT = the venue leg: static contracts (Step 0a–0r) + CLEAN ASan+UBSan build + all suites via the parallel harness + prod-binary guards. `--suites a,b` = iteration mode (incremental rebuild, subset, seconds). `--tsan` = the ThreadSanitizer leg. CLANGARM64 gets CI's trap-UBSan flags automatically. |
+| **test** | `test.sh` | DEFAULT = the venue leg: static contracts (Step 0a–0r) + CLEAN ASan+UBSan build + all suites via the parallel harness + prod-binary guards. `--suites a,b` = iteration mode (incremental rebuild, subset, seconds). `--tsan` = the ThreadSanitizer leg. `--contracts-only` = the static contract steps alone (PR CI's contracts job for docs-only and non-product changes). CLANGARM64 gets CI's trap-UBSan flags automatically. |
 | **package wrappers** | `ci/test-package-wrappers.sh` | Go, npm, and PyPI runtime-set publication/lock suites on the current host. CI runs the same entry on Linux and Windows so both platform lock implementations gate. |
 | **build** | `build.sh` | CLEAN production runtime set (native executable + authenticated integration asset; `--with-ui` adds one content-addressed UI pack). ccache via `env.sh` makes repeats fast; `CCACHE_COMPILERCHECK=content` guarantees a hit is byte-identical to a cold compile — never stale. `--version`, `STATIC=1`, `BUILD_DIR=`. |
 | **lint** | `lint.sh` | clang-tidy + cppcheck + clang-format (+ no-skips policy). `--ci` = the CI gate set (no clang-tidy). Drives the same make targets as `make lint`/`lint-ci`. |

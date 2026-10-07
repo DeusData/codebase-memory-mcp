@@ -7,26 +7,29 @@
 int tf_pass_count = 0;
 int tf_fail_count = 0;
 int tf_skip_count = 0;
+int tf_deselected_count = 0;
 
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "test_daemon_runtime_contract.h"
-#include "foundation/compat.h"     /* cbm_setenv — #845 supervisor kill switch */
-#include "foundation/compat_fs.h"  /* cbm_fopen — worker response file */
-#include "foundation/constants.h"  /* CBM_SZ_4K — forced stderr buffer */
-#include "foundation/log.h"        /* crash-durable worker log probe */
-#include "foundation/mem.h"        /* cbm_mem_init — worker budget */
-#include "foundation/log.h"        /* worker liveness heartbeat probe */
-#include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
-#include "daemon/bootstrap.h"      /* runner rendezvous isolation */
-#include "daemon/runtime.h"        /* bounded worker response probe */
-#include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
-#include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
-#include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
-#include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
-#include "ui/http_server.h"        /* deleted-self executable probe */
-#include "result_spill.h"          /* pinned free disk: spill verdicts ignore the host disk */
+#include "foundation/compat.h"         /* cbm_setenv — #845 supervisor kill switch */
+#include "foundation/compat_fs.h"      /* cbm_fopen — worker response file */
+#include "foundation/constants.h"      /* CBM_SZ_4K — forced stderr buffer */
+#include "foundation/log.h"            /* crash-durable worker log probe */
+#include "foundation/mem.h"            /* cbm_mem_init — worker budget */
+#include "foundation/log.h"            /* worker liveness heartbeat probe */
+#include "foundation/platform.h"       /* cbm_file_exists — blocking-git marker */
+#include "foundation/test_selection.h" /* shared executable selection token bound */
+#include "daemon/bootstrap.h"          /* runner rendezvous isolation */
+#include "daemon/runtime.h"            /* bounded worker response probe */
+#include "daemon/ipc.h"                /* Windows private-lock re-exec probe */
+#include "daemon/version_cohort.h"     /* Windows crash-turnover re-exec probe */
+#include "mcp/index_supervisor.h"      /* cbm_index_set_worker_role */
+#include "mcp/mcp.h"                   /* cbm_mcp_handle_tool — act as a real worker */
+#include "ui/http_server.h"            /* deleted-self executable probe */
+#include "result_spill.h"              /* pinned free disk: spill verdicts ignore the host disk */
 #include <sqlite3.h>
+#include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -39,11 +42,20 @@ int tf_skip_count = 0;
 #include <io.h>
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
 #include <windows.h>
+#include "foundation/win_utf8.h" /* cbm_module_path_utf8 — the runner's own image */
 #else
 #include <unistd.h>
 #ifdef __APPLE__
 #include <fcntl.h>
 #include <sys/mman.h>
+#endif
+#ifdef CBM_TEST_COVERAGE
+#include <dlfcn.h>    /* the libc functions behind the profile-keeping ones */
+#include <fcntl.h>    /* the marker of a forked child */
+#include <poll.h>     /* non-consuming child-failure observation */
+#include <pthread.h>  /* pthread_atfork: a forked child names its own profile */
+#include <stdarg.h>   /* execl */
+#include <sys/stat.h> /* reject detectable failure-channel descriptor replacement */
 #endif
 #endif
 
@@ -829,11 +841,817 @@ static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
 #endif
 }
 
+/* ── Per-test selection: CBM_TEST_ONLY / CBM_TEST_ONLY_FILE ──────────
+ * The test-impact selector names whole suites as `suite` and individual tests
+ * as `suite:test`. CBM_TEST_ONLY accepts comma-separated tokens; the file named
+ * by CBM_TEST_ONLY_FILE accepts one per line, with blank lines and # comments.
+ * Both may be set; the selection is their union.
+ * Argv keeps selecting suites and the tokens narrow inside that selection, so
+ * the parallel harness can hand every per-suite process the same list.
+ *
+ * Tokens are strict. After the run, one that names a suite this build does not
+ * register, or a test its suite never ran, fails the run by name: a selection
+ * that quietly ran less than it named would be a green for work never done. A
+ * token for a registered suite that argv left out belongs to another process
+ * and is not this one to judge. */
+typedef enum {
+    TF_ONLY_UNSEEN = 0, /* no registered suite carries the suite name */
+    TF_ONLY_REGISTERED, /* the suite exists; argv did not ask this process for it */
+    TF_ONLY_ENTERED,    /* the suite ran and no RUN_TEST carried the test name */
+    TF_ONLY_MATCHED,
+} tf_only_state_t;
+
+typedef struct {
+    char *suite;      /* one allocation holding "suite\0test" or "suite\0" */
+    const char *test; /* empty names a whole suite; otherwise points past the colon */
+    tf_only_state_t state;
+} tf_only_token_t;
+
+static tf_only_token_t *tf_only_tokens = NULL;
+static size_t tf_only_count = 0;
+static size_t tf_only_cap = 0;
+static bool tf_only_active = false;
+/* Tokens are sorted by suite, so the running suite has one run [first, end). */
+static size_t tf_only_suite_first = 0;
+static size_t tf_only_suite_end = 0;
+
+const char *tf_current_suite = NULL;
+
+static bool tf_only_name_valid(const char *name, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        if (!isalnum((unsigned char)name[i]) && name[i] != '_') {
+            return false;
+        }
+    }
+    return length > 0;
+}
+
+/* Adds the token in text[0..length). Surrounding whitespace is not part of it
+ * (the CR of a CRLF file included), and an empty span is not a token. */
+static bool tf_only_add(const char *text, size_t length) {
+    while (length > 0 && isspace((unsigned char)text[0])) {
+        text++;
+        length--;
+    }
+    while (length > 0 && isspace((unsigned char)text[length - 1])) {
+        length--;
+    }
+    if (length == 0) {
+        return true;
+    }
+    /* No test or suite name comes near this; it also bounds the copy below. */
+    const char *colon = length <= CBM_TEST_SELECTION_TOKEN_MAX ? memchr(text, ':', length) : NULL;
+    size_t suite_length = colon ? (size_t)(colon - text) : length;
+    if (length > CBM_TEST_SELECTION_TOKEN_MAX || !tf_only_name_valid(text, suite_length) ||
+        (colon && !tf_only_name_valid(colon + 1, length - suite_length - 1))) {
+        fprintf(stderr, "malformed test selection token: %.*s (expected suite or suite:test)\n",
+                (int)length, text);
+        return false;
+    }
+    if (tf_only_count == tf_only_cap) {
+        size_t cap = tf_only_cap ? tf_only_cap * 2 : CBM_SZ_64;
+        tf_only_token_t *grown = realloc(tf_only_tokens, cap * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "Failed to allocate the test selection\n");
+            return false;
+        }
+        tf_only_tokens = grown;
+        tf_only_cap = cap;
+    }
+    char *copy = malloc(length + 1);
+    if (!copy) {
+        fprintf(stderr, "Failed to allocate the test selection\n");
+        return false;
+    }
+    memcpy(copy, text, length);
+    copy[suite_length] = '\0';
+    copy[length] = '\0';
+    tf_only_tokens[tf_only_count++] = (tf_only_token_t){
+        .suite = copy, .test = copy + suite_length + (colon ? 1 : 0), .state = TF_ONLY_UNSEEN};
+    return true;
+}
+
+static bool tf_only_add_list(const char *list) {
+    for (const char *cursor = list;;) {
+        const char *comma = strchr(cursor, ',');
+        if (!tf_only_add(cursor, comma ? (size_t)(comma - cursor) : strlen(cursor))) {
+            return false;
+        }
+        if (!comma) {
+            return true;
+        }
+        cursor = comma + 1;
+    }
+}
+
+static bool tf_only_add_file(const char *path) {
+    FILE *file = cbm_fopen(path, "r");
+    if (!file) {
+        fprintf(stderr, "cannot read test selection file: %s\n", path);
+        return false;
+    }
+    char line[CBM_SZ_1K];
+    bool ok = true;
+    while (ok && fgets(line, sizeof(line), file)) {
+        size_t length = strlen(line);
+        if (length == sizeof(line) - 1 && line[length - 1] != '\n') {
+            /* The rest of the line would be read back as a token of its own. */
+            fprintf(stderr, "test selection file line too long: %s\n", path);
+            ok = false;
+        } else {
+            ok = tf_only_add(line, strcspn(line, "#\n"));
+        }
+    }
+    if (ok && ferror(file)) {
+        fprintf(stderr, "cannot read test selection file: %s\n", path);
+        ok = false;
+    }
+    (void)fclose(file);
+    return ok;
+}
+
+static int tf_only_compare(const void *left, const void *right) {
+    const tf_only_token_t *a = left;
+    const tf_only_token_t *b = right;
+    int by_suite = strcmp(a->suite, b->suite);
+    return by_suite != 0 ? by_suite : strcmp(a->test, b->test);
+}
+
+static void tf_only_free(void) {
+    for (size_t i = 0; i < tf_only_count; i++) {
+        free(tf_only_tokens[i].suite);
+    }
+    free(tf_only_tokens);
+    tf_only_tokens = NULL;
+    tf_only_count = 0;
+    tf_only_cap = 0;
+    tf_only_active = false;
+}
+
+/* Reads the selection once. False means the selection itself is unusable: the
+ * caller stops before any suite, because falling back to "everything" or to
+ * "nothing" would decide a gate by accident. An empty variable is unset, as it
+ * is in a shell; a selection that is set and names no test is an error, since
+ * a caller who wants every test leaves both variables unset. */
+static bool tf_only_init(void) {
+    const char *list = getenv("CBM_TEST_ONLY");
+    const char *path = getenv("CBM_TEST_ONLY_FILE");
+    bool has_list = list && list[0];
+    bool has_path = path && path[0];
+    if (!has_list && !has_path) {
+        return true;
+    }
+    if ((has_list && !tf_only_add_list(list)) || (has_path && !tf_only_add_file(path))) {
+        return false;
+    }
+    if (tf_only_count == 0) {
+        fprintf(stderr, "test selection names no test (CBM_TEST_ONLY, CBM_TEST_ONLY_FILE)\n");
+        return false;
+    }
+    qsort(tf_only_tokens, tf_only_count, sizeof(*tf_only_tokens), tf_only_compare);
+    tf_only_active = true;
+    return true;
+}
+
+/* Returns the first token of `suite` and stores one past its last. */
+static size_t tf_only_suite_run(const char *suite, size_t *end_out) {
+    size_t first = 0;
+    while (first < tf_only_count && strcmp(tf_only_tokens[first].suite, suite) != 0) {
+        first++;
+    }
+    size_t end = first;
+    while (end < tf_only_count && strcmp(tf_only_tokens[end].suite, suite) == 0) {
+        end++;
+    }
+    *end_out = end;
+    return first;
+}
+
+static void tf_only_raise(size_t first, size_t end, tf_only_state_t state) {
+    for (size_t i = first; i < end; i++) {
+        if (tf_only_tokens[i].state < state) {
+            tf_only_tokens[i].state = state;
+        }
+    }
+}
+
+bool tf_suite_enter(const char *suite) {
+    if (tf_current_suite) {
+        /* A suite run from inside another: its tests belong to the registered
+         * suite that runs it, which is the name a token and argv both use. */
+        return true;
+    }
+    if (tf_only_active) {
+        tf_only_suite_first = tf_only_suite_run(suite, &tf_only_suite_end);
+        if (tf_only_suite_first == tf_only_suite_end) {
+            return false; /* no token names it: its body, setup included, never runs */
+        }
+        tf_only_raise(tf_only_suite_first, tf_only_suite_end, TF_ONLY_ENTERED);
+        for (size_t i = tf_only_suite_first; i < tf_only_suite_end; i++) {
+            if (!tf_only_tokens[i].test[0]) {
+                /* Entering fulfills a whole-suite token even when it has no tests. */
+                tf_only_tokens[i].state = TF_ONLY_MATCHED;
+            }
+        }
+    }
+    tf_current_suite = suite;
+    return true;
+}
+
+void tf_suite_leave(const char *suite) {
+    if (tf_current_suite && strcmp(tf_current_suite, suite) == 0) {
+        tf_current_suite = NULL;
+        tf_only_suite_first = 0;
+        tf_only_suite_end = 0;
+    }
+}
+
+bool tf_test_selected(const char *test) {
+    if (!tf_only_active) {
+        return true;
+    }
+    bool selected = false;
+    for (size_t i = tf_only_suite_first; i < tf_only_suite_end; i++) {
+        if (!tf_only_tokens[i].test[0] || strcmp(tf_only_tokens[i].test, test) == 0) {
+            tf_only_tokens[i].state = TF_ONLY_MATCHED;
+            selected = true;
+        }
+    }
+    if (!selected) {
+        tf_deselected_count++;
+    }
+    return selected;
+}
+
+/* The strict half of the selection: every token this process was responsible
+ * for must have entered its whole suite or matched its explicit test. */
+static void tf_only_report_unmatched(void) {
+    for (size_t i = 0; i < tf_only_count; i++) {
+        const tf_only_token_t *token = &tf_only_tokens[i];
+        if (token->state != TF_ONLY_UNSEEN && token->state != TF_ONLY_ENTERED) {
+            continue;
+        }
+        if (i > 0 && tf_only_compare(token, &tf_only_tokens[i - 1]) == 0) {
+            continue; /* named twice, reported once */
+        }
+        fprintf(stderr, "selected test not compiled into this build or unknown: %s%s%s\n",
+                token->suite, token->test[0] ? ":" : "", token->test);
+        tf_fail_count++;
+    }
+}
+
+#ifdef CBM_TEST_COVERAGE
+/* ── Per-test coverage profiles ──────────────────────────────────────
+ * Compiled only into the instrumented runner (make test-runner-cov: clang
+ * source coverage, no sanitizer). With CBM_TEST_COVERAGE_DIR set, every test
+ * leaves its own raw profiles under <dir>/<suite>/:
+ *   <test>.parent.profraw       what this process executed inside the test
+ *   <test>.<pid>.profraw        one per child the test spawned. Children
+ *                               inherit LLVM_PROFILE_FILE, so a re-exec of this
+ *                               runner or a product binary names its own file
+ *   <test>.<pid>.forked         an unaccounted forked child: the coverage of
+ *                               this test remains incomplete
+ *   _setup.<n>.profraw          what ran between tests: suite setup, and the
+ *                               prologue and epilogue of the runner itself
+ *   _setup.child.<pid>.profraw  children spawned between tests
+ * The first two are the coverage of the test; the others belong to no test. */
+void __llvm_profile_set_filename(const char *pattern);
+int __llvm_profile_write_file(void);
+void __llvm_profile_reset_counters(void);
+
+enum { TF_COVERAGE_PATH_CAP = CBM_SZ_4K + CBM_SZ_1K };
+static char tf_coverage_dir[CBM_SZ_4K]; /* canonical; empty = not a coverage run */
+/* The runtime keeps the pointer it is handed, not a copy: these outlive it. */
+static char tf_coverage_profile[TF_COVERAGE_PATH_CAP];
+static char tf_coverage_child_pattern[TF_COVERAGE_PATH_CAP];
+static unsigned int tf_coverage_setup_index = 0;
+/* Keep the first failed interval named and unreset for the rest of the run. */
+static bool tf_coverage_write_failed = false;
+/* This process started with a `%c` profile: its counters are mapped onto the
+ * file, and it neither names nor writes a profile itself (see Children). */
+static bool tf_coverage_continuous = false;
+
+#ifndef _WIN32
+/* Negative evidence only: these private pipe ends must retain exclusive custody.
+ * Identity/flag checks reject detectable damage, not arbitrary aliasing/history.
+ * Supported children keep BOTH inherited ends; parent disposal cannot remove
+ * their last reader. No reader drains this pipe, even after failure is latched. */
+static struct {
+    int fd[2];
+    struct stat identity[2];
+    pid_t owner;
+    bool started;
+    bool active;
+    bool failed;
+    bool reported;
+    bool transport_broken; /* child-local unsupported delivery failure */
+} tf_coverage_channel = {.fd = {-1, -1}};
+static bool tf_coverage_atfork_attempted;
+static int tf_coverage_atfork_status = -1;
+
+static int tf_coverage_channel_flags(int fd, int command) {
+    int result;
+    do {
+        result = fcntl(fd, command);
+    } while (result < 0 && errno == EINTR);
+    return result;
+}
+
+static bool tf_coverage_channel_end(int index, bool require_flags) {
+    int fd = tf_coverage_channel.fd[index];
+    struct stat current;
+    if (fd < 0) {
+        return false;
+    }
+    int status;
+    do {
+        status = fstat(fd, &current);
+    } while (status < 0 && errno == EINTR);
+    if (status != 0 || !S_ISFIFO(current.st_mode) ||
+        current.st_dev != tf_coverage_channel.identity[index].st_dev ||
+        current.st_ino != tf_coverage_channel.identity[index].st_ino) {
+        return false;
+    }
+    int flags = tf_coverage_channel_flags(fd, F_GETFL);
+    if (flags < 0 || (flags & O_ACCMODE) != (index == 0 ? O_RDONLY : O_WRONLY)) {
+        return false;
+    }
+    if (!require_flags) {
+        return true;
+    }
+    int descriptor_flags = tf_coverage_channel_flags(fd, F_GETFD);
+    return (flags & O_NONBLOCK) != 0 && descriptor_flags >= 0 &&
+           (descriptor_flags & FD_CLOEXEC) != 0;
+}
+
+static bool tf_coverage_channel_intact(void) {
+    return tf_coverage_channel.fd[0] >= 0 && tf_coverage_channel.fd[1] >= 0 &&
+           tf_coverage_channel.fd[0] != tf_coverage_channel.fd[1] &&
+           tf_coverage_channel_end(0, true) && tf_coverage_channel_end(1, true);
+}
+
+static void tf_coverage_channel_fail(const char *reason) {
+    if (getpid() != tf_coverage_channel.owner) {
+        return;
+    }
+    tf_coverage_channel.failed = true;
+    if (!tf_coverage_channel.reported) {
+        tf_coverage_channel.reported = true;
+        fprintf(stderr, "coverage child accounting failed: owner_pid=%ld reason=%s\n",
+                (long)tf_coverage_channel.owner, reason);
+        tf_fail_count++;
+    }
+}
+
+static void tf_coverage_channel_observe(void) {
+    if (!tf_coverage_channel.active || getpid() != tf_coverage_channel.owner) {
+        return;
+    }
+    if (!tf_coverage_channel_intact()) {
+        tf_coverage_channel_fail("channel-invalid");
+        return;
+    }
+    struct pollfd event = {.fd = tf_coverage_channel.fd[0], .events = POLLIN};
+    int ready;
+    do {
+        ready = poll(&event, 1, 0);
+    } while (ready < 0 && errno == EINTR);
+    if (ready < 0 || (ready > 0 && (event.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
+        tf_coverage_channel_fail("observation");
+    } else if (ready > 0) {
+        tf_coverage_channel_fail((event.revents & POLLIN) ? "child-marker" : "observation");
+    }
+}
+
+static bool tf_coverage_channel_blocked(void) {
+    return getpid() == tf_coverage_channel.owner && tf_coverage_channel.failed;
+}
+
+static bool tf_coverage_channel_prepare_end(int index) {
+    int fd = tf_coverage_channel.fd[index];
+    if (fstat(fd, &tf_coverage_channel.identity[index]) != 0 ||
+        !S_ISFIFO(tf_coverage_channel.identity[index].st_mode)) {
+        return false;
+    }
+    int flags = fcntl(fd, F_GETFL);
+    int descriptor_flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && descriptor_flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 &&
+           fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) == 0;
+}
+
+/* Only the single-threaded setup path uses this: both obtained ends are still
+ * exclusively owned even if preparing their identity/flags failed. */
+static bool tf_coverage_channel_abort_setup(void) {
+    bool closed = true;
+    for (int i = 0; i < 2; i++) {
+        int fd = tf_coverage_channel.fd[i];
+        tf_coverage_channel.fd[i] = -1;
+        if (fd >= 0 && close(fd) != 0) {
+            closed = false;
+        }
+    }
+    return closed;
+}
+
+static bool tf_coverage_channel_unavailable(const char *reason) {
+    tf_coverage_channel.failed = true;
+    fprintf(stderr, "coverage child accounting unavailable: reason=%s\n", reason);
+    return false;
+}
+
+static bool tf_coverage_channel_activate(void) {
+    if (tf_coverage_channel.started) {
+        return tf_coverage_channel_unavailable("already-started");
+    }
+    tf_coverage_channel.started = true;
+    tf_coverage_channel.owner = getpid();
+    if (pipe(tf_coverage_channel.fd) != 0) {
+        return tf_coverage_channel_unavailable("pipe");
+    }
+    if (!tf_coverage_channel_prepare_end(0) || !tf_coverage_channel_prepare_end(1) ||
+        !tf_coverage_channel_intact()) {
+        bool closed = tf_coverage_channel_abort_setup();
+        return tf_coverage_channel_unavailable(closed ? "pipe-setup" : "pipe-setup-close");
+    }
+    tf_coverage_channel.active = true;
+    return true;
+}
+
+static void tf_coverage_channel_finish(void) {
+    if (!tf_coverage_channel.active || getpid() != tf_coverage_channel.owner) {
+        return;
+    }
+    tf_coverage_channel_observe();
+    tf_coverage_channel.active = false;
+    if (tf_coverage_channel.fd[0] == tf_coverage_channel.fd[1]) {
+        tf_coverage_channel_fail("channel-invalid");
+        tf_coverage_channel.fd[0] = tf_coverage_channel.fd[1] = -1;
+        return;
+    }
+    for (int i = 0; i < 2; i++) {
+        int fd = tf_coverage_channel.fd[i];
+        bool owned = tf_coverage_channel_end(i, false);
+        tf_coverage_channel.fd[i] = -1;
+        if (!owned) {
+            /* Do not close a detectable replacement. Unknown ownership remains
+             * for kernel process-exit cleanup, never a blind retry/close. */
+            tf_coverage_channel_fail("channel-invalid");
+        } else if (close(fd) != 0) {
+            tf_coverage_channel_fail("channel-close");
+        }
+    }
+}
+
+/* Fixed storage and descriptor syscalls only in the post-fork failure path.
+ * EAGAIN is evidence solely under intact, never-drained exclusive custody.
+ * Unsupported transport loss cannot report itself magically to the parent. */
+static void tf_coverage_channel_notify(void) {
+    int saved_errno = errno;
+    if (tf_coverage_channel.active && !tf_coverage_channel.transport_broken) {
+        bool delivered = false;
+        if (tf_coverage_channel_intact()) {
+            const unsigned char byte = 1;
+            ssize_t written;
+            do {
+                written = write(tf_coverage_channel.fd[1], &byte, sizeof(byte));
+            } while (written < 0 && errno == EINTR);
+            delivered = written == 1 || (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        }
+        tf_coverage_channel.transport_broken = !delivered;
+    }
+    errno = saved_errno;
+}
+#endif /* !_WIN32 */
+
+/* Names the profile this process writes next and the one its children will. */
+static bool tf_coverage_route(const char *directory, const char *own, const char *child) {
+    int own_length =
+        snprintf(tf_coverage_profile, sizeof(tf_coverage_profile), "%s/%s.profraw", directory, own);
+    /* `%c`: an exec'd child maps its counters onto the file (see Children). */
+    int child_length = snprintf(tf_coverage_child_pattern, sizeof(tf_coverage_child_pattern),
+                                "%s/%s.%%p%%c.profraw", directory, child);
+    if (own_length <= 0 || (size_t)own_length >= sizeof(tf_coverage_profile) || child_length <= 0 ||
+        (size_t)child_length >= sizeof(tf_coverage_child_pattern)) {
+        return false;
+    }
+    __llvm_profile_set_filename(tf_coverage_profile);
+    return cbm_setenv("LLVM_PROFILE_FILE", tf_coverage_child_pattern, 1) == 0;
+}
+
+/* Between tests the interval is suite setup, and so is any child it spawns. */
+static bool tf_coverage_route_setup(const char *suite_dir) {
+    char own[CBM_SZ_64];
+    (void)snprintf(own, sizeof(own), "_setup.%u", tf_coverage_setup_index);
+    return tf_coverage_route(suite_dir, own, "_setup.child");
+}
+
+/* Writes the current interval and resets counters only after a successful write. */
+static bool tf_coverage_flush(void) {
+    if (__llvm_profile_write_file() != 0) {
+        tf_coverage_write_failed = true;
+        fprintf(stderr, "coverage profile write failed: %s\n", tf_coverage_profile);
+        tf_fail_count++;
+        return false;
+    }
+    __llvm_profile_reset_counters();
+    return true;
+}
+
+/* Check the current parent interval before choosing the runner status. Keep
+ * counters and routing intact: the automatic exit writer still follows, and
+ * this checked prefix does not certify its outcome or later callbacks. */
+static void tf_coverage_finish(void) {
+    if (!tf_coverage_dir[0] || tf_coverage_write_failed) {
+        return;
+    }
+#ifndef _WIN32
+    if (getpid() != tf_coverage_channel.owner || tf_coverage_channel_blocked()) {
+        return;
+    }
+#endif
+    if (__llvm_profile_write_file() != 0) {
+        tf_coverage_write_failed = true;
+        fprintf(stderr, "coverage profile write failed: %s\n", tf_coverage_profile);
+        tf_fail_count++;
+    }
+}
+
+static bool tf_coverage_suite_dir(char *out, size_t cap) {
+    int length = snprintf(out, cap, "%s/%s", tf_coverage_dir,
+                          tf_current_suite ? tf_current_suite : "_nosuite");
+    return length > 0 && (size_t)length < cap && cbm_mkdir_p(out, 0755);
+}
+
+/* A coverage run that loses a profile would report the test as executing
+ * nothing, and the impact map would trust that: fail the run instead. */
+static void tf_coverage_lost(const char *test) {
+    fprintf(stderr, "coverage profile could not be routed: %s:%s\n",
+            tf_current_suite ? tf_current_suite : "_nosuite", test);
+    tf_fail_count++;
+}
+
+void tf_coverage_test_begin(const char *test) {
+#ifndef _WIN32
+    tf_coverage_channel_observe();
+    if (tf_coverage_channel_blocked()) {
+        return;
+    }
+#endif
+    char suite_dir[TF_COVERAGE_PATH_CAP];
+    char own[CBM_SZ_512];
+    if (!tf_coverage_dir[0] || tf_coverage_write_failed) {
+        return;
+    }
+    int own_length = snprintf(own, sizeof(own), "%s.parent", test);
+    if (own_length <= 0 || (size_t)own_length >= sizeof(own) ||
+        !tf_coverage_suite_dir(suite_dir, sizeof(suite_dir)) ||
+        !tf_coverage_route_setup(suite_dir)) {
+        tf_coverage_lost(test);
+        return;
+    }
+    if (!tf_coverage_flush()) {
+        return;
+    }
+    tf_coverage_setup_index++;
+    /* Named before the test runs, not after: a forked child that leaves through
+     * exit() writes to the name it inherited, which must not be the setup file. */
+    if (!tf_coverage_route(suite_dir, own, test)) {
+        tf_coverage_lost(test);
+    }
+}
+
+void tf_coverage_test_end(const char *test) {
+#ifndef _WIN32
+    tf_coverage_channel_observe();
+    if (tf_coverage_channel_blocked()) {
+        return;
+    }
+#endif
+    char suite_dir[TF_COVERAGE_PATH_CAP];
+    char own[CBM_SZ_512];
+    if (!tf_coverage_dir[0] || tf_coverage_write_failed) {
+        return;
+    }
+    int own_length = snprintf(own, sizeof(own), "%s.parent", test);
+    if (own_length <= 0 || (size_t)own_length >= sizeof(own) ||
+        !tf_coverage_suite_dir(suite_dir, sizeof(suite_dir)) ||
+        !tf_coverage_route(suite_dir, own, test)) {
+        tf_coverage_lost(test);
+        return;
+    }
+    if (!tf_coverage_flush()) {
+        return;
+    }
+    /* The runtime writes once more at exit, to whatever name is current. Left
+     * on the file of this test, that write would replace the profile just
+     * taken with the teardown that follows it. */
+    if (!tf_coverage_route_setup(suite_dir)) {
+        tf_coverage_lost(test);
+    }
+}
+
+/* False when the run asked for coverage and cannot have it. Children run in
+ * other working directories, so they are handed an absolute name. */
+static bool tf_coverage_init(void) {
+    const char *dir = getenv("CBM_TEST_COVERAGE_DIR");
+    if (!dir || !dir[0]) {
+        return true;
+    }
+#ifndef _WIN32
+    /* A binary built for continuous profiles starts in that mode unless
+     * LLVM_PROFILE_FILE names a plain file, and then ignores every name this
+     * runner gives it: all tests would land in one default.profraw. */
+    const char *initial = getenv("LLVM_PROFILE_FILE");
+    if (!initial || !initial[0] || tf_coverage_continuous) {
+        fprintf(stderr,
+                "a coverage run starts with LLVM_PROFILE_FILE=/dev/null "
+                "(got: %s)\n",
+                initial && initial[0] ? initial : "unset");
+        return false;
+    }
+    if (!tf_coverage_atfork_attempted || tf_coverage_atfork_status != 0) {
+        fprintf(stderr, "coverage child accounting unavailable: reason=atfork code=%d\n",
+                tf_coverage_atfork_status);
+        return false;
+    }
+#endif
+    if (!cbm_mkdir_p(dir, 0755) ||
+        !cbm_canonical_path(dir, tf_coverage_dir, sizeof(tf_coverage_dir))) {
+        tf_coverage_dir[0] = '\0';
+        fprintf(stderr, "cannot use coverage directory: %s\n", dir);
+        return false;
+    }
+#ifndef _WIN32
+    if (!tf_coverage_channel_activate()) {
+        tf_coverage_dir[0] = '\0';
+        return false;
+    }
+#endif
+    /* Routing sets the environment, which may move what `dir` points at. */
+    if (!tf_coverage_route(tf_coverage_dir, "_runner.%p", "_runner.child")) {
+        fprintf(stderr, "cannot route coverage profiles under: %s\n", tf_coverage_dir);
+        tf_coverage_dir[0] = '\0';
+#ifndef _WIN32
+        tf_coverage_channel_finish();
+#endif
+        return false;
+    }
+    return true;
+}
+
+#ifndef _WIN32
+/* ── Children ────────────────────────────────────────────────────────
+ * A same-image, non-continuous fork gets its own profile and an obligation
+ * marker. Explicit _exit/_Exit writes retire that marker only after the native
+ * writer reports success. A failed write or signal leaves the marker behind.
+ *
+ * Normal exit retains its marker: delegating to libc does not establish the
+ * outcome of the final atexit writer. Exec retains the original-image marker
+ * too; a successor profile cannot establish that this image was accounted for.
+ * A failed exec may return to this image and later finish with a successful
+ * explicit write, which can then retire its marker.
+ *
+ * These wrappers establish retirement behavior only for markers that were
+ * successfully placed. The private channel reports marker-open/close failures
+ * for controlled same-image children retaining exclusive descriptor custody.
+ * Continuous mode, successor images, libc-internal spawning and arbitrary
+ * descendants remain separate obligations; marker absence certifies none. */
+static char tf_coverage_fork_profile[TF_COVERAGE_PATH_CAP];
+static char tf_coverage_fork_marker[TF_COVERAGE_PATH_CAP]; /* empty: not a counted fork */
+
+static void tf_coverage_fork_marker_place(void) {
+    if (tf_coverage_fork_marker[0]) {
+        int fd = open(tf_coverage_fork_marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || close(fd) != 0) {
+            tf_coverage_channel_notify();
+        }
+    }
+}
+
+static void tf_coverage_fork_marker_lift(void) {
+    if (tf_coverage_fork_marker[0]) {
+        (void)unlink(tf_coverage_fork_marker);
+    }
+}
+
+/* Runs in the child of every fork() of this image. Only what is safe between
+ * fork and exec of a threaded process: no allocation, static buffers. */
+static void tf_coverage_fork_child(void) {
+    static const char tail[] = ".%p%c.profraw";
+    tf_coverage_fork_marker[0] = '\0';
+    if (tf_coverage_continuous) {
+        return; /* the counters are mapped onto the file of the parent */
+    }
+    const char *pattern = getenv("LLVM_PROFILE_FILE");
+    size_t length = pattern ? strlen(pattern) : 0;
+    if (length <= sizeof(tail) - 1 || strcmp(pattern + length - (sizeof(tail) - 1), tail) != 0) {
+        return; /* not a coverage run */
+    }
+    int stem = (int)(length - (sizeof(tail) - 1));
+    long pid = (long)getpid();
+    int profile_length = snprintf(tf_coverage_fork_profile, sizeof(tf_coverage_fork_profile),
+                                  "%.*s.%ld.profraw", stem, pattern, pid);
+    int marker_length = snprintf(tf_coverage_fork_marker, sizeof(tf_coverage_fork_marker),
+                                 "%.*s.%ld.forked", stem, pattern, pid);
+    if (profile_length <= 0 || (size_t)profile_length >= sizeof(tf_coverage_fork_profile) ||
+        marker_length <= 0 || (size_t)marker_length >= sizeof(tf_coverage_fork_marker)) {
+        tf_coverage_fork_marker[0] = '\0';
+        return;
+    }
+    __llvm_profile_set_filename(tf_coverage_fork_profile);
+    tf_coverage_fork_marker_place();
+}
+
+static void tf_coverage_exit_now(int status) __attribute__((noreturn));
+static void tf_coverage_exit_now(int status) {
+    if (!tf_coverage_continuous && __llvm_profile_write_file() == 0) {
+        tf_coverage_fork_marker_lift();
+    }
+    void (*libc_exit)(int) = (void (*)(int))dlsym(RTLD_NEXT, "_exit");
+    if (libc_exit) {
+        libc_exit(status);
+    }
+    abort();
+}
+
+void _exit(int status) {
+    tf_coverage_exit_now(status);
+}
+
+void _Exit(int status) {
+    tf_coverage_exit_now(status);
+}
+
+void exit(int status) {
+    void (*libc_exit)(int) = (void (*)(int))dlsym(RTLD_NEXT, "exit");
+    if (libc_exit) {
+        libc_exit(status);
+    }
+    abort();
+}
+
+/* Keep the original-image obligation across both successful and failed exec. */
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    int (*libc_execve)(const char *, char *const[], char *const[]) =
+        (int (*)(const char *, char *const[], char *const[]))dlsym(RTLD_NEXT, "execve");
+    return libc_execve ? libc_execve(path, argv, envp) : -1;
+}
+
+int execv(const char *path, char *const argv[]) {
+    int (*libc_execv)(const char *, char *const[]) =
+        (int (*)(const char *, char *const[]))dlsym(RTLD_NEXT, "execv");
+    return libc_execv ? libc_execv(path, argv) : -1;
+}
+
+int execvp(const char *file, char *const argv[]) {
+    int (*libc_execvp)(const char *, char *const[]) =
+        (int (*)(const char *, char *const[]))dlsym(RTLD_NEXT, "execvp");
+    return libc_execvp ? libc_execvp(file, argv) : -1;
+}
+
+enum { TF_COVERAGE_EXECL_ARG_CAP = 64 };
+
+int execl(const char *path, const char *arg0, ...) {
+    char *argv[TF_COVERAGE_EXECL_ARG_CAP];
+    int argc = 0;
+    va_list args;
+    va_start(args, arg0);
+    for (const char *arg = arg0; arg != NULL && argc < TF_COVERAGE_EXECL_ARG_CAP - 1;
+         arg = va_arg(args, const char *)) {
+        argv[argc++] = (char *)arg;
+    }
+    va_end(args);
+    argv[argc] = NULL;
+    return execv(path, argv);
+}
+#endif /* !_WIN32 */
+
+/* Runs first in every process of this image, role children included: they
+ * fork too. Windows has neither fork nor an interposable _exit here. */
+static void tf_coverage_process_init(void) {
+#ifndef _WIN32
+    /* Read before anything routes: tf_coverage_route puts a `%c` pattern into
+     * the environment of a process that is not continuous itself. */
+    const char *initial = getenv("LLVM_PROFILE_FILE");
+    tf_coverage_continuous = initial != NULL && strstr(initial, "%c") != NULL;
+    if (!tf_coverage_atfork_attempted) {
+        tf_coverage_atfork_attempted = true;
+        tf_coverage_atfork_status = pthread_atfork(NULL, NULL, tf_coverage_fork_child);
+    }
+#endif
+}
+#endif /* CBM_TEST_COVERAGE */
+
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 static bool *g_suite_arg_matched = NULL;
 
 static bool suite_requested(const char *name) {
+    /* Every registered suite passes through here, requested or not: this is
+     * where a selection token learns that its suite exists in this build. */
+    size_t token_end = 0;
+    size_t token_first = tf_only_suite_run(name, &token_end);
+    tf_only_raise(token_first, token_end, TF_ONLY_REGISTERED);
     if (g_suite_argc <= 1) {
         return true;
     }
@@ -901,6 +1719,7 @@ extern void suite_private_file_lock(void);
 extern void suite_lock_registry(void);
 extern void suite_extraction(void);
 extern void suite_callable_sig(void);
+extern void suite_test_conventions(void);
 extern void suite_extraction_inheritance(void);
 extern void suite_extraction_imports(void);
 extern void suite_parse_coverage(void);
@@ -910,6 +1729,23 @@ extern void suite_grammar_imports(void);
 extern void suite_ac(void);
 extern void suite_store_nodes(void);
 extern void suite_store_edges(void);
+extern void suite_store_impact(void);
+extern void suite_store_scope(void);
+extern void suite_store_graph_digest(void);
+extern void suite_test_impact(void);
+extern void suite_test_impact_profiles(void);
+extern void suite_test_impact_changes(void);
+extern void suite_test_impact_origins(void);
+extern void suite_test_impact_git(void);
+extern void suite_test_impact_tree(void);
+extern void suite_test_impact_tree_read(void);
+extern void suite_test_impact_inventory(void);
+extern void suite_test_impact_classify(void);
+extern void suite_test_impact_source(void);
+extern void suite_test_impact_seed(void);
+extern void suite_test_impact_engine(void);
+extern void suite_test_impact_artifact(void);
+extern void suite_test_impact_runner_filter(void);
 extern void suite_store_search(void);
 extern void suite_cypher(void);
 extern void suite_mcp(void);
@@ -927,11 +1763,24 @@ extern void suite_daemon_ipc(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
 extern void suite_gitignore(void);
+extern void suite_gitignore_checked(void);
+extern void suite_inventory_filter(void);
+#if defined(CBM_TEST_COVERAGE) && !defined(_WIN32)
+extern void suite_coverage_children(void);
+extern void suite_coverage_setup_success(void);
+extern void suite_coverage_setup_uncertain(void);
+extern int tf_coverage_children_dispatch(int argc, char **argv);
+extern void suite_coverage_parent_failure(void);
+extern int tf_coverage_parent_failure_args(int *argc, char **argv);
+extern void tf_coverage_parent_failure_finish(void);
+#endif
 extern void suite_git_context(void);
 extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_pipeline_conventions(void);
+extern void suite_pipeline_frozen(void);
 extern void suite_importance(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
@@ -1005,6 +1854,8 @@ extern void suite_security(void);
 extern void suite_yaml(void);
 extern void suite_integration(void);
 extern void suite_lang_contract(void);
+extern void suite_conditional_variants(void);
+extern void suite_spawns(void);
 extern void suite_edge_imports(void);
 extern void suite_edge_structural(void);
 extern void suite_lsp_resolution_probe(void);
@@ -1036,10 +1887,55 @@ extern void suite_dump_verify_io(void);
  * caches at thread teardown (pass_parallel.c). */
 extern void cbm_kind_in_set_free_cache(void);
 
+/* Native subprocess capture probe; implemented with its tests. */
+extern int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv);
+extern void tf_test_impact_runner_filter_set_binary(const char *path);
+extern int tf_maybe_run_git_facts_diff_probe(int argc, char **argv);
+
+/* The runner's own image, for the tests that start or copy it again. argv[0]
+ * is the caller's spelling, and a Windows parent that found the runner by
+ * search (the native python scheduler, scripts/run-test-wave.py) passes it
+ * without ".exe", which an exact spawn or copy of that path cannot open. */
+const char *tf_runner_image(int argc, char **argv);
+const char *tf_runner_image(int argc, char **argv) {
+#ifdef _WIN32
+    static char image[4096];
+    if (!image[0]) {
+        char *module = cbm_module_path_utf8();
+        if (module && strlen(module) < sizeof(image)) {
+            memcpy(image, module, strlen(module) + 1);
+        }
+        free(module);
+    }
+    if (image[0]) {
+        return image;
+    }
+#endif
+    return argc > 0 && argv ? argv[0] : NULL;
+}
+
 int main(int argc, char **argv) {
     /* #2003: never let a caller's GIT_DIR/GIT_INDEX_FILE/... redirect fixture
      * git commands at the caller's real repository. */
     th_clear_git_repo_env();
+    tf_test_impact_runner_filter_set_binary(tf_runner_image(argc, argv));
+#ifdef CBM_TEST_COVERAGE
+    tf_coverage_process_init();
+#ifndef _WIN32
+    int coverage_child_rc = tf_coverage_children_dispatch(argc, argv);
+    if (coverage_child_rc >= 0) {
+        return coverage_child_rc;
+    }
+#endif
+#endif
+    int stdout_probe_rc = tf_maybe_run_subprocess_stdout_probe(argc, argv);
+    if (stdout_probe_rc >= 0) {
+        return stdout_probe_rc;
+    }
+    int git_facts_probe_rc = tf_maybe_run_git_facts_diff_probe(argc, argv);
+    if (git_facts_probe_rc >= 0) {
+        return git_facts_probe_rc;
+    }
     int memory_limit_probe_rc = tf_maybe_run_windows_memory_limit_probe(argc, argv);
     if (memory_limit_probe_rc >= 0) {
         return memory_limit_probe_rc;
@@ -1176,6 +2072,11 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+#if defined(CBM_TEST_COVERAGE) && !defined(_WIN32)
+    if (tf_coverage_parent_failure_args(&argc, argv) != 0) {
+        return 2;
+    }
+#endif
     const char *skip_perf_env = getenv("CBM_SKIP_PERF");
     g_skip_perf = skip_perf_env != NULL && strcmp(skip_perf_env, "1") == 0;
     if (argc == 2 && strcmp(argv[1], "--list-suites") == 0) {
@@ -1185,10 +2086,26 @@ int main(int argc, char **argv) {
         g_suite_argc = argc;
         g_suite_argv = argv;
     }
+    if (!g_list_only && !tf_only_init()) {
+        tf_only_free();
+        return 2;
+    }
+#ifdef CBM_TEST_COVERAGE
+    if (!g_list_only && !tf_coverage_init()) {
+#ifndef _WIN32
+        tf_coverage_channel_finish();
+#endif
+        tf_only_free();
+        return 2;
+    }
+#endif
     if (g_suite_argc > 1) {
         g_suite_arg_matched = calloc((size_t)argc, sizeof(*g_suite_arg_matched));
         if (!g_suite_arg_matched) {
             fprintf(stderr, "Failed to allocate test-suite argument tracking\n");
+#if defined(CBM_TEST_COVERAGE) && !defined(_WIN32)
+            tf_coverage_channel_finish();
+#endif
             return 1;
         }
     }
@@ -1220,6 +2137,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(ac);
     RUN_SELECTED_SUITE(extraction);
     RUN_SELECTED_SUITE(callable_sig);
+    RUN_SELECTED_SUITE(test_conventions);
     RUN_SELECTED_SUITE(extraction_inheritance);
     RUN_SELECTED_SUITE(extraction_imports);
     RUN_SELECTED_SUITE(parse_coverage);
@@ -1230,6 +2148,23 @@ int main(int argc, char **argv) {
     /* Store (M5) */
     RUN_SELECTED_SUITE(store_nodes);
     RUN_SELECTED_SUITE(store_edges);
+    RUN_SELECTED_SUITE(store_impact);
+    RUN_SELECTED_SUITE(store_scope);
+    RUN_SELECTED_SUITE(store_graph_digest);
+    RUN_SELECTED_SUITE(test_impact);
+    RUN_SELECTED_SUITE(test_impact_profiles);
+    RUN_SELECTED_SUITE(test_impact_changes);
+    RUN_SELECTED_SUITE(test_impact_origins);
+    RUN_SELECTED_SUITE(test_impact_git);
+    RUN_SELECTED_SUITE(test_impact_tree);
+    RUN_SELECTED_SUITE(test_impact_tree_read);
+    RUN_SELECTED_SUITE(test_impact_inventory);
+    RUN_SELECTED_SUITE(test_impact_classify);
+    RUN_SELECTED_SUITE(test_impact_source);
+    RUN_SELECTED_SUITE(test_impact_seed);
+    RUN_SELECTED_SUITE(test_impact_engine);
+    RUN_SELECTED_SUITE(test_impact_artifact);
+    RUN_SELECTED_SUITE(test_impact_runner_filter);
     RUN_SELECTED_SUITE(store_search);
     RUN_SELECTED_SUITE(store_bulk);
     RUN_SELECTED_SUITE(store_pragmas);
@@ -1259,6 +2194,14 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(language);
     RUN_SELECTED_SUITE(userconfig);
     RUN_SELECTED_SUITE(gitignore);
+    RUN_SELECTED_SUITE(gitignore_checked);
+    RUN_SELECTED_SUITE(inventory_filter);
+#if defined(CBM_TEST_COVERAGE) && !defined(_WIN32)
+    RUN_SELECTED_SUITE(coverage_children);
+    RUN_SELECTED_SUITE(coverage_setup_success);
+    RUN_SELECTED_SUITE(coverage_setup_uncertain);
+    RUN_SELECTED_SUITE(coverage_parent_failure);
+#endif
     RUN_SELECTED_SUITE(git_context);
     RUN_SELECTED_SUITE(discover);
 
@@ -1268,6 +2211,8 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(pipeline_conventions);
+    RUN_SELECTED_SUITE(pipeline_frozen);
     RUN_SELECTED_SUITE(importance);
     RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);
@@ -1392,6 +2337,8 @@ int main(int argc, char **argv) {
 
     /* Per-language graph contracts (node/edge types, attribution, no-crash) */
     RUN_SELECTED_SUITE(lang_contract);
+    RUN_SELECTED_SUITE(conditional_variants);
+    RUN_SELECTED_SUITE(spawns);
     RUN_SELECTED_SUITE(edge_imports);
     RUN_SELECTED_SUITE(edge_structural);
     RUN_SELECTED_SUITE(lsp_resolution_probe);
@@ -1430,11 +2377,22 @@ int main(int argc, char **argv) {
     if (g_suite_argc > 1 && !any_suite_matched) {
         fprintf(stderr, "No matching test suites requested\n");
     }
+#if defined(CBM_TEST_COVERAGE) && !defined(_WIN32)
+    tf_coverage_parent_failure_finish();
+#endif
+    tf_only_report_unmatched();
+    tf_only_free();
     free(g_suite_arg_matched);
     g_suite_arg_matched = NULL;
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();
     sqlite3_shutdown();
+#if defined(CBM_TEST_COVERAGE) && !defined(_WIN32)
+    tf_coverage_channel_finish();
+#endif
+#ifdef CBM_TEST_COVERAGE
+    tf_coverage_finish();
+#endif
     TEST_SUMMARY();
 }

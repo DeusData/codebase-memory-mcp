@@ -13,6 +13,8 @@
 enum {
     USE_PREFIX_LEN = 4, /* strlen("use ") */
     MIN_WOLFRAM_CHILDREN = 2,
+    /* Nested `#if` branches followed while collecting C includes. */
+    C_INCLUDE_NEST_LIMIT = 64,
     SECOND_IDX = 1,
 };
 
@@ -45,7 +47,7 @@ static void parse_lisp_imports(CBMExtractCtx *ctx);
 static void parse_starlark_imports(CBMExtractCtx *ctx);
 static void parse_tcl_imports(CBMExtractCtx *ctx);
 static void parse_teal_imports(CBMExtractCtx *ctx);
-static void parse_zsh_imports(CBMExtractCtx *ctx);
+static void parse_shell_source_imports(CBMExtractCtx *ctx);
 static void parse_css_imports(CBMExtractCtx *ctx);
 static void parse_html_imports(CBMExtractCtx *ctx);
 static void parse_cmake_imports(CBMExtractCtx *ctx);
@@ -663,10 +665,22 @@ static char *strip_angle_brackets(CBMArena *a, char *path) {
     return path;
 }
 
-static void parse_c_imports(CBMExtractCtx *ctx) {
+/* Node kinds that only group file-level items: the branches of `#if` /
+ * `#ifdef` (an include guard is one) and the body of `extern "C" { ... }`. */
+static bool is_c_include_container(const char *kind) {
+    return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_ifdef") == 0 ||
+           strcmp(kind, "preproc_else") == 0 || strcmp(kind, "preproc_elif") == 0 ||
+           strcmp(kind, "preproc_elifdef") == 0 || strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "declaration_list") == 0;
+}
+
+/* Collect the includes among `parent`'s children, descending into
+ * preprocessor branches: every header keeps its includes inside its include
+ * guard, so the top level alone gave a guarded header no imports at all. */
+static void parse_c_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
     CBMArena *a = ctx->arena;
 
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
         return;
@@ -675,6 +689,9 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "preproc_include") != 0 && strcmp(kind, "preproc_import") != 0) {
+            if (depth < C_INCLUDE_NEST_LIMIT && is_c_include_container(kind)) {
+                parse_c_imports_in(ctx, node, depth + SKIP_ONE);
+            }
             continue;
         }
 
@@ -693,6 +710,10 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+static void parse_c_imports(CBMExtractCtx *ctx) {
+    parse_c_imports_in(ctx, ctx->root, 0);
 }
 
 // --- Ruby imports ---
@@ -2166,10 +2187,13 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
     }
 }
 
-// --- Zsh imports ---
+// --- Bash / Zsh imports ---
 // source file / . file — `command` nodes whose command_name is "source" or ".".
-// The argument field carries the sourced path.
-static void parse_zsh_imports(CBMExtractCtx *ctx) {
+// The argument field carries the sourced path. Every other command is a call,
+// not an import: read as an import, `set -e` imported "set", which the import
+// resolver then bound to whatever project symbol is named set (a TSX method),
+// and every `set` call in the script followed it.
+static void parse_shell_source_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_512);
@@ -3028,8 +3052,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "call");
         break;
     case CBM_LANG_BASH:
-        // source/. commands
-        parse_generic_imports(ctx, "command");
+        parse_shell_source_imports(ctx);
         break;
     case CBM_LANG_ZIG:
         parse_zig_imports(ctx);
@@ -3099,7 +3122,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_teal_imports(ctx);
         break;
     case CBM_LANG_ZSH:
-        parse_zsh_imports(ctx);
+        parse_shell_source_imports(ctx);
         break;
     case CBM_LANG_CMAKE:
         parse_cmake_imports(ctx);

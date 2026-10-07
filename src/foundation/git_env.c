@@ -74,13 +74,21 @@ bool cbm_git_env_entry_is_repo_local(const char *entry) {
     return git_env_name_is_repo_local(entry, name_len);
 }
 
+/* Explicit diff flags must not be overridden by the caller's environment.
+ * Keep the public repository-local classification and its Git-derived list
+ * unchanged; this extra removal belongs only to child construction. */
+static bool git_env_name_should_strip(const char *name, size_t name_len) {
+    return git_env_name_is_repo_local(name, name_len) ||
+           git_env_name_equals(name, name_len, "GIT_DIFF_OPTS");
+}
+
 #ifdef _WIN32
 
-/* Wide entry name → is it repository-local? Names we match are ASCII, so any
+/* Wide entry name → should the child omit it? Names we match are ASCII, so any
  * non-ASCII code unit is an immediate mismatch. Windows keeps per-drive cwd
  * entries ("=C:=C:\\dir") whose name starts with '='; the search for the
  * separator starts at index 1 so they are kept untouched. */
-static bool git_env_wide_entry_is_repo_local(const wchar_t *entry) {
+static bool git_env_wide_entry_should_strip(const wchar_t *entry) {
     char name[64] = {0};
     size_t n = 0;
     for (size_t i = 0; entry[i] && (i == 0 || entry[i] != L'='); i++) {
@@ -89,7 +97,7 @@ static bool git_env_wide_entry_is_repo_local(const wchar_t *entry) {
         }
         name[n++] = (char)entry[i];
     }
-    return git_env_name_is_repo_local(name, n);
+    return git_env_name_should_strip(name, n);
 }
 
 wchar_t *cbm_git_child_env_block(void) {
@@ -99,7 +107,7 @@ wchar_t *cbm_git_child_env_block(void) {
     }
     size_t kept = 0;
     for (const wchar_t *e = current; *e; e += wcslen(e) + 1) {
-        if (!git_env_wide_entry_is_repo_local(e)) {
+        if (!git_env_wide_entry_should_strip(e)) {
             kept += wcslen(e) + 1;
         }
     }
@@ -111,7 +119,7 @@ wchar_t *cbm_git_child_env_block(void) {
     }
     size_t pos = 0;
     for (const wchar_t *e = current; *e; e += wcslen(e) + 1) {
-        if (!git_env_wide_entry_is_repo_local(e)) {
+        if (!git_env_wide_entry_should_strip(e)) {
             size_t len = wcslen(e) + 1;
             memcpy(block + pos, e, len * sizeof(wchar_t));
             pos += len;
@@ -127,11 +135,17 @@ wchar_t *cbm_git_child_env_block(void) {
 
 #else
 
+static bool git_env_entry_should_strip(const char *entry) {
+    const char *eq = strchr(entry, '=');
+    size_t name_len = eq ? (size_t)(eq - entry) : strlen(entry);
+    return git_env_name_should_strip(entry, name_len);
+}
+
 char **cbm_git_child_envp(void) {
     size_t count = 0;
     size_t bytes = 0;
     for (char **e = environ; e && *e; e++) {
-        if (!cbm_git_env_entry_is_repo_local(*e)) {
+        if (!git_env_entry_should_strip(*e)) {
             count++;
             bytes += strlen(*e) + 1;
         }
@@ -144,7 +158,7 @@ char **cbm_git_child_envp(void) {
     char *strings = (char *)envp + table;
     size_t slot = 0;
     for (char **e = environ; e && *e && slot < count; e++) {
-        if (!cbm_git_env_entry_is_repo_local(*e)) {
+        if (!git_env_entry_should_strip(*e)) {
             size_t len = strlen(*e) + 1;
             memcpy(strings, *e, len);
             envp[slot++] = strings;
