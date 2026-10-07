@@ -635,6 +635,8 @@ static cbm_pipeline_frozen_status_t frozen_allocate_pipeline(
     cbm_pipeline_t *p = calloc(1, sizeof(*p));
     if (!p)
         return CBM_PIPELINE_FROZEN_OOM;
+    atomic_init(&p->unresolved_capture_failed, false);
+    cbm_mutex_init(&p->unresolved_mutex);
     owner->pipeline = p;
     p->frozen = owner;
     p->repo_path = strdup(in->source_root);
