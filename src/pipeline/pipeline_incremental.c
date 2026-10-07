@@ -16,6 +16,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/lsp_surface.h"
+#include "foundation/mem_core.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
@@ -37,6 +38,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <sys/stat.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <limits.h>
 
 /* ── Constants ───────────────────────────────────────────────────── */
 
@@ -141,6 +143,7 @@ typedef struct {
     int count;
     int cap;
     CBMHashTable *seen_paths;
+    cbm_pipeline_t *frozen; /* optional cooperative frozen checkpoint */
 } semantic_manifest_builder_t;
 
 static int semantic_manifest_cmp(const void *a, const void *b) {
@@ -168,54 +171,85 @@ void cbm_pipeline_free_semantic_manifest(cbm_file_hash_t *manifest, int count) {
 
 /* Hash a stable file generation. A concurrent edit is retried once; a second
  * race fails closed so a mixed-generation manifest can never be published. */
-static int semantic_manifest_hash_file(const char *abs_path, char out[CBM_SHA256_HEX_LEN + 1],
-                                       int64_t *mtime_ns, int64_t *size) {
+static bool semantic_manifest_read_digest(const char *path, cbm_sha256_ctx *sha,
+                                          cbm_pipeline_t *frozen) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file)
+        return false;
+    (void)setvbuf(file, NULL, _IONBF, 0);
+    unsigned char buf[CBM_SZ_64K];
+    size_t len;
+    bool valid = true;
+    while ((len = fread(buf, 1, sizeof(buf), file)) > 0) {
+        if (cbm_pipeline_frozen_checkpoint(frozen)) {
+            valid = false;
+            break;
+        }
+        cbm_sha256_update(sha, buf, len);
+    }
+    valid = valid && !ferror(file);
+    if (fclose(file) != 0)
+        valid = false;
+    return valid;
+}
+
+static bool semantic_manifest_regular(const char *path, cbm_path_info_t *info) {
+    return cbm_path_info_utf8(path, info) == 0 && info->is_regular && !info->is_symlink;
+}
+
+static void semantic_manifest_finish_digest(cbm_sha256_ctx *sha, char out[CBM_SHA256_HEX_LEN + 1]) {
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(sha, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+static int semantic_manifest_hash_file_ex(const char *abs_path, char out[CBM_SHA256_HEX_LEN + 1],
+                                          int64_t *mtime_ns, int64_t *size,
+                                          cbm_pipeline_t *frozen) {
     for (int attempt = 0; attempt < 2; attempt++) {
-        cbm_path_info_t before;
-        if (cbm_path_info_utf8(abs_path, &before) != 0 || !before.is_regular || before.is_symlink) {
+        cbm_path_info_t before, after;
+        if (!semantic_manifest_regular(abs_path, &before))
             return CBM_NOT_FOUND;
-        }
-        FILE *f = cbm_fopen(abs_path, "rb");
-        if (!f) {
-            return CBM_NOT_FOUND;
-        }
-        /* Reads go through buf below: a stdio buffer of its own was one unused
-         * 4 KB allocation per file (43 k on the Go corpus, waste sanitizer
-         * 2026-09-17). */
-        (void)setvbuf(f, NULL, _IONBF, 0);
         cbm_sha256_ctx sha;
         cbm_sha256_init(&sha);
-        unsigned char buf[CBM_SZ_64K];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-            cbm_sha256_update(&sha, buf, n);
-        }
-        bool read_ok = !ferror(f);
-        if (fclose(f) != 0) {
-            read_ok = false;
-        }
-        cbm_path_info_t after;
-        if (!read_ok || cbm_path_info_utf8(abs_path, &after) != 0 || !after.is_regular ||
-            after.is_symlink) {
+        if (!semantic_manifest_read_digest(abs_path, &sha, frozen) ||
+            !semantic_manifest_regular(abs_path, &after))
             return CBM_NOT_FOUND;
-        }
-        if (before.size != after.size || before.mtime_ns != after.mtime_ns) {
+        if (before.size != after.size || before.mtime_ns != after.mtime_ns)
             continue;
-        }
-        uint8_t digest[CBM_SHA256_DIGEST_LEN];
-        cbm_sha256_final(&sha, digest);
-        static const char hex[] = "0123456789abcdef";
-        for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
-            out[i * 2] = hex[digest[i] >> 4];
-            out[i * 2 + 1] = hex[digest[i] & 0x0f];
-        }
-        out[CBM_SHA256_HEX_LEN] = '\0';
+        semantic_manifest_finish_digest(&sha, out);
         *mtime_ns = after.mtime_ns;
         *size = after.size;
         return 0;
     }
     cbm_log_warn("semantic_manifest.raced", "path", abs_path);
     return CBM_NOT_FOUND;
+}
+
+static int semantic_manifest_hash_file(const char *path, char out[CBM_SHA256_HEX_LEN + 1],
+                                       int64_t *mtime, int64_t *size) {
+    return semantic_manifest_hash_file_ex(path, out, mtime, size, NULL);
+}
+
+static bool semantic_manifest_reserve(semantic_manifest_builder_t *builder) {
+    if (builder->count != builder->cap)
+        return true;
+    if (builder->cap > INT_MAX / 2)
+        return false;
+    int capacity = builder->cap > 0 ? builder->cap * 2 : CBM_SZ_64;
+    if ((size_t)capacity > SIZE_MAX / sizeof(*builder->items))
+        return false;
+    cbm_file_hash_t *items = realloc(builder->items, (size_t)capacity * sizeof(*items));
+    if (!items)
+        return false;
+    builder->items = items;
+    builder->cap = capacity;
+    return true;
 }
 
 static int semantic_manifest_add_digest(semantic_manifest_builder_t *builder, const char *project,
@@ -230,15 +264,8 @@ static int semantic_manifest_add_digest(semantic_manifest_builder_t *builder, co
             return CBM_NOT_FOUND;
         }
     }
-    if (builder->count == builder->cap) {
-        int new_cap = builder->cap > 0 ? builder->cap * 2 : CBM_SZ_64;
-        cbm_file_hash_t *grown = realloc(builder->items, (size_t)new_cap * sizeof(*builder->items));
-        if (!grown) {
-            return CBM_NOT_FOUND;
-        }
-        builder->items = grown;
-        builder->cap = new_cap;
-    }
+    if (!semantic_manifest_reserve(builder))
+        return CBM_NOT_FOUND;
     char *project_copy = strdup(project);
     char *path_copy = strdup(rel_path);
     char *sha_copy = strdup(sha);
@@ -268,6 +295,8 @@ static int semantic_manifest_add_digest(semantic_manifest_builder_t *builder, co
 
 static int semantic_manifest_add(semantic_manifest_builder_t *builder, const char *project,
                                  const char *rel_path, const char *abs_path) {
+    if (cbm_pipeline_frozen_checkpoint(builder->frozen))
+        return CBM_NOT_FOUND;
     if (!rel_path || !rel_path[0]) {
         return 0;
     }
@@ -281,7 +310,7 @@ static int semantic_manifest_add(semantic_manifest_builder_t *builder, const cha
     char sha[CBM_SHA256_HEX_LEN + 1];
     int64_t mtime_ns = 0;
     int64_t size = 0;
-    if (semantic_manifest_hash_file(abs_path, sha, &mtime_ns, &size) != 0) {
+    if (semantic_manifest_hash_file_ex(abs_path, sha, &mtime_ns, &size, builder->frozen) != 0) {
         cbm_log_error("semantic_manifest.err", "path", abs_path);
         return CBM_NOT_FOUND;
     }
@@ -342,57 +371,58 @@ static bool semantic_manifest_package_control(const char *name) {
 static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
                                            const char *project, const char *abs_dir,
                                            const char *rel_dir, int depth, char **excluded_dirs,
+                                           int excluded_count);
+
+static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
+                                           const char *project, const char *abs_dir,
+                                           const char *rel_dir, int depth, char **excluded_dirs,
+                                           int excluded_count, const char *name) {
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        return 0;
+    char abs_path[CBM_SZ_4K], rel_path[CBM_SZ_4K];
+    int abs_n = snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
+    int rel_n = rel_dir && rel_dir[0] ? snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name)
+                                      : snprintf(rel_path, sizeof(rel_path), "%s", name);
+    if (abs_n < 0 || (size_t)abs_n >= sizeof(abs_path) || rel_n < 0 ||
+        (size_t)rel_n >= sizeof(rel_path))
+        return CBM_NOT_FOUND;
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(abs_path, &info) != 0)
+        return CBM_NOT_FOUND;
+    if (info.is_symlink)
+        return 0;
+    if (info.is_directory) {
+        if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+            cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count))
+            return 0;
+        return semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
+                                               excluded_dirs, excluded_count);
+    }
+    bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
+                                                      strcmp(name, ".codebase-memory.json") == 0);
+    bool control =
+        strcmp(name, ".gitignore") == 0 || root_control || semantic_manifest_package_control(name);
+    return info.is_regular && control ? semantic_manifest_add(builder, project, rel_path, abs_path)
+                                      : 0;
+}
+
+static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
+                                           const char *project, const char *abs_dir,
+                                           const char *rel_dir, int depth, char **excluded_dirs,
                                            int excluded_count) {
     enum { MANIFEST_WALK_MAX_DEPTH = 64 };
-    if (depth >= MANIFEST_WALK_MAX_DEPTH) {
+    if (depth >= MANIFEST_WALK_MAX_DEPTH)
         return 0;
-    }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
-    if (!dir) {
+    if (!dir)
         return CBM_NOT_FOUND;
-    }
     int rc = 0;
     cbm_dirent_t *entry;
     while (rc == 0 && (entry = cbm_readdir(dir)) != NULL) {
-        const char *name = entry->name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-            continue;
-        }
-        char abs_path[CBM_SZ_4K];
-        char rel_path[CBM_SZ_4K];
-        int abs_n = snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
-        int rel_n = rel_dir && rel_dir[0]
-                        ? snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name)
-                        : snprintf(rel_path, sizeof(rel_path), "%s", name);
-        if (abs_n < 0 || abs_n >= (int)sizeof(abs_path) || rel_n < 0 ||
-            rel_n >= (int)sizeof(rel_path)) {
-            rc = CBM_NOT_FOUND;
-            break;
-        }
-        cbm_path_info_t path_info;
-        if (cbm_path_info_utf8(abs_path, &path_info) != 0) {
-            rc = CBM_NOT_FOUND;
-            break;
-        }
-        if (path_info.is_symlink) {
-            continue;
-        }
-        if (path_info.is_directory) {
-            if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
-                cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
-                continue;
-            }
-            rc = semantic_manifest_walk_controls(builder, project, abs_path, rel_path, depth + 1,
-                                                 excluded_dirs, excluded_count);
-            continue;
-        }
-        bool root_control =
-            (!rel_dir || !rel_dir[0]) &&
-            (strcmp(name, ".cbmignore") == 0 || strcmp(name, ".codebase-memory.json") == 0);
-        if (path_info.is_regular && (strcmp(name, ".gitignore") == 0 || root_control ||
-                                     semantic_manifest_package_control(name))) {
-            rc = semantic_manifest_add(builder, project, rel_path, abs_path);
-        }
+        rc = cbm_pipeline_frozen_checkpoint(builder->frozen);
+        if (rc == 0)
+            rc = semantic_manifest_control_entry(builder, project, abs_dir, rel_dir, depth,
+                                                 excluded_dirs, excluded_count, entry->name);
     }
     cbm_closedir(dir);
     return rc;
@@ -620,6 +650,171 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
     return equal;
 }
 
+/* Frozen manifests use the same rows and source controls, but never ambient
+ * config/Git refresh, parallel hashing, or non-cancellable qsort. */
+static int frozen_manifest_seed(semantic_manifest_builder_t *builder, cbm_pipeline_t *p) {
+    const char *project = cbm_pipeline_project_name(p);
+    const cbm_userconfig_t *config = cbm_pipeline_frozen_config(p);
+    char git_digest[CBM_SHA256_HEX_LEN + 1];
+    semantic_manifest_git_digest(cbm_pipeline_frozen_git(p), git_digest);
+    int rc = semantic_manifest_add_digest(builder, project, CBM_SEMANTIC_INPUT_GIT_CONTEXT,
+                                          git_digest, 0, 0);
+    if (rc == 0)
+        rc = semantic_manifest_add_digest(builder, project, CBM_SEMANTIC_INPUT_GLOBAL_CONFIG,
+                                          config->global_source_sha256, 0, 0);
+    if (rc == 0)
+        rc = semantic_manifest_add_digest(builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
+                                          config->project_source_sha256, 0, 0);
+    return rc;
+}
+
+static int frozen_manifest_aliases(semantic_manifest_builder_t *builder, cbm_pipeline_t *p,
+                                   char **excluded, int excluded_count) {
+    const char *root = cbm_pipeline_repo_path(p);
+    cbm_path_alias_collection_t *aliases =
+        cbm_load_path_aliases_excluded(root, excluded, excluded_count);
+    int rc = cbm_pipeline_frozen_checkpoint(p);
+    if (!aliases)
+        return rc; /* Existing API conflates no aliases with unavailable aliases. */
+    for (int i = 0; rc == 0 && i < aliases->count; i++) {
+        rc = cbm_pipeline_frozen_checkpoint(p);
+        const char *rel = aliases->scopes[i].source_rel_path;
+        if (rc != 0 || !rel)
+            continue;
+        char abs_path[CBM_SZ_4K];
+        int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", root, rel);
+        rc = n < 0 || (size_t)n >= sizeof(abs_path)
+                 ? CBM_NOT_FOUND
+                 : semantic_manifest_add(builder, cbm_pipeline_project_name(p), rel, abs_path);
+    }
+    cbm_path_alias_collection_free(aliases);
+    return rc;
+}
+
+static int frozen_manifest_sift(cbm_pipeline_t *p, cbm_file_hash_t *items, size_t root,
+                                size_t count) {
+    while (root < count / 2) {
+        if (cbm_pipeline_frozen_checkpoint(p))
+            return CBM_NOT_FOUND;
+        size_t child = root * 2 + 1;
+        if (child + 1 < count && semantic_manifest_cmp(&items[child], &items[child + 1]) < 0)
+            child++;
+        if (semantic_manifest_cmp(&items[root], &items[child]) >= 0)
+            break;
+        cbm_file_hash_t saved = items[root];
+        items[root] = items[child];
+        items[child] = saved;
+        root = child;
+    }
+    return 0;
+}
+
+static int frozen_manifest_sort(cbm_pipeline_t *p, cbm_file_hash_t *items, int count) {
+    for (size_t i = (size_t)count / 2; i > 0; i--) {
+        if (frozen_manifest_sift(p, items, i - 1, (size_t)count))
+            return CBM_NOT_FOUND;
+    }
+    for (size_t end = (size_t)count; end > 1; end--) {
+        if (cbm_pipeline_frozen_checkpoint(p))
+            return CBM_NOT_FOUND;
+        cbm_file_hash_t saved = items[0];
+        items[0] = items[end - 1];
+        items[end - 1] = saved;
+        if (frozen_manifest_sift(p, items, 0, end - 1))
+            return CBM_NOT_FOUND;
+    }
+    return cbm_pipeline_frozen_checkpoint(p);
+}
+
+int cbm_pipeline_build_frozen_manifest(cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                       int file_count, char **excluded, int excluded_count,
+                                       cbm_file_hash_t **out, int *out_count) {
+    if (!out || !out_count)
+        return CBM_NOT_FOUND;
+    *out = NULL;
+    *out_count = 0;
+    if (!cbm_pipeline_is_frozen(p) || file_count < 0 || (file_count && !files))
+        return CBM_NOT_FOUND;
+    semantic_manifest_builder_t builder = {.frozen = p};
+    builder.seen_paths = cbm_ht_create(CBM_SZ_64);
+    if (!builder.seen_paths)
+        return CBM_NOT_FOUND;
+    int rc = cbm_pipeline_frozen_checkpoint(p);
+    if (rc == 0)
+        rc = frozen_manifest_seed(&builder, p);
+    if (rc == 0 && file_count > 0)
+        cbm_pipeline_frozen_manifest_dispatch(p);
+    for (int i = 0; rc == 0 && i < file_count; i++) {
+        rc = cbm_pipeline_frozen_checkpoint(p);
+        if (rc == 0)
+            rc = semantic_manifest_add(&builder, cbm_pipeline_project_name(p), files[i].rel_path,
+                                       files[i].path);
+    }
+    if (rc == 0)
+        rc = semantic_manifest_walk_controls(&builder, cbm_pipeline_project_name(p),
+                                             cbm_pipeline_repo_path(p), "", 0, excluded,
+                                             excluded_count);
+    if (rc == 0)
+        rc = frozen_manifest_aliases(&builder, p, excluded, excluded_count);
+    if (rc == 0)
+        rc = frozen_manifest_sort(p, builder.items, builder.count);
+    cbm_ht_free(builder.seen_paths);
+    if (rc != 0) {
+        cbm_pipeline_free_semantic_manifest(builder.items, builder.count);
+        return rc;
+    }
+    *out = builder.items;
+    *out_count = builder.count;
+    return 0;
+}
+
+bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_t *left,
+                                         int left_count, const cbm_file_hash_t *right,
+                                         int right_count) {
+    if (left_count < 0 || left_count != right_count || (left_count && (!left || !right)))
+        return false;
+    for (int i = 0; i < left_count; i++) {
+        if (cbm_pipeline_frozen_checkpoint(p) || strcmp(left[i].rel_path, right[i].rel_path) != 0 ||
+            strcmp(left[i].sha256, right[i].sha256) != 0)
+            return false;
+    }
+    return cbm_pipeline_frozen_checkpoint(p) == 0;
+}
+
+static int frozen_fresh_manifest(cbm_pipeline_t *p, cbm_file_hash_t **out, int *out_count) {
+    *out = NULL;
+    *out_count = 0;
+    if (cbm_pipeline_frozen_checkpoint(p))
+        return CBM_NOT_FOUND;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL,
+                                .resource_policy = cbm_pipeline_resource_policy(p),
+                                .resource_violation = cbm_pipeline_resource_violation(p)};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+    cbm_ignored_file_t *ignored = NULL;
+    int ignored_count = 0;
+    int ignored_total = 0;
+    const cbm_userconfig_t *previous = cbm_get_user_lang_config();
+    cbm_set_user_lang_config(cbm_pipeline_frozen_config(p));
+    /* With a classified file list the reconciliation re-hashes exactly the
+     * listed files: a file added to the source root since is not compared,
+     * because it is not indexed either. */
+    int rc = cbm_pipeline_frozen_has_file_list(p)
+                 ? cbm_pipeline_frozen_listed_files(p, &files, &count)
+                 : cbm_discover_ex2(cbm_pipeline_repo_path(p), &opts, &files, &count, &excluded,
+                                    &excluded_count, &ignored, &ignored_count, &ignored_total);
+    if (rc == 0)
+        rc = cbm_pipeline_build_frozen_manifest(p, files, count, excluded, excluded_count, out,
+                                                out_count);
+    cbm_set_user_lang_config(previous);
+    cbm_discover_free(files, count);
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free_ignored(ignored, ignored_count);
+    return rc;
+}
+
 int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count) {
     const char *repo_path = cbm_pipeline_repo_path(p);
@@ -628,6 +823,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
     }
     *out = NULL;
     *out_count = 0;
+    if (cbm_pipeline_is_frozen(p))
+        return frozen_fresh_manifest(p, out, out_count);
     cbm_discover_opts_t opts = {
         .mode = (cbm_index_mode_t)cbm_pipeline_get_mode(p),
         .ignore_file = NULL,
@@ -642,10 +839,12 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
     cbm_ignored_file_t *fresh_ignored = NULL;
     int fresh_ignored_count = 0;
     int fresh_ignored_total = 0;
-    cbm_userconfig_t *fresh_userconfig = cbm_userconfig_load(repo_path);
+    cbm_userconfig_t *fresh_userconfig = cbm_userconfig_load_with_source(repo_path);
     cbm_git_context_t fresh_git_ctx = {0};
     const cbm_userconfig_t *previous_userconfig = cbm_get_user_lang_config();
-    int rc = fresh_userconfig ? cbm_git_context_resolve(repo_path, &fresh_git_ctx) : CBM_NOT_FOUND;
+    int rc = cbm_pipeline_project_source_matches(p, fresh_userconfig)
+                 ? cbm_git_context_resolve(repo_path, &fresh_git_ctx)
+                 : CBM_PIPELINE_ABORT_PRESERVE_DB;
     if (rc == 0) {
         cbm_set_user_lang_config(fresh_userconfig);
         rc = cbm_discover_ex2(repo_path, &opts, &fresh_files, &fresh_file_count, &fresh_excluded,
@@ -1055,12 +1254,52 @@ static bool incr_label_is_registry_symbol(const char *label) {
  * project's definition symbols so the resolver can match cross-file symbols
  * during incremental. Mirrors the full-index registry contents exactly so an
  * incremental re-resolve picks the same nodes a full reindex would. */
+/* Each symbol is seeded with its file's DETECTED language, exactly what the
+ * full index recorded (pass_definitions.c / pass_parallel.c), so the cross-
+ * language veto judges an incremental re-resolve the same way. Stored nodes carry no
+ * language, so it comes from the current discovery (rel_path -> language);
+ * synthetic LSP sources (<python-builtins>) map by their fixed path, which is
+ * also why a builtin stub that outlives the last .py file stays Python. */
+typedef struct {
+    cbm_registry_t *registry;
+    CBMHashTable *lang_by_path; /* rel_path -> (CBMLanguage + 1); keys borrowed */
+} registry_seed_t;
+
 static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
-    cbm_registry_t *r = (cbm_registry_t *)userdata;
+    registry_seed_t *seed = (registry_seed_t *)userdata;
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
-    cbm_registry_add(r, node->name, node->qualified_name, node->label);
+    CBMLanguage lang = cbm_registry_synthetic_path_language(node->file_path);
+    if (lang == CBM_LANG_COUNT && seed->lang_by_path && node->file_path) {
+        void *v = cbm_ht_get(seed->lang_by_path, node->file_path);
+        if (v) {
+            lang = (CBMLanguage)((uintptr_t)v - SKIP_ONE);
+        }
+    }
+    cbm_registry_add_lang(seed->registry, node->name, node->qualified_name, node->label, lang);
+}
+
+/* Seed the registry from every registry symbol in the graph buffer, with
+ * languages taken from the discovered files (see registry_visitor). */
+static void registry_seed_from_gbuf(cbm_registry_t *registry, const cbm_gbuf_t *gbuf,
+                                    const cbm_file_info_t *files, int file_count) {
+    registry_seed_t seed = {.registry = registry, .lang_by_path = NULL};
+    if (files && file_count > 0) {
+        seed.lang_by_path = cbm_ht_create((size_t)file_count * PAIR_LEN);
+    }
+    if (seed.lang_by_path) {
+        for (int i = 0; i < file_count; i++) {
+            if (files[i].rel_path) {
+                cbm_ht_set(seed.lang_by_path, files[i].rel_path,
+                           (void *)((uintptr_t)files[i].language + SKIP_ONE));
+            }
+        }
+    }
+    cbm_gbuf_foreach_node(gbuf, registry_visitor, &seed);
+    if (seed.lang_by_path) {
+        cbm_ht_free(seed.lang_by_path);
+    }
 }
 
 static void free_incremental_result_cache(CBMFileResult **cache, int count) {
@@ -1095,6 +1334,9 @@ enum {
      * always worth attempting; the percentage governs at scale, where it is
      * the honest signal that a rebuild costs less than a repair. */
     CLOSURE_BUDGET_FLOOR_FILES = 8,
+    /* Variant partners of partners: real chains are one step (a header and
+     * its source, a set of platform files); a longer one declines. */
+    CLOSURE_VARIANT_ROUNDS_MAX = 8,
 };
 
 typedef struct {
@@ -1124,6 +1366,7 @@ typedef struct {
     int count;
     int n_changed;
     int n_dependents;
+    int fatal_rc; /* configured probe failures cannot decline to a full retry */
     cbm_lsp_surface_row_t *stored_rows; /* whole previous generation */
     int stored_count;
 } closure_plan_t;
@@ -1231,7 +1474,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
      * a full build takes, which is what makes its output converge. */
 
 #define MIN_FILES_FOR_PARALLEL_INCR 50
-    int worker_count = cbm_default_worker_count(true);
+    int worker_count = cbm_pipeline_is_frozen(ctx->pipeline) ? 1 : cbm_default_worker_count(true);
     bool use_parallel =
         closure != NULL || (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR);
 
@@ -1297,11 +1540,24 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         CBMModuleDefIndex *module_def_index = NULL;
         CBMCrossLspRegistries cross_registries = {0};
         CBMCrossLspRegistries *registries_arg = NULL;
+        CBMArena legacy_cross_arena;
+        bool legacy_cross_arena_live = false;
+        bool owner_walk_required = atomic_load(&ctx->test_definition_owners_seen) != 0;
+        char cross_disabled[CBM_SZ_16];
+        if (owner_walk_required && cbm_safe_getenv("CBM_DISABLE_LSP_CROSS", cross_disabled,
+                                                   sizeof(cross_disabled), NULL) != NULL) {
+            atomic_store(&ctx->test_declarations_failed, 1);
+            rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+            goto cross_resolve_cleanup;
+        }
         if (closure) {
             /* Fresh surfaces for the re-parsed files, from the same collect
              * path a full build uses; then registries over stored + fresh. */
-            def_modules = (char **)calloc((size_t)ci, sizeof(char *));
-            int *def_starts = (int *)calloc((size_t)ci + 1, sizeof(int));
+            def_modules = cbm_pipeline_test_force_def_modules_null(ctx)
+                              ? NULL
+                              : (char **)calloc((size_t)ci, sizeof(char *));
+            int *def_starts =
+                (int *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, ((size_t)ci + 1) * sizeof(int));
             int fresh_count = 0;
             CBMLSPDef *fresh_defs =
                 def_modules && def_starts
@@ -1309,6 +1565,18 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                                                ctx->project_name, def_modules, &fresh_count,
                                                def_starts)
                     : NULL;
+            if (fresh_count < 0 || (owner_walk_required && (!fresh_defs || fresh_count <= 0))) {
+                /* Do not substitute the previous generation's definitions for
+                 * configured owners that failed fresh preparation. */
+                cbm_free(CBM_MEM_CLASS_EXTRACT, def_starts);
+                free(fresh_defs);
+                closure->def_modules = def_modules;
+                closure->def_module_count = def_modules ? ci : 0;
+                def_modules = NULL;
+                atomic_store(&ctx->test_declarations_failed, 1);
+                rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+                goto cross_resolve_cleanup;
+            }
             if ((fresh_defs || fresh_count == 0) && def_starts &&
                 cbm_lsp_surface_build_rows(ctx, ctx->project_name, cache, changed_files, ci,
                                            fresh_defs, def_starts, &closure->fresh_rows,
@@ -1316,7 +1584,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 closure->fresh_rows = NULL;
                 closure->fresh_count = 0;
             }
-            free(def_starts);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, def_starts);
             all_def_count = closure->base_def_count + fresh_count;
             if (all_def_count > 0) {
                 all_defs = (CBMLSPDef *)cbm_arena_alloc(&closure->arena,
@@ -1360,16 +1628,38 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             /* The resolve workers borrow def_modules strings; ownership moves
              * to the closure ctx so they outlive resolve + calls. */
             closure->def_modules = def_modules;
-            closure->def_module_count = ci;
+            closure->def_module_count = def_modules ? ci : 0;
             def_modules = NULL;
             cbm_log_info("incremental.closure_registries", "base",
                          itoa_buf(closure->base_def_count), "fresh", itoa_buf(fresh_count),
                          "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+        } else if (owner_walk_required) {
+            /* The legacy route formerly passed no cross inputs. Prepare its
+             * changed-file definitions with the same helper as the full path;
+             * CALLS resolution still uses the loaded project-wide registry.
+             * Only configured owners require this additional cross walk. */
+            cbm_arena_init(&legacy_cross_arena);
+            legacy_cross_arena_live = true;
+            def_modules = cbm_arena_alloc(&legacy_cross_arena, (size_t)ci * sizeof(*def_modules));
+            if (def_modules) {
+                memset(def_modules, 0, (size_t)ci * sizeof(*def_modules));
+                all_defs =
+                    cbm_pxc_collect_all_defs(ctx, &legacy_cross_arena, cache, changed_files, ci,
+                                             ctx->project_name, def_modules, &all_def_count, NULL);
+            }
+            if (!all_defs || all_def_count <= 0) {
+                atomic_store(&ctx->test_declarations_failed, 1);
+                rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+                goto cross_resolve_cleanup;
+            }
+            module_def_index = cbm_pxc_build_module_def_index(all_defs, all_def_count);
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
-                                  all_defs, all_def_count, closure ? closure->def_modules : NULL,
-                                  module_def_index, registries_arg);
+        rc = cbm_parallel_resolve(
+            ctx, changed_files, ci, cache, &shared_ids, worker_count, all_defs, all_def_count,
+            closure ? closure->def_modules : def_modules, module_def_index, registries_arg);
+
+    cross_resolve_cleanup:
         if (module_def_index) {
             cbm_pxc_free_module_def_index(module_def_index);
         }
@@ -1380,6 +1670,15 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                      itoa_buf((int)elapsed_ms(t)));
         cbm_gbuf_set_next_id(ctx->gbuf, atomic_load(&shared_ids));
         free_incremental_result_cache(cache, ci);
+        if (legacy_cross_arena_live) {
+            free(all_defs); /* array returned by the existing collect helper */
+            if (def_modules) {
+                for (int i = 0; i < ci; i++) {
+                    free(def_modules[i]); /* existing module-QN helper ownership */
+                }
+            }
+            cbm_arena_destroy(&legacy_cross_arena);
+        }
         return rc;
     } else {
         cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
@@ -1405,6 +1704,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (rc == 0) {
             rc = cbm_pipeline_check_cancel(ctx);
         }
+        /* Keep ordinary legacy routing unchanged; configured owners require
+         * the same origin-aware cross pass as a full sequential run. */
+        if (rc == 0 && atomic_load(&ctx->test_definition_owners_seen)) {
+            rc = cbm_pipeline_pass_lsp_cross(ctx, changed_files, ci, cache);
+        }
         if (rc == 0) {
             rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
         }
@@ -1426,6 +1730,20 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (owns_cache) {
             free_incremental_result_cache(cache, ci);
             ctx->result_cache = prior_cache;
+        }
+        /* Cross results borrow these registries/module strings through the
+         * last consumer above, exactly as in the full sequential driver. */
+        if (ctx->seq_cross_arena_live) {
+            cbm_arena_destroy(&ctx->seq_cross_arena);
+            ctx->seq_cross_arena_live = false;
+        }
+        if (ctx->seq_cross_def_modules) {
+            for (int i = 0; i < ctx->seq_cross_def_module_count; i++) {
+                free(ctx->seq_cross_def_modules[i]);
+            }
+            free(ctx->seq_cross_def_modules);
+            ctx->seq_cross_def_modules = NULL;
+            ctx->seq_cross_def_module_count = 0;
         }
         return rc;
     }
@@ -1597,6 +1915,10 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         .gbuf = probe_gbuf,
         .registry = NULL,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .test_declarations = cbm_pipeline_test_declarations(p),
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        .test_fault_mask = cbm_pipeline_test_fault_mask(p),
+#endif
         .pipeline = NULL, /* probe must not record file errors twice */
         .mode = cbm_pipeline_get_mode(p),
         .path_aliases = aliases,
@@ -1612,8 +1934,10 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
                                   cbm_default_worker_count(true));
     }
     if (rc == 0) {
-        char **def_modules = (char **)calloc((size_t)probe_count, sizeof(char *));
-        int *def_starts = (int *)calloc((size_t)probe_count + 1, sizeof(int));
+        char **def_modules =
+            (char **)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)probe_count * sizeof(char *));
+        int *def_starts =
+            (int *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, ((size_t)probe_count + 1) * sizeof(int));
         int def_count = 0;
         CBMLSPDef *defs = NULL;
         CBMArena probe_arena;
@@ -1621,19 +1945,21 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         if (def_modules && def_starts) {
             defs = cbm_pxc_collect_all_defs(NULL, &probe_arena, cache, probe_files, probe_count,
                                             project, def_modules, &def_count, def_starts);
-            rc = cbm_lsp_surface_build_rows(NULL, project, cache, probe_files, probe_count, defs,
-                                            def_starts, out_rows, out_count);
+            rc = def_count < 0
+                     ? CBM_PIPELINE_ABORT_PRESERVE_DB
+                     : cbm_lsp_surface_build_rows(NULL, project, cache, probe_files, probe_count,
+                                                  defs, def_starts, out_rows, out_count);
         } else {
             rc = -1;
         }
         free(defs);
         cbm_arena_destroy(&probe_arena);
-        free(def_starts);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, def_starts);
         if (def_modules) {
             for (int i = 0; i < probe_count; i++) {
                 free(def_modules[i]);
             }
-            free(def_modules);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, def_modules);
         }
     }
     if (cache) {
@@ -1690,6 +2016,84 @@ static void closure_seed_governed(CBMHashTable *closure_set, const cbm_file_info
             cbm_ht_set(closure_set, files[i].rel_path, (void *)files[i].rel_path);
         }
     }
+}
+
+static bool closure_path_listed(char **paths, int count, const char *path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(paths[i], path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Variant partners (graph_buffer.c "Definition variants"): a definition
+ * written in several files (platform files, a struct's header declaration
+ * and its source definition, Go build-tagged files) is ONE node whose
+ * file_path names one of them, with a DEFINES edge from every file that
+ * writes a variant. Re-parsing one of those files alone rebuilds the node
+ * without the others' spans and outbound edges, or leaves a changed
+ * partner's stale span behind; so every file of such a node joins the
+ * closure, to a fixpoint. `paths` is the delta (changed, then deleted from
+ * index n_changed on); `dependents` already joined. A deleted partner is in
+ * the delta already; any other partner outside the discovery declines, as a
+ * dependent would. Returns the decline reason, or NULL. */
+static const char *closure_add_variant_partners(cbm_store_t *store, const char *project,
+                                                CBMHashTable *closure_set,
+                                                CBMHashTable *files_by_path, char **paths,
+                                                int path_count, int n_changed, char **dependents,
+                                                int dependent_count) {
+    int cap = path_count + dependent_count + CBM_SZ_64;
+    const char **pending = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)cap * sizeof(char *));
+    if (!pending) {
+        return "alloc";
+    }
+    int n = 0;
+    for (int i = 0; i < path_count; i++) {
+        pending[n++] = paths[i];
+    }
+    for (int i = 0; i < dependent_count; i++) {
+        pending[n++] = dependents[i];
+    }
+    const char *decline = NULL;
+    for (int round = 0; n > 0 && !decline; round++) {
+        char **partners = NULL;
+        int pc = 0;
+        if (round == CLOSURE_VARIANT_ROUNDS_MAX) {
+            decline = "variant_partner_rounds";
+        } else if (cbm_store_get_variant_partner_files(store, project, pending, n, &partners,
+                                                       &pc) != CBM_STORE_OK) {
+            decline = "variant_partner_query_failed";
+        }
+        n = 0;
+        for (int i = 0; i < pc && !decline; i++) {
+            const cbm_file_info_t *fi = cbm_ht_get(files_by_path, partners[i]);
+            if (!fi) {
+                if (!closure_path_listed(paths + n_changed, path_count - n_changed, partners[i])) {
+                    decline = "variant_partner_not_discovered";
+                }
+                continue;
+            }
+            if (cbm_ht_get(closure_set, fi->rel_path)) {
+                continue;
+            }
+            cbm_ht_set(closure_set, fi->rel_path, (void *)fi->rel_path);
+            if (n == cap) {
+                cap *= PAIR_LEN;
+                const char **grown =
+                    cbm_realloc(CBM_MEM_CLASS_OTHER, pending, (size_t)cap * sizeof(char *));
+                if (!grown) {
+                    decline = "alloc";
+                    break;
+                }
+                pending = grown;
+            }
+            pending[n++] = fi->rel_path;
+        }
+        cbm_store_free_dependent_files(partners, pc);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, pending);
+    return decline;
 }
 
 /* Decide whether this manifest delta is closure-repairable, and if so build
@@ -1829,9 +2233,14 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         }
         probe_files[i] = *info;
     }
-    if (n_changed > 0 && closure_probe_surfaces(p, project, probe_files, n_changed, &probe_rows,
-                                                &probe_count) != 0) {
+    int probe_rc = n_changed > 0 ? closure_probe_surfaces(p, project, probe_files, n_changed,
+                                                          &probe_rows, &probe_count)
+                                 : 0;
+    if (probe_rc != 0) {
         cbm_ht_free(rows_by_path);
+        if (probe_rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
+            plan->fatal_rc = probe_rc;
+        }
         decline = "probe_failed";
         goto done;
     }
@@ -1906,6 +2315,12 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             cbm_ht_set(closure_set, dependents[i], dependents[i]);
         }
     }
+    decline =
+        closure_add_variant_partners(store, project, closure_set, files_by_path, changed_paths,
+                                     n_changed + n_deleted, n_changed, dependents, dependent_count);
+    if (decline) {
+        goto done;
+    }
     /* closure_count == 0 is legitimate: a deleted-only delta with no
      * dependents has nothing to re-parse, but the purge itself still needs
      * the executor. */
@@ -1953,7 +2368,9 @@ done:
         cbm_log_info("incremental.closure_decline", "reason", decline, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
         cbm_store_free_lsp_surfaces(plan->stored_rows, plan->stored_count);
+        int fatal_rc = plan->fatal_rc;
         memset(plan, 0, sizeof(*plan));
+        plan->fatal_rc = fatal_rc;
         return 0;
     }
     return 1;
@@ -1975,7 +2392,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                              closure_plan_t *plan, cbm_file_info_t *changed_files, int ci,
                              char **deleted, int deleted_count, cbm_file_hash_t *mode_skipped,
                              int mode_skipped_count, cbm_coverage_row_t *old_cov, int old_cov_count,
-                             cbm_store_t *route_store, struct timespec t0) {
+                             cbm_store_t *route_store, const cbm_file_info_t *files, int file_count,
+                             struct timespec t0) {
     struct timespec t;
     cbm_store_close(route_store);
 
@@ -2045,7 +2463,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     if (!registry) {
         goto out;
     }
-    cbm_gbuf_foreach_node(gbuf, registry_visitor, registry);
+    registry_seed_from_gbuf(registry, gbuf, files, file_count);
     cbm_log_info("delta.preseed_done", "registry", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
@@ -2173,6 +2591,10 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .gbuf = gbuf,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .test_declarations = cbm_pipeline_test_declarations(p),
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        .test_fault_mask = cbm_pipeline_test_fault_mask(p),
+#endif
         .pipeline = p,
         .mode = cbm_pipeline_get_mode(p),
         .path_aliases = path_aliases,
@@ -2217,6 +2639,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_pipeline_set_pkgmap(NULL);
     if (phase_rc != 0) {
         cbm_log_error("delta.err", "phase", "extract_resolve", "rc", itoa_buf(phase_rc));
+        if (phase_rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
+            result = phase_rc;
+        }
         goto out;
     }
     cbm_log_info("delta.repair", "files", itoa_buf(ci), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
@@ -2236,6 +2661,14 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
      * A failure here is a delta-route failure: `result` still holds
      * FORCE_FULL_REINDEX, so the run degrades to a correct full rebuild
      * rather than publishing wrong scores. */
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    if (cbm_pipeline_complexity_recompute_store(staging, project) != 0) {
+        cbm_log_error("delta.err", "phase", "complexity_recompute");
+        goto out;
+    }
+    cbm_log_info("pass.timing", "pass", "delta_complexity_store", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_pipeline_importance_recompute_store(staging, project) != 0) {
         cbm_log_error("delta.err", "phase", "importance_recompute");
@@ -2393,8 +2826,10 @@ out:
     surface_name_set_free(stale_surface_set);
     if (cr_arena_live) {
         cbm_store_free_lsp_surfaces(cr.fresh_rows, cr.fresh_count);
-        for (int i = 0; i < cr.def_module_count; i++) {
-            free(cr.def_modules[i]);
+        if (cr.def_modules) {
+            for (int i = 0; i < cr.def_module_count; i++) {
+                free(cr.def_modules[i]);
+            }
         }
         free(cr.def_modules);
         for (int i = 0; i < cr.rehydrate_arena_count; i++) {
@@ -2520,6 +2955,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 #endif
+            if (closure_plan.fatal_rc) {
+                return closure_plan.fatal_rc;
+            }
             cbm_log_info("incremental.force_full", "reason", "semantic_manifest_changed");
             return CBM_PIPELINE_FORCE_FULL_REINDEX;
         }
@@ -2618,7 +3056,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return run_closure_delta(p, db_path, project, baseline_manifest, baseline_count,
                                  &closure_plan, changed_files, ci, deleted, deleted_count,
                                  mode_skipped, mode_skipped_count, old_cov, old_cov_count, store,
-                                 t0);
+                                 files, file_count, t0);
     }
 
     struct timespec t;
@@ -2725,7 +3163,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Step 3-5: Registry + extract + resolve */
     cbm_registry_t *registry = cbm_registry_new();
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_gbuf_foreach_node(existing, registry_visitor, registry);
+    registry_seed_from_gbuf(registry, existing, files, file_count);
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
@@ -2746,6 +3184,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .test_declarations = cbm_pipeline_test_declarations(p),
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        .test_fault_mask = cbm_pipeline_test_fault_mask(p),
+#endif
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = cbm_pipeline_get_mode(p),
         .path_aliases = path_aliases,

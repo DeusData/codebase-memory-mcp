@@ -33,6 +33,7 @@
 #include "daemon/version_cohort.h"
 #include "mcp/mcp.h"
 #include "mcp/index_supervisor.h"
+#include "mcp/test_impact_engine.h"
 #include "cli/cli.h"
 #include "cli/progress_sink.h"
 #include "foundation/constants.h"
@@ -1279,6 +1280,10 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return cbm_cmd_hook_augment(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "test-impact") == 0) {
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+            return cbm_test_impact_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "install") == 0) {
             return cbm_cmd_install(argc - i - SKIP_ONE, argv + i + SKIP_ONE);

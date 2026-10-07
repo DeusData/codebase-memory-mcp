@@ -3,13 +3,19 @@
 name: Lint & Security
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      lanes:
+        description: 'PR lane selection (scripts/ci/select-lanes.sh JSON list); "all" = every job (dry run, release)'
+        type: string
+        default: all
 
 permissions:
   contents: read
 
 jobs:
   lint:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'lint') }}
     # Pinned, not ubuntu-latest: the LLVM install below adds an
     # apt.llvm.org llvm-toolchain-NOBLE repo, which is 24.04 by name. When
     # GitHub moves ubuntu-latest to the next LTS this job breaks on a day
@@ -64,6 +70,7 @@ jobs:
   # provability (never suppressed — the NOLINT ban applies here too).
   # Vendored-tree diagnostics are path-filtered, mirroring .cppcheck.
   lint-mem:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'lint-mem') }}
     # Pinned for the same reason as `lint`: llvm-toolchain-noble-21 below.
     runs-on: ubuntu-24.04
     timeout-minutes: 60

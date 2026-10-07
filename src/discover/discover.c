@@ -10,6 +10,7 @@
  *   5. Language detection for accepted files
  */
 #include "discover/discover.h"
+#include "discover/discover_policy_internal.h"
 #include "cbm.h" // CBMLanguage, CBM_LANG_COUNT, CBM_LANG_JSON
 
 #include "foundation/constants.h"
@@ -107,20 +108,6 @@ static const char *FAST_PATTERNS[] = {".d.ts",      ".bundle.", ".chunk.", ".gen
                                       "_string.go", "mock_",    "_mock.",  "_test_helpers.",
                                       ".stories.",  ".spec.",   ".test.",  NULL};
 
-/* ── Ignored JSON filenames ──────────────────────── */
-
-static const char *IGNORED_JSON_FILES[] = {
-    "package.json",       "package-lock.json", "tsconfig.json",
-    "jsconfig.json",      "composer.json",     "composer.lock",
-    "yarn.lock",          "openapi.json",      "swagger.json",
-    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
-    ".babelrc.json",      "tslint.json",       "angular.json",
-    "firebase.json",      "renovate.json",     "lerna.json",
-    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
-    "deno.json",          "biome.json",        "devcontainer.json",
-    ".devcontainer.json", "launch.json",       "settings.json",
-    "extensions.json",    "tasks.json",        NULL};
-
 /* ── Helper: check if string is in NULL-terminated array ─────────── */
 
 static bool str_in_list(const char *s, const char *const *list) {
@@ -134,8 +121,7 @@ static bool str_in_list(const char *s, const char *const *list) {
 
 /* ── Helper: check if string ends with suffix ────────────── */
 
-static bool ends_with(const char *s, const char *suffix) {
-    size_t slen = strlen(s);
+static bool ends_with(const char *s, size_t slen, const char *suffix) {
     size_t sufflen = strlen(suffix);
     if (sufflen > slen) {
         return false;
@@ -349,7 +335,7 @@ static bool resolve_global_excludes_path(char *out, size_t out_sz) {
 }
 
 /* True when rel_path equals a suffix rule or ends with "/" + the rule. */
-static bool rel_path_has_skip_suffix(const char *rel_path) {
+bool cbm_discover_path_has_skip_suffix(const char *rel_path) {
     if (!rel_path) {
         return false;
     }
@@ -393,15 +379,16 @@ bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode) {
         return false;
     }
 
+    size_t filename_length = strlen(filename);
     for (int i = 0; ALWAYS_IGNORED_SUFFIXES[i]; i++) {
-        if (ends_with(filename, ALWAYS_IGNORED_SUFFIXES[i])) {
+        if (ends_with(filename, filename_length, ALWAYS_IGNORED_SUFFIXES[i])) {
             return true;
         }
     }
 
     if (mode != CBM_MODE_FULL) {
         for (int i = 0; FAST_IGNORED_SUFFIXES[i]; i++) {
-            if (ends_with(filename, FAST_IGNORED_SUFFIXES[i])) {
+            if (ends_with(filename, filename_length, FAST_IGNORED_SUFFIXES[i])) {
                 return true;
             }
         }
@@ -725,7 +712,7 @@ static int gitignore_chain_result(const gitignore_link_t *link, const char *rel_
  * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
  * contain parallel checkouts of the same repo whose indexing would duplicate
  * the whole codebase (#802). */
-static bool is_safety_core_dir(const char *name) {
+bool cbm_discover_is_safety_core_directory(const char *name) {
     static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
                                                    ".claude-worktrees", NULL};
     return str_in_list(name, SAFETY_CORE_DIRS);
@@ -775,12 +762,12 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore) {
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) ||
-        rel_path_has_skip_suffix(rel_path)) {
+        cbm_discover_path_has_skip_suffix(rel_path)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
          * match for this dir un-skips a built-in skip-list dir — except the
          * non-negatable safety core. Fall through so .gitignore/global/local
          * rules still apply to the un-skipped dir. */
-        bool unskipped = cbmignore && !is_safety_core_dir(entry_name) &&
+        bool unskipped = cbmignore && !cbm_discover_is_safety_core_directory(entry_name) &&
                          cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
         if (!unskipped) {
             return true;
@@ -841,60 +828,11 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
     return global_ignored ? "gitignore" : NULL;
 }
 
-/* Detect language for a file, handling .m disambiguation and JSON filtering. */
+/* Detect language for a file: its name, and its first bytes where the name is
+ * not enough (cbm_language_classify; the pinned test-impact inventory uses the
+ * same rule on git blobs). */
 static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
-    CBMLanguage lang = cbm_language_for_filename(entry_name);
-    if (lang == CBM_LANG_COUNT) {
-        /* Filename/extension detection failed: fall back to a conservative
-         * shebang probe so extensionless scripts get indexed (#1199). Filename
-         * detection stays authoritative — this runs only when it returns
-         * unknown. */
-        return cbm_language_from_shebang(abs_path);
-    }
-    /* Special: .m files need content-based disambiguation */
-    const char *dot = strrchr(entry_name, '.');
-    if (dot && strcmp(dot, ".m") == 0) {
-        lang = cbm_disambiguate_m(abs_path);
-    }
-    /* Special: .cls is shared by ObjectScript UDL, Apex and VB6 class modules */
-    if (dot && strcmp(dot, ".cls") == 0) {
-        lang = cbm_disambiguate_cls(abs_path);
-    }
-    /* Special: .inc is shared by BitBake and ObjectScript include files */
-    if (dot && strcmp(dot, ".inc") == 0) {
-        lang = cbm_disambiguate_inc(abs_path);
-    }
-    /* Special: .cfc components may be script-dialect or tag-dialect (<cfcomponent>) */
-    if (dot && strcmp(dot, ".cfc") == 0) {
-        lang = cbm_disambiguate_cfc(abs_path);
-    }
-    /* Special: .frm is shared by FORM and VB6 forms (#721) */
-    if (dot && strcmp(dot, ".frm") == 0) {
-        lang = cbm_disambiguate_frm(abs_path);
-    }
-    /* Special: .res is also a binary Godot / Windows resource (#2176) */
-    if (dot && strcmp(dot, ".res") == 0) {
-        lang = cbm_disambiguate_res(abs_path);
-    }
-    /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
-     * detected by content; otherwise .xml stays XML. */
-    if (lang == CBM_LANG_XML) {
-        FILE *xf = cbm_fopen(abs_path, "r");
-        if (xf) {
-            char xbuf[CBM_SZ_256];
-            size_t xn = fread(xbuf, SKIP_ONE, sizeof(xbuf) - SKIP_ONE, xf);
-            (void)fclose(xf);
-            xbuf[xn] = '\0';
-            if (strstr(xbuf, "<Export generator=")) {
-                return CBM_LANG_OBJECTSCRIPT_EXPORT;
-            }
-        }
-    }
-    /* Check ignored JSON files */
-    if (lang == CBM_LANG_JSON && str_in_list(entry_name, IGNORED_JSON_FILES)) {
-        return CBM_LANG_COUNT;
-    }
-    return lang;
+    return cbm_language_for_file(entry_name, abs_path);
 }
 
 /* UTF-8-safe stat: wide API on Windows, regular stat on POSIX. */

@@ -392,6 +392,8 @@ scripts/smoke-invariants.sh
 scripts/ci/preflight-docker.sh
 scripts/ci/require-all-green.sh
 scripts/ci/verify-shard-union.sh
+scripts/ci/select-lanes.sh
+scripts/ci/test-impact-shadow.sh
 scripts/ci/generate-sbom.py
 scripts/package-release.sh
 scripts/ci/smoke-artifact.sh
@@ -436,6 +438,8 @@ test-infrastructure/vm/vm-smoke.sh
 scripts/smoke-invariants.sh
 scripts/fuzz.sh
 scripts/memwaste.sh
+scripts/ci/select-lanes.sh
+scripts/ci/test-impact-shadow.sh
 "
     for entry in $STRICT_ENTRIES; do
         out=$(cd "$ROOT" && bash "$entry" --definitely-not-a-flag 2>&1) && rc=0 || rc=$?

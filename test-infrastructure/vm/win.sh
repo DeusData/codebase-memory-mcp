@@ -71,6 +71,9 @@ Environment:
   CBM_VM_BRANCH          branch for update (default: current local branch)
   CBM_VM_MIN_FREE_GB     preflight free-disk floor (default 14, runner spec)
   CBM_VM_SKIP_PREFLIGHT=1  bootstrap-only escape (checkout predates the script)
+  CBM_CI_RUN_ID          isolated checkout, build, temp and log namespace;
+                         checks disk/Defender without shared residue cleanup
+  CBM_CI_KEEP=0|1        retain isolated test build on success when set to 1
 
 Exit codes: 0 success · 2 usage error · other = the canonical leg's own code.
 EOF
@@ -101,12 +104,41 @@ USER_="${CBM_VM_USER:-test}"
 # A local clone hardlinks .git/objects, so it costs seconds and little disk.
 # Unset (the default) keeps the historical single-tree behaviour.
 VM_BASE_REPO="/c/cbm"
+VM_RUN_ENV=""
+VM_UBSAN_RUNNER_ENV=""
+VM_LOG_SETUP=""
+VM_BUILD_LOG=/tmp/win-build.log
+VM_TEST_PAR_LOG=/tmp/win-test-par.log
+VM_SOAK_LOG=/tmp/win-soak.log
+VM_UBSAN_BUILD_LOG=/tmp/win-ubsan-build.log
+VM_UBSAN_TEST_LOG=/tmp/win-ubsan-test.log
+VM_TRAP_BUILD_LOG=/tmp/win-trap-ubsan-build.log
+VM_TRAP_TEST_LOG=/tmp/win-trap-ubsan-test.log
 if [ -n "${CBM_CI_RUN_ID:-}" ]; then
     if [[ ! "$CBM_CI_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
         echo "FATAL: CBM_CI_RUN_ID must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}." >&2
         exit 2
     fi
+    case "${CBM_CI_KEEP:-0}" in
+    0 | 1) ;;
+    *) echo "FATAL: CBM_CI_KEEP must be 0 or 1." >&2; exit 2 ;;
+    esac
+    if [ "${CBM_VM_SKIP_PREFLIGHT:-0}" = "1" ]; then
+        echo "FATAL: isolated runs require disk and Defender preflight." >&2
+        exit 2
+    fi
     VM_REPO="/c/cbm-run-${CBM_CI_RUN_ID}"
+    VM_RUN_ENV="CBM_CI_RUN_ID='$CBM_CI_RUN_ID' CBM_CI_KEEP='${CBM_CI_KEEP:-0}'"
+    VM_UBSAN_RUNNER_ENV="CBM_VM_RUNNER=build/c/test-runner"
+    VM_LOG_DIR="$VM_REPO/.vm-logs/$CBM_CI_RUN_ID"
+    VM_LOG_SETUP="mkdir -p '$VM_LOG_DIR' && "
+    VM_BUILD_LOG="$VM_LOG_DIR/build.log"
+    VM_TEST_PAR_LOG="$VM_LOG_DIR/test-par.log"
+    VM_SOAK_LOG="$VM_LOG_DIR/soak.log"
+    VM_UBSAN_BUILD_LOG="$VM_LOG_DIR/ubsan-build.log"
+    VM_UBSAN_TEST_LOG="$VM_LOG_DIR/ubsan-test.log"
+    VM_TRAP_BUILD_LOG="$VM_LOG_DIR/trap-ubsan-build.log"
+    VM_TRAP_TEST_LOG="$VM_LOG_DIR/trap-ubsan-test.log"
 else
     VM_REPO="$VM_BASE_REPO"
 fi
@@ -189,8 +221,10 @@ vm_preflight() {
         echo "=== win.sh: preflight SKIPPED (CBM_VM_SKIP_PREFLIGHT=1) ==="
         return 0
     }
+    local cleanup_mode=""
+    [ -z "${CBM_CI_RUN_ID:-}" ] || cleanup_mode=" -CheckOnly"
     vm_cmd "powershell -NoProfile -ExecutionPolicy Bypass -File \
-${VM_REPO_WIN}\\scripts\\ci\\clean-test-residue.ps1 -MinFreeGB ${CBM_VM_MIN_FREE_GB:-14}"
+${VM_REPO_WIN}\\scripts\\ci\\clean-test-residue.ps1 -MinFreeGB ${CBM_VM_MIN_FREE_GB:-14}${cleanup_mode}"
     # Defender parity: every Windows venue (this VM and the GitHub runners)
     # tests with real-time protection ACTIVE — the same canonical script the
     # CI jobs run, so a drifted-off Defender fails loudly, never silently.
@@ -270,7 +304,7 @@ build)
     # NOT via CC='ccache clang', which bypassed the verified-cache env layer.
     # The test-runner is no longer built here: the test leg (scripts/test.sh)
     # builds its own runner, same as CI's test jobs.
-    vm clangarm64 "cd $VM_REPO && scripts/build.sh CC=clang CXX=clang++ > /tmp/win-build.log 2>&1 && echo BUILD_OK || (echo BUILD_FAIL; tail -20 /tmp/win-build.log; exit 1)"
+    vm clangarm64 "cd $VM_REPO && ${VM_LOG_SETUP}scripts/build.sh CC=clang CXX=clang++ > '$VM_BUILD_LOG' 2>&1 && echo BUILD_OK || (echo BUILD_FAIL; tail -20 '$VM_BUILD_LOG'; exit 1)"
     ;;
 test)
     [ $# -ge 1 ] || { echo "usage: win.sh test <suite...>" >&2; exit 2; }
@@ -283,7 +317,7 @@ test)
     # before spending a leg on it — cheap insurance against a concurrent
     # session having re-synced the shared checkout.
     [ -z "${CBM_VM_EXPECT_HEAD:-}" ] || vm_assert_head "$CBM_VM_EXPECT_HEAD"
-    vm clangarm64 "cd $VM_REPO && bash test-infrastructure/vm/vm-run-tests.sh $*"
+    vm clangarm64 "cd $VM_REPO && $VM_RUN_ENV bash test-infrastructure/vm/vm-run-tests.sh $*"
     [ -z "${CBM_VM_EXPECT_HEAD:-}" ] || vm_assert_head "$CBM_VM_EXPECT_HEAD"
     ;;
 guards)
@@ -331,7 +365,7 @@ soak)
         echo "usage: win.sh soak [positive-minutes]" >&2
         exit 2
     fi
-    vm clangarm64 "cd $VM_REPO && CBM_VM_TEST_LOG=/tmp/win-soak.log bash \
+    vm clangarm64 "cd $VM_REPO && $VM_RUN_ENV CBM_VM_TEST_LOG='$VM_SOAK_LOG' bash \
         test-infrastructure/vm/vm-run-tests.sh --soak '$duration'"
     ;;
 sh)
@@ -348,11 +382,11 @@ ubsan-build)
     # Validated: UBSan needs no interceptors, so it builds, runs, AND reports
     # correctly under emulation. (ASan does NOT: no aarch64 runtime exists and
     # the x86_64 runtime faults in emulated process-init — ASan stays CI-only.)
-    vm clang64 "cd $VM_REPO && make -j${JOBS} -f Makefile.cbm CC=clang CXX=clang++ SANITIZE='-fsanitize=undefined -fno-omit-frame-pointer' build/c/test-runner > /tmp/win-ubsan-build.log 2>&1 && echo UBSAN_BUILD_OK || (echo UBSAN_BUILD_FAIL; tail -20 /tmp/win-ubsan-build.log; exit 1)"
+    vm clang64 "cd $VM_REPO && ${VM_LOG_SETUP}make -j${JOBS} -f Makefile.cbm CC=clang CXX=clang++ SANITIZE='-fsanitize=undefined -fno-omit-frame-pointer' build/c/test-runner > '$VM_UBSAN_BUILD_LOG' 2>&1 && echo UBSAN_BUILD_OK || (echo UBSAN_BUILD_FAIL; tail -20 '$VM_UBSAN_BUILD_LOG'; exit 1)"
     ;;
 ubsan-test)
     [ $# -ge 1 ] || { echo "usage: win.sh ubsan-test <suite...>" >&2; exit 2; }
-    vm clang64 "cd $VM_REPO && CBM_VM_TEST_LOG=/tmp/win-ubsan-test.log bash test-infrastructure/vm/vm-run-tests.sh $*"
+    vm clang64 "cd $VM_REPO && $VM_RUN_ENV $VM_UBSAN_RUNNER_ENV CBM_VM_TEST_LOG='$VM_UBSAN_TEST_LOG' bash test-infrastructure/vm/vm-run-tests.sh $*"
     ;;
 trap-ubsan-build)
     # NATIVE ARM64 UBSan via trap mode. -fsanitize-trap=undefined needs NO
@@ -364,13 +398,13 @@ trap-ubsan-build)
     # fired, reproduce under the emulated `win.sh ubsan-build`/`ubsan-test`,
     # which carries the full runtime + message. BUILD_DIR isolated so it never
     # clobbers the plain test-runner.
-    vm clangarm64 "cd $VM_REPO && make -j${JOBS} -f Makefile.cbm CC='ccache clang' CXX='ccache clang++' SANITIZE='-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer' BUILD_DIR=build/trap-ubsan build/trap-ubsan/test-runner > /tmp/win-trap-ubsan-build.log 2>&1 && echo TRAP_UBSAN_BUILD_OK || (echo TRAP_UBSAN_BUILD_FAIL; tail -20 /tmp/win-trap-ubsan-build.log; exit 1)"
+    vm clangarm64 "cd $VM_REPO && ${VM_LOG_SETUP}make -j${JOBS} -f Makefile.cbm CC='ccache clang' CXX='ccache clang++' SANITIZE='-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer' BUILD_DIR=build/trap-ubsan build/trap-ubsan/test-runner > '$VM_TRAP_BUILD_LOG' 2>&1 && echo TRAP_UBSAN_BUILD_OK || (echo TRAP_UBSAN_BUILD_FAIL; tail -20 '$VM_TRAP_BUILD_LOG'; exit 1)"
     ;;
 trap-ubsan-test)
     [ $# -ge 1 ] || { echo "usage: win.sh trap-ubsan-test <suite...>" >&2; exit 2; }
     # A UB trap crashes the runner with SIGILL (exit 132); the harness reports
     # the failing suite so the emulated diagnosis loop can name the check.
-    vm clangarm64 "cd $VM_REPO && CBM_VM_RUNNER=build/trap-ubsan/test-runner CBM_VM_TEST_LOG=/tmp/win-trap-ubsan-test.log bash test-infrastructure/vm/vm-run-tests.sh $*"
+    vm clangarm64 "cd $VM_REPO && $VM_RUN_ENV CBM_VM_RUNNER=build/trap-ubsan/test-runner CBM_VM_TEST_LOG='$VM_TRAP_TEST_LOG' bash test-infrastructure/vm/vm-run-tests.sh $*"
     ;;
 pageheap)
     # OS-level heap verification (page-granular overflow/UAF detection) for the
@@ -393,7 +427,9 @@ test-par)
     # under the CI-shaped protected temp root with FULL output (this leg once
     # ran under the MSYS-shared /tmp and piped through `tail -25` — the same
     # truncated-blindness class that hid 40 Windows failures from `test`).
-    vm clangarm64 "cd $VM_REPO && CBM_VM_TEST_LOG=/tmp/win-test-par.log bash test-infrastructure/vm/vm-run-tests.sh --par"
+    [ -z "${CBM_VM_EXPECT_HEAD:-}" ] || vm_assert_head "$CBM_VM_EXPECT_HEAD"
+    vm clangarm64 "cd $VM_REPO && $VM_RUN_ENV CBM_VM_TEST_LOG='$VM_TEST_PAR_LOG' bash test-infrastructure/vm/vm-run-tests.sh --par"
+    [ -z "${CBM_VM_EXPECT_HEAD:-}" ] || vm_assert_head "$CBM_VM_EXPECT_HEAD"
     ;;
 help | -h | --help)
     print_help

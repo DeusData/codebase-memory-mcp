@@ -46,6 +46,7 @@ static bool pc_module_is_dir(CBMLanguage lang) {
 
 /* Read entire file into heap-allocated buffer. Caller must free(). */
 static char *read_file(const char *path, int *out_len) {
+    *out_len = -1; /* unknown/read failure; zero is a proven empty file */
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
@@ -56,6 +57,9 @@ static char *read_file(const char *path, int *out_len) {
     (void)fseek(f, 0, SEEK_SET);
 
     if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
+        if (size == 0) {
+            *out_len = 0;
+        }
         (void)fclose(f);
         return NULL;
     }
@@ -682,6 +686,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
+            /* An LSP answer on a synthetic builtin (`<python-builtins>`) is
+             * not project code: a spawn spelling still spawns. The parallel
+             * pass keeps the LSP answer in `res` and asks the same question.
+             * MUST match pass_parallel.c. */
+            cbm_pipeline_spawn_t spawn;
+            if (cbm_pipeline_spawn_site(ctx->gbuf, lang, call, imports, &res, &spawn)) {
+                cbm_pipeline_emit_spawn(ctx->gbuf, source_node, call, &spawn);
+                return SKIP_ONE;
+            }
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
                                  imp_vals, imp_count, false, route_mount);
             return SKIP_ONE;
@@ -751,6 +764,34 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     if (!rust_external) {
         res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
                                    imp_count);
+        /* Cross-language veto: a name-only guess never binds another
+         * language's symbol (a JS app.get must not become Python's
+         * builtins.dict.get). The vetoed answer becomes EMPTY here, before
+         * the fallbacks below, so the route/HTTP classification still runs.
+         * MUST match pass_parallel.c. */
+        if (cbm_registry_name_guess_vetoed(ctx->registry, lang, &res)) {
+            res = (cbm_resolution_t){0};
+        }
+    }
+    /* `p->open(fd)`: the registry does not split a callee on the arrow, and a
+     * member is not a name it could resolve anyway. The object's type decides,
+     * exactly as for the dot call handled further down. MUST match
+     * pass_parallel.c. */
+    bool arrow_bound = false;
+    if ((!res.qualified_name || res.qualified_name[0] == '\0') &&
+        cbm_c_arrow_member_call(lang, call->callee_name)) {
+        arrow_bound = cbm_pipeline_c_member_call_resolve(
+                          lsp_calls, NULL, ctx->gbuf, ctx->registry, ctx->project_name,
+                          call->enclosing_func_qn, call->callee_name,
+                          cbm_c_member_rule_file(lang, rel), &res) != NULL;
+    }
+    /* A call that starts another program (subprocess.run, exec.Command,
+     * posix_spawn): a SPAWNS edge to its Process node instead of a CALLS
+     * edge. MUST match pass_parallel.c. */
+    cbm_pipeline_spawn_t spawn;
+    if (cbm_pipeline_spawn_site(ctx->gbuf, lang, call, imports, &res, &spawn)) {
+        cbm_pipeline_emit_spawn(ctx->gbuf, source_node, call, &spawn);
+        return SKIP_ONE;
     }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
@@ -889,6 +930,28 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
+    /* A call that resolved onto a struct Field: refused across languages and
+     * for a bare C call; a C/C++ member call takes the Field its object's type
+     * names instead of the one the member name happened to find. */
+    switch (cbm_call_onto_field_policy(lang, call->callee_name, target_node->label,
+                                       target_node->file_path)) {
+    case CBM_FIELD_CALL_DROP:
+        return 0;
+    case CBM_FIELD_CALL_BY_OWNER:
+        /* An arrow call was already bound this way above. */
+        if (!arrow_bound) {
+            target_node = cbm_pipeline_c_member_call_resolve(
+                lsp_calls, NULL, ctx->gbuf, ctx->registry, ctx->project_name,
+                call->enclosing_func_qn, call->callee_name, cbm_c_member_rule_file(lang, rel),
+                &res);
+        }
+        if (!target_node || source_node->id == target_node->id) {
+            return 0;
+        }
+        break;
+    case CBM_FIELD_CALL_KEEP:
+        break;
+    }
     /* #725: suffix_match is language-agnostic and will attach a Python
      * Store.commit() call to a JS function named commit (or a Bash main
      * to a Python main). Drop that weak cross-language edge. */
@@ -999,12 +1062,19 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     int slen = 0;
     char *src = read_file(fi->path, &slen);
     if (!src) {
+        if (slen != 0) {
+            (void)cbm_pipeline_test_extraction_ok(ctx, fi->language, NULL);
+        }
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file_ex(src, slen, fi->language, ctx->project_name, fi->rel_path,
-                                           CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table,
-                                           ctx->return_type_table);
+    CBMFileResult *r =
+        cbm_pipeline_test_force_extract_null(ctx, fi->language)
+            ? NULL
+            : cbm_extract_file_ex_with_tests(
+                  src, slen, fi->language, ctx->project_name, fi->rel_path, CBM_EXTRACT_BUDGET,
+                  NULL, NULL, ctx->macro_table, ctx->return_type_table, ctx->test_declarations);
     free(src);
+    (void)cbm_pipeline_test_extraction_ok(ctx, fi->language, r);
     if (r) {
         *owned = true;
     }
@@ -1038,8 +1108,18 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         bool result_owned = false;
         CBMFileResult *result = calls_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
+            if (atomic_load(&ctx->test_declarations_failed)) {
+                return CBM_PIPELINE_ABORT_PRESERVE_DB;
+            }
             errors++;
             continue;
+        }
+
+        if (!cbm_pipeline_test_result_ok(ctx, result)) {
+            if (result_owned) {
+                cbm_free_result(result);
+            }
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
         if (result->calls.count == 0) {

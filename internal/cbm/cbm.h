@@ -17,6 +17,27 @@ TSNode cbm_ts_child_by_field_name(TSNode node, const char *name, uint32_t name_l
  * (TS_FIELD("body") expands to "body", 4), which must expand before the call. */
 #define ts_node_child_by_field_name(...) cbm_ts_child_by_field_name(__VA_ARGS__)
 
+/* Immutable, explicitly supplied test-declaration snapshot. */
+typedef struct cbm_test_declarations cbm_test_declarations_t;
+
+typedef enum {
+    CBM_TEST_ROLE_NONE = 0,
+    CBM_TEST_ROLE_CASE,
+    CBM_TEST_ROLE_SUITE
+} CBMTestDefinitionRole;
+
+typedef enum {
+    CBM_TEST_EXTRACT_OK = 0,
+    CBM_TEST_EXTRACT_UNSUPPORTED_LANGUAGE,
+    CBM_TEST_EXTRACT_UNSUPPORTED_PRESET,
+    CBM_TEST_EXTRACT_UNSUPPORTED_NAME,
+    CBM_TEST_EXTRACT_MISSING_ARGUMENT,
+    CBM_TEST_EXTRACT_UNSUPPORTED_ARGUMENT,
+    CBM_TEST_EXTRACT_AMBIGUOUS,
+    CBM_TEST_EXTRACT_UNSUPPORTED_FORM,
+    CBM_TEST_EXTRACT_OOM
+} CBMTestExtractStatus;
+
 // Language enum mirrors lang.Language in Go.
 // Order must match lang_specs.c tables.
 typedef enum {
@@ -250,6 +271,11 @@ typedef struct {
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
+    CBMTestDefinitionRole test_role; /* NONE preserves legacy helper/test-file semantics */
+    /* Configured raw definitions only; zero for all legacy rows. Exact spans
+     * are bound to the owning result's source identity before cross-file use. */
+    uint32_t test_name_start_byte, test_name_end_byte;
+    uint32_t test_body_start_byte, test_body_end_byte;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -443,6 +469,10 @@ typedef struct {
 typedef enum {
     CBM_RESOLVED_INVOCATION = 0,
     CBM_RESOLVED_CALL_REFERENCE,
+    /* C-family member access `a.b` / `a->b`: callee_qn is the Field `b` of the
+     * type of `a`. One row per (caller, field), not per occurrence, and no site
+     * span: the join is by enclosing function and member name. */
+    CBM_RESOLVED_FIELD_REFERENCE,
 } CBMResolvedKind;
 
 // LSP-resolved invocation/reference: high-confidence type-aware resolution.
@@ -647,6 +677,24 @@ typedef struct CBMFileResult {
      * the Rust inner docs (//!). NULL for other languages and undocumented
      * files. */
     const char *module_doc;
+    /* A consumed configured definition could not be mapped safely. Only an
+     * allocation failure (OOM) still aborts publication: any other status is
+     * degraded per file by cbm_test_declarations_degrade. error_msg is
+     * arena-owned as usual. */
+    CBMTestExtractStatus test_declarations_status;
+    int test_declaration_index;     /* meaningful on failure; -1 = preset */
+    uint32_t test_declaration_line; /* 0 = snapshot preflight */
+    bool has_test_definition_owners;
+    /* has_error was raised by a configured-definition issue alone. */
+    bool test_error_only;
+    /* The file's configured test forms could not be mapped: it carries no
+     * configured test roles; the status names why (no pointer: compaction
+     * and spill relocate only the strings they know). */
+    bool test_declarations_degraded;
+    CBMTestExtractStatus test_declarations_degraded_status;
+    int test_owner_source_len;
+    CBMLanguage test_owner_language;
+    char test_owner_source_sha256[65]; /* exact raw source; identity, not authentication */
 } CBMFileResult;
 
 // --- Enclosing function cache ---
@@ -738,7 +786,34 @@ typedef struct {
      * POD section index. */
     void *doc_memo;
     void *doc_pod_index;
+    const cbm_test_declarations_t *test_declarations; /* borrowed for this call only */
+    bool test_declarations_raw_source;
+    struct CBMTestDefinitionMatch *test_definition_matches; /* traversal scratch */
+    int test_definition_match_count;
+    int test_definition_match_cap;
 } CBMExtractCtx;
+
+/* Internal configured-definition seams. No declarations pointer enters a result. */
+/* A configured test form the extractor cannot map degrades the FILE, not
+ * the index (user decision 2026-10-04): its configured test roles, owner
+ * spans and owner flag are dropped, the status reads OK again, an error the
+ * issue alone raised is cleared, and test_declarations_degraded keeps the
+ * reason for a per-file diagnostic. OK and OOM results are left unchanged:
+ * an allocation failure still fails. Idempotent. */
+void cbm_test_declarations_degrade(CBMFileResult *result);
+/* The fixed description of a configured-definition status (static). */
+const char *cbm_test_extract_status_message(CBMTestExtractStatus status);
+bool cbm_test_declarations_validate(CBMFileResult *result,
+                                    const cbm_test_declarations_t *declarations);
+void cbm_test_declarations_finish(CBMExtractCtx *ctx);
+/* Raw AST candidate only: no declaration/configuration decisions. A C split
+ * invocation uses its adjacent compound body as scope; ordinary definitions
+ * use their function node. Callers still validate raw bytes before ownership. */
+bool cbm_test_definition_candidate(TSNode scope, CBMLanguage language, TSNode *name, TSNode *body);
+const char *cbm_test_definition_qn(CBMExtractCtx *ctx, TSNode function);
+bool cbm_test_definition_owners_match(const CBMFileResult *owners, const char *source,
+                                      int source_len, bool cpp_mode, const char *module_qn);
+const char *cbm_test_definition_owner_qn(const CBMFileResult *owners, TSNode function);
 
 // --- Public API ---
 
@@ -841,6 +916,16 @@ CBMFileResult *cbm_extract_file_ex(
     const CBMMacroTable *macro_table,           // ObjectScript macros, or NULL
     const CBMReturnTypeTable *return_type_table // OS return types, or NULL
 );
+
+/* Additive immutable-snapshot entry point. NULL preserves legacy behavior.
+ * Snapshot must outlive this call; returned data is independently result-owned.
+ * A non-OK result status is an explicit configured-mapping failure, not a
+ * successful empty inventory. error_msg may be NULL on diagnostic OOM. */
+CBMFileResult *cbm_extract_file_ex_with_tests(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, int64_t timeout_micros, const char **extra_defines,
+    const char **include_paths, const CBMMacroTable *macro_table,
+    const CBMReturnTypeTable *return_type_table, const cbm_test_declarations_t *test_declarations);
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);

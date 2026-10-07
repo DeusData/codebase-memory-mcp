@@ -4,7 +4,12 @@
 name: Security Gate
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      lanes:
+        description: 'PR lane selection (scripts/ci/select-lanes.sh JSON list); "all" = every job (dry run, release)'
+        type: string
+        default: all
 
 permissions:
   contents: read
@@ -23,6 +28,7 @@ jobs:
         run: scripts/security-vendored.sh
 
   license-gate:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'license-gate') }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -39,6 +45,7 @@ jobs:
         run: scripts/audit-license-provenance.py
 
   codeql-gate:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'codeql-gate') }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     # Without security-events:read this job inherits the workflow's

@@ -7,8 +7,9 @@
  * would otherwise resolve every indexed project against the CALLER's repository
  * (a non-git directory reported as is_git=true, history and branch data from
  * the wrong repo). Every git spawn therefore gets a child environment with
- * exactly the variables `git rev-parse --local-env-vars` prints removed. The
- * scrub is per spawn: cbm's own environment is never modified (unsetenv in the
+ * the variables `git rev-parse --local-env-vars` prints removed. GIT_DIFF_OPTS
+ * is also removed so it cannot override explicit unified-context flags.
+ * The scrub is per spawn: cbm's own environment is never modified (unsetenv in the
  * parent would race every other thread reading the environment).
  */
 #ifndef CBM_GIT_ENV_H
@@ -31,12 +32,14 @@ bool cbm_git_env_entry_is_repo_local(const char *entry);
 
 #ifdef _WIN32
 /* A CREATE_UNICODE_ENVIRONMENT block: the current environment minus the
- * repository-local git variables. One allocation; release with cbm_git_child_env_free().
+ * repository-local git variables and GIT_DIFF_OPTS. One allocation; release with
+ * cbm_git_child_env_free().
  * NULL on allocation/snapshot failure. */
 wchar_t *cbm_git_child_env_block(void);
 #else
 /* A NULL-terminated envp: the current environment minus the repository-local
- * git variables. Pointers and strings live in ONE allocation; release with
+ * git variables and GIT_DIFF_OPTS. Pointers and strings live in ONE allocation;
+ * release with
  * cbm_git_child_env_free(). NULL on allocation failure. */
 char **cbm_git_child_envp(void);
 #endif
