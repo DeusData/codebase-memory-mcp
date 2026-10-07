@@ -32,8 +32,9 @@
  */
 
 import { chromium } from 'playwright';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { prepareHandtestProfile } from './lib/handtest-profile.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -142,9 +143,9 @@ const historyButton = (page, label) => page.locator(`.atlas-architecture [aria-l
 /* ------------------------------------------------------------------ */
 /* Ablauf                                                               */
 
-await rm(PROFILE, { recursive: true, force: true });
+const runProfile = await prepareHandtestProfile(PROFILE);
 await mkdir(OUT, { recursive: true });
-const context = await chromium.launchPersistentContext(PROFILE, {
+const context = await chromium.launchPersistentContext(runProfile, {
     headless: true, viewport: VIEWPORT, deviceScaleFactor: 2,
     args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
 });

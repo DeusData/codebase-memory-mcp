@@ -79,6 +79,19 @@ describe('complete scoped graph acquisition', () => {
         expect(result.data.nodes.map(node => node.id)).toEqual([1, 2]);
         expect(result.data.edges.map(edge => edge.id)).toEqual([1]);
     });
+    it.each(['file', 'folder'] as const)('preserves edge-limit partial metadata when an unexpanded %s stops between pages', async kind => {
+        const a = node(1), b = node(2), c = node(3);
+        const queryGraph = vi.fn<GraphQueryClient['queryGraph']>().mockResolvedValueOnce(page([row(a), row(b), row(c)]))
+            .mockResolvedValueOnce(page([edgeRow(1, a, b), edgeRow(2, b, c)], { total: 3, offset: 0, nextOffset: 2, nextCursor: 'third', hasMore: true }))
+            .mockResolvedValueOnce(page([edgeRow(3, c, a)], { total: 3, offset: 2 }));
+        const result = await loadGraphScope('p', { kind, path: kind === 'file' ? 'src/a.ts' : 'src', name: kind }, 0, 'both', undefined,
+            { client: { queryGraph }, limits: { nodes: 100, edges: 1 } });
+        expect(queryGraph).toHaveBeenCalledTimes(2);
+        expect(result.depth).toBe(0);
+        expect(result.data.nodes.map(node => node.id)).toEqual([1, 2, 3]);
+        expect(result.data.edges.map(edge => edge.id)).toEqual([1, 2]);
+        expect(result.partial).toEqual({ layer: 1, nodes: 3, edges: 2, limit: 'edges' });
+    });
 });
 
 it('render limits retain selected roots and never retain dangling edges', () => {

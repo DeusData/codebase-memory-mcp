@@ -114,6 +114,43 @@ describe('the loaded model across an in-page project switch (K24)', () => {
         expect(container.textContent).not.toContain('Old project question');
     });
 
+    it.each(['token counting', 'answer generation'] as const)('keeps the old %s barrier across successive project switches', async stage => {
+        const { props, runtime } = fixture();
+        const counting = deferred<number>(), answer = deferred<string>();
+        await load(props, 'django-demo');
+        if (stage === 'token counting') runtime.countTokens.mockReturnValueOnce(counting.promise);
+        else runtime.chat.mockReturnValueOnce(answer.promise);
+        await type('Old project question');
+        await act(async () => button('Send ↑').click());
+        expect(runtime.countTokens).toHaveBeenCalledOnce();
+        expect(runtime.chat).toHaveBeenCalledTimes(stage === 'token counting' ? 0 : 1);
+
+        try {
+            await switchTo(props, 'cbm');
+            await switchTo(props, 'third-project');
+            await type('Final project question');
+            // The first operation stays blocked by our promise, independent of timing.
+            await act(async () => { container.querySelector('textarea')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); });
+            expect(runtime.countTokens).toHaveBeenCalledOnce();
+            expect(runtime.chat).toHaveBeenCalledTimes(stage === 'token counting' ? 0 : 1);
+            expect(button('Stopping…').disabled).toBe(true);
+            expect(runtime.dispose).not.toHaveBeenCalled();
+        } finally {
+            await act(async () => { counting.resolve(100); answer.resolve('OLD_PROJECT_ANSWER'); });
+        }
+
+        await act(async () => button('Send ↑').click());
+        expect(runtime.countTokens).toHaveBeenCalledTimes(2);
+        expect(runtime.chat).toHaveBeenCalledTimes(stage === 'token counting' ? 1 : 2);
+        const sent = runtime.chat.mock.calls.at(-1)![0].map(message => message.content).join('\n');
+        expect(sent).toContain('Final project question');
+        expect(sent).toContain('SOURCE_OF_third-project');
+        expect(sent).not.toContain('SOURCE_OF_django-demo');
+        expect(container.textContent).not.toContain('OLD_PROJECT_ANSWER');
+        expect(props.createRuntime).toHaveBeenCalledOnce();
+        expect(runtime.prepare).toHaveBeenCalledOnce();
+    });
+
     it('keeps a model that is still loading and finishes loading it in the new project', async () => {
         const { props, runtime, states } = fixture(); const loading = deferred<void>();
         runtime.prepare.mockReturnValueOnce(loading.promise);

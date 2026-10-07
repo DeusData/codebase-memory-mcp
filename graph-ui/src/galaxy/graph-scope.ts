@@ -241,7 +241,7 @@ export async function loadGraphScope(project: string, scope: GraphScope, depth: 
     // A cluster starts with all of its members and their internal edges.
     if (depth === 0 && roots.size > 1) {
         const initial = [...edges.values()].filter(edge => roots.has(edge.source) && roots.has(edge.target));
-        return { data: arrangeScopedGraph([...nodes.values()].filter(node => roots.has(node.id)), initial, roots, levels), roots, depth: 0, exhausted: edgeTypes?.length === 0, frontier: edgeTypes?.length === 0 ? [] : [...roots], levels, traversalKey };
+        return { data: arrangeScopedGraph([...nodes.values()].filter(node => roots.has(node.id)), initial, roots, levels), roots, depth: 0, exhausted: edgeTypes?.length === 0, frontier: edgeTypes?.length === 0 ? [] : [...roots], levels, traversalKey, ...(partial ? { partial } : {}) };
     }
     return { data: arrangeScopedGraph([...nodes.values()], [...edges.values()], roots, levels), roots, depth: reachedDepth,
         exhausted: !partial && (edgeTypes?.length === 0 || (depth > 0 && frontier.length === 0)), frontier, levels, traversalKey, ...(partial ? { partial } : {}) };

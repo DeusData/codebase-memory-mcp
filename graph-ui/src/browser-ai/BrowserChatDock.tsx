@@ -539,6 +539,8 @@ export default function BrowserChatDock({ proactiveSelection, selectionScope = "
         const adopted = handover.runtime;
         runtime.current = adopted; runtimeModel.current = handover.modelId;
         adopted.setFatalHandler?.(failure => { if (runtime.current === adopted) invalidateRuntime(failure); });
+        // A further project switch must carry the same unfinished operation with it.
+        operationSettled.current = handover.settled;
         const waiting = handover.ready ?? handover.settled;
         if (!waiting) { setPhase('ready'); return; }
         const ticket = epoch.current;
@@ -550,6 +552,7 @@ export default function BrowserChatDock({ proactiveSelection, selectionScope = "
         } else { stopRequested.current = true; setStopping(true); setPhase('counting'); }
         void waiting.then(() => {
             if (epoch.current !== ticket || runtime.current !== adopted) return;
+            if (operationSettled.current === handover.settled) operationSettled.current = undefined;
             pending.current = false; stopRequested.current = false; loading.current = undefined; setStopping(false);
             if (handover.ready) { setCached(previous => new Set(previous).add(handover.modelId)); setProgress(undefined); }
             setPhase('ready');
