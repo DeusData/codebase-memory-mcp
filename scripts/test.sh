@@ -476,6 +476,11 @@ make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
+# The sanitizer runner omits global allocator interposition. Exercise the real
+# release allocator before its constructor, independently of the host libc.
+echo "=== Step 5a0: production allocator startup regression (mimalloc #1341) ==="
+bash "$ROOT/tests/test_mimalloc_startup.sh" "$ROOT/$BUILD_DIR"
+
 # Step 5a: that watchdog is also the SMALLEST-stack thread in the image, which
 # makes it the first casualty when static TLS grows — glibc takes the TLS block
 # out of each thread's own stack allocation. Checked here, against the binary
