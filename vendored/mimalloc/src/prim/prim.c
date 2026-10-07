@@ -27,7 +27,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #endif
 
 // Generic process initialization
-#ifndef MI_PRIM_HAS_PROCESS_ATTACH
+#if !defined(MI_PRIM_HAS_PROCESS_ATTACH)
 #if defined(__GNUC__) || defined(__clang__)
   // gcc,clang: use the constructor/destructor attribute
   // which for both seem to run before regular constructors/destructors

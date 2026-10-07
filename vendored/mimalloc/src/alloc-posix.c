@@ -31,17 +31,6 @@ terms of the MIT license. A copy of the license can be found in the file
 #define ENOMEM 12
 #endif
 
-
-mi_decl_nodiscard size_t mi_malloc_size(const void* p) mi_attr_noexcept {
-  // if (!mi_is_in_heap_region(p)) return 0;
-  return mi_usable_size(p);
-}
-
-mi_decl_nodiscard size_t mi_malloc_usable_size(const void *p) mi_attr_noexcept {
-  // if (!mi_is_in_heap_region(p)) return 0;
-  return mi_usable_size(p);
-}
-
 mi_decl_nodiscard size_t mi_malloc_good_size(size_t size) mi_attr_noexcept {
   return mi_good_size(size);
 }
@@ -52,13 +41,12 @@ void mi_cfree(void* p) mi_attr_noexcept {
   }
 }
 
-int mi_posix_memalign(void** p, size_t alignment, size_t size) mi_attr_noexcept {
+int mi_posix_memalign(void** p, size_t alignment, size_t size) {  // mi_attr_noexcept (issue #794)
   // Note: The spec dictates we should not modify `*p` on an error. (issue#27)
   // <http://man7.org/linux/man-pages/man3/posix_memalign.3.html>
   if (p == NULL) return EINVAL;
-  if ((alignment % sizeof(void*)) != 0) return EINVAL;                 // natural alignment
-  // it is also required that alignment is a power of 2 and > 0; this is checked in `mi_malloc_aligned`
-  if (alignment==0 || !_mi_is_power_of_two(alignment)) return EINVAL;  // not a power of 2
+  // it is required that alignment is a power of 2 and a multiple of sizeof(void*)
+  if (alignment<sizeof(void*) || !_mi_is_power_of_two(alignment)) return EINVAL;  // not a power of 2
   void* q = mi_malloc_aligned(size, alignment);
   if (q==NULL && size != 0) return ENOMEM;
   mi_assert_internal(_mi_is_aligned(q,alignment));
@@ -122,7 +110,7 @@ mi_decl_nodiscard int mi_reallocarr( void* ptrp, size_t count, size_t size ) mi_
   }
   void** op = (void**)ptrp;
   if (total == 0) {
-    free(*op);
+    mi_free(*op);
     *op = NULL;
     return 0;
   }

@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2024-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2024-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -22,7 +22,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #elif __cplusplus >= 201103L
 #define mi_decl_align(a)        alignas(a)
 #else
-#define mi_decl_align(a)
+#define mi_decl_align(a)        _Alignas(a)
 #endif
 
 

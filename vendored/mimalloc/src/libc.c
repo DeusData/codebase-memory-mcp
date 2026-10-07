@@ -39,8 +39,8 @@ bool _mi_streq(const char* s, const char* t) {
   return (*s == *t);
 }
 
-void _mi_strlcpy(char* dest, const char* src, size_t dest_size) {
-  if (dest==NULL || src==NULL || dest_size == 0) return;
+bool _mi_strlcpy(char* dest, const char* src, size_t dest_size) {
+  if (dest==NULL || src==NULL || dest_size == 0) return (src==NULL || *src==0);
   // copy until end of src, or when dest is (almost) full
   while (*src != 0 && dest_size > 1) {
     *dest++ = *src++;
@@ -48,23 +48,24 @@ void _mi_strlcpy(char* dest, const char* src, size_t dest_size) {
   }
   // always zero terminate
   *dest = 0;
+  return (*src == 0);
 }
 
-void _mi_strlcat(char* dest, const char* src, size_t dest_size) {
-  if (dest==NULL || src==NULL || dest_size == 0) return;
+bool _mi_strlcat(char* dest, const char* src, size_t dest_size) {
+  if (dest==NULL || src==NULL || dest_size == 0) return (src==NULL || *src==0);
   // find end of string in the dest buffer
   while (*dest != 0 && dest_size > 1) {
     dest++;
     dest_size--;
   }
   // and catenate
-  _mi_strlcpy(dest, src, dest_size);
+  return _mi_strlcpy(dest, src, dest_size);
 }
 
 size_t _mi_strnlen(const char* s, size_t max_len) {
   if (s==NULL) return 0;
   size_t len = 0;
-  while(s[len] != 0 && len < max_len) { len++; }
+  while(len < max_len && s[len] != 0) { len++; }
   return len;
 }
 
@@ -76,7 +77,7 @@ char* _mi_strnstr(char* s, size_t max_len, const char* pat) {
   if (s==NULL) return NULL;
   if (pat==NULL) return s;
   const size_t m = _mi_strnlen(s, max_len);
-  const size_t n = _mi_strlen(pat);  
+  const size_t n = _mi_strlen(pat);
   for (size_t start = 0; start + n <= m; start++) {
     size_t i = 0;
     while (i<n && pat[i]==s[start+i]) {
@@ -88,16 +89,18 @@ char* _mi_strnstr(char* s, size_t max_len, const char* pat) {
 }
 
 #ifdef MI_NO_GETENV
-bool _mi_getenv(const char* name, char* result, size_t result_size) {
+int _mi_getenv(const char* name, char* result, size_t result_size) {
   MI_UNUSED(name);
   MI_UNUSED(result);
   MI_UNUSED(result_size);
-  return false;
+  return ENOENT;
 }
 #else
-bool _mi_getenv(const char* name, char* result, size_t result_size) {
-  if (name==NULL || result == NULL || result_size < 64) return false;
-  return _mi_prim_getenv(name,result,result_size);
+int _mi_getenv(const char* name, char* result, size_t result_size) {
+  if (name==NULL || result == NULL || result_size < 64) return ENOENT;
+  // change the result of _mi_prim_getenv to an errno result
+  const int res = _mi_prim_getenv(name,result,result_size);
+  return (res > 0 ? 0 : (res == 0 ? ENOENT : EAGAIN));
 }
 #endif
 
@@ -117,13 +120,13 @@ bool _mi_atomic_once_enter(mi_atomic_once_t* once) {
   const mi_threadid_t current_tid = _mi_thread_id();
   if (once_tid == current_tid) {
     return false; // recursive invocation; we need this for process_init for example
-  }  
+  }
 
   mi_lock_acquire(&once->lock);
   uintptr_t expected = 0;
   if (mi_atomic_cas_strong_acq_rel(&once->tid, &expected, current_tid)) {  // could use atomic_load/store as well
     return true;  // should execute and release
-  } 
+  }
   else {
     mi_lock_release(&once->lock);
     return false; // already another thread entered and released
@@ -134,8 +137,25 @@ void _mi_atomic_once_release(mi_atomic_once_t* once) {
   if (mi_atomic_load_acquire(&once->tid)>1) {  // paranoia
     mi_atomic_store_release(&once->tid,1);     // done executing
     mi_lock_release(&once->lock);
-  }  
+  }
 }
+
+#if MI_USE_PTHREADS
+mi_decl_noinline bool _mi_pthread_key_create(pthread_key_t* pkey, void (*destruct)(void*), void* init) {
+  int err = pthread_key_create(pkey,destruct);
+  if mi_unlikely(err!=0) {
+    *pkey = MI_PTHREAD_KEY_INVALID;
+    _mi_error_message(ENOMEM,"unable to allocate a thread local variable (error %d)\n", err);
+    return false;
+  }
+  mi_assert_internal(*pkey != MI_PTHREAD_KEY_INVALID);
+  if (init!=NULL) {
+    pthread_setspecific(*pkey,init);
+  };
+  mi_assert_internal(pthread_getspecific(*pkey)==init);
+  return true;
+}
+#endif
 
 
 // --------------------------------------------------------
@@ -196,22 +216,20 @@ static void mi_out_num(uintmax_t x, size_t base, char prefix, char** out, char* 
     mi_outc('0',out,end);
   }
   else {
-    // output digits in reverse
-    char* start = *out;
-    while (x > 0) {
+    #define MI_MAX_OUT_DIGITS (160)     /* a 512 bit number has 155 digits */
+    char num[MI_MAX_OUT_DIGITS];  
+    int dcount = 0;
+    while(x>0 && dcount < MI_MAX_OUT_DIGITS) {
       char digit = (char)(x % base);
-      mi_outc((digit <= 9 ? '0' + digit : 'A' + digit - 10),out,end);
+      num[dcount++] = (digit <= 9 ? '0' + digit : 'A' + digit - 10);
       x = x / base;
     }
+    if (dcount>=MI_MAX_OUT_DIGITS) return;  // don't output anything?
     if (prefix != 0) {
       mi_outc(prefix, out, end);
     }
-    size_t len = *out - start;
-    // and reverse in-place
-    for (size_t i = 0; i < (len / 2); i++) {
-      char c = start[len - i - 1];
-      start[len - i - 1] = start[i];
-      start[i] = c;
+    while(dcount-- > 0) {
+      mi_outc(num[dcount], out, end);
     }
   }
 }
@@ -258,7 +276,10 @@ int _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
       if (c >= '1' && c <= '9') {
         width = (c - '0'); MI_NEXTC();
         while (c >= '0' && c <= '9') {
-          width = (10 * width) + (c - '0'); MI_NEXTC();
+          if (width < SIZE_MAX/1024) {  // no overflow
+            width = (10 * width) + (c - '0');
+          }
+          MI_NEXTC();
         }
         if (c == 0) break;  // extra check due to while
       }
@@ -297,7 +318,7 @@ int _mi_vsnprintf(char* buf, size_t bufsize, const char* fmt, va_list args) {
         if (width == 0 && (c == 'x' || c == 'p')) {
           if (c == 'p')   { width = 2 * (x <= UINT32_MAX ? 4 : ((x >> 16) <= UINT32_MAX ? 6 : sizeof(void*))); }
           if (width == 0) { width = 2; }
-          fill = '0';
+          if (alignright) { fill = '0'; }
         }
         mi_out_num(x, (c == 'x' || c == 'p' ? 16 : 10), numplus, &out, end);
       }
@@ -350,6 +371,7 @@ int _mi_snprintf(char* buf, size_t buflen, const char* fmt, ...) {
   return written;
 }
 
+#undef MI_NEXTC
 
 
 // --------------------------------------------------------
@@ -365,7 +387,7 @@ static size_t mi_ctz_generic32(uint32_t x) {
     31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9
   };
   if (x==0) return 32;
-  return debruijn[(uint32_t)((x & -(int32_t)x) * (uint32_t)(0x077CB531U)) >> 27];
+  return debruijn[(uint32_t)((x & (~x + 1U)) * (uint32_t)(0x077CB531U)) >> 27];
 }
 
 static size_t mi_clz_generic32(uint32_t x) {

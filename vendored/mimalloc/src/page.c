@@ -15,6 +15,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/internal.h"
 #include "mimalloc/atomic.h"
 #include "mimalloc/prim.h"
+#include "mimalloc/prim-tls.h"
 
 /* -----------------------------------------------------------
   Definition of page queues for each block size
@@ -41,7 +42,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page);
 
 #if (MI_DEBUG>=3)
 static size_t mi_page_list_count(mi_page_t* page, mi_block_t* head) {
-  mi_assert_internal(_mi_ptr_page(page->page_start) == page);
+  mi_assert_internal(_mi_ptr_page(mi_page_start(page)) == page);
   const uint8_t* slice_start = mi_page_slice_start(page);
   mi_assert_internal(_mi_is_aligned(slice_start,MI_PAGE_ALIGN));
   size_t count = 0;
@@ -84,6 +85,10 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
   mi_assert_internal(mi_page_block_size(page) > 0);
   mi_assert_internal(page->used <= page->capacity);
   mi_assert_internal(page->capacity <= page->reserved);
+  
+  mi_assert_internal(page->heap!=NULL);
+  mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
+  mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
 
   // const size_t bsize = mi_page_block_size(page);
   // uint8_t* start = mi_page_start(page);
@@ -99,7 +104,7 @@ static bool mi_page_is_valid_init(mi_page_t* page) {
       mi_assert_expensive(mi_mem_is_zero(block + 1, ubsize - sizeof(mi_block_t)));
     }
   }
-  #endif
+  #endif 
 
   #if !MI_TRACK_ENABLED && !MI_TSAN
   mi_block_t* tfree = mi_page_thread_free(page);
@@ -123,6 +128,9 @@ bool _mi_page_is_valid(mi_page_t* page) {
   #endif
   if (!mi_page_is_abandoned(page)) {
     //mi_assert_internal(!_mi_process_is_initialized);
+    mi_assert_internal(page->heap!=NULL);
+    mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
+    mi_assert_internal(page_theap == NULL || mi_page_theap(page)==page_theap);
     {
       mi_page_queue_t* pq = mi_page_queue_of(page);
       mi_assert_internal(mi_page_queue_contains(pq, page));
@@ -155,7 +163,7 @@ static void mi_page_thread_collect_to_local(mi_page_t* page, mi_block_t* head)
 
   // if `count > max_count` there was a memory corruption (possibly infinite list due to double multi-threaded free)
   if mi_unlikely(count > max_count) {
-    _mi_error_message(EFAULT, "corrupted thread-free list\n");
+    _mi_error_message(EFAULT, "corrupted thread-free list (possibly due to a cross-thread double free)\n");
     return; // the thread-free items cannot be freed
   }
   // if `count > page->used` there was another kind memory corruption (either in the page meta-data or in the linked list)
@@ -265,24 +273,6 @@ void _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head) {
   Page fresh and retire
 ----------------------------------------------------------- */
 
-/*
-// called from segments when reclaiming abandoned pages
-void _mi_page_reclaim(mi_theap_t* theap, mi_page_t* page) {
-  // mi_page_set_theap(page, theap);
-  // _mi_page_use_delayed_free(page, MI_USE_DELAYED_FREE, true); // override never (after theap is set)
-  _mi_page_free_collect(page, false); // ensure used count is up to date
-
-  mi_assert_expensive(mi_page_is_valid_init(page));
-  // mi_assert_internal(mi_page_theap(page) == theap);
-  // mi_assert_internal(mi_page_thread_free_flag(page) != MI_NEVER_DELAYED_FREE);
-
-  // TODO: push on full queue immediately if it is full?
-  mi_page_queue_t* pq = mi_theap_page_queue_of(theap, page);
-  mi_page_queue_push(theap, pq, page);
-  mi_assert_expensive(_mi_page_is_valid(page));
-}
-*/
-
 // called from `mi_free` on a reclaim, and fresh_alloc if we get an abandoned page
 void _mi_theap_page_reclaim(mi_theap_t* theap, mi_page_t* page)
 {
@@ -331,7 +321,9 @@ static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, si
     if (!mi_page_immediate_available(page)) {
       if (mi_page_is_expandable(page)) {
         if (!mi_page_extend_free(theap, page)) {
-          return NULL; // cannot commit
+          // cannot commit
+          _mi_page_abandon(page,pq);
+          return NULL;
         };
       }
       else {
@@ -419,7 +411,6 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
   _mi_arenas_collect(false, false, theap->tld);  // allow purging
 }
 
-#define MI_MAX_RETIRE_SIZE    MI_LARGE_OBJ_SIZE_MAX   // should be less than size for MI_BIN_HUGE
 #define MI_RETIRE_CYCLES      (16)
 
 // Retire a page with no more used blocks
@@ -530,7 +521,7 @@ static void mi_theap_collect_full_pages(mi_theap_t* theap) {
 #define MI_MIN_SLICES       (2)
 
 static void mi_page_free_list_extend_secure(mi_theap_t* const theap, mi_page_t* const page, const size_t bsize, const size_t extend) {
-  #if (MI_SECURE<3)
+  #if (MI_SECURE < 2)
   mi_assert_internal(page->free == NULL);
   mi_assert_internal(page->local_free == NULL);
   #endif
@@ -587,7 +578,7 @@ static void mi_page_free_list_extend_secure(mi_theap_t* const theap, mi_page_t* 
 
 static mi_decl_noinline void mi_page_free_list_extend( mi_page_t* const page, const size_t bsize, const size_t extend)
 {
-  #if (MI_SECURE<3)
+  #if (MI_SECURE < 2)
   mi_assert_internal(page->free == NULL);
   mi_assert_internal(page->local_free == NULL);
   #endif
@@ -628,7 +619,7 @@ static mi_decl_noinline void mi_page_free_list_extend( mi_page_t* const page, co
 // extra test in malloc? or cache effects?)
 static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   mi_assert_expensive(mi_page_is_valid_init(page));
-  #if (MI_SECURE<3)
+  #if (MI_SECURE < 2)
   mi_assert(page->free == NULL);
   mi_assert(page->local_free == NULL);
   if (page->free != NULL) return true;
@@ -662,14 +653,28 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
 
   // commit on demand?
   if (page->slice_committed > 0) {
+    // reduce extend if it commits more than an arena slice
+    if ((extend * bsize) > MI_ARENA_SLICE_SIZE) {
+      extend = _mi_divide_up(MI_ARENA_SLICE_SIZE, bsize);
+    }
+    // commit required size
     const size_t needed_size = (page->capacity + extend)*bsize;
-    const size_t needed_commit = _mi_align_up( mi_page_slice_offset_of(page, needed_size), MI_PAGE_MIN_COMMIT_SIZE );
+    mi_assert_internal(needed_size <= page_size);
+    size_t needed_commit = _mi_align_up( mi_page_slice_offset_of(page, needed_size), MI_PAGE_MIN_COMMIT_SIZE );
+    #if MI_SECURE>=5
+    // the previous alignup could extend the commit into the guard page; re-adjust if needed
+    const size_t page_size_commit = _mi_align_up( mi_page_slice_offset_of(page, page_size), _mi_os_page_size() );    
+    if (needed_commit > page_size_commit) { 
+      needed_commit = page_size_commit;
+    }
+    #endif
     if (needed_commit > page->slice_committed) {
       mi_assert_internal(((needed_commit - page->slice_committed) % _mi_os_page_size()) == 0);
-      if (!_mi_os_commit(mi_page_slice_start(page) + page->slice_committed, needed_commit - page->slice_committed, NULL)) {
+      if (!_mi_os_commit(_mi_theap_subproc(theap), mi_page_slice_start(page) + page->slice_committed, needed_commit - page->slice_committed, NULL)) {
         return false;
       }
-      page->slice_committed = needed_commit;
+      mi_assert_internal(needed_commit < UINT32_MAX);
+      page->slice_committed = (uint32_t)needed_commit;
     }
   }
 
@@ -693,8 +698,8 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(page != NULL);
   mi_assert(theap!=NULL);
-  page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap)); // faster for `mi_page_associated_theap`
-  mi_page_set_theap(page, theap);
+  // page->heap = (_mi_is_heap_main(_mi_theap_heap(theap)) ? NULL : _mi_theap_heap(theap)); // faster for `mi_page_associated_theap`
+  // mi_page_set_theap(page, theap);
 
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size); MI_UNUSED(page_start);
@@ -707,11 +712,13 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   #endif
   #if MI_DEBUG>2
   if (page->memid.initially_zero) {
-    mi_track_mem_defined(page->page_start, mi_page_committed(page));
+    mi_track_mem_defined(mi_page_start(page), mi_page_committed(page));
     mi_assert_expensive(mi_mem_is_zero(page_start, mi_page_committed(page)));
   }
   #endif
 
+  mi_assert_internal(page->heap != NULL);
+  mi_assert_internal(page->heap == _mi_theap_heap(theap));
   mi_assert_internal(page->theap!=NULL);
   mi_assert_internal(page->theap == mi_page_theap(page));
   mi_assert_internal(page->capacity == 0);
@@ -984,10 +991,8 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
       return NULL;
     }
     // otherwise we initialize the thread and its default theap
-    mi_thread_init();
-    theap = _mi_theap_default();
-    if mi_unlikely(!mi_theap_is_initialized(theap)) { return NULL; }
-    mi_assert_internal(_mi_theap_default()==theap);
+    theap = _mi_thread_init();
+    if mi_unlikely(!mi_theap_is_initialized(theap)) { return NULL; }    
   }
   mi_assert_internal(mi_theap_is_initialized(theap));
 

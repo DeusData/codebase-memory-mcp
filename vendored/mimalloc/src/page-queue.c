@@ -112,10 +112,10 @@ size_t _mi_bin_size(size_t bin) {
 
 // Good size for allocation
 mi_decl_nodiscard mi_decl_export size_t mi_good_size(size_t size) mi_attr_noexcept {
-  if (size <= MI_LARGE_MAX_OBJ_SIZE) {
+  if (size <= MI_LARGE_MAX_OBJ_SIZE - MI_PADDING_SIZE) {
     return _mi_bin_size(mi_bin(size + MI_PADDING_SIZE));
   }
-  else if (size <= MI_MAX_ALLOC_SIZE) {
+  else if (size <= MI_MAX_ALLOC_SIZE - MI_PADDING_SIZE) {
     return _mi_align_up(size + MI_PADDING_SIZE,_mi_os_page_size());
   }
   else {
@@ -420,39 +420,4 @@ static void mi_page_queue_enqueue_from(mi_page_queue_t* to, mi_page_queue_t* fro
 static void mi_page_queue_enqueue_from_full(mi_page_queue_t* to, mi_page_queue_t* from, mi_page_t* page) {
   // note: we could insert at the front to increase reuse, but it slows down certain benchmarks (like `alloc-test`)
   mi_page_queue_enqueue_from_ex(to, from, true /* enqueue at the end of the `to` queue? */, page);
-}
-
-// Only called from `mi_theap_absorb`.
-size_t _mi_page_queue_append(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_queue_t* append) {
-  mi_assert_internal(mi_theap_contains_queue(theap,pq));
-  mi_assert_internal(pq->block_size == append->block_size);
-
-  if (append->first==NULL) return 0;
-
-  // set append pages to new theap and count
-  size_t count = 0;
-  for (mi_page_t* page = append->first; page != NULL; page = page->next) {
-    mi_page_set_theap(page, theap);
-    count++;
-  }
-  mi_assert_internal(count == append->count);
-
-  if (pq->last==NULL) {
-    // take over afresh
-    mi_assert_internal(pq->first==NULL);
-    pq->first = append->first;
-    pq->last = append->last;
-    mi_theap_queue_first_update(theap, pq);
-  }
-  else {
-    // append to end
-    mi_assert_internal(pq->last!=NULL);
-    mi_assert_internal(append->first!=NULL);
-    pq->last->next = append->first;
-    append->first->prev = pq->last;
-    pq->last = append->last;
-  }
-  pq->count += append->count;
-
-  return count;
 }

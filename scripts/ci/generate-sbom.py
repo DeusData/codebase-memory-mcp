@@ -40,7 +40,7 @@ sbom = {
     "packages": [
         {"SPDXID": "SPDXRef-Package-sqlite3", "name": "sqlite3", "versionInfo": "3.51.3", "licenseDeclared": "blessing", "downloadLocation": "https://sqlite.org", "filesAnalyzed": False},
         {"SPDXID": "SPDXRef-Package-yyjson", "name": "yyjson", "versionInfo": "0.12.0", "licenseDeclared": "MIT", "downloadLocation": "https://github.com/ibireme/yyjson", "filesAnalyzed": False},
-        {"SPDXID": "SPDXRef-Package-mimalloc", "name": "mimalloc", "versionInfo": "3.3.2", "licenseDeclared": "MIT", "downloadLocation": "https://github.com/microsoft/mimalloc", "filesAnalyzed": False},
+        {"SPDXID": "SPDXRef-Package-mimalloc", "name": "mimalloc", "versionInfo": "3.4.4", "licenseDeclared": "MIT", "downloadLocation": "https://github.com/microsoft/mimalloc", "filesAnalyzed": False},
         {"SPDXID": "SPDXRef-Package-xxhash", "name": "xxhash", "versionInfo": "0.8.3", "licenseDeclared": "BSD-2-Clause", "downloadLocation": "https://github.com/Cyan4973/xxHash", "filesAnalyzed": False},
         {"SPDXID": "SPDXRef-Package-tre", "name": "tre", "versionInfo": "0.8.0", "licenseDeclared": "BSD-2-Clause", "downloadLocation": "https://github.com/laurikari/tre", "filesAnalyzed": False},
         {"SPDXID": "SPDXRef-Package-tree-sitter", "name": "tree-sitter", "versionInfo": "0.24.4", "licenseDeclared": "MIT", "downloadLocation": "https://github.com/tree-sitter/tree-sitter", "filesAnalyzed": False},

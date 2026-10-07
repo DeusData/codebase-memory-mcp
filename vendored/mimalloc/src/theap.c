@@ -1,5 +1,5 @@
 /*----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -7,7 +7,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
-#include "mimalloc/prim.h"  // _mi_theap_default
+#include "mimalloc/prim-tls.h"  // _mi_theap_default
 
 #if defined(_MSC_VER) && (_MSC_VER < 1920)
 #pragma warning(disable:4204)  // non-constant aggregate initializer
@@ -23,7 +23,7 @@ typedef bool (theap_page_visitor_fun)(mi_theap_t* theap, mi_page_queue_t* pq, mi
 // Visit all pages in a theap; returns `false` if break was called.
 static bool mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, bool include_full, void* arg1, void* arg2)
 {
-  if (theap==NULL || theap->page_count==0) return 0;
+  if (theap==NULL || theap->page_count==0) return true;
 
   // visit all pages
   #if MI_DEBUG>1
@@ -50,19 +50,24 @@ static bool mi_theap_visit_pages(mi_theap_t* theap, theap_page_visitor_fun* fn, 
 }
 
 
-#if MI_DEBUG>=2
+#if MI_DEBUG>=3
 static bool mi_theap_page_is_valid(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
   MI_UNUSED(arg1);
   MI_UNUSED(arg2);
   MI_UNUSED(pq);
   mi_assert_internal(mi_page_theap(page) == theap);
+  mi_theap_t* const page_theap = _mi_heap_theap_peek(page->heap);
+  mi_assert_internal(page_theap == NULL || theap == page_theap);
   mi_assert_expensive(_mi_page_is_valid(page));
   return true;
 }
-#endif
-#if MI_DEBUG>=3
+
 static bool mi_theap_is_valid(mi_theap_t* theap) {
   mi_assert_internal(theap!=NULL);
+  mi_heap_t* const heap = _mi_theap_heap_peek(theap);
+  mi_assert_internal(heap != NULL);
+  mi_theap_t* const heap_theap = _mi_heap_theap_peek(heap);  // don't use mi_heap_theap as that may re-initialize the thread
+  mi_assert_internal(heap_theap==NULL || heap_theap == theap);
   mi_theap_visit_pages(theap, &mi_theap_page_is_valid, true, NULL, NULL);
   for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
     mi_assert_internal(_mi_page_queue_is_valid(theap, &theap->pages[bin]));
@@ -91,7 +96,7 @@ typedef enum mi_collect_e {
 static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg_collect, void* arg2 ) {
   MI_UNUSED(arg2);
   MI_UNUSED(theap);
-  mi_assert_internal(mi_theap_page_is_valid(theap, pq, page, NULL, NULL));
+  mi_assert_expensive(mi_theap_page_is_valid(theap, pq, page, NULL, NULL));
   mi_collect_t collect = *((mi_collect_t*)arg_collect);
   _mi_page_free_collect(page, collect >= MI_FORCE);
   if (mi_page_all_free(page)) {
@@ -110,7 +115,8 @@ static bool mi_theap_page_collect(mi_theap_t* theap, mi_page_queue_t* pq, mi_pag
 
 static void mi_theap_merge_stats(mi_theap_t* theap) {
   mi_assert_internal(mi_theap_is_initialized(theap));
-  _mi_stats_merge_into(&_mi_theap_heap(theap)->stats, &theap->stats);
+  mi_heap_t* const heap = _mi_theap_heap(theap);
+  _mi_stats_merge_into(&heap->stats, &theap->stats);
 }
 
 static void mi_theap_collect_ex(mi_theap_t* theap, mi_collect_t collect)
@@ -170,24 +176,35 @@ mi_theap_t* mi_theap_get_default(void) {
   return theap;
 }
 
+mi_theap_t* mi_theap_set_default(mi_theap_t* theap) {
+  mi_theap_t* const previous = mi_theap_get_default();
+  if (mi_theap_is_initialized(theap)) {
+    _mi_theap_default_set(theap);
+  }
+  return previous;
+}
+
 // todo: make order of parameters consistent (but would that break compat with CPython?)
 void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
 {
   mi_assert_internal(theap!=NULL);
   mi_assert_internal(heap!=NULL);
+  mi_assert_internal(tld!=NULL);
   mi_memid_t memid = theap->memid;
   _mi_memcpy_aligned(theap, &_mi_theap_empty, sizeof(mi_theap_t));
   theap->memid = memid;
-  theap->refcount = 1;
   theap->tld   = tld;  // avoid reading the thread-local tld during initialization
-  mi_atomic_store_ptr_relaxed(mi_heap_t,&theap->heap,heap);
+  mi_atomic_store_release(&theap->refcount,1);
+  mi_atomic_store_release(&theap->freed,0);
+  mi_atomic_store_ptr_release(mi_subproc_t,&theap->subproc,heap->subproc);
   mi_assert_internal(theap->stats.size == sizeof(mi_stats_t));
   
   _mi_theap_options_init(theap);
+  
   if (theap->tld->is_in_threadpool) {
     // if we run as part of a thread pool it is better to not arbitrarily reclaim abandoned pages into our theap.
     // this is checked in `free.c:mi_free_try_collect_mt`
-    // .. but abandoning is good in this case: halve the full page retain (possibly to 0)
+    // .. but abandoning is good in this case: quarter the full page retain (possibly to 0)
     // (so blocked threads do not hold on to too much memory)
     if (theap->page_full_retain > 0) {
       theap->page_full_retain = theap->page_full_retain / 4;
@@ -196,29 +213,40 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
 
   // push on the thread local theaps list
   mi_theap_t* head = NULL;
+  mi_random_ctx_t head_random;
   mi_lock(&theap->tld->theaps_lock) {
     head = theap->tld->theaps;
     theap->tprev = NULL;
     theap->tnext = head;
-    if (head!=NULL) { head->tprev = theap; }
     theap->tld->theaps = theap;
+    if (head!=NULL) { 
+      head->tprev = theap; 
+      head_random = head->random;
+    }    
   }
 
-  // initialize random
-  if (head == NULL) {  // first theap in this thread?
+  // initialize random if heap==NULL
+  if (head==NULL) {  // first theap of the first thread?
     #if defined(_WIN32) && !defined(MI_SHARED_LIB)
+    if (tld->thread_seq==0) {
       _mi_random_init_weak(&theap->random);    // prevent allocation failure during bcrypt dll initialization with static linking (issue #1185)
-    #else
-      _mi_random_init(&theap->random);
+    }
+    else
     #endif
+    {
+      _mi_random_init(&theap->random);
+    }
   }
   else {
-    _mi_random_split(&head->random, &theap->random);
+    _mi_random_split(&head_random, &theap->random); // &theap->random is used as nonce so it is ok if threads capture the same head->random
   }
-  theap->cookie  = _mi_theap_random_next(theap) | 1;
-  _mi_theap_guarded_init(theap);
-  mi_subproc_stat_increase(_mi_subproc(),theaps,1);
+  theap->cookie = _mi_theap_random_next(theap) | 1;
+  _mi_theap_guarded_init(theap);  // needs theap->random
+  mi_subproc_stat_increase(_mi_theap_subproc(theap),theaps,1);  // on subproc to match theap_free_mem
 
+  // only now set the heap member as it is used to determine if a theap is initialized
+  mi_atomic_store_ptr_release(mi_heap_t,&theap->heap,heap);
+  
   // push on the heap's theap list
   mi_lock(&heap->theaps_lock) {
     head = heap->theaps;
@@ -232,31 +260,29 @@ void _mi_theap_init(mi_theap_t* theap, mi_heap_t* heap, mi_tld_t* tld)
 mi_theap_t* _mi_theap_create(mi_heap_t* heap, mi_tld_t* tld) {
   mi_assert_internal(tld!=NULL);
   mi_assert_internal(heap!=NULL);
+  mi_assert_internal(_mi_thread_id() == tld->thread_id);
+  // mi_assert_internal(_mi_heap_theap_peek(heap)==NULL);  // don't access thread locals as this is called on thread init
+
   // allocate and initialize a theap
   mi_memid_t memid;
   mi_theap_t* theap;
-  //if (!_mi_is_heap_main(heap)) {
-  //  theap = (mi_theap_t*)mi_heap_zalloc(mi_heap_main(),sizeof(mi_theap_t));
-  //  memid = _mi_memid_create(MI_MEM_HEAP_MAIN);
-  //  memid.initially_zero = memid.initially_committed = true;
-  //}
-  //else
+  
   if (heap->exclusive_arena == NULL) {
-    theap = (mi_theap_t*)_mi_meta_zalloc(sizeof(mi_theap_t), &memid);
+    theap = (mi_theap_t*)_mi_meta_zalloc(heap->subproc, sizeof(mi_theap_t), &memid);
   }
   else {
     // theaps associated with a specific arena are allocated in that arena
     // note: takes up at least one slice which is quite wasteful...
     const size_t size = _mi_align_up(sizeof(mi_theap_t),MI_ARENA_MIN_OBJ_SIZE);
-    theap = (mi_theap_t*)_mi_arenas_alloc(heap, size, true, true, heap->exclusive_arena, tld->thread_seq, tld->numa_node, &memid);
-    mi_assert_internal(memid.mem.os.size >= size);
+    theap = (mi_theap_t*)_mi_arenas_alloc(heap, size, true, true, heap->exclusive_arena, tld->thread_seq, tld->numa_node, &memid);    
   }
   if (theap==NULL) {
     _mi_error_message(ENOMEM, "unable to allocate theap meta-data\n");
     return NULL;
   }
+
   theap->memid = memid;
-  _mi_theap_init(theap, heap, tld);
+  _mi_theap_init(theap, heap, tld);  
   return theap;
 }
 
@@ -266,29 +292,30 @@ uintptr_t _mi_theap_random_next(mi_theap_t* theap) {
 
 static void mi_theap_free_mem(mi_theap_t* theap) {
   if (theap!=NULL) {
-    mi_subproc_stat_decrease(_mi_subproc(),theaps,1);
+    mi_subproc_stat_decrease(_mi_theap_subproc(theap),theaps,1);
     // free the used memory
     if (theap->memid.memkind == MI_MEM_HEAP_MAIN) {  // note: for now unused as it would access theap_default stats in mi_free of the current theap
       mi_assert_internal(_mi_is_heap_main(mi_heap_of(theap)));
-      mi_free(theap);
+      _mi_free_subproc_safe(theap);
     }
     else if (theap->memid.memkind == MI_MEM_META) {
-      _mi_meta_free(theap, sizeof(*theap), theap->memid);
+      _mi_meta_free(_mi_theap_subproc(theap), theap, sizeof(*theap), theap->memid);
     }
     else {
-      _mi_arenas_free(theap, _mi_align_up(sizeof(*theap),MI_ARENA_MIN_OBJ_SIZE), theap->memid ); // issue #1168, avoid assertion failure
+      _mi_arenas_free(_mi_theap_subproc(theap), theap, _mi_align_up(sizeof(*theap),MI_ARENA_MIN_OBJ_SIZE), theap->memid ); // issue #1168, avoid assertion failure
     }
   }
 }
 
+// we need to reference count theaps due to the _mi_theap_cached thread locals
 void _mi_theap_incref(mi_theap_t* theap) {
-  if (theap!=NULL && theap->memid.memkind > MI_MEM_STATIC) {
+  if (theap!=NULL && !mi_memid_needs_no_free(theap->memid)) {
     mi_atomic_increment_acq_rel(&theap->refcount);
   }
 }
 
 void _mi_theap_decref(mi_theap_t* theap) {
-  if (theap!=NULL && theap->memid.memkind > MI_MEM_STATIC) {
+  if (theap!=NULL && !mi_memid_needs_no_free(theap->memid)) {
     if (mi_atomic_decrement_acq_rel(&theap->refcount) == 1) {
       mi_theap_free_mem(theap);
     }
@@ -301,13 +328,15 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
   mi_assert(theap != NULL);
   if (theap==NULL) return true;
 
-  mi_heap_t* const heap = mi_atomic_exchange_ptr_acq_rel(mi_heap_t, &theap->heap, NULL);
-  if (heap==NULL) {
+  // ensure only one thread actually frees the theap
+  const size_t freed = mi_atomic_exchange_acq_rel( &theap->freed, 1 );
+  if (freed!=0) {
     // concurrent interaction, retry in an outer loop (as the other thread may be blocked on our lock)
     return false;
   }
   else {
     // merge stats to the owning heap
+    mi_heap_t* const heap = _mi_theap_heap(theap);
     _mi_stats_merge_into(&heap->stats, &theap->stats);
 
     // remove ourselves from the heap theaps list
@@ -323,9 +352,16 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
       if (theap->tnext != NULL) { theap->tnext->tprev = theap->tprev;  }
       if (theap->tprev != NULL) { theap->tprev->tnext = theap->tnext;  }
                           else { mi_assert_internal(theap->tld->theaps == theap); theap->tld->theaps = theap->tnext; }
-      theap->tnext = theap->tprev = NULL;                        
+      theap->tnext = theap->tprev = NULL;           
     }
+
+    // Set heap to NULL only after we are removed from the thread local theaps list since
+    // we may concurrently traverse it to collect (in `init.c:mi_thread_theaps_done`)
+    // (We need to set it to NULL to avoid an ABA problem where the _mi_theap_cached
+    // has a heap address that is reused for a newly allocated heap.)
+    mi_atomic_store_ptr_release(mi_heap_t, &theap->heap, NULL);
     theap->tld = NULL;
+    // leave subproc field as is for free-ing
     _mi_theap_decref(theap);
     return true;
   }
@@ -333,138 +369,23 @@ bool _mi_theap_free(mi_theap_t* theap, bool acquire_heap_theaps_lock, bool acqui
 
 
 /* -----------------------------------------------------------
-  Heap destroy
------------------------------------------------------------ */
-/*
-
-// zero out the page queues
-static void mi_theap_reset_pages(mi_theap_t* theap) {
-  mi_assert_internal(theap != NULL);
-  mi_assert_internal(mi_theap_is_initialized(theap));
-  // TODO: copy full empty theap instead?
-  _mi_memset(&theap->pages_free_direct, 0, sizeof(theap->pages_free_direct));
-  _mi_memcpy_aligned(&theap->pages, &_mi_theap_empty.pages, sizeof(theap->pages));
-  // theap->thread_delayed_free = NULL;
-  theap->page_count = 0;
-}
-
-static bool _mi_theap_page_destroy(mi_theap_t* theap, mi_page_queue_t* pq, mi_page_t* page, void* arg1, void* arg2) {
-  MI_UNUSED(arg1);
-  MI_UNUSED(arg2);
-  MI_UNUSED(pq);
-
-  // ensure no more thread_delayed_free will be added
-  //_mi_page_use_delayed_free(page, MI_NEVER_DELAYED_FREE, false);
-
-  // stats
-  const size_t bsize = mi_page_block_size(page);
-  if (bsize > MI_LARGE_MAX_OBJ_SIZE) {
-    mi_theap_stat_decrease(theap, malloc_huge, bsize);
-  }
-  #if (MI_STAT>0)
-  _mi_page_free_collect(page, false);  // update used count
-  const size_t inuse = page->used;
-  if (bsize <= MI_LARGE_MAX_OBJ_SIZE) {
-    mi_theap_stat_decrease(theap, malloc_normal, bsize * inuse);
-    #if (MI_STAT>1)
-    mi_theap_stat_decrease(theap, malloc_bins[_mi_bin(bsize)], inuse);
-    #endif
-  }
-  // mi_theap_stat_decrease(theap, malloc_requested, bsize * inuse);  // todo: off for aligned blocks...
-  #endif
-
-  /// pretend it is all free now
-  mi_assert_internal(mi_page_thread_free(page) == NULL);
-  page->used = 0;
-
-  // and free the page
-  // mi_page_free(page,false);
-  page->next = NULL;
-  page->prev = NULL;
-  mi_page_set_theap(page, NULL);
-  _mi_arenas_page_free(page, theap);
-
-  return true; // keep going
-}
-
-void _mi_theap_destroy_pages(mi_theap_t* theap) {
-  mi_theap_visit_pages(theap, &_mi_theap_page_destroy, NULL, NULL);
-  mi_theap_reset_pages(theap);
-}
-
-#if MI_TRACK_HEAP_DESTROY
-static bool mi_cdecl mi_theap_track_block_free(const mi_theap_t* theap, const mi_theap_area_t* area, void* block, size_t block_size, void* arg) {
-  MI_UNUSED(theap); MI_UNUSED(area);  MI_UNUSED(arg); MI_UNUSED(block_size);
-  mi_track_free_size(block,mi_usable_size(block));
-  return true;
-}
-#endif
-
-void mi_theap_destroy(mi_theap_t* theap) {
-  mi_assert(theap != NULL);
-  mi_assert(mi_theap_is_initialized(theap));
-  mi_assert(!theap->allow_page_reclaim);
-  mi_assert(!theap->allow_page_abandon);
-  mi_assert_expensive(mi_theap_is_valid(theap));
-  if (theap==NULL || !mi_theap_is_initialized(theap)) return;
-  #if MI_GUARDED
-  // _mi_warning_message("'mi_theap_destroy' called but MI_GUARDED is enabled -- using `mi_theap_delete` instead (theap at %p)\n", theap);
-  mi_theap_delete(theap);
-  return;
-  #else
-  if (theap->allow_page_reclaim) {
-    _mi_warning_message("'mi_theap_destroy' called but ignored as the theap was not created with 'allow_destroy' (theap at %p)\n", theap);
-    // don't free in case it may contain reclaimed pages,
-    mi_theap_delete(theap);
-  }
-  else {
-    // track all blocks as freed
-    #if MI_TRACK_HEAP_DESTROY
-    mi_theap_visit_blocks(theap, true, mi_theap_track_block_free, NULL);
-    #endif
-    // free all pages
-    _mi_theap_destroy_pages(theap);
-    mi_theap_free(theap,true);
-  }
-  #endif
-}
-
-// forcefully destroy all theaps in the current thread
-void _mi_theap_unsafe_destroy_all(mi_theap_t* theap) {
-  mi_assert_internal(theap != NULL);
-  if (theap == NULL) return;
-  mi_theap_t* curr = theap->tld->theaps;
-  while (curr != NULL) {
-    mi_theap_t* next = curr->next;
-    if (!curr->allow_page_reclaim) {
-      mi_theap_destroy(curr);
-    }
-    else {
-      _mi_theap_destroy_pages(curr);
-    }
-    curr = next;
-  }
-}
-*/
-
-/* -----------------------------------------------------------
-  Safe Heap delete
+  Safe theap delete
 ----------------------------------------------------------- */
 
 // Safe delete a theap without freeing any still allocated blocks in that theap.
-void _mi_theap_delete(mi_theap_t* theap, bool acquire_tld_theaps_lock)
-{
-  mi_assert(theap != NULL);
-  mi_assert(mi_theap_is_initialized(theap));
-  mi_assert_expensive(mi_theap_is_valid(theap));
-  if (theap==NULL || !mi_theap_is_initialized(theap)) return;
+// void _mi_theap_delete(mi_theap_t* theap, bool acquire_tld_theaps_lock)
+// {
+//   mi_assert(theap != NULL);
+//   mi_assert(mi_theap_is_initialized(theap));
+//   mi_assert_expensive(mi_theap_is_valid(theap));
+//   if (theap==NULL || !mi_theap_is_initialized(theap)) return;
 
-  // abandon all pages
-  _mi_theap_collect_abandon(theap);
+//   // abandon all pages
+//   _mi_theap_collect_abandon(theap);
 
-  mi_assert_internal(theap->page_count==0);
-  _mi_theap_free(theap, true /* acquire heap->theaps_lock */, acquire_tld_theaps_lock);
-}
+//   mi_assert_internal(theap->page_count==0);
+//   _mi_theap_free(theap, true /* acquire heap->theaps_lock */, acquire_tld_theaps_lock);
+// }
 
 
 
@@ -663,6 +584,11 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   return true;
 }
 
+// bool _mi_page_visit_blocks( mi_page_t* page, mi_block_visit_fun* visitor, void* arg ) {
+//   mi_heap_area_t area;
+//   _mi_heap_area_init(&area, page);
+//   return _mi_theap_area_visit_blocks(&area, page, visitor, arg);
+// }
 
 
 // Separate struct to keep `mi_page_t` out of the public interface

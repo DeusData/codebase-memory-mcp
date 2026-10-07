@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -41,6 +41,13 @@ terms of the MIT license. A copy of the license can be found in the file
   #else
   #include <sys/mman.h>
   #endif
+  #if defined(__riscv) || defined(_M_RISCV)
+    #if defined(MI_HAS_SYS_HWPROBEH)
+      #include <sys/hwprobe.h>
+    #elif defined(MI_HAS_ASM_HWPROBEH)
+      #include <asm/hwprobe.h>
+    #endif
+  #endif
 #elif defined(__APPLE__)
   #include <AvailabilityMacros.h>
   #include <TargetConditionals.h>
@@ -72,7 +79,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MADV_FREE  POSIX_MADV_FREE
 #endif
 
-#define MI_UNIX_LARGE_PAGE_SIZE (2*MI_MiB) // TODO: can we query the OS for this?
+#define MI_UNIX_LARGE_PAGE_SIZE (2*MI_MiB) // todo: can we query the OS for this?
 
 //------------------------------------------------------------------------------------
 // Use syscalls for some primitives to allow for libraries that override open/read/close etc.
@@ -150,13 +157,14 @@ static bool unix_detect_thp(void) {
   #if defined(__linux__)
   int fd = mi_prim_open("/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY);
   if (fd >= 0) {
-    char buf[32];
+    char buf[64];
     ssize_t nread = mi_prim_read(fd, &buf, sizeof(buf));
     mi_prim_close(fd);
     // <https://www.kernel.org/doc/html/latest/admin-guide/mm/transhuge.html>
     // between brackets is the current value, for example: always [madvise] never
     if (nread >= 1) {
-      thp_enabled = (_mi_strnstr(buf,32,"[never]") == NULL);
+      if (nread > 64) { nread = 64; }
+      thp_enabled = (_mi_strnstr(buf,nread,"[never]") == NULL);
     }
   }
   #endif
@@ -205,6 +213,40 @@ static void unix_detect_physical_memory( size_t page_size, size_t* physical_memo
   #endif
 }
 
+// Detect the virtual address bits (currently Linux/RISC-V only)
+static size_t unix_detect_virtual_address_bits(void) {
+  #if defined(__riscv) || defined(_M_RISCV)
+    #if defined(RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS)
+      struct riscv_hwprobe probe = { .key = RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS, };
+      // Prefer the GNU libc interface if available, as it can also use the VDSO
+      #if defined(MI_HAS_SYS_HWPROBEH)
+      if (__riscv_hwprobe(&probe, 1, 0, NULL, 0) == 0)
+      #else
+      if (syscall(__NR_riscv_hwprobe, &probe, 1, 0, NULL, 0) == 0)
+      #endif
+      {
+        if (probe.key != -1) { // If a key is unknown to the kernel, its key field will be cleared to -1.
+          return (MI_SIZE_BITS - mi_clz((uintptr_t)probe.value));
+        }
+      }
+    #endif
+    // Fallback to checking /proc/cpuinfo for older kernels
+    const int fd = mi_prim_open("/proc/cpuinfo", O_RDONLY);
+    if (fd >= 0) {
+      char buf[2048];
+      const ssize_t nread = mi_prim_read(fd, &buf, sizeof(buf));
+      mi_prim_close(fd);
+      if ((nread >= 1) && (nread <= (ssize_t)sizeof(buf))) {
+        if (_mi_strnstr(buf, nread, "sv39")) { return 39; }
+        else if (_mi_strnstr(buf, nread, "sv48")) { return 48; }
+        else if (_mi_strnstr(buf, nread, "sv57")) { return 57; }
+      }
+    }
+  #endif // riscv
+  // default
+  return MI_MAX_VABITS;
+}
+
 void _mi_prim_mem_init( mi_os_mem_config_t* config )
 {
   long psize = sysconf(_SC_PAGESIZE);
@@ -218,6 +260,7 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config )
   config->has_partial_free = true;    // mmap can free in parts
   config->has_virtual_reserve = true; // todo: check if this true for NetBSD?  (for anonymous mmap with PROT_NONE)
   config->has_transparent_huge_pages = unix_detect_thp();
+  config->virtual_address_bits = unix_detect_virtual_address_bits();
 
   // disable transparent huge pages for this process?
   #if (defined(__linux__) || defined(__ANDROID__)) && defined(PR_GET_THP_DISABLE)
@@ -333,6 +376,10 @@ static int unix_mmap_fd(void) {
   #endif
 }
 
+#if defined(MAP_ALIGNED_SUPER) || defined(MAP_HUGETLB) || defined(MAP_HUGE_1GB) || defined(MAP_HUGE_2MB) || defined(VM_FLAGS_SUPERPAGE_SIZE_2MB)
+#define MI_OS_HAS_HUGE_PAGES  1
+#endif
+
 static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protect_flags, bool large_only, bool allow_large, bool* is_large) {
   #if !defined(MAP_ANONYMOUS)
   #define MAP_ANONYMOUS  MAP_ANON
@@ -350,6 +397,7 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
   protect_flags |= PROT_MAX(PROT_READ | PROT_WRITE); // BSD
   #endif
   // huge page allocation
+  #if MI_OS_HAS_HUGE_PAGES
   if (allow_large && (large_only || (_mi_os_canuse_large_page(size, try_alignment) && mi_option_is_enabled(mi_option_allow_large_os_pages)))) {
     static _Atomic(size_t) large_page_try_ok; // = 0;
     size_t try_ok = mi_atomic_load_acquire(&large_page_try_ok);
@@ -370,8 +418,8 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
       lflags |= MAP_HUGETLB;
       #endif
       #ifdef MAP_HUGE_1GB
-      static bool mi_huge_pages_available = true;
-      if (large_only && (size % MI_GiB) == 0 && mi_huge_pages_available) {
+      static _Atomic(size_t) mi_huge_1gib_pages_unavailable;
+      if (large_only && (size % MI_GiB) == 0 && (mi_atomic_load_relaxed(&mi_huge_1gib_pages_unavailable)==0)) {
         lflags |= MAP_HUGE_1GB;
       }
       else
@@ -390,7 +438,7 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
         p = unix_mmap_prim_aligned(addr, size, try_alignment, protect_flags, lflags, lfd);
         #ifdef MAP_HUGE_1GB
         if (p == NULL && (lflags & MAP_HUGE_1GB) == MAP_HUGE_1GB) {
-          mi_huge_pages_available = false; // don't try huge 1GiB pages again
+          mi_atomic_store_relaxed(&mi_huge_1gib_pages_unavailable,1); // don't try huge 1GiB pages again
           if (large_only) {
             _mi_warning_message("unable to allocate huge (1GiB) page, trying large (2MiB) pages instead (errno: %i)\n", errno);
           }
@@ -404,7 +452,8 @@ static void* unix_mmap(void* addr, size_t size, size_t try_alignment, int protec
         }
       }
     }
-  }
+  } // huge pages
+  #endif
   // regular allocation
   if (p == NULL) {
     *is_large = false;
@@ -492,27 +541,28 @@ int _mi_prim_reuse(void* start, size_t size) {
 
 int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
   int err = 0;
-  #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
-    // decommit on macOS: use MADV_FREE_REUSABLE as it does immediate rss accounting (issue #1097)
-    err = unix_madvise(start, size, MADV_FREE_REUSABLE);
-    if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+  #if 1
+    #if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+      // decommit on macOS: use MADV_FREE_REUSABLE as it does immediate rss accounting (issue #1097)
+      err = unix_madvise(start, size, MADV_FREE_REUSABLE);
+      if (err) { err = unix_madvise(start, size, MADV_DONTNEED); }
+    #else
+      // decommit: use MADV_DONTNEED as it decreases rss immediately (unlike MADV_FREE)
+      err = unix_madvise(start, size, MADV_DONTNEED);
+    #endif
+    #if !MI_DEBUG && MI_SECURE<=2
+      *needs_recommit = false;
+    #else
+      *needs_recommit = true;
+      mprotect(start, size, PROT_NONE);
+    #endif
   #else
-    // decommit: use MADV_DONTNEED as it decreases rss immediately (unlike MADV_FREE)
-    err = unix_madvise(start, size, MADV_DONTNEED);
-  #endif
-  #if !MI_DEBUG && MI_SECURE<=2
-    *needs_recommit = false;
-  #else
+    // decommit: use mmap with MAP_FIXED and PROT_NONE to discard the existing memory (and reduce rss)
     *needs_recommit = true;
-    mprotect(start, size, PROT_NONE);
+    const int fd = unix_mmap_fd();
+    void* p = mmap(start, size, PROT_NONE, (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE), fd, 0);
+    if (p != start) { err = errno; }
   #endif
-  /*
-  // decommit: use mmap with MAP_FIXED and PROT_NONE to discard the existing memory (and reduce rss)
-  *needs_recommit = true;
-  const int fd = unix_mmap_fd();
-  void* p = mmap(start, size, PROT_NONE, (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE), fd, 0);
-  if (p != start) { err = errno; }
-  */
   return err;
 }
 
@@ -579,15 +629,15 @@ int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bo
   bool is_large = true;
   *is_zero = true;
   *addr = unix_mmap(hint_addr, size, MI_ARENA_SLICE_ALIGN, PROT_READ | PROT_WRITE, true, true, &is_large);
-  if (*addr != NULL && numa_node >= 0 && numa_node < 8*MI_INTPTR_SIZE) { // at most 64 nodes
+  if (*addr != NULL && numa_node >= 0 && numa_node < (8*MI_INTPTR_SIZE - 1)) { // at most 63 nodes
     unsigned long numa_mask = (1UL << numa_node);
-    // TODO: does `mbind` work correctly for huge OS pages? should we
+    // todo: does `mbind` work correctly for huge OS pages? should we
     // use `set_mempolicy` before calling mmap instead?
     // see: <https://lkml.org/lkml/2017/2/9/875>
     long err = mi_prim_mbind(*addr, size, MPOL_PREFERRED, &numa_mask, 8*MI_INTPTR_SIZE, 0);
     if (err != 0) {
       err = errno;
-      _mi_warning_message("failed to bind huge (1GiB) pages to numa node %d (error: %d (0x%x))\n", numa_node, err, err);
+      _mi_warning_message("failed to bind huge (1GiB) pages to numa node %d (error: %ld (0x%lx))\n", numa_node, err, err);
     }
   }
   return (*addr != NULL ? 0 : errno);
@@ -612,9 +662,9 @@ int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bo
 
 size_t _mi_prim_numa_node(void) {
   #if defined(MI_HAS_SYSCALL_H) && defined(SYS_getcpu)
-    unsigned long node = 0;
-    unsigned long ncpu = 0;
-    long err = syscall(SYS_getcpu, &ncpu, &node, NULL);
+    unsigned int node = 0;
+    unsigned int ncpu = 0;
+    int err = syscall(SYS_getcpu, &ncpu, &node, NULL);
     if (err != 0) return 0;
     return node;
   #else
@@ -625,10 +675,15 @@ size_t _mi_prim_numa_node(void) {
 size_t _mi_prim_numa_node_count(void) {
   char buf[128];
   unsigned node = 0;
+  size_t skipped = 0;
   for(node = 0; node < 256; node++) {
     // enumerate node entries -- todo: it there a more efficient way to do this? (but ensure there is no allocation)
     _mi_snprintf(buf, 127, "/sys/devices/system/node/node%u", node + 1);
-    if (mi_prim_access(buf,R_OK) != 0) break;
+    if (mi_prim_access(buf,R_OK) != 0) {
+      skipped++;
+      if (skipped > 4) break; // allow some sparseness of nodes but not more than 4
+    }
+    else { skipped = 0; }     // reset skipped count
   }
   return (node+1);
 }
@@ -656,7 +711,7 @@ size_t _mi_prim_numa_node_count(void) {
 #elif defined(__DragonFly__)
 
 size_t _mi_prim_numa_node(void) {
-  // TODO: DragonFly does not seem to provide any userland means to get this information.
+  // todo: DragonFly does not seem to provide any userland means to get this information.
   return 0ul;
 }
 
@@ -686,34 +741,38 @@ size_t _mi_prim_numa_node_count(void) {
 
 #include <time.h>
 
-#if defined(CLOCK_REALTIME) || defined(CLOCK_MONOTONIC)
-
-mi_msecs_t _mi_prim_clock_now(void) {
-  struct timespec t;
-  #ifdef CLOCK_MONOTONIC
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  #else
-  clock_gettime(CLOCK_REALTIME, &t);
-  #endif
-  return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000);
-}
-
-#else
-
 // low resolution timer
-mi_msecs_t _mi_prim_clock_now(void) {
-  #if !defined(CLOCKS_PER_SEC) || (CLOCKS_PER_SEC == 1000) || (CLOCKS_PER_SEC == 0)
-  return (mi_msecs_t)clock();
-  #elif (CLOCKS_PER_SEC < 1000)
-  return (mi_msecs_t)clock() * (1000 / (mi_msecs_t)CLOCKS_PER_SEC);
+static mi_msecs_t mi_prim_clock_now_lowres(void) {
+  const int64_t ticks = (int64_t)clock();
+  #if !defined(CLOCKS_PER_SEC)
+    return ticks;
   #else
-  return (mi_msecs_t)clock() / ((mi_msecs_t)CLOCKS_PER_SEC / 1000);
+    if (CLOCKS_PER_SEC <= 0 || CLOCKS_PER_SEC == 1000) {
+      return ticks;
+    }
+    else if (CLOCKS_PER_SEC > 0 && CLOCKS_PER_SEC < 1000) {
+      return ticks * (1000 / (mi_msecs_t)CLOCKS_PER_SEC);
+    }
+    else {
+      return ticks / ((mi_msecs_t)CLOCKS_PER_SEC / 1000);
+    }
   #endif
 }
 
-#endif
-
-
+mi_msecs_t _mi_prim_clock_now(void) {
+  #if defined(CLOCK_REALTIME) || defined(CLOCK_MONOTONIC)
+    #ifdef CLOCK_MONOTONIC
+    const clockid_t clockid = CLOCK_MONOTONIC;
+    #else
+    const clockid_t clockid = CLOCK_REALTIME;
+    #endif
+    struct timespec t;
+    if (clock_gettime(clockid,&t) == 0) {
+      return ((mi_msecs_t)t.tv_sec * 1000) + ((mi_msecs_t)t.tv_nsec / 1000000L);
+    }
+  #endif
+  return mi_prim_clock_now_lowres();
+}
 
 
 //----------------------------------------------------------------
@@ -738,43 +797,48 @@ static mi_msecs_t timeval_secs(const struct timeval* tv) {
 }
 
 void _mi_prim_process_info(mi_process_info_t* pinfo)
-{
+{  
   struct rusage rusage;
-  getrusage(RUSAGE_SELF, &rusage);
-  pinfo->utime = timeval_secs(&rusage.ru_utime);
-  pinfo->stime = timeval_secs(&rusage.ru_stime);
-#if !defined(__HAIKU__)
-  pinfo->page_faults = rusage.ru_majflt;
-#endif
-#if defined(__HAIKU__)
-  // Haiku does not have (yet?) a way to
-  // get these stats per process
-  thread_info tid;
-  area_info mem;
-  ssize_t c;
-  get_thread_info(find_thread(0), &tid);
-  while (get_next_area_info(tid.team, &c, &mem) == B_OK) {
-    pinfo->peak_rss += mem.ram_size;
+  if (getrusage(RUSAGE_SELF, &rusage) == 0) {
+    pinfo->utime = timeval_secs(&rusage.ru_utime);
+    pinfo->stime = timeval_secs(&rusage.ru_stime);
+    #if !defined(__HAIKU__)
+      pinfo->page_faults = rusage.ru_majflt;
+    #endif
+    #if defined(__APPLE__)
+      pinfo->peak_rss = rusage.ru_maxrss;         // macos reports in bytes
+    #else
+      pinfo->peak_rss = rusage.ru_maxrss * 1024;  // Linux/BSD report in KiB
+    #endif
   }
-  pinfo->page_faults = 0;
-#elif defined(__APPLE__)
-  pinfo->peak_rss = rusage.ru_maxrss;         // macos reports in bytes
-  #ifdef MACH_TASK_BASIC_INFO
-  struct mach_task_basic_info info;
-  mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
-  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
-    pinfo->current_rss = (size_t)info.resident_size;
-  }
-  #else
-  struct task_basic_info info;
-  mach_msg_type_number_t infoCount = TASK_BASIC_INFO_COUNT;
-  if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
-    pinfo->current_rss = (size_t)info.resident_size;
-  }
+  
+  #if defined(__HAIKU__)
+    // Haiku does not have (yet?) a way to
+    // get these stats per process
+    thread_info tid;
+    if (get_thread_info(find_thread(0), &tid) == B_OK) {
+      area_info mem;
+      ssize_t c;    
+      while (get_next_area_info(tid.team, &c, &mem) == B_OK) {
+        pinfo->peak_rss += mem.ram_size;
+      }
+    }
+    pinfo->page_faults = 0;
+  #elif defined(__APPLE__)  
+    #ifdef MACH_TASK_BASIC_INFO
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
+      pinfo->current_rss = (size_t)info.resident_size;
+    }
+    #else
+    struct task_basic_info info;
+    mach_msg_type_number_t infoCount = TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS) {
+      pinfo->current_rss = (size_t)info.resident_size;
+    }
+    #endif
   #endif
-#else
-  pinfo->peak_rss = rusage.ru_maxrss * 1024;  // Linux/BSD report in KiB
-#endif
   // use defaults for commit
 }
 
@@ -821,28 +885,28 @@ static char** mi_get_environ(void) {
   return environ;
 }
 #endif
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
-  if (name==NULL) return false;
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+  if (name==NULL) return -1;
   const size_t len = _mi_strlen(name);
-  if (len == 0) return false;
+  if (len == 0) return -1;
   char** env = mi_get_environ();
-  if (env == NULL) return false;
+  if (env == NULL) return -1;
   // compare up to 10000 entries
   for (int i = 0; i < 10000 && env[i] != NULL; i++) {
     const char* s = env[i];
     if (_mi_strnicmp(name, s, len) == 0 && s[len] == '=') { // case insensitive
       // found it
-      _mi_strlcpy(result, s + len + 1, result_size);
-      return true;
+      if (!_mi_strlcpy(result, s + len + 1, result_size)) return -1; 
+      return 1;   // success
     }
   }
-  return false;
+  return 0; // not found
 }
 #else
 // fallback: use standard C `getenv` but this cannot be used while initializing the C runtime
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   // cannot call getenv() when still initializing the C runtime.
-  if (_mi_preloading()) return false;
+  if (_mi_preloading()) return -1;  // error, try again later
   const char* s = getenv(name);
   if (s == NULL) {
     // we check the upper case name too.
@@ -854,9 +918,9 @@ bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
     buf[len] = 0;
     s = getenv(buf);
   }
-  if (s == NULL || _mi_strnlen(s,result_size) >= result_size)  return false;
-  _mi_strlcpy(result, s, result_size);
-  return true;
+  if (s == NULL || _mi_strnlen(s,result_size) >= result_size) return 0; // not found
+  if (!_mi_strlcpy(result, s, result_size)) return -1;
+  return 1;  // success  
 }
 #endif  // !MI_USE_ENVIRON
 
@@ -917,7 +981,10 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
   size_t count = 0;
   while(count < buf_len) {
     ssize_t ret = mi_prim_read(fd, (char*)buf + count, buf_len - count);
-    if (ret<=0) {
+    if (ret==0) {
+      break;
+    }
+    else if (ret<0) {
       if (errno!=EAGAIN && errno!=EINTR) break;
     }
     else {
@@ -945,7 +1012,7 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 
 // use pthread local storage keys to detect thread ending
 // (and used with MI_TLS_PTHREADS for the default theap)
-pthread_key_t _mi_heap_default_key = (pthread_key_t)(-1);
+pthread_key_t _mi_heap_default_key = MI_PTHREAD_KEY_INVALID;
 
 static void mi_pthread_done(void* value) {
   if (value!=NULL) {
@@ -954,21 +1021,24 @@ static void mi_pthread_done(void* value) {
 }
 
 void _mi_prim_thread_init_auto_done(void) {
-  mi_assert_internal(_mi_heap_default_key == (pthread_key_t)(-1));
+  mi_assert_internal(_mi_heap_default_key == MI_PTHREAD_KEY_INVALID);
   pthread_key_create(&_mi_heap_default_key, &mi_pthread_done);
 }
 
 void _mi_prim_thread_done_auto_done(void) {
-  if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // do not leak the key, see issue #809
-    pthread_key_delete(_mi_heap_default_key);
+  pthread_key_t key = _mi_heap_default_key;
+  if (key != MI_PTHREAD_KEY_INVALID) {  // do not leak the key, see issue #809
+    _mi_heap_default_key = MI_PTHREAD_KEY_INVALID;
+    pthread_key_delete(key);
   }
 }
 
 void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
-  if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // can happen during recursive invocation on freeBSD
+  if (_mi_heap_default_key != MI_PTHREAD_KEY_INVALID) {  // can happen during recursive invocation on freeBSD
     pthread_setspecific(_mi_heap_default_key, theap);
   }
 }
+
 
 #else
 

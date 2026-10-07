@@ -14,8 +14,8 @@ terms of the MIT license. A copy of the license can be found in the file
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#elif !defined(__wasi__) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__))
-#define  MI_USE_PTHREADS
+#elif MI_TLS_MODEL_PTHREADS || (!defined(__wasi__) && (!defined(__EMSCRIPTEN__) || defined(__EMSCRIPTEN_PTHREADS__)))
+#define  MI_USE_PTHREADS        1
 #include <pthread.h>
 #endif
 
@@ -215,16 +215,12 @@ static inline uintptr_t mi_atomic_exchange_explicit(_Atomic(uintptr_t)*p, uintpt
   (void)(mo);
   return (uintptr_t)MI_MSC_64(_InterlockedExchange)((volatile msc_intptr_t*)p, (msc_intptr_t)exchange);
 }
-static inline void mi_atomic_thread_fence(mi_memory_order mo) {
-  (void)(mo);
-  _Atomic(uintptr_t) x = 0;
-  mi_atomic_exchange_explicit(&x, 1, mo);
-}
 
 static inline uintptr_t mi_atomic_load_explicit(_Atomic(uintptr_t) const* p, mi_memory_order mo) {
   (void)(mo);
   // assert(mo<=mi_memory_order_acquire); // others are not used by mimalloc
   #if defined(_M_IX86) || defined(_M_X64)
+    // on x86/x64 we have a strong memory model so any load is acquire
     return (uintptr_t)MI_MSC_XX(__iso_volatile_load)((volatile const intptr_t*)p);
   #elif defined(_M_ARM) || defined(_M_ARM64)
     if (mo == mi_memory_order_relaxed) {
@@ -335,18 +331,18 @@ static inline void mi_atomic_void_addi64_relaxed(volatile int64_t* p, const vola
   }
 }
 
-static inline void mi_atomic_maxi64_relaxed(volatile _Atomic(int64_t)*p, int64_t x) {
+static inline void mi_atomic_maxi64_relaxed(volatile _Atomic(int64_t)* p, int64_t x) {
   int64_t current;
   do {
     current = *p;
   } while (current < x && _InterlockedCompareExchange64(p, x, current) != current);
 }
 
-static inline void mi_atomic_addi64_acq_rel(volatile _Atomic(int64_t*)p, int64_t i) {
+static inline void mi_atomic_addi64_acq_rel(volatile _Atomic(int64_t)* p, int64_t i) {
   mi_atomic_addi64_relaxed(p, i);
 }
 
-static inline bool mi_atomic_casi64_strong_acq_rel(volatile _Atomic(int64_t*)p, int64_t* exp, int64_t des) {
+static inline bool mi_atomic_casi64_strong_acq_rel(volatile _Atomic(int64_t)* p, int64_t* exp, int64_t des) {
   const int64_t read = _InterlockedCompareExchange64(p, des, *exp);
   if (read == *exp) {
     return true;
@@ -496,10 +492,10 @@ static inline void mi_lock_release(mi_lock_t* lock) {
   lock->mutex.unlock();
 }
 static inline void mi_lock_init(mi_lock_t* lock) {
-  new(&lock->mutex) std::mutex();
+  new(&lock->mutex) std::mutex();  // in-place constructor
 }
 static inline void mi_lock_done(mi_lock_t* lock) {
-  (void)(lock);
+  lock->mutex.~mutex(); // in-place destructor
 }
 
 #else
@@ -524,6 +520,7 @@ static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
   return mi_atomic_cas_strong_acq_rel(&lock->mutex, &expected, (uintptr_t)1);
 }
 static inline void mi_lock_acquire(mi_lock_t* lock) {
+  size_t ticks = 0;
   for (int i = 0; i < 10000; i++) {  // for at most 10000 tries?
     if (mi_lock_try_acquire(lock)) return;
     _mi_prim_thread_yield();

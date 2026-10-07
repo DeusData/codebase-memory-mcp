@@ -48,7 +48,7 @@ terms of the MIT license. A copy of the license can be found in the file
   void operator delete[](void* p, std::size_t n) noexcept { mi_free_size(p,n); };
   #endif
 
-  #if (__cplusplus > 201402L || defined(__cpp_aligned_new))
+  #if (__cplusplus > 201402L && defined(__cpp_aligned_new))
   void operator delete  (void* p, std::align_val_t al) noexcept { mi_free_aligned(p, static_cast<size_t>(al)); }
   void operator delete[](void* p, std::align_val_t al) noexcept { mi_free_aligned(p, static_cast<size_t>(al)); }
   void operator delete  (void* p, std::size_t n, std::align_val_t al) noexcept { mi_free_size_aligned(p, n, static_cast<size_t>(al)); };

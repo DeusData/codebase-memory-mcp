@@ -16,6 +16,7 @@ terms of the MIT license. A copy of the license can be found in the file
 #include <stddef.h>   // size_t
 #include <stdint.h>   // int64_t etc
 #include <stdbool.h>  // bool
+#include <limits.h>   // LONG_MAX
 
 // ------------------------------------------------------
 // Size of a pointer.
@@ -102,13 +103,13 @@ typedef int32_t  mi_ssize_t;
 #include <intrin.h>
 #endif
 
-#if MI_ARCH_X64 && defined(__AVX2__) && !defined(__BMI2__) // msvc
+#if MI_ARCH_X64 && defined(__AVX2__) && !defined(__BMI2__) // avx2 implies bmi2
 #define __BMI2__  1
 #endif
-#if MI_ARCH_X64 && (defined(__AVX2__) || defined(__BMI2__)) && !defined(__BMI1__) // msvc
+#if MI_ARCH_X64 && (defined(__AVX2__) || defined(__BMI2__) || defined(__BMI__)) && !defined(__BMI1__) // bmi2 implies bmi1
 #define __BMI1__  1
 #endif
-#if MI_ARCH_X64 && defined(__AVX2__) && !defined(__LZCNT__) // msvc
+#if MI_ARCH_X64 && defined(__AVX2__) && !defined(__LZCNT__) // avx2 implies lzcnt
 #define __LZCNT__  1
 #endif
 
@@ -124,6 +125,15 @@ typedef int32_t  mi_ssize_t;
 #define MI_MAX_VABITS     (48)
 #else
 #define MI_MAX_VABITS     (32)
+#endif
+
+// the MI_MIN_VABITS determine how many bits of the address are always mapped in the page_map
+#if MI_MAX_VABITS <= 32
+#define MI_MIN_VABITS     (32)
+#elif MI_MAX_VABITS <= 43
+#define MI_MIN_VABITS     MI_MAX_VABITS
+#else
+#define MI_MIN_VABITS     (43)    /* 8 TiB */
 #endif
 
 // use a flat page-map or a 2-level one
@@ -177,12 +187,16 @@ typedef int32_t  mi_ssize_t;
 -------------------------------------------------------------------------------- */
 
 size_t _mi_popcount_generic(size_t x);
+extern bool _mi_cpu_has_popcnt;
 
 static inline size_t mi_popcount(size_t x) {
   #if mi_has_builtinz(popcount)
     return mi_builtinz(popcount)(x);
-  #elif defined(_MSC_VER) && (MI_ARCH_X64 || MI_ARCH_X86 || MI_ARCH_ARM64 || MI_ARCH_ARM32)
-    return mi_msc_builtinz(__popcnt)(x);
+  #elif defined(_MSC_VER) && (MI_ARCH_ARM64 || MI_ARCH_ARM32)
+    return mi_msc_builtinz(_CountOneBits)(x);
+  #elif defined(_MSC_VER) && (MI_ARCH_X64 || MI_ARCH_X86)
+    if (_mi_cpu_has_popcnt) { return mi_msc_builtinz(__popcnt)(x); }
+                       else { return _mi_popcount_generic(x); }      // see issue #1291
   #elif MI_ARCH_X64 && defined(__BMI1__)
     return (size_t)_mm_popcnt_u64(x);
   #else
