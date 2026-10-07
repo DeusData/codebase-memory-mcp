@@ -363,17 +363,29 @@ static void copy_path_without_query(const char *path, char *out, size_t outsz) {
 }
 
 void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,
-                         int64_t duration_us) {
+                         int64_t duration_us, int64_t handler_duration_us,
+                         int64_t response_serialization_us, bool cancelled, bool timed_out) {
     char duration_ms[CBM_SZ_32];
+    char handler_duration_ms[CBM_SZ_32];
+    char response_serialization_ms[CBM_SZ_32];
     snprintf(duration_ms, sizeof(duration_ms), "%" PRId64, duration_us / 1000);
+    snprintf(handler_duration_ms, sizeof(handler_duration_ms), "%" PRId64,
+             handler_duration_us / 1000);
+    snprintf(response_serialization_ms, sizeof(response_serialization_ms), "%" PRId64,
+             response_serialization_us / 1000);
+    const char *status = timed_out ? "timeout" : (is_error ? "error" : "ok");
     if (tool_name && tool_name[0] != '\0') {
         cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "tool", tool_name, "status",
-                is_error ? "error" : "ok", "duration_ms", duration_ms, NULL);
+                "method", method ? method : "", "tool", tool_name, "status", status,
+                "duration_ms", duration_ms, "handler_duration_ms", handler_duration_ms,
+                "response_serialization_ms", response_serialization_ms, "cancelled",
+                cancelled ? "true" : "false", "timed_out", timed_out ? "true" : "false", NULL);
     } else {
         cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
-                "method", method ? method : "", "status", is_error ? "error" : "ok", "duration_ms",
-                duration_ms, NULL);
+                "method", method ? method : "", "status", status, "duration_ms", duration_ms,
+                "handler_duration_ms", handler_duration_ms, "response_serialization_ms",
+                response_serialization_ms, "cancelled", cancelled ? "true" : "false", "timed_out",
+                timed_out ? "true" : "false", NULL);
     }
 }
 
