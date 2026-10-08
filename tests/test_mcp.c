@@ -6666,6 +6666,118 @@ TEST(tool_trace_union_records_min_hop_across_seeds) {
     PASS();
 }
 
+TEST(tool_trace_path_expands_overrides_as_possible_callees) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "dispatch-fixture";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/dispatch-fixture"), CBM_STORE_OK);
+
+    cbm_node_t caller = {.project = project,
+                         .label = "Function",
+                         .name = "run_local",
+                         .qualified_name = "dispatch_fixture.run_local",
+                         .file_path = "src/fixture.py",
+                         .start_line = 1,
+                         .end_line = 2};
+    cbm_node_t contract = {.project = project,
+                           .label = "Method",
+                           .name = "process",
+                           .qualified_name = "dispatch_fixture.LocalProcessor.process",
+                           .file_path = "src/fixture.py",
+                           .start_line = 4,
+                           .end_line = 5};
+    cbm_node_t alpha = {.project = project,
+                        .label = "Method",
+                        .name = "process",
+                        .qualified_name = "dispatch_fixture.LocalAlphaProcessor.process",
+                        .file_path = "src/fixture.py",
+                        .start_line = 7,
+                        .end_line = 8};
+    cbm_node_t beta = {.project = project,
+                       .label = "Method",
+                       .name = "process",
+                       .qualified_name = "dispatch_fixture.LocalBetaProcessor.process",
+                       .file_path = "src/fixture.py",
+                       .start_line = 10,
+                       .end_line = 11};
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    int64_t contract_id = cbm_store_upsert_node(store, &contract);
+    int64_t alpha_id = cbm_store_upsert_node(store, &alpha);
+    int64_t beta_id = cbm_store_upsert_node(store, &beta);
+    ASSERT_GT(caller_id, 0);
+    ASSERT_GT(contract_id, 0);
+    ASSERT_GT(alpha_id, 0);
+    ASSERT_GT(beta_id, 0);
+    cbm_edge_t calls = {
+        .project = project, .source_id = caller_id, .target_id = contract_id, .type = "CALLS"};
+    cbm_edge_t overrides[] = {
+        {.project = project, .source_id = alpha_id, .target_id = contract_id, .type = "OVERRIDE"},
+        {.project = project, .source_id = beta_id, .target_id = contract_id, .type = "OVERRIDE"},
+    };
+    ASSERT_GT(cbm_store_insert_edge(store, &calls), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &overrides[0]), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &overrides[1]), 0);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"dispatch-fixture\",\"function_name\":\"run_local\","
+        "\"direction\":\"outbound\",\"depth\":1,\"include_overrides\":true,"
+        "\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *callees = yyjson_obj_get(root, "callees");
+    yyjson_val *possible = yyjson_obj_get(root, "possible_callees");
+    bool valid = callees && trace_grouped_row_named(callees, "process", NULL) &&
+                 !trace_grouped_row_named(callees, "LocalAlphaProcessor.process", NULL) &&
+                 !trace_grouped_row_named(callees, "LocalBetaProcessor.process", NULL) &&
+                 possible && yyjson_is_arr(possible) && yyjson_arr_size(possible) == 1 &&
+                 strstr(inner, "dispatch_fixture.LocalAlphaProcessor.process") &&
+                 strstr(inner, "dispatch_fixture.LocalBetaProcessor.process") &&
+                 cbm_store_count_edges_by_type(store, project, "CALLS") == 1 &&
+                 cbm_store_count_edges_by_type(store, project, "OVERRIDE") == 2;
+    if (valid) {
+        yyjson_val *entry = yyjson_arr_get(possible, 0);
+        yyjson_val *implementations = yyjson_obj_get(entry, "implementations");
+        valid = yyjson_get_str(yyjson_obj_get(entry, "contract")) &&
+                strcmp(yyjson_get_str(yyjson_obj_get(entry, "contract")),
+                       "dispatch_fixture.LocalProcessor.process") == 0 &&
+                implementations && yyjson_is_arr(implementations) &&
+                yyjson_arr_size(implementations) == 2;
+    }
+
+    char *default_response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"dispatch-fixture\",\"function_name\":\"run_local\","
+        "\"direction\":\"outbound\",\"depth\":1,\"format\":\"json\"}");
+    char *default_inner = extract_text_content(default_response);
+    valid = valid && default_inner && !strstr(default_inner, "possible_callees");
+    free(default_inner);
+    free(default_response);
+
+    char *tree_response = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"project\":\"dispatch-fixture\",\"function_name\":\"run_local\","
+        "\"direction\":\"outbound\",\"depth\":1,\"include_overrides\":true}");
+    char *tree_inner = extract_text_content(tree_response);
+    valid = valid && tree_inner && strstr(tree_inner, "possible_callees: [") &&
+            strstr(tree_inner, "dispatch_fixture.LocalAlphaProcessor.process") &&
+            strstr(tree_inner, "dispatch_fixture.LocalBetaProcessor.process");
+    free(tree_inner);
+    free(tree_response);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(valid);
+    PASS();
+}
+
 /* Exactly-once trace pagination: 12 callees paged at limit=5 must yield
  * 5+5+2 rows with every callee appearing on exactly one page, exact totals
  * on every page, and a final page without a cursor. Stale and mismatched
@@ -23640,6 +23752,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
+    RUN_TEST(tool_trace_path_expands_overrides_as_possible_callees);
     RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args);
     RUN_TEST(tool_trace_budget_never_slices_identifiers);

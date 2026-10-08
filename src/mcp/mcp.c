@@ -605,7 +605,8 @@ static const tool_def_t TOOLS[] = {
 
     {"trace_path",
      "Trace callers/callees, data flow, or cross-service paths. Defaults exclude tests and "
-     "resolver evidence. Rows keep qn/hop with explicit totals, relations, and continuations.",
+     "resolver evidence. include_overrides adds possible implementations separately from declared "
+     "CALLS targets.",
      "{\"type\":\"object\",\"properties\":{\"function_name\":{\"type\":\"string\"},\"project\":{"
      "\"type\":\"string\"},\"direction\":{\"type\":\"string\",\"enum\":[\"inbound\",\"outbound\","
      "\"both\"],\"default\":\"both\"},\"depth\":{\"type\":\"integer\",\"default\":3,"
@@ -620,6 +621,9 @@ static const tool_def_t TOOLS[] = {
      "\"mode\":{"
      "\"type\":\"string\",\"enum\":[\"calls\",\"data_flow\",\"cross_service\"],\"default\":"
      "\"calls\",\"description\":\"calls, argument-aware data_flow, or service edges.\"},"
+     "\"include_overrides\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"For outbound calls, list OVERRIDE implementations separately as possible "
+     "callees. Declared CALLS edges remain unchanged.\"},"
      "\"parameter_name\":{\"type\":\"string\",\"description\":\"data_flow parameter filter.\"},"
      "\"edge_types\":{\"type\":\"array\",\"items\":{"
      "\"type\":\"string\"}},\"risk_labels\":{\"type\":\"boolean\",\"default\":false,"
@@ -8726,6 +8730,103 @@ static int bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int 
     return CBM_STORE_OK;
 }
 
+static void free_node_contents(cbm_node_t *n);
+
+static int trace_override_edge_cmp(const void *pa, const void *pb) {
+    const cbm_edge_t *a = pa;
+    const cbm_edge_t *b = pb;
+    if (a->target_id < b->target_id) {
+        return -1;
+    }
+    if (a->target_id > b->target_id) {
+        return 1;
+    }
+    if (a->source_id < b->source_id) {
+        return -1;
+    }
+    if (a->source_id > b->source_id) {
+        return 1;
+    }
+    return 0;
+}
+
+static char *trace_possible_callees_json(cbm_store_t *store, const char *project,
+                                         const cbm_traverse_result_t *tr, bool include_tests,
+                                         int *status) {
+    *status = CBM_STORE_OK;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        *status = CBM_STORE_ERR;
+        return NULL;
+    }
+    yyjson_mut_val *possible = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, possible);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (tr->visited_count > 0) {
+        int rc = cbm_store_find_edges_by_type(store, project, "OVERRIDE", &edges, &edge_count);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_edges(edges, edge_count);
+            *status = rc;
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
+        if (edge_count > 1) {
+            qsort(edges, (size_t)edge_count, sizeof(*edges), trace_override_edge_cmp);
+        }
+    }
+
+    for (int i = 0; i < tr->visited_count; i++) {
+        const cbm_node_t *contract = &tr->visited[i].node;
+        int low = 0;
+        int high = edge_count;
+        while (low < high) {
+            int middle = low + (high - low) / 2;
+            if (edges[middle].target_id < contract->id) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+
+        yyjson_mut_val *implementations = yyjson_mut_arr(doc);
+        for (int j = low; j < edge_count && edges[j].target_id == contract->id; j++) {
+            cbm_node_t implementation = {0};
+            int rc = cbm_store_find_node_by_id(store, edges[j].source_id, &implementation);
+            if (rc != CBM_STORE_OK) {
+                free_node_contents(&implementation);
+                cbm_store_free_edges(edges, edge_count);
+                *status = rc;
+                yyjson_mut_doc_free(doc);
+                return NULL;
+            }
+            if (include_tests || !is_test_file(implementation.file_path)) {
+                yyjson_mut_arr_add_strcpy(
+                    doc, implementations,
+                    implementation.qualified_name ? implementation.qualified_name
+                                                  : implementation.name);
+            }
+            free_node_contents(&implementation);
+        }
+        if (yyjson_mut_arr_size(implementations) > 0) {
+            yyjson_mut_val *entry = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(
+                doc, entry, "contract",
+                contract->qualified_name ? contract->qualified_name : contract->name);
+            yyjson_mut_obj_add_val(doc, entry, "implementations", implementations);
+            yyjson_mut_arr_add_val(possible, entry);
+        }
+    }
+
+    cbm_store_free_edges(edges, edge_count);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!json) {
+        *status = CBM_STORE_ERR;
+    }
+    return json;
+}
+
 /* ── Pagination cursors (stateless, exactly-once) ────────────────────
  * Token: "c1.<leg>.<generation>.<qhash>.<hop>.<id>" — version, trace leg
  * (o=callees, i=callers), the store generation (per-DB uid + mutation
@@ -8758,7 +8859,7 @@ typedef struct {
 static uint64_t trace_params_hash(const char *project, const char *func_name, const char *direction,
                                   const char *mode, const char *param_name, int depth,
                                   bool include_tests, bool risk_labels, bool include_evidence,
-                                  int limit, const char *args) {
+                                  bool include_overrides, int limit, const char *args) {
     uint64_t h = 0xcbf29ce484222325ULL;
     h = cursor_fnv1a64(project ? project : "", h);
     h = cursor_fnv1a64("|", h);
@@ -8774,8 +8875,8 @@ static uint64_t trace_params_hash(const char *project, const char *func_name, co
      * watermark; it does not change graph identity. Excluding it lets a caller
      * follow a hard-floor instruction and raise max_output_tokens without
      * invalidating the cursor that reached that page. */
-    snprintf(nums, sizeof(nums), "|%d|%d|%d|%d|%d", depth, include_tests ? 1 : 0,
-             risk_labels ? 1 : 0, include_evidence ? 1 : 0, limit);
+    snprintf(nums, sizeof(nums), "|%d|%d|%d|%d|%d|%d", depth, include_tests ? 1 : 0,
+             risk_labels ? 1 : 0, include_evidence ? 1 : 0, include_overrides ? 1 : 0, limit);
     h = cursor_fnv1a64(nums, h);
 
     /* Explicit edge types define the traversed graph. Omitting them from the
@@ -9200,6 +9301,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         (size_t)max_output_tokens * (size_t)MCP_OUTPUT_BYTES_PER_TOKEN_ESTIMATE;
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
+    bool include_overrides = cbm_mcp_get_bool_arg(args, "include_overrides");
     /* Off by default: two extra columns on every row is exactly the kind of
      * inflation the tree format exists to avoid. Opt in when you need to judge
      * whether an edge is trustworthy. */
@@ -9263,7 +9365,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (cursor_arg && cursor_arg[0]) {
         uint64_t qh = trace_params_hash(project, func_name, direction ? direction : "both", mode,
                                         param_name, depth, include_tests, risk_labels,
-                                        include_evidence, trace_limit, args);
+                                        include_evidence, include_overrides, trace_limit, args);
         const char *cerr = trace_cursor_decode(cursor_arg, generation, qh, &cur);
         if (cerr) {
             free(cursor_arg);
@@ -9391,6 +9493,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     const char *edge_types[MCP_COL_16];
     int edge_type_count = 0;
     yyjson_doc *et_doc_keep = resolve_trace_edge_types(args, mode, edge_types, &edge_type_count);
+    bool calls_edge_selected = false;
+    for (int i = 0; i < edge_type_count; i++) {
+        if (strcmp(edge_types[i], "CALLS") == 0) {
+            calls_edge_selected = true;
+            break;
+        }
+    }
 
     /* Run BFS for each requested direction.
      * IMPORTANT: emitters borrow node-string pointers — traversal results
@@ -9440,6 +9549,29 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (!include_tests) {
         trace_filter_test_rows(&tr_out);
         trace_filter_test_rows(&tr_in);
+    }
+
+    char *possible_callees = NULL;
+    if (include_overrides && do_outbound && calls_edge_selected) {
+        int override_rc = CBM_STORE_OK;
+        possible_callees =
+            trace_possible_callees_json(store, project, &tr_out, include_tests, &override_rc);
+        if (!possible_callees || override_rc != CBM_STORE_OK) {
+            cbm_store_traverse_free(&tr_out);
+            cbm_store_traverse_free(&tr_in);
+            cbm_store_free_nodes(nodes, node_count);
+            free(func_name);
+            free(project);
+            free(direction);
+            free(mode);
+            free(param_name);
+            free(possible_callees);
+            if (et_doc_keep) {
+                yyjson_doc_free(et_doc_keep);
+            }
+            return cbm_mcp_text_result(
+                "override expansion failed; inspect index_status and retry", true);
+        }
     }
 
     /* Page windows in canonical (hop,id) order. Legs drain in a fixed order
@@ -9525,7 +9657,7 @@ render_trace_output:;
         snprintf(nc.generation, sizeof(nc.generation), "%s", generation);
         nc.qhash =
             trace_params_hash(project, func_name, direction, mode, param_name, depth, include_tests,
-                              risk_labels, include_evidence, trace_limit, args);
+                              risk_labels, include_evidence, include_overrides, trace_limit, args);
         /* The watermark is the last row ACTUALLY emitted, not the leg that
          * happens to have additional rows. At an exact outbound page boundary
          * inbound may be pending with zero emitted rows. */
@@ -9657,6 +9789,11 @@ render_trace_output:;
                                     "depth/edge_types or disable data_flow/include_evidence.");
             }
         }
+        if (possible_callees) {
+            cbm_sb_append(&sb, "possible_callees: ");
+            cbm_sb_append(&sb, possible_callees);
+            cbm_sb_append(&sb, "\n");
+        }
         json = cbm_sb_finish(&sb);
     } else {
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -9687,6 +9824,21 @@ render_trace_output:;
                 bfs_to_tree_json(doc, &view_in, risk_labels && emit_optional_fields, include_tests,
                                  data_flow && emit_optional_fields,
                                  include_evidence && emit_optional_fields, &in_edge_ctx));
+        }
+        if (possible_callees) {
+            yyjson_doc *possible_doc = yyjson_read(possible_callees, strlen(possible_callees), 0);
+            yyjson_mut_val *possible_copy =
+                possible_doc ? yyjson_val_mut_copy(doc, yyjson_doc_get_root(possible_doc))
+                             : NULL;
+            if (possible_copy) {
+                yyjson_mut_obj_add_val(doc, root, "possible_callees", possible_copy);
+            } else {
+                yyjson_mut_obj_add_str(doc, root, "possible_callees_error",
+                                       "could not encode results; retry trace_path");
+            }
+            if (possible_doc) {
+                yyjson_doc_free(possible_doc);
+            }
         }
         if (trace_truncated) {
             yyjson_mut_obj_add_bool(doc, root, "truncated", true);
@@ -9760,6 +9912,9 @@ render_trace_output:;
                     trace_emit_omitted_optional_fields_tree(&floor, risk_labels, data_flow,
                                                             include_evidence);
                 }
+                if (possible_callees) {
+                    cbm_tree_scalar_bool(&floor, "possible_callees_omitted", true);
+                }
                 cbm_tree_scalar_str(&floor, "hint",
                                     "raise max_output_tokens; no identifier was sliced");
                 json = cbm_sb_finish(&floor);
@@ -9790,6 +9945,9 @@ render_trace_output:;
                     yyjson_mut_obj_add_bool(floor_doc, floor, "optional_fields_omitted", true);
                     trace_emit_omitted_optional_fields_json(floor_doc, floor, risk_labels,
                                                             data_flow, include_evidence);
+                }
+                if (possible_callees) {
+                    yyjson_mut_obj_add_bool(floor_doc, floor, "possible_callees_omitted", true);
                 }
                 yyjson_mut_obj_add_str(floor_doc, floor, "hint",
                                        "raise max_output_tokens; no identifier was sliced");
@@ -9842,6 +10000,7 @@ trace_output_ready:
     free(direction);
     free(mode);
     free(param_name);
+    free(possible_callees);
     if (et_doc_keep) {
         yyjson_doc_free(et_doc_keep);
     }
