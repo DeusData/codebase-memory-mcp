@@ -9594,6 +9594,15 @@ static void install_omp_durable_context(const cbm_agent_registry_context_t *regi
         dry_run);
 }
 
+static void install_zcode_durable_context(const char *home, bool force, bool dry_run) {
+    char instructions_path[CLI_BUF_1K];
+    char skills_dir[CLI_BUF_1K];
+    snprintf(instructions_path, sizeof(instructions_path), "%s/.zcode/AGENTS.md", home);
+    snprintf(skills_dir, sizeof(skills_dir), "%s/.zcode/skills", home);
+    install_managed_agent_instructions("ZCode", instructions_path, dry_run);
+    install_agent_skill("ZCode", skills_dir, force, dry_run);
+}
+
 static void install_agent_client_registry(const char *home, const char *binary_path,
                                           bool inherit_claude_session, bool force, bool dry_run) {
     cbm_agent_registry_context_t registry;
@@ -9667,6 +9676,8 @@ static void install_agent_client_registry(const char *home, const char *binary_p
             install_pi_durable_context(home, binary_path, force, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_OMP) {
             install_omp_durable_context(&registry, force, dry_run);
+        } else if (profile->id == CBM_AGENT_CLIENT_ZCODE) {
+            install_zcode_durable_context(home, force, dry_run);
         }
     }
 }
@@ -12095,6 +12106,15 @@ static void uninstall_omp_durable_context(const cbm_agent_registry_context_t *re
         dry_run);
 }
 
+static void uninstall_zcode_durable_context(const char *home, bool dry_run) {
+    char instructions_path[CLI_BUF_1K];
+    char skills_dir[CLI_BUF_1K];
+    snprintf(instructions_path, sizeof(instructions_path), "%s/.zcode/AGENTS.md", home);
+    snprintf(skills_dir, sizeof(skills_dir), "%s/.zcode/skills", home);
+    uninstall_managed_agent_instructions("ZCode", instructions_path, dry_run);
+    uninstall_agent_skill("ZCode", skills_dir, dry_run);
+}
+
 static void uninstall_agent_client_registry(const char *home, bool dry_run) {
     cbm_agent_registry_context_t registry;
     cbm_init_agent_registry_context(home, &registry);
@@ -12156,6 +12176,8 @@ static void uninstall_agent_client_registry(const char *home, bool dry_run) {
             uninstall_pi_durable_context(home, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_OMP) {
             uninstall_omp_durable_context(&registry, dry_run);
+        } else if (profile->id == CBM_AGENT_CLIENT_ZCODE) {
+            uninstall_zcode_durable_context(home, dry_run);
         }
     }
 }
