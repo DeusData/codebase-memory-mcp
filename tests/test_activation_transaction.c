@@ -764,6 +764,95 @@ TEST(activation_transaction_rejects_symlink_candidate_target_and_parent) {
     PASS();
 }
 
+/* #2306: managed Linux hosts keep /home a real directory and point the
+ * per-user entry elsewhere (/home/alice -> /local/home/alice). Root owns that
+ * entry, so it is trusted like the #2175 /home alias; the seam stands a
+ * fixture tree in for /home and the test account in for root. Every status is
+ * captured before the seam is reset so a failure cannot leak into the
+ * following tests. */
+TEST(activation_transaction_follows_trusted_per_user_home_entry) {
+#if defined(__linux__) && defined(CBM_ENABLE_TEST_SEAMS)
+    char root[ACTIVATION_TEST_PATH_CAP];
+    char home[ACTIVATION_TEST_PATH_CAP];
+    char entry[ACTIVATION_TEST_PATH_CAP];
+    char relocated[ACTIVATION_TEST_PATH_CAP];
+    char relocated_bin[ACTIVATION_TEST_PATH_CAP];
+    char relocated_target[ACTIVATION_TEST_PATH_CAP];
+    char target[ACTIVATION_TEST_PATH_CAP];
+    ASSERT_TRUE(activation_test_fixture(root));
+    ASSERT_TRUE(activation_test_path(home, root, "home"));
+    ASSERT_TRUE(activation_test_path(entry, home, "alice"));
+    ASSERT_TRUE(activation_test_path(relocated, root, "local-alice"));
+    ASSERT_TRUE(activation_test_path(relocated_bin, relocated, "bin"));
+    ASSERT_TRUE(activation_test_path(relocated_target, relocated_bin, "cbm"));
+    ASSERT_TRUE(activation_test_path(target, entry, "bin/cbm"));
+    ASSERT_TRUE(cbm_mkdir_p(home, 0755));
+    ASSERT_EQ(chmod(home, 0755), 0);
+    ASSERT_TRUE(cbm_mkdir_p(relocated_bin, 0700));
+    ASSERT_EQ(symlink(relocated, entry), 0);
+    unsigned long self = (unsigned long)geteuid();
+
+    /* Without the seam the entry is an ordinary user symlink: refused. */
+    cbm_activation_transaction_t *transaction = NULL;
+    cbm_activation_transaction_status_t untrusted_status = cbm_activation_transaction_stage_bytes(
+        target, "candidate", strlen("candidate"), &transaction);
+    bool untrusted_created = transaction != NULL;
+    (void)cbm_activation_transaction_close(&transaction);
+
+    /* The home root and the entry must belong to the trusted owner. */
+    cbm_activation_transaction_set_home_root_for_testing(home, self + 1U);
+    cbm_activation_transaction_status_t foreign_owner_status =
+        cbm_activation_transaction_stage_bytes(target, "candidate", strlen("candidate"),
+                                               &transaction);
+    bool foreign_owner_created = transaction != NULL;
+    (void)cbm_activation_transaction_close(&transaction);
+
+    /* A home root others can write could have its entry swapped: refused. */
+    cbm_activation_transaction_set_home_root_for_testing(home, self);
+    (void)chmod(home, 0775);
+    cbm_activation_transaction_status_t writable_home_status =
+        cbm_activation_transaction_stage_bytes(target, "candidate", strlen("candidate"),
+                                               &transaction);
+    bool writable_home_created = transaction != NULL;
+    (void)cbm_activation_transaction_close(&transaction);
+    (void)chmod(home, 0755);
+
+    /* Trusted root, trusted entry: staged and committed into the target. */
+    cbm_activation_transaction_status_t trusted_status = cbm_activation_transaction_stage_bytes(
+        target, "candidate", strlen("candidate"), &transaction);
+    cbm_activation_transaction_status_t commit_status =
+        transaction ? cbm_activation_transaction_commit(transaction, NULL, NULL)
+                    : CBM_ACTIVATION_TRANSACTION_INVALID_STATE;
+    cbm_activation_transaction_status_t finalize_status =
+        transaction ? cbm_activation_transaction_finalize(transaction)
+                    : CBM_ACTIVATION_TRANSACTION_INVALID_STATE;
+    cbm_activation_transaction_status_t close_status =
+        cbm_activation_transaction_close(&transaction);
+    cbm_activation_transaction_set_home_root_for_testing(NULL, 0);
+
+    char contents[ACTIVATION_TEST_CONTENT_CAP] = "";
+    bool published = activation_test_read(relocated_target, contents);
+    int unlink_status = unlink(entry);
+    int cleanup_status = th_rmtree(root);
+
+    ASSERT_EQ(untrusted_status, CBM_ACTIVATION_TRANSACTION_IO);
+    ASSERT_FALSE(untrusted_created);
+    ASSERT_EQ(foreign_owner_status, CBM_ACTIVATION_TRANSACTION_IO);
+    ASSERT_FALSE(foreign_owner_created);
+    ASSERT_EQ(writable_home_status, CBM_ACTIVATION_TRANSACTION_IO);
+    ASSERT_FALSE(writable_home_created);
+    ASSERT_EQ(trusted_status, CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_EQ(commit_status, CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_EQ(finalize_status, CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_EQ(close_status, CBM_ACTIVATION_TRANSACTION_OK);
+    ASSERT_TRUE(published);
+    ASSERT_STR_EQ(contents, "candidate");
+    ASSERT_EQ(unlink_status, 0);
+    ASSERT_EQ(cleanup_status, 0);
+#endif
+    PASS();
+}
+
 TEST(activation_transaction_fails_closed_if_target_directory_is_replaced) {
     char root[ACTIVATION_TEST_PATH_CAP];
     char active[ACTIVATION_TEST_PATH_CAP];
@@ -1089,6 +1178,7 @@ SUITE(activation_transaction) {
     RUN_TEST(activation_transaction_admits_group_writable_ancestor);
     RUN_TEST(activation_transaction_rejects_windows_callback_allow_directory_ace);
     RUN_TEST(activation_transaction_rejects_symlink_candidate_target_and_parent);
+    RUN_TEST(activation_transaction_follows_trusted_per_user_home_entry);
     RUN_TEST(activation_transaction_fails_closed_if_target_directory_is_replaced);
     RUN_TEST(activation_transaction_does_not_replace_target_created_at_publish_boundary);
     RUN_TEST(activation_transaction_rejects_macos_mutating_extended_acl);

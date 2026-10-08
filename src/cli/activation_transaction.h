@@ -100,6 +100,11 @@ const char *cbm_activation_transaction_refusal_note(void);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
                                                          unsigned long os_error);
+/* Linux only: stand home_root in for /home and owner_uid in for root when
+ * deciding whether /home or a /home/<name> entry is a trusted alias. NULL
+ * restores the production values. Inert elsewhere. */
+void cbm_activation_transaction_set_home_root_for_testing(const char *home_root,
+                                                          unsigned long owner_uid);
 #endif
 
 #endif /* CBM_ACTIVATION_TRANSACTION_H */
