@@ -776,6 +776,43 @@ bool cbm_workspace_manifest_is_approved(const char *cache_dir, const char *proje
     return found;
 }
 
+/* Resolve a manifest entry to the directory it names — the form the policy is
+ * defined over. The file holds the entry as a person wrote it, and a spelling
+ * can reach a directory through a link or through `..` segments; the directory
+ * that would be indexed is the resolved one, so that is the one classified, at
+ * approval and again at use. Only an absolute entry is accepted: the manifest
+ * is read by a long-lived process whose working directory is unrelated to the
+ * project, so a relative spelling has no base it could honestly be resolved
+ * against. Returns NULL on success, otherwise the reason the entry is unusable.
+ * out must hold WS_LINE_MAX bytes. */
+static const char *ws_manifest_entry_resolve(const char *entry, char *out, size_t out_sz) {
+    if (ws_volume_prefix_len(entry) == 0) {
+        return "must be an absolute path";
+    }
+    if (!cbm_canonical_path(entry, out, out_sz)) {
+        return "must name an existing directory";
+    }
+    if (!cbm_is_dir(out)) {
+        return "is not a directory";
+    }
+    return NULL;
+}
+
+/* "requested path <entry>: <reason>", with the resolved form shown when it
+ * differs from what was written: the person typed one and the policy judged
+ * the other. */
+static void ws_manifest_entry_refusal(char *err, size_t err_sz, const char *entry,
+                                      const char *resolved, const char *reason) {
+    if (!err || err_sz == 0) {
+        return;
+    }
+    if (resolved && strcmp(resolved, entry) != 0) {
+        snprintf(err, err_sz, "requested path %s (resolves to %s): %s", entry, resolved, reason);
+    } else {
+        snprintf(err, err_sz, "requested path %s: %s", entry, reason);
+    }
+}
+
 bool cbm_workspace_manifest_approve(const char *cache_dir, const char *home_dir,
                                     const char *project_root, char *err, size_t err_sz) {
     if (err && err_sz) {
@@ -800,14 +837,19 @@ bool cbm_workspace_manifest_approve(const char *cache_dir, const char *home_dir,
     }
 
     /* Approving a manifest must not become a way around the breadth policy: every
-     * requested entry has to stand on its own as an indexing root. */
+     * requested entry has to stand on its own as an indexing root, judged by the
+     * directory it resolves to. */
     for (int i = 0; i < m.count; i++) {
-        cbm_ws_verdict_t v = cbm_workspace_classify_root(m.entries[i], home_dir, cache_dir);
+        char resolved[WS_LINE_MAX];
+        const char *unusable = ws_manifest_entry_resolve(m.entries[i], resolved, sizeof(resolved));
+        if (unusable) {
+            ws_manifest_entry_refusal(err, err_sz, m.entries[i], NULL, unusable);
+            return false;
+        }
+        cbm_ws_verdict_t v = cbm_workspace_classify_root(resolved, home_dir, cache_dir);
         if (v != CBM_WS_ALLOW) {
-            if (err) {
-                snprintf(err, err_sz, "requested path %s: %s", m.entries[i],
-                         cbm_workspace_verdict_reason(v));
-            }
+            ws_manifest_entry_refusal(err, err_sz, m.entries[i], resolved,
+                                      cbm_workspace_verdict_reason(v));
             return false;
         }
     }
@@ -850,12 +892,19 @@ bool cbm_workspace_manifest_allows(const char *cache_dir, const char *home_dir,
         return false;
     }
     for (int i = 0; i < m.count; i++) {
-        /* Re-classify at use time as well as at approval time: the credential list
-         * may have grown since, and a stored approval must not outrank it. */
-        if (cbm_workspace_classify_root(m.entries[i], home_dir, cache_dir) != CBM_WS_ALLOW) {
+        /* Resolve and re-classify at use time as well as at approval time: the
+         * credential list may have grown since, and a link may lead somewhere
+         * else than it did when the person approved it. A stored approval must
+         * not outrank either. An entry that no longer resolves matches nothing,
+         * and the other entries of the manifest are consulted as before. */
+        char resolved[WS_LINE_MAX];
+        if (ws_manifest_entry_resolve(m.entries[i], resolved, sizeof(resolved)) != NULL) {
             continue;
         }
-        if (cbm_path_within_root(m.entries[i], candidate)) {
+        if (cbm_workspace_classify_root(resolved, home_dir, cache_dir) != CBM_WS_ALLOW) {
+            continue;
+        }
+        if (cbm_path_within_root(resolved, candidate)) {
             return true;
         }
     }

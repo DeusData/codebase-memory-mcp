@@ -552,6 +552,44 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 
+/* Resolve a route handler reference (the registry's answer for route passes).
+ * A class-qualified "Ns\\Class::method" reference — the extractor's form for
+ * Laravel `[Class::class, 'method']` and invokable `Class::class` handlers
+ * (#1146), with the class already qualified through the file's `use` imports
+ * and namespace — is placed on a method QN only by what places the class file:
+ * the composer.json PSR-4 class file in gbuf (cbm_pipeline_psr4_member_qn).
+ * When a PSR-4 prefix covers the class, that answer is final: a covered class
+ * whose file or member is absent stays unresolved, as its `use` import does
+ * (#1186). Only a class no prefix covers falls back to the one candidate whose
+ * directories end with the class's namespace. Never by short name alone, so a
+ * vendor controller that is not in the repo gets no handler. A reference
+ * without "::" resolves exactly as cbm_registry_resolve does. */
+cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const char *handler_ref,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count,
+                                              const cbm_gbuf_t *gbuf);
+
+/* Where composer's PSR-4 autoloader places a PHP class member. Tri-state, so
+ * "no prefix covers the class" (another strategy may answer) is never
+ * confused with "a prefix covers it but places nothing" (final). */
+typedef enum {
+    CBM_PSR4_MEMBER_NOT_COVERED = 0, /* no psr-4 prefix covers the class */
+    CBM_PSR4_MEMBER_RESOLVED,        /* *out_qn is the member's QN */
+    CBM_PSR4_MEMBER_UNRESOLVED,      /* covered, but no class file holds the
+                                      * class with this member: leave it
+                                      * unresolved, never guess elsewhere */
+} cbm_psr4_member_t;
+
+/* Place `member` on the PHP class `class_fqn` ("Ns\\Class", NUL-terminated)
+ * the way composer's PSR-4 autoloader places the class: the class file the
+ * import resolver picks for `use Ns\\Class;` (#1186), the class that file
+ * defines, then that class's member. *out_qn is set only on
+ * CBM_PSR4_MEMBER_RESOLVED (else NULL) and is owned by gbuf. Missing
+ * arguments or no package map give CBM_PSR4_MEMBER_NOT_COVERED. Read-only on
+ * gbuf. */
+cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char *class_fqn,
+                                              const char *member, const char **out_qn);
+
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
  * Caller must free() the returned string. */

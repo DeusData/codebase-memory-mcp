@@ -894,6 +894,14 @@ void cbm_work_arena_keep_begin(void);
 /* Free the compaction scratch this thread kept (cbm_work_arena_release calls it). */
 void cbm_result_compact_release_thread(void);
 
+/* Parse one whole file as if its last line ended with "\n" (#2078). The
+ * parser sees the source plus one virtual newline when the last byte is not
+ * already one; the returned tree is then clamped back to `source_len`, so no
+ * node range, point or text reaches past the real bytes. Every whole-file parse
+ * goes through here, so a retained tree and a fallback re-parse agree. */
+TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
+                         TSParseOptions opts);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file tree-sitter parse budget in microseconds of the

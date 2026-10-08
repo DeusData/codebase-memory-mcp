@@ -414,8 +414,9 @@ static bool handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              esc_fa);
     bool emitted = cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props) > 0;
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
-                                                     module_qn, imp_keys, imp_vals, imp_count);
+        cbm_resolution_t hres =
+            cbm_registry_resolve_handler(ctx->registry, call->second_arg_name, module_qn, imp_keys,
+                                         imp_vals, imp_count, ctx->gbuf);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
