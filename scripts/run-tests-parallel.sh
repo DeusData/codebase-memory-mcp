@@ -24,6 +24,11 @@ RUNNER="${1:?usage: run-tests-parallel.sh <path-to-test-runner> [jobs]}"
 JOBS="${2:-${CBM_TEST_PAR_JOBS:-}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEDULER="$SCRIPT_DIR/run-test-wave.py"
+# The end-of-run failure summary and the failing-log selection live in one
+# sourced file so tests/test_failure_report_contract.sh can drive the real
+# functions with fabricated logs.
+# shellcheck source=suite-failure-report.sh
+source "$SCRIPT_DIR/suite-failure-report.sh"
 
 if [ -z "$JOBS" ]; then
     if command -v nproc >/dev/null 2>&1; then
@@ -303,6 +308,14 @@ NSHARD=$(wc -l < "$SHARD_EXPECT" | tr -d ' ')
 } > "$LOGDIR/shard-manifest.txt"
 echo "=== parallel test run: $NSHARD of $NSUITES suites (shard ${SHARD_INDEX}/${SHARD_TOTAL}, $(wc -l < "$SER_FILE" | tr -d ' ') serial-tail), $JOBS jobs ==="
 
+# Leave the logs of every non-green suite in $LOGDIR/failed for CI to upload
+# when the job fails. An EXIT trap rather than a call next to the summary
+# below, because the run has three ways out — the scheduler giving up, the
+# union guard, and the normal end — and the first two are exactly the runs
+# whose logs are otherwise unrecoverable. The trap only copies files: it never
+# calls exit, so the status this script ends with is untouched.
+trap 'collect_failed_suite_logs "$LOGDIR" "$RESULTS_FILE" "$SHARD_EXPECT"' EXIT
+
 # Per-suite wall-clock ceilings make a wedged child fail loudly. The
 # `incremental` suite legitimately re-indexes large fixtures (minutes), while
 # `daemon_runtime` measures ~610s solo on arm64 under ASan; those and
@@ -389,10 +402,7 @@ echo "── 8 slowest suites ──"
 sort -t= -k6 -rn "$RESULTS_FILE" | head -8
 grep -v ' rc=0 ' "$RESULTS_FILE" || true
 for f in $(grep -v ' rc=0 ' "$RESULTS_FILE" | awk '{print $1}'); do
-    echo "──── $f: every failure site ────"
-    grep -B2 -A8 "FAIL" "$LOGDIR/$f.log" | head -120
-    echo "──── $f: last 15 lines ────"
-    tail -15 "$LOGDIR/$f.log"
+    suite_failure_summary "$f" "$LOGDIR/$f.log"
 done
 
 echo "────────────────────────────────────────────"
