@@ -16,6 +16,7 @@
 #include <cli/agent_profiles.h>
 #include <cli/activation_transaction.h>
 #include <cli/cli.h>
+#include <cli/agent_clients.h>
 #include <cli/progress_sink.h>
 #include <daemon/bootstrap.h>
 #include <daemon/ipc.h>
@@ -6749,13 +6750,70 @@ TEST(cli_detect_agents_finds_agentty) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
+    /* agentty lives in the table-driven registry, not the legacy detector. */
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_by_stable_id("agentty");
+    ASSERT_NOT_NULL(profile);
+
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/.agentty", tmpdir);
     test_mkdirp(dir);
 
-    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
-    ASSERT_TRUE(agents.agentty);
+    cbm_agent_client_resolve_options_t options;
+    memset(&options, 0, sizeof(options));
+    options.home_dir = tmpdir;
+    ASSERT_TRUE(cbm_agent_client_detect(CBM_AGENT_CLIENT_AGENTTY, &options));
 
+    char config_path[512];
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    char expected[512];
+    snprintf(expected, sizeof(expected), "%s/.agentty/mcp.json", tmpdir);
+    ASSERT_STR_EQ(config_path, expected);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_agentty_mcp_config_env_override) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-agentty-env-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char *saved = save_test_env("AGENTTY_MCP_CONFIG");
+    char override_path[512];
+    snprintf(override_path, sizeof(override_path), "%s/override.json", tmpdir);
+    cbm_setenv("AGENTTY_MCP_CONFIG", override_path, 1);
+
+    cbm_agent_client_resolve_options_t options;
+    memset(&options, 0, sizeof(options));
+    options.home_dir = tmpdir;
+
+    char config_path[512];
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    ASSERT_STR_EQ(config_path, override_path);
+
+    /* Tilde expansion goes against the home directory. */
+    cbm_setenv("AGENTTY_MCP_CONFIG", "~/agentty-override.json", 1);
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    char expected[512];
+    snprintf(expected, sizeof(expected), "%s/agentty-override.json", tmpdir);
+    ASSERT_STR_EQ(config_path, expected);
+
+    /* Unset falls back to ~/.agentty/mcp.json. */
+    cbm_unsetenv("AGENTTY_MCP_CONFIG");
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    snprintf(expected, sizeof(expected), "%s/.agentty/mcp.json", tmpdir);
+    ASSERT_STR_EQ(config_path, expected);
+
+    restore_test_env("AGENTTY_MCP_CONFIG", saved);
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -6880,6 +6938,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "agentty",
     };
     ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 46U);
+    /* The table-driven registry must carry agentty too — the legacy detector no
+     * longer knows about it. */
+    ASSERT_NOT_NULL(cbm_agent_client_by_stable_id("agentty"));
     char *data = read_test_file_alloc("README.md");
     if (!data)
         FAIL("could not read README.md for supported-agent contract");
@@ -7241,6 +7302,7 @@ TEST(cli_agentty_install_then_uninstall_roundtrip) {
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
     char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    char *saved_override = save_test_env("AGENTTY_MCP_CONFIG");
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("CBM_CACHE_DIR");
@@ -7291,11 +7353,40 @@ TEST(cli_agentty_install_then_uninstall_roundtrip) {
     bool user_kept = stat(user_file, &state) == 0;
     bool foreign_kept = mcp_after_uninstall && strstr(mcp_after_uninstall, "\"other-mcp\"") != NULL;
 
+    /* $AGENTTY_MCP_CONFIG redirects both install and uninstall: agentty never
+     * reads ~/.agentty/mcp.json while the variable points at an explicit
+     * file, so writing there would silently no-op on the agent's side. */
+    char override_path[640];
+    snprintf(override_path, sizeof(override_path), "%s/override-mcp.json", tmpdir);
+    cbm_setenv("AGENTTY_MCP_CONFIG", override_path, 1);
+    cbm_install_agent_configs(tmpdir, binary, false, false);
+    struct stat override_state;
+    const char *const override_markers[] = {"mcpServers", "codebase-memory-mcp", binary};
+    if (!test_file_contains_all(override_path, override_markers, 3) ||
+        stat(override_path, &override_state) != 0)
+        FAIL("install must honor $AGENTTY_MCP_CONFIG and write the override file");
+    char *default_after_override = read_test_file_alloc(mcp_path);
+    bool default_untouched =
+        !default_after_override || strstr(default_after_override, "codebase-memory-mcp") == NULL;
+    free(default_after_override);
+    if (!default_untouched)
+        FAIL("install must not re-add the entry to ~/.agentty/mcp.json while "
+             "$AGENTTY_MCP_CONFIG is set");
+    argv[0] = "uninstall";
+    uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    char *override_after_uninstall = read_test_file_alloc(override_path);
+    bool override_entry_removed =
+        override_after_uninstall && strstr(override_after_uninstall, "codebase-memory-mcp") == NULL;
+    free(override_after_uninstall);
+    if (!override_entry_removed)
+        FAIL("uninstall must honor $AGENTTY_MCP_CONFIG and clean the override file");
+
     free(mcp_after_install);
     free(mcp_after_uninstall);
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("CBM_CACHE_DIR", saved_cache);
+    restore_test_env("AGENTTY_MCP_CONFIG", saved_override);
     test_rmdir_r(tmpdir);
 
     if (!installed)
@@ -17445,15 +17536,18 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
     ASSERT_FALSE(registry.claude_code);
     ASSERT_FALSE(registry.cursor);
 
-    /* agentty is a detected agent, but it must still be selectable and
-     * filtered: a selection that omits it must zero it, or a user asking for
-     * "claude,codex" silently gets agentty configured too. */
+    /* agentty is a registry client: selectable through the shared selector
+     * vocabulary, and a selection that omits it must drop it (a registry
+     * install only ever runs when cli_clients_selects_registry_client passes). */
     cbm_detected_agents_t agentty = all;
     ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("agentty", &agentty));
-    ASSERT_TRUE(agentty.agentty);
     cbm_detected_agents_t leak = all;
     ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("claude,codex", &leak));
-    ASSERT_FALSE(leak.agentty);
+    cbm_cli_set_client_selection_for_testing("agentty");
+    ASSERT_TRUE(cbm_cli_selects_registry_client_for_testing("agentty"));
+    cbm_cli_set_client_selection_for_testing("claude,codex");
+    ASSERT_FALSE(cbm_cli_selects_registry_client_for_testing("agentty"));
+    cbm_cli_set_client_selection_for_testing(NULL);
 
     /* Every token in the table must resolve — a client added to detection but
      * forgotten here is invisible to the selector. */
@@ -17969,7 +18063,7 @@ SUITE(cli) {
     RUN_TEST(cli_yaml_parse_empty);
     RUN_TEST(cli_yaml_has);
 
-    /* Agent detection (7 tests — group A) */
+    /* Agent detection */
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_claude_empty_dir_not_detected_issue1180);
@@ -17983,6 +18077,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_grok);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_detect_agents_finds_agentty);
+    RUN_TEST(cli_agentty_mcp_config_env_override);
     RUN_TEST(cli_agentty_install_then_uninstall_roundtrip);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_supported_agent_surfaces_match_installers);

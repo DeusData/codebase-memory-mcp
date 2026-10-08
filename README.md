@@ -544,7 +544,7 @@ overwrite user-modified agents.
 | Pi | Detected | — | `~/.pi/agent/AGENTS.md` + skill; MCP/subagents require an explicit reviewed extension |
 | IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
 | Oh My Pi (omp) | Detected | Effective agent directory (`OMP_PROFILE` / `PI_CODING_AGENT_DIR`; default `~/.omp/agent/mcp.json`) | Skill and three direct-MCP graph-tool subagents (Scout/Verify/Auditor); preserves user `AGENTS.md` |
-| agentty | Detected | `~/.agentty/mcp.json` | Skill in `~/.agentty/skills` (Claude-compatible SKILL.md) |
+| agentty | Detected | `~/.agentty/mcp.json` (overridden by `$AGENTTY_MCP_CONFIG`) | Skill in `~/.agentty/skills` (Claude-compatible SKILL.md) |
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
 
 For Codex, install keeps only a tiny managed activation pointer in global
