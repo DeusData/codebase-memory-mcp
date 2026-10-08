@@ -716,8 +716,7 @@ TEST(tslsp_nocrash_using_decl) {
 TEST(tslsp_nocrash_megasource) {
     /* 50 KB of `;` should parse and walk without blowing the stack or arena. */
     char *buf = (char *)malloc(50001);
-    if (!buf)
-        PASS();
+    ASSERT_NOT_NULL(buf);
     memset(buf, ';', 50000);
     buf[50000] = '\0';
     CBMFileResult *r = extract_ts(buf);
@@ -3279,8 +3278,7 @@ TEST(tslsp_stress_many_classes) {
     /* 50 classes, each with one method, plus a dispatcher function calling all. */
     enum { BUF_CAP = 200 * 1024 };
     char *buf = (char *)malloc(BUF_CAP);
-    if (!buf)
-        PASS();
+    ASSERT_NOT_NULL(buf);
     char *p = buf;
     char *end = buf + BUF_CAP;
     for (int i = 0; i < 50; i++) {
@@ -3463,8 +3461,7 @@ TEST(tslsp_stress_5000_lines) {
      * doesn't crash, finishes in reasonable time. */
     enum { BUF_CAP = 800 * 1024 };
     char *buf = (char *)malloc(BUF_CAP);
-    if (!buf)
-        PASS();
+    ASSERT_NOT_NULL(buf);
     char *p = buf;
     char *end = buf + BUF_CAP;
     for (int i = 0; i < 200; i++) {
@@ -3531,8 +3528,7 @@ TEST(tslsp_stress_empty_classes_at_scale) {
     /* 500 empty classes — registry stress. */
     enum { BUF_CAP = 40 * 1024 };
     char *buf = (char *)malloc(BUF_CAP);
-    if (!buf)
-        PASS();
+    ASSERT_NOT_NULL(buf);
     char *p = buf;
     char *end = buf + BUF_CAP;
     for (int i = 0; i < 500; i++) {
