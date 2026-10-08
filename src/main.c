@@ -45,7 +45,7 @@ enum {
     MAIN_PORT_OFF = 7, /* strlen("--port=") */
     MAIN_MAX_PORT = 65536,
     MAIN_PATH_CAP = 4096,
-    MAIN_CONNECT_TIMEOUT_MS = 1000,
+    MAIN_CONNECT_TIMEOUT_MS = 30000,
     /* #2277: the conflict-remedy STATUS probe runs only after a refusal, so it
      * gets the same budget as `daemon status`: the daemon hashes the peer's
      * (~300 MB) image before answering, which can exceed a 1 s connect budget. */
@@ -57,7 +57,7 @@ enum {
      * the OS finishes reclaiming a dead holder's lock. This only bounds a peer
      * that never finishes, so a command cannot hang indefinitely. */
     MAIN_STARTUP_CONTENTION_CEILING_MS = 120000,
-    MAIN_MCP_STARTUP_TIMEOUT_MS = 30000,
+    MAIN_MCP_STARTUP_TIMEOUT_MS = 120000,
     MAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000,
     MAIN_HOOK_CONNECT_TIMEOUT_MS = 250,
     MAIN_HOOK_REQUEST_TIMEOUT_MS = 1500,

@@ -482,6 +482,9 @@ int cbm_daemon_ipc_wait_pending(const cbm_ipc_pending_ops_t *ops, uint32_t timeo
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#ifdef __FreeBSD__
+#include <sys/ucred.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -3739,6 +3742,15 @@ uint64_t cbm_daemon_ipc_connection_peer_pid(const cbm_daemon_ipc_connection_t *c
         return 0;
     }
     return (uint64_t)credentials.pid;
+#elif defined(__FreeBSD__)
+    struct xucred credentials;
+    socklen_t length = sizeof(credentials);
+    if (getsockopt(connection->fd, SOL_LOCAL, LOCAL_PEERCRED, &credentials, &length) != 0 ||
+        length != sizeof(credentials) || credentials.cr_version != XUCRED_VERSION ||
+        credentials.cr_uid != geteuid() || credentials.cr_pid <= 0) {
+        return 0;
+    }
+    return (uint64_t)credentials.cr_pid;
 #elif defined(SOL_LOCAL) && defined(LOCAL_PEERPID)
     pid_t peer_pid = 0;
     socklen_t length = sizeof(peer_pid);

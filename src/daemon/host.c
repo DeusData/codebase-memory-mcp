@@ -40,7 +40,7 @@ enum {
     HOST_RUNTIME_SHUTDOWN_MS = 10000,
     HOST_APPLICATION_SHUTDOWN_MS = 10000,
     HOST_COORDINATION_CLEANUP_MS = 500,
-    HOST_INITIAL_CLIENT_TIMEOUT_MS = 10000,
+    HOST_INITIAL_CLIENT_TIMEOUT_MS = 120000,
     /* A just-superseded daemon generation can still hold the cohort claim for
      * the brief window between going client-terminal (which lets the next
      * generation start) and releasing its cohort locks. Wait out that handoff
