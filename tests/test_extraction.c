@@ -2543,6 +2543,37 @@ TEST(ts_interface) {
     PASS();
 }
 
+/* #514: interface members are method_signature nodes, not method_definition,
+ * so they were never emitted and calls through an interface-typed field had
+ * no target. Abstract class members likewise. Signatures inside type literals
+ * and class overloads must not become defs. */
+TEST(ts_interface_method_signatures_are_methods) {
+    CBMFileResult *r = extract("export interface OrderRepository {\n"
+                               "  save(orderId: string): Promise<void>;\n"
+                               "  findOneOrFail(orderId: string): Promise<{ id: string }>;\n"
+                               "}\n"
+                               "export abstract class BaseRepo {\n"
+                               "  abstract flush(): void;\n"
+                               "}\n"
+                               "export class Impl {\n"
+                               "  load(a: string): void;\n"
+                               "  load(a: string, b?: number): void {}\n"
+                               "}\n"
+                               "export type Shape = { area(): number };\n",
+                               CBM_LANG_TYPESCRIPT, "t", "order.repository.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Interface", "OrderRepository"));
+    ASSERT_EQ(count_defs_named(r, "Method", "save"), 1);
+    ASSERT_EQ(count_defs_named(r, "Method", "findOneOrFail"), 1);
+    ASSERT_EQ(count_defs_named(r, "Method", "flush"), 1);
+    ASSERT_EQ(count_defs_named(r, "Method", "load"), 1);
+    ASSERT_EQ(count_defs_named(r, "Method", "area"), 0);
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- TSX component --- */
 TEST(tsx_component) {
     CBMFileResult *r = extract(
@@ -9765,6 +9796,7 @@ SUITE(extraction) {
     RUN_TEST(cuda_kernel);
     RUN_TEST(python_decorator);
     RUN_TEST(ts_interface);
+    RUN_TEST(ts_interface_method_signatures_are_methods);
     RUN_TEST(tsx_component);
     RUN_TEST(lua_table_method);
     RUN_TEST(emacs_lisp_defun);

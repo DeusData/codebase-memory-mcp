@@ -222,6 +222,24 @@ static inline bool cbm_pipeline_node_is_callable_target(const cbm_gbuf_node_t *n
            strcmp(node->label, "Constructor") == 0 || strcmp(node->label, "Class") == 0;
 }
 
+/* Whether the raw-name fallback must drop a blocked usage. An exact
+ * `import_map` hit is not a guess: the registry bound the name through the
+ * very import that blocked it, so the edge stays (an imported class passed to
+ * a decorator or used as a parameter type, #514). */
+static inline bool cbm_pipeline_blocked_usage_vetoed(const CBMUsage *usage, const char *strategy,
+                                                     const cbm_gbuf_node_t *target) {
+    if (!usage->semantic_reference_blocked) {
+        return false;
+    }
+    if (usage->semantic_reference_local_shadow) {
+        return true;
+    }
+    if (strategy && strcmp(strategy, "import_map") == 0) {
+        return false;
+    }
+    return cbm_pipeline_node_is_callable_target(target);
+}
+
 static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const char *tail) {
     const char *qt = cbm_pipeline_qn_class_method_tail(qn);
     return qt && tail && strcmp(qt, tail) == 0;

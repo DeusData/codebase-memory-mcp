@@ -917,6 +917,93 @@ static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
     return qualified;
 }
 
+/* JS/TS barrels. An import that lands on a Folder (`./svc` -> svc/index.ts)
+ * or on a module that only re-exports the name never reaches the declaring
+ * module, so `module.Name` is not in the registry and DI member calls on the
+ * imported type stay unresolved. Follow the barrel's own IMPORTS edges (its
+ * `export ... from` statements) to the one module that defines `name`. Those
+ * edges do not record which names each statement re-exports, so the
+ * definition node is the proof; two different definitions fail closed. */
+enum { PXC_BARREL_MAX_DEPTH = 8 };
+
+static bool pxc_is_js_family(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+}
+
+/* The graph node whose QN is cbm_pipeline_fqn_compute(project, rel_path, name),
+ * or NULL. The one place this pass computes a transient QN for a lookup. */
+static const cbm_gbuf_node_t *pxc_find_by_computed_qn(const cbm_gbuf_t *gbuf, const char *project,
+                                                      const char *rel_path, const char *name) {
+    char *qn = cbm_pipeline_fqn_compute(project, rel_path, name);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+    free(qn);
+    return n;
+}
+
+/* Node of `name` when the file at rel_path defines it, else NULL. */
+static const cbm_gbuf_node_t *pxc_defined_symbol(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                 const char *rel_path, const char *name) {
+    const cbm_gbuf_node_t *node = pxc_find_by_computed_qn(gbuf, project_name, rel_path, name);
+    if (node && node->label && strcmp(node->label, "Module") != 0 &&
+        strcmp(node->label, "Folder") != 0 && strcmp(node->label, "File") != 0) {
+        return node;
+    }
+    return NULL;
+}
+
+/* `visited` holds barrel file QNs already searched for `name`: barrels form
+ * DAGs (and cycles) where one lib index is reachable through many paths, and
+ * re-walking it on each path is exponential in the depth cap. */
+static const cbm_gbuf_node_t *pxc_barrel_symbol(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                const cbm_gbuf_node_t *target, const char *name,
+                                                int depth, CBMHashTable *visited) {
+    if (!target || !target->label || !target->file_path || depth > PXC_BARREL_MAX_DEPTH) {
+        return NULL;
+    }
+    static const char *const index_names[] = {"index.ts", "index.tsx", "index.mts",
+                                              "index.js", "index.jsx", "index.mjs"};
+    char rel[CBM_SZ_1K];
+    const cbm_gbuf_node_t *file_node = NULL;
+    if (strcmp(target->label, "Module") == 0) {
+        snprintf(rel, sizeof(rel), "%s", target->file_path);
+        file_node = pxc_find_by_computed_qn(gbuf, project_name, rel, "__file__");
+    } else if (strcmp(target->label, "Folder") == 0) {
+        for (size_t i = 0; i < sizeof(index_names) / sizeof(index_names[0]) && !file_node; i++) {
+            snprintf(rel, sizeof(rel), "%s/%s", target->file_path, index_names[i]);
+            file_node = pxc_find_by_computed_qn(gbuf, project_name, rel, "__file__");
+        }
+    }
+    if (!file_node || cbm_ht_has(visited, file_node->qualified_name)) {
+        return NULL;
+    }
+    cbm_ht_set(visited, file_node->qualified_name, (void *)file_node);
+    const cbm_gbuf_node_t *defined = pxc_defined_symbol(gbuf, project_name, rel, name);
+    if (defined) {
+        return defined;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count) !=
+        0) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = NULL;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_node_t *next = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        const cbm_gbuf_node_t *def =
+            pxc_barrel_symbol(gbuf, project_name, next, name, depth + 1, visited);
+        if (!def) {
+            continue;
+        }
+        if (found && found != def) {
+            return NULL;
+        }
+        found = def;
+    }
+    return found;
+}
+
 static bool pxc_import_map_has_local(const char *const *keys, int count, const char *local_name) {
     if (!keys || !local_name)
         return false;
@@ -991,9 +1078,8 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
 
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
-    free(file_qn);
+    const cbm_gbuf_node_t *file_node =
+        pxc_find_by_computed_qn(gbuf, project_name, rel_path, "__file__");
     if (file_node && cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
                                                         &edge_count) != 0) {
         edges = NULL;
@@ -1032,7 +1118,23 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
             continue;
         memcpy(local, start, n);
         local[n] = '\0';
-        char *value = pxc_import_value_qn(lang, result, local, target);
+        const cbm_gbuf_node_t *value_node = target;
+        if (pxc_is_js_family(lang) && target->label && target->file_path) {
+            const cbm_gbuf_node_t *direct =
+                strcmp(target->label, "Module") == 0
+                    ? pxc_defined_symbol(gbuf, project_name, target->file_path, local)
+                    : NULL;
+            CBMHashTable *visited = direct ? NULL : cbm_ht_create(16);
+            if (visited) {
+                const cbm_gbuf_node_t *barrel =
+                    pxc_barrel_symbol(gbuf, project_name, target, local, 0, visited);
+                cbm_ht_free(visited);
+                if (barrel) {
+                    value_node = barrel;
+                }
+            }
+        }
+        char *value = pxc_import_value_qn(lang, result, local, value_node);
         if (!value) {
             free(local);
             continue;

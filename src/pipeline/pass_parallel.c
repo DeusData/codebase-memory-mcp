@@ -3531,8 +3531,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                                       tgt->label)) {
                 continue;
             }
-            if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
-                                                      cbm_pipeline_node_is_callable_target(tgt))) {
+            if (cbm_pipeline_blocked_usage_vetoed(usage, res.strategy, tgt)) {
                 continue;
             }
         }
