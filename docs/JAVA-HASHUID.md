@@ -48,8 +48,8 @@ project share a `hashuid`.
 | `Method` (with a body) | yes | type_id 2 |
 | `Constructor` (label `Method`) | yes | type_id 3, detected by "no return type and the name equals the enclosing class's simple name" |
 | `Method` **without** a body | **yes** — deliberate superset | interface / abstract / native declarations are real, referencable entities. TrackerV2 skips them. Identify them with `hasBody:false`. See "Deliberate differences" below. |
-| `record` declaration | no | not in TrackerV2's type registry |
-| `@interface` (annotation type) | no | not in TrackerV2's type registry |
+| `record` declaration | no | not in TrackerV2's type registry, and it does not scope its members |
+| `@interface` (annotation type) | no | not in TrackerV2's type registry — but it **does** scope its members, see below |
 | anonymous class scope (`new T() { ... }`) | no | not in TrackerV2's registry, but its **members** are |
 | `Field`, `Variable`, `File`, `Folder`, `Route`, `Decorator`, `Branch`, `Project` | no | cbm-only node kinds; TrackerV2 has no notion of them |
 
@@ -67,6 +67,13 @@ graph) and are not an error: they are simply outside TrackerV2's model.
   containers (so a member of an anonymous class created inside
   `GitClient.iterateFileContents` reports
   `GitClient.iterateFileContents.$AC_Iterator`).
+- **`@interface` scopes its members; `record` does not.** TrackerV2's container
+  set is `class_declaration | interface_declaration | enum_declaration |
+  annotation_type_declaration | method_declaration | constructor_declaration`.
+  An enum declared inside an annotation type therefore reports the annotation's
+  name as its `logical_module` (`TestAnnotation.Level` → module
+  `TestAnnotation`), while a member of a `record` reports only the enclosing
+  class. Neither type carries an identity of its own.
 - **`duplicate_fingerprint` is per file and position dependent.** Declarations
   sharing the first seven fields get `sha256(declaration text) + index`, indexed
   by `(start_line, end_line)`. Inserting a new colliding declaration earlier in

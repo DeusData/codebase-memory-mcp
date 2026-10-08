@@ -34,9 +34,12 @@
  *      referencable entity that deserves an identity of its own. These nodes
  *      are identifiable by `hasBody:false`, so a comparison against TrackerV2
  *      can put them aside in one filter instead of guessing.
- *   2. A `record` and an `@interface` are not identity-bearing types, and they
- *      do not scope their members either. Their nodes get no HashUID and are
- *      skipped when a member walks its container chain.
+ *   2. A `record` and an `@interface` are not identity-bearing types, so their
+ *      nodes get no HashUID. They do NOT agree on scoping, and the difference
+ *      is TrackerV2's, not a choice: TrackerV2's container set
+ *      (`TreeSitterJavaParser.isContainerType`) contains
+ *      `annotation_type_declaration` but not `record_declaration`, so an
+ *      `@interface` DOES scope its members while a `record` does not.
  *   3. `logical_module` is the chain of enclosing container SIMPLE names, not a
  *      qualified path: a method in a top-level class reports just the class
  *      name, a class nested in `Outer` reports `Outer`, and a top-level class
@@ -425,16 +428,21 @@ static bool hu_is_tracker_type(const char *props) {
     return !hu_get_type_kind(props, kind, sizeof(kind));
 }
 
-/* Whether the type scopes its members. Everything identity-bearing does, and
- * so does an anonymous class — it is the one kind that scopes without being
- * registered, which is why records/annotations and anonymous classes cannot
- * share a single "is a type" test. */
+/* Whether the type scopes its members. Identity-bearing types do, and so do
+ * the two kinds that scope without carrying a HashUID of their own: anonymous
+ * classes and annotation types. TrackerV2's container set is
+ * `class | interface | enum | annotation_type_declaration | method |
+ * constructor`, so an `@interface` contributes a segment to the container chain
+ * even though it gets no identity. A `record` is the only kind TrackerV2 leaves
+ * out of that set. This is why the test cannot be "is this a registered
+ * identity kind" — `@interface` and anonymous classes answer the identity
+ * question with "no" and the scoping question with "yes". */
 static bool hu_scopes_members(const char *props) {
     char kind[CBM_SZ_32];
     if (!hu_get_type_kind(props, kind, sizeof(kind))) {
         return true;
     }
-    return strcmp(kind, "anonymous") == 0;
+    return strcmp(kind, "record") != 0;
 }
 
 static const char *hu_container_name(CBMHashTable *containers, const char *qn) {
