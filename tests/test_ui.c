@@ -627,6 +627,30 @@ TEST(layout_dead_code_classification) {
                       .qualified_name = "dc::exportedfn",
                       .file_path = "src/d.c",
                       .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t framework = {.project = "dc",
+                            .label = "Function",
+                            .name = "frameworkfn",
+                            .qualified_name = "dc::frameworkfn",
+                            .file_path = "src/routes.c",
+                            .properties_json = "{}"};
+    cbm_node_t route = {.project = "dc",
+                        .label = "Route",
+                        .name = "GET /framework",
+                        .qualified_name = "dc::route",
+                        .file_path = "src/routes.c",
+                        .properties_json = "{}"};
+    cbm_node_t unrelated = {.project = "dc",
+                            .label = "Class",
+                            .name = "UnrelatedTarget",
+                            .qualified_name = "dc::unrelated",
+                            .file_path = "src/routes.c",
+                            .properties_json = "{}"};
+    cbm_node_t nonroute = {.project = "dc",
+                           .label = "Function",
+                           .name = "nonroutefn",
+                           .qualified_name = "dc::nonroutefn",
+                           .file_path = "src/routes.c",
+                           .properties_json = "{}"};
     cbm_node_t single = {.project = "dc",
                          .label = "Function",
                          .name = "calledonce",
@@ -658,6 +682,14 @@ TEST(layout_dead_code_classification) {
     cbm_store_upsert_node(store, &tst);
     cbm_store_upsert_node(store, &tstpath);
     cbm_store_upsert_node(store, &exp);
+    int64_t id_framework = cbm_store_upsert_node(store, &framework);
+    int64_t id_route = cbm_store_upsert_node(store, &route);
+    int64_t id_unrelated = cbm_store_upsert_node(store, &unrelated);
+    int64_t id_nonroute = cbm_store_upsert_node(store, &nonroute);
+    ASSERT_GT(id_framework, 0);
+    ASSERT_GT(id_route, 0);
+    ASSERT_GT(id_unrelated, 0);
+    ASSERT_GT(id_nonroute, 0);
     int64_t id_single = cbm_store_upsert_node(store, &single);
     int64_t id_norm = cbm_store_upsert_node(store, &norm);
     int64_t id_caller = cbm_store_upsert_node(store, &caller);
@@ -670,9 +702,15 @@ TEST(layout_dead_code_classification) {
     cbm_edge_t e2 = {
         .project = "dc", .source_id = id_caller, .target_id = id_norm, .type = "CALLS"};
     cbm_edge_t e3 = {.project = "dc", .source_id = id_dead, .target_id = id_norm, .type = "CALLS"};
+    cbm_edge_t framework_route = {
+        .project = "dc", .source_id = id_framework, .target_id = id_route, .type = "HANDLES"};
+    cbm_edge_t framework_unrelated = {
+        .project = "dc", .source_id = id_nonroute, .target_id = id_unrelated, .type = "HANDLES"};
     cbm_store_insert_edge(store, &e1);
     cbm_store_insert_edge(store, &e2);
     cbm_store_insert_edge(store, &e3);
+    ASSERT_GT(cbm_store_insert_edge(store, &framework_route), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &framework_unrelated), 0);
 
     cbm_layout_result_t *r = cbm_layout_compute(store, "dc", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
     ASSERT_NOT_NULL(r);
@@ -699,6 +737,18 @@ TEST(layout_dead_code_classification) {
     ln = find_layout_node(r, "exportedfn");
     ASSERT_NOT_NULL(ln);
     ASSERT_STR_EQ(ln->status, "exported");
+
+    ln = find_layout_node(r, "frameworkfn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "entry");
+
+    ln = find_layout_node(r, "nonroutefn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "dead");
+
+    ln = find_layout_node(r, "GET /framework");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "structural");
 
     ln = find_layout_node(r, "calledonce");
     ASSERT_NOT_NULL(ln);
