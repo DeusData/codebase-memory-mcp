@@ -1420,17 +1420,30 @@ static bool ts_scope_has_binding(const CBMScope *scope, const char *name) {
     return ts_scope_binding_owner(scope, name) != NULL;
 }
 
+/* Full QN of an imported symbol. An import value is normally the module QN
+ * (symbol = module + "." + name), but may already be the symbol QN. When the
+ * module QN ends in ".name" the spelling is ambiguous: `Foo.ts` exporting
+ * `Foo` (module `x.Foo`, symbol `x.Foo.Foo`) looks exactly like an
+ * already-qualified value. Treating it as the symbol typed every imported
+ * same-name class as its module (#1354), so the registry decides: a
+ * registered `module.name` wins, else the value is the symbol. Two hashed
+ * lookups on a finalized/sealed registry, only in the ambiguous case. */
 static const char *ts_import_symbol_qn(TSLSPContext *ctx, const char *module_qn, const char *name) {
     if (!ctx || !module_qn || !name) {
         return NULL;
     }
+    const char *appended = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
     size_t module_len = strlen(module_qn);
     size_t name_len = strlen(name);
     if (module_len > name_len + 1 && module_qn[module_len - name_len - 1] == '.' &&
         strcmp(module_qn + module_len - name_len, name) == 0) {
+        if (appended && (cbm_registry_lookup_type(ctx->registry, appended) ||
+                         cbm_registry_lookup_func(ctx->registry, appended))) {
+            return appended;
+        }
         return module_qn;
     }
-    return cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
+    return appended;
 }
 
 /* Same-file function values use only the exact current-module QN. No short-name,
@@ -1860,7 +1873,12 @@ static const CBMType *eval_indexed_access(TSLSPContext *ctx, const CBMType *obj,
     return cbm_type_unknown();
 }
 
-// Look up a method on a receiver type — returns the registered func.
+/* Depth-guarded entry, same contract as lookup_member_type: the method walk
+ * recurses through wrapper classes, union members and the extends/implements
+ * chain. A cyclic chain (#1743: the Effect idiom `class Service extends
+ * Context.Service<Service, I>()(...)` whose base resolved to the class itself)
+ * recursed without bound and overflowed the resolver thread's stack. Past the
+ * cap the method is simply not found. */
 static const CBMRegisteredFunc *lookup_method(TSLSPContext *ctx, const CBMType *recv,
                                               const char *method_name) {
     TSLookupState state = {0};
@@ -2046,6 +2064,42 @@ static const char *ts_import_module_for_local(const TSLSPContext *ctx, const cha
         matched = module_qn;
     }
     return matched;
+}
+
+/* Type of `new C()` for a bare class name, in TS scoping order: a class
+ * declared in this module, else the class an unambiguous import binding
+ * names, else the historical current-module spelling. Without the import
+ * step (#1354) `new ImportedClass()` was typed as a phantom current-module
+ * class, so every method call on the instance missed the registry and the
+ * cross-file edge was lost while the same code in the class's own file
+ * resolved. One hashed type lookup; the registry is only read. */
+static const CBMType *ts_new_bare_class_type(TSLSPContext *ctx, const char *cname) {
+    if (!ctx->module_qn)
+        return cbm_type_named(ctx->arena, cname);
+    const char *local_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+    if (cbm_registry_lookup_type(ctx->registry, local_qn))
+        return cbm_type_named(ctx->arena, local_qn);
+    bool import_matched = false;
+    const char *import_module = ts_import_module_for_local(ctx, cname, &import_matched);
+    if (import_module)
+        return cbm_type_named(ctx->arena, ts_import_symbol_qn(ctx, import_module, cname));
+    return cbm_type_named(ctx->arena, local_qn);
+}
+
+/* Type of a `new_expression`: a bare constructor name follows TS scoping
+ * (ts_new_bare_class_type), a dotted one is taken as spelled. NULL when the
+ * node carries no constructor. Shared by expression evaluation and by the
+ * field-initializer inference in ast_sweep_shapes, so `const t = new C()`
+ * and `private t = new C()` type the instance identically. */
+static const CBMType *ts_new_expression_type(TSLSPContext *ctx, TSNode node) {
+    TSNode ctor = ts_node_child_by_field_name(node, "constructor", TS_LSP_FIELD_LEN("constructor"));
+    if (ts_node_is_null(ctor))
+        return NULL;
+    char *cname = node_text(ctx, ctor);
+    if (!cname)
+        return NULL;
+    return strchr(cname, '.') == NULL ? ts_new_bare_class_type(ctx, cname)
+                                      : cbm_type_named(ctx->arena, cname);
 }
 
 static const CBMRegisteredFunc *ts_lookup_namespace_call(TSLSPContext *ctx, const char *object_name,
@@ -2273,20 +2327,9 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
                 result = lookup_member_type(ctx, recv, pname);
         }
     } else if (strcmp(kind, "new_expression") == 0) {
-        TSNode ctor =
-            ts_node_child_by_field_name(node, "constructor", TS_LSP_FIELD_LEN("constructor"));
-        if (!ts_node_is_null(ctor)) {
-            char *cname = node_text(ctx, ctor);
-            if (cname) {
-                // Bare class name → qualify against module.
-                if (strchr(cname, '.') == NULL && ctx->module_qn) {
-                    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
-                    result = cbm_type_named(ctx->arena, qn);
-                } else {
-                    result = cbm_type_named(ctx->arena, cname);
-                }
-            }
-        }
+        const CBMType *nt = ts_new_expression_type(ctx, node);
+        if (nt)
+            result = nt;
     } else if (strcmp(kind, "call_expression") == 0) {
         TSNode fn = ts_node_child_by_field_name(node, "function", TS_LSP_FIELD_LEN("function"));
         if (!ts_node_is_null(fn)) {
@@ -2518,14 +2561,7 @@ static const CBMType *resolve_type_with_imports(TSLSPContext *ctx, const CBMType
                 continue;
             if (strcmp(lname, bare) != 0)
                 continue;
-            // Heuristic: if mqn already ends in ".bare" use as-is; otherwise append.
-            size_t mqn_len = strlen(mqn);
-            size_t bare_len = strlen(bare);
-            if (mqn_len > bare_len + 1 && mqn[mqn_len - bare_len - 1] == '.' &&
-                strcmp(mqn + mqn_len - bare_len, bare) == 0) {
-                return cbm_type_named(ctx->arena, mqn);
-            }
-            return cbm_type_named(ctx->arena, cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, bare));
+            return cbm_type_named(ctx->arena, ts_import_symbol_qn(ctx, mqn, bare));
         }
         return t;
     }
@@ -5423,6 +5459,76 @@ static const CBMType *interface_method_signature_from_ast(TSLSPContext *ctx, TSN
     return cbm_type_func(ctx->arena, NULL, param_count ? param_types : NULL, return_types);
 }
 
+/* Parsed type of a `type_annotation` field (`: T`), or unknown. */
+static const CBMType *ts_annotation_field_type(TSLSPContext *ctx, TSNode owner) {
+    TSNode tann = ts_node_child_by_field_name(owner, "type", TS_LSP_FIELD_LEN("type"));
+    if (ts_node_is_null(tann))
+        return cbm_type_unknown();
+    TSNode tn =
+        strcmp(ts_node_type(tann), "type_annotation") == 0 ? ts_node_named_child(tann, 0) : tann;
+    return ts_node_is_null(tn) ? cbm_type_unknown() : ts_parse_type_node(ctx, tn);
+}
+
+/* Declared type of a class field (`public_field_definition`) or interface
+ * property: the annotation when present, else, for an unannotated field
+ * initialised with `new C()`, the type of that instance (#514). No other
+ * initializer is inferred: `new` names its type exactly, arbitrary
+ * expressions do not. */
+static const CBMType *ts_field_decl_type(TSLSPContext *ctx, TSNode m) {
+    if (!ts_node_is_null(ts_node_child_by_field_name(m, "type", TS_LSP_FIELD_LEN("type"))))
+        return ts_annotation_field_type(ctx, m);
+    TSNode val = ts_node_child_by_field_name(m, "value", TS_LSP_FIELD_LEN("value"));
+    if (ts_node_is_null(val) || strcmp(ts_node_type(val), "new_expression") != 0)
+        return cbm_type_unknown();
+    const CBMType *nt = ts_new_expression_type(ctx, val);
+    return nt ? nt : cbm_type_unknown();
+}
+
+/* A constructor parameter is a TS parameter property, i.e. also declares a
+ * class field, iff it carries an accessibility modifier, `readonly` or
+ * `override`. */
+static bool ts_param_is_property(TSNode p) {
+    uint32_t pc = ts_node_child_count(p);
+    for (uint32_t ci = 0; ci < pc; ci++) {
+        const char *ck = ts_node_type(ts_node_child(p, ci));
+        if (strcmp(ck, "accessibility_modifier") == 0 || strcmp(ck, "readonly") == 0 ||
+            strcmp(ck, "override_modifier") == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Append the parameter properties of a `constructor` method_definition to
+ * the field arrays (#514): `constructor(private readonly svc: Svc)` declares
+ * field `svc: Svc`, the dominant NestJS injection shape. Any other member is
+ * ignored. Returns the new field count. */
+static int ts_collect_param_properties(TSLSPContext *ctx, TSNode m, const char **names,
+                                       const CBMType **types, int count, int cap) {
+    TSNode mname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
+    char *mnm = ts_node_is_null(mname) ? NULL : node_text(ctx, mname);
+    if (!mnm || strcmp(mnm, "constructor") != 0)
+        return count;
+    TSNode params = ts_node_child_by_field_name(m, "parameters", TS_LSP_FIELD_LEN("parameters"));
+    uint32_t pnc = ts_node_is_null(params) ? 0 : ts_node_named_child_count(params);
+    for (uint32_t pi = 0; pi < pnc && count < cap; pi++) {
+        TSNode p = ts_node_named_child(params, pi);
+        const char *pk = ts_node_type(p);
+        if ((strcmp(pk, "required_parameter") != 0 && strcmp(pk, "optional_parameter") != 0) ||
+            !ts_param_is_property(p))
+            continue;
+        TSNode pat = ts_node_child_by_field_name(p, "pattern", TS_LSP_FIELD_LEN("pattern"));
+        if (ts_node_is_null(pat) || strcmp(ts_node_type(pat), "identifier") != 0)
+            continue;
+        char *pnm = node_text(ctx, pat);
+        if (!pnm)
+            continue;
+        names[count] = pnm;
+        types[count] = ts_annotation_field_type(ctx, p);
+        count++;
+    }
+    return count;
+}
+
 // AST sweep: walk class/interface bodies to collect field names+types and refine
 // embedded_types / type_param_names.
 static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *reg) {
@@ -5535,21 +5641,21 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
             if (strcmp(mk, "public_field_definition") == 0 ||
                 strcmp(mk, "property_signature") == 0) {
                 TSNode fname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
-                TSNode ftype = ts_node_child_by_field_name(m, "type", TS_LSP_FIELD_LEN("type"));
                 if (ts_node_is_null(fname))
                     continue;
                 char *fnm = node_text(ctx, fname);
                 if (!fnm)
                     continue;
-                const CBMType *ft = cbm_type_unknown();
-                if (!ts_node_is_null(ftype)) {
-                    TSNode tch = ts_node_named_child(ftype, 0);
-                    if (!ts_node_is_null(tch))
-                        ft = ts_parse_type_node(ctx, tch);
-                }
                 field_names[field_count] = fnm;
-                field_types[field_count] = ft;
+                field_types[field_count] = ts_field_decl_type(ctx, m);
                 field_count++;
+                continue;
+            }
+
+            // Constructor parameter properties are class fields too (#514).
+            if (!is_interface && strcmp(mk, "method_definition") == 0) {
+                field_count =
+                    ts_collect_param_properties(ctx, m, field_names, field_types, field_count, 63);
                 continue;
             }
 
@@ -5885,7 +5991,7 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
             jsx_mode ? (js_mode ? tree_sitter_javascript() : tree_sitter_tsx())
                      : (js_mode ? tree_sitter_javascript() : tree_sitter_typescript());
         ts_parser_set_language(parser, lang);
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         if (!tree)
             return;
@@ -6096,7 +6202,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             jsx_mode ? (js_mode ? tree_sitter_javascript() : tree_sitter_tsx())
                      : (js_mode ? tree_sitter_javascript() : tree_sitter_typescript());
         ts_parser_set_language(parser, lang);
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         if (!tree)
             return;

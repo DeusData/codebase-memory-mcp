@@ -273,6 +273,8 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->structural_profile);
     cr_str(c, &d->body_tokens);
     cr_str(c, &d->impl_trait);
+    cr_str(c, &d->http_client);
+    cr_str(c, &d->http_base_url);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
@@ -355,6 +357,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->resolved_calls.items[i].callee_qn);
         cr_str(c, &r->resolved_calls.items[i].strategy);
         cr_str(c, &r->resolved_calls.items[i].reason);
+        cr_str(c, &r->resolved_calls.items[i].callee_sig);
     }
     cr_array(c, (void **)&r->string_refs.items, r->string_refs.count, sizeof(CBMStringRef));
     for (int i = 0; i < r->string_refs.count && r->string_refs.items; i++) {
@@ -375,6 +378,12 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->channels.items[i].transport);
         cr_str(c, &r->channels.items[i].enclosing_func_qn);
     }
+    cr_array(c, (void **)&r->field_types.items, r->field_types.count, sizeof(CBMFieldType));
+    for (int i = 0; i < r->field_types.count && r->field_types.items; i++) {
+        cr_str(c, &r->field_types.items[i].class_qn);
+        cr_str(c, &r->field_types.items[i].field_name);
+        cr_str(c, &r->field_types.items[i].type_text);
+    }
     cr_str(c, &r->module_qn);
     cr_str(c, &r->namespace_name);
     cr_list(c, &r->exports);
@@ -383,6 +392,7 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_list(c, &r->macros);
     cr_str(c, &r->error_msg);
     cr_str(c, &r->error_ranges);
+    cr_str(c, &r->module_doc);
     cr_blob(c, (const void **)&r->source, r->source ? (size_t)r->source_len + SKIP_ONE : 0);
 }
 
@@ -521,6 +531,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.string_refs.cap = tmp.string_refs.count;
     tmp.infra_bindings.cap = tmp.infra_bindings.count;
     tmp.channels.cap = tmp.channels.count;
+    tmp.field_types.cap = tmp.field_types.count;
 
     /* A composite kept its per-unit results only so shallow-copied strings
      * stayed valid; every string is now a copy of its own. */

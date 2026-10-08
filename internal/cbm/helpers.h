@@ -174,7 +174,29 @@ void cbm_kind_in_set_free_cache(void);
 // Check if node has an ancestor of the given kind, within max_depth levels.
 bool cbm_has_ancestor_kind(TSNode node, const char *kind, int max_depth);
 
+// Growable pending-node stack for the iterative AST walkers.
+//
+// No work cap may decide graph content, so walker stacks never truncate: a
+// walker starts on a small caller-owned on-stack chunk (`inline_buf`) and spills
+// to the heap (through the memory core, class EXTRACT) only for trees whose
+// pending set outgrows it. Traversal order is unaffected by where the frames
+// live. Ensures room for `need` frames in total; on success `*items`/`*cap`
+// describe the (possibly moved) stack and true is returned. On allocation
+// failure the stack is left intact, the failure is logged at error level under
+// "extract.walk_stack_alloc_failed" (walker=<walker>), and false is returned —
+// the caller then reports its documented failure sentinel instead of a
+// silently truncated result.
+bool cbm_walk_stack_reserve(void **items, int *cap, int need, size_t elem_size,
+                            const void *inline_buf, const char *walker);
+// Release a stack grown by cbm_walk_stack_reserve (no-op for the inline chunk).
+void cbm_walk_stack_release(void *items, const void *inline_buf);
+
+// Sentinel reported by the walkers below when their pending stack could not be
+// grown (allocation failure): the metric is unavailable, never an undercount.
+#define CBM_WALK_METRIC_UNAVAILABLE (-1)
+
 // Count nodes of given kinds in subtree (for complexity metric).
+// Returns CBM_WALK_METRIC_UNAVAILABLE on allocation failure.
 int cbm_count_branching(TSNode node, const char **branching_types);
 
 // Per-function structural complexity, computed in a single AST walk.
@@ -188,6 +210,7 @@ typedef struct {
 
 // Compute the metrics above in one traversal of `node`'s subtree.
 // `branching_types` is the language's branching node-type set.
+// On allocation failure every field is CBM_WALK_METRIC_UNAVAILABLE.
 void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
 
 // Is `kind` a loop construct node type? Language-agnostic curated set (for/while/
@@ -226,6 +249,17 @@ char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *r
 // language this is exactly cbm_fqn_compute (no behavior change).
 char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
                                   const char *name, CBMLanguage lang);
+
+// C-family platform variants: the same external-linkage function defined in
+// files that differ only by a platform token (foo_win.c / foo_posix.c,
+// src/unix/fs.c / src/win/fs.c) is ONE function with platform variants — two
+// external definitions of one name cannot link into one program, so they are
+// alternatives by construction. Returns the platform-neutral QN (the path with
+// its platform tokens removed) for a non-static file-scope function of
+// C/C++/CUDA/ObjC whose `qn` is the plain file-stem form; otherwise `qn`.
+const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+                                    const char *rel_path, const char *name, const char *qn,
+                                    TSNode func_node);
 
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);

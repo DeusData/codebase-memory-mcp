@@ -359,6 +359,7 @@ typedef enum {
     WORKER_RESPONSE_READ_OK = 0,
     WORKER_RESPONSE_READ_ERROR,
     WORKER_RESPONSE_READ_TOO_LARGE,
+    WORKER_RESPONSE_READ_EMPTY, /* the pre-created file was never written (#1300) */
 } worker_response_read_status_t;
 
 /* Read at most one daemon-application payload. The worker is already reaped,
@@ -384,6 +385,14 @@ static char *slurp_worker_response(const char *path, worker_response_read_status
         (void)fclose(f);
         return NULL;
     }
+    if (n == 0) {
+        /* The supervisor creates the response file before spawning, so an
+         * empty file is a worker that never wrote its result. Reading it as
+         * "" made that a successful run with an empty response (#1300). */
+        *status_out = WORKER_RESPONSE_READ_EMPTY;
+        (void)fclose(f);
+        return NULL;
+    }
     if (fseek(f, 0, SEEK_SET) != 0) {
         (void)fclose(f);
         return NULL;
@@ -403,6 +412,67 @@ static char *slurp_worker_response(const char *path, worker_response_read_status
     buf[rd] = '\0';
     *status_out = WORKER_RESPONSE_READ_OK;
     return buf;
+}
+
+enum {
+    WORKER_LOG_TAIL_BYTES = 64 * 1024, /* last-phase scan window: bounded, never the whole log */
+    WORKER_LOG_LINE_CAP = 1024,
+};
+
+/* Copy the event name of one structured log line ("level=... msg=<event> ..."
+ * or {"level":...,"event":"<event>",...}) into out. False for any other line
+ * (plain stderr text, a truncated fragment). */
+static bool worker_log_line_event(const char *line, char *out, size_t out_size) {
+    static const char text_key[] = " msg=";
+    static const char json_key[] = "\"event\":\"";
+    const char *start = NULL;
+    char stop = ' ';
+    if (strncmp(line, "level=", strlen("level=")) == 0) {
+        const char *msg = strstr(line, text_key);
+        start = msg ? msg + strlen(text_key) : NULL;
+    } else if (strncmp(line, "{\"level\":", strlen("{\"level\":")) == 0) {
+        const char *event = strstr(line, json_key);
+        start = event ? event + strlen(json_key) : NULL;
+        stop = '"';
+    }
+    if (!start) {
+        return false;
+    }
+    size_t length = 0;
+    while (start[length] && start[length] != stop && start[length] != '\n' &&
+           start[length] != '\r') {
+        length++;
+    }
+    if (length == 0 || length >= out_size) {
+        return false;
+    }
+    memcpy(out, start, length);
+    out[length] = '\0';
+    return true;
+}
+
+/* #1300: the last structured event the worker logged before it exited — the
+ * phase it reached. Scans only the log's final WORKER_LOG_TAIL_BYTES. */
+static void worker_log_last_phase(const char *log_path, char *out, size_t out_size) {
+    (void)snprintf(out, out_size, "%s", "unknown");
+    FILE *log = cbm_fopen(log_path, "rb");
+    if (!log) {
+        return;
+    }
+    if (fseek(log, 0, SEEK_END) == 0) {
+        long size = ftell(log);
+        long from = size > WORKER_LOG_TAIL_BYTES ? size - WORKER_LOG_TAIL_BYTES : 0;
+        if (size >= 0 && fseek(log, from, SEEK_SET) == 0) {
+            char line[WORKER_LOG_LINE_CAP];
+            char event[CBM_SZ_128];
+            while (fgets(line, sizeof(line), log)) {
+                if (worker_log_line_event(line, event, sizeof(event))) {
+                    (void)snprintf(out, out_size, "%s", event);
+                }
+            }
+        }
+    }
+    (void)fclose(log);
 }
 
 enum {
@@ -634,6 +704,10 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
     } else if (handle->result.cancellation_requested) {
         cbm_log_warn("index.supervisor.worker_cancelled", "outcome",
                      cbm_proc_outcome_str(handle->result.outcome), "log", handle->log_path);
+    } else if (handle->result.response_missing) {
+        /* #1300: keep and name the log — it is the only record of the run. */
+        cbm_log_error("index.supervisor.no_response", "exit_code", exit_text, "last_phase",
+                      handle->result.last_phase, "log", handle->log_path);
     } else if (handle->result.outcome == CBM_PROC_CLEAN && !cbm_profile_active) {
         (void)cbm_unlink(handle->log_path);
     } else if (handle->result.outcome == CBM_PROC_CLEAN) {
@@ -828,6 +902,16 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
             handle->result.response_rejected = true;
             handle->result.outcome = CBM_PROC_EXIT_NONZERO;
             handle->result.exit_code = -1;
+        } else if (!handle->result.response) {
+            /* #1300: a clean exit that wrote no response. The outcome stays
+             * CLEAN (the disposition is FALLBACK: an explicit error, no
+             * in-process fallback and no recovery re-run of a worker that did
+             * not crash); the log and the last phase it reached are kept. */
+            handle->result.response_missing = true;
+            worker_log_last_phase(handle->log_path, handle->result.last_phase,
+                                  sizeof(handle->result.last_phase));
+            (void)snprintf(handle->result.worker_log, sizeof(handle->result.worker_log), "%s",
+                           handle->log_path);
         }
     }
     (void)cbm_unlink(handle->response_path);

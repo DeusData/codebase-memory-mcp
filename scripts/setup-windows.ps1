@@ -1,5 +1,5 @@
 # codebase-memory-mcp setup script (Windows)
-# Default: download pre-built native Windows binary
+# Default: install the pre-built native Windows binary through install.ps1
 # -FromSource: build from source inside WSL (requires Go + gcc in WSL)
 
 param(
@@ -123,7 +123,7 @@ if ($Help) {
     Write-Host ""
     Write-Host "Usage: .\setup-windows.ps1 [-FromSource] [-Help]"
     Write-Host ""
-    Write-Host "  Default:      Download pre-built Windows binary"
+    Write-Host "  Default:      Download the pre-built Windows binary through install.ps1"
     Write-Host "  -FromSource:  Build from source inside WSL (requires Go 1.23+ and gcc in WSL)"
     Write-Host ""
     exit 0
@@ -225,7 +225,7 @@ if ($FromSource) {
         exit 1
     }
 
-    # Configure — WSL binary needs wsl.exe wrapper
+    # Configure -- WSL binary needs wsl.exe wrapper
     $mcpConfig = [ordered]@{
         type    = "stdio"
         command = "wsl.exe"
@@ -243,41 +243,105 @@ if ($FromSource) {
     Write-Host "    wsl.exe -- rm -rf ~/.cache/codebase-memory-mcp/"
 
 } else {
-    # --- Download pre-built native Windows binary ---
-    Write-Host "Fetching latest release..." -ForegroundColor White
+    # --- Download + install through install.ps1 ---
+    #
+    # install.ps1 is the one implementation of "fetch a release and install
+    # it": it downloads checksums.txt next to the archive, verifies the
+    # archive's SHA-256 against it, validates the zip layout and only then
+    # runs the binary's own `install`. This script used to carry a second
+    # copy of that download, which did not keep up with the installer. It
+    # now fetches install.ps1 from the same origin and branch it is itself
+    # served from and hands over to it, so there is exactly one install path.
+    #
+    # CBM_DOWNLOAD_URL (the installers' download-base override, for local
+    # testing) also moves the installer fetch: install.ps1 is then taken from
+    # "$env:CBM_DOWNLOAD_URL/install.ps1".
+    $installerUrl = "https://raw.githubusercontent.com/$Repo/main/install.ps1"
+    if ($env:CBM_DOWNLOAD_URL) {
+        $installerUrl = $env:CBM_DOWNLOAD_URL.TrimEnd('/') + "/install.ps1"
+    }
 
-    $releaseUrl = "https://api.github.com/repos/$Repo/releases/latest"
-    $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{ "User-Agent" = "codebase-memory-mcp-setup" }
-    $tag = $release.tag_name
-
-    if (-not $tag) {
-        Write-Fail "Could not determine latest release."
-        Write-Host "  Check: https://github.com/$Repo/releases"
+    # Same transport rule as install.ps1: HTTPS, or plain HTTP for a loopback
+    # authority only (the local test fixture). No redirects are followed: both
+    # origins serve the installer directly.
+    try { $installerUri = [Uri]$installerUrl } catch { $installerUri = $null }
+    $loopbackHttp = (
+        $installerUri -and $installerUri.IsAbsoluteUri -and
+        $installerUri.Scheme -eq "http" -and $installerUri.IsLoopback -and
+        [string]::IsNullOrEmpty($installerUri.UserInfo)
+    )
+    if (-not $installerUri -or -not $installerUri.IsAbsoluteUri -or
+        ($installerUri.Scheme -ne "https" -and -not $loopbackHttp) -or
+        -not [string]::IsNullOrEmpty($installerUri.UserInfo)) {
+        Write-Fail "Refusing non-HTTPS installer URL: $installerUrl"
         exit 1
     }
-    Write-Ok "Latest release: $tag"
 
-    $asset = "codebase-memory-mcp-windows-amd64.zip"
-    $downloadUrl = "https://github.com/$Repo/releases/download/$tag/$asset"
+    # TLS 1.2+ for the fetch (older Windows PowerShell defaults to TLS 1.0,
+    # which GitHub rejects). TLS 1.3 only where schannel can negotiate it; see
+    # the note in install.ps1.
+    $protocols = [Net.SecurityProtocolType]::Tls12
+    if ([Environment]::OSVersion.Version.Build -ge 20348 -and
+        ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13')) {
+        $protocols = $protocols -bor [Net.SecurityProtocolType]::Tls13
+    }
+    [Net.ServicePointManager]::SecurityProtocol = $protocols
 
-    Write-Host "Downloading $asset..." -ForegroundColor White
-
-    # Create install directory
-    if (-not (Test-Path $InstallDir)) {
-        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    # A fresh staging directory of its own with an owner-only DACL, the
+    # way install.ps1 stages its own download. The ACL is best effort: a
+    # filesystem that cannot carry one must not fail the install.
+    $stageDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-setup-$(Get-Random)"
+    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+    try {
+        $stageAcl = New-Object System.Security.AccessControl.DirectorySecurity
+        $stageAcl.SetAccessRuleProtection($true, $false)
+        $stageOwner = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+        $stageAcl.SetOwner($stageOwner)
+        $stageAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $stageOwner, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        Set-Acl -Path $stageDir -AclObject $stageAcl -ErrorAction Stop
+    } catch {
+        Write-Host "  note: could not harden the staging directory ACL: $($_.Exception.Message)"
     }
 
-    $tmpZip = Join-Path $env:TEMP $asset
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZip -UseBasicParsing
+    $installer = Join-Path $stageDir "install.ps1"
+    $failure = $null
+    try {
+        Write-Host "Fetching install.ps1..." -ForegroundColor White
+        Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing -MaximumRedirection 0
+        if (-not (Test-Path -LiteralPath $installer -PathType Leaf) -or
+            (Get-Item -LiteralPath $installer).Length -eq 0) {
+            throw "fetched an empty install.ps1 from $installerUrl"
+        }
+        Write-Ok "install.ps1 fetched"
 
-    # Extract
-    Expand-Archive -Path $tmpZip -DestinationPath $InstallDir -Force
-    Remove-Item $tmpZip -Force
+        Write-Host ""
+        Write-Host "Installing through install.ps1..." -ForegroundColor White
+        # The installer configures nothing (--skip-config): agent configuration
+        # stays this script's interactive step below. It runs in a child host
+        # of the same PowerShell so its exit code is unambiguous and its global
+        # settings do not leak into this session. The pre-seeded exit code
+        # keeps a child that fails to start from reading as success.
+        $hostExe = (Get-Process -Id $PID).Path
+        $global:LASTEXITCODE = 1
+        & $hostExe -NoProfile -ExecutionPolicy Bypass -File $installer "--dir=$InstallDir" --skip-config
+        if ($LASTEXITCODE -ne 0) {
+            throw "install.ps1 exited with $LASTEXITCODE"
+        }
+    } catch {
+        $failure = "$_"
+    } finally {
+        Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+    }
+    if ($failure) {
+        Write-Fail "Installation through install.ps1 failed: $failure"
+        exit 1
+    }
 
     $binaryPath = Join-Path $InstallDir "$BinaryName.exe"
 
     if (-not (Test-Path $binaryPath)) {
-        Write-Fail "Binary not found at $binaryPath after extraction"
+        Write-Fail "Binary not found at $binaryPath after installation"
         exit 1
     }
     Write-Ok "Installed to $binaryPath"

@@ -1156,9 +1156,13 @@ static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_buf
     }
     int n = 0;
     for (int w = 0; w < worker_count; w++) {
-        memcpy(&pairs[n], worker_bufs[w].edges,
-               (size_t)worker_bufs[w].count * sizeof(deferred_edge_t));
-        n += worker_bufs[w].count;
+        /* A worker that emitted no pair never allocated its buffer, and
+         * memcpy's source is declared nonnull (glibc) even for zero bytes. */
+        if (worker_bufs[w].count > 0) {
+            memcpy(&pairs[n], worker_bufs[w].edges,
+                   (size_t)worker_bufs[w].count * sizeof(deferred_edge_t));
+            n += worker_bufs[w].count;
+        }
         deferred_buf_free(&worker_bufs[w]);
     }
     qsort(pairs, (size_t)n, sizeof(deferred_edge_t), cmp_deferred_edge_canonical);

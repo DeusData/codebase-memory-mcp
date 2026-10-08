@@ -89,6 +89,7 @@ Current keys:
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+| `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
 
@@ -200,7 +201,21 @@ process that should share one daemon must see the same value — set it in the
 environment of your MCP client and your shell alike, or a CLI invocation without
 it will coordinate through the default location instead.
 
-Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and one-shot CLI commands use their own current environment without starting the daemon.
+**WSL2 and Windows drives (`/mnt/c`, `/mnt/e`, ...).** `CBM_CACHE_DIR` goes through
+the same private-directory check. With WSL's default automount options, DrvFs
+reports every directory as `0777` and ignores `chmod`, so a cache under
+`/mnt/<drive>` is refused, and the refusal names this remedy. Either turn on
+permission metadata in `/etc/wsl.conf`, then run `wsl --shutdown` and reopen WSL:
+
+```ini
+[automount]
+options = "metadata,umask=22,fmask=11"
+```
+
+or keep the cache on the Linux filesystem (the default `~/.cache/codebase-memory-mcp`),
+which is also much faster than a 9p-mounted Windows drive.
+
+Environment used by daemon-owned components—such as diagnostics, daemon logging, and process-wide indexing resource limits—is captured from the first daemon-backed session that starts the daemon. Later sessions join the existing process and cannot replace those values. To change them, close every daemon-backed session, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running, so its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon — joining an already-running daemon, it inherits that daemon's already-captured values instead.
 
 
 ### Roots that are always refused
@@ -220,6 +235,33 @@ Two limits are worth stating plainly. This constrains *scope*, not
 be indexed and later returned. And the credential list is a denylist, so it
 raises the cost of a mistake rather than closing the class — a directory it does
 not name is permitted.
+
+### Shared / HPC filesystems
+
+On clusters and other shared machines, home directories often live on a network
+filesystem (NFS, Lustre, GPFS, SMB/CIFS), and `~/.cache` is sometimes a symlink
+into a shared tree. Three rules keep CBM working there:
+
+- **Put the cache and the rendezvous on local storage.** Set `CBM_CACHE_DIR` (indexes,
+  `_config.db`) and, if needed, `CBM_RUNTIME_DIR` (the daemon rendezvous) to a
+  local disk you own, for example `/local/scratch/$USER/cbm` or `/tmp/$USER-cbm`.
+  Set the same values in your MCP client's environment and your shell.
+- **Do not route the cache into another account's tree.** A symlinked `~/.cache` is
+  resolved and allowed, but every directory on the *resolved* path must be owned
+  by you or by root. If a parent such as `/shared/fs` belongs to another account,
+  that account can rename or replace anything below it, so CBM refuses the path
+  and names the directory and its owner:
+
+  ```text
+  ... (cache-private) - '/shared/fs' is owned by uid 1234 (alice), not by you (uid 1000) or root; ...
+  ```
+
+  This check has no override. Choose a location with a safe ancestry instead.
+- **Avoid network filesystems for the cache.** The indexes are SQLite databases in
+  WAL mode, which needs shared-memory locking that network filesystems do not
+  provide reliably. On Linux, CBM logs one `daemon.cache_root_network_fs` warning
+  at startup when the cache root is on NFS, Lustre, GPFS, CIFS or SMB2. The cache
+  still works there, but it can be slow, and a database can be corrupted.
 
 ## 5. Agent and Editor Integration Files
 

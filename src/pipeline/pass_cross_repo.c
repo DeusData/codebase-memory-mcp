@@ -13,12 +13,14 @@
 #include "pipeline/pipeline_internal.h" // cbm_route_canon_path
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 
 #include <sqlite3/sqlite3.h>
+#include <yyjson/yyjson.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -153,15 +155,38 @@ static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) 
     return matches;
 }
 
-static bool cr_project_exists(const char *project) {
+typedef enum {
+    CR_PROJECT_USABLE = 0,
+    CR_PROJECT_MISSING, /* no store, or the store is not exactly this project */
+    CR_PROJECT_LEGACY,  /* exact project, but a pre-#768 schema (reindex required) */
+} cr_project_state_t;
+
+/* Classify `project` as a cross-repo input: usable when its store holds
+ * exactly that project AND carries the schema the read-write open in
+ * cr_open_existing_project requires. Checking only the first let a pre-#768
+ * store (still readable, so list_projects shows it) pass validation and the
+ * ["*"] enumeration, then abort the whole run at its write open — after the
+ * source's previous CROSS_* generation had already been deleted. The probe is
+ * read-only, so the legacy store is left untouched for its reindex. (#2133) */
+static cr_project_state_t cr_project_state(const char *project) {
     char path[CR_PATH_BUF];
     if (!cr_db_path(project, path, sizeof(path))) {
-        return false;
+        return CR_PROJECT_MISSING;
     }
     cbm_store_t *store = cbm_store_open_path_query(path);
-    bool exists = cr_store_has_exact_project(store, project);
+    cr_project_state_t state =
+        cr_store_has_exact_project(store, project) ? CR_PROJECT_USABLE : CR_PROJECT_MISSING;
+    if (state == CR_PROJECT_USABLE && !cbm_store_edges_schema_current(store)) {
+        cbm_log_warn("cross_repo.project_unusable", "project", project, "reason",
+                     "pre_768_schema_reindex_required");
+        state = CR_PROJECT_LEGACY;
+    }
     cbm_store_close(store);
-    return exists;
+    return state;
+}
+
+static bool cr_project_exists(const char *project) {
+    return cr_project_state(project) == CR_PROJECT_USABLE;
 }
 
 static cbm_store_t *cr_open_existing_project(const char *project) {
@@ -592,6 +617,80 @@ static bool emit_cross_route_bidirectional(
     return insert_cross_edge(tgt_store, tgt_project, handler_id, tgt_route_id, edge_type, rev, ctx);
 }
 
+/* A resolved route: the matched Route QN plus its handler's name and file. */
+typedef struct {
+    char qn[CR_QN_BUF];
+    char name[CBM_SZ_256];
+    char file[CBM_SZ_512];
+} cr_route_hit_t;
+
+/* Resolve a client call (method + canonical path) to a handled Route in
+ * store: exact method QN, then ANY, then segment-wise template matching,
+ * since a concrete client path ("/v2/orders/123") never exact-matches a
+ * templated route ("/v2/orders/{}") (#523). Returns the handler id, or 0. */
+static int64_t resolve_route_handler(cbm_store_t *store, const char *method, const char *curl,
+                                     cr_route_hit_t *hit, bool *failed, cr_run_context_t *ctx) {
+    snprintf(hit->qn, sizeof(hit->qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
+    int64_t handler_id = find_route_handler(store, hit->qn, hit->name, sizeof(hit->name), hit->file,
+                                            sizeof(hit->file), failed);
+    if (!*failed && handler_id == 0) {
+        snprintf(hit->qn, sizeof(hit->qn), "__route__ANY__%s", curl);
+        handler_id = find_route_handler(store, hit->qn, hit->name, sizeof(hit->name), hit->file,
+                                        sizeof(hit->file), failed);
+    }
+    if (!*failed && handler_id == 0) {
+        handler_id = find_route_handler_fuzzy(store, curl, method[0] ? method : NULL, hit->qn,
+                                              sizeof(hit->qn), hit->name, sizeof(hit->name),
+                                              hit->file, sizeof(hit->file), failed, ctx);
+    }
+    return *failed ? 0 : handler_id;
+}
+
+/* True when the caller's own project has a HANDLES edge into the local Route
+ * node its HTTP_CALLS points at. Sets *failed on a query error. (#1459) */
+static bool route_node_handled(struct sqlite3 *src_db, const char *src_project, int64_t route_id,
+                               bool *failed) {
+    *failed = false;
+    sqlite3_stmt *s = NULL;
+    if (sqlite3_prepare_v2(src_db,
+                           "SELECT 1 FROM edges WHERE project = ?1 AND target_id = ?2 "
+                           "AND type = 'HANDLES' LIMIT 1",
+                           CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+        *failed = true;
+        return false;
+    }
+    if (sqlite3_bind_text(s, SKIP_ONE, src_project, CBM_NOT_FOUND, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_int64(s, PAIR_LEN, route_id) != SQLITE_OK) {
+        sqlite3_finalize(s);
+        *failed = true;
+        return false;
+    }
+    int step_rc = sqlite3_step(s);
+    if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) {
+        *failed = true;
+    }
+    if (sqlite3_finalize(s) != SQLITE_OK) {
+        *failed = true;
+    }
+    return !*failed && step_rc == SQLITE_ROW;
+}
+
+/* Caller-local floor (#1459): a call the caller's own project serves is an
+ * in-project call — another project exposing the same path is no evidence of
+ * a cross-service call. "Served" is the HANDLES edge on the Route node the
+ * HTTP_CALLS points at, or the same method/ANY/template resolution the target
+ * lookup uses, applied to the caller's own store: a method-less fetch() points
+ * at the ANY node while the local handler sits on the GET node. */
+static bool call_served_locally(cbm_store_t *src_store, struct sqlite3 *src_db,
+                                const char *src_project, int64_t route_id, const char *method,
+                                const char *curl, bool *failed, cr_run_context_t *ctx) {
+    if (route_node_handled(src_db, src_project, route_id, failed) || *failed) {
+        return !*failed;
+    }
+    cr_route_hit_t local;
+    return resolve_route_handler(src_store, method, curl, &local, failed, ctx) != 0;
+}
+
 static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *src_project,
                                            cbm_store_t *tgt_store, const char *tgt_project,
                                            cr_run_context_t *ctx) {
@@ -632,35 +731,26 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
             continue;
         }
 
-        /* Build the expected Route QN in the target project (authority-stripped
-         * and param-canonicalized so client url_path matches the server handler
-         * regardless of base URL and framework placeholder syntax). */
-        char route_qn[CR_QN_BUF];
+        /* Canonical client path: authority-stripped and param-canonicalized so
+         * it matches a server handler regardless of base URL and framework
+         * placeholder syntax. */
         char cpath[CBM_SZ_256];
         const char *curl = cbm_route_canon_path(cr_url_path(url_path), cpath, sizeof(cpath));
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method[0] ? method : "ANY", curl);
 
-        char handler_name[CBM_SZ_256] = {0};
-        char handler_file[CBM_SZ_512] = {0};
         bool query_failed = false;
+        bool served_locally = call_served_locally(src_store, src_db, src_project, route_id, method,
+                                                  curl, &query_failed, ctx);
+        if (query_failed) {
+            failed = true;
+            break;
+        }
+        if (served_locally) {
+            continue;
+        }
+
+        cr_route_hit_t hit;
         int64_t handler_id =
-            find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
-                               handler_file, sizeof(handler_file), &query_failed);
-        if (!query_failed && handler_id == 0) {
-            /* Try without method (ANY) */
-            snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s", curl);
-            handler_id = find_route_handler(tgt_store, route_qn, handler_name, sizeof(handler_name),
-                                            handler_file, sizeof(handler_file), &query_failed);
-        }
-        if (!query_failed && handler_id == 0) {
-            /* Exact QN lookup missed. A concrete client path ("/v2/orders/123")
-             * never exact-matches a templated route ("/v2/orders/{}"), so fall
-             * back to segment-wise template matching. (#523) */
-            handler_id =
-                find_route_handler_fuzzy(tgt_store, curl, method[0] ? method : NULL, route_qn,
-                                         sizeof(route_qn), handler_name, sizeof(handler_name),
-                                         handler_file, sizeof(handler_file), &query_failed, ctx);
-        }
+            resolve_route_handler(tgt_store, method, curl, &hit, &query_failed, ctx);
         if (query_failed) {
             failed = true;
             break;
@@ -674,9 +764,8 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         }
 
         if (!emit_cross_route_bidirectional(src_store, src_project, src_db, caller_id, route_id,
-                                            tgt_store, tgt_project, handler_id, route_qn,
-                                            handler_name, handler_file, url_path, method,
-                                            "CROSS_HTTP_CALLS", ctx)) {
+                                            tgt_store, tgt_project, handler_id, hit.qn, hit.name,
+                                            hit.file, url_path, method, "CROSS_HTTP_CALLS", ctx)) {
             failed = !cr_cancel_requested(ctx);
             break;
         }
@@ -1063,8 +1152,33 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
 
 static void free_project_list(char **projects, int count);
 
+/* Remember a store the ["*"] enumeration skipped, so the caller can name it
+ * instead of the run silently covering fewer projects than exist. */
+static bool cr_record_skip(cbm_cross_repo_result_t *result, const char *project,
+                           const char *reason) {
+    if (!result) {
+        return true;
+    }
+    cbm_cross_repo_skip_t *grown =
+        cbm_realloc(CBM_MEM_CLASS_OTHER, result->skipped_projects,
+                    ((size_t)result->skipped_count + 1U) * sizeof(*result->skipped_projects));
+    if (!grown) {
+        return false;
+    }
+    result->skipped_projects = grown;
+    char *name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, project);
+    if (!name) {
+        return false;
+    }
+    grown[result->skipped_count].project = name;
+    grown[result->skipped_count].reason = reason;
+    result->skipped_count++;
+    return true;
+}
+
 /* When target_projects = ["*"], scan the cache directory for all .db files. */
-static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
+static int collect_all_projects(char ***out, cr_run_context_t *ctx,
+                                cbm_cross_repo_result_t *result) {
     *out = NULL;
     const char *dir = cr_cache_dir();
     cbm_dir_t *d = cbm_opendir(dir);
@@ -1094,15 +1208,13 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
             failed = true;
             break;
         }
+        /* Internal stores are exact filenames (cbm_is_internal_cache_db).
+         * Substring filtering would hide legitimate projects such as
+         * orders_config_service or api-wal. */
+        if (!cbm_is_project_index_db(ent->name)) {
+            continue;
+        }
         size_t len = strlen(ent->name);
-        if (len < CR_COL_4 || strcmp(ent->name + len - CR_DB_EXT_LEN, ".db") != 0) {
-            continue;
-        }
-        /* Internal stores are exact filenames. Substring filtering would hide
-         * legitimate projects such as orders_config_service or api-wal. */
-        if (strcmp(ent->name, "_cross_repo.db") == 0 || strcmp(ent->name, "_config.db") == 0) {
-            continue;
-        }
         if (count >= CR_MAX_PROJECTS) {
             failed = true;
             break;
@@ -1114,7 +1226,15 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
         }
         memcpy(project, ent->name, project_length);
         project[project_length] = '\0';
-        if (!cbm_validate_project_name(project) || !cr_project_exists(project)) {
+        if (!cbm_validate_project_name(project)) {
+            continue;
+        }
+        cr_project_state_t state = cr_project_state(project);
+        if (state == CR_PROJECT_LEGACY && !cr_record_skip(result, project, "pre_768_schema")) {
+            failed = true;
+            break;
+        }
+        if (state != CR_PROJECT_USABLE) {
             continue;
         }
         if (count >= cap) {
@@ -1199,6 +1319,106 @@ static int collect_named_projects(const char **targets, int target_count, char *
     return unique_count;
 }
 
+/* ── Last-run marker ─────────────────────────────────────────────── */
+
+static bool cr_status_key(const char *project, char *buf, size_t bufsz) {
+    int written = snprintf(buf, bufsz, "cross_repo_last_run:%s", project);
+    return written > 0 && (size_t)written < bufsz;
+}
+
+/* Record this run in the SOURCE store's store_meta, next to the CROSS_*
+ * edges it just rewrote: a reindex that rebuilds the store drops both
+ * together, so the marker can never outlive the links it describes. Written
+ * once the source's previous CROSS_* generation was cleaned, whatever the
+ * outcome, because from then on the old summary no longer matches the graph.
+ * Project names are validated ([A-Za-z0-9._-]) or "*", so no JSON escaping is
+ * needed. Best-effort: a marker failure is logged, never fails the run. */
+static void cr_record_last_run(cbm_store_t *src_store, const char *project, const char **targets,
+                               int target_count, const cbm_cross_repo_result_t *result) {
+    char key[CR_QN_BUF];
+    if (!cr_status_key(project, key, sizeof(key))) {
+        return;
+    }
+    size_t cap = CR_PROPS_BUF;
+    for (int i = 0; i < target_count; i++) {
+        cap += (targets[i] ? strlen(targets[i]) : 0) + CR_COL_4;
+    }
+    char *json = cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!json) {
+        return;
+    }
+    char when[CBM_SZ_32];
+    time_t now = time(NULL);
+    struct tm tm_now;
+    if (!cbm_gmtime_r(&now, &tm_now) ||
+        strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", &tm_now) == 0) {
+        when[0] = '\0';
+    }
+    const char *outcome = result->failed ? "failed" : result->cancelled ? "cancelled" : "complete";
+    size_t len = (size_t)snprintf(
+        json, cap, "{\"last_run_at\":\"%s\",\"outcome\":\"%s\",\"targets\":[", when, outcome);
+    for (int i = 0; i < target_count && len < cap; i++) {
+        len += (size_t)snprintf(json + len, cap - len, "%s\"%s\"", i ? "," : "",
+                                targets[i] ? targets[i] : "");
+    }
+    if (len < cap) {
+        int total = result->http_edges + result->async_edges + result->channel_edges +
+                    result->grpc_edges + result->graphql_edges + result->trpc_edges;
+        len += (size_t)snprintf(json + len, cap - len,
+                                "],\"projects_scanned\":%d,\"total_cross_edges\":%d,"
+                                "\"skipped_projects\":%d}",
+                                result->projects_scanned, total, result->skipped_count);
+    }
+    if (len >= cap || cbm_store_meta_put(src_store, key, json) != CBM_STORE_OK) {
+        cbm_log_warn("cross_repo.status_unrecorded", "project", project);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+}
+
+bool cbm_cross_repo_add_status_json(struct yyjson_mut_doc *doc, struct yyjson_mut_val *parent,
+                                    cbm_store_t *store, const char *project) {
+    char key[CR_QN_BUF];
+    if (!doc || !parent || !store || !project || !cr_status_key(project, key, sizeof(key))) {
+        return false;
+    }
+    char *raw = NULL;
+    int rc = cbm_store_meta_get(store, key, &raw);
+    yyjson_doc *recorded = rc == CBM_STORE_OK ? yyjson_read(raw, strlen(raw), 0) : NULL;
+    cbm_free(CBM_MEM_CLASS_STORE, raw);
+    yyjson_val *recorded_root = recorded ? yyjson_doc_get_root(recorded) : NULL;
+    yyjson_mut_val *status = NULL;
+    if (yyjson_is_obj(recorded_root)) {
+        status = yyjson_val_mut_copy(doc, recorded_root);
+    }
+    if (!status) {
+        status = yyjson_mut_obj(doc);
+    }
+    yyjson_doc_free(recorded);
+    if (!status) {
+        return false;
+    }
+    /* "never_run" is the honest reading of an absent marker: no run with this
+     * project as the source has completed its cleanup since the store was
+     * (re)built. A target-side run still leaves its CROSS_* edges here. */
+    const char *state = rc == CBM_STORE_NOT_FOUND         ? "never_run"
+                        : yyjson_mut_obj_size(status) > 0 ? "ran"
+                                                          : "unavailable";
+    yyjson_mut_obj_add_str(doc, status, "status", state);
+    return yyjson_mut_obj_add_val(doc, parent, "cross_repo", status);
+}
+
+void cbm_cross_repo_result_free(cbm_cross_repo_result_t *result) {
+    if (!result) {
+        return;
+    }
+    for (int i = 0; i < result->skipped_count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, result->skipped_projects[i].project);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, result->skipped_projects);
+    result->skipped_projects = NULL;
+    result->skipped_count = 0;
+}
+
 static cr_run_status_t add_match_count(int *total, cr_match_result_t matched) {
     *total += matched.count;
     return matched.status;
@@ -1230,7 +1450,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
     int resolved_count = 0;
 
     if (target_count == SKIP_ONE && target_projects[0] && strcmp(target_projects[0], "*") == 0) {
-        resolved_count = collect_all_projects(&resolved, &run);
+        resolved_count = collect_all_projects(&resolved, &run, &result);
     } else {
         resolved_count = collect_named_projects(target_projects, target_count, &resolved, &run);
     }
@@ -1239,17 +1459,33 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         result.failed = !result.cancelled;
         return result;
     }
+    int other_targets = 0;
     for (int i = 0; i < resolved_count; i++) {
         if (cr_cancel_requested(&run)) {
             result.cancelled = true;
             free_project_list(resolved, resolved_count);
             return result;
         }
-        if (strcmp(resolved[i], project) != 0 && !cr_project_exists(resolved[i])) {
+        if (strcmp(resolved[i], project) == 0) {
+            continue;
+        }
+        if (!cr_project_exists(resolved[i])) {
             result.failed = true;
             free_project_list(resolved, resolved_count);
             return result;
         }
+        other_targets++;
+    }
+    /* Nothing but the source itself to match against (a self-only list, or
+     * ["*"] in a store holding only the source). Reporting that as success
+     * with projects_scanned:0 is indistinguishable from "these services share
+     * no routes", and the source's existing CROSS_* edges would be wiped below
+     * with nothing to rebuild them. Fail before any write. (#1133) */
+    if (other_targets == 0) {
+        result.failed = true;
+        result.no_targets = true;
+        free_project_list(resolved, resolved_count);
+        return result;
     }
 
     /* Every input is known to exist before destructive source cleanup. The
@@ -1352,6 +1588,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         result.projects_scanned++;
     }
 
+    cr_record_last_run(src_store, project, target_projects, target_count, &result);
     cbm_store_close(src_store);
 
     free_project_list(resolved, resolved_count);

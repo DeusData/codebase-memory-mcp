@@ -566,6 +566,41 @@ TEST(config_toml_legacy_remove_reports_foreign_table_without_mutation) {
     PASS();
 }
 
+/* #1720: `env_vars` naming only the variables cbm itself forwards is part of
+ * the owned shape (#1562/#1664), so a table Codex rewrote without markers is
+ * adopted; any other forwarded name keeps the table foreign. */
+TEST(config_toml_legacy_remove_adopts_owned_env_vars_only) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, "theme = \"dark\"\n"
+                                  "[mcp_servers.codebase-memory-mcp]\n"
+                                  "command = 'C:\\cbm\\codebase-memory-mcp.exe'\n"
+                                  "env_vars = [\"CBM_CACHE_DIR\"]\n"
+                                  "\n"
+                                  "[tui]\n"
+                                  "keep = true\n"),
+              0);
+    ASSERT_EQ(
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, "theme = \"dark\"\n[tui]\nkeep = true\n");
+
+    const char *foreign = "[mcp_servers.codebase-memory-mcp]\n"
+                          "command = \"/opt/codebase-memory-mcp\"\n"
+                          "env_vars = [\"CBM_CACHE_DIR\", \"HOME\"]\n";
+    ASSERT_EQ(th_write_file(path, foreign), 0);
+    ASSERT_EQ(
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        1);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, foreign);
+    th_cleanup(dir);
+    PASS();
+}
+
 TEST(config_toml_vibe_non_array_and_dotted_conflicts_fail_closed) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
@@ -832,6 +867,181 @@ TEST(config_toml_managed_unbalanced_duplicate_fail_closed) {
     ASSERT_EQ(cbm_toml_remove_managed_block(path, CTE_BEGIN, CTE_END), -1);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, duplicate);
+    th_cleanup(dir);
+    PASS();
+}
+
+/* #2228: the region between the managed markers is not only ours. Codex
+ * Desktop appended its own tables below a block that ended config.toml, the
+ * closing marker stayed the last line, and [mcp_servers.node_repl], [desktop]
+ * and the marketplaces ended up inside the markers. The next install rewrote
+ * the whole region and deleted them, together with a key the user had added
+ * to our own table. */
+static const char *CTE_MCP_BEGIN = "# >>> codebase-memory-mcp MCP >>>";
+static const char *CTE_MCP_END = "# <<< codebase-memory-mcp MCP <<<";
+static const char *CTE_MCP_DECLARATION = "[mcp_servers.codebase-memory-mcp]\n";
+#define CTE_MCP_BEGIN_LINE "# >>> codebase-memory-mcp MCP >>>\n"
+#define CTE_MCP_END_LINE "# <<< codebase-memory-mcp MCP <<<\n"
+#define CTE_MCP_PREFIX                                                        \
+    "model = \"gpt-5\"\n\n[mcp_servers.codegraph]\ncommand = \"codegraph\"\n" \
+    "args = [\"serve\", \"--mcp\"]\n"
+/* The 0.10.4 shape of our block: no env_vars yet. */
+#define CTE_MCP_OLD_TABLE \
+    "[mcp_servers.codebase-memory-mcp]\ncommand = \"/old/codebase-memory-mcp\"\nargs = []\n"
+#define CTE_MCP_NEW_TABLE                                                                    \
+    "[mcp_servers.codebase-memory-mcp]\ncommand = \"/new/codebase-memory-mcp\"\nargs = []\n" \
+    "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+#define CTE_MCP_USER_LINES "# raised for a 1.5 GB index\nstartup_timeout_sec = 90\n"
+#define CTE_MCP_FOREIGN                                                                    \
+    "[mcp_servers.node_repl]\nargs = []\n"                                                 \
+    "command = \"/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl\"\n"  \
+    "startup_timeout_sec = 120\n\n"                                                        \
+    "[mcp_servers.node_repl.env]\nNODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS = \"5000\"\n\n" \
+    "[desktop]\nfollowUpQueueMode = \"steer\"\n\n"                                         \
+    "[marketplaces.openai-codex]\nsource_type = \"git\"\n"                                 \
+    "source = \"https://github.com/openai/codex-plugin-cc.git\"\n"
+#define CTE_MCP_ISSUE2228                                                  \
+    CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE CTE_MCP_USER_LINES \
+        "\n" CTE_MCP_FOREIGN CTE_MCP_END_LINE
+#define CTE_MCP_LEAD_AND_CHILD                                             \
+    CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE                                      \
+        "# pinned by hand\n" CTE_MCP_OLD_TABLE                             \
+        "\n[mcp_servers.codebase-memory-mcp.env]\nRUST_LOG = \"warn\"\n\n" \
+        "[notice]\nhide_full_access_warning = true\n" CTE_MCP_END_LINE     \
+        "\n[profiles.fast]\nmodel = \"o4-mini\"\n"
+
+TEST(config_toml_managed_keeps_foreign_tables_and_user_keys_issue2228) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    /* Our table is rewritten in the current shape and keeps the user's comment
+     * and key; the foreign tables move, byte for byte and in order, to just
+     * after the block, so from now on the markers bracket only our table. */
+    const char *expected = CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE CTE_MCP_USER_LINES
+        CTE_MCP_END_LINE CTE_MCP_FOREIGN;
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, CTE_MCP_ISSUE2228), 0);
+    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, expected);
+    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, expected);
+    th_cleanup(dir);
+    PASS();
+}
+
+/* Control: without foreign content the output is exactly what the whole-region
+ * rewrite always produced — unchanged for the current shape, the new shape for
+ * an old one. */
+TEST(config_toml_managed_control_without_foreign_content_issue2228) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    const char *current = CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE CTE_MCP_END_LINE
+        "\n[profiles.fast]\nmodel = \"o4-mini\"\n";
+    const char *old = CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE CTE_MCP_END_LINE
+        "\n[profiles.fast]\nmodel = \"o4-mini\"\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, current), 0);
+    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, current);
+    ASSERT_EQ(th_write_file(path, old), 0);
+    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, current);
+    th_cleanup(dir);
+    PASS();
+}
+
+/* A comment above our header belongs to no table of ours and moves above the
+ * block; a sub-table of our table is part of our server entry and stays with
+ * it (outside the markers it would collide with the next install). */
+TEST(config_toml_managed_keeps_lead_and_owned_subtable_issue2228) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    const char *expected = CTE_MCP_PREFIX
+        "# pinned by hand\n" CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE
+        "[mcp_servers.codebase-memory-mcp.env]\nRUST_LOG = \"warn\"\n\n" CTE_MCP_END_LINE
+        "[notice]\nhide_full_access_warning = true\n"
+        "\n[profiles.fast]\nmodel = \"o4-mini\"\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, CTE_MCP_LEAD_AND_CHILD), 0);
+    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, expected);
+    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, expected);
+    th_cleanup(dir);
+    PASS();
+}
+
+/* Where ownership cannot be decided, nothing is written: a second [[hooks]]
+ * element we did not declare, or a move that would hand the keys below the
+ * block to a different table. */
+TEST(config_toml_managed_ambiguous_foreign_content_fails_closed_issue2228) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    const char *hook = "[[hooks]]\nevent = \"UserPromptSubmit\"\n"
+                       "command = \"cbm hook-augment --dialect kimi\"\ntimeout = 5\n";
+    const char *extra_element = "# BEGIN codebase-memory-mcp\n"
+                                "[[hooks]]\nevent = \"UserPromptSubmit\"\n"
+                                "command = \"cbm hook-augment --dialect kimi\"\ntimeout = 5\n\n"
+                                "[[hooks]]\nevent = \"Stop\"\ncommand = \"notify-send done\"\n"
+                                "# END codebase-memory-mcp\n";
+    const char *rescoped_tail = "# BEGIN codebase-memory-mcp\n"
+                                "[notice]\nhide_full_access_warning = true\n\n"
+                                "[[hooks]]\nevent = \"UserPromptSubmit\"\n"
+                                "command = \"cbm hook-augment --dialect kimi\"\ntimeout = 5\n"
+                                "# END codebase-memory-mcp\n"
+                                "matcher = \"user\"\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT(cte_assert_unchanged_after_managed_upsert(path, extra_element, hook));
+    ASSERT(cte_assert_unchanged_after_managed_upsert(path, rescoped_tail, hook));
+    th_cleanup(dir);
+    PASS();
+}
+
+/* Uninstall takes only what we declare -- our table with its keys and
+ * sub-tables -- and leaves everything else between the markers in place. */
+TEST(config_toml_managed_remove_owned_keeps_foreign_content_issue2228) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    const char *extra_element = "keep = true\n# BEGIN codebase-memory-mcp\n"
+                                "[[hooks]]\nevent = \"UserPromptSubmit\"\n\n"
+                                "[[hooks]]\nevent = \"Stop\"\n"
+                                "# END codebase-memory-mcp\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, CTE_MCP_ISSUE2228), 0);
+    ASSERT_EQ(
+        cbm_toml_remove_managed_block_owned(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_DECLARATION),
+        0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, CTE_MCP_PREFIX CTE_MCP_FOREIGN);
+
+    ASSERT_EQ(th_write_file(path, CTE_MCP_LEAD_AND_CHILD), 0);
+    ASSERT_EQ(
+        cbm_toml_remove_managed_block_owned(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_DECLARATION),
+        0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, CTE_MCP_PREFIX "# pinned by hand\n"
+                                         "[notice]\nhide_full_access_warning = true\n"
+                                         "\n[profiles.fast]\nmodel = \"o4-mini\"\n");
+
+    ASSERT_EQ(th_write_file(path, extra_element), 0);
+    ASSERT_EQ(cbm_toml_remove_managed_block_owned(path, CTE_BEGIN, CTE_END, "[[hooks]]\n"), -1);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, extra_element);
     th_cleanup(dir);
     PASS();
 }
@@ -1391,6 +1601,55 @@ TEST(config_toml_codex_reports_stable_failure_reasons) {
     PASS();
 }
 
+/* #2044: an installed binary under a profile with a space (C:\Users\First Last)
+ * is rendered single-quoted by cbm_shell_quote_word / cbm_powershell_quote_word.
+ * The hook block must accept exactly what those writers emit, read it back as
+ * owned, and still refuse an unquoted word that the shell would split. */
+TEST(config_toml_codex_accepts_quoted_binary_path_with_spaces) {
+    static const char command[] = "'/Users/First Last/.local/bin/codebase-memory-mcp' hook-augment";
+    static const char command_windows[] = "& 'C:/Users/First Last/AppData/Local/Programs/"
+                                          "codebase-memory-mcp/codebase-memory-mcp.exe' "
+                                          "hook-augment";
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char first[CTE_FILE_CAP];
+    char actual[CTE_FILE_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, "keep = true\n"), 0);
+
+    cbm_toml_codex_hook_failure_t failure = CBM_TOML_CODEX_HOOK_FAILURE_INVALID_ARGUMENT;
+    ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                               CBM_TOML_CODEX_HOOK_UPSERT, 1, &failure),
+              0);
+    ASSERT_STR_EQ(cbm_toml_codex_hook_failure_name(failure), "none");
+    ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                               CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
+              0);
+    ASSERT_EQ(cte_read(path, first, sizeof(first)), 0);
+    ASSERT(strstr(first, "First Last/.local/bin/codebase-memory-mcp' hook-augment") != NULL);
+
+    /* The written block is recognised as ours: a second upsert is a no-op. */
+    ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                               CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, first);
+    ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
+                                               CBM_TOML_CODEX_HOOK_REMOVE, 0, &failure),
+              0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, "keep = true\n");
+
+    /* Unquoted, the space splits the executable word: still refused. */
+    ASSERT_EQ(cte_codex_edit_commands_detailed(
+                  path, "/Users/First Last/.local/bin/codebase-memory-mcp hook-augment",
+                  command_windows, CBM_TOML_CODEX_HOOK_UPSERT, 1, &failure),
+              -1);
+    ASSERT_STR_EQ(cbm_toml_codex_hook_failure_name(failure), "command_render");
+    th_cleanup(dir);
+    PASS();
+}
+
 TEST(config_toml_codex_preserves_bom_crlf_and_foreign_aot) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
@@ -1490,6 +1749,11 @@ SUITE(config_toml_edit) {
     RUN_TEST(config_toml_managed_remove);
     RUN_TEST(config_toml_managed_idempotent);
     RUN_TEST(config_toml_managed_unbalanced_duplicate_fail_closed);
+    RUN_TEST(config_toml_managed_keeps_foreign_tables_and_user_keys_issue2228);
+    RUN_TEST(config_toml_managed_control_without_foreign_content_issue2228);
+    RUN_TEST(config_toml_managed_keeps_lead_and_owned_subtable_issue2228);
+    RUN_TEST(config_toml_managed_ambiguous_foreign_content_fails_closed_issue2228);
+    RUN_TEST(config_toml_managed_remove_owned_keeps_foreign_content_issue2228);
     RUN_TEST(config_toml_vibe_insert_among_other_tables);
     RUN_TEST(config_toml_vibe_replace_target_preserves_comments_tables);
     RUN_TEST(config_toml_vibe_owned_table_installs_idempotently_and_removes_exact_state);
@@ -1506,6 +1770,8 @@ SUITE(config_toml_edit) {
     RUN_TEST(config_toml_codex_accepts_v0102_managed_windows_crlf);
     RUN_TEST(config_toml_codex_rejects_ambiguous_inline_byte_identically);
     RUN_TEST(config_toml_codex_reports_stable_failure_reasons);
+    RUN_TEST(config_toml_codex_accepts_quoted_binary_path_with_spaces);
     RUN_TEST(config_toml_codex_preserves_bom_crlf_and_foreign_aot);
     RUN_TEST(config_toml_legacy_remove_reports_foreign_table_without_mutation);
+    RUN_TEST(config_toml_legacy_remove_adopts_owned_env_vars_only);
 }

@@ -26,14 +26,23 @@ CI venue would never see.
 
 .PARAMETER SkipGate
 Sweep and report, but do not fail when free space is short. For inspection only.
+
+.PARAMETER CheckOnly
+Assert the free-space floor without enumerating or removing residue. Isolated
+runs use fresh checkout/build/temp roots and must not sweep another run's files.
+Cannot be combined with SkipGate.
 #>
 [CmdletBinding()]
 param(
     [double]$MinFreeGB = 14,
-    [switch]$SkipGate
+    [switch]$SkipGate,
+    [switch]$CheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
+if ($CheckOnly -and $SkipGate) {
+    throw 'CheckOnly cannot be combined with SkipGate: the disk floor is required.'
+}
 
 function Get-FreeGB {
     [math]::Round((Get-PSDrive C).Free / 1GB, 2)
@@ -56,21 +65,23 @@ function Remove-ResidueDir([string]$Path) {
 $before = Get-FreeGB
 $removed = 0
 $failed = @()
-$roots = @($env:USERPROFILE, $env:TEMP) | Where-Object { $_ } | Select-Object -Unique
-
-foreach ($root in $roots) {
-    if (-not (Test-Path -LiteralPath $root)) { continue }
-    Get-ChildItem -LiteralPath $root -Directory -Filter 'cbm-*' -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            if (Remove-ResidueDir $_.FullName) {
-                $removed++
-            } else {
-                $failed += $_.FullName
+if (-not $CheckOnly) {
+    $roots = @($env:USERPROFILE, $env:TEMP) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        Get-ChildItem -LiteralPath $root -Directory -Filter 'cbm-*' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                if (Remove-ResidueDir $_.FullName) {
+                    $removed++
+                } else {
+                    $failed += $_.FullName
+                }
             }
-        }
+    }
 }
 
 $after = Get-FreeGB
+if ($CheckOnly) { Write-Output 'preflight-mode=check-only' }
 Write-Output "residue-dirs-removed=$removed residue-dirs-failed=$($failed.Count) free-gb-before=$before free-gb-after=$after"
 foreach ($f in $failed) { Write-Warning "could not sweep: $f" }
 

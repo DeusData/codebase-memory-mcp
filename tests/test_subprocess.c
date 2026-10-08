@@ -9,21 +9,34 @@
  *      (SKIP_PLATFORM on Windows, which lacks it).
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/platform.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/git_env.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#if !defined(SYS_close_range) && (defined(__x86_64__) || defined(__aarch64__))
+#define SYS_close_range 436
+#endif
+#endif
 #else
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #include "../src/foundation/win_utf8.h"
 #endif
@@ -120,6 +133,41 @@ TEST(subprocess_run_exit_nonzero) {
     cbm_proc_result_t r = run_sh("exit 7", 0);
     ASSERT_EQ(r.outcome, CBM_PROC_EXIT_NONZERO);
     ASSERT_EQ(r.exit_code, 7);
+    PASS();
+#endif
+}
+
+/* A short command can finish before its parent checks the child's process
+ * group; macOS then answers ESRCH for the exited, unreaped child. That is a
+ * finished run with its own exit status, never a spawn failure (macOS CI read
+ * `git write-tree` as SPAWN_FAILED errno 3 under load). The seam holds the
+ * parent until the child has exited: that order, deterministically. */
+TEST(subprocess_run_child_exited_before_group_check) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX process groups");
+#else
+    cbm_subprocess_hold_parent_until_child_exits_for_testing(1);
+    cbm_proc_result_t r = run_sh("exit 3", 0);
+    cbm_subprocess_hold_parent_until_child_exits_for_testing(0);
+    ASSERT_EQ(r.outcome, CBM_PROC_EXIT_NONZERO);
+    ASSERT_EQ(r.exit_code, 3);
+    PASS();
+#endif
+}
+
+/* The window before that: macOS answers ESRCH for a child that has started
+ * exiting, before waitid can report it. A non-blocking "has it exited?"
+ * probe said no there, and macos-15-intel CI read a short `git config` as
+ * SPAWN_FAILED errno 3. The seam makes the parent observe exactly that. */
+TEST(subprocess_run_child_exiting_at_group_check) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX process groups");
+#else
+    cbm_subprocess_observe_exiting_child_for_testing(1);
+    cbm_proc_result_t r = run_sh("exit 3", 0);
+    cbm_subprocess_observe_exiting_child_for_testing(0);
+    ASSERT_EQ(r.outcome, CBM_PROC_EXIT_NONZERO);
+    ASSERT_EQ(r.exit_code, 3);
     PASS();
 #endif
 }
@@ -1008,6 +1056,94 @@ TEST(subprocess_posix_child_closes_unrelated_descriptors) {
 #endif
 }
 
+/* #1484: the child's close-inherited-descriptors step must not cost
+ * O(RLIMIT_NOFILE) syscalls. The seam runs the exact child routine in this
+ * process against two descriptors parked at the TOP of the descriptor table
+ * (nothing else lives there), and reports which strategy did the work. On
+ * Linux that must be close_range(2) whenever the kernel has it -- the per-fd
+ * loop is the bug. The ENOSYS-injected leg proves the fallback still closes. */
+#ifndef _WIN32
+static bool subprocess_fd_is_closed(int fd) {
+    return fcntl(fd, F_GETFD) == -1 && errno == EBADF;
+}
+
+static cbm_fd_close_strategy_t subprocess_expected_close_strategy(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    /* Probe the kernel on an empty range: an old kernel (< 5.9) or a seccomp
+     * filter without it answers ENOSYS/EPERM, and then the loop is correct. */
+    long probe = syscall(SYS_close_range, ~0U, ~0U, 0U);
+    return (probe == 0 || errno == EINVAL) ? CBM_FD_CLOSE_RANGE : CBM_FD_CLOSE_LOOP;
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    return CBM_FD_CLOSEFROM;
+#else
+    return CBM_FD_CLOSE_LOOP;
+#endif
+}
+
+/* Park two non-CLOEXEC descriptors near the top of the table; returns the lower
+ * of the two and hands back the original (low) descriptor in *keep_low. The
+ * kernel may cap the table below _SC_OPEN_MAX (macOS: kern.maxfilesperproc),
+ * so the start point halves until F_DUPFD accepts it. */
+static int subprocess_park_high_fds(int *keep_low) {
+    char path[] = "/tmp/cbm-subprocess-highfd-XXXXXX";
+    int low = cbm_mkstemp(path);
+    if (low < 0) {
+        return -1;
+    }
+    (void)unlink(path);
+    long top = sysconf(_SC_OPEN_MAX);
+    if (top <= 0 || top > 1048576L) {
+        top = 1048576L;
+    }
+    int high = -1;
+    for (long base = top - 4; high < 0 && base > 64; base /= 2) {
+        high = fcntl(low, F_DUPFD, (int)base);
+    }
+    int higher = high >= 0 ? fcntl(low, F_DUPFD, high + 1) : -1;
+    if (higher != high + 1) {
+        (void)close(low);
+        if (high >= 0) {
+            (void)close(high);
+        }
+        if (higher >= 0) {
+            (void)close(higher);
+        }
+        return -1;
+    }
+    *keep_low = low;
+    return high;
+}
+#endif
+
+TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fork+exec descriptor closing; Windows uses a handle allow-list");
+#else
+    for (int inject_enosys = 0; inject_enosys <= 1; inject_enosys++) {
+        int keep_low = -1;
+        int high = subprocess_park_high_fds(&keep_low);
+        ASSERT_TRUE(high > STDERR_FILENO);
+        cbm_subprocess_force_close_range_enosys_for_testing(inject_enosys != 0);
+        /* The loop bound covers exactly the parked pair; close_range has none. */
+        cbm_fd_close_strategy_t used =
+            cbm_subprocess_close_fds_from_for_testing(high, (long)high + 2);
+        cbm_subprocess_force_close_range_enosys_for_testing(false);
+        bool closed = subprocess_fd_is_closed(high) && subprocess_fd_is_closed(high + 1);
+        bool low_survived = fcntl(keep_low, F_GETFD) >= 0;
+        (void)close(keep_low);
+
+        ASSERT_TRUE(closed);
+        ASSERT_TRUE(low_survived); /* only descriptors >= lowfd are touched */
+        cbm_fd_close_strategy_t expected = subprocess_expected_close_strategy();
+        if (inject_enosys && expected == CBM_FD_CLOSE_RANGE) {
+            expected = CBM_FD_CLOSE_LOOP; /* kernel "lacks" it: the fallback must run */
+        }
+        ASSERT_EQ((int)used, (int)expected);
+    }
+    PASS();
+#endif
+}
+
 TEST(subprocess_root_exit_drains_surviving_descendant) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group descendant probe; native Windows coverage pending");
@@ -1256,7 +1392,967 @@ TEST(win_cmd_payload_rejects_short_relative_and_non_cmd_paths) {
     PASS();
 }
 
+/* ── Git child environment (#2003) ────────────────────────────────────────────
+ * strip_git_repo_env / cbm_popen_git drop every variable of
+ * `git rev-parse --local-env-vars` from the CHILD only: the parent keeps its
+ * environment, other variables pass through, and without the flag a child
+ * still inherits everything. The test sets the variables itself (a runner may
+ * clear them at startup) and restores them before asserting. */
+#ifndef _WIN32
+typedef struct {
+    char *saved[CBM_GIT_REPO_ENV_VAR_COUNT];
+    bool present[CBM_GIT_REPO_ENV_VAR_COUNT];
+} gitenv_snapshot_t;
+
+static void gitenv_enter(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        const char *v = getenv(cbm_git_repo_env_vars[i]);
+        snap->present[i] = v != NULL;
+        snap->saved[i] = v ? strdup(v) : NULL;
+        setenv(cbm_git_repo_env_vars[i], "/cbm-decoy-repo", 1);
+    }
+    setenv("CBM_GITENV_KEEP", "kept", 1);
+}
+
+static void gitenv_leave(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        if (snap->present[i]) {
+            setenv(cbm_git_repo_env_vars[i], snap->saved[i], 1);
+        } else {
+            unsetenv(cbm_git_repo_env_vars[i]);
+        }
+        free(snap->saved[i]);
+    }
+    unsetenv("CBM_GITENV_KEEP");
+}
+
+/* exit 0: no git repo-local var is set and CBM_GITENV_KEEP=kept; exit 3: a git
+ * var leaked; exit 4: the unrelated variable was lost. */
+static void gitenv_probe_script(char *buf, size_t cap) {
+    size_t n = (size_t)snprintf(buf, cap, "[ \"$CBM_GITENV_KEEP\" = kept ] || exit 4;");
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT && n < cap; i++) {
+        n += (size_t)snprintf(buf + n, cap - n, " [ -z \"${%s+x}\" ] || exit 3;",
+                              cbm_git_repo_env_vars[i]);
+    }
+    if (n < cap) {
+        (void)snprintf(buf + n, cap - n, " exit 0");
+    }
+}
+
+static int gitenv_spawn_probe(bool strip) {
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    cbm_proc_opts_t opts = {.bin = "/bin/sh", .argv = argv, .strip_git_repo_env = strip};
+    cbm_proc_result_t r;
+    if (cbm_subprocess_run(&opts, &r) != 0) {
+        return -1;
+    }
+    return r.exit_code;
+}
+#endif
+
+TEST(subprocess_strip_git_repo_env_is_per_child) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    int stripped = gitenv_spawn_probe(true);
+    int inherited = gitenv_spawn_probe(false);
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_EQ(stripped, 0);   /* git vars gone, CBM_GITENV_KEEP passed through */
+    ASSERT_EQ(inherited, 3);  /* without the flag the child inherits as before */
+    ASSERT_TRUE(parent_kept); /* the parent environment is never modified */
+    PASS();
+#endif
+}
+
+TEST(popen_git_strips_repo_env_and_reports_exit_status) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    char cmd[2200];
+    snprintf(cmd, sizeof(cmd), "echo probe; %s", script);
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    FILE *fp = cbm_popen_git(cmd);
+    char line[64] = {0};
+    bool got_line = fp && fgets(line, sizeof(line), fp) != NULL;
+    int status = fp ? cbm_pclose(fp) : -1;
+    FILE *fail = cbm_popen_git("exit 7");
+    int fail_status = fail ? cbm_pclose(fail) : -1;
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_TRUE(got_line);
+    ASSERT_STR_EQ(line, "probe\n");
+    ASSERT_TRUE(status >= 0 && WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_TRUE(fail_status >= 0 && WIFEXITED(fail_status));
+    ASSERT_EQ(WEXITSTATUS(fail_status), 7); /* pclose() semantics: raw wait status */
+    ASSERT_TRUE(parent_kept);
+    PASS();
+#endif
+}
+
+/* Native fixed-byte child and independent stdout-capture contract tests. */
+enum { SP_STDOUT_BYTES = 2305, SP_STDOUT_PATH = 1024 };
+static const char *sp_stdout_test_binary;
+static const char sp_stderr_text[] = "stderr-first\nstderr-tail";
+static const char sp_stdout_text[] = "stdout-only\n";
+
+static void sp_stdout_payload(unsigned char bytes[SP_STDOUT_BYTES]) {
+    for (int i = 0; i < SP_STDOUT_BYTES; i++)
+        bytes[i] = (unsigned char)('a' + i % 26);
+    bytes[0] = 'B';
+    bytes[1] = '\0';
+    bytes[2] = '\r';
+    bytes[3] = '\n';
+    bytes[4] = '\n';
+    bytes[1022] = 'X';
+    bytes[1023] = '\r';
+    bytes[1024] = '\n';
+    bytes[2048] = '\0';
+    bytes[SP_STDOUT_BYTES - 1] = 'Z'; /* final byte has no newline */
+}
+
+/* Called before normal harness setup. Normal entry remembers argv[0], whose
+ * storage lasts through main; the private exact argv grammar never runs suites. */
+static int sp_stdin_probe(int argc, char **argv);
+const char *tf_runner_image(int argc, char **argv); /* test_main.c */
+int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv);
+int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv) {
+    if (argc >= 2 && argv && strcmp(argv[1], "__cbm_subprocess_stdin_probe") == 0)
+        return sp_stdin_probe(argc, argv);
+    if (argc < 2 || !argv || strcmp(argv[1], "__cbm_subprocess_stdout_probe") != 0) {
+        sp_stdout_test_binary = tf_runner_image(argc, argv);
+        return -1;
+    }
+    if (argc != 4 || (strcmp(argv[2], "binary") != 0 && strcmp(argv[2], "text") != 0 &&
+                      strcmp(argv[2], "empty") != 0))
+        return 91;
+#ifdef _WIN32
+    if (_setmode(cbm_fileno(stdout), _O_BINARY) == -1 ||
+        _setmode(cbm_fileno(stderr), _O_BINARY) == -1)
+        return 92;
+#endif
+    if (argv[3][0]) {
+        /* A state barrier, not a transient timing assertion. The deadline only
+         * bounds cleanup if the parent fails before releasing this child. */
+        uint64_t deadline = cbm_now_ms() + 30000U;
+        while (!cbm_file_exists(argv[3])) {
+            if (cbm_now_ms() >= deadline)
+                return 93;
+            cbm_usleep(1000);
+        }
+    }
+    if (strcmp(argv[2], "binary") == 0) {
+        unsigned char bytes[SP_STDOUT_BYTES];
+        sp_stdout_payload(bytes);
+        if (fwrite(bytes, 1, sizeof(bytes), stdout) != sizeof(bytes))
+            return 94;
+    } else if (strcmp(argv[2], "text") == 0) {
+        if (fwrite(sp_stdout_text, 1, sizeof(sp_stdout_text) - 1, stdout) !=
+            sizeof(sp_stdout_text) - 1)
+            return 94;
+    }
+    if (fflush(stdout) != 0)
+        return 94;
+    if (fwrite(sp_stderr_text, 1, sizeof(sp_stderr_text) - 1, stderr) !=
+            sizeof(sp_stderr_text) - 1 ||
+        fflush(stderr) != 0)
+        return 95;
+    return 0;
+}
+
+typedef struct {
+    char root[SP_STDOUT_PATH];
+    char out[SP_STDOUT_PATH];
+    char log[SP_STDOUT_PATH];
+    char other[SP_STDOUT_PATH];
+    char gate[SP_STDOUT_PATH];
+} sp_stdout_fixture_t;
+
+static bool sp_stdout_path(char *out, const char *root, const char *leaf) {
+    int n = snprintf(out, SP_STDOUT_PATH, "%s/%s", root, leaf);
+    return n > 0 && n < SP_STDOUT_PATH;
+}
+
+static bool sp_stdout_fixture_open(sp_stdout_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    if (!sp_stdout_test_binary || !sp_stdout_test_binary[0])
+        return false;
+    const char *root = th_mktempdir("cbm-sp-stdout");
+    if (!root)
+        return false;
+    int n = snprintf(fx->root, sizeof(fx->root), "%s", root);
+    bool ok = n > 0 && (size_t)n < sizeof(fx->root) && sp_stdout_path(fx->out, root, "out.bin") &&
+              sp_stdout_path(fx->log, root, "err.log") &&
+              sp_stdout_path(fx->other, root, "other.bin") &&
+              sp_stdout_path(fx->gate, root, "release");
+    if (!ok)
+        (void)th_rmtree(root);
+    return ok;
+}
+
+static bool sp_stdout_file_equals(const char *path, const void *bytes, size_t count) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file)
+        return false;
+    const unsigned char *expected = bytes;
+    bool equal = true;
+    for (size_t i = 0; i < count; i++) {
+        int byte = fgetc(file);
+        if (byte == EOF || (unsigned char)byte != expected[i]) {
+            equal = false;
+            break;
+        }
+    }
+    if (equal)
+        equal = fgetc(file) == EOF && !ferror(file);
+    if (fclose(file) != 0)
+        equal = false;
+    return equal;
+}
+
+typedef struct {
+    char lines[4][64];
+    int count;
+    bool overflow;
+} sp_stdout_logs_t;
+
+static void sp_stdout_log(const char *line, void *opaque) {
+    sp_stdout_logs_t *log = opaque;
+    if (log->count >= 4 || strlen(line) >= sizeof(log->lines[0])) {
+        log->overflow = true;
+    } else {
+        memcpy(log->lines[log->count], line, strlen(line) + 1);
+    }
+    log->count++;
+}
+
+static bool sp_stdout_stderr_only(const sp_stdout_logs_t *log) {
+    return !log->overflow && log->count == 2 && strcmp(log->lines[0], "stderr-first") == 0 &&
+           strcmp(log->lines[1], "stderr-tail") == 0;
+}
+
+static int sp_stdout_run(const char *mode, cbm_proc_opts_t *opts, cbm_proc_result_t *result) {
+    const char *argv[] = {sp_stdout_test_binary, "__cbm_subprocess_stdout_probe", mode, "", NULL};
+    opts->bin = sp_stdout_test_binary;
+    opts->argv = argv;
+    return cbm_subprocess_run(opts, result);
+}
+
+static bool sp_stdout_poll_terminal(cbm_subprocess_t *process, cbm_proc_result_t *result,
+                                    uint64_t deadline) {
+    do {
+        cbm_proc_poll_t state = cbm_subprocess_poll(process, result);
+        if (state == CBM_PROC_POLL_TERMINAL)
+            return true;
+        if (state == CBM_PROC_POLL_ERROR)
+            return false;
+        cbm_usleep(1000);
+    } while (cbm_now_ms() < deadline);
+    return false;
+}
+
+/* The finite child normally exits immediately. On a RED path, cancel and drain
+ * before destroying; never pass a live handle to destroy. */
+static bool sp_stdout_reap(cbm_subprocess_t *process, cbm_proc_result_t *result) {
+    bool terminal = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 10000U);
+    bool cleaned = terminal;
+    if (!cleaned) {
+        (void)cbm_subprocess_request_cancel(process);
+        cleaned = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 4000U);
+    }
+    if (cleaned)
+        cbm_subprocess_destroy(process);
+    return terminal;
+}
+
+TEST(subprocess_stdout_null_preserves_merged_log) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    sp_stdout_logs_t logs = {0};
+    cbm_proc_opts_t opts = {
+        .log_file = fx.log, .stdout_file = NULL, .on_log_line = sp_stdout_log, .log_ud = &logs};
+    cbm_proc_result_t result = {0};
+    int rc = sp_stdout_run("text", &opts, &result);
+    const char expected[] = "stdout-only\nstderr-first\nstderr-tail";
+    bool exact = sp_stdout_file_equals(fx.log, expected, sizeof(expected) - 1);
+    bool callbacks =
+        !logs.overflow && logs.count == 3 && strcmp(logs.lines[0], "stdout-only") == 0 &&
+        strcmp(logs.lines[1], "stderr-first") == 0 && strcmp(logs.lines[2], "stderr-tail") == 0;
+    int cleanup = th_rmtree(fx.root);
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(callbacks);
+    PASS();
+}
+
+TEST(subprocess_stdout_capture_exact_binary_and_stderr_isolation) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    sp_stdout_logs_t logs = {0};
+    cbm_proc_opts_t opts = {
+        .stdout_file = fx.out, .log_file = fx.log, .on_log_line = sp_stdout_log, .log_ud = &logs};
+    cbm_proc_result_t result = {0};
+    int rc = sp_stdout_run("binary", &opts, &result);
+    unsigned char expected[SP_STDOUT_BYTES];
+    sp_stdout_payload(expected);
+    bool exact = sp_stdout_file_equals(fx.out, expected, sizeof(expected));
+    bool stderr_exact = sp_stdout_file_equals(fx.log, sp_stderr_text, sizeof(sp_stderr_text) - 1);
+    bool callbacks = sp_stdout_stderr_only(&logs);
+    int cleanup = th_rmtree(fx.root);
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(stderr_exact);
+    ASSERT_TRUE(callbacks);
+    PASS();
+}
+
+TEST(subprocess_stdout_capture_without_log_discards_only_stderr) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    sp_stdout_logs_t logs = {0};
+    cbm_proc_opts_t opts = {
+        .stdout_file = fx.out, .log_file = NULL, .on_log_line = sp_stdout_log, .log_ud = &logs};
+    cbm_proc_result_t result = {0};
+    int rc = sp_stdout_run("binary", &opts, &result);
+    unsigned char expected[SP_STDOUT_BYTES];
+    sp_stdout_payload(expected);
+    bool exact = sp_stdout_file_equals(fx.out, expected, sizeof(expected));
+    bool absent_log = !cbm_file_exists(fx.log);
+    int cleanup = th_rmtree(fx.root);
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(absent_log);
+    ASSERT_EQ(logs.count, 0);
+    PASS();
+}
+
+TEST(subprocess_stdout_empty_capture_survives_log_deletion) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    sp_stdout_logs_t logs = {0};
+    cbm_proc_opts_t opts = {.stdout_file = fx.out,
+                            .log_file = fx.log,
+                            .on_log_line = sp_stdout_log,
+                            .log_ud = &logs,
+                            .delete_log_on_exit = true};
+    cbm_proc_result_t result = {0};
+    int rc = sp_stdout_run("empty", &opts, &result);
+    bool exact_empty = sp_stdout_file_equals(fx.out, "", 0);
+    bool deleted_log = !cbm_file_exists(fx.log);
+    bool callbacks = sp_stdout_stderr_only(&logs);
+    int cleanup = th_rmtree(fx.root);
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(exact_empty);
+    ASSERT_TRUE(deleted_log);
+    ASSERT_TRUE(callbacks);
+    PASS();
+}
+
+TEST(subprocess_stdout_capture_owns_caller_path) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    char caller_path[SP_STDOUT_PATH];
+    memcpy(caller_path, fx.out, strlen(fx.out) + 1);
+    const char sentinel[] = "untouched-alternate-file";
+    int sentinel_rc = th_write_file(fx.other, sentinel);
+    const char *argv[] = {sp_stdout_test_binary, "__cbm_subprocess_stdout_probe", "binary", fx.gate,
+                          NULL};
+    cbm_proc_opts_t opts = {
+        .bin = sp_stdout_test_binary, .argv = argv, .stdout_file = caller_path, .log_file = fx.log};
+    cbm_subprocess_t *process = NULL;
+    int spawn_rc = sentinel_rc == 0 ? cbm_subprocess_spawn(&opts, &process) : -1;
+    bool got_process = process != NULL;
+    /* The child cannot emit before this mutation: its gate is still absent. */
+    memcpy(caller_path, fx.other, strlen(fx.other) + 1);
+    int gate_rc = th_write_file(fx.gate, "release");
+    cbm_proc_result_t result = {0};
+    bool terminal = process && sp_stdout_reap(process, &result);
+    unsigned char expected[SP_STDOUT_BYTES];
+    sp_stdout_payload(expected);
+    bool exact = sp_stdout_file_equals(fx.out, expected, sizeof(expected));
+    bool alternate_unchanged = sp_stdout_file_equals(fx.other, sentinel, sizeof(sentinel) - 1);
+    int cleanup = th_rmtree(fx.root);
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_EQ(sentinel_rc, 0);
+    ASSERT_EQ(spawn_rc, 0);
+    ASSERT_TRUE(got_process);
+    ASSERT_EQ(gate_rc, 0);
+    ASSERT_TRUE(terminal);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(alternate_unchanged);
+    PASS();
+}
+
+TEST(subprocess_stdout_rejects_invalid_capture_paths_and_cleans_up) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    char missing_parent[SP_STDOUT_PATH];
+    bool path_ok = sp_stdout_path(missing_parent, fx.root, "missing-parent/out.bin");
+    const char *paths[] = {"", fx.log, fx.root, missing_parent};
+    bool rejected[4] = {false};
+    bool null_handle[4] = {false};
+    bool cleanup_terminal[4] = {true, true, true, true};
+    if (path_ok) {
+        for (int i = 0; i < 4; i++) {
+            const char *argv[] = {sp_stdout_test_binary, "__cbm_subprocess_stdout_probe", "text",
+                                  "", NULL};
+            cbm_proc_opts_t opts = {.bin = sp_stdout_test_binary,
+                                    .argv = argv,
+                                    .stdout_file = paths[i],
+                                    .log_file = fx.log};
+            cbm_subprocess_t *process = NULL;
+            int rc = cbm_subprocess_spawn(&opts, &process);
+            rejected[i] = rc == -1;
+            null_handle[i] = process == NULL;
+            if (process) {
+                cbm_proc_result_t ignored;
+                cleanup_terminal[i] = sp_stdout_reap(process, &ignored);
+            }
+        }
+    }
+    int cleanup = th_rmtree(fx.root);
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(path_ok);
+    for (int i = 0; i < 4; i++) {
+        ASSERT_TRUE(cleanup_terminal[i]);
+        ASSERT_TRUE(rejected[i]);
+        ASSERT_TRUE(null_handle[i]);
+    }
+    PASS();
+}
+
+/* Independent stdin_file contract fixtures. No shell and no owned heap allocation. */
+enum { SP_STDIN_BYTES = 4099 };
+static const char sp_stdin_out_sentinel[] = "output-sentinel";
+static const char sp_stdin_log_sentinel[] = "log-sentinel";
+
+static void sp_stdin_payload(unsigned char bytes[SP_STDIN_BYTES]) {
+    for (int i = 0; i < SP_STDIN_BYTES; i++)
+        bytes[i] = (unsigned char)(i % 256);
+    bytes[0] = 'I';
+    bytes[1] = 0;
+    bytes[2] = '\r';
+    bytes[3] = '\n';
+    bytes[4] = '\n';
+    bytes[5] = 0x1a; /* Windows text-mode EOF must not truncate the fixture. */
+    bytes[1023] = 0;
+    bytes[SP_STDIN_BYTES - 1] = 0x7f; /* No final LF. */
+}
+
+static bool sp_stdin_write(const char *path, const void *bytes, size_t count) {
+    FILE *file = cbm_fopen(path, "wb");
+    if (!file)
+        return false;
+    bool ok = count == 0 || fwrite(bytes, 1, count, file) == count;
+    if (fclose(file) != 0)
+        ok = false;
+    return ok;
+}
+
+static bool sp_stdin_clean(int rc, const cbm_proc_result_t *result) {
+    return rc == 0 && result->outcome == CBM_PROC_CLEAN && result->exit_code == 0 &&
+           result->tree_quiesced && !result->supervision_failed;
+}
+
+/* Do not remove inputs/captures following failed containment. Terminal handles
+ * may be destroyed, but a nonquiescent tree's fixture is intentionally retained. */
+static bool sp_stdin_safe_run(int rc, const cbm_proc_result_t *result) {
+    return result->tree_quiesced ||
+           (rc == -1 && result->outcome == CBM_PROC_SPAWN_FAILED && !result->supervision_failed);
+}
+
+static bool sp_stdin_finish(cbm_subprocess_t *process, cbm_proc_result_t *result) {
+    bool terminal = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 10000U);
+    if (!terminal) {
+        (void)cbm_subprocess_request_cancel(process);
+        terminal = sp_stdout_poll_terminal(process, result, cbm_now_ms() + 4000U);
+    }
+    if (terminal)
+        cbm_subprocess_destroy(process);
+    return terminal && result->tree_quiesced && !result->supervision_failed;
+}
+
+static int sp_stdin_run(cbm_proc_opts_t *opts, cbm_proc_result_t *result) {
+    const char *argv[] = {sp_stdout_test_binary, "__cbm_subprocess_stdin_probe", "echo", "", NULL};
+    opts->bin = sp_stdout_test_binary;
+    opts->argv = argv;
+    opts->quiet_timeout_ms = 10000; /* Finite containment guard, not a timing oracle. */
+    return cbm_subprocess_run(opts, result);
+}
+
+typedef struct {
+    bool prepared;
+    bool rejected;
+    bool no_handle;
+    bool outputs_unchanged;
+    bool no_child_marker;
+    bool reusable;
+    bool safe_cleanup;
+} sp_stdin_rejection_t;
+
+static sp_stdin_rejection_t sp_stdin_check_rejection(const char *binary, const char *input,
+                                                     const char *out, const char *log,
+                                                     const char *marker,
+                                                     const char *valid_empty_input) {
+    sp_stdin_rejection_t check = {.safe_cleanup = true};
+    (void)cbm_unlink(marker);
+    check.prepared =
+        sp_stdin_write(out, sp_stdin_out_sentinel, sizeof(sp_stdin_out_sentinel) - 1) &&
+        sp_stdin_write(log, sp_stdin_log_sentinel, sizeof(sp_stdin_log_sentinel) - 1) &&
+        sp_stdout_file_equals(valid_empty_input, "", 0) && !cbm_file_exists(marker);
+    if (!check.prepared)
+        return check;
+    const char *argv[] = {binary, "__cbm_subprocess_stdin_probe", "stamp", marker, NULL};
+    cbm_proc_opts_t opts = {.bin = binary,
+                            .argv = argv,
+                            .stdin_file = input,
+                            .stdout_file = out,
+                            .log_file = log,
+                            .quiet_timeout_ms = 10000};
+    cbm_subprocess_t *process = NULL;
+    int rc = cbm_subprocess_spawn(&opts, &process);
+    check.rejected = rc == -1;
+    check.no_handle = process == NULL;
+    if (process) {
+        cbm_proc_result_t result = {0};
+        check.safe_cleanup = sp_stdin_finish(process, &result);
+    }
+    if (!check.safe_cleanup)
+        return check;
+    check.outputs_unchanged =
+        sp_stdout_file_equals(out, sp_stdin_out_sentinel, sizeof(sp_stdin_out_sentinel) - 1) &&
+        sp_stdout_file_equals(log, sp_stdin_log_sentinel, sizeof(sp_stdin_log_sentinel) - 1);
+    check.no_child_marker = !cbm_file_exists(marker);
+
+    /* A real empty regular file remains a usable input after each rejection.
+     * This control also passes when the API-only baseline ignores stdin_file. */
+    const char *valid_argv[] = {binary, "__cbm_subprocess_stdin_probe", "echo", "", NULL};
+    opts.argv = valid_argv;
+    opts.stdin_file = valid_empty_input;
+    cbm_proc_result_t result = {0};
+    rc = cbm_subprocess_run(&opts, &result);
+    check.safe_cleanup = sp_stdin_safe_run(rc, &result);
+    check.reusable = sp_stdin_clean(rc, &result) && sp_stdout_file_equals(out, "", 0) &&
+                     sp_stdout_file_equals(log, sp_stderr_text, sizeof(sp_stderr_text) - 1) &&
+                     sp_stdout_file_equals(valid_empty_input, "", 0);
+    return check;
+}
+
+/* Dispatched through the existing early native probe entry, before harness setup. */
+static int sp_stdin_probe(int argc, char **argv) {
+#ifdef _WIN32
+    if (_setmode(cbm_fileno(stdin), _O_BINARY) == -1 ||
+        _setmode(cbm_fileno(stdout), _O_BINARY) == -1 ||
+        _setmode(cbm_fileno(stderr), _O_BINARY) == -1)
+        return 101;
+#endif
+    if (argc == 8 && strcmp(argv[2], "reject") == 0) {
+        sp_stdin_rejection_t check =
+            sp_stdin_check_rejection(argv[0], argv[3], argv[4], argv[5], argv[6], argv[7]);
+        if (!check.safe_cleanup)
+            return 125; /* Parent must retain files if nested containment failed. */
+        if (!check.prepared)
+            return 102;
+        if (!check.reusable)
+            return 103;
+        return check.rejected && check.no_handle && check.outputs_unchanged && check.no_child_marker
+                   ? 0
+                   : 104;
+    }
+    if (argc == 6 && strcmp(argv[2], "parent-eof") == 0) {
+        /* Isolated process only: furnish genuinely readable parent stdin, then
+         * verify a NULL stdin_file child still gets the null device. */
+        FILE *file = cbm_fopen(argv[3], "rb");
+        if (!file)
+            return 105;
+#ifdef _WIN32
+        int duplicated = _dup2(cbm_fileno(file), cbm_fileno(stdin));
+#else
+        int duplicated = dup2(cbm_fileno(file), cbm_fileno(stdin));
+#endif
+        bool closed = fclose(file) == 0;
+        if (duplicated < 0 || !closed)
+            return 106;
+#ifdef _WIN32
+        if (!SetStdHandle(STD_INPUT_HANDLE, (HANDLE)_get_osfhandle(cbm_fileno(stdin))))
+            return 106;
+#endif
+        /* Exercise the descriptor directly: a stdio-buffer-only rewind must not
+         * leave the inherited OS offset at EOF and make the control vacuous. */
+        unsigned char witness;
+#ifdef _WIN32
+        if (_read(cbm_fileno(stdin), &witness, 1) != 1 ||
+            _lseek(cbm_fileno(stdin), 0, SEEK_SET) != 0)
+            return 107;
+#else
+        if (read(cbm_fileno(stdin), &witness, 1) != 1 || lseek(cbm_fileno(stdin), 0, SEEK_SET) != 0)
+            return 107;
+#endif
+        const char *child_argv[] = {argv[0], "__cbm_subprocess_stdin_probe", "echo", "", NULL};
+        cbm_proc_opts_t opts = {.bin = argv[0],
+                                .argv = child_argv,
+                                .stdin_file = NULL,
+                                .stdout_file = argv[4],
+                                .log_file = argv[5],
+                                .quiet_timeout_ms = 10000};
+        cbm_proc_result_t result = {0};
+        int rc = cbm_subprocess_run(&opts, &result);
+        if (!sp_stdin_safe_run(rc, &result))
+            return 125;
+        return sp_stdin_clean(rc, &result) && sp_stdout_file_equals(argv[4], "", 0) &&
+                       sp_stdout_file_equals(argv[5], sp_stderr_text, sizeof(sp_stderr_text) - 1)
+                   ? 0
+                   : 108;
+    }
+    if (argc != 4)
+        return 109;
+    if (strcmp(argv[2], "stamp") == 0) {
+        if (!sp_stdin_write(argv[3], "child-started", 13) ||
+            fwrite(sp_stdout_text, 1, sizeof(sp_stdout_text) - 1, stdout) !=
+                sizeof(sp_stdout_text) - 1)
+            return 110;
+    } else if (strcmp(argv[2], "echo") == 0) {
+        if (argv[3][0]) {
+            /* The parent releases this state barrier only after mutating its
+             * borrowed path. The deadline merely bounds an abandoned fixture. */
+            uint64_t deadline = cbm_now_ms() + 30000U;
+            while (!cbm_file_exists(argv[3])) {
+                if (cbm_now_ms() >= deadline)
+                    return 111;
+                cbm_usleep(1000);
+            }
+        }
+        unsigned char bytes[512];
+        size_t count;
+        while ((count = fread(bytes, 1, sizeof(bytes), stdin)) != 0) {
+            if (fwrite(bytes, 1, count, stdout) != count)
+                return 112;
+        }
+        if (ferror(stdin))
+            return 112;
+    } else {
+        return 109;
+    }
+    if (fflush(stdout) != 0 ||
+        fwrite(sp_stderr_text, 1, sizeof(sp_stderr_text) - 1, stderr) !=
+            sizeof(sp_stderr_text) - 1 ||
+        fflush(stderr) != 0)
+        return 113;
+    return 0;
+}
+
+TEST(subprocess_stdin_null_is_eof_even_with_readable_parent_input) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    unsigned char input[SP_STDIN_BYTES];
+    sp_stdin_payload(input);
+    bool prepared = sp_stdin_write(fx.other, input, sizeof(input));
+    const char *argv[] = {sp_stdout_test_binary,
+                          "__cbm_subprocess_stdin_probe",
+                          "parent-eof",
+                          fx.other,
+                          fx.out,
+                          fx.log,
+                          NULL};
+    cbm_proc_opts_t opts = {.bin = sp_stdout_test_binary, .argv = argv, .quiet_timeout_ms = 20000};
+    cbm_proc_result_t result = {0};
+    int rc = prepared ? cbm_subprocess_run(&opts, &result) : -1;
+    bool safe = !prepared || (sp_stdin_safe_run(rc, &result) && result.exit_code != 125);
+    bool unchanged = sp_stdout_file_equals(fx.other, input, sizeof(input));
+    bool empty = sp_stdout_file_equals(fx.out, "", 0);
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(sp_stdin_clean(rc, &result));
+    ASSERT_TRUE(unchanged);
+    ASSERT_TRUE(empty);
+    PASS();
+}
+
+TEST(subprocess_stdin_empty_regular_file_is_success) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    bool prepared = sp_stdin_write(fx.other, "", 0);
+    sp_stdout_logs_t logs = {0};
+    cbm_proc_opts_t opts = {.stdin_file = fx.other,
+                            .stdout_file = fx.out,
+                            .log_file = fx.log,
+                            .on_log_line = sp_stdout_log,
+                            .log_ud = &logs};
+    cbm_proc_result_t result = {0};
+    int rc = prepared ? sp_stdin_run(&opts, &result) : -1;
+    bool safe = !prepared || sp_stdin_safe_run(rc, &result);
+    bool exact = sp_stdout_file_equals(fx.out, "", 0) && sp_stdout_file_equals(fx.other, "", 0) &&
+                 sp_stdout_file_equals(fx.log, sp_stderr_text, sizeof(sp_stderr_text) - 1);
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(sp_stdin_clean(rc, &result));
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(sp_stdout_stderr_only(&logs));
+    PASS();
+}
+
+TEST(subprocess_stdin_binary_roundtrip_and_stderr_isolation) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    unsigned char input[SP_STDIN_BYTES];
+    sp_stdin_payload(input);
+    bool prepared = sp_stdin_write(fx.other, input, sizeof(input));
+    sp_stdout_logs_t logs = {0};
+    cbm_proc_opts_t opts = {.stdin_file = fx.other,
+                            .stdout_file = fx.out,
+                            .log_file = fx.log,
+                            .on_log_line = sp_stdout_log,
+                            .log_ud = &logs};
+    cbm_proc_result_t result = {0};
+    int rc = prepared ? sp_stdin_run(&opts, &result) : -1;
+    bool safe = !prepared || sp_stdin_safe_run(rc, &result);
+    bool exact = sp_stdout_file_equals(fx.out, input, sizeof(input));
+    bool unchanged = sp_stdout_file_equals(fx.other, input, sizeof(input));
+    bool stderr_exact = sp_stdout_file_equals(fx.log, sp_stderr_text, sizeof(sp_stderr_text) - 1);
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(sp_stdin_clean(rc, &result));
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(unchanged);
+    ASSERT_TRUE(stderr_exact);
+    ASSERT_TRUE(sp_stdout_stderr_only(&logs));
+    PASS();
+}
+
+TEST(subprocess_stdin_stream_combinations_preserve_input) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    unsigned char input[SP_STDIN_BYTES];
+    sp_stdin_payload(input);
+    bool prepared = sp_stdin_write(fx.other, input, sizeof(input));
+    bool all_clean = true, all_exact = true, all_unchanged = true, all_logs = true;
+    bool safe = true;
+    for (int mode = 0; prepared && safe && mode < 3; mode++) {
+        (void)cbm_unlink(fx.log);
+        sp_stdout_logs_t logs = {0};
+        cbm_proc_opts_t opts = {.stdin_file = fx.other,
+                                .stdout_file = mode == 2 ? NULL : fx.out,
+                                .log_file = mode == 1 ? NULL : fx.log,
+                                .delete_log_on_exit = mode == 0,
+                                .on_log_line = mode == 2 ? NULL : sp_stdout_log,
+                                .log_ud = &logs};
+        cbm_proc_result_t result = {0};
+        int rc = sp_stdin_run(&opts, &result);
+        safe = sp_stdin_safe_run(rc, &result);
+        all_clean = all_clean && sp_stdin_clean(rc, &result);
+        all_unchanged = all_unchanged && sp_stdout_file_equals(fx.other, input, sizeof(input));
+        if (mode == 2) {
+            unsigned char merged[SP_STDIN_BYTES + sizeof(sp_stderr_text) - 1];
+            memcpy(merged, input, sizeof(input));
+            memcpy(merged + sizeof(input), sp_stderr_text, sizeof(sp_stderr_text) - 1);
+            all_exact = all_exact && sp_stdout_file_equals(fx.log, merged, sizeof(merged));
+        } else {
+            all_exact = all_exact && sp_stdout_file_equals(fx.out, input, sizeof(input));
+            all_logs = all_logs && !cbm_file_exists(fx.log) &&
+                       (mode == 0 ? sp_stdout_stderr_only(&logs) : logs.count == 0);
+        }
+    }
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(all_clean);
+    ASSERT_TRUE(all_exact);
+    ASSERT_TRUE(all_unchanged);
+    ASSERT_TRUE(all_logs);
+    PASS();
+}
+
+TEST(subprocess_stdin_caller_path_mutation_before_gate_release) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    char alternate[SP_STDOUT_PATH], caller_path[SP_STDOUT_PATH];
+    unsigned char input[SP_STDIN_BYTES];
+    sp_stdin_payload(input);
+    static const char alternate_bytes[] = "different-input-must-not-be-read";
+    bool prepared = sp_stdout_path(alternate, fx.root, "alternate.bin") &&
+                    sp_stdin_write(fx.other, input, sizeof(input)) &&
+                    sp_stdin_write(alternate, alternate_bytes, sizeof(alternate_bytes) - 1);
+    memcpy(caller_path, fx.other, strlen(fx.other) + 1);
+    const char *argv[] = {sp_stdout_test_binary, "__cbm_subprocess_stdin_probe", "echo", fx.gate,
+                          NULL};
+    cbm_proc_opts_t opts = {.bin = sp_stdout_test_binary,
+                            .argv = argv,
+                            .stdin_file = caller_path,
+                            .stdout_file = fx.out,
+                            .log_file = fx.log};
+    cbm_subprocess_t *process = NULL;
+    int rc = prepared ? cbm_subprocess_spawn(&opts, &process) : -1;
+    bool got_process = process != NULL;
+    if (prepared)
+        memcpy(caller_path, alternate, strlen(alternate) + 1);
+    int gate_rc = prepared ? th_write_file(fx.gate, "release") : -1;
+    cbm_proc_result_t result = {0};
+    bool safe = !process || sp_stdin_finish(process, &result);
+    bool exact = sp_stdout_file_equals(fx.out, input, sizeof(input));
+    bool original_kept = sp_stdout_file_equals(fx.other, input, sizeof(input));
+    bool alternate_kept =
+        prepared && sp_stdout_file_equals(alternate, alternate_bytes, sizeof(alternate_bytes) - 1);
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(got_process);
+    ASSERT_EQ(gate_rc, 0);
+    ASSERT_TRUE(sp_stdin_clean(rc, &result));
+    ASSERT_TRUE(exact);
+    ASSERT_TRUE(original_kept);
+    ASSERT_TRUE(alternate_kept);
+    PASS();
+}
+
+TEST(subprocess_stdin_rejects_invalid_paths_before_outputs) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    char missing[SP_STDOUT_PATH];
+    bool prepared =
+        sp_stdout_path(missing, fx.root, "missing-input") && sp_stdin_write(fx.other, "", 0);
+    const char *paths[] = {"", missing, fx.root};
+    sp_stdin_rejection_t checks[3] = {{0}};
+    bool safe = true;
+    for (int i = 0; prepared && safe && i < 3; i++) {
+        checks[i] = sp_stdin_check_rejection(sp_stdout_test_binary, paths[i], fx.out, fx.log,
+                                             fx.gate, fx.other);
+        safe = checks[i].safe_cleanup;
+    }
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(checks[i].prepared);
+        ASSERT_TRUE(checks[i].reusable);
+        ASSERT_TRUE(checks[i].rejected);
+        ASSERT_TRUE(checks[i].no_handle);
+        ASSERT_TRUE(checks[i].outputs_unchanged);
+        ASSERT_TRUE(checks[i].no_child_marker);
+    }
+    PASS();
+}
+
+TEST(subprocess_stdin_rejects_exact_output_aliases_before_outputs) {
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    bool prepared = sp_stdin_write(fx.other, "", 0);
+    const char *paths[] = {fx.log, fx.out};
+    sp_stdin_rejection_t checks[2] = {{0}};
+    bool safe = true;
+    for (int i = 0; prepared && safe && i < 2; i++) {
+        checks[i] = sp_stdin_check_rejection(sp_stdout_test_binary, paths[i], fx.out, fx.log,
+                                             fx.gate, fx.other);
+        safe = checks[i].safe_cleanup;
+    }
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_TRUE(checks[i].prepared);
+        ASSERT_TRUE(checks[i].reusable);
+        ASSERT_TRUE(checks[i].rejected);
+        ASSERT_TRUE(checks[i].no_handle);
+        ASSERT_TRUE(checks[i].outputs_unchanged);
+        ASSERT_TRUE(checks[i].no_child_marker);
+    }
+    PASS();
+}
+
+TEST(subprocess_stdin_posix_fifo_and_symlink_reject_without_blocking_runner) {
+#ifdef _WIN32
+    /* WHITELIST: POSIX FIFO/symlink semantics only. Directory rejection is covered
+     * above on Windows. No verified unprivileged Windows reparse fixture exists
+     * in this package; that branch is a recorded coverage limit, not a PASS. */
+    SKIP_PLATFORM("POSIX FIFO and symlink fixture; Windows directory covered separately");
+#else
+    sp_stdout_fixture_t fx;
+    ASSERT_TRUE(sp_stdout_fixture_open(&fx));
+    char fifo[SP_STDOUT_PATH], link[SP_STDOUT_PATH];
+    bool prepared = sp_stdout_path(fifo, fx.root, "input.fifo") &&
+                    sp_stdout_path(link, fx.root, "input.link") &&
+                    sp_stdin_write(fx.other, "", 0) && mkfifo(fifo, 0600) == 0 &&
+                    symlink(fx.other, link) == 0;
+    struct stat fifo_stat, link_stat;
+    bool kinds = prepared && lstat(fifo, &fifo_stat) == 0 && S_ISFIFO(fifo_stat.st_mode) &&
+                 lstat(link, &link_stat) == 0 && S_ISLNK(link_stat.st_mode);
+    const char *paths[] = {fifo, link};
+    bool clean[2] = {false}, no_child[2] = {false};
+    bool safe = true;
+    for (int i = 0; kinds && safe && i < 2; i++) {
+        (void)cbm_unlink(fx.gate);
+        const char *argv[] = {sp_stdout_test_binary,
+                              "__cbm_subprocess_stdin_probe",
+                              "reject",
+                              paths[i],
+                              fx.out,
+                              fx.log,
+                              fx.gate,
+                              fx.other,
+                              NULL};
+        /* The probe can itself block inside spawn on a broken blocking FIFO
+         * open. Only that isolated process is then killed by this safety guard.
+         * No elapsed-time threshold is used as evidence of correct rejection. */
+        cbm_proc_opts_t opts = {
+            .bin = sp_stdout_test_binary, .argv = argv, .quiet_timeout_ms = 20000};
+        cbm_proc_result_t result = {0};
+        int rc = cbm_subprocess_run(&opts, &result);
+        safe = sp_stdin_safe_run(rc, &result) && result.exit_code != 125;
+        clean[i] = sp_stdin_clean(rc, &result);
+        no_child[i] = !cbm_file_exists(fx.gate);
+    }
+    int cleanup = safe ? th_rmtree(fx.root) : -1;
+    ASSERT_EQ(cleanup, 0);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(kinds);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_TRUE(clean[i]);
+        ASSERT_TRUE(no_child[i]);
+    }
+    PASS();
+#endif
+}
+
 SUITE(subprocess) {
+    RUN_TEST(subprocess_stdin_null_is_eof_even_with_readable_parent_input);
+    RUN_TEST(subprocess_stdin_empty_regular_file_is_success);
+    RUN_TEST(subprocess_stdin_binary_roundtrip_and_stderr_isolation);
+    RUN_TEST(subprocess_stdin_stream_combinations_preserve_input);
+    RUN_TEST(subprocess_stdin_caller_path_mutation_before_gate_release);
+    RUN_TEST(subprocess_stdin_rejects_invalid_paths_before_outputs);
+    RUN_TEST(subprocess_stdin_rejects_exact_output_aliases_before_outputs);
+    RUN_TEST(subprocess_stdin_posix_fifo_and_symlink_reject_without_blocking_runner);
+    RUN_TEST(subprocess_stdout_null_preserves_merged_log);
+    RUN_TEST(subprocess_stdout_capture_exact_binary_and_stderr_isolation);
+    RUN_TEST(subprocess_stdout_capture_without_log_discards_only_stderr);
+    RUN_TEST(subprocess_stdout_empty_capture_survives_log_deletion);
+    RUN_TEST(subprocess_stdout_capture_owns_caller_path);
+    RUN_TEST(subprocess_stdout_rejects_invalid_capture_paths_and_cleans_up);
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
     RUN_TEST(subprocess_classify_windows_crash_codes);
@@ -1266,6 +2362,8 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_outcome_str);
     RUN_TEST(subprocess_run_clean);
     RUN_TEST(subprocess_run_exit_nonzero);
+    RUN_TEST(subprocess_run_child_exited_before_group_check);
+    RUN_TEST(subprocess_run_child_exiting_at_group_check);
     RUN_TEST(subprocess_run_resolves_literal_binary_name_from_path);
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
@@ -1284,7 +2382,10 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
+    RUN_TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
+    RUN_TEST(subprocess_strip_git_repo_env_is_per_child);
+    RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);
     RUN_TEST(win_cmdline_overflow_rejected);

@@ -835,6 +835,162 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
     gb->next_id = next_id;
 }
 
+/* ── Definition variants ─────────────────────────────────────────────
+ * One name defined more than once under mutually exclusive conditions —
+ * C-family #if/#else, Rust #[cfg], build-tagged files, a definition under an
+ * `if` — is ONE identity: one QN, one node, whose edges are the union of
+ * every variant's body. The collision rule below keeps one canonical winner
+ * for name, file, lines and properties; every variant's span survives in the
+ * node's `variants` property ([{"file_path","start_line","end_line"}],
+ * sorted, unique), so a change in any variant maps to the node. Recorded only
+ * between definitions of the same label with real spans: a different kind
+ * sharing the QN (C: struct vs function) is no variant, a span on line 0 is
+ * no location (delta-route proxies), and a full tie is the same entity. */
+static void *gb_yy_malloc(void *ctx, size_t size) {
+    (void)ctx;
+    return cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, size);
+}
+
+static void *gb_yy_realloc(void *ctx, void *block, size_t old_size, size_t size) {
+    (void)ctx;
+    (void)old_size;
+    return cbm_realloc(CBM_MEM_CLASS_GBUF_STRING, block, size);
+}
+
+static void gb_yy_free(void *ctx, void *block) {
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, block);
+}
+
+static const yyjson_alc gb_yy_alc = {gb_yy_malloc, gb_yy_realloc, gb_yy_free, NULL};
+
+enum { GB_VARIANTS_MAX = 64 };
+
+typedef struct {
+    const char *file;
+    int start;
+    int end;
+} gb_span_t;
+
+static bool gb_variant_label(const char *label) {
+    static const char *const labels[] = {"Function", "Method", "Class", "Interface", "Enum",
+                                         "Struct",   "Trait",  "Type",  "Macro"};
+    for (size_t i = 0; label && i < sizeof(labels) / sizeof(labels[0]); i++) {
+        if (strcmp(label, labels[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int gb_span_cmp(const void *a, const void *b) {
+    const gb_span_t *x = a;
+    const gb_span_t *y = b;
+    int c = strcmp(x->file, y->file);
+    if (c == 0) {
+        c = (x->start > y->start) - (x->start < y->start);
+    }
+    if (c == 0) {
+        c = (x->end > y->end) - (x->end < y->end);
+    }
+    return c;
+}
+
+/* A definition's spans: its `variants` property, else its own span. */
+static int gb_spans_of(yyjson_doc *doc, const char *file, int start, int end, gb_span_t *out,
+                       int n) {
+    yyjson_val *list = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "variants") : NULL;
+    if (yyjson_is_arr(list) && yyjson_arr_size(list) > 0) {
+        size_t i;
+        size_t max;
+        yyjson_val *v;
+        yyjson_arr_foreach(list, i, max, v) {
+            const char *f = yyjson_get_str(yyjson_obj_get(v, "file_path"));
+            int s = (int)yyjson_get_int(yyjson_obj_get(v, "start_line"));
+            int e = (int)yyjson_get_int(yyjson_obj_get(v, "end_line"));
+            if (f && s > 0 && n < GB_VARIANTS_MAX) {
+                out[n++] = (gb_span_t){f, s, e};
+            }
+        }
+        return n;
+    }
+    if (start > 0 && n < GB_VARIANTS_MAX) {
+        out[n++] = (gb_span_t){file ? file : "", start, end};
+    }
+    return n;
+}
+
+/* The survivor's properties with the union of both definitions' variant
+ * spans. Returns a GBUF_STRING-owned JSON string, or NULL when there is
+ * nothing to record (fewer than two distinct spans) or on any failure — the
+ * survivor then keeps its own properties: a lost variants list costs
+ * precision, never data. */
+static char *gb_variants_props(const char *survivor_props, const char *a_props, const char *a_file,
+                               int a_start, int a_end, const char *b_props, const char *b_file,
+                               int b_start, int b_end) {
+    if (a_start <= 0 || b_start <= 0) {
+        return NULL;
+    }
+    yyjson_doc *a_doc =
+        a_props ? yyjson_read_opts((char *)a_props, strlen(a_props), 0, &gb_yy_alc, NULL) : NULL;
+    yyjson_doc *b_doc =
+        b_props ? yyjson_read_opts((char *)b_props, strlen(b_props), 0, &gb_yy_alc, NULL) : NULL;
+    gb_span_t spans[GB_VARIANTS_MAX * 2];
+    int n = gb_spans_of(a_doc, a_file, a_start, a_end, spans, 0);
+    n = gb_spans_of(b_doc, b_file, b_start, b_end, spans, n);
+    qsort(spans, (size_t)n, sizeof(spans[0]), gb_span_cmp);
+    int unique = 0;
+    for (int i = 0; i < n; i++) {
+        if (unique == 0 || gb_span_cmp(&spans[unique - 1], &spans[i]) != 0) {
+            spans[unique++] = spans[i];
+        }
+    }
+    char *out = NULL;
+    if (unique >= 2) {
+        yyjson_mut_doc *mut = yyjson_mut_doc_new(&gb_yy_alc);
+        yyjson_doc *s_doc = survivor_props
+                                ? yyjson_read_opts((char *)survivor_props, strlen(survivor_props),
+                                                   0, &gb_yy_alc, NULL)
+                                : NULL;
+        yyjson_mut_val *root = s_doc && yyjson_is_obj(yyjson_doc_get_root(s_doc))
+                                   ? yyjson_val_mut_copy(mut, yyjson_doc_get_root(s_doc))
+                                   : yyjson_mut_obj(mut);
+        yyjson_mut_val *list = yyjson_mut_arr(mut);
+        for (int i = 0; root && list && i < unique; i++) {
+            yyjson_mut_val *v = yyjson_mut_arr_add_obj(mut, list);
+            yyjson_mut_obj_add_strcpy(mut, v, "file_path", spans[i].file);
+            yyjson_mut_obj_add_int(mut, v, "start_line", spans[i].start);
+            yyjson_mut_obj_add_int(mut, v, "end_line", spans[i].end);
+        }
+        if (mut && root && list) {
+            yyjson_mut_obj_remove_key(root, "variants");
+            yyjson_mut_obj_add_val(mut, root, "variants", list);
+            yyjson_mut_doc_set_root(mut, root);
+            out = yyjson_mut_write_opts(mut, 0, &gb_yy_alc, NULL, NULL);
+        }
+        yyjson_doc_free(s_doc);
+        yyjson_mut_doc_free(mut);
+    }
+    yyjson_doc_free(a_doc);
+    yyjson_doc_free(b_doc);
+    return out;
+}
+
+/* Record the variant spans of a same-QN collision on the surviving node. */
+static void gb_record_variants(cbm_gbuf_node_t *survivor, const char *a_label, const char *a_props,
+                               const char *a_file, int a_start, int a_end, const char *b_label,
+                               const char *b_props, const char *b_file, int b_start, int b_end) {
+    if (!gb_variant_label(a_label) || !b_label || strcmp(a_label, b_label) != 0) {
+        return;
+    }
+    char *merged = gb_variants_props(survivor->properties_json, a_props, a_file, a_start, a_end,
+                                     b_props, b_file, b_start, b_end);
+    if (merged) {
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, survivor->properties_json);
+        survivor->properties_json = merged;
+    }
+}
+
 /* ── Node operations ─────────────────────────────────────────────── */
 
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
@@ -892,7 +1048,18 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
             c = strcmp(existing->label ? existing->label : "", label ? label : "");
         }
         if (c > 0) {
+            gb_record_variants(existing, existing->label, existing->properties_json,
+                               existing->file_path, existing->start_line, existing->end_line, label,
+                               properties_json, file_path, start_line, end_line);
             return existing->id; /* existing entity is the canonical winner */
+        }
+        /* The arrival wins: its properties, plus every variant span both carry. */
+        char *variant_props = NULL;
+        if (gb_variant_label(label) && existing->label && strcmp(existing->label, label) == 0) {
+            variant_props =
+                gb_variants_props(properties_json, existing->properties_json, existing->file_path,
+                                  existing->start_line, existing->end_line, properties_json,
+                                  file_path, start_line, end_line);
         }
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
@@ -903,7 +1070,9 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * label/name — cbm_gbuf_find_by_label/name then missed or mis-listed it,
          * which is how the flickering Function set reached the semantic pass). */
         char *new_name = heap_strdup(name);
-        char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
+        char *new_props = variant_props     ? variant_props
+                          : properties_json ? heap_strdup(properties_json)
+                                            : NULL;
         const char *new_label_interned = gb_intern(gb, label);
         bool label_changed = !existing->label || !new_label_interned ||
                              strcmp(existing->label, new_label_interned) != 0;
@@ -1493,7 +1662,22 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             c = strcmp(existing->label ? existing->label : "", sn->label ? sn->label : "");
         }
         bool sn_wins = c <= 0;
+        if (!sn_wins) {
+            gb_record_variants(existing, existing->label, existing->properties_json,
+                               existing->file_path, existing->start_line, existing->end_line,
+                               sn->label, sn->properties_json, sn->file_path, sn->start_line,
+                               sn->end_line);
+        }
         if (sn_wins) {
+            /* src's properties, plus every variant span both carry. */
+            char *variant_props = NULL;
+            if (gb_variant_label(sn->label) && existing->label &&
+                strcmp(existing->label, sn->label) == 0) {
+                variant_props = gb_variants_props(sn->properties_json, existing->properties_json,
+                                                  existing->file_path, existing->start_line,
+                                                  existing->end_line, sn->properties_json,
+                                                  sn->file_path, sn->start_line, sn->end_line);
+            }
             /* Keep the secondary indexes consistent when the surviving
              * label/name changes (the old code left the node listed under its
              * original label/name, so find_by_label/name mis-listed it). */
@@ -1518,9 +1702,10 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             existing->file_path = (char *)gb_intern(dst, sn->file_path);
             existing->start_line = sn->start_line;
             existing->end_line = sn->end_line;
-            if (sn->properties_json) {
+            if (variant_props || sn->properties_json) {
                 cbm_free(CBM_MEM_CLASS_GBUF_STRING, existing->properties_json);
-                existing->properties_json = heap_strdup(sn->properties_json);
+                existing->properties_json =
+                    variant_props ? variant_props : heap_strdup(sn->properties_json);
             }
             if (label_changed) {
                 node_ptr_array_t *by_label = get_or_create_node_array(

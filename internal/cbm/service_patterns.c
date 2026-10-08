@@ -41,6 +41,11 @@ static const lib_pattern_t http_libraries[] = {
 
     /* JavaScript / TypeScript */
     {"axios", CBM_SVC_HTTP, NULL},
+    /* `import Axios from "axios"`: the capitalized default-import binding
+     * (also axios's own Axios / AxiosInstance types). Matching is
+     * case-sensitive, so without this entry `Axios.get(url)` fell through to
+     * the `.get` route-suffix fallback and became a route registration. */
+    {"Axios", CBM_SVC_HTTP, NULL},
     {"superagent", CBM_SVC_HTTP, NULL},
     {"needle", CBM_SVC_HTTP, NULL},
     {"node-fetch", CBM_SVC_HTTP, NULL},
@@ -572,6 +577,11 @@ static const method_suffix_t route_reg_suffixes[] = {
     {".add_route", "ANY"},
     {".add_api_route", "ANY"},
     {".add_api_websocket_route", "ANY"},
+    /* FastAPI/Starlette WebSocket decorators (`@router.websocket('/ws')`,
+     * `@app.websocket_route('/events')`): not an HTTP verb, so ANY — mirrors
+     * .add_api_websocket_route above (#1245). */
+    {".websocket", "ANY"},
+    {".websocket_route", "ANY"},
     {NULL, NULL},
 };
 
@@ -752,9 +762,9 @@ static bool has_filesystem_extension(const char *path) {
     ext[ext_len] = '\0';
 
     static const char *const hard_file_exts[] = {
-        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
-        ".ini",  ".key",    ".pem",         ".pid",  ".properties", ".service",
-        ".sock", ".socket", ".sqlite",      ".toml", NULL};
+        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",  ".env",        ".ini", ".key",
+        ".log",  ".md",     ".pdf",         ".pem",  ".pid", ".properties", ".rst", ".service",
+        ".sock", ".socket", ".sqlite",      ".toml", ".txt", NULL};
     for (int i = 0; hard_file_exts[i]; i++) {
         if (path_ext_matches(ext, hard_file_exts[i])) {
             return true;
@@ -863,6 +873,139 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
         return false;
     }
     return true;
+}
+
+/* ── GraphQL operation identity (#598) ─────────────────────────── */
+
+static bool gql_name_start(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static bool gql_name_char(unsigned char c) {
+    return gql_name_start(c) || (c >= '0' && c <= '9');
+}
+
+/* Skip one lexical unit whose braces are not structure: a # comment, a "..."
+ * or """...""" string, or a JS ${...} template interpolation. Returns p
+ * unchanged when p starts none of them. */
+static const char *gql_skip_opaque(const char *p) {
+    if (*p == '#') {
+        while (*p && *p != '\n' && *p != '\r') {
+            p++;
+        }
+        return p;
+    }
+    if (strncmp(p, "\"\"\"", 3) == 0) {
+        const char *end = strstr(p + 3, "\"\"\"");
+        return end ? end + 3 : p + strlen(p);
+    }
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"') {
+            p += (*p == '\\' && p[1]) ? 2 : 1;
+        }
+        return *p ? p + 1 : p;
+    }
+    if (p[0] == '$' && p[1] == '{') {
+        int depth = 1;
+        p += 2;
+        while (*p && depth > 0) {
+            depth += (*p == '{') - (*p == '}');
+            p++;
+        }
+        return p;
+    }
+    return p;
+}
+
+/* Skip GraphQL "ignored tokens" (whitespace, commas, comments). */
+static const char *gql_skip_ignored(const char *p) {
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') {
+            p++;
+        }
+        if (*p != '#') {
+            return p;
+        }
+        p = gql_skip_opaque(p);
+    }
+}
+
+/* Copy the Name token at p (bounded). Returns false when p is not a Name. */
+static bool gql_copy_name(const char *p, char *name_buf, size_t name_sz) {
+    if (!gql_name_start((unsigned char)*p) || !name_buf || name_sz == 0) {
+        return false;
+    }
+    size_t n = 0;
+    while (gql_name_char((unsigned char)p[n]) && n + 1 < name_sz) {
+        name_buf[n] = p[n];
+        n++;
+    }
+    name_buf[n] = '\0';
+    return true;
+}
+
+static const char *gql_operation_keyword(const char *tok, size_t len) {
+    static const char *const kws[] = {"query", "mutation", "subscription", NULL};
+    for (int i = 0; kws[i]; i++) {
+        if (strlen(kws[i]) == len && strncmp(tok, kws[i], len) == 0) {
+            return kws[i];
+        }
+    }
+    return NULL;
+}
+
+bool cbm_service_pattern_graphql_operation(const char *doc, const char **op_type, char *name_buf,
+                                           size_t name_sz) {
+    *op_type = "operation";
+    if (name_buf && name_sz > 0) {
+        name_buf[0] = '\0';
+    }
+    if (!doc) {
+        return false;
+    }
+    int depth = 0;
+    bool in_fragment = false;
+    const char *p = doc;
+    while (*p) {
+        const char *q = gql_skip_opaque(p);
+        if (q != p) {
+            p = q;
+            continue;
+        }
+        unsigned char c = (unsigned char)*p;
+        if (c == '{' && depth == 0 && !in_fragment) {
+            *op_type = "query"; /* `{ ... }` shorthand is an anonymous query */
+            return false;
+        }
+        if (c == '{' || c == '}') {
+            depth += (c == '{') ? 1 : -1;
+            depth = depth < 0 ? 0 : depth;
+            in_fragment = in_fragment && depth > 0;
+            p++;
+            continue;
+        }
+        if (depth > 0 || in_fragment || !gql_name_start(c)) {
+            p++;
+            continue;
+        }
+        const char *tok = p;
+        while (gql_name_char((unsigned char)*p)) {
+            p++;
+        }
+        size_t len = (size_t)(p - tok);
+        if (len == strlen("fragment") && strncmp(tok, "fragment", len) == 0) {
+            in_fragment = true;
+            continue;
+        }
+        const char *kw = gql_operation_keyword(tok, len);
+        if (!kw) {
+            return false; /* not a GraphQL document (URL, dict key, variable ...) */
+        }
+        *op_type = kw;
+        return gql_copy_name(gql_skip_ignored(p), name_buf, name_sz);
+    }
+    return false;
 }
 
 /* ── Public API ────────────────────────────────────────────────── */

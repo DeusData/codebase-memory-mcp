@@ -8,6 +8,12 @@ on:
 
 permissions: read-all
 
+# Only the newest main commit is scored: a newer push (or the weekly run)
+# cancels a pending or running score of an older commit.
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scorecard:
     runs-on: ubuntu-latest
@@ -27,6 +33,6 @@ jobs:
           publish_results: true
 
       - name: Upload SARIF results
-        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
         with:
           sarif_file: results.sarif

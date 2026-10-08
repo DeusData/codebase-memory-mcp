@@ -71,13 +71,33 @@ ifeq ($(TEST_SEAMS),1)
 TEST_SEAM_DEFINE := -DCBM_ENABLE_TEST_SEAMS=1
 endif
 
+# Per-test coverage for the test-impact map. TEST_COVERAGE=1 compiles clang
+# source coverage into OUR code only -- the one-shot sources, the LSP unity
+# object and the preprocessor -- in the test runner and in the product binary,
+# and turns on the runner's per-test profile hooks (tests/test_framework.h).
+# Vendored objects stay uninstrumented: a vendored change selects tests by rule,
+# and every counter compiled in is written out again for every test. Like every
+# other flavour it needs its own BUILD_DIR; the test-runner-cov and cbm-cov
+# targets pin one.
+# -fprofile-continuous: a child process started with `%c` in LLVM_PROFILE_FILE
+# keeps its counters mapped onto its profile file, so a child that is killed
+# still leaves a complete profile. Linux needs the flag for `%c` to work at
+# all; with it macOS behaves the same way (tests/test_main.c, "Children").
+TEST_COVERAGE ?= 0
+TEST_COVERAGE_FLAGS :=
+TEST_COVERAGE_DEFINE :=
+ifeq ($(TEST_COVERAGE),1)
+TEST_COVERAGE_FLAGS := -fprofile-instr-generate -fcoverage-mapping -fprofile-continuous
+TEST_COVERAGE_DEFINE := -DCBM_TEST_COVERAGE=1
+endif
+
 # Production flags (CFLAGS_EXTRA allows CI to inject -DCBM_VERSION)
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
 CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) \
-              $(GLOBAL_OVERRIDE_DEFINE) $(MEMWASTE_CFLAGS) $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(MEMWASTE_VENDOR_CFLAGS)
+              $(GLOBAL_OVERRIDE_DEFINE) $(MEMWASTE_CFLAGS) $(TEST_COVERAGE_FLAGS) $(CFLAGS_EXTRA)
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(MEMWASTE_VENDOR_CFLAGS) $(TEST_COVERAGE_FLAGS)
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -102,8 +122,10 @@ INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
 COVERAGE_MARKER_TEST_DEFINE = -DCBM_COVERAGE_MARKER_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
 	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
-	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(CXX_STDLIB_FLAGS)
+	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
+	-g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS) \
+	$(CXX_STDLIB_FLAGS)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
@@ -309,6 +331,7 @@ FOUNDATION_SRCS = \
     src/foundation/str_util.c \
     src/foundation/workspace.c \
     src/foundation/platform.c \
+    src/foundation/path_syntax_internal.c \
     src/foundation/system_info.c \
     src/foundation/slab_alloc.c \
     src/foundation/yaml.c \
@@ -327,6 +350,7 @@ FOUNDATION_SRCS = \
     src/foundation/limits.c \
     src/foundation/index_policy.c \
     src/foundation/subprocess.c \
+    src/foundation/git_env.c \
     src/foundation/sha256.c \
     src/foundation/secure_random.c \
     src/foundation/macos_acl.c \
@@ -337,6 +361,7 @@ FOUNDATION_SRCS = \
 EXTRACTION_SRCS = \
     $(CBM_DIR)/cbm.c \
     $(CBM_DIR)/extract_defs.c \
+    $(CBM_DIR)/callable_sig.c \
     $(CBM_DIR)/extract_calls.c \
     $(CBM_DIR)/extract_imports.c \
     $(CBM_DIR)/extract_usages.c \
@@ -348,13 +373,16 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_channels.c \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/extract_dbt.c \
+    $(CBM_DIR)/sql_values.c \
     $(CBM_DIR)/helpers.c \
+    $(CBM_DIR)/cpp_branch_views.c \
     $(CBM_DIR)/result_compact.c \
     $(CBM_DIR)/result_spill.c \
     $(CBM_DIR)/lang_specs.c \
     $(CBM_DIR)/macro_table.c \
     $(CBM_DIR)/iris_export_xml.c \
-    $(CBM_DIR)/service_patterns.c
+    $(CBM_DIR)/service_patterns.c \
+    $(CBM_DIR)/spawn_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
@@ -397,13 +425,15 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c
+STORE_SRCS = src/store/store.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
+MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c \
+	src/mcp/test_impact.c src/mcp/test_impact_diff.c src/mcp/test_impact_classify.c src/mcp/test_impact_source.c src/mcp/test_impact_seed.c src/mcp/test_impact_engine.c src/mcp/test_impact_engine_snapshot.c src/mcp/test_impact_engine_reach.c src/mcp/test_impact_engine_artifact.c src/mcp/test_impact_cli.c src/mcp/test_impact_artifact.c src/mcp/test_impact_changes.c src/mcp/test_impact_origins.c src/mcp/test_impact_coverage.c src/mcp/test_impact_config.c src/mcp/test_impact_select.c src/mcp/test_impact_policy.c src/mcp/test_impact_git.c src/mcp/test_impact_inventory.c src/mcp/test_impact_inventory_input.c src/mcp/test_impact_tree.c src/mcp/test_impact_tree_audit.c src/mcp/test_impact_tree_read.c src/mcp/test_impact_tree_batch.c src/mcp/test_impact_tree_digest.c src/mcp/test_impact_tree_names.c src/mcp/test_impact_tree_plan.c src/mcp/test_impact_tree_posix.c src/mcp/test_impact_tree_posix_acl.c src/mcp/test_impact_tree_posix_io.c src/mcp/test_impact_tree_util.c src/mcp/test_impact_tree_windows.c src/mcp/test_impact_tree_windows_acl.c src/mcp/test_impact_tree_windows_io.c \
+	src/mcp/test_impact_result.c src/mcp/test_impact_result_json.c src/mcp/test_impact_result_project.c src/mcp/test_impact_result_receipt.c src/mcp/test_impact_result_rows.c src/mcp/test_impact_result_util.c src/mcp/test_impact_result_validate.c src/mcp/test_impact_result_wire.c
 
 # Shared MCP daemon coordination and local transport
 DAEMON_SRCS = \
@@ -422,7 +452,18 @@ DAEMON_SRCS = \
 DISCOVER_SRCS = \
     src/discover/language.c \
     src/discover/userconfig.c \
+    src/discover/test_conventions.c \
     src/discover/gitignore.c \
+    src/discover/gitignore_checked.c \
+    src/discover/inventory_filter.c \
+    src/discover/inventory.c \
+    src/discover/inventory_guard.c \
+    src/discover/inventory_metadata.c \
+    src/discover/inventory_directories.c \
+    src/discover/inventory_controls.c \
+    src/discover/gitignore_checked_parse.c \
+    src/discover/gitignore_core.c \
+    src/discover/gitignore_guard.c \
     src/discover/discover.c
 
 # Graph buffer module (new)
@@ -434,6 +475,7 @@ PIPELINE_SRCS = \
     src/pipeline/lsp_surface.c \
     src/pipeline/pipeline_delta.c \
     src/pipeline/path_alias.c \
+    src/pipeline/laravel_routing.c \
     src/pipeline/registry.c \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
@@ -441,6 +483,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \
     src/pipeline/pass_calls.c \
+    src/pipeline/pass_spawns.c \
     src/pipeline/pass_lsp_cross.c \
     src/pipeline/pass_usages.c \
     src/pipeline/pass_semantic.c \
@@ -613,6 +656,8 @@ PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h te
 
 TEST_FOUNDATION_SRCS = \
     tests/test_main.c \
+    tests/test_coverage_children.c \
+    tests/test_coverage_parent_failure.c \
     tests/test_arena.c \
     tests/test_hash_table.c \
     tests/test_dyn_array.c \
@@ -631,6 +676,8 @@ TEST_FOUNDATION_SRCS = \
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
+    tests/test_callable_sig.c \
+    tests/test_test_conventions.c \
     tests/test_extraction_inheritance.c \
     tests/test_extraction_imports.c \
     tests/test_parse_coverage.c \
@@ -642,6 +689,9 @@ TEST_EXTRACTION_SRCS = \
 TEST_STORE_SRCS = \
     tests/test_store_nodes.c \
     tests/test_store_edges.c \
+    tests/test_store_impact.c \
+    tests/test_store_scope.c \
+    tests/test_store_graph_digest.c \
     tests/test_store_search.c \
     tests/test_store_arch.c \
     tests/test_store_bulk.c \
@@ -654,6 +704,23 @@ TEST_CYPHER_SRCS = \
 
 TEST_MCP_SRCS = \
     tests/test_mcp.c \
+    tests/test_test_impact.c \
+    tests/test_test_impact_profiles.c \
+    tests/test_test_impact_changes.c \
+    tests/test_test_impact_origins.c \
+    tests/test_test_impact_git.c \
+    tests/test_test_impact_tree.c \
+    tests/test_test_impact_inventory.c \
+    tests/test_test_impact_classify.c \
+    tests/test_test_impact_source.c \
+    tests/test_test_impact_seed.c \
+    tests/test_test_impact_engine.c \
+    tests/test_test_impact_artifact.c \
+    tests/test_test_impact_inventory_errors.c \
+    tests/test_test_impact_inventory_support.c \
+    tests/test_test_impact_runner_filter.c \
+    tests/test_test_impact_runner_filter_fixture.c \
+    tests/test_test_impact_runner_filter_process.c \
     tests/test_index_supervisor.c
 
 TEST_DAEMON_SRCS = \
@@ -671,12 +738,23 @@ TEST_DISCOVER_SRCS = \
     tests/test_language.c \
     tests/test_userconfig.c \
     tests/test_gitignore.c \
+    tests/test_gitignore_checked.c \
+    tests/if_native_git_path.c \
+    tests/test_inventory_filter.c \
+    tests/test_inventory_filter_cases.c \
+    tests/test_inventory_filter_errors.c \
+    tests/test_inventory_filter_limits.c \
+    tests/test_inventory_filter_native.c \
+    tests/test_inventory_filter_native_fixture.c \
+    tests/test_inventory_filter_native_platform.c \
+    tests/test_inventory_filter_structure_extra.c \
+    tests/test_inventory_filter_support.c \
     tests/test_git_context.c \
     tests/test_discover.c
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -715,7 +793,7 @@ TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
 TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
-TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c
+TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c tests/test_conditional_variants.c tests/test_spawns.c
 
 TEST_TRACES_SRCS = tests/test_traces.c
 
@@ -830,8 +908,14 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
+# $(TEST_SEAM_DEFINE): these prod objects (grammars, ts_runtime, lsp_all) are
+# linked into the same binary as the CFLAGS_PROD sources, so both halves must
+# agree on the seam switch. lsp_all holds seam code of its own (ts_lsp.c's
+# budget probes, any seam counter a resolver defines): without the define a
+# TEST_SEAMS=1 binary silently lacks those seams, and a seam symbol that cbm.c
+# references fails to link. GRAMMAR_CFLAGS_TEST always carries the define.
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
-                 $(MEMWASTE_VENDOR_CFLAGS)
+                 $(TEST_SEAM_DEFINE) $(MEMWASTE_VENDOR_CFLAGS)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
@@ -849,7 +933,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security fuzz
+.PHONY: test-coverage-flush test test-par test-repro test-foundation test-tsan test-daemon-smoke test-runner-cov cbm-cov cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security fuzz
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -888,7 +972,7 @@ $(BUILD_DIR)/ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
 $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) $(TEST_COVERAGE_FLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
@@ -939,7 +1023,9 @@ $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) Makefile.cbm | $(BUILD_DIR)
+# .build-config: SQLITE3_CFLAGS carries MEMWASTE_VENDOR_CFLAGS (see the stamp
+# under "Production binary").
+$(BUILD_DIR)/prod_sqlite3.o: $(SQLITE3_SRC) Makefile.cbm $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS) -c -o $@ $<
 
 # TRE regex (only compiled on Windows — POSIX uses system <regex.h>)
@@ -969,7 +1055,7 @@ $(BUILD_DIR)/tre.o: $(TRE_SRC) | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) $(TSAN_SANITIZE) -c -o $@ $<
 
-$(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/prod_tre.o: $(TRE_SRC) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 $(MEMWASTE_VENDOR_CFLAGS) -c -o $@ $<
 endif
 
@@ -1123,28 +1209,35 @@ TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 
-$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c $(GRAMMAR_UNITY_DEPS) | $(BUILD_DIR)
+# Every prod object whose flags carry a BUILD_CONFIG_SIG variable
+# (TEST_SEAM_DEFINE via GRAMMAR_CFLAGS, MEMWASTE_VENDOR_CFLAGS) depends on the
+# $(BUILD_DIR)/.build-config stamp. These objects are compiled once and linked
+# into every later binary, so without the stamp a TEST_SEAMS or MEMWASTE flip
+# relinks the PREVIOUS flavour: a release binary keeps seam code compiled into
+# lsp_all, or a seams binary misses it. prod_mimalloc.o and the unixcoder blob
+# take no config variable and stay off the stamp.
+$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c $(GRAMMAR_UNITY_DEPS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+$(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) $(BUILD_DIR)/.build-config | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) $(TEST_COVERAGE_FLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
 LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
-$(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR) -c -o $@ $<
-$(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (compiled separately, not unity-built via zstd_store.c)
 ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
-$(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c $(BUILD_DIR)/.build-config | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
@@ -1160,14 +1253,15 @@ MAIN_SRC = src/main.c
 # configuration and it is rewritten only when that content changes, so ordinary
 # incremental builds are unaffected. (Single-quoted: the signature may contain
 # the escaped quotes of -DCBM_VERSION, which are literal inside '', but must not
-# contain a literal single quote.)
+# contain a literal single quote.) The config-flavoured prod objects above
+# depend on the stamp for the same reason as the binary.
 # SANITIZE belongs here: it changes the instrumentation compiled into every
 # object, so a build that only changes it MUST rebuild. Its absence made
 # `scripts/test.sh SANITIZE= ...` -- the documented way to get a plain build
 # for trap debugging -- silently re-run the previously instrumented binary,
 # which during this bisect produced a "crashes without sanitizers too" result
 # that was pure artifact and sent the investigation down the wrong path.
-BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)|SANITIZE=$(SANITIZE)|MEMWASTE=$(MEMWASTE)|MEMWASTE_ACCESS=$(MEMWASTE_ACCESS)|MEMWASTE_PROFILE=$(MEMWASTE_PROFILE)
+BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)|SANITIZE=$(SANITIZE)|MEMWASTE=$(MEMWASTE)|MEMWASTE_ACCESS=$(MEMWASTE_ACCESS)|MEMWASTE_PROFILE=$(MEMWASTE_PROFILE)|TEST_COVERAGE=$(TEST_COVERAGE)
 .PHONY: build-config-check
 build-config-check:
 $(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
@@ -1362,6 +1456,84 @@ test-lsan:
 		CC=$(LSAN_LLVM_BIN)/clang CXX=$(LSAN_LLVM_BIN)/clang++ BUILD_DIR=build/lsan
 	cd $(CURDIR) && ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" \
 		./build/lsan/test-runner $(LSAN_SUITES)
+
+# ── Per-test coverage build (test-impact map) ───────────────────
+# The instrumented runner and product binary (TEST_COVERAGE=1 above), in their
+# own build directory. Homebrew LLVM rather than Apple clang: the raw profile
+# format is versioned with the compiler, so llvm-profdata and llvm-cov have to
+# come from the toolchain that built the binary.
+#   LLVM_PROFILE_FILE=/dev/null CBM_TEST_COVERAGE_DIR=<dir> \
+#       build/cov/test-runner [suite...]
+# leaves one profile set per test (tests/test_main.c). The runner names every
+# profile itself, but the profile runtime creates its default file before main
+# runs: started without LLVM_PROFILE_FILE it leaves an empty default.profraw in
+# the working directory.
+# No C suite runs the product binary -- they re-exec the runner itself. The
+# shell process regressions do, and they find the instrumented one the way they
+# find any other: CBM_TEST_BINARY=build/cov/codebase-memory-mcp, with
+# LLVM_PROFILE_FILE set by whoever collects the profiles.
+COV_LLVM_BIN ?= /opt/homebrew/opt/llvm/bin
+COV_BUILD_DIR ?= build/cov
+COV_MAKE = $(MAKE) -f Makefile.cbm CC=$(COV_LLVM_BIN)/clang CXX=$(COV_LLVM_BIN)/clang++ \
+	BUILD_DIR=$(COV_BUILD_DIR) SANITIZE= TEST_COVERAGE=1
+test-runner-cov:
+	$(COV_MAKE) $(COV_BUILD_DIR)/test-runner
+cbm-cov:
+	$(COV_MAKE) $(COV_BUILD_DIR)/codebase-memory-mcp TEST_SEAMS=1
+
+# Genuine LLVM write failures must fail the parent coverage run.
+test-coverage-flush: test-runner-cov
+	@evidence_dir=$$(mktemp -d "$(COV_BUILD_DIR)/coverage-flush.XXXXXX") && \
+		printf 'Coverage flush evidence: %s/proof\n' "$$evidence_dir" && \
+		python3 tests/test_coverage_flush.py \
+			--runner "$(COV_BUILD_DIR)/test-runner" \
+			--llvm-profdata "$(COV_LLVM_BIN)/llvm-profdata" \
+			--output-dir "$$evidence_dir/proof"
+
+.PHONY: test-coverage-children
+# Genuine child profile/marker and setup-reducer controls; evidence is retained.
+test-coverage-children: test-runner-cov
+	@evidence_dir=$$(mktemp -d "$(COV_BUILD_DIR)/coverage-children.XXXXXX") && \
+		printf 'Coverage child evidence: %s/proof\n' "$$evidence_dir" && \
+		python3 tests/test_coverage_children.py \
+			--runner "$(COV_BUILD_DIR)/test-runner" \
+			--llvm-profdata "$(COV_LLVM_BIN)/llvm-profdata" \
+			--reducer scripts/test-impact/coverage-map.py \
+			--output-dir "$$evidence_dir/proof"
+
+.PHONY: test-coverage-parent-failure
+# Positive default plus genuine owned EMFILE; all evidence is retained.
+test-coverage-parent-failure: test-runner-cov
+	@evidence_dir=$$(mktemp -d "$(COV_BUILD_DIR)/coverage-parent-failure.XXXXXX") && \
+		printf 'Coverage parent failure evidence: %s/proof\n' "$$evidence_dir" && \
+		python3 tests/test_coverage_parent_failure.py \
+			--runner "$(COV_BUILD_DIR)/test-runner" \
+			--llvm-profdata "$(COV_LLVM_BIN)/llvm-profdata" \
+			--reducer scripts/test-impact/coverage-map.py \
+			--output-dir "$$evidence_dir/proof"
+
+.PHONY: test-coverage-terminal
+# A readable stale terminal profile cannot hide a failed parent write.
+test-coverage-terminal: test-runner-cov
+	@evidence_dir=$$(mktemp -d "$(COV_BUILD_DIR)/coverage-terminal.XXXXXX") && \
+		printf 'Coverage terminal evidence: %s/proof\n' "$$evidence_dir" && \
+		python3 tests/test_coverage_terminal.py \
+			--runner "$(COV_BUILD_DIR)/test-runner" \
+			--llvm-profdata "$(COV_LLVM_BIN)/llvm-profdata" \
+			--helper tests/test_coverage_children.py \
+			--reducer scripts/test-impact/coverage-map.py \
+			--output-dir "$$evidence_dir/proof"
+
+.PHONY: test-coverage-live-v2
+# Native full-identity transport remains explicitly unadmitted; evidence is retained.
+test-coverage-live-v2: test-runner-cov
+	@evidence_dir=$$(mktemp -d "$(COV_BUILD_DIR)/coverage-live-v2.XXXXXX") && \
+		printf 'Coverage live-v2 evidence: %s/proof\n' "$$evidence_dir" && \
+		PYTHONDONTWRITEBYTECODE=1 python3 tests/test_coverage_live_v2.py \
+			--collector scripts/test-impact/coverage-map.py \
+			--runner "$(COV_BUILD_DIR)/test-runner" \
+			--llvm-profdata "$(COV_LLVM_BIN)/llvm-profdata" \
+			--output "$$evidence_dir/proof" $(if $(COV_LIVE_V2_CASE),--case "$(COV_LIVE_V2_CASE)")
 
 # ── Coverage-guided fuzzing (libFuzzer) ─────────────────────────
 # One binary, three targets (tests/fuzz/cbm_fuzz.c): the per-file extractor,

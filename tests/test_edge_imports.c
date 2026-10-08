@@ -645,6 +645,113 @@ TEST(ei_go_import_never_binds_symbol) {
     PASS();
 }
 
+/* #2127 helper: inbound edges of `edge_type` onto the (single) node named
+ * `name` with label `label`; -1 when that node is missing. */
+static int ei_inbound_edges_on(cbm_store_t *store, const char *project, const char *name,
+                               const char *label, const char *edge_type) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int64_t id = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, label) == 0) {
+            id = nodes[i].id;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    if (id == 0) {
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_target_type(store, id, edge_type, &edges, &n) != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_free_edges(edges, n);
+    return n;
+}
+
+/* #2127: `from unittest.mock import patch` names an EXTERNAL module. Strategy
+ * 1 cannot resolve it, and Strategy 3's symbol-name fallback bound the import
+ * to the only project definition named `patch` — an unrelated REST view's
+ * HTTP handler — so every patch(...) call became an import_map CALLS edge at
+ * confidence 0.95 (and, once the import edge is gone, a unique_name edge; the
+ * member form `mock.patch(...)` a suffix_match edge). A Python import path
+ * names its module chain, so a symbol hit whose QN does not contain the chain
+ * of an EXTERNAL import is not the imported thing. The true project import
+ * (`from app.util import helper`) must keep both its IMPORTS and its CALLS
+ * edge. `pad` > MIN_FILES_FOR_PARALLEL(50) runs the
+ * same fixture through the parallel pipeline, so both drivers are covered. */
+static int ei_py_external_import_case(int pad) {
+    enum { EI_2127_BASE = 5, EI_2127_MAX = EI_2127_BASE + 64 };
+    static char names[EI_2127_MAX][32];
+    EILangFile f[EI_2127_MAX];
+    int n = 0;
+    f[n++] = (EILangFile){"app/views.py", "class PkgConfigView:\n"
+                                          "    def get(self, request):\n        return 1\n\n"
+                                          "    def patch(self, request):\n        return 2\n\n"
+                                          "    def copy(self):\n        return 3\n"};
+    f[n++] = (EILangFile){"app/util.py", "def helper():\n    return 1\n"};
+    /* Recall pin: a PROJECT module re-exporting a name defined elsewhere
+     * (`app.base` re-exports `app.errors.BoomError`) is an internal import;
+     * its weak resolution is never judged by the #2127 guard. */
+    f[n++] = (EILangFile){"app/errors.py", "class BoomError(Exception):\n    pass\n"};
+    f[n++] = (EILangFile){"app/base.py", "from app.errors import BoomError\n"};
+    f[n++] = (EILangFile){"tests/test_views.py", "import copy\n"
+                                                 "from unittest import mock\n"
+                                                 "from unittest.mock import patch\n"
+                                                 "from app.base import BoomError\n"
+                                                 "from app.util import helper\n\n\n"
+                                                 "def test_something():\n"
+                                                 "    mock.patch(\"app.views.other\")\n"
+                                                 "    copy.copy(helper)\n"
+                                                 "    if helper() > 1:\n"
+                                                 "        raise BoomError()\n"
+                                                 "    with patch(\"app.views.thing\"):\n"
+                                                 "        return helper()\n"};
+    for (int i = 0; i < pad && n < EI_2127_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        f[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int bad_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "patch", "Method", "IMPORTS") : -1;
+    int bad_calls = store ? ei_inbound_edges_on(store, lp.project, "patch", "Method", "CALLS") : -1;
+    /* `import copy` (a plain module import of stdlib `copy`) is no project
+     * method: neither the import nor `copy.copy(...)` may bind it. */
+    bad_imports += store ? ei_inbound_edges_on(store, lp.project, "copy", "Method", "IMPORTS") : 0;
+    bad_calls += store ? ei_inbound_edges_on(store, lp.project, "copy", "Method", "CALLS") : 0;
+    int good_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "helper", "Function", "IMPORTS") : -1;
+    int good_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "helper", "Function", "CALLS") : -1;
+    int reexport_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "BoomError", "Class", "CALLS") : -1;
+    int ok = bad_imports == 0 && bad_calls == 0 && good_imports >= 1 && good_calls >= 1 &&
+             reexport_calls >= 1;
+    if (!ok) {
+        fprintf(stderr,
+                "  [#2127 pad=%d] PkgConfigView.patch+copy IMPORTS=%d CALLS=%d (want 0/0); "
+                "helper IMPORTS=%d CALLS=%d (want >=1/>=1); BoomError CALLS=%d (want >=1)\n",
+                pad, bad_imports, bad_calls, good_imports, good_calls, reexport_calls);
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_py_external_import_never_binds_project_symbol) {
+    /* Both legs run before asserting so a failure diagnoses both drivers. */
+    int sequential_ok = ei_py_external_import_case(0);
+    int parallel_ok = ei_py_external_import_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* C++: header include should resolve to the header file node, not the same-stem
  * source node. Also exercises angle-bracket include resolution. */
 TEST(ei_cpp_header_include_targets_header_file) {
@@ -1137,6 +1244,194 @@ TEST(ei_php_interface_use) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * PHP PSR-4 — #1186
+ *
+ * With composer.json `autoload.psr-4`, `use App\Models\Agency;` names exactly
+ * one file: <mapped-dir>/Models/Agency.php. The resolver instead fell through
+ * to the namespace bucket and bound every class import of App\Models to the
+ * FIRST file declaring that namespace (User.php), fabricating a hub. These
+ * tests pin the exact target file per local name; a missing class file must
+ * leave the import unresolved rather than land on a sibling.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const char *local_name; /* IMPORTS edge local_name */
+    const char *want_path;  /* expected target file_path; NULL = no edge */
+} EIPhpImportExpect;
+
+/* Find the IMPORTS edge of `importer` whose local_name is `local` and write
+ * its target's file_path into `out` ("" when there is no such edge). */
+static void ei_import_target_path(cbm_store_t *store, const char *project, const char *importer,
+                                  const char *local, char *out, size_t outsz) {
+    out[0] = '\0';
+    int64_t src_id = ei_node_id_for_file_label(store, project, importer, "File");
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (src_id <= 0 ||
+        cbm_store_find_edges_by_source_type(store, src_id, "IMPORTS", &edges, &n) != CBM_STORE_OK) {
+        return;
+    }
+    char needle[256];
+    snprintf(needle, sizeof(needle), "\"local_name\":\"%s\"", local);
+    for (int i = 0; i < n; i++) {
+        if (!edges[i].properties_json || !strstr(edges[i].properties_json, needle)) {
+            continue;
+        }
+        cbm_node_t target;
+        memset(&target, 0, sizeof(target));
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &target) == CBM_STORE_OK) {
+            snprintf(out, outsz, "%s", target.file_path ? target.file_path : "?");
+            cbm_node_free_fields(&target);
+        }
+        break;
+    }
+    cbm_store_free_edges(edges, n);
+}
+
+/* Index `files` and check every expectation for `importer`. Returns 1 when
+ * all hold; prints each mismatch so a RED names the fabricated target. */
+static int ei_php_imports_match(const EILangFile *files, int nfiles, const char *importer,
+                                const EIPhpImportExpect *want, int nwant) {
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, nfiles);
+    if (!store) {
+        ei_cleanup(&lp, store);
+        return 0;
+    }
+    int ok = 1;
+    for (int i = 0; i < nwant; i++) {
+        char got[512];
+        ei_import_target_path(store, lp.project, importer, want[i].local_name, got, sizeof(got));
+        const char *expect = want[i].want_path ? want[i].want_path : "";
+        if (strcmp(got, expect) != 0) {
+            fprintf(stderr, "  [IMPORTS %s] %s -> got \"%s\", want \"%s\"\n", importer,
+                    want[i].local_name, got, expect);
+            ok = 0;
+        }
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+#define EI_PHP_CLASS(ns, cls) "<?php\nnamespace " ns ";\n\nclass " cls " {\n}\n"
+
+/* Several classes in one namespace directory: each import binds its own file,
+ * not the first file of App\Models. */
+TEST(ei_php_psr4_class_per_file_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json",
+         "{\"name\":\"acme/app\",\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Models/Agency.php", EI_PHP_CLASS("App\\Models", "Agency")},
+        {"app/Models/Client.php", EI_PHP_CLASS("App\\Models", "Client")},
+        {"app/Models/Property.php", EI_PHP_CLASS("App\\Models", "Property")},
+        {"app/Models/User.php", EI_PHP_CLASS("App\\Models", "User")},
+        {"app/Http/Controller.php", "<?php\nnamespace App\\Http;\n\n"
+                                    "use App\\Models\\Property;\nuse App\\Models\\User;\n"
+                                    "use App\\Models\\Client as C;\n\n"
+                                    "class Controller {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Property", "app/Models/Property.php"},
+        {"User", "app/Models/User.php"},
+        {"C", "app/Models/Client.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 6, "app/Http/Controller.php", want, 3));
+    PASS();
+}
+
+/* Sub-namespaces map to subdirectories of the PSR-4 root, at any depth. */
+TEST(ei_php_psr4_nested_subnamespace_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Models/Billing/Account.php", EI_PHP_CLASS("App\\Models\\Billing", "Account")},
+        {"app/Models/Billing/Invoice.php", EI_PHP_CLASS("App\\Models\\Billing", "Invoice")},
+        {"app/Models/Billing/Tax/Exempt.php", EI_PHP_CLASS("App\\Models\\Billing\\Tax", "Exempt")},
+        {"app/Models/Billing/Tax/Rate.php", EI_PHP_CLASS("App\\Models\\Billing\\Tax", "Rate")},
+        {"app/Jobs/Bill.php", "<?php\nnamespace App\\Jobs;\n\n"
+                              "use App\\Models\\Billing\\Invoice;\n"
+                              "use App\\Models\\Billing\\Tax\\Rate;\n\n"
+                              "class Bill {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Invoice", "app/Models/Billing/Invoice.php"},
+        {"Rate", "app/Models/Billing/Tax/Rate.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 6, "app/Jobs/Bill.php", want, 2));
+    PASS();
+}
+
+/* Several psr-4 roots, across two composer.json files and both autoload
+ * sections: the longest matching prefix wins (App\Domain\ -> src/Domain/ over
+ * App\ -> app/), a package's own root maps its namespace, and autoload-dev
+ * maps Tests\. The decoy app/Domain/Order.php declares the same namespace and
+ * sorts first. */
+TEST(ei_php_psr4_multiple_roots_longest_prefix_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\","
+                          "\"App\\\\Domain\\\\\":\"src/Domain/\"}},"
+                          "\"autoload-dev\":{\"psr-4\":{\"Tests\\\\\":\"tests/\"}}}\n"},
+        {"tests/Support/Assert.php", EI_PHP_CLASS("Tests\\Support", "Assert")},
+        {"tests/Support/Factory.php", EI_PHP_CLASS("Tests\\Support", "Factory")},
+        {"packages/billing/composer.json",
+         "{\"name\":\"acme/billing\",\"autoload\":{\"psr-4\":{\"Billing\\\\\":\"src/\"}}}\n"},
+        {"app/Domain/Order.php", EI_PHP_CLASS("App\\Domain", "Order")},
+        {"src/Domain/Customer.php", EI_PHP_CLASS("App\\Domain", "Customer")},
+        {"src/Domain/Order.php", EI_PHP_CLASS("App\\Domain", "Order")},
+        {"packages/billing/src/Account.php", EI_PHP_CLASS("Billing", "Account")},
+        {"packages/billing/src/Ledger.php", EI_PHP_CLASS("Billing", "Ledger")},
+        {"app/Http/Checkout.php", "<?php\nnamespace App\\Http;\n\n"
+                                  "use App\\Domain\\Order;\nuse Billing\\Ledger;\n"
+                                  "use Tests\\Support\\Assert;\n\n"
+                                  "class Checkout {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Order", "src/Domain/Order.php"},
+        {"Ledger", "packages/billing/src/Ledger.php"},
+        {"Assert", "tests/Support/Assert.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 10, "app/Http/Checkout.php", want, 3));
+    PASS();
+}
+
+/* Control: `use function` / `use const` name a namespace member, not a class
+ * file, so they must not go through PSR-4 class-file mapping (there is no
+ * app/Helpers/format_money.php); they keep resolving to the declaring file. */
+TEST(ei_php_psr4_use_function_not_class_mapped_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Helpers/money.php", "<?php\nnamespace App\\Helpers;\n\n"
+                                  "const CURRENCY = 'EUR';\n\n"
+                                  "function format_money($x) { return $x; }\n"},
+        {"app/Http/Shop.php", "<?php\nnamespace App\\Http;\n\n"
+                              "use function App\\Helpers\\format_money;\n"
+                              "use const App\\Helpers\\CURRENCY;\n\n"
+                              "class Shop {\n"
+                              "    public function show() { return format_money(CURRENCY); }\n"
+                              "}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"format_money", "app/Helpers/money.php"},
+        {"CURRENCY", "app/Helpers/money.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 3, "app/Http/Shop.php", want, 2));
+    PASS();
+}
+
+/* Control: a PSR-4 class whose file does not exist stays unresolved — it must
+ * never fall back to the first file of the namespace directory. The present
+ * sibling import still resolves. */
+TEST(ei_php_psr4_missing_class_file_unresolved_issue1186) {
+    static const EILangFile f[] = {
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
+        {"app/Models/User.php", EI_PHP_CLASS("App\\Models", "User")},
+        {"app/Http/Guard.php", "<?php\nnamespace App\\Http;\n\n"
+                               "use App\\Models\\Ghost;\nuse App\\Models\\User;\n\n"
+                               "class Guard {\n}\n"}};
+    static const EIPhpImportExpect want[] = {
+        {"Ghost", NULL},
+        {"User", "app/Models/User.php"},
+    };
+    ASSERT_TRUE(ei_php_imports_match(f, 3, "app/Http/Guard.php", want, 2));
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1171,6 +1466,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_blank_import);
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
+    RUN_TEST(ei_py_external_import_never_binds_project_symbol);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */
@@ -1218,4 +1514,9 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_const_use);
     RUN_TEST(ei_php_multiple_use_statements);
     RUN_TEST(ei_php_interface_use);
+    RUN_TEST(ei_php_psr4_class_per_file_issue1186);
+    RUN_TEST(ei_php_psr4_nested_subnamespace_issue1186);
+    RUN_TEST(ei_php_psr4_multiple_roots_longest_prefix_issue1186);
+    RUN_TEST(ei_php_psr4_use_function_not_class_mapped_issue1186);
+    RUN_TEST(ei_php_psr4_missing_class_file_unresolved_issue1186);
 }

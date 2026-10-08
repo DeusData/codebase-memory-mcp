@@ -236,8 +236,20 @@ jobs:
       - name: Generate SBOM
         run: python3 scripts/ci/generate-sbom.py "${{ inputs.version }}"
 
+      # actions/attest-sbom is deprecated. What it does now is emit
+      # "::warning::actions/attest-sbom has been deprecated" and forward to
+      # actions/attest with NODE_OPTIONS set, passing sbom-path straight
+      # through. Calling attest directly produces the same attestation without
+      # the wrapper, and sbom-path is a first-class input there (verified
+      # against the action definition at this exact SHA, which is tag v4.1.0).
+      #
+      # This step deliberately carries no continue-on-error: a release must
+      # fail if its SBOM cannot be attested. An unattested SBOM is worse than
+      # an absent one, because the artifact still ships looking complete.
       - name: Attest SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        env:
+          NODE_OPTIONS: '--max-http-header-size=32768'
         with:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'

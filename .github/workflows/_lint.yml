@@ -3,14 +3,24 @@
 name: Lint & Security
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      lanes:
+        description: 'PR lane selection (scripts/ci/select-lanes.sh JSON list); "all" = every job (dry run, release)'
+        type: string
+        default: all
 
 permissions:
   contents: read
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'lint') }}
+    # Pinned, not ubuntu-latest: the LLVM install below adds an
+    # apt.llvm.org llvm-toolchain-NOBLE repo, which is 24.04 by name. When
+    # GitHub moves ubuntu-latest to the next LTS this job breaks on a day
+    # nobody chose. Pin the runner to the release the repo line already names.
+    runs-on: ubuntu-24.04
     # 15 min proved too tight on a slow runner day and a timed-out lint reads
     # as "cancelled", which the release graph must treat as a hard stop; keep
     # a bound, but one only a genuine hang can hit (normal runtime ~5 min).
@@ -60,7 +70,9 @@ jobs:
   # provability (never suppressed — the NOLINT ban applies here too).
   # Vendored-tree diagnostics are path-filtered, mirroring .cppcheck.
   lint-mem:
-    runs-on: ubuntu-latest
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'lint-mem') }}
+    # Pinned for the same reason as `lint`: llvm-toolchain-noble-21 below.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

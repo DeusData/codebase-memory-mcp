@@ -30,6 +30,9 @@
 
 #include "test_framework.h"
 #include "cbm.h"
+#include "sql_values.h"        /* #1735 value-row scanner */
+#include "foundation/compat.h" /* cbm_setenv / cbm_unsetenv */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -504,16 +507,38 @@ TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610) {
 }
 
 /* GUARD: a MISSING/ERROR node WITH WIDTH at EOF is a genuine loss and must
- * still be flagged. A Makefile whose final recipe line lacks its newline really
- * does drop the recipe from the tree — cbm's flag is honest there. */
+ * still be flagged. The construct here is broken whether or not the line is
+ * terminated, so neither the zero-width rule nor the virtual final newline
+ * (#2078) may excuse it.
+ *
+ * This guard used a Makefile whose final recipe line lacks its newline, which
+ * really did drop the recipe from the tree. Since #2078 the parser sees that
+ * line terminated and the recipe parses, so there is no loss left to report --
+ * see makefile_unterminated_recipe_is_parsed_issue2078. */
 TEST(width_bearing_error_at_eof_still_flagged_issue1610) {
-    const char *src = "all:\n\techo hi"; /* no trailing newline; recipe is lost */
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1,"; /* unclosed at EOF */
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
     if (!flagged) {
         FAIL("a width-bearing parse failure at EOF must still be reported");
+    }
+    PASS();
+}
+
+/* #2078: the recipe the old #1610 guard lost is now parsed -- the file is not
+ * flagged, with or without a trailing blank. */
+TEST(makefile_unterminated_recipe_is_parsed_issue2078) {
+    const char *cases[] = {"all:\n\techo hi", "all:\n\techo hi "};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MAKEFILE, "Makefile");
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("an unterminated final recipe line must parse like a terminated one");
+        }
     }
     PASS();
 }
@@ -608,11 +633,12 @@ TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746) {
     PASS();
 }
 
-/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too — the
- * Makefile recipe really is dropped, and only zero-width nodes are excused. */
+/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too, and
+ * only zero-width nodes are excused. (Formerly the unterminated Makefile
+ * recipe, which #2078 now parses -- see the #1610 guard above.) */
 TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746) {
-    const char *src = "all:\n\techo hi ";
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1, ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
@@ -983,7 +1009,894 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
     PASS();
 }
 
+/* ── #1735: SQL data dumps ───────────────────────────────────────────────────
+ * A mysqldump file is a few CREATE TABLEs followed by megabytes of literal
+ * INSERT rows. Tree-sitter built a full tree for every row until the parse
+ * budget ran out, and the whole file — tables included — was skipped as
+ * "parse timeout". Literal-only rows after the first of each VALUES list are
+ * now kept out of the parse (sql_values.c). These tests pin that nothing the
+ * full parse extracted outside those rows is lost (and, for standard '' escapes
+ * the grammar reads correctly, that nothing changes at all), that a row which
+ * can reference something is still parsed, and that the parse no longer grows
+ * with the row count. */
+
+typedef struct {
+    char *s;
+    size_t len;
+    size_t cap;
+} cov_buf_t;
+
+static void cov_put(cov_buf_t *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        va_end(ap2);
+        return;
+    }
+    if (b->len + (size_t)n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (b->len + (size_t)n + 1 > cap) {
+            cap *= 2;
+        }
+        char *grown = realloc(b->s, cap);
+        if (!grown) {
+            va_end(ap2);
+            return;
+        }
+        b->s = grown;
+        b->cap = cap;
+    }
+    vsnprintf(b->s + b->len, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)n;
+}
+
+static const char *const DUMP_WORDS[] = {"Kabul", "Herat",     "Amsterdam",    "O'Brien",
+                                         "Haag",  "Rotterdam", "Zuid-Holland", "Utrecht"};
+enum { DUMP_WORD_COUNT = sizeof(DUMP_WORDS) / sizeof(DUMP_WORDS[0]) };
+static const char *const DUMP_ODD[] = {"NULL", "-12.5", "0x1F",  "_binary 'ab'", "DEFAULT",
+                                       "TRUE", "1e-3",  "X'0A'", "''",           "'a''b'"};
+enum { DUMP_ODD_COUNT = sizeof(DUMP_ODD) / sizeof(DUMP_ODD[0]) };
+
+/* Deterministic mysqldump-shaped SQL: two tables and a view, then `stmts`
+ * extended INSERTs of `rows` tuples. `mysql_esc` writes a quote inside a string
+ * as \' (MySQL) instead of '' (standard). `mixed` puts one tuple holding a
+ * subquery and one holding a function call in the middle of every INSERT. The
+ * first two INSERTs separate their tuples with a newline and with a comment, the
+ * way pretty-printed dumps do. */
+static char *sql_dump(int stmts, int rows, bool mysql_esc, bool mixed) {
+    cov_buf_t b = {NULL, 0, 0};
+    cov_put(&b, "-- MySQL dump 10.13\n"
+                "/*!40101 SET NAMES utf8mb4 */;\n"
+                "CREATE TABLE `city` (\n"
+                "  `ID` int NOT NULL,\n"
+                "  `Name` char(35) NOT NULL DEFAULT '',\n"
+                "  `CountryCode` char(3),\n"
+                "  `Note` text,\n"
+                "  `Population` int\n"
+                ");\n"
+                "CREATE TABLE country (Code char(3), Name char(52));\n"
+                "CREATE VIEW big_cities AS SELECT Name FROM city WHERE Population > 1000000;\n"
+                "LOCK TABLES `city` WRITE;\n");
+    uint32_t seed = 1735;
+    int id = 1;
+    for (int s = 0; s < stmts; s++) {
+        cov_put(&b, "INSERT INTO `city` VALUES ");
+        const char *sep = s == 0 ? ",\n" : (s == 1 ? ", /* split */ " : ",");
+        for (int r = 0; r < rows; r++) {
+            if (r > 0) {
+                cov_put(&b, "%s", sep);
+            }
+            if (mixed && r == rows / 2) {
+                cov_put(&b, "((SELECT MAX(Code) FROM country),'x','AAA',NULL,1)");
+                continue;
+            }
+            if (mixed && r == rows / 2 + 1) {
+                cov_put(&b, "(%d,UPPER('y'),'BBB',NULL,2)", id++);
+                continue;
+            }
+            seed = seed * 1103515245u + 12345u;
+            const char *w = DUMP_WORDS[(seed >> 8) % DUMP_WORD_COUNT];
+            cov_put(&b, "(%d,'", id++);
+            for (const char *p = w; *p; p++) {
+                cov_put(&b, *p == '\'' ? (mysql_esc ? "\\'" : "''") : "%c", *p);
+            }
+            cov_put(&b, "','%c%c%c',%s,%u)", 'A' + (int)(seed % 26), 'A' + (int)((seed >> 5) % 26),
+                    'A' + (int)((seed >> 10) % 26), DUMP_ODD[(seed >> 12) % DUMP_ODD_COUNT],
+                    (seed >> 3) % 9000000u);
+        }
+        cov_put(&b, ";\n");
+    }
+    cov_put(&b, "UNLOCK TABLES;\n");
+    return b.s;
+}
+
+static void fp_s(cov_buf_t *b, const char *s) {
+    cov_put(b, "%s|", s ? s : "~");
+}
+
+/* Everything the graph is built from except calls and usages, in order (those
+ * two are compared site by site, sites_agree). */
+static char *result_fingerprint(const CBMFileResult *r) {
+    cov_buf_t b = {NULL, 0, 0};
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        fp_s(&b, d->label);
+        fp_s(&b, d->name);
+        fp_s(&b, d->qualified_name);
+        fp_s(&b, d->signature);
+        fp_s(&b, d->return_type);
+        fp_s(&b, d->structural_profile);
+        fp_s(&b, d->body_tokens);
+        cov_put(&b, "%u-%u c%d l%d\n", d->start_line, d->end_line, d->complexity, d->lines);
+    }
+    for (int i = 0; i < r->imports.count; i++) {
+        fp_s(&b, r->imports.items[i].local_name);
+        fp_s(&b, r->imports.items[i].module_path);
+        cov_put(&b, "imp\n");
+    }
+    for (int i = 0; i < r->rw.count; i++) {
+        fp_s(&b, r->rw.items[i].var_name);
+        cov_put(&b, "rw%d\n", (int)r->rw.items[i].is_write);
+    }
+    for (int i = 0; i < r->type_refs.count; i++) {
+        fp_s(&b, r->type_refs.items[i].type_name);
+        cov_put(&b, "tref\n");
+    }
+    for (int i = 0; i < r->env_accesses.count; i++) {
+        fp_s(&b, r->env_accesses.items[i].env_key);
+        cov_put(&b, "env\n");
+    }
+    for (int i = 0; i < r->throws.count; i++) {
+        fp_s(&b, r->throws.items[i].exception_name);
+        cov_put(&b, "throw\n");
+    }
+    for (int i = 0; i < r->string_refs.count; i++) {
+        fp_s(&b, r->string_refs.items[i].value);
+        cov_put(&b, "sref%d\n", (int)r->string_refs.items[i].kind);
+    }
+    cov_put(&b, "ta%d it%d rc%d ib%d ch%d\n", r->type_assigns.count, r->impl_traits.count,
+            r->resolved_calls.count, r->infra_bindings.count, r->channels.count);
+    return b.s;
+}
+
+static int has_usage_named(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strstr(r->usages.items[i].ref_name, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int has_call_named(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strstr(r->calls.items[i].callee_name, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    const char *name;
+    uint32_t start;
+    uint32_t end;
+} cov_site_t;
+
+static int collect_sites(const CBMFileResult *r, bool calls, cov_site_t **out) {
+    int n = calls ? r->calls.count : r->usages.count;
+    *out = calloc((size_t)(n > 0 ? n : 1), sizeof(cov_site_t));
+    for (int i = 0; i < n && *out; i++) {
+        (*out)[i] =
+            calls ? (cov_site_t){r->calls.items[i].callee_name, r->calls.items[i].site_start_byte,
+                                 r->calls.items[i].site_end_byte}
+                  : (cov_site_t){r->usages.items[i].ref_name, r->usages.items[i].site_start_byte,
+                                 r->usages.items[i].site_end_byte};
+    }
+    return *out ? n : 0;
+}
+
+static bool site_in(cov_site_t s, const cov_site_t *arr, int n) {
+    for (int i = 0; i < n; i++) {
+        if (arr[i].start == s.start && arr[i].end == s.end && s.name && arr[i].name &&
+            strcmp(arr[i].name, s.name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Calls (calls=true) or usages, cut parse against full parse:
+ *  - nothing the full parse found outside the dropped rows may be missing;
+ *  - with `exact`, the cut parse may find nothing the full parse did not.
+ * The full parse does find things INSIDE dropped rows: the SQL grammar reads
+ * DEFAULT and a _binary introducer as identifiers, and a MySQL \' escape it
+ * does not know turns the rest of a string into one. None of those names
+ * anything. Without `exact` (MySQL escapes) the cut parse may find more: the
+ * full parse's error recovery around a misread escape swallows neighbouring
+ * rows, a subquery row among them, and the cut parse no longer misreads them. */
+static bool sites_agree(const char *src, const CBMFileResult *cut, const CBMFileResult *full,
+                        bool calls, bool exact) {
+    cov_site_t *cs = NULL;
+    cov_site_t *fs = NULL;
+    int cn = collect_sites(cut, calls, &cs);
+    int fn = collect_sites(full, calls, &fs);
+    CBMSqlKeptRanges k = {NULL, 0};
+    (void)cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k);
+    bool ok = cs && fs;
+    for (int i = 0; ok && exact && i < cn; i++) {
+        if (!site_in(cs[i], fs, fn)) {
+            fprintf(stderr, "  %s only in the cut parse\n", cs[i].name);
+            ok = false;
+        }
+    }
+    for (int i = 0; ok && i < fn; i++) {
+        if (site_in(fs[i], cs, cn)) {
+            continue;
+        }
+        for (uint32_t j = 0; j < k.count; j++) {
+            if (fs[i].start < k.items[j].end_byte && fs[i].end > k.items[j].start_byte) {
+                fprintf(stderr, "  %s lost outside the dropped rows\n", fs[i].name);
+                ok = false;
+            }
+        }
+    }
+    cbm_sql_kept_ranges_free(&k);
+    free(cs);
+    free(fs);
+    return ok;
+}
+
+static int count_calls_named(const CBMFileResult *r, const char *name) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, name) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The same source parsed with the row exclusion and without it (test seam). */
+static CBMFileResult *extract_sql_full(const char *src, const char *path) {
+    cbm_setenv("CBM_TEST_SQL_FULL_PARSE_ON", path, 1);
+    CBMFileResult *r = do_extract(src, CBM_LANG_SQL, path);
+    cbm_unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
+    return r;
+}
+
+TEST(sql_dump_literal_rows_leave_the_graph_unchanged_issue1735) {
+    for (int esc = 0; esc < 2; esc++) {
+        char *src = sql_dump(4, 60, esc == 1, true);
+        ASSERT_NOT_NULL(src);
+        CBMFileResult *cut = do_extract(src, CBM_LANG_SQL, "dump.sql");
+        CBMFileResult *full = extract_sql_full(src, "dump.sql");
+        ASSERT_NOT_NULL(cut);
+        ASSERT_NOT_NULL(full);
+        ASSERT_FALSE(cut->has_error);
+        ASSERT_TRUE(has_def(cut, "big_cities"));
+        char *fp_cut = result_fingerprint(cut);
+        char *fp_full = result_fingerprint(full);
+        ASSERT_NOT_NULL(fp_cut);
+        ASSERT_NOT_NULL(fp_full);
+        ASSERT_STR_EQ(fp_cut, fp_full);
+        ASSERT_TRUE(sites_agree(src, cut, full, true, esc == 0));
+        ASSERT_TRUE(sites_agree(src, cut, full, false, esc == 0));
+        /* Every INSERT's subquery row is parsed. */
+        ASSERT_EQ(count_calls_named(cut, "MAX"), 4);
+        /* ...and the rows really were left out: under a quarter of the file
+         * is parsed. */
+        CBMSqlKeptRanges k = {NULL, 0};
+        ASSERT_TRUE(cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k));
+        size_t kept = 0;
+        for (uint32_t j = 0; j < k.count; j++) {
+            kept += k.items[j].end_byte - k.items[j].start_byte;
+        }
+        cbm_sql_kept_ranges_free(&k);
+        ASSERT_LT(kept * 4, strlen(src));
+        free(fp_cut);
+        free(fp_full);
+        cbm_free_result(cut);
+        cbm_free_result(full);
+        free(src);
+    }
+    PASS();
+}
+
+TEST(sql_dump_tuple_with_subquery_or_call_is_still_parsed_issue1735) {
+    char *src = sql_dump(1, 20, true, true);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = do_extract(src, CBM_LANG_SQL, "dump.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_usage_named(r, "country")); /* from the subquery row */
+    ASSERT_TRUE(has_call_named(r, "UPPER"));    /* from the function-call row */
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+TEST(sql_dump_parse_does_not_grow_with_the_row_count_issue1735) {
+    /* A count, not a clock: with literal rows kept out, doubling them must not
+     * add a single tree node. */
+    char *small = sql_dump(1, 500, true, false);
+    char *big = sql_dump(1, 1000, true, false);
+    ASSERT_NOT_NULL(small);
+    ASSERT_NOT_NULL(big);
+    CBMFileResult *rs = do_extract(small, CBM_LANG_SQL, "small.sql");
+    CBMFileResult *rb = do_extract(big, CBM_LANG_SQL, "big.sql");
+    ASSERT_NOT_NULL(rs);
+    ASSERT_NOT_NULL(rb);
+    ASSERT_EQ(rs->tree_nodes, rb->tree_nodes);
+    ASSERT_EQ(rs->defs.count, rb->defs.count);
+    cbm_free_result(rs);
+    cbm_free_result(rb);
+    free(small);
+    free(big);
+    PASS();
+}
+
+TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735) {
+    /* ~26 MB with MySQL escapes. The production parse budget is CPU time, so
+     * extracting under it made the verdict a function of runner speed (an
+     * ASan arm leg tripped it). The property behind "indexed, not timed out"
+     * is a count: the parse work is set by the statements, not by the rows.
+     * So: extract unbudgeted, assert the outcome, and bound the tree by the
+     * same 330 statements carrying only a handful of rows each (the full
+     * parse built a tree node for every row token). */
+    char *src = sql_dump(330, 2000, true, true);
+    char *few = sql_dump(330, 4, true, true);
+    ASSERT_NOT_NULL(src);
+    ASSERT_NOT_NULL(few);
+    size_t len = strlen(src);
+    ASSERT_GT(len, (size_t)24 * 1024 * 1024);
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)len, CBM_LANG_SQL, "covproj", "world.sql", 0, NULL, NULL);
+    CBMFileResult *rf =
+        cbm_extract_file(few, (int)strlen(few), CBM_LANG_SQL, "covproj", "few.sql", 0, NULL, NULL);
+    free(src);
+    free(few);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(rf);
+    bool indexed = !r->has_error && has_def(r, "big_cities") && has_usage_named(r, "country");
+    uint32_t nodes = r->tree_nodes;
+    uint32_t few_nodes = rf->tree_nodes;
+    cbm_free_result(r);
+    cbm_free_result(rf);
+    ASSERT_TRUE(indexed);
+    ASSERT_GT(few_nodes, 0);
+    ASSERT_LTE(nodes, 2 * few_nodes);
+    PASS();
+}
+
+/* The text the parser sees: every kept range, concatenated. */
+static char *kept_text(const char *src, const CBMSqlKeptRanges *k) {
+    cov_buf_t b = {NULL, 0, 0};
+    cov_put(&b, "%s", "");
+    for (uint32_t i = 0; i < k->count; i++) {
+        cov_put(&b, "%.*s", (int)(k->items[i].end_byte - k->items[i].start_byte),
+                src + k->items[i].start_byte);
+    }
+    return b.s;
+}
+
+TEST(sql_values_scanner_excludes_only_literal_rows_issue1735) {
+    /* {source, what the parser sees} — NULL means nothing is excluded. */
+    static const char *const cases[][2] = {
+        {"INSERT INTO t VALUES (1,'a'),(2,'b\\'c'),(3,NULL);", "INSERT INTO t VALUES (1,'a');"},
+        {"INSERT INTO t VALUES (1),(f(2)),(3);", "INSERT INTO t VALUES (1),(f(2));"},
+        {"insert into t values (1),(-2.5e3),(0x1F),(_binary 'x'),(DEFAULT),(true),(X'0A'),"
+         "('it''s'),(.5),();",
+         "insert into t values (1);"},
+        {"REPLACE INTO t VALUES (1), /* c */ (2), (3);", "REPLACE INTO t VALUES (1);"},
+        {"INSERT INTO t VALUES (1),(2) -- c\n,(3);", "INSERT INTO t VALUES (1) -- c\n;"},
+        {"INSERT INTO t VALUES (1),((SELECT id FROM u)),(x),(\"q\"),(`b`),(a.b);", NULL},
+        {"INSERT INTO t VALUES (1),('a\nb'),(2);", "INSERT INTO t VALUES (1),('a\nb');"},
+        {"INSERT INTO t VALUES (1),(2) ON DUPLICATE KEY UPDATE a=VALUES(a);",
+         "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a=VALUES(a);"},
+        {"INSERT INTO t (a, b) VALUES (1, 2), (3, 4);", "INSERT INTO t (a, b) VALUES (1, 2);"},
+        {"SELECT 'INSERT INTO t VALUES (1),(2)';", NULL},
+        {"-- INSERT INTO t VALUES (1),(2)\nSELECT 1;", NULL},
+        {"/* INSERT INTO t VALUES (1),(2) */ SELECT 1;", NULL},
+        {"SELECT * FROM (VALUES (1),(2)) AS v(x);", NULL},
+        {"CREATE FUNCTION f() AS $$ SELECT 1; INSERT INTO t VALUES (1),(2); $$;", NULL},
+        {"INSERT INTO t VALUES (1),(2", NULL},
+        {"INSERT INTO t VALUES (1),(1abc),(2);", "INSERT INTO t VALUES (1),(1abc);"},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const char *src = cases[c][0];
+        CBMSqlKeptRanges k = {NULL, 0};
+        bool cut = cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k);
+        if (!cases[c][1]) {
+            if (cut) {
+                fprintf(stderr, "  case %zu excluded rows unexpectedly: %s\n", c, src);
+            }
+            ASSERT_FALSE(cut);
+            continue;
+        }
+        ASSERT_TRUE(cut);
+        char *seen = kept_text(src, &k);
+        ASSERT_NOT_NULL(seen);
+        ASSERT_STR_EQ(seen, cases[c][1]);
+        free(seen);
+        cbm_sql_kept_ranges_free(&k);
+    }
+    PASS();
+}
+
+TEST(sql_values_scanner_keeps_positions_of_kept_text_issue1735) {
+    const char *src = "INSERT INTO t VALUES\n(1),\n(2);\nCREATE TABLE u (id int);\n";
+    CBMSqlKeptRanges k = {NULL, 0};
+    ASSERT_TRUE(cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k));
+    ASSERT_EQ(k.count, 2u);
+    /* excluded: ",\n(2)" from byte 24 (row 1, col 3) to byte 29 (row 2, col 3) */
+    ASSERT_EQ(k.items[0].start_byte, 0u);
+    ASSERT_EQ(k.items[0].end_byte, 24u);
+    ASSERT_EQ(k.items[0].end_point.row, 1u);
+    ASSERT_EQ(k.items[0].end_point.column, 3u);
+    ASSERT_EQ(k.items[1].start_byte, 29u);
+    ASSERT_EQ(k.items[1].start_point.row, 2u);
+    ASSERT_EQ(k.items[1].start_point.column, 3u);
+    ASSERT_EQ(k.items[1].end_byte, (uint32_t)strlen(src));
+    ASSERT_EQ(k.items[1].end_point.row, 4u);
+    ASSERT_EQ(k.items[1].end_point.column, 0u);
+    cbm_sql_kept_ranges_free(&k);
+    /* The table after the cut keeps its real line. */
+    CBMFileResult *r = do_extract(src, CBM_LANG_SQL, "pos.sql");
+    ASSERT_NOT_NULL(r);
+    bool found = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "u") == 0) {
+            ASSERT_EQ(r->defs.items[i].start_line, 4u);
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── #1736: a lone '&' in JSX is text, not a parse failure ────────────────
+ * Upstream tree-sitter-javascript (and the tsx dialect built on it) accepted
+ * '&' inside a JSX string only before a space/digit or as a complete
+ * character reference, and never inside JSX text, so `href="...?a=1&b=2"`
+ * (the reporter's Google Fonts URL) or `<p>Tom &Jerry</p>` produced an ERROR
+ * node and a parse_partial flag. Both grammars are now self-maintained forks
+ * (tools/tree-sitter-javascript, tools/tree-sitter-tsx). Each case wraps the
+ * JSX in a component and puts a second function AFTER it, so a pass also
+ * proves the definitions around the JSX are extracted. */
+static const char *const JSX_AMP_BODIES[] = {
+    /* the #1736 shape: '&' + letter in a double-quoted attribute */
+    "<link href=\"https://fonts.x/css2?family=Inter:wght@300;400&family=Syne&display=swap\" />",
+    "<link href='https://x.com/a?a=1&b=2' />", /* single-quoted attribute */
+    "<p title=\"a&\">x</p>",                   /* '&' right before the quote */
+    "<p>Tom &Jerry</p>",                       /* '&' + letter in JSX text */
+    "<p>Tom & Jerry</p>",                      /* '&' + space in JSX text */
+    "<p>x &1 y</p>",                           /* '&' + digit in JSX text */
+    /* controls: references keep parsing; '& ' / '&1' in attributes */
+    "<p title=\"x&amp;y&#38;z & w &1\">A&amp;B &#38; C</p>",
+};
+
+static const struct {
+    CBMLanguage lang;
+    const char *path;
+} JSX_AMP_LANGS[] = {
+    {CBM_LANG_JAVASCRIPT, "app/page.js"},
+    {CBM_LANG_JAVASCRIPT, "app/page.jsx"},
+    {CBM_LANG_TSX, "app/layout.tsx"},
+};
+
+enum { JSX_AMP_SRC_CAP = 512 };
+
+TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736) {
+    size_t nb = sizeof(JSX_AMP_BODIES) / sizeof(JSX_AMP_BODIES[0]);
+    size_t nl = sizeof(JSX_AMP_LANGS) / sizeof(JSX_AMP_LANGS[0]);
+    int failures = 0;
+    for (size_t l = 0; l < nl; l++) {
+        for (size_t b = 0; b < nb; b++) {
+            char src[JSX_AMP_SRC_CAP];
+            snprintf(src, sizeof(src),
+                     "export default function Page() {\n  return (\n    %s\n  );\n}\n"
+                     "export function After() {\n  return 1;\n}\n",
+                     JSX_AMP_BODIES[b]);
+            CBMFileResult *r = do_extract(src, JSX_AMP_LANGS[l].lang, JSX_AMP_LANGS[l].path);
+            ASSERT_NOT_NULL(r);
+            bool bad = r->parse_incomplete || !has_def(r, "Page") || !has_def(r, "After");
+            if (bad) {
+                fprintf(stderr, "  %s flagged=%d ranges=%s body=%s\n", JSX_AMP_LANGS[l].path,
+                        (int)r->parse_incomplete, r->error_ranges ? r->error_ranges : "(none)",
+                        JSX_AMP_BODIES[b]);
+                failures++;
+            }
+            cbm_free_result(r);
+        }
+    }
+    ASSERT_EQ(failures, 0);
+    PASS();
+}
+
+/* GUARD against an inert test: the same wrapper with genuinely broken JSX is
+ * still flagged in every one of the three languages, so the green above is the
+ * grammar accepting '&', not the signal being switched off. */
+TEST(jsx_broken_markup_still_parse_partial_issue1736) {
+    size_t nl = sizeof(JSX_AMP_LANGS) / sizeof(JSX_AMP_LANGS[0]);
+    for (size_t l = 0; l < nl; l++) {
+        const char *src = "export default function Page() {\n  return (\n"
+                          "    <p title=\"a\" =>x</p>\n  );\n}\n"
+                          "export function After() {\n  return 1;\n}\n";
+        CBMFileResult *r = do_extract(src, JSX_AMP_LANGS[l].lang, JSX_AMP_LANGS[l].path);
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        ASSERT_TRUE(flagged);
+    }
+    PASS();
+}
+
+/* ── #1748: C# 12 collection expressions in conditional branches ─────────────
+ * The vendored tree-sitter-c-sharp (pin 88366631d598) predated upstream's
+ * collection-expression support (#402, first released in v0.23.4): `[...]` was
+ * only reachable as an element_binding_expression, so an empty or a second
+ * collection literal after `?`/`:` had no valid parse and error recovery ate
+ * the surrounding statement. Every body below is valid C# 12; the method that
+ * FOLLOWS it pins that extraction resumes after the conditional. */
+#define CS_1748_WRAP(body)                         \
+    "class M\n"                                    \
+    "{\n"                                          \
+    "    async Task Go(bool c, List<int> items)\n" \
+    "    {\n" body "\n"                            \
+    "    }\n"                                      \
+    "    Task<List<int>> F() => null;\n"           \
+    "    void AfterConditional() { }\n"            \
+    "}\n"
+
+TEST(cs_collection_expression_in_conditional_is_complete_issue1748) {
+    static const char *const bodies[] = {
+        /* the reported shape: wrapped ternary, empty collection first */
+        CS_1748_WRAP("        var x = c\n            ? []\n            : await F();"),
+        CS_1748_WRAP("        var x = c ? []\n            : await F();"),
+        CS_1748_WRAP("        List<int> x = c\n            ? []\n            : [items.First()];"),
+        /* both branches collection expressions, single line */
+        CS_1748_WRAP("        List<int> x = c ? [] : [1];"),
+        /* single-line, single collection branch (also failed on the old pin) */
+        CS_1748_WRAP("        var x = c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? [] : await F();"),
+        CS_1748_WRAP("        return c ? [] : items;"),
+        CS_1748_WRAP("        if (c) return c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? items : [];"),
+        CS_1748_WRAP("        var x = c switch { true => [], _ => items };"),
+        CS_1748_WRAP("        int[] a = [1, 2, ..items];"),
+        /* control: the same wrapped shape without a collection expression */
+        CS_1748_WRAP("        var x = c\n            ? null\n            : await F();"),
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        CBMFileResult *r = do_extract(bodies[i], CBM_LANG_CSHARP, "M.cs");
+        ASSERT_NOT_NULL(r);
+        bool partial = r->parse_incomplete;
+        bool has_after = has_def(r, "AfterConditional");
+        if (partial || !has_after) {
+            fprintf(stderr, "  case %zu: partial=%d ranges=%s after_def=%d\n", i, partial,
+                    r->error_ranges ? r->error_ranges : "(none)", has_after);
+            failures++;
+        }
+        cbm_free_result(r);
+    }
+    if (failures != 0) {
+        FAIL("valid C# 12 collection expressions in conditional branches must parse completely");
+    }
+    PASS();
+}
+
+/* Calls nested in a collection expression (element and spread) must still be
+ * extracted after the refresh moved them under collection_expression /
+ * expression_element / spread_element (previously element_binding_expression /
+ * argument / range_expression). */
+TEST(cs_calls_inside_collection_expression_extracted_issue1748) {
+    const char *src = "class M\n"
+                      "{\n"
+                      "    int[] Build(bool c)\n"
+                      "    {\n"
+                      "        return c ? [] : [Head(), ..Tail()];\n"
+                      "    }\n"
+                      "    int Head() => 1;\n"
+                      "    int[] Tail() => null;\n"
+                      "}\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    bool partial = r->parse_incomplete;
+    bool head = false;
+    bool tail = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *n = r->calls.items[i].callee_name;
+        if (n && strcmp(n, "Head") == 0) {
+            head = true;
+        }
+        if (n && strcmp(n, "Tail") == 0) {
+            tail = true;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_FALSE(partial);
+    ASSERT_TRUE(head);
+    ASSERT_TRUE(tail);
+    PASS();
+}
+
+/* GUARD: the refreshed grammar must not hide genuinely broken C#. */
+TEST(cs_malformed_conditional_remains_partial_issue1748) {
+    CBMFileResult *r =
+        do_extract(CS_1748_WRAP("        var x = c ? ] : ;"), CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── #2078: every file is parsed as if it ended with a newline ───────────────
+ *
+ * Several grammars need a line terminator that a file's last line may simply
+ * not have. tree-sitter-markdown is the sharpest case: an opening code fence,
+ * an ATX heading or a bare list marker as the final bytes of a file leaves a
+ * WIDTH-BEARING ERROR (so the #1610 zero-width rule cannot excuse it), and a
+ * file that is only "```" came back as a whole-file error. Appending one "\n"
+ * made every one of these clean -- the reporter proved it on 21 real files.
+ *
+ * cbm now feeds the parser one virtual "\n" past EOF when the last byte is not
+ * already a newline, then clamps the tree back to the real length, so no
+ * consumer sees a byte, a line or a range that is not in the file. */
+TEST(markdown_unterminated_last_line_is_clean_issue2078) {
+    const char *cases[] = {
+        "text\n```", /* opening fence at EOF (upstream PR #262, closed unmerged) */
+        "```",       /* the whole file is one opening fence */
+        "# Top",     /* ATX heading */
+        "- ",        /* bare list marker */
+    };
+    int flagged = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        if (r->parse_incomplete || r->parse_unusable) {
+            fprintf(stderr, "  case %zu flagged: partial=%d unusable=%d ranges=%s\n", i,
+                    r->parse_incomplete, r->parse_unusable,
+                    r->error_ranges ? r->error_ranges : "(none)");
+            flagged++;
+        }
+        cbm_free_result(r);
+    }
+    if (flagged) {
+        FAIL("a markdown file must not be flagged only because its last line is unterminated");
+    }
+    PASS();
+}
+
+/* Controls: the same bytes WITH the newline were already clean and stay so. */
+TEST(markdown_terminated_last_line_controls_unchanged_issue2078) {
+    const char *cases[] = {"text\n```\n", "```\n", "# Top\n", "- \n"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT_FALSE(r->parse_unusable);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Everything extraction reports, as one string, so two results compare
+ * byte-for-byte: defs (every text field and range), calls (exact byte spans),
+ * imports and the coverage verdict. */
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+} dump_buf_t;
+
+static void dump_str(dump_buf_t *b, const char *tag, const char *s) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%s", tag, s ? s : "~");
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+static void dump_num(dump_buf_t *b, const char *tag, long v) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%ld", tag, v);
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+/* The Module def spans the whole file, and its end line follows the line
+ * convention for a terminated last line (#1967), so it is compared on its own
+ * rather than through the dump. */
+static char *dump_extraction(const CBMFileResult *r) {
+    dump_buf_t b = {(char *)calloc(1u << 16, 1), 1u << 16, 0};
+    if (!b.buf) {
+        return NULL;
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Module") == 0) {
+            continue;
+        }
+        dump_str(&b, "\nD", d->qualified_name);
+        dump_str(&b, "name", d->name);
+        dump_str(&b, "label", d->label);
+        dump_num(&b, "start", d->start_line);
+        dump_num(&b, "end", d->end_line);
+        dump_num(&b, "lines", d->lines);
+        dump_num(&b, "cx", d->complexity);
+        dump_num(&b, "params", d->param_count);
+        dump_str(&b, "sig", d->signature);
+        dump_str(&b, "ret", d->return_type);
+        dump_str(&b, "doc", d->docstring);
+        dump_str(&b, "prof", d->structural_profile);
+        dump_str(&b, "tok", d->body_tokens);
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        dump_str(&b, "\nC", c->callee_name);
+        dump_str(&b, "in", c->enclosing_func_qn);
+        dump_num(&b, "line", c->start_line);
+        dump_num(&b, "from", (long)c->site_start_byte);
+        dump_num(&b, "to", (long)c->site_end_byte);
+        dump_num(&b, "args", c->arg_count);
+    }
+    for (int i = 0; i < r->imports.count; i++) {
+        dump_str(&b, "\nI", r->imports.items[i].local_name);
+        dump_str(&b, "path", r->imports.items[i].module_path);
+    }
+    dump_str(&b, "\nP", r->error_ranges);
+    dump_num(&b, "partial", r->parse_incomplete);
+    dump_num(&b, "unusable", r->parse_unusable);
+    dump_str(&b, "", "\n");
+    return b.buf;
+}
+
+static uint32_t module_end_line(const CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Module") == 0) {
+            return r->defs.items[i].end_line;
+        }
+    }
+    return 0;
+}
+
+static char *extract_dump(const char *src, CBMLanguage lang, const char *path,
+                          uint32_t *module_end) {
+    CBMFileResult *r = do_extract(src, lang, path);
+    if (!r) {
+        return NULL;
+    }
+    char *d = dump_extraction(r);
+    if (module_end) {
+        *module_end = module_end_line(r);
+    }
+    cbm_free_result(r);
+    return d;
+}
+
+/* GUARD: for code grammars a trailing newline is insignificant, so a file
+ * without one must extract byte-identically to the same file with one -- every
+ * def, range, text field and call byte span. The virtual newline may never
+ * show up as phantom content or a phantom line. */
+TEST(code_without_final_newline_extracts_identically_issue2078) {
+    struct {
+        const char *src; /* no trailing newline */
+        CBMLanguage lang;
+        const char *path;
+        uint32_t lines;
+    } cases[] = {
+        {"#include <stdio.h>\n\nstatic int beta(int x) {\n    return x + 1;\n}\n\n"
+         "void alpha(void) { printf(\"a\"); beta(2); }",
+         CBM_LANG_C, "a.c", 7},
+        {"import os\n\n\nclass K:\n    def m(self, a):\n        return os.path.join(a)\n\n\n"
+         "def f(x):\n    \"\"\"doc\"\"\"\n    return K().m(x)",
+         CBM_LANG_PYTHON, "a.py", 11},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t n = strlen(cases[i].src);
+        char *terminated = (char *)malloc(n + 2);
+        ASSERT_NOT_NULL(terminated);
+        memcpy(terminated, cases[i].src, n);
+        terminated[n] = '\n';
+        terminated[n + 1] = '\0';
+        uint32_t bare_module_end = 0;
+        char *bare = extract_dump(cases[i].src, cases[i].lang, cases[i].path, &bare_module_end);
+        char *term = extract_dump(terminated, cases[i].lang, cases[i].path, NULL);
+        free(terminated);
+        ASSERT_NOT_NULL(bare);
+        ASSERT_NOT_NULL(term);
+        bool same = strcmp(bare, term) == 0;
+        if (!same) {
+            fprintf(stderr, "  %s differs:\n--- without final newline%s--- with final newline%s",
+                    cases[i].path, bare, term);
+        }
+        free(bare);
+        free(term);
+        if (!same) {
+            FAIL("extraction must not depend on whether the last line is terminated");
+        }
+        if (bare_module_end != cases[i].lines) {
+            fprintf(stderr, "  %s: module ends on line %u, file has %u\n", cases[i].path,
+                    bare_module_end, cases[i].lines);
+            FAIL("the virtual newline must not add a line to the module");
+        }
+    }
+    PASS();
+}
+
+/* GUARD against phantom content: a heading on an unterminated last line is a
+ * one-line file. No def may end past line 1, no text may carry the virtual
+ * newline, and the result must equal the terminated file's. */
+TEST(virtual_newline_adds_no_phantom_line_or_text_issue2078) {
+    CBMFileResult *r = do_extract("# Top", CBM_LANG_MARKDOWN, "top.md");
+    ASSERT_NOT_NULL(r);
+    bool found = has_def(r, "Top");
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->end_line > 1 || d->start_line > 1) {
+            fprintf(stderr, "  def %s spans %u-%u\n", d->name ? d->name : "?", d->start_line,
+                    d->end_line);
+            cbm_free_result(r);
+            FAIL("no def may reach past the last real line");
+        }
+        if ((d->name && strchr(d->name, '\n')) || (d->signature && strchr(d->signature, '\n'))) {
+            cbm_free_result(r);
+            FAIL("no extracted text may contain the virtual newline");
+        }
+    }
+    cbm_free_result(r);
+    if (!found) {
+        /* Before #2078 the unterminated heading was silently dropped: no
+         * Section, and no parse_partial flag to say so. */
+        FAIL("the heading on an unterminated last line must be extracted as a Section");
+    }
+    PASS();
+}
+
+/* GUARD: the empty file and a file that is exactly "\n" get no virtual
+ * newline (nothing is unterminated) and stay clean. */
+TEST(empty_and_newline_only_files_unchanged_issue2078) {
+    const char *srcs[] = {"", "\n"};
+    CBMLanguage langs[] = {CBM_LANG_MARKDOWN, CBM_LANG_PYTHON, CBM_LANG_C};
+    const char *paths[] = {"e.md", "e.py", "e.c"};
+    for (size_t s = 0; s < 2; s++) {
+        for (size_t l = 0; l < 3; l++) {
+            CBMFileResult *r = do_extract(srcs[s], langs[l], paths[l]);
+            ASSERT_NOT_NULL(r);
+            ASSERT_FALSE(r->parse_incomplete);
+            ASSERT_FALSE(r->parse_unusable);
+            cbm_free_result(r);
+        }
+    }
+    PASS();
+}
+
+/* #1967: every line counter over one source buffer answers the same
+ * question the same way. A trailing newline ends the last line; it does not
+ * open a new one. */
+TEST(source_line_count_one_convention) {
+    ASSERT_EQ(cbm_source_line_count("", 0), 1u);
+    ASSERT_EQ(cbm_source_line_count("a", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\n", 2), 1u);
+    ASSERT_EQ(cbm_source_line_count("\n", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\nb", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\nb\n", 4), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\n\n", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\r\nb\r\n", 6), 2u);
+    /* src_len bounds the count, not a NUL terminator. */
+    ASSERT_EQ(cbm_source_line_count("a\nb\nc", 2), 1u);
+    PASS();
+}
+
 SUITE(parse_coverage) {
+    RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
     RUN_TEST(c_error_range_points_at_failed_region);
@@ -1008,6 +1921,7 @@ SUITE(parse_coverage) {
     RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
     RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(makefile_unterminated_recipe_is_parsed_issue2078);
     RUN_TEST(c_ifdef_split_range_narrows_to_dropped_branch);
     RUN_TEST(c_ifdef_split_range_excludes_lines_the_preprocessor_explained);
     RUN_TEST(c_ifdef_split_range_never_starts_on_a_directive);
@@ -1023,4 +1937,20 @@ SUITE(parse_coverage) {
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
     RUN_TEST(coverage_range_never_covers_an_extracted_definition);
     RUN_TEST(coverage_gap_of_only_comments_is_not_a_miss);
+    RUN_TEST(sql_values_scanner_excludes_only_literal_rows_issue1735);
+    RUN_TEST(sql_values_scanner_keeps_positions_of_kept_text_issue1735);
+    RUN_TEST(sql_dump_literal_rows_leave_the_graph_unchanged_issue1735);
+    RUN_TEST(sql_dump_tuple_with_subquery_or_call_is_still_parsed_issue1735);
+    RUN_TEST(sql_dump_parse_does_not_grow_with_the_row_count_issue1735);
+    RUN_TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735);
+    RUN_TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736);
+    RUN_TEST(jsx_broken_markup_still_parse_partial_issue1736);
+    RUN_TEST(cs_collection_expression_in_conditional_is_complete_issue1748);
+    RUN_TEST(cs_calls_inside_collection_expression_extracted_issue1748);
+    RUN_TEST(cs_malformed_conditional_remains_partial_issue1748);
+    RUN_TEST(markdown_unterminated_last_line_is_clean_issue2078);
+    RUN_TEST(markdown_terminated_last_line_controls_unchanged_issue2078);
+    RUN_TEST(code_without_final_newline_extracts_identically_issue2078);
+    RUN_TEST(virtual_newline_adds_no_phantom_line_or_text_issue2078);
+    RUN_TEST(empty_and_newline_only_files_unchanged_issue2078);
 }

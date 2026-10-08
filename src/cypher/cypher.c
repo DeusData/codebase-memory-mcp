@@ -12,6 +12,8 @@
 #include "foundation/platform.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
+#include "foundation/hash_table.h"
+#include "foundation/mem_core.h"
 
 enum {
     CYP_BUF_16 = 16,
@@ -2300,7 +2302,6 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
 /* Get node property by name.
  * store may be NULL; only needed for virtual degree properties. */
 static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
-static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
 static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
     if (!n || !prop) {
@@ -2310,8 +2311,6 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     if (str && str[0]) {
         return str;
     }
-    /* Note: a string field that exists but is empty ("") falls through here so a
-     * WITH-aggregation node stub (below) can re-fetch it. */
     /* Computed and JSON-derived values live in rotating thread-local buffers:
      * a single row (or an ORDER-BY comparison) reads several of these before any
      * of them is copied out, so returning one shared static buffer would alias
@@ -2347,40 +2346,6 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512);
         if (v && v[0]) {
             return v;
-        }
-    }
-    /* WITH aggregation carries a node group var by id + name only (the group key
-     * is the node name), so every other property is absent on the stub. Detect
-     * the stub (id set, but the full string fields were never populated) and
-     * re-fetch the node so RETURN g.file_path / g.label / g.<metric> project
-     * correctly instead of returning blank. The gate is heuristic, not an exact
-     * stub discriminator: a real bound node with NULL label AND file_path would
-     * also match, but in that case the worst case is one redundant indexed fetch
-     * that returns the same value — never a wrong result. */
-    if (store && n->id > 0 && !n->file_path && !n->label) {
-        cbm_node_t full = {0};
-        if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
-            const char *res = NULL;
-            const char *rv = node_string_field(&full, prop);
-            if (rv && rv[0]) {
-                snprintf(out, CBM_SZ_512, "%s", rv);
-                res = out;
-            } else if (strcmp(prop, "start_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.start_line);
-                res = out;
-            } else if (strcmp(prop, "end_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.end_line);
-                res = out;
-            } else if (full.properties_json && full.properties_json[0] == '{') {
-                const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
-                if (jv && jv[0]) {
-                    res = out;
-                }
-            }
-            node_fields_free(&full);
-            if (res) {
-                return res;
-            }
         }
     }
     return "";
@@ -2631,6 +2596,12 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
     return n->name ? n->name : "";
 }
 
+/* Set when an `=~` or inline-property pattern was refused by the regex
+ * wrapper's compile-size guard during the CURRENT execution; cbm_cypher_execute
+ * turns it into result->warning so an empty result can be told from "no such
+ * name". Reset at the start of every execution. */
+static _Thread_local bool g_cypher_regex_refused = false;
+
 /* Evaluate a comparison operator between actual and expected strings. */
 static bool eval_comparison_op(const char *op, const char *actual, const char *expected) {
     if (strcmp(op, "=") == 0) {
@@ -2641,7 +2612,11 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
     }
     if (strcmp(op, "=~") == 0) {
         cbm_regex_t re;
-        if (cbm_regcomp(&re, expected, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+        int comp_rc = cbm_regcomp(&re, expected, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+        if (comp_rc != 0) {
+            if (comp_rc == CBM_REG_ETOOBIG) {
+                g_cypher_regex_refused = true;
+            }
             return false;
         }
         int rc = cbm_regexec(&re, actual, 0, NULL, 0);
@@ -2803,6 +2778,96 @@ static bool eval_where(const cbm_where_clause_t *w, binding_t *b) {
     return is_and;
 }
 
+/* Three-valued WHERE evaluation for the early (seed-row) pass in
+ * execute_single: only the first MATCH alias is bound there, so a leaf on
+ * any other alias is UNKNOWN rather than true. The two-valued evaluator
+ * returns true for an unbound alias, which NOT / XOR then invert -- pruning
+ * every seed before relationship expansion (distilled from PR #1245). The
+ * full evaluation reruns after expansion (Step 3), so the early pass only has
+ * to prune on a definite false. Allocation-free, O(expression nodes). */
+typedef enum { CYP_PARTIAL_FALSE = 0, CYP_PARTIAL_TRUE, CYP_PARTIAL_UNKNOWN } cyp_partial_t;
+
+static cyp_partial_t partial_and(cyp_partial_t l, cyp_partial_t r) {
+    if (l == CYP_PARTIAL_FALSE || r == CYP_PARTIAL_FALSE) {
+        return CYP_PARTIAL_FALSE;
+    }
+    return (l == CYP_PARTIAL_TRUE && r == CYP_PARTIAL_TRUE) ? CYP_PARTIAL_TRUE
+                                                            : CYP_PARTIAL_UNKNOWN;
+}
+
+static cyp_partial_t partial_or(cyp_partial_t l, cyp_partial_t r) {
+    if (l == CYP_PARTIAL_TRUE || r == CYP_PARTIAL_TRUE) {
+        return CYP_PARTIAL_TRUE;
+    }
+    return (l == CYP_PARTIAL_FALSE && r == CYP_PARTIAL_FALSE) ? CYP_PARTIAL_FALSE
+                                                              : CYP_PARTIAL_UNKNOWN;
+}
+
+/* A condition whose alias is not bound yet is UNKNOWN; a literal-only LHS
+ * (func condition with no variable arg) has nothing to wait for. */
+static cyp_partial_t eval_condition_partial(const cbm_condition_t *c, binding_t *b) {
+    if (c->variable && !binding_get(b, c->variable) && !binding_get_edge(b, c->variable)) {
+        return CYP_PARTIAL_UNKNOWN;
+    }
+    return eval_condition(c, b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+}
+
+static cyp_partial_t eval_expr_partial(const cbm_expr_t *e, // NOLINT(misc-no-recursion)
+                                       binding_t *b) {
+    if (!e) {
+        return CYP_PARTIAL_TRUE;
+    }
+    if (e->type == EXPR_CONDITION) {
+        return eval_condition_partial(&e->cond, b);
+    }
+    cyp_partial_t left = eval_expr_partial(e->left, b);
+    if (e->type == EXPR_NOT) {
+        if (left == CYP_PARTIAL_UNKNOWN) {
+            return CYP_PARTIAL_UNKNOWN;
+        }
+        return left == CYP_PARTIAL_TRUE ? CYP_PARTIAL_FALSE : CYP_PARTIAL_TRUE;
+    }
+    /* Same short-circuits as eval_expr: a definite left decides AND / OR. */
+    if (e->type == EXPR_AND && left == CYP_PARTIAL_FALSE) {
+        return CYP_PARTIAL_FALSE;
+    }
+    if (e->type == EXPR_OR && left == CYP_PARTIAL_TRUE) {
+        return CYP_PARTIAL_TRUE;
+    }
+    cyp_partial_t right = eval_expr_partial(e->right, b);
+    if (e->type == EXPR_AND) {
+        return partial_and(left, right);
+    }
+    if (e->type == EXPR_OR) {
+        return partial_or(left, right);
+    }
+    /* EXPR_XOR */
+    if (left == CYP_PARTIAL_UNKNOWN || right == CYP_PARTIAL_UNKNOWN) {
+        return CYP_PARTIAL_UNKNOWN;
+    }
+    return left != right ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+}
+
+static cyp_partial_t eval_where_partial(const cbm_where_clause_t *w, binding_t *b) {
+    if (!w) {
+        return CYP_PARTIAL_TRUE;
+    }
+    if (w->root) {
+        return eval_expr_partial(w->root, b);
+    }
+    /* Legacy flat evaluation */
+    if (w->count == 0) {
+        return CYP_PARTIAL_TRUE;
+    }
+    bool is_and = (w->op && strcmp(w->op, "AND") == 0) != 0;
+    cyp_partial_t result = is_and ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+    for (int i = 0; i < w->count; i++) {
+        cyp_partial_t r = eval_condition_partial(&w->conditions[i], b);
+        result = is_and ? partial_and(result, r) : partial_or(result, r);
+    }
+    return result;
+}
+
 /* Check if a string value looks like a regex pattern. */
 static bool looks_like_regex(const char *s) {
     if (!s) {
@@ -2821,13 +2886,17 @@ static bool check_inline_props(const cbm_node_t *n, const cbm_prop_filter_t *pro
         const char *actual = node_prop(n, props[i].key, store);
         if (looks_like_regex(props[i].value)) {
             cbm_regex_t re;
-            if (cbm_regcomp(&re, props[i].value, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
+            int comp_rc = cbm_regcomp(&re, props[i].value, CBM_REG_EXTENDED | CBM_REG_NOSUB);
+            if (comp_rc == 0) {
                 bool matched = cbm_regexec(&re, actual, 0, NULL, 0) == 0;
                 cbm_regfree(&re);
                 if (!matched) {
                     return false;
                 }
             } else if (strcmp(actual, props[i].value) != 0) {
+                if (comp_rc == CBM_REG_ETOOBIG) {
+                    g_cypher_regex_refused = true;
+                }
                 return false;
             }
         } else if (strcmp(actual, props[i].value) != 0) {
@@ -2872,6 +2941,104 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
         row[i] = values[i] ? heap_strdup(values[i]) : heap_strdup("");
     }
     rb->rows[rb->row_count++] = row;
+}
+
+/* ── DISTINCT while projecting (#1364) ─────────────────────────────
+ *
+ * RETURN DISTINCT used to project up to the engine row cap and only then drop
+ * duplicates, so a value first seen past the cap never reached the result: on
+ * a 150k-edge index `RETURN DISTINCT type(r)` lost its one HAS_BRANCH edge.
+ * The projection loops now de-duplicate as they go, so the cap counts DISTINCT
+ * rows. Memory stays bounded by the cap: only admitted rows are remembered;
+ * rows past the cap are probed (no insert) solely to decide `truncated`. */
+typedef struct {
+    CBMHashTable *seen; /* row key -> the same heap key; NULL = not DISTINCT */
+} rb_distinct_t;
+
+static void rb_distinct_init(rb_distinct_t *d, bool distinct) {
+    d->seen = distinct ? cbm_ht_create(CBM_SZ_64) : NULL;
+}
+
+static void rb_distinct_free_key(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    cbm_free(CBM_MEM_CLASS_OTHER, value);
+}
+
+static void rb_distinct_free(rb_distinct_t *d) {
+    if (d->seen) {
+        cbm_ht_foreach(d->seen, rb_distinct_free_key, NULL);
+        cbm_ht_free(d->seen);
+        d->seen = NULL;
+    }
+}
+
+/* Length-prefixed row key ("<len>:<value>" per column), so no value content
+ * can make two different rows collide. NULL projects as "" (as rb_add_row). */
+static char *rb_distinct_row_key(const char **vals, int n) {
+    size_t total = SKIP_ONE;
+    for (int i = 0; i < n; i++) {
+        total += (vals[i] ? strlen(vals[i]) : 0) + CBM_SZ_32;
+    }
+    char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, total);
+    if (!key) {
+        return NULL;
+    }
+    size_t pos = 0;
+    key[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        const char *v = vals[i] ? vals[i] : "";
+        int w = snprintf(key + pos, total - pos, "%zu:%s", strlen(v), v);
+        if (w > 0) {
+            pos += (size_t)w;
+        }
+    }
+    return key;
+}
+
+/* Admission for one projected row. Returns false for a row DISTINCT already
+ * holds. On true, *key_out is the key to hand to rb_distinct_keep (NULL when
+ * not DISTINCT, or when the key allocation failed — the row is then admitted
+ * without de-duplication rather than dropped). */
+static bool rb_distinct_is_new(const rb_distinct_t *d, const char **vals, int n, char **key_out) {
+    *key_out = NULL;
+    if (!d->seen) {
+        return true;
+    }
+    char *key = rb_distinct_row_key(vals, n);
+    if (!key) {
+        return true;
+    }
+    if (cbm_ht_has(d->seen, key)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        return false;
+    }
+    *key_out = key;
+    return true;
+}
+
+static void rb_distinct_keep(rb_distinct_t *d, char *key) {
+    if (key) {
+        cbm_ht_set(d->seen, key, key);
+    }
+}
+
+/* Add one projected row under a row cap, de-duplicating when DISTINCT.
+ * Returns false once a NEW row arrives with the cap already full: the caller
+ * stops there, and flags truncation when the cap is the engine budget. A
+ * duplicate past the cap is neither kept nor evidence of truncation. */
+static bool rb_add_row_capped(result_builder_t *rb, rb_distinct_t *d, const char **vals, int cap) {
+    char *key = NULL;
+    if (!rb_distinct_is_new(d, vals, rb->col_count, &key)) {
+        return true;
+    }
+    if (rb->row_count >= cap) {
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        return false;
+    }
+    rb_distinct_keep(d, key);
+    rb_add_row(rb, vals);
+    return true;
 }
 
 /* ── Main execution ─────────────────────────────────────────────── */
@@ -3842,6 +4009,30 @@ static void distinct_list_add(char ***list, int *count, const char *val) {
     (*list)[idx] = heap_strdup(val);
 }
 
+/* Resolve one WITH ORDER BY key on a projected binding. The key is either a
+ * projected name (`c`, or an unaliased `f.name`) or a property of a carried
+ * node (`g.start_line` after `WITH f AS g`, #2208): an exact projected name
+ * wins, otherwise `var.prop` is split and resolved on the carried node. */
+static const char *order_key_value(binding_t *b, const char *key) {
+    const char *dot = strchr(key, '.');
+    if (!dot) {
+        return binding_get_virtual(b, key, NULL);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], key) == 0) {
+            return binding_get_virtual(b, key, NULL);
+        }
+    }
+    char var[CBM_SZ_256];
+    size_t vlen = (size_t)(dot - key);
+    if (vlen >= sizeof(var)) {
+        return "";
+    }
+    memcpy(var, key, vlen);
+    var[vlen] = '\0';
+    return binding_get_virtual(b, var, dot + SKIP_ONE);
+}
+
 /* Sort bindings by the ORDER BY key list (virtual variables) using bubble
  * sort; later keys break ties, direction is per key (#1334). */
 static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clause_t *wc) {
@@ -3849,9 +4040,8 @@ static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clau
         for (int j = 0; j < count - i - SKIP_ONE; j++) {
             int cmp = 0;
             for (int k = 0; k < wc->order_key_count && cmp == 0; k++) {
-                const char *va = binding_get_virtual(&vbindings[j], wc->order_keys[k], NULL);
-                const char *vb2 =
-                    binding_get_virtual(&vbindings[j + SKIP_ONE], wc->order_keys[k], NULL);
+                const char *va = order_key_value(&vbindings[j], wc->order_keys[k]);
+                const char *vb2 = order_key_value(&vbindings[j + SKIP_ONE], wc->order_keys[k]);
                 char *ea = NULL;
                 char *eb = NULL;
                 double da = strtod(va, &ea);
@@ -3925,8 +4115,27 @@ typedef struct {
     double *mins, *maxs;
     char ***distinct_lists;  /* per-item set of seen values for COUNT(DISTINCT) */
     int *distinct_n;         /* per-item distinct count (#239) */
-    int64_t *group_node_ids; /* per-item node id when the group var is a node (0 = not) */
+    cbm_node_t *group_nodes; /* per-item carried node (deep copy; id 0 = not a node) */
 } with_agg_t;
+
+/* A WITH item that is a bare, bound node variable (`WITH f`, `WITH f AS g`)
+ * carries the node itself, not a scalar: return that node, else NULL. Property
+ * items, functions (labels/id/keys/...) and unbound OPTIONAL vars (id 0) stay
+ * scalar. The carried node keeps every field, so a later g.<prop> resolves
+ * exactly as it would without the WITH (#2208). */
+static const cbm_node_t *with_item_carried_node(const cbm_return_item_t *item, binding_t *b) {
+    if (item->func || item->property || !item->variable) {
+        return NULL;
+    }
+    const cbm_node_t *n = binding_get(b, item->variable);
+    return (n && n->id > 0) ? n : NULL;
+}
+
+/* Name a carried node is bound under: the AST-owned alias or variable, which
+ * outlives every binding of the query (binding_set does not copy the name). */
+static const char *with_item_node_alias(const cbm_return_item_t *item) {
+    return item->alias ? item->alias : item->variable;
+}
 
 /* Build a group key from non-aggregate WITH items */
 static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
@@ -3936,7 +4145,12 @@ static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, 
             continue;
         }
         char vbuf[CBM_SZ_512];
-        const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
+        const cbm_node_t *gn = with_item_carried_node(&wc->items[ci], b);
+        if (gn) {
+            /* Group a node by identity, never by its (non-unique) name. */
+            snprintf(vbuf, sizeof(vbuf), "#%lld", (long long)gn->id);
+        }
+        const char *v = gn ? vbuf : project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         kl += snprintf(key + kl, key_sz - (size_t)kl, "%s|", v);
         if (kl >= (int)key_sz) {
             kl = (int)key_sz - SKIP_ONE;
@@ -3966,7 +4180,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     (*aggs)[found].maxs = calloc(wc->count, sizeof(double));
     (*aggs)[found].distinct_lists = calloc(wc->count, sizeof(char **));
     (*aggs)[found].distinct_n = calloc(wc->count, sizeof(int));
-    (*aggs)[found].group_node_ids = calloc(wc->count, sizeof(int64_t));
+    (*aggs)[found].group_nodes = calloc(wc->count, sizeof(cbm_node_t));
     for (int ci = 0; ci < wc->count; ci++) {
         (*aggs)[found].mins[ci] = CYP_DBL_MAX;
         (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
@@ -3979,18 +4193,9 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         char vbuf[CBM_SZ_512];
         const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
-        /* If this group item is a bare node variable, remember its id so the
-         * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). Excludes entity-introspection funcs (labels/id/keys/
-         * properties): those project a scalar off the node (via project_item
-         * above), not the node itself, so the carried id must not be set or a
-         * later alias.property re-fetches the source node's real properties
-         * instead of returning empty for the non-node alias. */
-        if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
-            cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
-            if (gn) {
-                (*aggs)[found].group_node_ids[ci] = gn->id;
-            }
+        const cbm_node_t *gn = with_item_carried_node(&wc->items[ci], b);
+        if (gn) {
+            node_deep_copy(&(*aggs)[found].group_nodes[ci], gn);
         }
     }
     return found;
@@ -4033,11 +4238,14 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
     }
 }
 
-/* Add a virtual variable binding for one WITH item */
+/* Add a scalar virtual variable binding for one WITH item. The value lives in
+ * .name; the owned alias string (var_names points at it) lives in .project,
+ * which no property accessor exposes. It used to live in .qualified_name, so
+ * alias.qualified_name / keys(alias) returned the variable name as data (#2208). */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
-    cbm_node_t vn = {.name = heap_strdup(val), .qualified_name = heap_strdup(alias)};
+    cbm_node_t vn = {.name = heap_strdup(val), .project = heap_strdup(alias)};
     if (vb->var_count < CYP_BUF_16) {
-        vb->var_names[vb->var_count] = vn.qualified_name;
+        vb->var_names[vb->var_count] = vn.project;
         vb->var_nodes[vb->var_count] = vn;
         vb->var_count++;
     }
@@ -4062,7 +4270,12 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
         free(aggs[a].maxs);
         free(aggs[a].distinct_lists);
         free(aggs[a].distinct_n);
-        free(aggs[a].group_node_ids);
+        if (aggs[a].group_nodes) {
+            for (int ci = 0; ci < item_count; ci++) {
+                node_fields_free(&aggs[a].group_nodes[ci]);
+            }
+        }
+        free(aggs[a].group_nodes);
     }
     free(aggs);
 }
@@ -4102,13 +4315,10 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                     with_agg_format(wc->items[ci].func, &aggs[a], ci, vbuf, sizeof(vbuf));
                 }
                 with_add_vbinding_var(&vb, alias, vbuf);
+            } else if (aggs[a].group_nodes[ci].id > 0) {
+                binding_set(&vb, with_item_node_alias(&wc->items[ci]), &aggs[a].group_nodes[ci]);
             } else {
                 with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
-                /* Tag the carried virtual var with the node id (when the group
-                 * var is a node) so node_prop can re-fetch its full properties. */
-                if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
-                    vb.var_nodes[vb.var_count - 1].id = aggs[a].group_node_ids[ci];
-                }
             }
         }
         (*vbindings)[(*vcount)++] = vb;
@@ -4125,6 +4335,11 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
+            const cbm_node_t *carried = with_item_carried_node(&wc->items[ci], &bindings[bi]);
+            if (carried) {
+                binding_set(&vb, with_item_node_alias(&wc->items[ci]), carried);
+                continue;
+            }
             char func_buf[CBM_SZ_512];
             const char *val =
                 project_item(&bindings[bi], &wc->items[ci], func_buf, sizeof(func_buf));
@@ -4348,14 +4563,20 @@ static void execute_return_star_after_with(cbm_query_t *q, binding_t *bindings, 
         cols[i] = resolve_item_alias(&wc->items[i], name_bufs[i], sizeof(name_bufs[i]));
     }
     rb_set_columns(rb, cols, col_n);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, q->ret && q->ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CYP_MAX_VARS];
         for (int i = 0; i < col_n; i++) {
             cbm_node_t *vn = binding_get(&bindings[bi], cols[i]);
             vals[i] = vn && vn->name ? vn->name : "";
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, max_rows)) {
+            g_cypher_truncated = true;
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_count, int max_rows,
@@ -4370,19 +4591,22 @@ static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_co
     int projection_cap = max_rows;
     bool cap_is_engine_budget = true;
     cbm_return_clause_t *ret = q->ret;
-    if (ret && ret->limit >= 0 && ret->limit <= max_rows && !ret->distinct &&
-        ret->order_key_count == 0 && ret->skip <= 0) {
-        projection_cap = ret->limit;
+    if (ret && ret->limit >= 0 && ret->limit <= max_rows && ret->order_key_count == 0 &&
+        ret->skip <= 0) {
+        projection_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
         cap_is_engine_budget = false;
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < projection_cap; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, ret && ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_128];
         project_star_row(&bindings[bi], vars, vc, vals);
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, projection_cap)) {
+            g_cypher_truncated = g_cypher_truncated || cap_is_engine_budget;
+            break;
+        }
     }
-    if (cap_is_engine_budget && bind_count > projection_cap) {
-        g_cypher_truncated = true;
-    }
+    rb_distinct_free(&seen);
 }
 
 /* Format an aggregate value into buf based on function name */
@@ -4651,22 +4875,25 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
     bool cap_is_engine_budget = true;
-    if (ret->limit >= 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit;
+    if (ret->limit >= 0 && ret->order_key_count == 0 && ret->skip <= 0) {
+        proj_cap = ret->limit; /* DISTINCT: the cap counts distinct rows (#1364) */
         cap_is_engine_budget = false;
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
+    rb_distinct_t seen;
+    rb_distinct_init(&seen, ret->distinct);
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_32];
         char func_bufs[CBM_SZ_32][CBM_SZ_512];
         for (int ci = 0; ci < ret->count; ci++) {
             vals[ci] =
                 project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, proj_cap)) {
+            g_cypher_truncated = g_cypher_truncated || cap_is_engine_budget;
+            break;
+        }
     }
-    if (cap_is_engine_budget && bind_count > proj_cap) {
-        g_cypher_truncated = true;
-    }
+    rb_distinct_free(&seen);
 }
 
 /* Build default 3-column headers (name, qualified_name, label) per variable */
@@ -4811,9 +5038,12 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
             free(tmp);
         }
         if (opt && extra_count == 0) {
+            /* OPTIONAL with no start node: keep the row, pattern vars unbound.
+             * The buffer was sized for a single row when extra_count == 0, so
+             * this write must grow it like every other writer here. */
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
-            new_bindings[new_count++] = nb;
+            (void)binding_out_append(&new_bindings, &new_count, &new_cap, &nb);
         }
     }
     for (int bi = 0; bi < *bind_count; bi++) {
@@ -5005,7 +5235,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         }
     }
 
-    if (ret->distinct) {
+    /* The simple and star projections de-duplicate while projecting (#1364);
+     * only aggregate rows still need the post-pass. */
+    if (ret->distinct && has_agg && !ret->star) {
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);
@@ -5124,7 +5356,11 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 
     /* Build initial bindings with early WHERE */
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
-    binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
+    binding_t *bindings = malloc(((size_t)bind_cap + SKIP_ONE) * sizeof(binding_t));
+    if (!bindings) {
+        cbm_store_free_nodes(scanned, scan_count);
+        return CBM_NOT_FOUND; /* initial binding array refused */
+    }
     int bind_count = 0;
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : CYP_ANON_HEAD_VAR;
 
@@ -5135,7 +5371,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         binding_t b = {0};
         b.store = store;
         binding_set(&b, var_name, &scanned[i]);
-        bool pass = !q->where || eval_where(q->where, &b);
+        bool pass = eval_where_partial(q->where, &b) != CYP_PARTIAL_FALSE;
         if (pass) {
             bindings[bind_count++] = b;
         } else {
@@ -5433,8 +5669,11 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     g_cypher_depth_clamped = 0;
     g_cypher_trail_truncated = 0;
     g_cypher_truncated = false;
+    g_cypher_regex_refused = false;
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
-    if (max_rows <= 0) {
+    /* max_rows sizes the initial binding array: non-positive means the
+     * ceiling, and nothing above the ceiling is ever materialized anyway. */
+    if (max_rows <= 0 || max_rows > CYPHER_RESULT_CEILING) {
         max_rows = CYPHER_RESULT_CEILING;
     }
 
@@ -5520,8 +5759,8 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     /* Any internal ceiling that prevented exhaustive evaluation: a candidate or
      * traversal budget, or a variable-length range clamped to the engine cap. */
     out->truncated = g_cypher_truncated || g_cypher_trail_truncated != 0;
+    char wbuf[CBM_SZ_512] = "";
     if (g_cypher_depth_clamped > 0 || g_cypher_trail_truncated) {
-        char wbuf[CBM_SZ_256];
         if (g_cypher_depth_clamped > 0 && g_cypher_trail_truncated) {
             snprintf(wbuf, sizeof(wbuf),
                      "variable-length hop range clamped to the engine ceiling (%d) and "
@@ -5536,6 +5775,16 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             snprintf(wbuf, sizeof(wbuf),
                      "variable-length traversal budget was exhausted — results may be partial");
         }
+    }
+    /* A refused `=~` or property pattern matched nothing: say so, once per
+     * query, next to any traversal warning. */
+    if (g_cypher_regex_refused) {
+        size_t used = strlen(wbuf);
+        snprintf(wbuf + used, sizeof(wbuf) - used,
+                 "%sa =~ or property " CBM_REG_ETOOBIG_REASON " — the comparison matched nothing",
+                 used ? "; " : "");
+    }
+    if (wbuf[0]) {
         out->warning = heap_strdup(wbuf);
     }
 
