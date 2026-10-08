@@ -63,8 +63,9 @@ typedef struct {
                                       * be an absolute path ending in cmd.exe and argv must be
                                       * NULL. The fixed /D /S /V:OFF /C prefix is added while
                                       * this payload is copied verbatim for cmd.exe to parse. */
-    const char *log_file;            /* child stdout+stderr are redirected here and tailed;
-                                      * NULL => discard child output, no tailing */
+    const char *log_file;            /* stderr and, when stdout_file is NULL, stdout are
+                                      * redirected here and tailed; NULL => discard those
+                                      * streams, no tailing */
     cbm_proc_log_cb on_log_line;     /* optional per-line callback */
     void *log_ud;                    /* user data for on_log_line */
     int quiet_timeout_ms;            /* <= 0 => no timeout; else kill+HANG after this many
@@ -74,6 +75,23 @@ typedef struct {
     size_t memory_limit_bytes;       /* Windows-only hard commit limit for the entire Job Object;
                                       * 0 => no OS-enforced memory limit */
     bool delete_log_on_exit;         /* unlink log_file after reaping */
+    bool strip_git_repo_env;         /* child env omits git's repository-local variables
+                                      * (foundation/git_env.h) — set for every git spawn so
+                                      * an inherited GIT_DIR never overrides `git -C` */
+    const char *stdout_file;         /* optional separate stdout capture; NULL preserves
+                                      * merged log_file behavior. Must be nonempty and
+                                      * distinct from log_file; caller supplies private,
+                                      * non-aliasing paths and owns capture-file cleanup.
+                                      * Not tailed; quiet_timeout_ms observes log_file only.
+                                      * delete_log_on_exit never deletes this file. */
+    const char *stdin_file;          /* optional private, immutable regular binary input;
+                                      * NULL => null device, never inherited stdin.
+                                      * Must be nonempty and non-aliasing with log_file and
+                                      * stdout_file; exact equal strings are rejected.
+                                      * Caller closes its writer before spawn and retains
+                                      * the file until the child tree is quiescent.
+                                      * The child chooses its CRT binary mode on Windows.
+                                      * Never modified or deleted by this API. */
 } cbm_proc_opts_t;
 
 #define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000
@@ -188,6 +206,32 @@ bool cbm_build_win_cmd_payload(char *buf, size_t cap, const char *cmd_executable
  * of hoping a loaded machine reproduces it. Test builds only. */
 void cbm_subprocess_force_spawn_eagain_for_testing(int attempts);
 int cbm_subprocess_pending_spawn_eagain_for_testing(void);
+/* Hold the parent of the next N POSIX spawns until the child has exited (left
+ * unreaped) before it checks the child's process group: the order a loaded
+ * machine produces when a short command finishes before the parent runs
+ * again. Test builds only. */
+void cbm_subprocess_hold_parent_until_child_exits_for_testing(int spawns);
+/* For the next N POSIX spawns, the parent's group check observes what macOS
+ * shows for a child that is EXITING: setpgid and getpgid answer ESRCH while
+ * waitid does not report it yet. Test builds only. */
+void cbm_subprocess_observe_exiting_child_for_testing(int spawns);
+#endif
+
+/* How the POSIX fork+exec child closed its inherited descriptors (#1484). */
+typedef enum {
+    CBM_FD_CLOSE_RANGE = 1, /* Linux close_range(2): one syscall */
+    CBM_FD_CLOSEFROM,       /* BSD closefrom(3): one call */
+    CBM_FD_CLOSE_LOOP       /* close() per descriptor up to _SC_OPEN_MAX: O(RLIMIT_NOFILE) */
+} cbm_fd_close_strategy_t;
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && !defined(_WIN32)
+/* Run the child's close-inherited-descriptors step in the CALLING process for
+ * descriptors >= lowfd (callers pick a lowfd above everything they need) and
+ * report which strategy did the work. Test builds only. */
+cbm_fd_close_strategy_t cbm_subprocess_close_fds_from_for_testing(int lowfd, long max_fd);
+/* Make the close_range fast path behave as if the kernel lacked it (ENOSYS),
+ * so the fallback loop is exercised deterministically. Test builds only. */
+void cbm_subprocess_force_close_range_enosys_for_testing(bool force);
 #endif
 
 #endif /* CBM_SUBPROCESS_H */

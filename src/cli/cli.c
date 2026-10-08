@@ -23,6 +23,7 @@
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/sha256.h"
+#include "foundation/str_util.h"
 #include "cli/client_adapter.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 #include "mcp/index_supervisor.h"
@@ -62,7 +63,6 @@ enum {
     SQL_PARAM_1 = 1,   /* sqlite3_bind parameter index 1 */
     SQL_PARAM_2 = 2,
     SEMVER_PARTS = 3, /* major.minor.patch */
-    DB_EXT_LEN = 3,   /* strlen(".db") */
     MIN_ARGC_CMD = 3,
     /* minimum argc for subcommand with arg */ /* sqlite3_bind parameter index 2 */ /* 10 MB cap
                                                                                        factor */
@@ -226,6 +226,7 @@ typedef struct {
 static cbm_cli_activation_ops_t g_cli_activation_test_ops;
 static bool g_cli_activation_test_ops_set = false;
 static const char *g_cli_activation_runtime_parent_for_test = NULL;
+static bool g_cli_activation_scope_cache_unreadable_for_test = false;
 
 static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const char *message) {
     const char *diagnostic = message ? message : CLI_ACTIVATION_REFUSED_MESSAGE;
@@ -333,6 +334,10 @@ void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent) 
 
 const char *cbm_cli_activation_runtime_parent_for_test(void) {
     return g_cli_activation_runtime_parent_for_test;
+}
+
+void cbm_cli_set_activation_scope_cache_unreadable_for_test(bool unreadable) {
+    g_cli_activation_scope_cache_unreadable_for_test = unreadable;
 }
 
 static const char *cli_activation_action_text(cbm_daemon_runtime_activation_action_t action) {
@@ -541,6 +546,7 @@ typedef enum {
     CLI_ACTIVATION_SCOPE_ACTIVE = 0,
     CLI_ACTIVATION_SCOPE_NOTHING_TO_REPLACE,
     CLI_ACTIVATION_SCOPE_FOREIGN_COHORT,
+    CLI_ACTIVATION_SCOPE_UNCONFIRMED,
     CLI_ACTIVATION_SCOPE_ERROR,
 } cli_activation_scope_t;
 
@@ -566,9 +572,43 @@ static void cli_activation_log_guard_decision(const cli_activation_production_co
  * anything at all (a --skip-binary install without an index reset publishes
  * nothing), and whose cohort is active. Admission with an immediate deadline
  * is the cheapest authoritative read of the active lifetime record: OK means
- * the cohort is ours or empty, CONFLICT names the active identity (its cache
- * fingerprint is filled for every conflict kind), BUSY means another
- * activation holds maintenance and the barrier waits for it as before. */
+ * the cohort shares this exact identity (cache included) or is empty,
+ * CONFLICT names the active identity (its cache fingerprint is filled for
+ * every conflict kind), BUSY means another activation or a session start held
+ * the group, so the active identity was never read.
+ *
+ * Only a POSITIVE match may drain (user decision 2026-09-28, "unknown =
+ * foreign, keep it"): the daemon's activation-shutdown handler verifies the
+ * requester's build, never its cache, so this decision is the only thing
+ * that keeps another HOME's install/update from stopping the account's live
+ * daemon. A busy group or an unreadable active cache used to fall through to
+ * "ours" and stop every session behind that daemon. */
+static cli_activation_scope_t cli_activation_scope_unconfirmed(
+    cli_activation_production_context_t *context, const char *scope, const char *reason) {
+    const char *action = cli_activation_action_text(context->action);
+    (void)snprintf(context->scope_detail, sizeof(context->scope_detail),
+                   "active cohort ownership unconfirmed (%s); scope=%s; nothing stopped", reason,
+                   scope);
+    cli_activation_log_guard_decision(context, "unconfirmed_cohort", NULL);
+    /* Name the daemon being left: a read-only status probe (no cohort, no
+     * HELLO, no admission) that works across build skew. */
+    cbm_daemon_runtime_status_t daemon;
+    if (cbm_daemon_runtime_request_status(context->endpoint, &context->identity,
+                                          CLI_ACTIVATION_CONTROL_TIMEOUT_MS, &daemon)) {
+        printf("Leaving the running CBM daemon untouched (pid %lu, version %s): this %s could "
+               "not confirm that it serves the cache this %s targets (%s).\n",
+               (unsigned long)daemon.daemon_pid, daemon.semantic_version, action, action, reason);
+    } else {
+        printf("Leaving active CBM sessions untouched: this %s could not confirm that they "
+               "serve the cache it targets (%s).\n",
+               action, reason);
+    }
+    printf("If it is yours, close its CBM sessions and run `codebase-memory-mcp daemon stop` "
+           "to stop it yourself.\n");
+    (void)fflush(stdout);
+    return CLI_ACTIVATION_SCOPE_UNCONFIRMED;
+}
+
 static cli_activation_scope_t cli_activation_resolve_scope(
     cli_activation_production_context_t *context) {
     const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(context->endpoint);
@@ -594,20 +634,27 @@ static cli_activation_scope_t cli_activation_resolve_scope(
     if (lease) {
         return CLI_ACTIVATION_SCOPE_ERROR;
     }
+    if (g_cli_activation_scope_cache_unreadable_for_test) {
+        conflict.active_cache_fingerprint[0] = '\0';
+    }
     switch (status) {
     case CBM_VERSION_COHORT_OK:
-    case CBM_VERSION_COHORT_BUSY:
         return CLI_ACTIVATION_SCOPE_ACTIVE;
+    case CBM_VERSION_COHORT_BUSY:
+        return cli_activation_scope_unconfirmed(
+            context, scope, "the session group was busy, so its cache identity could not be read");
     case CBM_VERSION_COHORT_CONFLICT:
         break;
     default:
         return CLI_ACTIVATION_SCOPE_ERROR;
     }
-    if (!conflict.active_cache_fingerprint[0] ||
-        strcmp(conflict.active_cache_fingerprint, context->cache_fingerprint) == 0) {
-        /* Same cache namespace, another build or version: that IS the daemon
-         * this activation replaces. An unreadable active cache stays in scope
-         * rather than silently exempting a same-namespace daemon. */
+    if (!conflict.active_cache_fingerprint[0]) {
+        return cli_activation_scope_unconfirmed(context, scope,
+                                                "its cache identity could not be read");
+    }
+    if (strcmp(conflict.active_cache_fingerprint, context->cache_fingerprint) == 0) {
+        /* Positively confirmed: same cache namespace, another build or
+         * version. That IS the daemon this activation replaces. */
         return CLI_ACTIVATION_SCOPE_ACTIVE;
     }
     (void)snprintf(context->scope_detail, sizeof(context->scope_detail),
@@ -636,9 +683,10 @@ static int cli_activation_production_reserve(void *opaque, cbm_cli_activation_lo
     }
     if (scope != CLI_ACTIVATION_SCOPE_ACTIVE) {
         /* Nothing in the target namespace is being replaced, or the only
-         * active cohort serves another namespace: hold no maintenance,
-         * admission, lifetime or startup lock (each wakes or blocks the other
-         * namespace's sessions) and send no drain request. */
+         * active cohort serves another namespace, or its ownership could not
+         * be confirmed: hold no maintenance, admission, lifetime or startup
+         * lock (each wakes or blocks the other namespace's sessions) and
+         * send no drain request. */
         if (!cli_activation_log_event(context, "quiesce_skipped", context->scope_detail)) {
             return CLI_ERR;
         }
@@ -1456,7 +1504,11 @@ static const char skill_content[] =
     "| Text search | `search_code` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `list_projects` — check if project is indexed\n"
+    /* #1690: a guessed repo or folder name misses the project whenever the
+     * checkout directory differs from it; the root_path is what identifies it. */
+    "1. `list_projects` — pick the project whose `root_path` contains your working directory; "
+    "pass its `name` (or the absolute directory itself) as `project`, never a repo or folder "
+    "name\n"
     "2. `get_graph_schema` — understand node/edge types\n"
     "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
     "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
@@ -1512,7 +1564,7 @@ static const char skill_content[] =
     "`check_index_coverage`, `manage_adr`, `ingest_traces`\n"
     "\n"
     "## Edge Types\n"
-    "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
+    "CALLS, HTTP_CALLS, ASYNC_CALLS, SPAWNS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
     "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, REFERENCES_FILE,\n"
     "FILE_CHANGES_WITH, SIMILAR_TO, SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
     "CONTAINS_PACKAGE\n"
@@ -2726,9 +2778,40 @@ static void cbm_kiro_home_dir(const char *home_dir, char *out, size_t out_sz) {
     cbm_env_home_dir("KIRO_HOME", home_dir, ".kiro", out, out_sz);
 }
 
-static void cbm_hermes_home_dir(const char *home_dir, char *out, size_t out_sz) {
-    cbm_env_home_dir("HERMES_HOME", home_dir, ".hermes", out, out_sz);
+/* #1180: native Windows Hermes -- the install.ps1 CLI, the MSIX package and
+ * the Desktop app -- defaults HERMES_HOME to %LOCALAPPDATA%\hermes and keeps a
+ * legacy ~/.hermes only while the new directory is absent (hermes-agent
+ * website/docs/user-guide/windows-native.md "Data layout";
+ * apps/desktop/electron/data-paths.mjs resolveDesktopHermesHome). Probing
+ * only ~/.hermes missed those installs and aimed config.yaml at a home Hermes
+ * never reads. Other platforms use ~/.hermes. */
+static void cbm_hermes_home_dir_for(const char *home_dir, bool windows, char *out, size_t out_sz) {
+    const char *fallback = ".hermes";
+    if (windows) {
+        char native[CLI_BUF_1K];
+        char legacy[CLI_BUF_1K];
+        snprintf(native, sizeof(native), "%s/AppData/Local/hermes", home_dir);
+        snprintf(legacy, sizeof(legacy), "%s/.hermes", home_dir);
+        if (dir_exists(native) || !dir_exists(legacy)) {
+            fallback = "AppData/Local/hermes";
+        }
+    }
+    cbm_env_home_dir("HERMES_HOME", home_dir, fallback, out, out_sz);
 }
+
+static void cbm_hermes_home_dir(const char *home_dir, char *out, size_t out_sz) {
+#ifdef _WIN32
+    cbm_hermes_home_dir_for(home_dir, true, out, out_sz);
+#else
+    cbm_hermes_home_dir_for(home_dir, false, out, out_sz);
+#endif
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_hermes_home_dir_for_testing(const char *home_dir, bool windows, char *out, size_t out_sz) {
+    cbm_hermes_home_dir_for(home_dir, windows, out, out_sz);
+}
+#endif
 
 static void cbm_qwen_home_dir(const char *home_dir, char *out, size_t out_sz) {
     cbm_env_home_dir("QWEN_HOME", home_dir, ".qwen", out, out_sz);
@@ -3031,6 +3114,53 @@ static int cbm_resolve_released_hook_command(const char *script_name, char *out,
     return written > 0 && (size_t)written < out_sz ? CLI_OK : CLI_ERR;
 }
 
+/* #1180: a bare ~/.claude directory is not a Claude Code install -- other
+ * tools create it -- and treating it as one wrote hooks, skills and MCP
+ * entries for a client the user never installed. Claude Code itself leaves
+ * its user config .claude.json (under CLAUDE_CONFIG_DIR when set), its
+ * settings.json, or the claude CLI. */
+static bool cbm_claude_code_detected(const char *home_dir) {
+    char dir[CLI_BUF_1K];
+    char path[CLI_BUF_1K];
+    cbm_claude_config_dir(home_dir, dir, sizeof(dir));
+    int written = snprintf(path, sizeof(path), "%s/settings.json", dir);
+    if (dir[0] && written > 0 && (size_t)written < sizeof(path) && cbm_file_exists(path)) {
+        return true;
+    }
+    cbm_claude_user_root(home_dir, dir, sizeof(dir));
+    written = snprintf(path, sizeof(path), "%s/.claude.json", dir);
+    if (dir[0] && written > 0 && (size_t)written < sizeof(path) && cbm_file_exists(path)) {
+        return true;
+    }
+    return cbm_agent_cli_exists("claude", home_dir);
+}
+
+/* OpenCode keeps its data (auth, logs, sessions; the global config itself on
+ * older installs) in ~/.local/share/opencode on every OS --
+ * %USERPROFILE%\.local\share\opencode on Windows (opencode.ai/docs/
+ * troubleshooting, "Storage"). The CLI and the Desktop app's bundled
+ * opencode-cli server both create it, so it identifies an install that has
+ * no config file, no ~/.config/opencode and no `opencode` on PATH
+ * (#1167, #1180). */
+static bool cbm_opencode_detected(const char *home_dir) {
+    char path[CLI_BUF_1K];
+    cbm_opencode_config_path(home_dir, path, sizeof(path));
+    if (cbm_file_exists(path) || cbm_agent_cli_exists("opencode", home_dir)) {
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s/.config/opencode", home_dir);
+    if (dir_exists(path)) {
+        return true;
+    }
+    char env_buf[CLI_BUF_1K];
+    const char *config_dir = cbm_safe_getenv("OPENCODE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (config_dir && config_dir[0] && dir_exists(config_dir)) {
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s/.local/share/opencode", home_dir);
+    return dir_exists(path);
+}
+
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_detected_agents_t agents;
     memset(&agents, 0, sizeof(agents));
@@ -3040,8 +3170,7 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     char path[CLI_BUF_1K];
 
-    cbm_claude_config_dir(home_dir, path, sizeof(path));
-    agents.claude_code = path[0] != '\0' && dir_exists(path);
+    agents.claude_code = cbm_claude_code_detected(home_dir);
 
     cbm_codex_config_dir(home_dir, path, sizeof(path));
     agents.codex = path[0] != '\0' && dir_exists(path);
@@ -3055,18 +3184,7 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_zed_config_dir(home_dir, path, sizeof(path));
     agents.zed = dir_exists(path);
 
-    cbm_opencode_config_path(home_dir, path, sizeof(path));
-    agents.opencode = cbm_file_exists(path) || cbm_agent_cli_exists("opencode", home_dir);
-    if (!agents.opencode) {
-        snprintf(path, sizeof(path), "%s/.config/opencode", home_dir);
-        agents.opencode = dir_exists(path);
-    }
-    if (!agents.opencode) {
-        char env_buf[CLI_BUF_1K];
-        const char *config_dir =
-            cbm_safe_getenv("OPENCODE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
-        agents.opencode = config_dir && config_dir[0] && dir_exists(config_dir);
-    }
+    agents.opencode = cbm_opencode_detected(home_dir);
 
     agents.aider = cbm_agent_cli_exists("aider", home_dir);
 
@@ -3226,6 +3344,9 @@ static const char agent_instructions_content[] =
     "### Session resets and subagents\n"
     "- At session start or after compaction, confirm the nearest graph project and generation with "
     "`list_projects` or `index_status`, then choose Scout, Verify, or Auditor.\n"
+    "- The graph project is the `list_projects` entry whose `root_path` contains your working "
+    "directory; pass its `name` (or the absolute directory itself) as `project`, never a repo or "
+    "folder name.\n"
     "- Before spawning a subagent, query the graph and coverage in the parent. Pass the tier, "
     "project, generation/freshness, bounded scope, queries and pagination state, qualified "
     "symbols, "
@@ -3631,6 +3752,8 @@ static const char aider_instructions_content[] =
     "First use in a repo: codebase-memory-mcp cli index_repository '{\"repo_path\":\"<abs "
     "path>\"}'\n"
     "List indexed projects (for <name>): codebase-memory-mcp cli list_projects '{}'\n"
+    "<name> is the entry whose root_path contains your working directory; pass it (or the "
+    "absolute directory itself), never a repo or folder name.\n"
     "\n"
     "## When to fall back to grep/glob\n"
     "- Searching for string literals, error messages, config values\n"
@@ -3793,8 +3916,11 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
 }
 
 int cbm_remove_codex_mcp(const char *config_path) {
+    /* #2228: only our table goes; foreign tables found between the markers
+     * (Codex Desktop appends below a block that ends the file) stay. */
     if (!config_path ||
-        cbm_toml_remove_managed_block(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END) != 0) {
+        cbm_toml_remove_managed_block_owned(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END,
+                                            CODEX_CMM_SECTION "\n") != 0) {
         return CLI_ERR;
     }
     return cbm_remove_codex_legacy_mcp(config_path) >= 0 ? CLI_OK : CLI_ERR;
@@ -4418,7 +4544,8 @@ static int cbm_upsert_grok_mcp(const char *binary_path, const char *config_path)
 static int cbm_remove_grok_mcp_owned(const char *binary_path, const char *config_path) {
     (void)binary_path;
     if (!config_path ||
-        cbm_toml_remove_managed_block(config_path, GROK_MCP_BEGIN, GROK_MCP_END) != 0) {
+        cbm_toml_remove_managed_block_owned(config_path, GROK_MCP_BEGIN, GROK_MCP_END,
+                                            GROK_CMM_SECTION "\n") != 0) {
         return CLI_ERR;
     }
     return cbm_remove_grok_legacy_mcp(config_path) >= 0 ? CLI_OK : CLI_ERR;
@@ -4984,7 +5111,8 @@ static int cbm_upsert_kimi_context_hook(const char *config_path, const char *bin
 }
 
 static int cbm_remove_kimi_context_hook(const char *config_path) {
-    return cbm_toml_remove_managed_block(config_path, KIMI_HOOK_BEGIN, KIMI_HOOK_END) == 0
+    return cbm_toml_remove_managed_block_owned(config_path, KIMI_HOOK_BEGIN, KIMI_HOOK_END,
+                                               "[[hooks]]\n") == 0
                ? CLI_OK
                : CLI_ERR;
 }
@@ -7207,8 +7335,7 @@ int cbm_list_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
         }
@@ -7231,8 +7358,7 @@ int cbm_remove_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             char path[CLI_BUF_1K];
             snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
             /* Also remove .db.tmp if present */
@@ -7268,7 +7394,7 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
     }
 
     char dbpath[CLI_BUF_1K];
-    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", cache_dir);
+    snprintf(dbpath, sizeof(dbpath), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
 
     /* Ensure directory exists */
     mkdirp(cache_dir, DIR_PERMS);
@@ -7404,6 +7530,11 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
     return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
 }
 
+/* Opt-in tree polling of non-git roots (#1948); see cli.h. */
+bool cbm_config_watch_non_git(cbm_config_t *cfg) {
+    return cbm_config_get_bool(cfg, CBM_CONFIG_WATCH_NON_GIT, false);
+}
+
 bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
                                   char *error, size_t error_size) {
     if (!cfg || !policy) {
@@ -7444,6 +7575,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
+    {CBM_CONFIG_WATCH_NON_GIT, "false",
+     "Also poll non-git project roots for changes (file-tree scan); off by default"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
@@ -10437,7 +10570,7 @@ static int cbm_install_agent_configs_with_previous(const char *home, const char 
     return result;
 }
 
-/* Count .db files in the cache directory. */
+/* Count project index .db files in the cache directory (internal stores excluded). */
 static int count_db_indexes(const char *home) {
     const char *cache_dir = get_cache_dir(home);
     if (!cache_dir) {
@@ -10450,8 +10583,7 @@ static int count_db_indexes(const char *home) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        size_t len = strlen(ent->name);
-        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+        if (cbm_is_project_index_db(ent->name)) {
             count++;
         }
     }
@@ -12811,6 +12943,41 @@ static int cli_uninstall_activate(void *opaque) {
     return CLI_OK;
 }
 
+/* A generic auto-answer is not consent to erase project indexes. An explicit
+ * --delete-indexes takes precedence even over --no; otherwise only a separate
+ * interactive answer can select deletion. This helper decides and reports,
+ * but all deletion remains in the final guarded uninstall activation. */
+static bool uninstall_decide_index_deletion(const char *home, bool requested, bool dry_run) {
+    int index_count = count_db_indexes(home);
+    if (index_count <= 0) {
+        return false;
+    }
+    printf("\nFound %d index(es):\n", index_count);
+    cbm_list_indexes(home);
+    bool delete_indexes = requested;
+    if (!requested) {
+        bool can_ask = g_auto_answer == 0;
+#ifdef _WIN32
+        can_ask = can_ask && _isatty(_fileno(stdin));
+#else
+        can_ask = can_ask && isatty(fileno(stdin));
+#endif
+        delete_indexes = can_ask && prompt_yn("Delete these indexes? (default: no)");
+    }
+    if (!delete_indexes) {
+        const char *cache_dir = get_cache_dir(home);
+        printf("Indexes kept in %s. To remove them, uninstall with --delete-indexes "
+               "or delete the project .db files there.\n",
+               cache_dir ? cache_dir : "the cache directory");
+        return false;
+    }
+    if (dry_run) {
+        printf("(dry-run — indexes would be deleted)\n");
+        return false;
+    }
+    return true;
+}
+
 int cbm_cmd_uninstall(int argc, char **argv) {
     /* `uninstall --help` used to UNINSTALL.
      *
@@ -12824,20 +12991,25 @@ int cbm_cmd_uninstall(int argc, char **argv) {
      * cannot auto-confirm the destruction we are trying to prevent. */
     for (int i = 0; i < argc; i++) {
         if (argv && argv[i] && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
-            printf("Usage: codebase-memory-mcp uninstall [options]\n\n"
-                   "Removes the codebase-memory-mcp binary, its agent configurations and,\n"
-                   "with confirmation, its indexes. THIS IS DESTRUCTIVE.\n\n"
-                   "Options:\n"
-                   "  --dry-run        Show what would be removed, change nothing\n"
-                   "  --dir=PATH       Uninstall from a custom install directory\n"
-                   "  -y, --yes        Do not prompt for confirmation\n"
-                   "  -h, --help       Show this help and exit\n\n"
-                   "Run with --dry-run first if you are unsure.\n");
+            printf(
+                "Usage: codebase-memory-mcp uninstall [options]\n\n"
+                "Removes the codebase-memory-mcp binary and its agent configurations.\n"
+                "THIS IS DESTRUCTIVE. Project indexes are kept by default. An interactive\n"
+                "terminal is asked separately; the default answer is to keep them.\n\n"
+                "Options:\n"
+                "  --dry-run          Show what would be removed, change nothing\n"
+                "  --dir=PATH         Uninstall from a custom install directory\n"
+                "  --delete-indexes   Also delete every project index (overrides --no)\n"
+                "  -y, --yes          Do not prompt; indexes are kept unless explicitly deleted\n"
+                "  -n, --no           Decline prompts; --delete-indexes still takes precedence\n"
+                "  -h, --help         Show this help and exit\n\n"
+                "Run with --dry-run first if you are unsure.\n");
             return CLI_OK;
         }
     }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    bool delete_indexes_requested = false;
     /* An install into a custom --dir must be removable from that same dir:
      * without this, anyone who installed outside ~/.local/bin has no supported
      * uninstall path at all. Mirrors cbm_cmd_install's parsing. */
@@ -12850,6 +13022,8 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strcmp(argv[i], "--delete-indexes") == 0) {
+            delete_indexes_requested = true;
         } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
             requested_bin_dir = argv[i] + SLEN("--dir=");
             if (!requested_bin_dir[0]) {
@@ -12881,23 +13055,9 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     agent_uninstall_failures_reset();
     cbm_detected_agents_t agents = cbm_detect_agents(home);
 
-    /* Confirm index removal outside the startup lock, but defer the mutation
-     * until the final guarded activation. Dry-run never removes indexes. */
-    bool delete_indexes = false;
-    int index_count = count_db_indexes(home);
-    if (index_count > 0) {
-        printf("\nFound %d index(es):\n", index_count);
-        cbm_list_indexes(home);
-        if (prompt_yn("Delete these indexes?")) {
-            if (dry_run) {
-                printf("(dry-run — indexes would be deleted)\n");
-            } else {
-                delete_indexes = true;
-            }
-        } else {
-            printf("Indexes kept.\n");
-        }
-    }
+    /* Decide outside the startup lock; mutate only in the final guarded
+     * activation. Dry-run never authorizes actual index removal. */
+    bool delete_indexes = uninstall_decide_index_deletion(home, delete_indexes_requested, dry_run);
 
     char bin_path_storage[CLI_BUF_1K];
     const char *bin_path = bin_path_storage;

@@ -75,6 +75,22 @@ int cbm_daemon_ipc_receive_frame_bounded(cbm_daemon_ipc_connection_t *connection
                                          uint32_t timeout_ms, uint32_t max_payload_length,
                                          cbm_daemon_frame_t *frame_out, uint8_t **payload_out);
 
+/* Bounded receive of an answer the peer queued before it closed, on a
+ * connection whose send just failed. A daemon at capacity or stopping answers
+ * from its accept loop without reading the request and closes at once; when
+ * that close lands before the client's first send, the send fails (EPIPE) and
+ * poisons the connection although the complete answer is still queued for
+ * reading -- POSIX keeps it readable after the peer's close (a Windows server
+ * close discards it, so there this fails like any other receive). A failed
+ * send consumes no inbound bytes, so the inbound frame boundary is intact;
+ * call this ONLY before anything was read from the connection. The connection
+ * stays poisoned for sends afterwards. Returns like
+ * cbm_daemon_ipc_receive_frame_bounded. */
+int cbm_daemon_ipc_receive_frame_after_failed_send(cbm_daemon_ipc_connection_t *connection,
+                                                   uint32_t timeout_ms, uint32_t max_payload_length,
+                                                   cbm_daemon_frame_t *frame_out,
+                                                   uint8_t **payload_out);
+
 /* Narrow crash/fault seams for publication-state and retry-state tests. They
  * are inert unless a test installs a hook/failure count in its own process. */
 typedef enum {

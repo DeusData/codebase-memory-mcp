@@ -56,6 +56,7 @@ static bool pu_module_is_dir(CBMLanguage lang) {
 
 /* Read file into heap buffer. Caller must free(). */
 static char *read_file(const char *path, int *out_len) {
+    *out_len = -1; /* unknown/read failure; zero is a proven empty file */
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
@@ -64,6 +65,9 @@ static char *read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
     if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
+        if (size == 0) {
+            *out_len = 0;
+        }
         (void)fclose(f);
         return NULL;
     }
@@ -151,6 +155,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
     cbm_pipeline_lsp_reference_index_t reference_index = {0};
     bool reference_index_ready =
         cbm_pipeline_lsp_reference_index_build(&result->resolved_calls, &reference_index);
+    cbm_pipeline_lsp_field_index_t field_index = {0};
+    bool field_index_ready =
+        cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
@@ -158,6 +165,45 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         }
         const cbm_gbuf_node_t *src = find_enclosing_node(ctx, usage->enclosing_func_qn, rel);
         if (!src) {
+            continue;
+        }
+
+        /* A C member name binds through the type of its object, published by
+         * the C LSP as field-owner rows, and through nothing else: the bare
+         * member name must never reach the short-name registry below. */
+        if (usage->kind == CBM_USAGE_VALUE &&
+            cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel),
+                                        usage->is_member_access)) {
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+                &result->resolved_calls, field_index_ready ? &field_index : NULL,
+                usage->enclosing_func_qn, usage->ref_name);
+            char member_esc[CBM_SZ_256];
+            cbm_json_escape(member_esc, sizeof(member_esc), usage->ref_name);
+            char member_props[CBM_SZ_512];
+            snprintf(member_props, sizeof(member_props), "{\"callee\":\"%s\"}", member_esc);
+            const CBMResolvedCall *owner;
+            bool typed = false;
+            while ((owner = cbm_pipeline_lsp_field_next(&owners)) != NULL) {
+                typed = true;
+                const cbm_gbuf_node_t *field =
+                    cbm_pipeline_lsp_field_node(ctx->gbuf, ctx->project_name, owner);
+                if (!field || field->id == src->id) {
+                    continue;
+                }
+                cbm_gbuf_insert_edge(ctx->gbuf, src->id, field->id, "USAGE", member_props);
+                resolved++;
+            }
+            if (!typed) {
+                /* The LSP could not type the object: only a member name the
+                 * project holds exactly once may still bind. */
+                const char *only = cbm_registry_unique_field_qn(ctx->registry, usage->ref_name);
+                const cbm_gbuf_node_t *field = only ? cbm_gbuf_find_by_qn(ctx->gbuf, only) : NULL;
+                if (field && field->id != src->id &&
+                    !cbm_suppress_cross_language_ref(lang, field->file_path)) {
+                    cbm_gbuf_insert_edge(ctx->gbuf, src->id, field->id, "USAGE", member_props);
+                    resolved++;
+                }
+            }
             continue;
         }
 
@@ -242,6 +288,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         resolved++;
     }
     cbm_pipeline_lsp_reference_index_free(&reference_index);
+    cbm_pipeline_lsp_field_index_free(&field_index);
     return resolved;
 }
 
@@ -284,6 +331,9 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
                             const char *module_qn, const char **imp_keys, const char **imp_vals,
                             int imp_count, CBMLanguage lang) {
     int resolved = 0;
+    cbm_pipeline_lsp_field_index_t field_index = {0};
+    bool field_index_ready =
+        cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
     for (int r = 0; r < result->rw.count; r++) {
         CBMReadWrite *rw = &result->rw.items[r];
         if (!rw->var_name) {
@@ -292,6 +342,36 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
 
         const cbm_gbuf_node_t *src = find_enclosing_node(ctx, rw->enclosing_func_qn, rel);
         if (!src) {
+            continue;
+        }
+
+        /* C member read/write: same owner join as resolve_usage_edges. */
+        if (cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel), rw->is_member_access)) {
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+                &result->resolved_calls, field_index_ready ? &field_index : NULL,
+                rw->enclosing_func_qn, rw->var_name);
+            const char *member_edge = rw->is_write ? "WRITES" : "READS";
+            const CBMResolvedCall *owner;
+            bool typed = false;
+            while ((owner = cbm_pipeline_lsp_field_next(&owners)) != NULL) {
+                typed = true;
+                const cbm_gbuf_node_t *field =
+                    cbm_pipeline_lsp_field_node(ctx->gbuf, ctx->project_name, owner);
+                if (!field || field->id == src->id) {
+                    continue;
+                }
+                cbm_gbuf_insert_edge(ctx->gbuf, src->id, field->id, member_edge, "{}");
+                resolved++;
+            }
+            if (!typed) {
+                const char *only = cbm_registry_unique_field_qn(ctx->registry, rw->var_name);
+                const cbm_gbuf_node_t *field = only ? cbm_gbuf_find_by_qn(ctx->gbuf, only) : NULL;
+                if (field && field->id != src->id &&
+                    !cbm_suppress_cross_language_ref(lang, field->file_path)) {
+                    cbm_gbuf_insert_edge(ctx->gbuf, src->id, field->id, member_edge, "{}");
+                    resolved++;
+                }
+            }
             continue;
         }
 
@@ -320,6 +400,7 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, edge_type, "{}");
         resolved++;
     }
+    cbm_pipeline_lsp_field_index_free(&field_index);
     return resolved;
 }
 
@@ -349,17 +430,35 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
             int source_len = 0;
             char *source = read_file(path, &source_len);
             if (!source) {
+                if (source_len != 0 &&
+                    !cbm_pipeline_test_extraction_ok(ctx, files[i].language, NULL)) {
+                    return CBM_PIPELINE_ABORT_PRESERVE_DB;
+                }
                 errors++;
                 continue;
             }
-            result = cbm_extract_file(source, source_len, files[i].language, ctx->project_name, rel,
-                                      CBM_EXTRACT_BUDGET, NULL, NULL);
+            result = cbm_pipeline_test_force_extract_null(ctx, files[i].language)
+                         ? NULL
+                         : cbm_extract_file_ex_with_tests(
+                               source, source_len, files[i].language, ctx->project_name, rel,
+                               CBM_EXTRACT_BUDGET, NULL, NULL, NULL, NULL, ctx->test_declarations);
             free(source);
+            if (!cbm_pipeline_test_extraction_ok(ctx, files[i].language, result)) {
+                cbm_free_result(result);
+                return CBM_PIPELINE_ABORT_PRESERVE_DB;
+            }
             if (!result) {
                 errors++;
                 continue;
             }
             result_owned = true;
+        }
+
+        if (!cbm_pipeline_test_result_ok(ctx, result)) {
+            if (result_owned) {
+                cbm_free_result(result);
+            }
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
         if (result->usages.count == 0 && result->throws.count == 0 && result->rw.count == 0) {

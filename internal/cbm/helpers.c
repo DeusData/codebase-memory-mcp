@@ -1300,6 +1300,18 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
 // --- Cached enclosing function QN ---
 
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
+    if (ctx->test_definition_match_count > 0) {
+        const char **function_kinds = func_kinds_for_lang(ctx->language);
+        for (TSNode current = node; !ts_node_is_null(current); current = ts_node_parent(current)) {
+            const char *configured_qn = cbm_test_definition_qn(ctx, current);
+            if (configured_qn)
+                return configured_qn;
+            /* A nested native function owns its own body; do not inherit a
+             * surrounding configured macro's QN through that boundary. */
+            if (cbm_kind_in_set(current, function_kinds))
+                break;
+        }
+    }
     uint32_t pos = ts_node_start_byte(node);
 
     // Check cache: find a function range that contains this position.
@@ -1664,6 +1676,146 @@ char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *
         return module;
     }
     return cbm_arena_sprintf(a, "%s.%s", module, name);
+}
+
+/* Operating systems and CPU architectures only: a token names a platform, so a
+ * path segment or stem suffix made of one marks a platform alternative. Vague
+ * words (generic, default, common, stub) are deliberately absent. */
+static const char *const platform_tokens[] = {
+    "win",       "win32",       "win64",   "windows", "wince",  "nt",        "posix",   "unix",
+    "linux",     "darwin",      "mac",     "macos",   "macosx", "osx",       "apple",   "ios",
+    "android",   "bsd",         "freebsd", "openbsd", "netbsd", "dragonfly", "solaris", "sunos",
+    "aix",       "hpux",        "haiku",   "fuchsia", "cygwin", "mingw",     "msvc",    "wasm",
+    "wasi",      "emscripten",  "x86",     "x86_64",  "x64",    "amd64",     "i386",    "i686",
+    "ia32",      "arm",         "arm64",   "aarch64", "armv7",  "riscv",     "riscv64", "mips",
+    "mips64",    "ppc",         "ppc64",   "powerpc", "s390",   "s390x",     "sparc",   "sparc64",
+    "loongarch", "loongarch64", NULL};
+
+static bool platform_token_eq(const char *s, size_t len) {
+    for (int i = 0; platform_tokens[i]; i++) {
+        const char *t = platform_tokens[i];
+        size_t tl = strlen(t);
+        if (tl != len) {
+            continue;
+        }
+        size_t k = 0;
+        while (k < len && tolower((unsigned char)s[k]) == t[k]) {
+            k++;
+        }
+        if (k == len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Length of `stem` without a trailing `_<token>` / `-<token>` / `.<token>`
+ * platform suffix (the longest one), or `len` when it has none. */
+static size_t platform_stem_len(const char *stem, size_t len) {
+    size_t best = len;
+    for (size_t sep = 1; sep < len; sep++) {
+        char c = stem[sep - 1];
+        if ((c == '_' || c == '-' || c == '.') && platform_token_eq(stem + sep, len - sep)) {
+            if (sep - 1 < best) {
+                best = sep - 1;
+            }
+        }
+    }
+    return best;
+}
+
+static bool c_family_variant_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_OBJC;
+}
+
+static bool func_is_static(TSNode func_node) {
+    uint32_t n = ts_node_child_count(func_node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_child(func_node, i);
+        if (strcmp(ts_node_type(child), "storage_class_specifier") == 0 &&
+            ts_node_child_count(child) > 0 &&
+            strcmp(ts_node_type(ts_node_child(child, 0)), "static") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+                                    const char *rel_path, const char *name, const char *qn,
+                                    TSNode func_node) {
+    if (!c_family_variant_lang(lang) || !rel_path || !name || !name[0] || !qn ||
+        ts_node_is_null(func_node) || func_is_static(func_node)) {
+        return qn;
+    }
+    char *plain = cbm_fqn_compute(a, project, rel_path, name);
+    if (!plain || strcmp(plain, qn) != 0) {
+        return qn; /* namespaced or otherwise scoped: not a file-scope function */
+    }
+    /* Rebuild the path without platform tokens: a directory segment that is
+     * one is dropped; a filename stem loses its platform suffix, and a stem
+     * that IS a token leaves the function at its directory. */
+    size_t len = strlen(rel_path);
+    char *neutral = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
+    if (!neutral) {
+        return qn;
+    }
+    size_t out = 0;
+    bool changed = false;
+    bool dir_level = false;
+    const char *seg = rel_path;
+    while (*seg) {
+        const char *slash = strchr(seg, '/');
+        size_t seg_len = slash ? (size_t)(slash - seg) : strlen(seg);
+        if (slash) {
+            if (platform_token_eq(seg, seg_len)) {
+                changed = true;
+            } else {
+                memcpy(neutral + out, seg, seg_len);
+                out += seg_len;
+                neutral[out++] = '/';
+            }
+            seg = slash + SKIP_ONE;
+            continue;
+        }
+        const char *dot = NULL;
+        for (const char *p = seg + seg_len; p > seg; p--) {
+            if (p[-1] == '.') {
+                dot = p - 1;
+                break;
+            }
+        }
+        size_t stem_len = dot && dot > seg ? (size_t)(dot - seg) : seg_len;
+        size_t keep = platform_token_eq(seg, stem_len) ? 0 : platform_stem_len(seg, stem_len);
+        if (keep != stem_len) {
+            changed = true;
+        }
+        if (keep == 0) {
+            dir_level = true; /* the function lives at the directory */
+            if (out > 0 && neutral[out - SKIP_ONE] == '/') {
+                out--;
+            }
+        } else {
+            memcpy(neutral + out, seg, keep);
+            out += keep;
+            memcpy(neutral + out, seg + stem_len, seg_len - stem_len);
+            out += seg_len - stem_len;
+        }
+        break;
+    }
+    neutral[out] = '\0';
+    if (!changed) {
+        return qn;
+    }
+    if (dir_level) {
+        /* No file stem left: the folder form keeps every directory segment
+         * (cbm_fqn_compute would strip a dotted segment as an extension). */
+        char *folder = cbm_fqn_folder(a, project ? project : "", neutral);
+        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : qn;
+    }
+    char *variant = cbm_fqn_compute(a, project, neutral, name);
+    return variant ? variant : qn;
 }
 
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {

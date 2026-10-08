@@ -59,8 +59,9 @@
  *
  * Observability (#858): a fired deadline is otherwise indistinguishable from
  * "no matches", so the handler first write()s a pre-formatted breadcrumb to
- * ~/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log (fd and message
- * prepared at arm time — only async-signal-safe write/_exit in the handler). */
+ * <cache_dir>/logs/hook-augment-timeouts.log (by default
+ * ~/.cache/codebase-memory-mcp/logs; fd and message prepared at arm time —
+ * only async-signal-safe write/_exit in the handler). */
 #ifndef _WIN32
 #define HA_DEADLINE_DEFAULT_MS 2000 /* in-process budget; see ha_deadline_ms()  */
 #define HA_DEADLINE_MIN_MS 50
@@ -103,20 +104,31 @@ static void ha_deadline_exit(int sig) {
     _exit(0);
 }
 
+/* Whether snprintf wrote the whole string into a buffer of `cap` bytes. */
+static bool ha_fits(int written, size_t cap) {
+    return written > 0 && (size_t)written < cap;
+}
+
 static void ha_open_crumb_log(int deadline_ms) {
     const char *override = getenv("CBM_HOOK_TIMEOUT_LOG"); /* tests + power users */
     char path[CBM_SZ_1K];
+    /* A path cut off at the buffer names some other file, and O_CREAT would
+     * create it. Such a path means no breadcrumb; the hook itself runs on. */
     if (override && override[0]) {
-        snprintf(path, sizeof(path), "%s", override);
-    } else {
-        const char *home = getenv("HOME");
-        if (!home || !home[0]) {
+        if (!ha_fits(snprintf(path, sizeof(path), "%s", override), sizeof(path))) {
             return;
         }
+    } else {
+        /* <cache_dir>/logs, where every cbm component logs: the cache dir is
+         * CBM_CACHE_DIR, else HOME (then USERPROFILE) + the default. */
+        const char *cache = cbm_resolve_cache_dir();
         char dir[CBM_SZ_1K];
-        snprintf(dir, sizeof(dir), "%s/.cache/codebase-memory-mcp/logs", home);
+        if (!cache || !ha_fits(snprintf(dir, sizeof(dir), "%s/logs", cache), sizeof(dir)) ||
+            !ha_fits(snprintf(path, sizeof(path), "%s/hook-augment-timeouts.log", dir),
+                     sizeof(path))) {
+            return;
+        }
         cbm_mkdir_p_ex(dir, 0755, CBM_MKDIR_FOLLOW_OWNED);
-        snprintf(path, sizeof(path), "%s/hook-augment-timeouts.log", dir);
     }
     g_ha_crumb_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_ha_crumb_fd < 0) {

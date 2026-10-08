@@ -182,11 +182,11 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Detected coding agents on the system. */
 typedef struct {
-    bool claude_code;   /* ~/.claude/ exists */
+    bool claude_code;   /* settings.json, .claude.json, or claude CLI exists */
     bool codex;         /* $CODEX_HOME or ~/.codex exists */
     bool gemini;        /* Gemini settings or executable exists */
     bool zed;           /* platform-specific Zed config dir exists */
-    bool opencode;      /* opencode on PATH or config exists */
+    bool opencode;      /* opencode on PATH, config, or data dir exists */
     bool antigravity;   /* Antigravity CLI config or executable exists */
     bool aider;         /* aider on PATH */
     bool kilocode;      /* KiloCode globalStorage dir exists */
@@ -197,7 +197,7 @@ typedef struct {
     bool openclaw;      /* ~/.openclaw/ exists */
     bool kiro;          /* ~/.kiro/ exists */
     bool junie;         /* ~/.junie/ exists */
-    bool hermes;        /* ~/.hermes/ or hermes CLI exists */
+    bool hermes;        /* Hermes home (Windows: %LOCALAPPDATA%\hermes) or CLI */
     bool openhands;     /* ~/.openhands/ or openhands CLI exists */
     bool cline;         /* ~/.cline/ or cline CLI exists */
     bool warp;          /* Warp footprint or oz/oz-preview/warp-cli exists */
@@ -216,6 +216,13 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 
 /* Install or refresh every detected agent integration below home. */
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+/* #1180: the Hermes home as resolved on Windows (`windows`) or elsewhere, so
+ * the %LOCALAPPDATA%\hermes default and its legacy ~/.hermes fallback are
+ * exercised on every host. */
+void cbm_hermes_home_dir_for_testing(const char *home_dir, bool windows, char *out, size_t out_sz);
+#endif
 
 #ifdef CBM_CLI_ENABLE_TEST_API
 /* #1558: client-selector vocabulary, exposed so a test can prove every token
@@ -404,7 +411,8 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
  * Prints each file path to stdout. Returns count of .db files found. */
 int cbm_list_indexes(const char *home_dir);
 
-/* Remove all .db files in the cache directory. Returns count removed. */
+/* Remove every project index .db (and its sidecars) in the cache directory.
+ * Internal stores (_config.db, _cross_repo.db) are kept. Returns count removed. */
 int cbm_remove_indexes(const char *home_dir);
 
 /* ── Config store (persistent key-value, backed by _config.db) ── */
@@ -445,6 +453,7 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
+#define CBM_CONFIG_WATCH_NON_GIT "watch_non_git"
 /* #1558: the graph UI's loopback listener. Stored in the UI config file rather
  * than the key-value store, but surfaced through `config` so it is findable. */
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
@@ -458,6 +467,11 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
  * default (true), so a failure to open the config store never silently disables
  * the watcher. */
 bool cbm_config_watcher_enabled(cbm_config_t *cfg);
+
+/* Whether the watcher also polls NON-GIT project roots (default false, #1948).
+ * Non-git roots are otherwise never refreshed after their first index. Read
+ * once at daemon startup, like watcher_enabled. NULL-safe (NULL → false). */
+bool cbm_config_watch_non_git(cbm_config_t *cfg);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
@@ -503,6 +517,12 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
 const char *cbm_cli_activation_runtime_parent_for_test(void);
+
+/* Internal integration-test seam: the activation scope read reports the active
+ * cohort's cache fingerprint as unreadable (blank), exactly what the scope
+ * decision sees when that field cannot be recovered. false restores the real
+ * read. Not a command-line or environment override. */
+void cbm_cli_set_activation_scope_cache_unreadable_for_test(bool unreadable);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 

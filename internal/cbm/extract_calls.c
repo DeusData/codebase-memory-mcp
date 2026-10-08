@@ -1763,6 +1763,59 @@ static const char *php_chain_prefix_arg(CBMArena *a, TSNode call_node, const cha
     return NULL;
 }
 
+/* The value of a plain PHP string literal ('...' or "..." with no
+ * interpolation or escapes), "" for an empty one; NULL for anything else. */
+static const char *php_plain_string_value(CBMArena *a, TSNode node, const char *source) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "string") != 0 && strcmp(kind, "encapsed_string") != 0) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (strcmp(ts_node_type(ts_node_named_child(node, i)), "string_content") != 0) {
+            return NULL;
+        }
+    }
+    return nc == 0 ? "" : cbm_node_text(a, ts_node_named_child(node, 0), source);
+}
+
+/* The first argument's value node of a PHP call (unwrapping `argument`). */
+static TSNode php_first_arg_value(TSNode call_node) {
+    TSNode none = {0};
+    TSNode args = ts_node_child_by_field_name(call_node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return none;
+    }
+    TSNode arg = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(arg), "argument") == 0) {
+        return ts_node_named_child_count(arg) == SKIP_ONE ? ts_node_named_child(arg, 0) : none;
+    }
+    return arg;
+}
+
+/* The literal 'prefix' of an attribute-array group (#1146):
+ * Route::group(['prefix' => 'v1/autocomplete', 'as' => ...], function () {...}),
+ * the form Firefly III's whole API is written in. */
+static const char *php_group_array_prefix(CBMArena *a, TSNode group_call, const char *source) {
+    TSNode attrs = php_first_arg_value(group_call);
+    if (ts_node_is_null(attrs) || strcmp(ts_node_type(attrs), "array_creation_expression") != 0) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(attrs);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode el = ts_node_named_child(attrs, i);
+        if (strcmp(ts_node_type(el), "array_element_initializer") != 0 ||
+            ts_node_named_child_count(el) != PAIR_LEN) {
+            continue;
+        }
+        const char *key = php_plain_string_value(a, ts_node_named_child(el, 0), source);
+        if (key && strcmp(key, "prefix") == 0) {
+            return php_plain_string_value(a, ts_node_named_child(el, SKIP_ONE), source);
+        }
+    }
+    return NULL;
+}
+
 static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const char *source) {
     const char *parts[PHP_PREFIX_PARTS_MAX];
     int part_count = 0;
@@ -1785,7 +1838,14 @@ static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const cha
                                         strcmp(ts_node_type(p), "scoped_call_expression") == 0)) {
                 TSNode gname = ts_node_child_by_field_name(p, TS_FIELD("name"));
                 char *gtxt = ts_node_is_null(gname) ? NULL : cbm_node_text(a, gname, source);
-                if (gtxt && strcmp(gtxt, "group") == 0) {
+                const char *array_prefix = gtxt && strcmp(gtxt, "group") == 0
+                                               ? php_group_array_prefix(a, p, source)
+                                               : NULL;
+                if (array_prefix) {
+                    if (part_count < PHP_PREFIX_PARTS_MAX) {
+                        parts[part_count++] = array_prefix; /* inner-first */
+                    }
+                } else if (gtxt && strcmp(gtxt, "group") == 0) {
                     /* Scan the receiver chain for prefix('...'). */
                     TSNode recv = ts_node_child_by_field_name(p, TS_FIELD("object"));
                     for (int hops = 0; hops < PHP_GROUP_WALK_MAX && !ts_node_is_null(recv);
@@ -1841,6 +1901,81 @@ static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const cha
     }
     buf[pos] = '\0';
     return pos ? cbm_arena_strndup(a, buf, pos) : NULL;
+}
+
+/* A Laravel route registrar receiver (#1146): the Route facade — also at the
+ * root of a registrar chain, Route::middleware('auth')->get(...) — or the
+ * $router instance route files are loaded with (RouteServiceProvider, Lumen).
+ * The same literal `Route` scope the #952 callee qualification accepts. */
+static bool php_is_laravel_registrar(CBMArena *a, TSNode call_node, const char *source) {
+    TSNode cur = call_node;
+    for (int hops = 0; hops < PHP_GROUP_WALK_MAX && !ts_node_is_null(cur); hops++) {
+        const char *kind = ts_node_type(cur);
+        if (strcmp(kind, "scoped_call_expression") == 0) {
+            TSNode scope = ts_node_child_by_field_name(cur, TS_FIELD("scope"));
+            const char *st = ts_node_is_null(scope) ? NULL : cbm_node_text(a, scope, source);
+            return st && strcmp(st, "Route") == 0;
+        }
+        if (strcmp(kind, "variable_name") == 0) {
+            const char *vt = cbm_node_text(a, cur, source);
+            return vt && strcmp(vt, "$router") == 0;
+        }
+        if (strcmp(kind, "member_call_expression") != 0) {
+            return false;
+        }
+        cur = ts_node_child_by_field_name(cur, TS_FIELD("object"));
+    }
+    return false;
+}
+
+/* Laravel accepts a route URI with or without its leading slash and trims
+ * '/' from both ends: Route::get('users', ...) serves /users, and '' is the
+ * group root. The route passes only mint a Route for a path that starts with
+ * '/', so give a recognised registration's literal URI its slash here, where
+ * the first argument is still at hand (#1146). Returns NULL — leave the call
+ * alone — for any other call, any non-literal URI, or one already slashed:
+ * `$request->get('name')`, `Cache::get('key')` and a collection's get('k')
+ * keep their argument. */
+static const char *php_laravel_route_uri(CBMArena *a, TSNode call_node, const char *source) {
+    static const char *const verbs[] = {"get", "post", "put", "patch", "delete", NULL};
+    TSNode mname = ts_node_child_by_field_name(call_node, TS_FIELD("name"));
+    const char *verb = ts_node_is_null(mname) ? NULL : cbm_node_text(a, mname, source);
+    bool is_verb = false;
+    for (int i = 0; verb && verbs[i] && !is_verb; i++) {
+        is_verb = strcmp(verb, verbs[i]) == 0;
+    }
+    if (!is_verb || !php_is_laravel_registrar(a, call_node, source)) {
+        return NULL;
+    }
+    TSNode arg0 = php_first_arg_value(call_node);
+    const char *uri = ts_node_is_null(arg0) ? NULL : php_plain_string_value(a, arg0, source);
+    if (!uri || uri[0] == '/') {
+        return NULL;
+    }
+    size_t len = strlen(uri);
+    while (len > 0 && uri[len - SKIP_ONE] == '/') {
+        len--;
+    }
+    return cbm_arena_sprintf(a, "/%.*s", (int)len, uri);
+}
+
+/* Is a Laravel registration's action (its last argument) a string — 'index'
+ * inside a Route::controller() group, 'UserController@show'? Such an action
+ * does not say which class owns the method, so resolving it could only guess a
+ * same-named function anywhere in the repo. */
+static bool php_route_action_is_string(TSNode call_node) {
+    TSNode args = ts_node_child_by_field_name(call_node, TS_FIELD("arguments"));
+    uint32_t nc = ts_node_is_null(args) ? 0 : ts_node_named_child_count(args);
+    if (nc < PAIR_LEN) {
+        return false;
+    }
+    TSNode action = ts_node_named_child(args, nc - SKIP_ONE);
+    if (strcmp(ts_node_type(action), "argument") == 0 &&
+        ts_node_named_child_count(action) == SKIP_ONE) {
+        action = ts_node_named_child(action, 0);
+    }
+    const char *kind = ts_node_type(action);
+    return strcmp(kind, "string") == 0 || strcmp(kind, "encapsed_string") == 0;
 }
 
 static bool is_nested_verilog_call_wrapper(CBMLanguage lang, TSNode node) {
@@ -2105,6 +2240,56 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
     }
 }
 
+static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node);
+
+/* A JS/TS request-config object -- `http({url: `/users/${id}`, method: 'GET'})`,
+ * `axios({url: '/orders'})`, the shape Orval and similar generators emit -- names
+ * its request URL in the `url` property. Return that URL (template literals
+ * flattened to the canonical "{}" form, like a bare template argument), or NULL.
+ * Only the `url` key counts: `path`/`endpoint` in an options object name other
+ * things too often. Route registrations are excluded: an object there is the
+ * route definition (Fastify `route({url, handler})`), not a client request, and
+ * its handler lives inside the object where the route pass cannot read it. So is
+ * axios `getUri(config)`: it takes the same config but only formats the URL and
+ * sends nothing (Orval's `get<Op>Url` helpers). (#2235) */
+static bool config_object_callee_eligible(const CBMExtractCtx *ctx, const char *callee_name) {
+    if (ctx->language != CBM_LANG_JAVASCRIPT && ctx->language != CBM_LANG_TYPESCRIPT &&
+        ctx->language != CBM_LANG_TSX && ctx->language != CBM_LANG_ARKTS) {
+        return false;
+    }
+    if (!callee_name || cbm_service_pattern_route_method(callee_name) != NULL) {
+        return false;
+    }
+    static const char get_uri[] = "getUri";
+    size_t clen = strlen(callee_name);
+    size_t glen = sizeof(get_uri) - 1;
+    return !(clen >= glen && strcmp(callee_name + clen - glen, get_uri) == 0);
+}
+
+static const char *js_config_object_url(CBMExtractCtx *ctx, TSNode obj, const char *callee_name) {
+    if (strcmp(ts_node_type(obj), "object") != 0 ||
+        !config_object_callee_eligible(ctx, callee_name)) {
+        return NULL;
+    }
+    uint32_t n = ts_node_named_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(obj, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            continue;
+        }
+        TSNode key_n = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        TSNode val_n = ts_node_child_by_field_name(pair, TS_FIELD("value"));
+        if (ts_node_is_null(key_n) || ts_node_is_null(val_n)) {
+            continue;
+        }
+        const char *key = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, key_n, ctx->source));
+        if (key && strcmp(key, "url") == 0) {
+            return extract_string_value(ctx, val_n);
+        }
+    }
+    return NULL;
+}
+
 /* Extract all arguments from a call expression into call->args[]. */
 static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
     uint32_t argc = ts_node_named_child_count(args);
@@ -2147,6 +2332,10 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
                 ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source);
             } else if (strcmp(ak, "identifier") == 0 && ca->expr) {
                 ca->value = lookup_string_constant(ctx, ca->expr);
+            } else if (strcmp(ak, "object") == 0) {
+                /* Request-config object: its `url` is what the arg-url
+                 * heuristic reads for a local fetch wrapper (#2235). */
+                ca->value = js_config_object_url(ctx, arg_node, call->callee_name);
             } else if (strcmp(ak, "call_expression") == 0) {
                 /* URL-builder helper call (issue #1009): resolve
                  * client(buildPath(id)) through the per-file builder map. */
@@ -2411,7 +2600,8 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
 }
 
 // Extract URL/topic from keyword or positional args.
-static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
+static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args,
+                                            const char *callee_name) {
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
@@ -2433,6 +2623,15 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
             const char *val = extract_keyword_url(ctx, arg);
+            if (val) {
+                return val;
+            }
+            continue;
+        }
+
+        /* JS/TS request-config object: `axios({url: '/orders'})` (#2235). */
+        if (strcmp(ak, "object") == 0) {
+            const char *val = js_config_object_url(ctx, arg, callee_name);
             if (val) {
                 return val;
             }
@@ -2489,6 +2688,123 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
     return unq;
 }
 
+/* True for a PHP class/namespace name: identifier segments joined by '\'. */
+static bool php_is_class_path(const char *s) {
+    if (!s || !s[0]) {
+        return false;
+    }
+    for (; *s; s++) {
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') ||
+              *s == '_' || *s == '\\')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Qualify a class name the way PHP resolves it: a leading '\' is already
+ * absolute; a first segment that a `use` clause imports (by alias or by last
+ * segment) is replaced by the imported name; anything else is relative to the
+ * file's namespace. Imports and the namespace are extracted before the call
+ * walk, so both are complete here. */
+static const char *php_qualify_class(CBMExtractCtx *ctx, const char *written) {
+    if (written[0] == '\\') {
+        return written + SKIP_ONE;
+    }
+    const char *sep = strchr(written, '\\');
+    size_t first_len = sep ? (size_t)(sep - written) : strlen(written);
+    const CBMImportArray *imps = &ctx->result->imports;
+    for (int i = 0; i < imps->count; i++) {
+        const CBMImport *imp = &imps->items[i];
+        const char *path = imp->module_path;
+        if (!imp->local_name || !path || strlen(imp->local_name) != first_len ||
+            strncmp(imp->local_name, written, first_len) != 0) {
+            continue;
+        }
+        path += path[0] == '\\' ? SKIP_ONE : 0;
+        if (php_is_class_path(path)) {
+            return cbm_arena_sprintf(ctx->arena, "%s%s", path, sep ? sep : "");
+        }
+    }
+    const char *ns = ctx->result->namespace_name;
+    return ns && ns[0] ? cbm_arena_sprintf(ctx->arena, "%s\\%s", ns, written) : written;
+}
+
+/* The fully-qualified class a PHP `X::class` expression names (`use` imports
+ * and the file namespace applied). NULL for any other expression, including
+ * `static::class` and `self::class`. */
+static const char *php_class_literal_fqn(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "class_constant_access_expression") != 0 ||
+        ts_node_named_child_count(node) != PAIR_LEN) {
+        return NULL;
+    }
+    TSNode cls = ts_node_named_child(node, 0);
+    const char *ck = ts_node_type(cls);
+    const char *member =
+        cbm_node_text(ctx->arena, ts_node_named_child(node, SKIP_ONE), ctx->source);
+    if ((strcmp(ck, "name") != 0 && strcmp(ck, "qualified_name") != 0) || !member ||
+        strcmp(member, "class") != 0) {
+        return NULL;
+    }
+    const char *text = cbm_node_text(ctx->arena, cls, ctx->source);
+    return php_is_class_path(text) ? php_qualify_class(ctx, text) : NULL;
+}
+
+/* The value of a PHP array element written without a key; a null node for a
+ * keyed element (`'uses' => ...`) or anything else. */
+static TSNode php_unkeyed_element_value(TSNode elem) {
+    TSNode none = {0};
+    if (strcmp(ts_node_type(elem), "array_element_initializer") != 0 ||
+        ts_node_named_child_count(elem) != SKIP_ONE) {
+        return none;
+    }
+    return ts_node_named_child(elem, 0);
+}
+
+static bool php_is_identifier(const char *s) {
+    if (!s || !((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) {
+        return false;
+    }
+    for (; *s; s++) {
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') ||
+              *s == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Laravel's class-based route handlers (#1146), as "Ns\Class::method":
+ *   [UserController::class, 'show']  -> App\Http\Controllers\UserController::show
+ *   GetCurrentUserController::class   -> App\...\GetCurrentUserController::__invoke
+ * with the class qualified through the file's `use` imports; the route passes
+ * place it on a method QN (cbm_registry_resolve_handler). NULL for any other
+ * expression. */
+static const char *php_class_route_handler(CBMExtractCtx *ctx, TSNode arg) {
+    const char *kind = ts_node_type(arg);
+    if (strcmp(kind, "class_constant_access_expression") == 0) {
+        const char *cls = php_class_literal_fqn(ctx, arg);
+        return cls ? cbm_arena_sprintf(ctx->arena, "%s::__invoke", cls) : NULL;
+    }
+    if (strcmp(kind, "array_creation_expression") != 0 ||
+        ts_node_named_child_count(arg) != PAIR_LEN) {
+        return NULL;
+    }
+    TSNode cls_node = php_unkeyed_element_value(ts_node_named_child(arg, 0));
+    TSNode method_node = php_unkeyed_element_value(ts_node_named_child(arg, SKIP_ONE));
+    if (ts_node_is_null(cls_node) || ts_node_is_null(method_node)) {
+        return NULL;
+    }
+    const char *cls = php_class_literal_fqn(ctx, cls_node);
+    const char *mk = ts_node_type(method_node);
+    if (!cls || (strcmp(mk, "string") != 0 && strcmp(mk, "encapsed_string") != 0)) {
+        return NULL;
+    }
+    const char *method =
+        strip_quotes(ctx->arena, cbm_node_text(ctx->arena, method_node, ctx->source));
+    return php_is_identifier(method) ? cbm_arena_sprintf(ctx->arena, "%s::%s", cls, method) : NULL;
+}
+
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     /* The LAST eligible argument wins, and every argument is examined.
      * Express, Fastify, gin and Laravel all put middleware between the route
@@ -2505,6 +2821,13 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
         if (strcmp(ts_node_type(arg2), "argument") == 0 && ts_node_named_child_count(arg2) > 0) {
             arg2 = ts_node_named_child(arg2, 0);
+        }
+        if (ctx->language == CBM_LANG_PHP) {
+            const char *class_handler = php_class_route_handler(ctx, arg2);
+            if (class_handler) {
+                handler = class_handler;
+                continue;
+            }
         }
         const char *ak2 = ts_node_type(arg2);
         /* `name` = PHP bare identifier handler; string = Laravel string handler
@@ -3876,7 +4199,17 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 args = swift_call_args(node);
             }
             if (!ts_node_is_null(args)) {
-                call.first_string_arg = extract_url_or_topic_arg(ctx, args);
+                call.first_string_arg = extract_url_or_topic_arg(ctx, args, call.callee_name);
+                /* #1146: a Laravel registration's slashless URI ('users', '')
+                 * becomes '/users' / '/' so it mints and composes below. */
+                const char *laravel_uri = NULL;
+                if (ctx->language == CBM_LANG_PHP && call.callee_name &&
+                    cbm_service_pattern_route_method(call.callee_name) != NULL) {
+                    laravel_uri = php_laravel_route_uri(ctx->arena, node, ctx->source);
+                    if (laravel_uri) {
+                        call.first_string_arg = laravel_uri;
+                    }
+                }
                 /* #952: routes registered inside Laravel `prefix()->group()`
                  * closures must carry the composed path — the resolve passes
                  * only see the flat CBMCall, so the enclosing chain can only
@@ -3895,7 +4228,10 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                                    : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
                     }
                 }
-                if (call.first_string_arg && call.first_string_arg[0] == '/') {
+                /* A slashless registration's string action would only be
+                 * guessed at (#1146): mint its Route without a handler. */
+                if (call.first_string_arg && call.first_string_arg[0] == '/' &&
+                    !(laravel_uri && php_route_action_is_string(node))) {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }
                 if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||

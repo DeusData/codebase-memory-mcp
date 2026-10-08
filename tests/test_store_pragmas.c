@@ -11,6 +11,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include "sqlite3.h" /* vendored/sqlite3 — read pragmas back on the store's own handle */
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,10 +100,91 @@ TEST(journal_size_limit_bounds_wal_issue1083) {
 
     cbm_store_t *s = cbm_store_open_path(tmp_path);
     ASSERT(s != NULL);
-    /* 256 MiB — far above the healthy WAL (~4 MiB), so no truncate/regrow churn
-     * in normal operation; it only fires after abnormal (starved) growth. */
+    /* 256 MiB — far above the healthy WAL (~64 MiB: 1000 autocheckpoint pages
+     * of 64 KiB), so no truncate/regrow churn in normal operation; it only
+     * fires after abnormal (starved) growth. */
     ASSERT(cbm_store_journal_size_limit(s) == (int64_t)268435456);
     cbm_store_close(s);
+
+    unlink(tmp_path);
+    char tmp_wal[300];
+    char tmp_shm[300];
+    snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+    snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+    unlink(tmp_wal);
+    unlink(tmp_shm);
+    PASS();
+}
+
+/* #1419: effective pragmas per store role, read on the handle itself —
+ * synchronous is per-connection and never persisted, so an external sqlite3
+ * shell reports its own default (FULL), not what the indexer runs with. */
+static int role_pragma_int(cbm_store_t *s, const char *sql) {
+    sqlite3_stmt *stmt = NULL;
+    int value = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), sql, -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        value = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return value;
+}
+
+static bool role_journal_mode_is(cbm_store_t *s, const char *want) {
+    sqlite3_stmt *stmt = NULL;
+    bool match = false;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s), "PRAGMA journal_mode;", -1, &stmt, NULL) ==
+            SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+        match = mode && strcmp(mode, want) == 0;
+    }
+    sqlite3_finalize(stmt);
+    return match;
+}
+
+TEST(store_role_pragmas_issue1419) {
+    enum {
+        SYNC_OFF = 0,
+        SYNC_NORMAL = 1,
+        SYNC_FULL = 2,
+        /* 64 MiB = 1024 of the 64 KiB pages every index is written with. */
+        WRITE_CACHE_KIB = -65536,
+        SQLITE_DEFAULT_CACHE_KIB = -2000,
+    };
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_test_roles_%d.db", cbm_tmpdir(), (int)getpid());
+    unlink(tmp_path);
+
+    /* Read-write role (live ADR writes, staging generations): WAL at NORMAL,
+     * with a page cache that holds more than a few 64 KiB pages. */
+    cbm_store_t *s = cbm_store_open_path(tmp_path);
+    ASSERT(s != NULL);
+    ASSERT_TRUE(role_journal_mode_is(s, "wal"));
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA synchronous;"), SYNC_NORMAL);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA cache_size;"), WRITE_CACHE_KIB);
+    /* Bulk role: sync off for the write burst, then back to the read-write
+     * settings rather than SQLite's defaults. */
+    ASSERT_EQ(cbm_store_begin_bulk(s), CBM_STORE_OK);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA synchronous;"), SYNC_OFF);
+    ASSERT_EQ(cbm_store_end_bulk(s), CBM_STORE_OK);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA synchronous;"), SYNC_NORMAL);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA cache_size;"), WRITE_CACHE_KIB);
+    /* Seal role: the durable checkpoint before the atomic rename runs at FULL
+     * and leaves a self-contained DELETE-mode file. */
+    ASSERT_EQ(cbm_store_seal_for_atomic_publish(s), CBM_STORE_OK);
+    ASSERT_EQ(role_pragma_int(s, "PRAGMA synchronous;"), SYNC_FULL);
+    ASSERT_TRUE(role_journal_mode_is(s, "delete"));
+    cbm_store_close(s);
+
+    /* Query role: read-only, never switches a sealed file back to WAL, and
+     * keeps SQLite's small default cache (one per request, so it stays cheap). */
+    cbm_store_t *q = cbm_store_open_path_query(tmp_path);
+    ASSERT(q != NULL);
+    ASSERT_EQ(sqlite3_db_readonly(cbm_store_get_db(q), "main"), 1);
+    ASSERT_TRUE(role_journal_mode_is(q, "delete"));
+    ASSERT_EQ(role_pragma_int(q, "PRAGMA cache_size;"), SQLITE_DEFAULT_CACHE_KIB);
+    cbm_store_close(q);
 
     unlink(tmp_path);
     char tmp_wal[300];
@@ -264,6 +347,7 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
 
 SUITE(store_pragmas) {
     RUN_TEST(journal_size_limit_bounds_wal_issue1083);
+    RUN_TEST(store_role_pragmas_issue1419);
     RUN_TEST(store_generation_tracks_mutations);
     RUN_TEST(store_generation_rejects_malformed_metadata_atomically);
     RUN_TEST(corrupt_page_scan_returns_error_not_truncation);

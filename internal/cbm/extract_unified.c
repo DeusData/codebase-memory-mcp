@@ -918,6 +918,13 @@ static const char *objectscript_get_method_qn(CBMExtractCtx *ctx, TSNode node,
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
+    /* Raw configured definitions already own the canonical QN, including
+     * namespace scope. Never rederive it from the bare macro identifier. */
+    const char *configured_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_qn) {
+        return configured_qn;
+    }
+
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
         return compute_wolfram_func_qn(ctx, node);
@@ -1103,9 +1110,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
-     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, qn_name,
-                                       ctx->language);
+     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality).
+     * C-family platform variants share their platform-neutral QN — the same
+     * rule extract_func_def applies, so in-body calls source to the def. */
+    const char *qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, qn_name,
+                                                 ctx->language);
+    return cbm_platform_variant_qn(ctx->arena, ctx->language, ctx->project, ctx->rel_path, qn_name,
+                                   qn, node);
 }
 
 // Compute class QN for scope tracking.
@@ -2370,7 +2381,12 @@ static void push_lexical_boundary(TSNode node, WalkState *state, uint32_t depth)
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth,
                                  const CBMInvocationDescriptor *invocation) {
-    if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
+    const char *configured_body_qn = NULL;
+    if (ctx->language == CBM_LANG_C && strcmp(ts_node_type(node), "compound_statement") == 0)
+        configured_body_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_body_qn) {
+        (void)push_function_scope(state, depth, configured_body_qn, node);
+    } else if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
         /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
          * but the def walk does not descend into function bodies, so it emits no
          * node for it. Pushing a func scope here would attribute in-body calls to

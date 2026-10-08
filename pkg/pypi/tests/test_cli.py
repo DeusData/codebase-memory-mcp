@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import io
 import json
 import os
 import stat
@@ -834,4 +835,297 @@ _cli._publish_runtime_set(
                     (_cli._WINDOWS_BINARY_NAME,),
                     False,
                 )
+
+
+class _FakeHttpsResponse:
+    """Minimal stand-in for the opener's response: headers, geturl, read."""
+
+    def __init__(self, body: bytes, headers=None):
+        self._body = body
+        self._offset = 0
+        self.headers = dict(headers or {})
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def geturl(self):
+        return "https://example.invalid/release.tar.gz"
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = len(self._body) - self._offset
+        chunk = self._body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+def _limits_with(**overrides):
+    return _cli._DEFAULT_ARCHIVE_LIMITS._replace(**overrides)
+
+
+def _write_tar_gz(archive, entries):
+    with tarfile.open(archive, "w:gz") as tf:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+
+def _write_zip(archive, entries):
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+
+
+def _release_entries(names):
+    return [(name, f"payload of {name}".encode()) for name in names]
+
+
+class ArchiveLimitTests(unittest.TestCase):
+    URL = "https://example.invalid/release.tar.gz"
+
+    def _download(self, response, destination, max_bytes):
+        with mock.patch.object(_cli._HTTPS_OPENER, "open", return_value=response):
+            _cli._download_https(self.URL, destination, max_bytes)
+
+    def test_download_rejects_a_declared_length_over_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = os.path.join(root, "release.tar.gz")
+            response = _FakeHttpsResponse(b"", {"Content-Length": "9"})
+            with self.assertRaises(RuntimeError) as raised:
+                self._download(response, destination, 8)
+            self.assertIn("8-byte safety limit", str(raised.exception))
+            self.assertFalse(os.path.exists(destination))
+
+    def test_download_rejects_a_body_over_the_limit_and_removes_the_partial_file(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            destination = os.path.join(root, "release.tar.gz")
+            response = _FakeHttpsResponse(b"x" * 1024)
+            with self.assertRaises(RuntimeError) as raised:
+                self._download(response, destination, 8)
+            self.assertIn("8-byte safety limit", str(raised.exception))
+            self.assertFalse(os.path.exists(destination))
+
+    def test_download_within_the_limit_stores_the_body(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = os.path.join(root, "release.tar.gz")
+            response = _FakeHttpsResponse(b"payload", {"Content-Length": "7"})
+            self._download(response, destination, 1024)
+            with open(destination, "rb") as stored:
+                self.assertEqual(stored.read(), b"payload")
+
+    def test_download_counts_bytes_when_the_declared_length_is_not_a_number(self):
+        # A superscript two passes str.isdigit but not int(); such values and
+        # plain junk must fall through to the byte counter, never crash.
+        for declared in ("²", "abc", "", "1e3", "-1"):
+            with self.subTest(declared=declared), tempfile.TemporaryDirectory() as root:
+                destination = os.path.join(root, "release.tar.gz")
+                response = _FakeHttpsResponse(b"x" * 1024, {"Content-Length": declared})
+                with self.assertRaises(RuntimeError) as raised:
+                    self._download(response, destination, 8)
+                self.assertIn("8-byte safety limit", str(raised.exception))
+                self.assertFalse(os.path.exists(destination))
+        with tempfile.TemporaryDirectory() as root:
+            destination = os.path.join(root, "release.tar.gz")
+            response = _FakeHttpsResponse(b"payload", {"Content-Length": "²"})
+            self._download(response, destination, 1024)
+            with open(destination, "rb") as stored:
+                self.assertEqual(stored.read(), b"payload")
+
+    def test_unix_tar_rejects_more_members_than_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "members.tar.gz"
+            _write_tar_gz(archive, [("one", b"a"), ("two", b"b"), ("three", b"c")])
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with tarfile.open(archive) as tf, self.assertRaises(SystemExit) as raised:
+                _cli._safe_extract_tar(
+                    tf,
+                    str(destination),
+                    ("one", "two", "three"),
+                    ("one",),
+                    limits=_limits_with(members=2),
+                )
+            self.assertIn("2-member safety limit", str(raised.exception))
+            self.assertFalse((destination / "one").exists())
+
+    def test_unix_tar_rejects_a_member_declared_over_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "member.tar.gz"
+            _write_tar_gz(archive, [("codebase-memory-mcp", b"x" * 65)])
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with tarfile.open(archive) as tf, self.assertRaises(SystemExit) as raised:
+                _cli._safe_extract_tar(
+                    tf,
+                    str(destination),
+                    ("codebase-memory-mcp",),
+                    ("codebase-memory-mcp",),
+                    limits=_limits_with(member_bytes=64),
+                )
+            self.assertIn(
+                "'codebase-memory-mcp' exceeds the 64-byte expanded safety limit",
+                str(raised.exception),
+            )
+            self.assertFalse((destination / "codebase-memory-mcp").exists())
+
+    def test_unix_tar_rejects_a_declared_aggregate_over_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "aggregate.tar.gz"
+            _write_tar_gz(archive, [("one", b"a" * 40), ("two", b"b" * 40)])
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with tarfile.open(archive) as tf, self.assertRaises(SystemExit) as raised:
+                _cli._safe_extract_tar(
+                    tf,
+                    str(destination),
+                    ("one", "two"),
+                    ("one",),
+                    limits=_limits_with(member_bytes=64, expanded_bytes=64),
+                )
+            self.assertIn(
+                "64-byte aggregate expanded safety limit", str(raised.exception)
+            )
+
+    def test_unix_tar_within_the_limits_extracts_only_the_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "release.tar.gz"
+            _write_tar_gz(archive, _release_entries(_cli._UNIX_ARCHIVE_NAMES))
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with tarfile.open(archive) as tf:
+                extracted = _cli._safe_extract_tar(
+                    tf,
+                    str(destination),
+                    _cli._UNIX_ARCHIVE_NAMES,
+                    ("codebase-memory-mcp",),
+                )
+            self.assertEqual(extracted, ("codebase-memory-mcp",))
+            self.assertEqual(
+                (destination / "codebase-memory-mcp").read_bytes(),
+                b"payload of codebase-memory-mcp",
+            )
+            self.assertEqual(os.listdir(destination), ["codebase-memory-mcp"])
+
+    def test_archive_copy_stops_a_member_that_yields_more_than_the_limit(self):
+        source = io.BytesIO(b"x" * 100)
+        output = io.BytesIO()
+        with self.assertRaises(SystemExit) as raised:
+            _cli._copy_archive_member_within_limits(
+                source,
+                output,
+                "member",
+                100,
+                0,
+                _limits_with(member_bytes=64, expanded_bytes=1024),
+            )
+        self.assertIn(
+            "'member' exceeds the 64-byte actual expanded safety limit",
+            str(raised.exception),
+        )
+        # Reading stopped one byte past the limit; nothing beyond it was kept.
+        self.assertEqual(source.tell(), 65)
+        self.assertLessEqual(len(output.getvalue()), 64)
+
+    def test_archive_copy_rejects_a_member_that_yields_more_than_it_declares(self):
+        source = io.BytesIO(b"x" * 100)
+        with self.assertRaises(SystemExit) as raised:
+            _cli._copy_archive_member_within_limits(
+                source,
+                io.BytesIO(),
+                "member",
+                10,
+                0,
+                _limits_with(member_bytes=1024, expanded_bytes=1024),
+            )
+        self.assertIn(
+            "'member' actual size 100 does not match declared size 10",
+            str(raised.exception),
+        )
+
+    def test_archive_copy_rejects_an_aggregate_over_the_actual_limit(self):
+        with self.assertRaises(SystemExit) as raised:
+            _cli._copy_archive_member_within_limits(
+                io.BytesIO(b"abcd"),
+                io.BytesIO(),
+                "member",
+                4,
+                3,
+                _limits_with(member_bytes=10, expanded_bytes=5),
+            )
+        self.assertIn(
+            "5-byte aggregate actual expanded safety limit", str(raised.exception)
+        )
+
+    def test_archive_member_write_removes_the_partial_file_on_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "codebase-memory-mcp")
+            with self.assertRaises(SystemExit):
+                _cli._write_archive_member_within_limits(
+                    io.BytesIO(b"x" * 100),
+                    target,
+                    "codebase-memory-mcp",
+                    10,
+                    0,
+                    _limits_with(member_bytes=1024, expanded_bytes=1024),
+                )
+            self.assertFalse(os.path.exists(target))
+
+    def test_windows_zip_rejects_more_members_than_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "members.zip"
+            _write_zip(archive, [("one", b"a"), ("two", b"b"), ("three", b"c")])
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with zipfile.ZipFile(archive) as zf, self.assertRaises(SystemExit) as raised:
+                _cli._safe_extract_zip(
+                    zf,
+                    str(destination),
+                    ("one", "two", "three"),
+                    ("one",),
+                    limits=_limits_with(members=2),
+                )
+            self.assertIn("2-member safety limit", str(raised.exception))
+
+    def test_windows_zip_rejects_a_member_declared_over_the_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "member.zip"
+            _write_zip(archive, [(_cli._WINDOWS_BINARY_NAME, b"x" * 65)])
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with zipfile.ZipFile(archive) as zf, self.assertRaises(SystemExit) as raised:
+                _cli._safe_extract_zip(
+                    zf,
+                    str(destination),
+                    (_cli._WINDOWS_BINARY_NAME,),
+                    (_cli._WINDOWS_BINARY_NAME,),
+                    limits=_limits_with(member_bytes=64),
+                )
+            self.assertIn("64-byte expanded safety limit", str(raised.exception))
+            self.assertFalse((destination / _cli._WINDOWS_BINARY_NAME).exists())
+
+    def test_windows_zip_within_the_limits_extracts_only_the_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "release.zip"
+            _write_zip(archive, _release_entries(_cli._WINDOWS_ARCHIVE_NAMES))
+            destination = Path(root) / "extract"
+            destination.mkdir()
+            with zipfile.ZipFile(archive) as zf:
+                extracted = _cli._safe_extract_zip(
+                    zf,
+                    str(destination),
+                    _cli._WINDOWS_ARCHIVE_NAMES,
+                    (_cli._WINDOWS_BINARY_NAME,),
+                )
+            self.assertEqual(extracted, (_cli._WINDOWS_BINARY_NAME,))
+            self.assertEqual(
+                (destination / _cli._WINDOWS_BINARY_NAME).read_bytes(),
+                b"payload of codebase-memory-mcp.exe",
+            )
+            self.assertEqual(os.listdir(destination), [_cli._WINDOWS_BINARY_NAME])
 
