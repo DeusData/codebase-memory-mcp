@@ -2771,6 +2771,17 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                                       cbm_store_count_edges(staging, project));
     cbm_log_info("delta.committed_counts", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
+    /* The staging file started as a byte-for-byte clone of the previous
+     * generation (cbm_delta_stage_clone above), so its `projects` row still
+     * carries whichever root_path/indexed_at the LAST full rebuild wrote.
+     * Every other write in this function patches nodes/edges/hashes/surfaces
+     * for the CURRENT run's repo_path, so the project row must be refreshed
+     * to match, or a later root_path-keyed read (get_code_snippet and
+     * friends) resolves files against a directory this run never touched. */
+    if (cbm_store_upsert_project(staging, project, cbm_pipeline_repo_path(p)) != CBM_STORE_OK) {
+        goto out;
+    }
+
     {
         int index_mode = cbm_pipeline_get_mode(p);
         cbm_pipeline_generation_t generation = {
