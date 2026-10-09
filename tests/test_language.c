@@ -1415,6 +1415,7 @@ TEST(lang_probe_bytes_follow_the_name) {
     ASSERT_EQ(cbm_language_probe_bytes("foo.inc"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("Form1.frm"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("App.res"), 4096);
+    ASSERT_EQ(cbm_language_probe_bytes("app.d"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("Widget.cfc"), 16384);
     ASSERT_EQ(cbm_language_probe_bytes("pom.xml"), 255);
     /* An unknown name falls back to a shebang probe of the first line. */
@@ -1456,6 +1457,9 @@ TEST(lang_classify_matches_every_content_rule) {
         {"p.frm", "#procedure foo\nLocal F = a;\n", CBM_LANG_FORM, cbm_disambiguate_frm},
         {"q.res", "RSRC\0\0\0\1binary", CBM_LANG_COUNT, cbm_disambiguate_res},
         {"r.res", "let x = 1\n", CBM_LANG_RESCRIPT, cbm_disambiguate_res},
+        {"dep.d", "target/debug/deps/app-0a1b2c.d: src/main.rs src/lib.rs\n", CBM_LANG_COUNT,
+         cbm_disambiguate_d},
+        {"app.d", "module app;\nimport std.stdio : writeln;\n", CBM_LANG_DLANG, cbm_disambiguate_d},
         {"s.xml", "<?xml version=\"1.0\"?>\n<Export generator=\"IRIS\" version=\"26\">\n",
          CBM_LANG_OBJECTSCRIPT_EXPORT, NULL},
         {"t.xml", "<?xml version=\"1.0\"?>\n<project/>\n", CBM_LANG_XML, NULL},
@@ -1503,6 +1507,7 @@ TEST(lang_classify_unreadable_content_keeps_the_name_default) {
     ASSERT_EQ(cbm_language_classify("a.cfc", NULL, 0, false, false), CBM_LANG_CFSCRIPT);
     ASSERT_EQ(cbm_language_classify("a.frm", NULL, 0, false, false), CBM_LANG_FORM);
     ASSERT_EQ(cbm_language_classify("a.res", NULL, 0, false, false), CBM_LANG_RESCRIPT);
+    ASSERT_EQ(cbm_language_classify("a.d", NULL, 0, false, false), CBM_LANG_DLANG);
     ASSERT_EQ(cbm_language_classify("a.xml", NULL, 0, false, false), CBM_LANG_XML);
     ASSERT_EQ(cbm_language_classify("run-tests", NULL, 0, false, false), CBM_LANG_COUNT);
     ASSERT_EQ(cbm_language_classify("main.go", NULL, 0, false, false), CBM_LANG_GO);
