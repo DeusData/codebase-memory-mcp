@@ -47,7 +47,15 @@ WHITELIST = Path(os.environ.get(
 MIN_WHY = 120
 MIN_TRIED = 40
 
-FINDING_RE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):\d+:\s+(?:error|warning):\s+(?P<msg>.*?)\s*\[(?P<check>[\w.-]+)\]\s*$")
+# With WarningsAsErrors enabled, clang-tidy appends the escalation reason to
+# analyzer checks, for example:
+#   [clang-analyzer-core.NullDereference,-warnings-as-errors]
+# Keep the check name separate from that suffix so the gate still matches the
+# same whitelist key instead of silently dropping the finding.
+FINDING_RE = re.compile(
+    r"^(?P<file>[^:]+):(?P<line>\d+):\d+:\s+(?:error|warning):\s+"
+    r"(?P<msg>.*?)\s*\[(?P<check>[\w.-]+)(?:,-warnings-as-errors)?\]\s*$"
+)
 
 
 def strip_noise(text):
