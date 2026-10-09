@@ -40,6 +40,7 @@ python3 - "$ROOT" <<'PYEOF'
 from __future__ import annotations
 
 import pathlib
+import json
 import re
 import sys
 
@@ -260,6 +261,67 @@ for name, pattern, why in REQUIRED:
     path = workflows / name
     if path.exists() and not re.search(pattern, path.read_text()):
         failures.append(f"{name}: missing required `{pattern}` — {why}")
+
+# The standard x86_64 release binary must be built and exercised on the
+# Ubuntu 22.04 glibc baseline; the static portable artifact has its own lane.
+build_lines = [
+    line for line in (workflows / "_build.yml").read_text().splitlines()
+    if not line.lstrip().startswith("#")
+]
+build_text = "\n".join(build_lines)
+build_job = re.search(
+    r"(?ms)^  build-unix:\s*\n(.*?)(?=^  build-windows:)", build_text)
+build_matrix = re.search(
+    r"(?ms)^      matrix:\s*\n(.*?)(?=^    runs-on:)",
+    build_job.group(1) if build_job else "")
+build_targets = re.findall(
+    r"(?m)^          - os:\s*(\S+)\s*\n"
+    r"            goos:\s*(\S+)\s*\n"
+    r"            goarch:\s*(\S+)\s*$",
+    build_matrix.group(1) if build_matrix else "")
+linux_amd64_builds = [
+    runner for runner, goos, goarch in build_targets
+    if goos == "linux" and goarch == "amd64"
+]
+if (not build_job or not build_matrix or linux_amd64_builds != ["ubuntu-22.04"]
+        or not re.search(
+            r"(?m)^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$",
+            build_job.group(1))):
+    failures.append(
+        "_build.yml: standard linux-amd64 release binary must build on "
+        "ubuntu-22.04")
+
+smoke_text = "\n".join(
+    line for line in (workflows / "_smoke.yml").read_text().splitlines()
+    if not line.lstrip().startswith("#")
+)
+core_unix = re.search(
+    r"(?ms)^\s*CORE_UNIX='(\[.*?^\s*\])'\s*$", smoke_text)
+try:
+    core_unix_targets = json.loads(core_unix.group(1)) if core_unix else []
+except json.JSONDecodeError:
+    core_unix_targets = []
+if not any(target == {
+        "os": "ubuntu-22.04", "goos": "linux", "goarch": "amd64"
+} for target in core_unix_targets):
+    failures.append(
+        "_smoke.yml: standard linux-amd64 release artifact must smoke on "
+        "ubuntu-22.04")
+
+smoke_unix_job = re.search(
+    r"(?ms)^  smoke-unix:\s*\n(.*?)(?=^  smoke-windows:)", smoke_text)
+if (not re.search(
+        r'UNIX=\$\(jq[^\n]*--argjson a "\$CORE_UNIX"', smoke_text)
+        or not smoke_unix_job
+        or not re.search(
+            r"(?m)^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$",
+            smoke_unix_job.group(1))
+        or not re.search(
+            r"(?m)^      matrix:\s*\$\{\{\s*fromJSON\(needs\.setup-matrix\.outputs\.unix\)\s*\}\}\s*$",
+            smoke_unix_job.group(1))):
+    failures.append(
+        "_smoke.yml: standard linux-amd64 smoke must consume CORE_UNIX "
+        "through the smoke-unix matrix")
 
 # Defender posture: hosted Windows runners have real-time protection
 # POLICY-LOCKED OFF (verified 2026-07-27: WinDefend starts, Set-MpPreference

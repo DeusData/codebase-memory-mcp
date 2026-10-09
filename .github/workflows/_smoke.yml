@@ -31,7 +31,7 @@ jobs:
           BROAD: ${{ inputs.broad_platforms }}
         run: |
           CORE_UNIX='[
-            {"os":"ubuntu-latest","goos":"linux","goarch":"amd64"},
+            {"os":"ubuntu-22.04","goos":"linux","goarch":"amd64"},
             {"os":"ubuntu-24.04-arm","goos":"linux","goarch":"arm64"},
             {"os":"macos-14","goos":"darwin","goarch":"arm64"},
             {"os":"macos-15-intel","goos":"darwin","goarch":"amd64"}
@@ -41,12 +41,9 @@ jobs:
           # Broad legs are REQUIRED gates (no optional / continue-on-error):
           # every smoke leg must pass. No `optional` flags anywhere.
           #
-          # NOTE: the *dynamic* linux binary links glibc 2.38+ and cannot run on
-          # older distros by design — older-glibc coverage is the -portable (static)
-          # binary's job, exercised green by the smoke-linux-portable broad legs
-          # (ubuntu-22.04 / 22.04-arm). So the dynamic broad legs stay on
-          # forward-compatible OSes only (macOS); running the dynamic binary on
-          # ubuntu-22.04 would fail Phase 1 (glibc too old), not a real regression.
+          # The standard linux-amd64 artifact is built against Ubuntu 22.04 and
+          # is smoke-tested on that glibc baseline. The static portable binaries
+          # retain their separate older-glibc coverage below.
           BROAD_UNIX='[
             {"os":"macos-15","goos":"darwin","goarch":"arm64"}
           ]'
