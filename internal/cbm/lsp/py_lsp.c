@@ -165,7 +165,7 @@ static void py_register_instance_field(PyLSPContext *ctx, const char *class_qn,
 static void py_bind_for_target(PyLSPContext *ctx, TSNode left, const CBMType *elem_type);
 static void py_register_lambda(PyLSPContext *ctx, const char *name, TSNode lambda_node);
 static void py_register_dict_literal(PyLSPContext *ctx, const char *name, TSNode dict_node);
-static TSNode py_lookup_lambda(PyLSPContext *ctx, const char *name);
+static int py_lookup_lambda(PyLSPContext *ctx, const char *name);
 static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, const char *key);
 
 /* ── Scope mutation wrappers ─────────────────────────────────────────────
@@ -685,19 +685,21 @@ static void py_register_lambda(PyLSPContext *ctx, const char *name, TSNode lambd
     }
     ctx->lambdas[ctx->lambda_count].name = cbm_arena_strdup(ctx->arena, name);
     ctx->lambdas[ctx->lambda_count].lambda_node = lambda_node;
+    ctx->lambdas[ctx->lambda_count].expanding = false;
     ctx->lambda_count++;
 }
 
-static TSNode py_lookup_lambda(PyLSPContext *ctx, const char *name) {
-    TSNode null_node = {0};
+/* Registry index of the lambda bound to `name`, or -1. An index, not a
+ * pointer: the registry array is replaced when it grows. */
+static int py_lookup_lambda(PyLSPContext *ctx, const char *name) {
     if (!ctx || !name)
-        return null_node;
+        return -1;
     for (int i = 0; i < ctx->lambda_count; i++) {
         if (ctx->lambdas[i].name && strcmp(ctx->lambdas[i].name, name) == 0) {
-            return ctx->lambdas[i].lambda_node;
+            return i;
         }
     }
-    return null_node;
+    return -1;
 }
 
 /* Helper for stripping quotes from a tree-sitter `string` node text. */
@@ -2517,11 +2519,18 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
         // Walk the lambda body for any nested call sites with the params
         // bound to the call's arg types. Resolved calls get caller_qn
         // set to a synthetic <lambda> child of the enclosing function.
-        TSNode lambda_node = py_lookup_lambda(ctx, fname);
-        if (!ts_node_is_null(lambda_node)) {
+        int lambda_idx = py_lookup_lambda(ctx, fname);
+        if (lambda_idx >= 0) {
+            TSNode lambda_node = ctx->lambdas[lambda_idx].lambda_node;
             TSNode params = ts_node_child_by_field_name(lambda_node, "parameters", 10);
             TSNode body = ts_node_child_by_field_name(lambda_node, "body", 4);
             TSNode args = ts_node_child_by_field_name(call_node, "arguments", 9);
+            // A lambda that reaches itself again (directly or through another
+            // lambda) would re-walk its body once per nesting level up to the
+            // walk-depth cap, and two such calls in one body double the work
+            // per level. Walk each body at most once per chain.
+            if (ctx->lambdas[lambda_idx].expanding)
+                return;
             CBMScope *saved = ctx->current_scope;
             ctx->current_scope = py_scope_push_checked(ctx);
             // Bind each lambda param to the call-site arg's type.
@@ -2554,7 +2563,9 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.<lambda>",
                                                        prev_func ? prev_func : ctx->module_qn);
             if (!ts_node_is_null(body)) {
+                ctx->lambdas[lambda_idx].expanding = true;
                 py_resolve_calls_in(ctx, body);
+                ctx->lambdas[lambda_idx].expanding = false;
             }
             ctx->enclosing_func_qn = prev_func;
             py_scope_restore(ctx, saved);
