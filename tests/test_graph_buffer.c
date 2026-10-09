@@ -582,6 +582,71 @@ TEST(gbuf_upsert_same_qn_updates_all_fields) {
     PASS();
 }
 
+/* PR C1: when a Macro and a definition share a QN, the definition owns it whichever
+ * line comes first; before, the later line won. C-preprocessor macros no longer get
+ * here (their QN ends in "#macro" and cannot equal a definition's). Chialisp does:
+ * `defmacro` / `defmac` defs are labelled Macro under a plain QN, so a macro and a
+ * `defun` of one name collide in one file or in a same-stem .clsp / .clib pair. */
+TEST(gbuf_upsert_definition_beats_same_qn_macro_c1) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    /* macro AFTER the function */
+    cbm_gbuf_upsert_node(gb, "Function", "assert", "p.cond.assert", "cond.clsp", 742, 779, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "assert", "p.cond.assert", "cond.clsp", 781, 782, "{}");
+    /* macro BEFORE the definition */
+    cbm_gbuf_upsert_node(gb, "Macro", "curry", "p.util.curry", "util.clib", 464, 465, "{}");
+    cbm_gbuf_upsert_node(gb, "Function", "curry", "p.util.curry", "util.clib", 3193, 3209, "{}");
+    /* a macro in the smaller path (.clib sorts before .clsp) still loses */
+    cbm_gbuf_upsert_node(gb, "Constant", "limit", "p.x.limit", "x.clsp", 653, 653, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "limit", "p.x.limit", "x.clib", 9, 10, "{}");
+    /* two macros: the classic contract (later line wins) is unchanged */
+    cbm_gbuf_upsert_node(gb, "Macro", "M", "p.m.M", "m.clib", 1, 2, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "M", "p.m.M", "m.clib", 9, 10, "{}");
+
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, "p.cond.assert");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Function");
+    ASSERT_EQ(n->start_line, 742);
+    n = cbm_gbuf_find_by_qn(gb, "p.util.curry");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Function");
+    ASSERT_EQ(n->start_line, 3193);
+    n = cbm_gbuf_find_by_qn(gb, "p.x.limit");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Constant");
+    ASSERT_STR_EQ(n->file_path, "x.clsp");
+    n = cbm_gbuf_find_by_qn(gb, "p.m.M");
+    ASSERT_NOT_NULL(n);
+    ASSERT_EQ(n->start_line, 9);
+    /* the label index follows the survivor: only the macro-vs-macro QN keeps one */
+    const cbm_gbuf_node_t **macros = NULL;
+    int macro_count = -1;
+    ASSERT_EQ(cbm_gbuf_find_by_label(gb, "Macro", &macros, &macro_count), 0);
+    ASSERT_EQ(macro_count, 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* The parallel merge (worker gbuf -> main gbuf) applies the same rule in both
+ * directions, so the survivor never depends on worker merge order. */
+TEST(gbuf_merge_definition_beats_same_qn_macro_c1) {
+    for (int order = 0; order < 2; order++) {
+        cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *with_fn = order == 0 ? dst : src;
+        cbm_gbuf_t *with_macro = order == 0 ? src : dst;
+        cbm_gbuf_upsert_node(with_fn, "Function", "f", "p.a.f", "a.clsp", 10, 20, "{}");
+        cbm_gbuf_upsert_node(with_macro, "Macro", "f", "p.a.f", "a.clsp", 30, 31, "{}");
+        ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(dst, "p.a.f");
+        ASSERT_NOT_NULL(n);
+        ASSERT_STR_EQ(n->label, "Function");
+        ASSERT_EQ(n->start_line, 10);
+        cbm_gbuf_free(dst);
+        cbm_gbuf_free(src);
+    }
+    PASS();
+}
+
 TEST(gbuf_upsert_long_qn) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
 
@@ -1250,6 +1315,8 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_upsert_null_qn);
     RUN_TEST(gbuf_upsert_empty_qn);
     RUN_TEST(gbuf_upsert_same_qn_updates_all_fields);
+    RUN_TEST(gbuf_upsert_definition_beats_same_qn_macro_c1);
+    RUN_TEST(gbuf_merge_definition_beats_same_qn_macro_c1);
     RUN_TEST(gbuf_upsert_long_qn);
     RUN_TEST(gbuf_find_by_qn_missing);
     RUN_TEST(gbuf_find_by_id_missing);

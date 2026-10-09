@@ -4965,6 +4965,47 @@ static const char **py_split_pipe(CBMArena *arena, const char *text) {
     return out;
 }
 
+/* Split a class def's field_defs ("name:QN|name:QN", built by the Python
+ * field fold in pass_lsp_cross.c) into the parallel NULL-terminated arrays a
+ * CBMRegisteredType carries. The types are already project QNs, so each one
+ * becomes a NAMED type verbatim. Without this, `obj.field.method()` on a class
+ * from another file lost the field's type (#1277); same-file classes get their
+ * fields from the per-file walk instead. Pure string work: no registry lookup
+ * happens here, so it is safe inside the type-registration pass. */
+static void py_split_field_defs(CBMArena *arena, const char *field_defs, const char ***names_out,
+                                const CBMType ***types_out) {
+    *names_out = NULL;
+    *types_out = NULL;
+    const char **pairs = py_split_pipe(arena, field_defs);
+    if (!pairs)
+        return;
+    int n = 0;
+    while (pairs[n])
+        n++;
+    const char **names =
+        (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const CBMType *));
+    if (!names || !types)
+        return;
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        char *colon = strchr(pairs[i], ':');
+        if (!colon || colon == pairs[i] || !colon[1])
+            continue;
+        *colon = '\0'; /* pairs[i] is this call's own arena copy */
+        names[kept] = pairs[i];
+        types[kept] = cbm_type_named(arena, colon + 1);
+        kept++;
+    }
+    if (kept == 0)
+        return;
+    names[kept] = NULL;
+    types[kept] = NULL;
+    *names_out = names;
+    *types_out = types;
+}
+
 /* Build a registry from CBMLSPDef[] supplied by the caller — covers both
  * the source file's own defs and cross-file referenced defs. */
 static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
@@ -4990,6 +5031,7 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             if (d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = py_split_pipe(arena, d->method_names_str);
             }
+            py_split_field_defs(arena, d->field_defs, &rt.field_names, &rt.field_types);
             cbm_registry_add_type(reg, rt);
         }
     }
@@ -5068,7 +5110,7 @@ void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_python());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -5149,7 +5191,7 @@ void cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_python());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);

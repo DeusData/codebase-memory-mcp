@@ -2827,60 +2827,138 @@ TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval) {
     PASS();
 }
 
-TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal) {
+/* Flaky-ledger item 12 (7 sightings, ASSERT(capacity_rejected)): the overflow
+ * client's HELLO raced the daemon's inline capacity rejection, which the
+ * accept loop writes WITHOUT reading that HELLO and follows with an immediate
+ * close. The hook pins one order per run so no window is left to race; the
+ * hold seam keeps the slow hello's slot until the test closes it, where the
+ * request deadline used to free it after 2 s. The waits below end on events
+ * that are guaranteed to arrive (see each comment), never on a bound. */
+typedef enum {
+    RUNTIME_CAP_HELLO_BEFORE_REJECTION = 0,
+    RUNTIME_CAP_REJECTION_BEFORE_HELLO = 1,
+} runtime_cap_order_t;
+
+static atomic_int runtime_cap_order;
+static atomic_bool runtime_cap_hello_sent;
+static atomic_bool runtime_cap_rejection_closed;
+static atomic_bool runtime_cap_order_pinned;
+static cbm_daemon_runtime_service_t *runtime_cap_service;
+
+static void runtime_cap_hello_hook(cbm_daemon_runtime_hello_point_t point) {
+    int order = atomic_load(&runtime_cap_order);
+    if (point == CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_SENT) {
+        atomic_store(&runtime_cap_hello_sent, true);
+    } else if (point == CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTED) {
+        atomic_store(&runtime_cap_rejection_closed, true);
+    } else if (point == CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTING &&
+               order == RUNTIME_CAP_HELLO_BEFORE_REJECTION) {
+        /* Accept thread. The client always gets there: its connect already
+         * completed and a HELLO fits the transport buffer, so its send never
+         * waits on this thread. */
+        while (!atomic_load(&runtime_cap_hello_sent)) {
+            cbm_usleep(200);
+        }
+        atomic_store(&runtime_cap_order_pinned, true);
+    } else if (point == CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_CONNECTED &&
+               order == RUNTIME_CAP_REJECTION_BEFORE_HELLO) {
+        /* Client (test) thread. Ends on the rejection, or on an admission (a
+         * broken cap): that worker is held by the seam, so a third slot stays
+         * counted until this HELLO goes out and the test fails on ACCEPTED. */
+        while (!atomic_load(&runtime_cap_rejection_closed) &&
+               cbm_daemon_runtime_service_active_connections(runtime_cap_service) <= 2) {
+            cbm_usleep(200);
+        }
+        atomic_store(&runtime_cap_order_pinned, atomic_load(&runtime_cap_rejection_closed));
+    }
+}
+
+typedef struct {
+    bool started;
+    bool slow_slot_counted;
+    bool order_pinned;
+    bool capacity_rejected;
+    bool slow_slot_released;
+    bool exited;
+    bool no_resurrection;
+} runtime_cap_outcome_t;
+
+static cbm_daemon_runtime_client_t *runtime_cap_overflow_connect(
+    runtime_test_fixture_t *fixture, const cbm_daemon_build_identity_t *identity,
+    runtime_cap_order_t order, runtime_cap_outcome_t *outcome) {
+    cbm_daemon_runtime_connect_result_t result = {0};
+    runtime_cap_service = fixture->service;
+    atomic_store(&runtime_cap_order, (int)order);
+    atomic_store(&runtime_cap_hello_sent, false);
+    atomic_store(&runtime_cap_rejection_closed, false);
+    atomic_store(&runtime_cap_order_pinned, false);
+    cbm_daemon_runtime_set_hello_hook_for_testing(runtime_cap_hello_hook);
+    cbm_daemon_runtime_client_t *overflow = cbm_daemon_runtime_client_connect(
+        fixture->endpoint, identity, RUNTIME_TEST_TIMEOUT_MS, &result);
+    cbm_daemon_runtime_set_hello_hook_for_testing(NULL);
+    /* Both counts are HELD here: the slow hello's slot by the seam, the
+     * accepted client by its open session. */
+    size_t connections = cbm_daemon_runtime_service_active_connections(fixture->service);
+    size_t clients = cbm_daemon_runtime_service_active_clients(fixture->service);
+    outcome->order_pinned = atomic_load(&runtime_cap_order_pinned);
+    outcome->capacity_rejected =
+        overflow == NULL && result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
+        strstr(result.message, "capacity") != NULL && connections == 2 && clients == 1;
+    if (!outcome->capacity_rejected) {
+        printf("  overflow: client=%s status=%d message=\"%s\" active_connections=%zu "
+               "active_clients=%zu order=%d pinned=%d\n",
+               overflow ? "admitted" : "null", (int)result.status, result.message, connections,
+               clients, (int)order, outcome->order_pinned);
+    }
+    return overflow;
+}
+
+static void runtime_cap_scenario(runtime_cap_order_t order, runtime_cap_outcome_t *outcome) {
+    memset(outcome, 0, sizeof(*outcome));
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_test_fixture_t fixture;
-    bool started = runtime_test_fixture_start_limited(&fixture, "connection-cap", &identity, 2);
+    cbm_daemon_runtime_hold_peer_waits_for_testing(true);
+    outcome->started = runtime_test_fixture_start_limited(&fixture, "connection-cap", &identity, 2);
     cbm_daemon_ipc_connection_t *slow_hello = NULL;
     cbm_daemon_runtime_client_t *accepted = NULL;
     cbm_daemon_runtime_client_t *overflow = NULL;
     cbm_daemon_runtime_client_t *resurrection = NULL;
     cbm_daemon_runtime_connect_result_t accepted_result = {0};
-    cbm_daemon_runtime_connect_result_t overflow_result = {0};
     cbm_daemon_runtime_connect_result_t resurrection_result = {0};
-    bool slow_slot_counted = false;
-    bool capacity_rejected = false;
-    bool slow_slot_released = false;
-    bool exited = false;
-    bool no_resurrection = false;
 
-    if (started) {
+    if (outcome->started) {
         slow_hello = cbm_daemon_ipc_connect(fixture.endpoint, RUNTIME_TEST_TIMEOUT_MS);
     }
     if (slow_hello) {
-        slow_slot_counted = cbm_daemon_runtime_service_wait_for_connections(
+        outcome->slow_slot_counted = cbm_daemon_runtime_service_wait_for_connections(
             fixture.service, 1, RUNTIME_TEST_TIMEOUT_MS);
         accepted = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
                                                      RUNTIME_TEST_TIMEOUT_MS, &accepted_result);
     }
     if (accepted) {
-        overflow = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
-                                                     RUNTIME_TEST_TIMEOUT_MS, &overflow_result);
-        capacity_rejected = overflow == NULL &&
-                            overflow_result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED &&
-                            strstr(overflow_result.message, "capacity") != NULL &&
-                            cbm_daemon_runtime_service_active_connections(fixture.service) == 2 &&
-                            cbm_daemon_runtime_service_active_clients(fixture.service) == 1;
+        overflow = runtime_cap_overflow_connect(&fixture, &identity, order, outcome);
 
         cbm_daemon_ipc_connection_close(slow_hello);
         slow_hello = NULL;
-        slow_slot_released = cbm_daemon_runtime_service_wait_for_connections(
+        outcome->slow_slot_released = cbm_daemon_runtime_service_wait_for_connections(
             fixture.service, 1, RUNTIME_TEST_TIMEOUT_MS);
         (void)cbm_daemon_runtime_client_close(accepted, RUNTIME_TEST_TIMEOUT_MS);
         accepted = NULL;
-        exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+        outcome->exited =
+            cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
 
         resurrection = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity, 100,
                                                          &resurrection_result);
         cbm_daemon_runtime_service_state_t terminal_state =
             cbm_daemon_runtime_service_state(fixture.service);
-        no_resurrection = resurrection == NULL &&
-                          (resurrection_result.status == CBM_DAEMON_RUNTIME_CONNECT_ERROR ||
-                           resurrection_result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED) &&
-                          cbm_daemon_runtime_service_active_clients(fixture.service) == 0 &&
-                          (terminal_state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING ||
-                           terminal_state == CBM_DAEMON_RUNTIME_SERVICE_EXITED);
+        outcome->no_resurrection =
+            resurrection == NULL &&
+            (resurrection_result.status == CBM_DAEMON_RUNTIME_CONNECT_ERROR ||
+             resurrection_result.status == CBM_DAEMON_RUNTIME_CONNECT_REJECTED) &&
+            cbm_daemon_runtime_service_active_clients(fixture.service) == 0 &&
+            (terminal_state == CBM_DAEMON_RUNTIME_SERVICE_STOPPING ||
+             terminal_state == CBM_DAEMON_RUNTIME_SERVICE_EXITED);
     }
 
     if (resurrection) {
@@ -2894,15 +2972,48 @@ TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal) {
     }
     cbm_daemon_ipc_connection_close(slow_hello);
     runtime_test_fixture_finish(&fixture);
+    cbm_daemon_runtime_hold_peer_waits_for_testing(false);
+}
 
-    ASSERT_TRUE(started);
-    ASSERT_TRUE(slow_slot_counted);
-    ASSERT_TRUE(capacity_rejected);
-    ASSERT_TRUE(slow_slot_released);
-    ASSERT_TRUE(exited);
-    ASSERT_TRUE(no_resurrection);
+/* The daemon answers the overflow only after its HELLO is on the wire: the
+ * order every platform delivers deterministically. */
+TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal) {
+    runtime_cap_outcome_t outcome;
+    runtime_cap_scenario(RUNTIME_CAP_HELLO_BEFORE_REJECTION, &outcome);
+
+    ASSERT_TRUE(outcome.started);
+    ASSERT_TRUE(outcome.slow_slot_counted);
+    ASSERT_TRUE(outcome.order_pinned);
+    ASSERT_TRUE(outcome.capacity_rejected);
+    ASSERT_TRUE(outcome.slow_slot_released);
+    ASSERT_TRUE(outcome.exited);
+    ASSERT_TRUE(outcome.no_resurrection);
     PASS();
 }
+
+#ifndef _WIN32
+/* Item 12's production race, pinned: the daemon has written its capacity
+ * rejection AND closed before the client sends its HELLO. That send fails
+ * (EPIPE) while the complete rejection sits in the client's receive buffer;
+ * the client must still report it, not a bare transport error that bootstrap
+ * would classify by lock state instead of "capacity reached".
+ * POSIX only: a Windows server close discards unread pipe data, so there the
+ * rejection is delivered by the drain-before-close instead (which the other
+ * order covers) and this order cannot carry one by design. */
+TEST(daemon_runtime_capacity_rejection_survives_daemon_close_before_hello) {
+    runtime_cap_outcome_t outcome;
+    runtime_cap_scenario(RUNTIME_CAP_REJECTION_BEFORE_HELLO, &outcome);
+
+    ASSERT_TRUE(outcome.started);
+    ASSERT_TRUE(outcome.slow_slot_counted);
+    ASSERT_TRUE(outcome.order_pinned);
+    ASSERT_TRUE(outcome.capacity_rejected);
+    ASSERT_TRUE(outcome.slow_slot_released);
+    ASSERT_TRUE(outcome.exited);
+    ASSERT_TRUE(outcome.no_resurrection);
+    PASS();
+}
+#endif
 
 TEST(daemon_runtime_rejects_forged_identity_extension) {
     cbm_daemon_build_identity_t identity =
@@ -5191,6 +5302,9 @@ SUITE(daemon_runtime) {
 #endif
     RUN_TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval);
     RUN_TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal);
+#ifndef _WIN32
+    RUN_TEST(daemon_runtime_capacity_rejection_survives_daemon_close_before_hello);
+#endif
     RUN_TEST(daemon_runtime_rejects_forged_identity_extension);
     RUN_TEST(daemon_runtime_application_response_roundtrip_is_byte_exact);
     RUN_TEST(daemon_runtime_final_disconnect_rejects_blocked_provisional_session);

@@ -51,17 +51,19 @@ RUN printf '%s\n' \
 # The key is fetched with `wget -O <file>` rather than `-qO- > <file>`: under
 # retry a redirect is opened once for all attempts, so a partial write from a
 # failed attempt would be prepended to the output of a later successful one.
-RUN retry apt-get -o Acquire::Retries=3 update \
+# APT normally treats transient index-download failures as warnings and exits
+# zero. Make every update fail on those errors so the outer retry can run.
+RUN retry apt-get -o Acquire::Retries=3 --error-on=any update \
     && retry apt-get -o Acquire::Retries=3 install -y --no-install-recommends wget gnupg ca-certificates \
     && retry wget -q -O /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
     && echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" > /etc/apt/sources.list.d/llvm-21.list \
-    && retry apt-get -o Acquire::Retries=3 update \
+    && retry apt-get -o Acquire::Retries=3 --error-on=any update \
     && retry apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
        clang-21 libclang-rt-21-dev llvm-21 \
     && ln -sf /usr/bin/clang-21 /usr/bin/clang \
     && ln -sf /usr/bin/clang++-21 /usr/bin/clang++
 
-RUN retry apt-get -o Acquire::Retries=3 update \
+RUN retry apt-get -o Acquire::Retries=3 --error-on=any update \
     && retry apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     cmake \
     ninja-build \

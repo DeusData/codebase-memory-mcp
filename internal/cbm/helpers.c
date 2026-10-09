@@ -988,16 +988,109 @@ static TSNode resolve_qualified_name(TSNode decl) {
     return null_node;
 }
 
+bool cbm_c_qualifier_is_recovered(TSNode qid) {
+    if (ts_node_is_null(qid)) {
+        return false;
+    }
+    uint32_t nc = ts_node_child_count(qid);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(qid, i);
+        if (!ts_node_is_named(c) && strcmp(ts_node_type(c), "::") == 0) {
+            return ts_node_is_missing(c);
+        }
+    }
+    return false;
+}
+
+/* A function DEFINITION's parameter list: empty, `(void)`, or every parameter
+ * named (variadic `...` allowed). A function-like macro invocation that only
+ * looks like a declarator — `TEST_BEGIN(test_name)`, whose one "parameter" is
+ * an untyped identifier read as a type — fails this, so its macro name is never
+ * mistaken for the defined function's name. */
+static bool c_params_name_every_parameter(TSNode params) {
+    enum { MAX_PARAMS_CHECKED = 64 }; /* indexed child access: keep it small */
+    uint32_t nc = ts_node_named_child_count(params);
+    if (nc > MAX_PARAMS_CHECKED) {
+        return false;
+    }
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode p = ts_node_named_child(params, i);
+        const char *pk = ts_node_type(p);
+        if (strcmp(pk, "comment") == 0 || strcmp(pk, "variadic_parameter") == 0) {
+            continue;
+        }
+        if (!ts_node_is_null(ts_node_child_by_field_name(p, TS_FIELD("declarator")))) {
+            continue;
+        }
+        /* `(void)`: the one parameter is an unnamed primitive type. */
+        TSNode type = ts_node_child_by_field_name(p, TS_FIELD("type"));
+        if (nc != 1 || ts_node_is_null(type) || strcmp(ts_node_type(type), "primitive_type") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TSNode cbm_c_recovered_func_name(TSNode func_declarator) {
+    TSNode null_node = {0};
+    if (ts_node_is_null(func_declarator) ||
+        strcmp(ts_node_type(func_declarator), "function_declarator") != 0) {
+        return null_node;
+    }
+    TSNode params = ts_node_child_by_field_name(func_declarator, TS_FIELD("parameters"));
+    if (ts_node_is_null(params) || !c_params_name_every_parameter(params)) {
+        return null_node;
+    }
+    TSNode err = ts_node_prev_sibling(params);
+    if (ts_node_is_null(err) || strcmp(ts_node_type(err), "ERROR") != 0) {
+        return null_node;
+    }
+    /* Only the macro-prefix shape: the ERROR holds nothing but bare identifiers
+     * (the real name, possibly after further attribute macros). Any other token
+     * means the region is not a declaration this rule can vouch for. */
+    enum { MAX_PREFIX_TOKENS = 4 };
+    uint32_t nc = ts_node_child_count(err);
+    if (nc == 0 || nc > MAX_PREFIX_TOKENS) {
+        return null_node;
+    }
+    TSNode last = null_node;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(err, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "identifier") != 0 && strcmp(ck, "type_identifier") != 0) {
+            return null_node;
+        }
+        last = c;
+    }
+    return last;
+}
+
 // Resolve function name from C/C++/CUDA/GLSL declarator chain. Shared canonical
 // implementation — see the header for the full rationale (#438).
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
     TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    /* Set once a recovered `RetT::name` qualifier was stepped through: on that
+     * path the C++ grammar names the function with a type_identifier. */
+    bool recovered = false;
     for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
         const char *dk = ts_node_type(decl);
-        if (is_c_terminal_name(dk)) {
+        if (is_c_terminal_name(dk) || (recovered && strcmp(dk, "type_identifier") == 0)) {
             return decl;
         }
+        if (strcmp(dk, "function_declarator") == 0) {
+            TSNode real = cbm_c_recovered_func_name(decl);
+            if (!ts_node_is_null(real)) {
+                return real;
+            }
+        }
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
+            if (cbm_c_qualifier_is_recovered(decl)) {
+                /* `API RetT name(...)`: the "scope" is the return type, the name
+                 * side carries the real declarator chain. */
+                decl = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+                recovered = true;
+                continue;
+            }
             return resolve_qualified_name(decl);
         }
         TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
@@ -1013,6 +1106,36 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
     return null_node;
 }
 
+/* The C-declarator grammars: same set resolve_func_name_c_family routes through
+ * cbm_resolve_c_declarator_name_node. */
+static bool c_declarator_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
+           lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC;
+}
+
+bool cbm_c_reserved_func_name(const char *name) {
+    /* Statement/operator keywords: error recovery over preprocessor-split code
+     * reads `else if (a) (b) {` as a definition `else if(...) {...}`. */
+    static const char *const kw[] = {"if",       "else", "for",     "while",   "do",
+                                     "switch",   "case", "default", "return",  "break",
+                                     "continue", "goto", "sizeof",  "typedef", NULL};
+    if (!name) {
+        return false;
+    }
+    for (const char *const *k = kw; *k; k++) {
+        if (strcmp(name, *k) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_GLSL || lang == CBM_LANG_OBJC || lang == CBM_LANG_ISPC;
+}
+
 // Convert a resolved function/method name node to its name string. Most nodes
 // map directly to their text, but a C++ conversion-operator's `operator_cast`
 // node spans the full "operator bool() const" — this grammar folds the parameter
@@ -1023,6 +1146,12 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
 // `if (obj)`) misses.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang) {
     char *text = cbm_node_text(a, name_node, source);
+    /* A C keyword is never a function name: the definition is an error-recovery
+     * artifact. No name means no def and no call scope (calls inside fall back
+     * to the enclosing scope), the same as any unnamed definition. */
+    if (text && c_declarator_lang(lang) && cbm_c_reserved_func_name(text)) {
+        return NULL;
+    }
     if (text && strcmp(ts_node_type(name_node), "operator_cast") == 0) {
         char *paren = strchr(text, '(');
         if (paren) {
@@ -1300,6 +1429,18 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
 // --- Cached enclosing function QN ---
 
 const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node) {
+    if (ctx->test_definition_match_count > 0) {
+        const char **function_kinds = func_kinds_for_lang(ctx->language);
+        for (TSNode current = node; !ts_node_is_null(current); current = ts_node_parent(current)) {
+            const char *configured_qn = cbm_test_definition_qn(ctx, current);
+            if (configured_qn)
+                return configured_qn;
+            /* A nested native function owns its own body; do not inherit a
+             * surrounding configured macro's QN through that boundary. */
+            if (cbm_kind_in_set(current, function_kinds))
+                break;
+        }
+    }
     uint32_t pos = ts_node_start_byte(node);
 
     // Check cache: find a function range that contains this position.
@@ -1664,6 +1805,146 @@ char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *
         return module;
     }
     return cbm_arena_sprintf(a, "%s.%s", module, name);
+}
+
+/* Operating systems and CPU architectures only: a token names a platform, so a
+ * path segment or stem suffix made of one marks a platform alternative. Vague
+ * words (generic, default, common, stub) are deliberately absent. */
+static const char *const platform_tokens[] = {
+    "win",       "win32",       "win64",   "windows", "wince",  "nt",        "posix",   "unix",
+    "linux",     "darwin",      "mac",     "macos",   "macosx", "osx",       "apple",   "ios",
+    "android",   "bsd",         "freebsd", "openbsd", "netbsd", "dragonfly", "solaris", "sunos",
+    "aix",       "hpux",        "haiku",   "fuchsia", "cygwin", "mingw",     "msvc",    "wasm",
+    "wasi",      "emscripten",  "x86",     "x86_64",  "x64",    "amd64",     "i386",    "i686",
+    "ia32",      "arm",         "arm64",   "aarch64", "armv7",  "riscv",     "riscv64", "mips",
+    "mips64",    "ppc",         "ppc64",   "powerpc", "s390",   "s390x",     "sparc",   "sparc64",
+    "loongarch", "loongarch64", NULL};
+
+static bool platform_token_eq(const char *s, size_t len) {
+    for (int i = 0; platform_tokens[i]; i++) {
+        const char *t = platform_tokens[i];
+        size_t tl = strlen(t);
+        if (tl != len) {
+            continue;
+        }
+        size_t k = 0;
+        while (k < len && tolower((unsigned char)s[k]) == t[k]) {
+            k++;
+        }
+        if (k == len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Length of `stem` without a trailing `_<token>` / `-<token>` / `.<token>`
+ * platform suffix (the longest one), or `len` when it has none. */
+static size_t platform_stem_len(const char *stem, size_t len) {
+    size_t best = len;
+    for (size_t sep = 1; sep < len; sep++) {
+        char c = stem[sep - 1];
+        if ((c == '_' || c == '-' || c == '.') && platform_token_eq(stem + sep, len - sep)) {
+            if (sep - 1 < best) {
+                best = sep - 1;
+            }
+        }
+    }
+    return best;
+}
+
+static bool c_family_variant_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_OBJC;
+}
+
+static bool func_is_static(TSNode func_node) {
+    uint32_t n = ts_node_child_count(func_node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_child(func_node, i);
+        if (strcmp(ts_node_type(child), "storage_class_specifier") == 0 &&
+            ts_node_child_count(child) > 0 &&
+            strcmp(ts_node_type(ts_node_child(child, 0)), "static") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+                                    const char *rel_path, const char *name, const char *qn,
+                                    TSNode func_node) {
+    if (!c_family_variant_lang(lang) || !rel_path || !name || !name[0] || !qn ||
+        ts_node_is_null(func_node) || func_is_static(func_node)) {
+        return qn;
+    }
+    char *plain = cbm_fqn_compute(a, project, rel_path, name);
+    if (!plain || strcmp(plain, qn) != 0) {
+        return qn; /* namespaced or otherwise scoped: not a file-scope function */
+    }
+    /* Rebuild the path without platform tokens: a directory segment that is
+     * one is dropped; a filename stem loses its platform suffix, and a stem
+     * that IS a token leaves the function at its directory. */
+    size_t len = strlen(rel_path);
+    char *neutral = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
+    if (!neutral) {
+        return qn;
+    }
+    size_t out = 0;
+    bool changed = false;
+    bool dir_level = false;
+    const char *seg = rel_path;
+    while (*seg) {
+        const char *slash = strchr(seg, '/');
+        size_t seg_len = slash ? (size_t)(slash - seg) : strlen(seg);
+        if (slash) {
+            if (platform_token_eq(seg, seg_len)) {
+                changed = true;
+            } else {
+                memcpy(neutral + out, seg, seg_len);
+                out += seg_len;
+                neutral[out++] = '/';
+            }
+            seg = slash + SKIP_ONE;
+            continue;
+        }
+        const char *dot = NULL;
+        for (const char *p = seg + seg_len; p > seg; p--) {
+            if (p[-1] == '.') {
+                dot = p - 1;
+                break;
+            }
+        }
+        size_t stem_len = dot && dot > seg ? (size_t)(dot - seg) : seg_len;
+        size_t keep = platform_token_eq(seg, stem_len) ? 0 : platform_stem_len(seg, stem_len);
+        if (keep != stem_len) {
+            changed = true;
+        }
+        if (keep == 0) {
+            dir_level = true; /* the function lives at the directory */
+            if (out > 0 && neutral[out - SKIP_ONE] == '/') {
+                out--;
+            }
+        } else {
+            memcpy(neutral + out, seg, keep);
+            out += keep;
+            memcpy(neutral + out, seg + stem_len, seg_len - stem_len);
+            out += seg_len - stem_len;
+        }
+        break;
+    }
+    neutral[out] = '\0';
+    if (!changed) {
+        return qn;
+    }
+    if (dir_level) {
+        /* No file stem left: the folder form keeps every directory segment
+         * (cbm_fqn_compute would strip a dotted segment as an extension). */
+        char *folder = cbm_fqn_folder(a, project ? project : "", neutral);
+        return folder ? cbm_arena_sprintf(a, "%s.%s", folder, name) : qn;
+    }
+    char *variant = cbm_fqn_compute(a, project, neutral, name);
+    return variant ? variant : qn;
 }
 
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {

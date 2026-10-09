@@ -1504,7 +1504,11 @@ static const char skill_content[] =
     "| Text search | `search_code` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `list_projects` — check if project is indexed\n"
+    /* #1690: a guessed repo or folder name misses the project whenever the
+     * checkout directory differs from it; the root_path is what identifies it. */
+    "1. `list_projects` — pick the project whose `root_path` contains your working directory; "
+    "pass its `name` (or the absolute directory itself) as `project`, never a repo or folder "
+    "name\n"
     "2. `get_graph_schema` — understand node/edge types\n"
     "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
     "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
@@ -1560,7 +1564,7 @@ static const char skill_content[] =
     "`check_index_coverage`, `manage_adr`, `ingest_traces`\n"
     "\n"
     "## Edge Types\n"
-    "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
+    "CALLS, HTTP_CALLS, ASYNC_CALLS, SPAWNS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
     "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, REFERENCES_FILE,\n"
     "FILE_CHANGES_WITH, SIMILAR_TO, SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
     "CONTAINS_PACKAGE\n"
@@ -2774,9 +2778,40 @@ static void cbm_kiro_home_dir(const char *home_dir, char *out, size_t out_sz) {
     cbm_env_home_dir("KIRO_HOME", home_dir, ".kiro", out, out_sz);
 }
 
-static void cbm_hermes_home_dir(const char *home_dir, char *out, size_t out_sz) {
-    cbm_env_home_dir("HERMES_HOME", home_dir, ".hermes", out, out_sz);
+/* #1180: native Windows Hermes -- the install.ps1 CLI, the MSIX package and
+ * the Desktop app -- defaults HERMES_HOME to %LOCALAPPDATA%\hermes and keeps a
+ * legacy ~/.hermes only while the new directory is absent (hermes-agent
+ * website/docs/user-guide/windows-native.md "Data layout";
+ * apps/desktop/electron/data-paths.mjs resolveDesktopHermesHome). Probing
+ * only ~/.hermes missed those installs and aimed config.yaml at a home Hermes
+ * never reads. Other platforms use ~/.hermes. */
+static void cbm_hermes_home_dir_for(const char *home_dir, bool windows, char *out, size_t out_sz) {
+    const char *fallback = ".hermes";
+    if (windows) {
+        char native[CLI_BUF_1K];
+        char legacy[CLI_BUF_1K];
+        snprintf(native, sizeof(native), "%s/AppData/Local/hermes", home_dir);
+        snprintf(legacy, sizeof(legacy), "%s/.hermes", home_dir);
+        if (dir_exists(native) || !dir_exists(legacy)) {
+            fallback = "AppData/Local/hermes";
+        }
+    }
+    cbm_env_home_dir("HERMES_HOME", home_dir, fallback, out, out_sz);
 }
+
+static void cbm_hermes_home_dir(const char *home_dir, char *out, size_t out_sz) {
+#ifdef _WIN32
+    cbm_hermes_home_dir_for(home_dir, true, out, out_sz);
+#else
+    cbm_hermes_home_dir_for(home_dir, false, out, out_sz);
+#endif
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_hermes_home_dir_for_testing(const char *home_dir, bool windows, char *out, size_t out_sz) {
+    cbm_hermes_home_dir_for(home_dir, windows, out, out_sz);
+}
+#endif
 
 static void cbm_qwen_home_dir(const char *home_dir, char *out, size_t out_sz) {
     cbm_env_home_dir("QWEN_HOME", home_dir, ".qwen", out, out_sz);
@@ -3079,6 +3114,53 @@ static int cbm_resolve_released_hook_command(const char *script_name, char *out,
     return written > 0 && (size_t)written < out_sz ? CLI_OK : CLI_ERR;
 }
 
+/* #1180: a bare ~/.claude directory is not a Claude Code install -- other
+ * tools create it -- and treating it as one wrote hooks, skills and MCP
+ * entries for a client the user never installed. Claude Code itself leaves
+ * its user config .claude.json (under CLAUDE_CONFIG_DIR when set), its
+ * settings.json, or the claude CLI. */
+static bool cbm_claude_code_detected(const char *home_dir) {
+    char dir[CLI_BUF_1K];
+    char path[CLI_BUF_1K];
+    cbm_claude_config_dir(home_dir, dir, sizeof(dir));
+    int written = snprintf(path, sizeof(path), "%s/settings.json", dir);
+    if (dir[0] && written > 0 && (size_t)written < sizeof(path) && cbm_file_exists(path)) {
+        return true;
+    }
+    cbm_claude_user_root(home_dir, dir, sizeof(dir));
+    written = snprintf(path, sizeof(path), "%s/.claude.json", dir);
+    if (dir[0] && written > 0 && (size_t)written < sizeof(path) && cbm_file_exists(path)) {
+        return true;
+    }
+    return cbm_agent_cli_exists("claude", home_dir);
+}
+
+/* OpenCode keeps its data (auth, logs, sessions; the global config itself on
+ * older installs) in ~/.local/share/opencode on every OS --
+ * %USERPROFILE%\.local\share\opencode on Windows (opencode.ai/docs/
+ * troubleshooting, "Storage"). The CLI and the Desktop app's bundled
+ * opencode-cli server both create it, so it identifies an install that has
+ * no config file, no ~/.config/opencode and no `opencode` on PATH
+ * (#1167, #1180). */
+static bool cbm_opencode_detected(const char *home_dir) {
+    char path[CLI_BUF_1K];
+    cbm_opencode_config_path(home_dir, path, sizeof(path));
+    if (cbm_file_exists(path) || cbm_agent_cli_exists("opencode", home_dir)) {
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s/.config/opencode", home_dir);
+    if (dir_exists(path)) {
+        return true;
+    }
+    char env_buf[CLI_BUF_1K];
+    const char *config_dir = cbm_safe_getenv("OPENCODE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (config_dir && config_dir[0] && dir_exists(config_dir)) {
+        return true;
+    }
+    snprintf(path, sizeof(path), "%s/.local/share/opencode", home_dir);
+    return dir_exists(path);
+}
+
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_detected_agents_t agents;
     memset(&agents, 0, sizeof(agents));
@@ -3088,8 +3170,7 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     char path[CLI_BUF_1K];
 
-    cbm_claude_config_dir(home_dir, path, sizeof(path));
-    agents.claude_code = path[0] != '\0' && dir_exists(path);
+    agents.claude_code = cbm_claude_code_detected(home_dir);
 
     cbm_codex_config_dir(home_dir, path, sizeof(path));
     agents.codex = path[0] != '\0' && dir_exists(path);
@@ -3103,18 +3184,7 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_zed_config_dir(home_dir, path, sizeof(path));
     agents.zed = dir_exists(path);
 
-    cbm_opencode_config_path(home_dir, path, sizeof(path));
-    agents.opencode = cbm_file_exists(path) || cbm_agent_cli_exists("opencode", home_dir);
-    if (!agents.opencode) {
-        snprintf(path, sizeof(path), "%s/.config/opencode", home_dir);
-        agents.opencode = dir_exists(path);
-    }
-    if (!agents.opencode) {
-        char env_buf[CLI_BUF_1K];
-        const char *config_dir =
-            cbm_safe_getenv("OPENCODE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
-        agents.opencode = config_dir && config_dir[0] && dir_exists(config_dir);
-    }
+    agents.opencode = cbm_opencode_detected(home_dir);
 
     agents.aider = cbm_agent_cli_exists("aider", home_dir);
 
@@ -3274,6 +3344,9 @@ static const char agent_instructions_content[] =
     "### Session resets and subagents\n"
     "- At session start or after compaction, confirm the nearest graph project and generation with "
     "`list_projects` or `index_status`, then choose Scout, Verify, or Auditor.\n"
+    "- The graph project is the `list_projects` entry whose `root_path` contains your working "
+    "directory; pass its `name` (or the absolute directory itself) as `project`, never a repo or "
+    "folder name.\n"
     "- Before spawning a subagent, query the graph and coverage in the parent. Pass the tier, "
     "project, generation/freshness, bounded scope, queries and pagination state, qualified "
     "symbols, "
@@ -3679,6 +3752,8 @@ static const char aider_instructions_content[] =
     "First use in a repo: codebase-memory-mcp cli index_repository '{\"repo_path\":\"<abs "
     "path>\"}'\n"
     "List indexed projects (for <name>): codebase-memory-mcp cli list_projects '{}'\n"
+    "<name> is the entry whose root_path contains your working directory; pass it (or the "
+    "absolute directory itself), never a repo or folder name.\n"
     "\n"
     "## When to fall back to grep/glob\n"
     "- Searching for string literals, error messages, config values\n"
@@ -3841,8 +3916,11 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
 }
 
 int cbm_remove_codex_mcp(const char *config_path) {
+    /* #2228: only our table goes; foreign tables found between the markers
+     * (Codex Desktop appends below a block that ends the file) stay. */
     if (!config_path ||
-        cbm_toml_remove_managed_block(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END) != 0) {
+        cbm_toml_remove_managed_block_owned(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END,
+                                            CODEX_CMM_SECTION "\n") != 0) {
         return CLI_ERR;
     }
     return cbm_remove_codex_legacy_mcp(config_path) >= 0 ? CLI_OK : CLI_ERR;
@@ -4466,7 +4544,8 @@ static int cbm_upsert_grok_mcp(const char *binary_path, const char *config_path)
 static int cbm_remove_grok_mcp_owned(const char *binary_path, const char *config_path) {
     (void)binary_path;
     if (!config_path ||
-        cbm_toml_remove_managed_block(config_path, GROK_MCP_BEGIN, GROK_MCP_END) != 0) {
+        cbm_toml_remove_managed_block_owned(config_path, GROK_MCP_BEGIN, GROK_MCP_END,
+                                            GROK_CMM_SECTION "\n") != 0) {
         return CLI_ERR;
     }
     return cbm_remove_grok_legacy_mcp(config_path) >= 0 ? CLI_OK : CLI_ERR;
@@ -5032,7 +5111,8 @@ static int cbm_upsert_kimi_context_hook(const char *config_path, const char *bin
 }
 
 static int cbm_remove_kimi_context_hook(const char *config_path) {
-    return cbm_toml_remove_managed_block(config_path, KIMI_HOOK_BEGIN, KIMI_HOOK_END) == 0
+    return cbm_toml_remove_managed_block_owned(config_path, KIMI_HOOK_BEGIN, KIMI_HOOK_END,
+                                               "[[hooks]]\n") == 0
                ? CLI_OK
                : CLI_ERR;
 }
@@ -7450,6 +7530,11 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
     return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
 }
 
+/* Opt-in tree polling of non-git roots (#1948); see cli.h. */
+bool cbm_config_watch_non_git(cbm_config_t *cfg) {
+    return cbm_config_get_bool(cfg, CBM_CONFIG_WATCH_NON_GIT, false);
+}
+
 bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
                                   char *error, size_t error_size) {
     if (!cfg || !policy) {
@@ -7490,6 +7575,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
+    {CBM_CONFIG_WATCH_NON_GIT, "false",
+     "Also poll non-git project roots for changes (file-tree scan); off by default"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
@@ -12856,6 +12943,41 @@ static int cli_uninstall_activate(void *opaque) {
     return CLI_OK;
 }
 
+/* A generic auto-answer is not consent to erase project indexes. An explicit
+ * --delete-indexes takes precedence even over --no; otherwise only a separate
+ * interactive answer can select deletion. This helper decides and reports,
+ * but all deletion remains in the final guarded uninstall activation. */
+static bool uninstall_decide_index_deletion(const char *home, bool requested, bool dry_run) {
+    int index_count = count_db_indexes(home);
+    if (index_count <= 0) {
+        return false;
+    }
+    printf("\nFound %d index(es):\n", index_count);
+    cbm_list_indexes(home);
+    bool delete_indexes = requested;
+    if (!requested) {
+        bool can_ask = g_auto_answer == 0;
+#ifdef _WIN32
+        can_ask = can_ask && _isatty(_fileno(stdin));
+#else
+        can_ask = can_ask && isatty(fileno(stdin));
+#endif
+        delete_indexes = can_ask && prompt_yn("Delete these indexes? (default: no)");
+    }
+    if (!delete_indexes) {
+        const char *cache_dir = get_cache_dir(home);
+        printf("Indexes kept in %s. To remove them, uninstall with --delete-indexes "
+               "or delete the project .db files there.\n",
+               cache_dir ? cache_dir : "the cache directory");
+        return false;
+    }
+    if (dry_run) {
+        printf("(dry-run — indexes would be deleted)\n");
+        return false;
+    }
+    return true;
+}
+
 int cbm_cmd_uninstall(int argc, char **argv) {
     /* `uninstall --help` used to UNINSTALL.
      *
@@ -12869,20 +12991,25 @@ int cbm_cmd_uninstall(int argc, char **argv) {
      * cannot auto-confirm the destruction we are trying to prevent. */
     for (int i = 0; i < argc; i++) {
         if (argv && argv[i] && (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)) {
-            printf("Usage: codebase-memory-mcp uninstall [options]\n\n"
-                   "Removes the codebase-memory-mcp binary, its agent configurations and,\n"
-                   "with confirmation, its indexes. THIS IS DESTRUCTIVE.\n\n"
-                   "Options:\n"
-                   "  --dry-run        Show what would be removed, change nothing\n"
-                   "  --dir=PATH       Uninstall from a custom install directory\n"
-                   "  -y, --yes        Do not prompt for confirmation\n"
-                   "  -h, --help       Show this help and exit\n\n"
-                   "Run with --dry-run first if you are unsure.\n");
+            printf(
+                "Usage: codebase-memory-mcp uninstall [options]\n\n"
+                "Removes the codebase-memory-mcp binary and its agent configurations.\n"
+                "THIS IS DESTRUCTIVE. Project indexes are kept by default. An interactive\n"
+                "terminal is asked separately; the default answer is to keep them.\n\n"
+                "Options:\n"
+                "  --dry-run          Show what would be removed, change nothing\n"
+                "  --dir=PATH         Uninstall from a custom install directory\n"
+                "  --delete-indexes   Also delete every project index (overrides --no)\n"
+                "  -y, --yes          Do not prompt; indexes are kept unless explicitly deleted\n"
+                "  -n, --no           Decline prompts; --delete-indexes still takes precedence\n"
+                "  -h, --help         Show this help and exit\n\n"
+                "Run with --dry-run first if you are unsure.\n");
             return CLI_OK;
         }
     }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
+    bool delete_indexes_requested = false;
     /* An install into a custom --dir must be removable from that same dir:
      * without this, anyone who installed outside ~/.local/bin has no supported
      * uninstall path at all. Mirrors cbm_cmd_install's parsing. */
@@ -12895,6 +13022,8 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strcmp(argv[i], "--delete-indexes") == 0) {
+            delete_indexes_requested = true;
         } else if (strncmp(argv[i], "--dir=", SLEN("--dir=")) == 0) {
             requested_bin_dir = argv[i] + SLEN("--dir=");
             if (!requested_bin_dir[0]) {
@@ -12926,23 +13055,9 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     agent_uninstall_failures_reset();
     cbm_detected_agents_t agents = cbm_detect_agents(home);
 
-    /* Confirm index removal outside the startup lock, but defer the mutation
-     * until the final guarded activation. Dry-run never removes indexes. */
-    bool delete_indexes = false;
-    int index_count = count_db_indexes(home);
-    if (index_count > 0) {
-        printf("\nFound %d index(es):\n", index_count);
-        cbm_list_indexes(home);
-        if (prompt_yn("Delete these indexes?")) {
-            if (dry_run) {
-                printf("(dry-run — indexes would be deleted)\n");
-            } else {
-                delete_indexes = true;
-            }
-        } else {
-            printf("Indexes kept.\n");
-        }
-    }
+    /* Decide outside the startup lock; mutate only in the final guarded
+     * activation. Dry-run never authorizes actual index removal. */
+    bool delete_indexes = uninstall_decide_index_deletion(home, delete_indexes_requested, dry_run);
 
     char bin_path_storage[CLI_BUF_1K];
     const char *bin_path = bin_path_storage;

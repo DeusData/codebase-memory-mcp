@@ -10,6 +10,7 @@
 #include "pipeline/pipeline_internal.h"
 
 #include <sqlite3/sqlite3.h>
+#include <yyjson/yyjson.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -270,12 +271,14 @@ TEST(cross_repo_null_target_fails_without_dereference) {
     const char *targets[] = {NULL};
     cbm_cross_repo_result_t result = cbm_cross_repo_match("null-target-source", targets, 1);
     rejected = result.failed;
+    cbm_cross_repo_result_free(&result);
 #else
     fflush(NULL);
     pid_t child = fork();
     if (child == 0) {
         const char *targets[] = {NULL};
         cbm_cross_repo_result_t result = cbm_cross_repo_match("null-target-source", targets, 1);
+        cbm_cross_repo_result_free(&result);
         _exit(result.failed ? 0 : 2);
     }
     int status = 0;
@@ -307,6 +310,7 @@ TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens) {
     const char *targets[] = {"*"};
     cbm_cross_repo_result_t result = cbm_cross_repo_match("wildcard-source", targets, 1);
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.projects_scanned, 4);
@@ -366,6 +370,7 @@ TEST(cross_repo_wildcard_skips_pre768_store_issue2133) {
     cbm_cross_repo_result_t result = cbm_cross_repo_match("wild-src", targets, 1);
     int edges = cross_repo_count_edges(&fixture, "wild-src", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.projects_scanned, 1);
@@ -393,11 +398,103 @@ TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133) {
     cbm_cross_repo_result_t result = cbm_cross_repo_match("named-src", with_pre768, 2);
     int after = cross_repo_count_edges(&fixture, "named-src", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&initial);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_FALSE(initial.failed);
     ASSERT_EQ(before, 1);
     ASSERT_TRUE(result.failed);
     ASSERT_EQ(after, before);
+    PASS();
+}
+
+/* Render the "cross_repo" status object the MCP/UI surfaces attach for
+ * `project`, read from its store the way index_status does (query open). */
+static char *cross_repo_status_json(const cross_repo_fixture_t *fixture, const char *project) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return NULL;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(path);
+    if (!store) {
+        return NULL;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    char *json = NULL;
+    if (cbm_cross_repo_add_status_json(doc, root, store, project)) {
+        json = yyjson_mut_write(doc, 0, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    cbm_store_close(store);
+    return json;
+}
+
+/* #2133 follow-up: an empty CROSS_* set could mean "never linked" or "linked,
+ * nothing matched" and no surface told them apart. The source store records
+ * each run; before any run the status says so explicitly. */
+TEST(cross_repo_status_distinguishes_never_run_from_ran_without_links) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_create_project(&fixture, "status-src") &&
+                 cross_repo_create_project(&fixture, "status-api");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed status fixture");
+    }
+
+    char *before = cross_repo_status_json(&fixture, "status-src");
+    const char *targets[] = {"status-api"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("status-src", targets, 1);
+    char *after = cross_repo_status_json(&fixture, "status-src");
+    cross_repo_fixture_end(&fixture);
+
+    bool before_never = before && strstr(before, "\"cross_repo\":{\"status\":\"never_run\"}");
+    bool after_ran =
+        after && strstr(after, "\"status\":\"ran\"") && strstr(after, "\"outcome\":\"complete\"") &&
+        strstr(after, "\"targets\":[\"status-api\"]") && strstr(after, "\"projects_scanned\":1") &&
+        strstr(after, "\"total_cross_edges\":0") && strstr(after, "\"last_run_at\":\"20");
+    free(before);
+    free(after);
+    cbm_cross_repo_result_free(&result);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_TRUE(before_never);
+    ASSERT_TRUE(after_ran);
+    PASS();
+}
+
+/* #2133 follow-up: ["*"] skips a pre-#768 store (it cannot be linked until a
+ * reindex); the result must name it rather than silently covering fewer
+ * projects, and the recorded status counts it. */
+TEST(cross_repo_wildcard_reports_skipped_pre768_store) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair(&fixture, "skip-src", "skip-api", "/orders", "s") &&
+                 cross_repo_create_pre768_project(&fixture, "aa-pre768-store");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed skipped-store fixture");
+    }
+
+    const char *targets[] = {"*"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("skip-src", targets, 1);
+    char *status = cross_repo_status_json(&fixture, "skip-src");
+    cross_repo_fixture_end(&fixture);
+
+    bool named = result.skipped_count == 1 && result.skipped_projects &&
+                 strcmp(result.skipped_projects[0].project, "aa-pre768-store") == 0 &&
+                 strcmp(result.skipped_projects[0].reason, "pre_768_schema") == 0;
+    bool status_counts =
+        status && strstr(status, "\"skipped_projects\":1") && strstr(status, "\"targets\":[\"*\"]");
+    free(status);
+    cbm_cross_repo_result_free(&result);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 1);
+    ASSERT_TRUE(named);
+    ASSERT_TRUE(status_counts);
     PASS();
 }
 
@@ -488,6 +585,7 @@ TEST(cross_repo_scan_bound_counts_examined_rows_not_matches) {
     const char *target = "bounded-target";
     cbm_cross_repo_result_t result = cbm_cross_repo_match("bounded-source", &target, 1);
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.projects_scanned, 1);
@@ -517,6 +615,8 @@ TEST(cross_repo_propagates_delete_failure) {
         failed = cbm_cross_repo_match("delete-source", &target, 1);
     }
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&initial);
+    cbm_cross_repo_result_free(&failed);
 
     ASSERT_TRUE(trigger_created);
     ASSERT_TRUE(failed.failed);
@@ -540,6 +640,7 @@ TEST(cross_repo_failed_bidirectional_insert_is_not_counted) {
     const char *target = "insert-target";
     cbm_cross_repo_result_t result = cbm_cross_repo_match("insert-source", &target, 1);
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_TRUE(result.failed);
     ASSERT_EQ(result.http_edges, 0);
@@ -592,6 +693,7 @@ TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_tar
     int later_target_edges =
         cross_repo_count_edges(&fixture, "cancel-target-c", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_EQ(hook.fired, 1);
     ASSERT_TRUE(result.cancelled);
@@ -623,6 +725,8 @@ TEST(cross_repo_pre_cancel_preserves_existing_cross_edges) {
         cbm_cross_repo_match_cancellable("pre-cancel-source", &target, 1, &cancelled);
     int after = cross_repo_count_edges(&fixture, "pre-cancel-source", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&initial);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_FALSE(initial.failed);
     ASSERT_TRUE(before > 0);
@@ -656,6 +760,8 @@ TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133) {
     cbm_cross_repo_result_t result = cbm_cross_repo_match("self-source", &self, 1);
     int after = cross_repo_count_edges(&fixture, "self-source", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&initial);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_FALSE(initial.failed);
     ASSERT_TRUE(before > 0);
@@ -679,6 +785,7 @@ TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133) {
     const char *targets[] = {"*"};
     cbm_cross_repo_result_t result = cbm_cross_repo_match("lonely-source", targets, 1);
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_TRUE(result.failed);
     ASSERT_TRUE(result.no_targets);
@@ -729,6 +836,7 @@ TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609) {
     const char *target = "shadow-target";
     cbm_cross_repo_result_t result = cbm_cross_repo_match("shadow-source", &target, 1);
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&result);
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.projects_scanned, 1);
@@ -756,6 +864,8 @@ TEST(cross_repo_caller_local_handler_blocks_cross_http_issue1459) {
     int mono_edges = cross_repo_count_edges(&fixture, "mono-1459", "CROSS_HTTP_CALLS");
     int api_edges = cross_repo_count_edges(&fixture, "api-1459", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&fwd);
+    cbm_cross_repo_result_free(&rev);
 
     ASSERT_FALSE(fwd.failed);
     ASSERT_FALSE(rev.failed);
@@ -789,6 +899,8 @@ TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459) 
     int mono_edges = cross_repo_count_edges(&fixture, "mono2-1459", "CROSS_HTTP_CALLS");
     int api_edges = cross_repo_count_edges(&fixture, "api3-1459", "CROSS_HTTP_CALLS");
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&fwd);
+    cbm_cross_repo_result_free(&rev);
 
     ASSERT_FALSE(fwd.failed);
     ASSERT_FALSE(rev.failed);
@@ -817,6 +929,8 @@ TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459) {
     const char *consumer = "client-1459";
     cbm_cross_repo_result_t rev = cbm_cross_repo_match("api2-1459", &consumer, 1);
     cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&fwd);
+    cbm_cross_repo_result_free(&rev);
 
     ASSERT_FALSE(fwd.failed);
     ASSERT_FALSE(rev.failed);
@@ -836,6 +950,8 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
     RUN_TEST(cross_repo_wildcard_skips_pre768_store_issue2133);
     RUN_TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133);
+    RUN_TEST(cross_repo_status_distinguishes_never_run_from_ran_without_links);
+    RUN_TEST(cross_repo_wildcard_reports_skipped_pre768_store);
     RUN_TEST(cross_repo_scan_bound_counts_examined_rows_not_matches);
     RUN_TEST(cross_repo_propagates_delete_failure);
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);

@@ -440,9 +440,12 @@ static void parse_pyproject_toml(const char *source, int source_len, const char 
     }
 }
 
-/* Extract PSR-4 autoload entries from composer.json root. */
-static void extract_psr4(yyjson_val *root, const char *dir, cbm_pkg_entries_t *entries) {
-    yyjson_val *autoload = yyjson_obj_get(root, "autoload");
+/* Extract PSR-4 entries from one composer.json autoload section ("autoload"
+ * or "autoload-dev": composer registers both, so test namespaces such as
+ * Tests\ map to their directory as well). */
+static void extract_psr4(yyjson_val *root, const char *section, const char *dir,
+                         cbm_pkg_entries_t *entries) {
+    yyjson_val *autoload = yyjson_obj_get(root, section);
     if (!yyjson_is_obj(autoload)) {
         return;
     }
@@ -459,6 +462,12 @@ static void extract_psr4(yyjson_val *root, const char *dir, cbm_pkg_entries_t *e
         }
         const char *ns_prefix = yyjson_get_str(key);
         const char *ns_dir = yyjson_get_str(val);
+        while (ns_dir[0] == '.' && ns_dir[SKIP_ONE] == '/') {
+            ns_dir += PAIR_LEN; /* "./src/" names src/ */
+        }
+        if (strcmp(ns_dir, ".") == 0) {
+            ns_dir = ""; /* "." names the manifest's own directory */
+        }
         char ns_entry[PKGMAP_PATH_BUF];
         if (dir[0]) {
             snprintf(ns_entry, sizeof(ns_entry), "%s/%s", dir, ns_dir);
@@ -497,7 +506,8 @@ static void parse_composer_json(const char *source, int source_len, const char *
         }
     }
 
-    extract_psr4(root, dir, entries);
+    extract_psr4(root, "autoload", dir, entries);
+    extract_psr4(root, "autoload-dev", dir, entries);
 
     free(dir);
     yyjson_doc_free(doc);
@@ -987,6 +997,12 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
+/* A composer.json `autoload.psr-4` key: a namespace prefix ending in '\\'. */
+static bool pkgmap_is_psr4_prefix(const char *pkg_name) {
+    size_t n = pkg_name ? strlen(pkg_name) : 0;
+    return n > 0 && pkg_name[n - SKIP_ONE] == '\\';
+}
+
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name) {
     /* Count total entries */
@@ -1004,8 +1020,14 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
     for (int w = 0; w < worker_count; w++) {
         cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
-            /* Convert entry_rel to QN: project.dir.parts */
-            char *qn = cbm_pipeline_fqn_module(project_name, we->items[i].entry_rel);
+            /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
+             * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
+             * instead: its readers map `Prefix\Sub\Class` onto a file path
+             * (<dir>/Sub/Class.php), which a dotted QN cannot express (#1186). */
+            const char *entry_rel = we->items[i].entry_rel;
+            char *qn = pkgmap_is_psr4_prefix(we->items[i].pkg_name)
+                           ? cbm_strndup(entry_rel, strlen(entry_rel))
+                           : cbm_pipeline_fqn_module(project_name, entry_rel);
             if (!qn) {
                 continue;
             }
@@ -1355,7 +1377,8 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
 }
 
 /* Try backslash-based prefix matching (PHP PSR-4: App\\Controllers\\Foo).
- * Returns heap QN or NULL. */
+ * The map value of a PSR-4 prefix is its repo-relative directory (see
+ * cbm_pkgmap_build). Returns heap QN or NULL. */
 static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path,
                                       const char *project_name) {
     char *buf = strdup(module_path);
@@ -1375,7 +1398,8 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
         }
         const char *subpath = module_path + (size_t)(bs - buf) + SKIP_ONE;
         char path_result[PKGMAP_PATH_BUF];
-        snprintf(path_result, sizeof(path_result), "%s/%s", base_dir, subpath);
+        snprintf(path_result, sizeof(path_result), "%s%s%s", base_dir, base_dir[0] ? "/" : "",
+                 subpath);
         for (char *c = path_result; *c; c++) {
             if (*c == '\\') {
                 *c = '/';
@@ -1541,6 +1565,239 @@ static bool import_targetable_label(const char *label) {
         }
     }
     return false;
+}
+
+/* #2127: a Python import path spells the module chain that owns the imported
+ * name (`from unittest.mock import patch` -> unittest, mock). Strategy 3 matches
+ * the leaf name alone, so an EXTERNAL import (stdlib / third party: no project
+ * module, Strategy 1 misses) bound to any same-named project definition -- a
+ * REST view's `patch` handler became the target of every mock.patch call at
+ * import_map confidence. For such an external import, accept a symbol hit only
+ * when the module segments preceding `name` in the import path occur, in
+ * order, among the hit's enclosing QN segments -- a src/ layout or sys.path
+ * root the module resolver missed (`from template_tests.utils import setup` ->
+ * proj.tests.template_tests.utils.setup) still qualifies. Relative prefixes
+ * (leading dots) carry no segment and are skipped. Imports of project modules
+ * are never judged by it (they may re-export from anywhere). Python only. */
+enum { PY_IMPORT_MAX_SEGS = 64 };
+bool cbm_python_import_path_matches_qn(const char *module_path, const char *name,
+                                       const char *hit_qn) {
+    if (!module_path || !name || !hit_qn) {
+        return true;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s", module_path);
+    char *as = strstr(path, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    const char *p = path;
+    while (*p == '.') {
+        p++;
+    }
+    /* Segments of the import path; name_at = index of the LAST `name`. */
+    const char *segs[PY_IMPORT_MAX_SEGS];
+    size_t lens[PY_IMPORT_MAX_SEGS];
+    int nseg = 0;
+    int name_at = -1;
+    size_t name_len = strlen(name);
+    while (*p && nseg < PY_IMPORT_MAX_SEGS) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len == name_len && strncmp(p, name, len) == 0) {
+            name_at = nseg;
+        }
+        segs[nseg] = p;
+        lens[nseg] = len;
+        nseg++;
+        if (!dot) {
+            break;
+        }
+        p = dot + SKIP_ONE;
+    }
+    if (name_at <= 0) {
+        return true; /* no module chain before the name: nothing to check */
+    }
+    /* Ordered-subsequence match against the hit's enclosing segments (every
+     * segment before the hit's own leaf). */
+    const char *leaf = strrchr(hit_qn, '.');
+    const char *q = hit_qn;
+    int want = 0;
+    while (want < name_at && leaf && q < leaf) {
+        const char *dot = strchr(q, '.');
+        size_t len = (size_t)(dot - q);
+        if (len == lens[want] && strncmp(q, segs[want], len) == 0) {
+            want++;
+        }
+        q = dot + SKIP_ONE;
+    }
+    return want == name_at;
+}
+
+/* #2127, call side: an imported name binds the file's identifier to that
+ * import for the whole module, exactly like a parameter binds it for a body.
+ * When the import could not be materialized (external module) the resolver
+ * falls through to project-wide short-name strategies and binds `patch(...)`
+ * (or `mock.patch(...)`) to whatever project definition shares the leaf. True
+ * when the callee's root identifier is bound by this file's Python imports and
+ * EVERY such binding's module chain (`unittest.mock` for `from unittest.mock
+ * import patch`; the callee's own dotted path for a root `import a.b`) is
+ * absent from `resolved_qn`'s enclosing segments AND the binding is external
+ * (no IMPORTS edge materialized it: the module is not in the project). An
+ * internal binding is never judged here -- a project module can re-export a
+ * name from anywhere -- and a chain consistent with the target (src/ layout)
+ * keeps the edge. `gbuf` NULL means "no IMPORTS edges" (all external). */
+static bool python_import_local_materialized(const cbm_gbuf_t *gbuf, const char *project_name,
+                                             const char *rel_path, const char *local_name) {
+    if (!gbuf || !rel_path) {
+        return false;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
+    safe_free(file_qn);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!file_node || cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                         &edge_count) != 0) {
+        return false;
+    }
+    char needle[CBM_SZ_256];
+    snprintf(needle, sizeof(needle), "\"local_name\":\"%s\"", local_name);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i]->properties_json && strstr(edges[i]->properties_json, needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
+                                           const char *resolved_qn, const cbm_gbuf_t *gbuf,
+                                           const char *project_name, const char *rel_path) {
+    if (!imports || imports->count <= 0 || !callee_name || !callee_name[0] || !resolved_qn ||
+        !resolved_qn[0]) {
+        return false;
+    }
+    const char *root_end = strchr(callee_name, '.');
+    size_t root_len = root_end ? (size_t)(root_end - callee_name) : strlen(callee_name);
+    bool bound = false;
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || !imp->module_path || strlen(imp->local_name) != root_len ||
+            strncmp(imp->local_name, callee_name, root_len) != 0) {
+            continue;
+        }
+        char full[1024];
+        snprintf(full, sizeof(full), "%s", imp->module_path);
+        char *as = strstr(full, " as ");
+        if (as) {
+            *as = '\0';
+        }
+        const char *path_leaf_seg = strrchr(full, '.');
+        bool from_import = path_leaf_seg && strcmp(path_leaf_seg + SKIP_ONE, imp->local_name) == 0;
+        if (!as && !from_import && strncmp(full, callee_name, root_len) == 0 &&
+            (full[root_len] == '.' || full[root_len] == '\0')) {
+            /* `import a.b` binds the ROOT package `a`: the callee already
+             * spells its own full dotted path (`a.b.f()`). */
+            snprintf(full, sizeof(full), "%s", callee_name);
+        } else if (!as && !path_leaf_seg && full[0] != '.' && strcmp(full, imp->local_name) != 0) {
+            /* `import m as y` (the extractor stores module_path `m`, local
+             * `y`; a from-import always spells a dotted path): `y` IS module
+             * `m`, so `y.T` spells `m.T`. */
+            snprintf(full, sizeof(full), "%s%s", imp->module_path, callee_name + root_len);
+        }
+        /* Otherwise (`from m import x [as y]`) only the import's own module
+         * chain is evidence: members reached THROUGH x (`x.objects.create`)
+         * may live on any type, so they are not compared. */
+        const char *leaf = strrchr(full, '.');
+        leaf = leaf ? leaf + SKIP_ONE : full;
+        if (cbm_python_import_path_matches_qn(full, leaf, resolved_qn) ||
+            python_import_local_materialized(gbuf, project_name, rel_path, imp->local_name)) {
+            return false; /* consistent with the target, or a project import */
+        }
+        bound = true;
+    }
+    return bound;
+}
+
+/* Base-class twin of the #2127 call gate. `class SimpleTestCase(
+ * unittest.TestCase)` under `import unittest` names the STDLIB base; the
+ * registry's same-module suffix fallback (`unittest.TestCase` -> module's
+ * `TestCase`) or a short-name strategy bound it to a same-named PROJECT class
+ * (django: an inheritance cycle SimpleTestCase -> TestCase ->
+ * TransactionTestCase -> SimpleTestCase, plus fabricated OVERRIDEs). An
+ * external import binding (never materialized as an IMPORTS edge) whose
+ * module chain the target does not spell can never be that target, whatever
+ * the registry strategy. Exact metadata import maps remain valid when the
+ * target spells the imported module chain. Every base resolver (sequential
+ * + parallel semantic, cross-LSP pxc) calls this ONE
+ * gate so the venues cannot diverge. Python only. */
+bool cbm_python_external_base_contradicts(CBMLanguage lang, const CBMImportArray *imports,
+                                          const char *base_spelling, const char *base_qn,
+                                          const cbm_gbuf_t *gbuf, const char *project_name,
+                                          const char *rel_path) {
+    return lang == CBM_LANG_PYTHON &&
+           cbm_python_import_binding_contradicts(imports, base_spelling, base_qn, gbuf,
+                                                 project_name, rel_path);
+}
+
+/* #2127: whether a Python import's module lives in this project. Relative
+ * imports always do; otherwise the module part (the path minus the imported
+ * name) must resolve to a graph node. Strategy 1 has already failed on the
+ * full path when this is asked. */
+static bool python_import_module_in_project(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                            const char *module_path) {
+    if (!module_path || module_path[0] == '.') {
+        return true;
+    }
+    char part[1024];
+    snprintf(part, sizeof(part), "%s", module_path);
+    char *as = strstr(part, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    char *dot = strrchr(part, '.');
+    if (!dot) {
+        return false; /* `import x`: Strategy 1 already missed x itself */
+    }
+    *dot = '\0';
+    char *qn = cbm_pipeline_resolve_module(ctx, source_rel, part);
+    bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
+    safe_free(qn);
+    return found;
+}
+
+/* `import a.b` / `import a` (as opposed to `from a import b`): every segment
+ * names a module. The extractor binds the ROOT (`a`) for a dotted plain
+ * import and the leaf for a from-import; a dot-less path is always a plain
+ * import. An aliased form is ambiguous and reads as a from-import. */
+static bool python_is_plain_module_import(const CBMImport *imp) {
+    const char *p = imp->module_path;
+    if (!p || p[0] == '.' || strstr(p, " as ")) {
+        return false;
+    }
+    const char *first_dot = strchr(p, '.');
+    if (!first_dot) {
+        return true;
+    }
+    const char *leaf = strrchr(p, '.') + SKIP_ONE;
+    size_t root_len = (size_t)(first_dot - p);
+    return imp->local_name && strlen(imp->local_name) == root_len &&
+           strncmp(imp->local_name, p, root_len) == 0 && strcmp(leaf, imp->local_name) != 0;
+}
+
+/* #2127: Strategy 3 hit filter for an EXTERNAL Python import. The hit must
+ * spell the import's module chain (a src/ layout the module resolver missed
+ * still does), and whatever names a module -- an enclosing path segment, or
+ * any segment of a plain `import x` -- can only be a Module/File node (`import
+ * copy` must not fall back to a project method called `copy`). */
+static bool python_external_hit_rejected(const CBMImport *imp, const char *name,
+                                         bool enclosing_segment, const cbm_gbuf_node_t *hit) {
+    if (!cbm_python_import_path_matches_qn(imp->module_path, name, hit->qualified_name)) {
+        return true;
+    }
+    bool names_module = enclosing_segment || python_is_plain_module_import(imp);
+    return names_module && strcmp(hit->label, "Module") != 0 && strcmp(hit->label, "File") != 0;
 }
 
 /* #1934: whether the name-guess import fallbacks — Strategy 1b (sibling file,
@@ -1818,6 +2075,144 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
+/* ── PHP PSR-4 class imports (#1186) ──────────────────────────────── */
+
+typedef enum {
+    PSR4_NOT_APPLICABLE = 0, /* no composer psr-4 prefix covers the import */
+    PSR4_RESOLVED,           /* the class file exists: *out is its File node */
+    PSR4_UNRESOLVED,         /* a prefix covers it but no class file exists */
+} psr4_outcome_t;
+
+/* The File node at exactly `rel_path`, or NULL. Looked up through the name
+ * index (File nodes are named by basename) and matched on the full path, so
+ * a same-named file in another directory never qualifies. */
+static const cbm_gbuf_node_t *psr4_file_node(const cbm_gbuf_t *gbuf, const char *rel_path) {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, path_leaf(rel_path), &hits, &hit_count) != 0 || !hits) {
+        return NULL;
+    }
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *n = hits[i];
+        if (n && n->label && strcmp(n->label, "File") == 0 && n->file_path &&
+            strcmp(n->file_path, rel_path) == 0) {
+            return n;
+        }
+    }
+    return NULL;
+}
+
+/* Resolve a PHP class import `use A\B\C;` the way composer's PSR-4 autoloader
+ * does: for every autoload.psr-4 prefix covering the name, longest first, the
+ * class lives in exactly <prefix-dir>/<rest>.php with sub-namespaces as
+ * subdirectories; the first existing file wins. When a prefix covers the name
+ * but no such file exists the import is UNRESOLVED: it must never fall through
+ * to the namespace bucket, which binds it to whichever file of the namespace
+ * came first. `use function` / `use const` name namespace members, not class
+ * files, so they are not applicable. */
+static psr4_outcome_t resolve_php_psr4_class(const cbm_gbuf_t *gbuf, const char *source_file_qn,
+                                             const CBMImport *imp, const cbm_gbuf_node_t **out) {
+    *out = NULL;
+    CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (!pkgmap || imp->kind != CBM_IMPORT_KIND_DEFAULT) {
+        return PSR4_NOT_APPLICABLE;
+    }
+    const char *name = imp->module_path;
+    if (name[0] == '\\') {
+        name++; /* fully qualified `use \App\X;` */
+    }
+    char key[PKGMAP_PATH_BUF];
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len >= sizeof(key) || !strchr(name, '\\')) {
+        return PSR4_NOT_APPLICABLE;
+    }
+    bool covered = false;
+    /* Right to left: each '\' ends a candidate prefix, longest first. */
+    for (size_t cut = name_len - SKIP_ONE; cut > 0; cut--) {
+        if (name[cut - SKIP_ONE] != '\\') {
+            continue;
+        }
+        memcpy(key, name, cut);
+        key[cut] = '\0';
+        const char *dir = (const char *)cbm_ht_get(pkgmap, key);
+        if (!dir) {
+            continue;
+        }
+        covered = true;
+        char rel[PKGMAP_PATH_BUF];
+        int w = snprintf(rel, sizeof(rel), "%s%s%s.php", dir, dir[0] ? "/" : "", name + cut);
+        if (w <= 0 || (size_t)w >= sizeof(rel)) {
+            continue;
+        }
+        for (char *c = rel; *c; c++) {
+            if (*c == '\\') {
+                *c = '/';
+            }
+        }
+        const cbm_gbuf_node_t *file = psr4_file_node(gbuf, rel);
+        if (file && (!source_file_qn || !file->qualified_name ||
+                     strcmp(file->qualified_name, source_file_qn) != 0)) {
+            *out = file;
+            return PSR4_RESOLVED;
+        }
+    }
+    return covered ? PSR4_UNRESOLVED : PSR4_NOT_APPLICABLE;
+}
+
+static bool psr4_class_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Trait") == 0 || strcmp(label, "Enum") == 0);
+}
+
+/* The QN of `member` on the class `cls` defined in `file_path`, or NULL when
+ * that file defines no such class or the class has no such member. */
+static const char *psr4_member_in_file(const cbm_gbuf_t *gbuf, const char *file_path,
+                                       const char *cls, const char *member) {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, cls, &hits, &hit_count) != 0 || !hits) {
+        return NULL;
+    }
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *c = hits[i];
+        if (!c || !psr4_class_label(c->label) || !c->qualified_name || !c->file_path ||
+            strcmp(c->file_path, file_path) != 0) {
+            continue;
+        }
+        char qn[CBM_SZ_1K];
+        int w = snprintf(qn, sizeof(qn), "%s.%s", c->qualified_name, member);
+        if (w <= 0 || (size_t)w >= sizeof(qn)) {
+            return NULL;
+        }
+        const cbm_gbuf_node_t *m = cbm_gbuf_find_by_qn(gbuf, qn);
+        return m ? m->qualified_name : NULL;
+    }
+    return NULL;
+}
+
+cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char *class_fqn,
+                                              const char *member, const char **out_qn) {
+    *out_qn = NULL;
+    if (!gbuf || !class_fqn || !member || !member[0]) {
+        return CBM_PSR4_MEMBER_NOT_COVERED;
+    }
+    const CBMImport imp = {.module_path = class_fqn, .kind = CBM_IMPORT_KIND_DEFAULT};
+    const cbm_gbuf_node_t *file = NULL;
+    psr4_outcome_t placed = resolve_php_psr4_class(gbuf, NULL, &imp, &file);
+    if (placed == PSR4_NOT_APPLICABLE) {
+        return CBM_PSR4_MEMBER_NOT_COVERED;
+    }
+    /* Covered from here on: composer would load this file or none, so a
+     * missing file, class or member leaves the member unresolved. */
+    if (placed != PSR4_RESOLVED || !file->file_path) {
+        return CBM_PSR4_MEMBER_UNRESOLVED;
+    }
+    const char *cls = strrchr(class_fqn, '\\');
+    cls = cls ? cls + SKIP_ONE : class_fqn;
+    *out_qn = psr4_member_in_file(gbuf, file->file_path, cls, member);
+    return *out_qn ? CBM_PSR4_MEMBER_RESOLVED : CBM_PSR4_MEMBER_UNRESOLVED;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -1833,6 +2228,18 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         resolve_header_include(ctx, source_rel, source_file_qn, imp->module_path);
     if (header_target) {
         return header_target;
+    }
+
+    /* PHP class imports covered by a composer psr-4 prefix name exactly one
+     * file; when it is absent the import stays unresolved (#1186). */
+    const cbm_gbuf_node_t *psr4_target = NULL;
+    switch (resolve_php_psr4_class(ctx->gbuf, source_file_qn, imp, &psr4_target)) {
+    case PSR4_RESOLVED:
+        return psr4_target;
+    case PSR4_UNRESOLVED:
+        return NULL;
+    case PSR4_NOT_APPLICABLE:
+        break;
     }
 
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
@@ -1882,8 +2289,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             src_base = pb + SKIP_ONE;
         }
     }
-    const bool symbol_fallback_allowed =
-        cbm_import_symbol_fallback_allowed(cbm_language_for_filename(src_base));
+    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
+    const bool symbol_fallback_allowed = cbm_import_symbol_fallback_allowed(src_lang);
 
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
      * import string is a sibling filename or directory (SCSS partials, Just/
@@ -2033,6 +2440,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             *dot = '\0';
             end = dot;
         }
+        /* #2127: a Python import whose module is not in the project (stdlib /
+         * third party) may only fall back to a hit that spells its chain. */
+        const bool py_external =
+            symbol_fallback_allowed && src_lang == CBM_LANG_PYTHON &&
+            !python_import_module_in_project(ctx, source_rel, imp->module_path);
         for (int ci = 0; symbol_fallback_allowed && ci < ncands; ci++) {
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
@@ -2053,6 +2465,9 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                     if (source_file_qn && cand->qualified_name &&
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
+                    }
+                    if (py_external && python_external_hit_rejected(imp, cands[ci], ci > 0, cand)) {
+                        continue; /* #2127: not the external module's symbol */
                     }
                     if (!best || (cand->qualified_name && best->qualified_name &&
                                   strcmp(cand->qualified_name, best->qualified_name) < 0)) {

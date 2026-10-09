@@ -60,16 +60,24 @@ vm_verdict() {
     local log="$1"
     local rc="$2"
     local mode="${3:-full}"
-    if ! grep -Eq '[0-9]+ passed' "$log"; then
+    # -a: a NUL or UTF-16 byte anywhere makes grep call the log binary and
+    # print no matches, which would count its failures as zero.
+    if ! grep -aEq '[0-9]+ passed' "$log"; then
         echo "GUARD: test runner produced no completion summary — the suites did" \
             "not validly run; treating as failure (runner rc=$rc)" >&2
         return 90
     fi
     local failed_total
     local complete
-    failed_total=$(grep -Eo '[0-9]+ failed' "$log" | grep -Eo '^[0-9]+' |
+    failed_total=$(grep -aEo '[0-9]+ failed' "$log" | grep -Eo '^[0-9]+' |
         awk '{s += $1} END {print s + 0}')
-    complete=$(grep -c '=== All tests passed ===' "$log")
+    # The marker counts only as the last step header of the log: the full leg's
+    # own contract steps echo runner-shaped lines (a stubbed entry prints the
+    # marker), so a marker followed by another step is that step's output.
+    complete=0
+    if [ "$(grep -aE '^=== ' "$log" | tail -n 1 | tr -d '\r')" = '=== All tests passed ===' ]; then
+        complete=1
+    fi
     if [ "${failed_total:-0}" -gt 0 ]; then
         echo "GUARD: the log reports $failed_total failed test(s) (runner rc=$rc)" >&2
         return 1
@@ -107,21 +115,33 @@ fi
 
 RUNNER="${CBM_VM_RUNNER:-}"
 
-# Per-run identity. The VM holds ONE checkout (/c/cbm), so two concurrent runs
-# shared a FIXED log path and the same build dir: the later run's output
-# replaced the earlier one's, and -PruneStale could delete a live run's temp
-# root out from under it. The run id namespaces the log and the build dir; the
-# protected temp root is already unique per run.
+# A supplied run id namespaces the log/build paths and disables shared pruning.
 CALLER_RUN_ID="${CBM_CI_RUN_ID:-}"
+if [ -n "$CALLER_RUN_ID" ]; then
+    if [[ ! "$CALLER_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+        echo "FATAL: CBM_CI_RUN_ID must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}." >&2
+        exit 2
+    fi
+    case "${CBM_CI_KEEP:-0}" in
+    0 | 1) ;;
+    *) echo "FATAL: CBM_CI_KEEP must be 0 or 1." >&2; exit 2 ;;
+    esac
+fi
 RUN_ID="${CBM_CI_RUN_ID:-$$-$(date +%s)}"
 export CBM_CI_RUN_ID="$RUN_ID"
 LOG="${CBM_VM_TEST_LOG:-/tmp/win-test-${RUN_ID}.log}"
+EFFECTIVE_BUILD_DIR=build/c
+TEMP_ROOT_ARGS=(-Prefix 'cbm-vm-tmp-' -PruneStale)
 
 # A caller that sets CBM_CI_RUN_ID is declaring concurrency, so give that run
 # its own BUILD_DIR; the default single-run path keeps the shared one and its
 # incremental reuse (a per-run build dir on the VM costs a full rebuild).
 if [ -n "$CALLER_RUN_ID" ]; then
-    BUILD_ARGS=("BUILD_DIR=build/vm-${RUN_ID}")
+    EFFECTIVE_BUILD_DIR="build/vm-${RUN_ID}"
+    BUILD_ARGS=("BUILD_DIR=$EFFECTIVE_BUILD_DIR")
+    LOG="${CBM_VM_TEST_LOG:-$PWD/.vm-logs/$RUN_ID/test.log}"
+    # Neither legacy cbm-* nor cbm-vm-tmp-* cleanup can select this namespace.
+    TEMP_ROOT_ARGS=(-Prefix "vm-cbm-${RUN_ID}-")
 else
     BUILD_ARGS=()
 fi
@@ -148,17 +168,20 @@ else
     # Default path: suites run through the canonical scripts/test.sh (which
     # builds its own runner, same as CI's test jobs). ACL-protect the build
     # directory it will use.
-    artifact="build/c/test-runner"
+    artifact="$EFFECTIVE_BUILD_DIR/test-runner"
 fi
 
-# Stale roots from earlier runs are removed up front; the current root is kept
-# after the run for post-mortem inspection. The root itself is created by the
+# Shared-mode stale roots are removed up front; isolated mode never prunes.
+# The current root is kept after the run for inspection. It is created by the
 # same script CI uses (scripts/ci/new-protected-temp-root.ps1) so the two venues
 # cannot drift apart on the ACL shape the daemon suites are validated against.
+if [ -n "$CALLER_RUN_ID" ]; then
+    mkdir -p -- "$(dirname "$LOG")" || exit 2
+fi
 root_windows="$(MSYS2_ARG_CONV_EXCL='*' powershell.exe -NoProfile \
     -ExecutionPolicy Bypass \
     -File "$(cygpath -w scripts/ci/new-protected-temp-root.ps1)" \
-    -Prefix 'cbm-vm-tmp-' -PruneStale \
+    "${TEMP_ROOT_ARGS[@]}" \
     -ProtectDir "$(cygpath -w "$(dirname "$artifact")")" | tr -d '\r')"
 [ -n "$root_windows" ] || { echo "ERROR: protected temp root creation failed" >&2; exit 2; }
 

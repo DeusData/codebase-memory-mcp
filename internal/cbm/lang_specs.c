@@ -2737,6 +2737,28 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 _Static_assert(sizeof(lang_specs) / sizeof(lang_specs[0]) == CBM_LANG_COUNT,
                "lang_specs array size must match CBM_LANG_COUNT");
 
+/* Conditional-compilation blocks per grammar (the `*_in_field_declaration_list`
+ * / `*_in_top_level` forms are aliased to these names by the grammars). */
+static const char *c_family_conditional_types[] = {
+    "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef", NULL};
+
+const char **cbm_conditional_block_types(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_GLSL:
+    case CBM_LANG_HLSL:
+    case CBM_LANG_ISPC:
+    case CBM_LANG_SLANG:
+        return c_family_conditional_types;
+    default:
+        return NULL;
+    }
+}
+
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {
     if (lang < 0 || lang >= CBM_LANG_COUNT) {
         return NULL;

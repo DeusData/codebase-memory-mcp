@@ -13,6 +13,8 @@
 enum {
     USE_PREFIX_LEN = 4, /* strlen("use ") */
     MIN_WOLFRAM_CHILDREN = 2,
+    /* Nested `#if` branches followed while collecting C includes. */
+    C_INCLUDE_NEST_LIMIT = 64,
     SECOND_IDX = 1,
 };
 
@@ -45,7 +47,7 @@ static void parse_lisp_imports(CBMExtractCtx *ctx);
 static void parse_starlark_imports(CBMExtractCtx *ctx);
 static void parse_tcl_imports(CBMExtractCtx *ctx);
 static void parse_teal_imports(CBMExtractCtx *ctx);
-static void parse_zsh_imports(CBMExtractCtx *ctx);
+static void parse_shell_source_imports(CBMExtractCtx *ctx);
 static void parse_css_imports(CBMExtractCtx *ctx);
 static void parse_html_imports(CBMExtractCtx *ctx);
 static void parse_cmake_imports(CBMExtractCtx *ctx);
@@ -663,10 +665,22 @@ static char *strip_angle_brackets(CBMArena *a, char *path) {
     return path;
 }
 
-static void parse_c_imports(CBMExtractCtx *ctx) {
+/* Node kinds that only group file-level items: the branches of `#if` /
+ * `#ifdef` (an include guard is one) and the body of `extern "C" { ... }`. */
+static bool is_c_include_container(const char *kind) {
+    return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_ifdef") == 0 ||
+           strcmp(kind, "preproc_else") == 0 || strcmp(kind, "preproc_elif") == 0 ||
+           strcmp(kind, "preproc_elifdef") == 0 || strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "declaration_list") == 0;
+}
+
+/* Collect the includes among `parent`'s children, descending into
+ * preprocessor branches: every header keeps its includes inside its include
+ * guard, so the top level alone gave a guarded header no imports at all. */
+static void parse_c_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
     CBMArena *a = ctx->arena;
 
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
         return;
@@ -675,6 +689,9 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "preproc_include") != 0 && strcmp(kind, "preproc_import") != 0) {
+            if (depth < C_INCLUDE_NEST_LIMIT && is_c_include_container(kind)) {
+                parse_c_imports_in(ctx, node, depth + SKIP_ONE);
+            }
             continue;
         }
 
@@ -693,6 +710,10 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+static void parse_c_imports(CBMExtractCtx *ctx) {
+    parse_c_imports_in(ctx, ctx->root, 0);
 }
 
 // --- Ruby imports ---
@@ -1205,7 +1226,29 @@ static void parse_wolfram_imports(CBMExtractCtx *ctx) {
 // require/include forms remain `expression_statement`s and are still handled by
 // the text fallback.  Take the first qualified_name/name descendant of each
 // clause as the module path.
-static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix) {
+// `use function` / `use const` carry the keyword as an anonymous direct child
+// of the declaration (flat form) or of the clause (grouped form
+// `use A\{function f, const C, K}`). DEFAULT when neither is present.
+static CBMImportKind php_use_kind(TSNode node) {
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (ts_node_is_named(c)) {
+            continue;
+        }
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "function") == 0) {
+            return CBM_IMPORT_KIND_FUNCTION;
+        }
+        if (strcmp(k, "const") == 0) {
+            return CBM_IMPORT_KIND_CONST;
+        }
+    }
+    return CBM_IMPORT_KIND_DEFAULT;
+}
+
+static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix,
+                                CBMImportKind decl_kind) {
     CBMArena *a = ctx->arena;
     // The path node is the qualified_name / namespace_name / name child.
     TSNode path_node = clause;
@@ -1230,12 +1273,14 @@ static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *g
     TSNode alias = ts_node_child_by_field_name(clause, TS_FIELD("alias"));
     const char *local =
         !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
-    CBMImport imp = {.local_name = local, .module_path = path};
+    CBMImportKind kind = decl_kind != CBM_IMPORT_KIND_DEFAULT ? decl_kind : php_use_kind(clause);
+    CBMImport imp = {.local_name = local, .module_path = path, .kind = kind};
     cbm_imports_push(&ctx->result->imports, a, imp);
 }
 
 static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     CBMArena *a = ctx->arena;
+    const CBMImportKind decl_kind = php_use_kind(decl);
     // Grouped form: namespace_use_group with a leading prefix qualified_name.
     TSNode group = decl;
     if (find_first_descendant_of(decl, "namespace_use_group", &group)) {
@@ -1257,7 +1302,7 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
             const char *ck = ts_node_type(clause);
             if (strcmp(ck, "namespace_use_group_clause") == 0 ||
                 strcmp(ck, "namespace_use_clause") == 0) {
-                emit_php_use_clause(ctx, clause, prefix);
+                emit_php_use_clause(ctx, clause, prefix, decl_kind);
             }
         }
         return;
@@ -1268,13 +1313,13 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     for (uint32_t i = 0; i < dc; i++) {
         TSNode clause = ts_node_named_child(decl, i);
         if (strcmp(ts_node_type(clause), "namespace_use_clause") == 0) {
-            emit_php_use_clause(ctx, clause, NULL);
+            emit_php_use_clause(ctx, clause, NULL, decl_kind);
             any = true;
         }
     }
     if (!any) {
         // Some grammar versions inline the path directly under the declaration.
-        emit_php_use_clause(ctx, decl, NULL);
+        emit_php_use_clause(ctx, decl, NULL, decl_kind);
     }
 }
 
@@ -2142,10 +2187,13 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
     }
 }
 
-// --- Zsh imports ---
+// --- Bash / Zsh imports ---
 // source file / . file — `command` nodes whose command_name is "source" or ".".
-// The argument field carries the sourced path.
-static void parse_zsh_imports(CBMExtractCtx *ctx) {
+// The argument field carries the sourced path. Every other command is a call,
+// not an import: read as an import, `set -e` imported "set", which the import
+// resolver then bound to whatever project symbol is named set (a TSX method),
+// and every `set` call in the script followed it.
+static void parse_shell_source_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_512);
@@ -3004,8 +3052,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "call");
         break;
     case CBM_LANG_BASH:
-        // source/. commands
-        parse_generic_imports(ctx, "command");
+        parse_shell_source_imports(ctx);
         break;
     case CBM_LANG_ZIG:
         parse_zig_imports(ctx);
@@ -3075,7 +3122,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_teal_imports(ctx);
         break;
     case CBM_LANG_ZSH:
-        parse_zsh_imports(ctx);
+        parse_shell_source_imports(ctx);
         break;
     case CBM_LANG_CMAKE:
         parse_cmake_imports(ctx);

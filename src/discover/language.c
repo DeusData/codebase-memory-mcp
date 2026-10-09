@@ -122,11 +122,16 @@ static const ext_entry_t EXT_TABLE[] = {
     {".frm", CBM_LANG_FORM},
     {".prc", CBM_LANG_FORM},
 
-    /* Fortran */
+    /* Fortran. Upper-case suffixes are the C-preprocessed spellings of the
+     * same free-form sources (#ifdef blocks); lookup is case-sensitive. */
     {".f03", CBM_LANG_FORTRAN},
     {".f08", CBM_LANG_FORTRAN},
     {".f90", CBM_LANG_FORTRAN},
     {".f95", CBM_LANG_FORTRAN},
+    {".F03", CBM_LANG_FORTRAN},
+    {".F08", CBM_LANG_FORTRAN},
+    {".F90", CBM_LANG_FORTRAN},
+    {".F95", CBM_LANG_FORTRAN},
 
     /* GLSL */
     {".frag", CBM_LANG_GLSL},
@@ -918,13 +923,12 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
-CBMLanguage cbm_language_for_extension(const char *ext) {
+static CBMLanguage lang_for_extension(const cbm_userconfig_t *ucfg, const char *ext) {
     if (!ext || !ext[0]) {
         return CBM_LANG_COUNT;
     }
 
     /* Check user-defined overrides first */
-    const cbm_userconfig_t *ucfg = cbm_get_user_lang_config();
     if (ucfg) {
         CBMLanguage ulang = cbm_userconfig_lookup(ucfg, ext);
         if (ulang != CBM_LANG_COUNT) {
@@ -940,7 +944,11 @@ CBMLanguage cbm_language_for_extension(const char *ext) {
     return CBM_LANG_COUNT;
 }
 
-CBMLanguage cbm_language_for_filename(const char *filename) {
+CBMLanguage cbm_language_for_extension(const char *ext) {
+    return lang_for_extension(cbm_get_user_lang_config(), ext);
+}
+
+static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *filename) {
     if (!filename || !filename[0]) {
         return CBM_LANG_COUNT;
     }
@@ -980,7 +988,6 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
     } COMPOUND_EXT_TABLE[] = {
         {".blade.php", CBM_LANG_BLADE},
     };
-    const cbm_userconfig_t *ucfg = cbm_get_user_lang_config();
     const char *p = strchr(filename, '.');
     while (p && p < last_dot) {
         for (size_t i = 0; i < sizeof(COMPOUND_EXT_TABLE) / sizeof(COMPOUND_EXT_TABLE[0]); i++) {
@@ -998,7 +1005,11 @@ CBMLanguage cbm_language_for_filename(const char *filename) {
     }
 
     /* Standard single-extension lookup (built-ins + user overrides). */
-    return cbm_language_for_extension(last_dot);
+    return lang_for_extension(ucfg, last_dot);
+}
+
+CBMLanguage cbm_language_for_filename(const char *filename) {
+    return lang_for_filename(cbm_get_user_lang_config(), filename);
 }
 
 const char *cbm_language_name(CBMLanguage lang) {
@@ -1089,45 +1100,61 @@ static char *shebang_next_token(char **cursor) {
     return start;
 }
 
-CBMLanguage cbm_language_from_shebang(const char *path) {
-    if (!path) {
-        return CBM_LANG_COUNT;
-    }
+/* ── Content probes ────────────────────────────────────────────────
+ * A few names do not decide a language alone; the file's first bytes do. Every
+ * probe is a function of those bytes only, so discovery (which reads files)
+ * and the pinned test-impact inventory (which reads git blobs) give a file the
+ * same language. The bytes are raw on every platform: a Windows text-mode read
+ * dropped carriage returns and stopped at a Ctrl-Z, which made the answer
+ * depend on the host. */
+enum {
+    LANG_PROBE_LINE = 255,       /* a shebang first line; the ObjectScript export marker */
+    LANG_PROBE_HEAD = CBM_SZ_4K, /* .m .cls .inc .frm .res */
+    LANG_PROBE_CFC = CBM_SZ_16K, /* .cfc: a long license block may precede the first tag */
+};
 
-    FILE *f = cbm_fopen(path, "rb");
+/* The first min(n, cap) bytes as a C string in dst[cap + 1]. The probes are
+ * string scans, so an embedded NUL ends what they see, as it always did. */
+static void lang_head_text(char *dst, size_t cap, const unsigned char *head, size_t n) {
+    size_t len = n < cap ? n : cap;
+    if (len > 0) {
+        memcpy(dst, head, len);
+    }
+    dst[len] = '\0';
+}
+
+/* The first `cap` bytes of a file, raw. false when the file cannot be opened.
+ * A read error keeps the bytes read before it, as the probes always did. */
+static bool lang_read_head(const char *path, unsigned char *buf, size_t cap, size_t *n) {
+    *n = 0;
+    FILE *f = path ? cbm_fopen(path, "rb") : NULL;
     if (!f) {
-        return CBM_LANG_COUNT; /* fail closed on read error */
+        return false;
     }
+    *n = fread(buf, SKIP_ONE, cap, f);
+    (void)fclose(f);
+    return true;
+}
 
-    /* Read only a bounded first line. */
-    char buf[CBM_SZ_256];
-    size_t n = fread(buf, SKIP_ONE, sizeof(buf) - SKIP_ONE, f);
-
-    /* Fail closed on any read error rather than parsing a partial buffer. */
-    if (ferror(f)) {
-        (void)fclose(f);
+/* `more`: the file has bytes beyond head[0..n). A first line that fills the
+ * probe and goes on is cut, and a cut line names no interpreter. */
+static CBMLanguage lang_shebang(const unsigned char *head, size_t n, bool more) {
+    if (n > LANG_PROBE_LINE) {
+        n = LANG_PROBE_LINE;
+        more = true;
+    }
+    if (n < PAIR_LEN) {
+        return CBM_LANG_COUNT; /* too short to begin with "#!" */
+    }
+    char buf[LANG_PROBE_LINE + SKIP_ONE];
+    memcpy(buf, head, n);
+    bool have_newline = (memchr(buf, '\n', n) != NULL);
+    if (!have_newline && n == LANG_PROBE_LINE && more) {
         return CBM_LANG_COUNT;
     }
-
-    /* If the bounded buffer filled without containing a newline, the first
-     * line may extend past our bound. Probe a single extra byte to tell an
-     * exact EOF (the whole file is <= 255 bytes) from a truncated longer
-     * line: any surviving byte -- including a newline just beyond the bound --
-     * means the first line was cut off, so fail closed. A probe read error
-     * fails closed too. This keeps the read bounded (no unbounded line read
-     * or allocation). */
-    bool have_newline = (memchr(buf, '\n', n) != NULL);
-    if (!have_newline && n == sizeof(buf) - SKIP_ONE) {
-        int probe = fgetc(f);
-        if (probe != EOF || ferror(f)) {
-            (void)fclose(f);
-            return CBM_LANG_COUNT;
-        }
-    }
-    (void)fclose(f);
 
     /* Must begin with "#!". */
-    if (n < PAIR_LEN || buf[0] != '#' || buf[1] != '!') {
+    if (buf[0] != '#' || buf[1] != '!') {
         return CBM_LANG_COUNT;
     }
 
@@ -1172,6 +1199,29 @@ CBMLanguage cbm_language_from_shebang(const char *path) {
     }
 
     return lang_for_interpreter(base);
+}
+
+CBMLanguage cbm_language_from_shebang(const char *path) {
+    if (!path) {
+        return CBM_LANG_COUNT;
+    }
+
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return CBM_LANG_COUNT; /* fail closed on read error */
+    }
+
+    /* Read only a bounded first line, plus one byte to tell an exact end of
+     * file from a longer first line. A read error fails closed rather than
+     * parsing a partial buffer. */
+    unsigned char buf[LANG_PROBE_LINE + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    bool failed = ferror(f) != 0;
+    (void)fclose(f);
+    if (failed) {
+        return CBM_LANG_COUNT;
+    }
+    return lang_shebang(buf, n > LANG_PROBE_LINE ? LANG_PROBE_LINE : n, n > LANG_PROBE_LINE);
 }
 
 /* ── .m file disambiguation ──────────────────────────────────────── */
@@ -1238,22 +1288,7 @@ static bool has_matlab_line_markers(const char *buf) {
     return false;
 }
 
-CBMLanguage cbm_disambiguate_m(const char *path) {
-    if (!path) {
-        return CBM_LANG_MATLAB;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_MATLAB;
-    }
-
-    /* Read first 4KB */
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage lang_m_text(const char *buf) {
     if (has_objc_markers(buf)) {
         return CBM_LANG_OBJC;
     }
@@ -1271,6 +1306,17 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     return CBM_LANG_MATLAB;
 }
 
+CBMLanguage cbm_disambiguate_m(const char *path) {
+    unsigned char head[LANG_PROBE_HEAD];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
+        return CBM_LANG_MATLAB;
+    }
+    char buf[LANG_PROBE_HEAD + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_HEAD, head, n);
+    return lang_m_text(buf);
+}
+
 /* Visual Basic 6 / VBA source exports are recognisable from their header (#721):
  * every module carries `Attribute VB_Name = "..."`, class modules open with
  * `VERSION 1.0 CLASS`, forms/controls with `VERSION 5.00` + `Begin VB.Form` /
@@ -1286,21 +1332,7 @@ static bool has_vb6_markers(const char *buf) {
  * VB6 form is reported as unsupported (CBM_LANG_COUNT) rather than handed to
  * the FORM grammar, which yields no defs and stray junk nodes. Defaults to
  * FORM on any doubt (preserves existing behaviour). */
-CBMLanguage cbm_disambiguate_frm(const char *path) {
-    if (!path) {
-        return CBM_LANG_FORM;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_FORM;
-    }
-
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage lang_frm_text(const char *buf) {
     /* VB6 form files open with "VERSION x.yy" on line 1. */
     if (strncmp(buf, "VERSION ", SLEN("VERSION ")) == 0 &&
         isdigit((unsigned char)buf[SLEN("VERSION ")])) {
@@ -1309,25 +1341,34 @@ CBMLanguage cbm_disambiguate_frm(const char *path) {
     return has_vb6_markers(buf) ? CBM_LANG_COUNT : CBM_LANG_FORM;
 }
 
+CBMLanguage cbm_disambiguate_frm(const char *path) {
+    unsigned char head[LANG_PROBE_HEAD];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
+        return CBM_LANG_FORM;
+    }
+    char buf[LANG_PROBE_HEAD + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_HEAD, head, n);
+    return lang_frm_text(buf);
+}
+
 /* Disambiguate .res files (#2176): ReScript source shares the extension with
  * two binary formats -- Godot resources (RSRC/RSCC magic, the default save
  * format for imported meshes) and Windows compiled resource files. Binary
  * content has no ReScript meaning, and a NUL byte never occurs in ReScript
  * text while both binary formats carry NULs in their first bytes. */
+static CBMLanguage lang_res_bytes(const unsigned char *head, size_t n) {
+    size_t len = n < LANG_PROBE_HEAD ? n : LANG_PROBE_HEAD;
+    return (len > 0 && memchr(head, '\0', len)) ? CBM_LANG_COUNT : CBM_LANG_RESCRIPT;
+}
+
 CBMLanguage cbm_disambiguate_res(const char *path) {
-    if (!path) {
+    unsigned char head[LANG_PROBE_HEAD];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
         return CBM_LANG_RESCRIPT;
     }
-
-    FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
-        return CBM_LANG_RESCRIPT;
-    }
-
-    char buf[CBM_SZ_4K];
-    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
-    (void)fclose(f);
-    return memchr(buf, '\0', n) ? CBM_LANG_COUNT : CBM_LANG_RESCRIPT;
+    return lang_res_bytes(head, n);
 }
 
 /* A make rule's targets end at a ':' followed by whitespace or the end of the
@@ -1398,23 +1439,11 @@ static bool is_dep_rule_line(const char *p, bool whole_file) {
  * and CMake (<object>.o.d). Those are "target: prereq ..." rules, often tens of
  * KB on one line, which the D grammar parses slowly into nothing but a module
  * node, so they are reported as unsupported (CBM_LANG_COUNT). Defaults to D on
- * any doubt (preserves existing behaviour). */
-CBMLanguage cbm_disambiguate_d(const char *path) {
-    if (!path) {
-        return CBM_LANG_DLANG;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_DLANG;
-    }
-
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
+ * any doubt (preserves existing behaviour). `n` is the count of head bytes buf
+ * was made from. */
+static CBMLanguage lang_d_text(const char *buf, size_t n) {
     /* A colon at the end of buf only ends the rule if nothing was cut off. */
-    bool whole_file = n < CBM_SZ_4K && strlen(buf) == n;
+    bool whole_file = n < LANG_PROBE_HEAD && strlen(buf) == n;
 
     const char *p = buf;
     if (strncmp(p, "\xEF\xBB\xBF", SLEN("\xEF\xBB\xBF")) == 0) {
@@ -1432,26 +1461,23 @@ CBMLanguage cbm_disambiguate_d(const char *path) {
     return is_dep_rule_line(p, whole_file) ? CBM_LANG_COUNT : CBM_LANG_DLANG;
 }
 
+CBMLanguage cbm_disambiguate_d(const char *path) {
+    unsigned char head[LANG_PROBE_HEAD];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
+        return CBM_LANG_DLANG;
+    }
+    char buf[LANG_PROBE_HEAD + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_HEAD, head, n);
+    return lang_d_text(buf, n);
+}
+
 /* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
  * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
  * with a line of the form "Class <UppercasePackage>..."; VB6 class modules
  * carry the VB6 header markers and are reported as unsupported (CBM_LANG_COUNT)
  * until a Visual Basic grammar exists. Defaults to Apex on any doubt. */
-CBMLanguage cbm_disambiguate_cls(const char *path) {
-    if (!path) {
-        return CBM_LANG_APEX;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_APEX;
-    }
-
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage lang_cls_text(const char *buf) {
     if (has_vb6_markers(buf)) {
         return CBM_LANG_COUNT;
     }
@@ -1471,6 +1497,17 @@ CBMLanguage cbm_disambiguate_cls(const char *path) {
     return CBM_LANG_APEX;
 }
 
+CBMLanguage cbm_disambiguate_cls(const char *path) {
+    unsigned char head[LANG_PROBE_HEAD];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
+        return CBM_LANG_APEX;
+    }
+    char buf[LANG_PROBE_HEAD + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_HEAD, head, n);
+    return lang_cls_text(buf);
+}
+
 /* Disambiguate .inc files: shared by BitBake include fragments and
  * InterSystems ObjectScript include (macro) files. ObjectScript .inc files are
  * predominantly macro definitions ("#define NAME ..." / "#def1arg NAME ...");
@@ -1480,21 +1517,7 @@ CBMLanguage cbm_disambiguate_cls(const char *path) {
  * We therefore match ObjectScript preprocessor directives ('#' immediately
  * followed by 'def'/';'), which BitBake never produces. Defaults to BitBake on
  * any doubt (preserves existing behaviour). */
-CBMLanguage cbm_disambiguate_inc(const char *path) {
-    if (!path) {
-        return CBM_LANG_BITBAKE;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_BITBAKE;
-    }
-
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage lang_inc_text(const char *buf) {
     const char *line = buf;
     while (*line) {
         /* ObjectScript include header: a line beginning "ROUTINE <Uppercase>". */
@@ -1517,6 +1540,17 @@ CBMLanguage cbm_disambiguate_inc(const char *path) {
         line = nl + SKIP_ONE;
     }
     return CBM_LANG_BITBAKE;
+}
+
+CBMLanguage cbm_disambiguate_inc(const char *path) {
+    unsigned char head[LANG_PROBE_HEAD];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
+        return CBM_LANG_BITBAKE;
+    }
+    char buf[LANG_PROBE_HEAD + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_HEAD, head, n);
+    return lang_inc_text(buf);
 }
 
 /* Case-insensitive prefix match (portable — no strncasecmp dependency). */
@@ -1544,23 +1578,7 @@ static bool starts_with_ci(const char *s, const char *prefix) {
  *        - a different leading tag (e.g. <cfquery> in a bare-tag file) ⇒ cfml;
  *        - anything else ("component { ... }") ⇒ cfscript.
  * Defaults to CBM_LANG_CFSCRIPT on any doubt (preserves table behaviour). */
-CBMLanguage cbm_disambiguate_cfc(const char *path) {
-    if (!path) {
-        return CBM_LANG_CFSCRIPT;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_CFSCRIPT;
-    }
-
-    /* Read a generous head: tag components can carry a large license/revision
-     * comment block before the <cfcomponent> opener. */
-    char buf[CBM_SZ_16K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_16K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage lang_cfc_text(const char *buf) {
     /* Rule 1: explicit tag-component markers ⇒ tag dialect. */
     if (cbm_strcasestr(buf, "<cfcomponent") != NULL || cbm_strcasestr(buf, "<cffunction") != NULL) {
         return CBM_LANG_CFML;
@@ -1588,4 +1606,165 @@ CBMLanguage cbm_disambiguate_cfc(const char *path) {
         return starts_with_ci(p, "<cfscript") ? CBM_LANG_CFSCRIPT : CBM_LANG_CFML;
     }
     return CBM_LANG_CFSCRIPT;
+}
+
+CBMLanguage cbm_disambiguate_cfc(const char *path) {
+    unsigned char head[LANG_PROBE_CFC];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
+        return CBM_LANG_CFSCRIPT;
+    }
+    char buf[LANG_PROBE_CFC + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_CFC, head, n);
+    return lang_cfc_text(buf);
+}
+
+/* ── One classifier for a name plus its first bytes ──────────────── */
+
+/* JSON files that are configuration, not source worth indexing. */
+static const char *const IGNORED_JSON_FILES[] = {
+    "package.json",       "package-lock.json", "tsconfig.json",
+    "jsconfig.json",      "composer.json",     "composer.lock",
+    "yarn.lock",          "openapi.json",      "swagger.json",
+    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
+    ".babelrc.json",      "tslint.json",       "angular.json",
+    "firebase.json",      "renovate.json",     "lerna.json",
+    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
+    "deno.json",          "biome.json",        "devcontainer.json",
+    ".devcontainer.json", "launch.json",       "settings.json",
+    "extensions.json",    "tasks.json",        NULL};
+
+static bool lang_name_in(const char *name, const char *const *list) {
+    for (int i = 0; list[i]; i++) {
+        if (strcmp(name, list[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The content rule a name needs, or NULL. */
+static const char *lang_probe_extension(const char *filename) {
+    static const char *const PROBED[] = {".m", ".cls", ".inc", ".cfc", ".frm", ".res", NULL};
+    const char *dot = strrchr(filename, '.');
+    return (dot && lang_name_in(dot, PROBED)) ? dot : NULL;
+}
+
+/* .d is shared by D and make-style dep-info (cargo, gcc -MD). Probe only while
+ * .d maps to D, so a user override to another language wins. */
+static bool lang_probe_d(CBMLanguage lang, const char *filename) {
+    const char *dot = strrchr(filename, '.');
+    return lang == CBM_LANG_DLANG && dot && strcmp(dot, ".d") == 0;
+}
+
+/* "<Export generator=" in the first line-probe bytes: an ObjectScript Studio
+ * export, which is XML by name. */
+static bool lang_objectscript_export(const unsigned char *head, size_t n) {
+    char buf[LANG_PROBE_LINE + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_LINE, head, n);
+    return strstr(buf, "<Export generator=") != NULL;
+}
+
+_Static_assert(LANG_PROBE_CFC == CBM_LANGUAGE_PROBE_MAX, "the longest probe is the public bound");
+
+size_t cbm_language_probe_bytes_with(const cbm_userconfig_t *config, const char *filename) {
+    if (!filename) {
+        return 0;
+    }
+    CBMLanguage lang = lang_for_filename(config, filename);
+    if (lang == CBM_LANG_COUNT) {
+        return LANG_PROBE_LINE; /* the shebang fallback */
+    }
+    const char *ext = lang_probe_extension(filename);
+    if (ext) {
+        return strcmp(ext, ".cfc") == 0 ? LANG_PROBE_CFC : LANG_PROBE_HEAD;
+    }
+    if (lang_probe_d(lang, filename)) {
+        return LANG_PROBE_HEAD;
+    }
+    return lang == CBM_LANG_XML ? LANG_PROBE_LINE : 0;
+}
+
+CBMLanguage cbm_language_classify_with(const cbm_userconfig_t *config, const char *filename,
+                                       const unsigned char *head, size_t head_len, bool more,
+                                       bool readable) {
+    if (!filename) {
+        return CBM_LANG_COUNT;
+    }
+    if (!readable || !head) {
+        head = NULL;
+        head_len = 0;
+    }
+    CBMLanguage lang = lang_for_filename(config, filename);
+    if (lang == CBM_LANG_COUNT) {
+        /* The name says nothing: a conservative shebang probe, so extensionless
+         * scripts get indexed (#1199). The name stays authoritative otherwise. */
+        return readable ? lang_shebang(head, head_len, more) : CBM_LANG_COUNT;
+    }
+    const char *ext = lang_probe_extension(filename);
+    if (ext) {
+        char buf[LANG_PROBE_CFC + SKIP_ONE];
+        bool cfc = strcmp(ext, ".cfc") == 0;
+        lang_head_text(buf, cfc ? LANG_PROBE_CFC : LANG_PROBE_HEAD, head, head_len);
+        if (strcmp(ext, ".m") == 0) {
+            /* Objective-C, Magma or MATLAB */
+            lang = readable ? lang_m_text(buf) : CBM_LANG_MATLAB;
+        } else if (strcmp(ext, ".cls") == 0) {
+            /* ObjectScript UDL, Apex or a Visual Basic 6 class module */
+            lang = readable ? lang_cls_text(buf) : CBM_LANG_APEX;
+        } else if (strcmp(ext, ".inc") == 0) {
+            /* BitBake or an ObjectScript include */
+            lang = readable ? lang_inc_text(buf) : CBM_LANG_BITBAKE;
+        } else if (cfc) {
+            /* script or tag dialect */
+            lang = readable ? lang_cfc_text(buf) : CBM_LANG_CFSCRIPT;
+        } else if (strcmp(ext, ".frm") == 0) {
+            /* FORM or a Visual Basic 6 form (#721) */
+            lang = readable ? lang_frm_text(buf) : CBM_LANG_FORM;
+        } else {
+            /* .res: ReScript, or a binary Godot / Windows resource (#2176) */
+            lang = readable ? lang_res_bytes(head, head_len) : CBM_LANG_RESCRIPT;
+        }
+    } else if (lang_probe_d(lang, filename)) {
+        /* D, or a make-style dep-info file */
+        char buf[LANG_PROBE_HEAD + SKIP_ONE];
+        lang_head_text(buf, LANG_PROBE_HEAD, head, head_len);
+        lang = readable ? lang_d_text(buf, head_len) : CBM_LANG_DLANG;
+    }
+    if (lang == CBM_LANG_XML && readable && lang_objectscript_export(head, head_len)) {
+        return CBM_LANG_OBJECTSCRIPT_EXPORT;
+    }
+    if (lang == CBM_LANG_JSON && lang_name_in(filename, IGNORED_JSON_FILES)) {
+        return CBM_LANG_COUNT;
+    }
+    return lang;
+}
+
+size_t cbm_language_probe_bytes(const char *filename) {
+    return cbm_language_probe_bytes_with(cbm_get_user_lang_config(), filename);
+}
+
+CBMLanguage cbm_language_classify(const char *filename, const unsigned char *head, size_t head_len,
+                                  bool more, bool readable) {
+    return cbm_language_classify_with(cbm_get_user_lang_config(), filename, head, head_len, more,
+                                      readable);
+}
+
+CBMLanguage cbm_language_for_file(const char *filename, const char *path) {
+    size_t probe = cbm_language_probe_bytes(filename);
+    if (probe == 0) {
+        return cbm_language_classify(filename, NULL, 0, false, true);
+    }
+    /* One byte past the probe tells a file that ends there from a longer one. */
+    unsigned char head[LANG_PROBE_CFC + SKIP_ONE];
+    size_t n = 0;
+    FILE *f = path ? cbm_fopen(path, "rb") : NULL;
+    if (!f) {
+        return cbm_language_classify(filename, NULL, 0, false, false);
+    }
+    n = fread(head, SKIP_ONE, probe + SKIP_ONE, f);
+    bool failed = ferror(f) != 0;
+    (void)fclose(f);
+    bool more = n > probe;
+    return cbm_language_classify(filename, head, more ? probe : n, more, !failed);
 }

@@ -1,7 +1,10 @@
-# PR validation: security gates + lint + full test suite. Builds, smoke and
-# soak stay maintainer-driven via the dry-run workflow_dispatch. Branch
+# PR validation: security gates + lint + the test legs this PR's changes need.
+# `changes` runs scripts/ci/select-lanes.sh on the PR's file list; every lane
+# job below runs only when selected (unknown paths, workflows, the harness,
+# Makefile.cbm and vendored code select everything). Builds, smoke and soak at
+# full breadth stay maintainer-driven via the dry-run workflow_dispatch. Branch
 # protection requires `dco` + `ci-ok` — a single stable summary context that
-# fails unless every PR stage succeeded.
+# fails unless every PR stage succeeded and every selected lane ran green.
 name: PR
 
 on:
@@ -21,6 +24,7 @@ concurrency:
 
 jobs:
   security:
+    needs: [changes]
     uses: ./.github/workflows/_security.yml
     # The called job requests security-events:read to count code-scanning
     # alerts; a reusable workflow cannot request more than its caller grants,
@@ -30,33 +34,92 @@ jobs:
       security-events: read
       actions: read
     secrets: inherit
+    with:
+      lanes: ${{ needs.changes.outputs.lanes }}
 
   lint:
+    needs: [changes]
+    if: ${{ contains(fromJSON(needs.changes.outputs.lanes), 'lint') || contains(fromJSON(needs.changes.outputs.lanes), 'lint-mem') }}
     uses: ./.github/workflows/_lint.yml
+    with:
+      lanes: ${{ needs.changes.outputs.lanes }}
+
+  # ── Smart CI, PR CI only: run only the tests this change can reach.
+  #    Active only while the repository variable TEST_IMPACT_MODE is `gate`;
+  #    unset (shadow) every test runs and test-impact-shadow only reports.
+  #    test-impact-select.sh --gate narrows only on a well-formed answer: a
+  #    failure of this job, a run-all answer or a lane that selects nothing
+  #    leaves `test` without a selection, and every test runs. ci-ok does not
+  #    need this job: when it breaks, PRs cost more minutes, never coverage.
+  #    Dry runs and releases never pass a selection.
+  select-tests:
+    needs: [changes]
+    if: ${{ vars.TEST_IMPACT_MODE == 'gate' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read # the merge base's team-artifact bundle (test-impact-artifact.yml)
+    outputs:
+      selection: ${{ steps.select.outputs.selection }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the engine certifies the history it diffs and refuses
+          # a shallow clone, so a depth-2 checkout always answered `all`.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build this checkout's engine
+        run: |
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          scripts/build.sh CC=gcc CXX=g++
+      - name: Select the tests
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
+      - name: Upload the selection
+        if: ${{ steps.select.outputs.selection == 'narrowed' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-selection
+          path: ${{ runner.temp }}/test-selection
+          if-no-files-found: error
+          overwrite: true
 
   test:
-    needs: [lint]
+    needs: [changes, lint, select-tests]
     if: ${{ !cancelled() && needs.lint.result == 'success' }}
     uses: ./.github/workflows/_test.yml
     with:
+      lanes: ${{ needs.changes.outputs.lanes }}
+      # Smart CI: only a successful select-tests run that narrowed passes a
+      # selection; skipped (shadow), failed, run-all and nothing-selected
+      # answers all run every test.
+      test_selection: ${{ needs.select-tests.result == 'success' && needs.select-tests.outputs.selection == 'narrowed' && 'test-selection' || '' }}
       # Perf assertions are timing-sensitive on shared runners; they stay in
       # dry runs and releases where a flaky red does not block a merge.
       skip_perf: true
-      # Iteration speed: split each C-suite leg across parallel shard jobs
-      # (ubuntu x3, windows x2; coverage re-proven every run by the
-      # shard-completeness job). Dry runs and releases shard identically.
+      # Iteration speed: split C-suite legs across parallel shard jobs
+      # (coverage re-proven every run by the shard-completeness job). The PR
+      # profile shards only arm64 (x2); x86 and Windows run whole, since each
+      # shard re-pays its setup. Dry runs and releases keep x3 / x2.
       shard_suites: true
+      shard_profile: pr
 
-  # ── Which files changed? Gate the (heavier) build+smoke on product code so
-  #    docs / CI / test-only PRs stay fast. ──
+  # ── Which lanes does this PR need? The changed files go through
+  #    scripts/ci/select-lanes.sh (tier, lanes, full, reasons); docs / CI /
+  #    test-only PRs stay fast, anything it cannot place runs everything. ──
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      product: ${{ steps.f.outputs.product }}
+      tier: ${{ steps.select.outputs.tier }}
+      full: ${{ steps.select.outputs.full }}
+      lanes: ${{ steps.select.outputs.lanes }}
+      smoke: ${{ steps.select.outputs.smoke }}
     steps:
-      - name: Detect product-code changes
-        id: f
+      - name: List the changed files
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
@@ -64,7 +127,9 @@ jobs:
         run: |
           # The full .diff endpoint rejects large-but-valid PRs at 20k lines.
           # The paginated files endpoint remains filename-only for this gate.
-          if FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename'); then
+          # A rename lists its old path too, as the fallback's --no-renames
+          # diff does: moving a file away is a change to where it was.
+          if FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[] | .filename, (.previous_filename // empty)'); then
             echo "file list: pulls/files API"
           else
             # The files endpoint renders the diff server-side too, and answers
@@ -81,31 +146,45 @@ jobs:
               "https://github.com/$REPO" "refs/pull/$PR/merge"
             FILES=$(git --git-dir="$CHANGES_GIT" diff --name-only --no-renames FETCH_HEAD^1 FETCH_HEAD)
           fi
-          printf '%s\n' "$FILES"
-          # A here-string, not a pipe: under this shell's pipefail, grep -q
-          # exits on its first match, printf dies of SIGPIPE once the list
-          # outgrows the pipe buffer, and the MATCH is then reported as a
-          # failure -- product=false, smoke skipped, on the largest PRs.
-          if grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)' <<<"$FILES"; then
-            echo "product=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "product=false" >> "$GITHUB_OUTPUT"
-          fi
+          printf '%s\n' "$FILES" > "$RUNNER_TEMP/changed-files.txt"
+          cat "$RUNNER_TEMP/changed-files.txt"
+
+      # The selector is PR code: it runs in its own step, after the
+      # token-bearing one, from a checkout that keeps no credentials.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The pulls/files API lists at most 3000 files: the PR's own count lets
+      # the selector notice a cut list and select everything instead.
+      - name: Select lanes
+        id: select
+        env:
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          scripts/ci/select-lanes.sh --format github-output --expect-files "$CHANGED_FILES" "$RUNNER_TEMP/changed-files.txt" > "$RUNNER_TEMP/selection.txt"
+          cat "$RUNNER_TEMP/selection.txt"
+          cat "$RUNNER_TEMP/selection.txt" >> "$GITHUB_OUTPUT"
+          # pr-smoke's legs, each tagged with its lane (kept in the job name,
+          # where ci-ok reads it back); the job gets the selected ones.
+          SMOKE='[{"os":"ubuntu-latest","lane":"smoke-ubuntu"},{"os":"macos-14","lane":"smoke-mac"},{"os":"windows-latest","lane":"smoke-win"}]'
+          LANES=$(sed -n 's/^lanes=//p' "$RUNNER_TEMP/selection.txt")
+          echo "smoke={\"include\":$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$SMOKE")}" >> "$GITHUB_OUTPUT"
 
   # ── Light smoke: build the PRODUCTION binary and run the core smoke on the
   #    three RELIABLE NATIVE platforms. Catches built-binary regressions at PR
   #    time (e.g. the Windows CreateProcess argv-quoting class that previously
   #    only surfaced in the release dry run). The full broad/emulated smoke stays
-  #    in the dry run. Only product-code PRs pay this; every leg gates.
+  #    in the dry run. Only the selected legs run (ubuntu from the extraction
+  #    tier up, all three for platform/packaging changes); every leg gates.
   #    The maintained local wrappers add a race-free release fixture so the
   #    download/checksum/install/update phases run here as well. ──
   pr-smoke:
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.product == 'true' }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (contains(fromJSON(needs.changes.outputs.lanes), 'smoke-ubuntu') || contains(fromJSON(needs.changes.outputs.lanes), 'smoke-mac') || contains(fromJSON(needs.changes.outputs.lanes), 'smoke-win')) }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+      matrix: ${{ fromJSON(needs.changes.outputs.smoke) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -177,27 +256,118 @@ jobs:
   # ── Waste sanitizer, REPORT-ONLY: memory + CPU waste on this repository and
   #    the per-function scaling lane (Linux). Deliberately NOT in ci-ok's needs:
   #    it uploads evidence and prints the ratchet, it never blocks a merge. Only
-  #    product-code PRs pay for it. ──
+  #    PRs whose selection holds the memwaste lane (memory core, memwaste
+  #    tooling, full runs) pay for it. ──
   memwaste:
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.product == 'true' }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'memwaste') }}
     uses: ./.github/workflows/_memwaste.yml
     with:
       mode: pr
 
+  # ── Test-impact SHADOW, REPORT-ONLY: predicts from the code graph which C
+  #    suites this change can affect (the latest released binary indexes the
+  #    PR checkout; detect_changes at depth 15 against the base, mapped to
+  #    suites, with the selector's run-all triggers) and uploads the
+  #    prediction, so graph-based selection can be judged against what really
+  #    failed before anything gates on it. continue-on-error and NOT in
+  #    ci-ok's needs: it can never block or pass a merge. ──
+  test-impact-shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read # the merge base's team-artifact bundle (test-impact-artifact.yml)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the engine (test-impact select) certifies the history
+          # it diffs and refuses a shallow clone ("Graft or shallow state
+          # prevents history certification"), which made every shadow answer
+          # run_all (GIT_UNAVAILABLE). About 400 MiB, this job only.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the latest released binary
+        id: release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/test-impact-shadow.sh --fetch-release "$RUNNER_TEMP/cbm-bin"
+      - name: Build the binary from this checkout (download failed)
+        if: ${{ steps.release.outcome == 'failure' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          scripts/build.sh CC=gcc CXX=g++
+          mkdir -p "$RUNNER_TEMP/cbm-bin"
+          cp build/c/codebase-memory-mcp "$RUNNER_TEMP/cbm-bin/"
+      - name: Predict the impacted suites
+        run: scripts/ci/test-impact-shadow.sh --binary "$RUNNER_TEMP/cbm-bin/codebase-memory-mcp" --out "$RUNNER_TEMP/test-impact"
+      # The engine (test-impact select) is this checkout's own code: the
+      # released binary predates it, so the checkout is built either way.
+      - name: Build this checkout's engine
+        if: ${{ steps.release.outcome != 'failure' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          scripts/build.sh CC=gcc CXX=g++
+      - name: Select with the team artifact (engine shadow)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact"
+      - name: Upload the prediction
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-impact-prediction
+          path: |
+            ${{ runner.temp }}/test-impact/prediction.json
+            ${{ runner.temp }}/test-impact/selection.json
+            ${{ runner.temp }}/test-impact/changed-files.txt
+            ${{ runner.temp }}/test-impact/selection-engine.json
+            ${{ runner.temp }}/test-impact/summary-engine.md
+          if-no-files-found: warn
+
+  # ── Docs-only and non-product PRs (tiers T0a, T0b) run the static contract
+  #    steps of the canonical test leg on their own: they police docs
+  #    surfaces (language counts, version metadata), test-infrastructure/ and
+  #    lint config too. Every test leg runs the same steps. ──
+  contracts:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && contains(fromJSON(needs.changes.outputs.lanes), 'contracts') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Contract steps only
+        run: scripts/test.sh --contracts-only
+
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage
-    # succeeded, so matrix renames can never silently deadlock merges. `skipped`
-    # is OK: pr-smoke skips on docs/CI/test-only PRs (changes.product == false).
-    needs: [security, lint, test, changes, pr-smoke]
+    # succeeded, so matrix renames can never silently deadlock merges, and
+    # every lane the selector chose ran green: `skipped` is OK only for a lane
+    # nobody selected (a selected lane that skipped is a silent gate loss).
+    # memwaste and the test-impact shadow are report-only and not needed here.
+    needs: [changes, security, lint, test, pr-smoke, contracts]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # actions:read lists this run's jobs, the lane-level truth behind `needs`.
+    permissions:
+      contents: read
+      actions: read
     steps:
       # Needs a checkout (unlike before): the gate logic lives in the canonical
       # scripts/ci entry, not inline YAML (venue-parity contract).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: All PR stages must have succeeded
+      - name: List this run's jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | {name, status, conclusion}' > "$RUNNER_TEMP/jobs.jsonl"
+      - name: All PR stages and every selected lane must have succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}
+          LANES: ${{ needs.changes.outputs.lanes }}
+          JOBS: ${{ runner.temp }}/jobs.jsonl
         run: scripts/ci/require-all-green.sh

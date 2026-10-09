@@ -235,9 +235,27 @@ typedef struct {
 cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
-/* Register a function/method/class. All strings are copied. */
+/* Register a function/method/class. All strings are copied. The entry's
+ * language is unknown, so name-based resolution never filters it out. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
+
+/* As cbm_registry_add, recording `lang`: the DETECTED language of the file
+ * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
+ * veto (cbm_registry_name_guess_vetoed) checks against the caller. */
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang);
+
+/* True when code in `caller` can call a symbol defined in `target` by bare
+ * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
+ * ObjC, JVM, .NET, ...; the table lives in registry.c), or Swift with the C
+ * family. An unknown language (CBM_LANG_COUNT) on either side is compatible. */
+bool cbm_lang_resolution_compatible(CBMLanguage caller, CBMLanguage target);
+
+/* Language of a synthetic definition source minted by a language's own LSP
+ * layer ("<python-builtins>" -> Python, "<kotlin-builtins>" -> Kotlin);
+ * CBM_LANG_COUNT for anything else. */
+CBMLanguage cbm_registry_synthetic_path_language(const char *file_path);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
@@ -249,6 +267,21 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
+
+/* Cross-language veto for a CALLS resolution made by a caller written in
+ * `caller_lang` (its file's detected language). True when `res` is a
+ * name-only answer (qualified_suffix, unique_name, suffix_match, the
+ * parallel field_type_hint re-pick, or same_module: two files of different
+ * languages with the same path stem share a module QN) whose target's recorded language the
+ * caller cannot call (cbm_lang_resolution_compatible): a JS call must never
+ * bind a Python symbol by spelling alone. Callers treat a vetoed answer as
+ * EMPTY before their empty-resolution fallbacks (route registration, HTTP
+ * clients), so those still classify the call. A veto, not a re-pick: the
+ * strategy chain is unchanged. Import-map and lsp_* answers are never
+ * vetoed; CBM_LANG_COUNT never vetoes. pass_calls.c and pass_parallel.c
+ * MUST apply it identically. Pure; unit-tested in test_registry.c. */
+bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_lang,
+                                    const cbm_resolution_t *res);
 
 /* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
  * consumer allowed to bind Table/View targets. Uncached (the per-file resolve
@@ -334,6 +367,16 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
 
+/* Import-binding counterpart (#2127). True when the callee's root identifier
+ * is bound by an import of this file whose module chain contradicts the
+ * resolved target (`from unittest.mock import patch; patch()` must not bind a
+ * project `PkgConfigView.patch`), and the match came from a weak short-name
+ * strategy. Same drop-list as the guards above; the language set lives at the
+ * call sites and must be identical in pass_calls.c and pass_parallel.c.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_import_bound_call(bool enabled, bool import_binding_contradicts,
+                                         const char *strategy);
+
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
  * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX
@@ -357,6 +400,42 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
  * legitimately reference their own members bare inside method bodies. Pure;
  * unit-tested in test_registry.c. */
 bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
+
+/* What to do with a call whose registry resolution landed on a Field node.
+ * Pure; unit-tested in test_registry.c. */
+typedef enum {
+    CBM_FIELD_CALL_KEEP = 0, /* not a Field target, or a language this rule leaves alone */
+    CBM_FIELD_CALL_DROP,     /* a Field can never be this call's target */
+    CBM_FIELD_CALL_BY_OWNER, /* C/C++ member call: the object's type names the Field */
+} cbm_field_call_policy_t;
+cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
+                                                   const char *target_label,
+                                                   const char *target_file_path);
+
+/* True for a C/C++ call spelled through an arrow (`p->open(fd)`). The
+ * short-name registry splits a callee on `.` and `::` only, so such a call
+ * comes back from it unresolved; the caller then asks the object's type for
+ * the member, as for a dot call. Pure; unit-tested in test_registry.c. */
+bool cbm_c_arrow_member_call(CBMLanguage caller_lang, const char *callee_text);
+
+/* True when a reference is the member half of a C `a.b` / `a->b`. Such a
+ * reference binds through the C LSP's field-owner rows (the type of `a`); with
+ * no typed owner it binds only cbm_registry_unique_field_qn(). C only. Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access);
+
+/* True when a file's member accesses follow the C member rule above: every C
+ * file, and every `.h`. A `.h` is parsed as C++ because it may be either, and
+ * `a.b` / `a->b` means the same in both: the type of `a` names `b`. Without it
+ * the inline functions of a C header kept binding members by bare name. Other
+ * C++ files are left to their own resolution. Pure; unit-tested in
+ * test_registry.c. */
+bool cbm_c_member_rule_file(CBMLanguage lang, const char *rel_path);
+
+/* The QN of the Field `member_name` names when exactly one Field in the
+ * registry carries that name (symbols of other labels are not candidates for
+ * a member); NULL when none or several do. */
+const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

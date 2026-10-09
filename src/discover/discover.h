@@ -18,6 +18,7 @@
 /* Use the existing CBMLanguage enum from extraction layer */
 #include "cbm.h"
 #include "foundation/index_policy.h"
+#include "discover/userconfig.h"
 
 /* ── Language detection ──────────────────────────────────────────── */
 
@@ -89,6 +90,32 @@ CBMLanguage cbm_language_from_shebang(const char *path);
  * On read failure, defaults to CBM_LANG_CFSCRIPT. */
 CBMLanguage cbm_disambiguate_cfc(const char *path);
 
+/* The language of a file from its base name and, where the name is not enough,
+ * its first bytes: the one rule discovery and the pinned test-impact inventory
+ * share. cbm_language_probe_bytes says how many leading bytes the name needs
+ * (0: the name decides). cbm_language_classify takes those bytes raw, `more`
+ * when the file has bytes beyond them, and `readable` false when they could
+ * not be read (each probe then keeps the name's default, as a failed open
+ * always did). The name lookup consults the installed user language config. */
+size_t cbm_language_probe_bytes(const char *filename);
+CBMLanguage cbm_language_classify(const char *filename, const unsigned char *head, size_t head_len,
+                                  bool more, bool readable);
+
+/* The same with the language config given explicitly (NULL: none) instead of
+ * the installed process-wide one, for a caller that classifies a snapshot
+ * under that snapshot's config while another index may have its own
+ * installed. */
+size_t cbm_language_probe_bytes_with(const cbm_userconfig_t *config, const char *filename);
+CBMLanguage cbm_language_classify_with(const cbm_userconfig_t *config, const char *filename,
+                                       const unsigned char *head, size_t head_len, bool more,
+                                       bool readable);
+
+/* The most leading bytes any name asks cbm_language_probe_bytes for. */
+#define CBM_LANGUAGE_PROBE_MAX 16384
+
+/* cbm_language_classify on the file at `path`, read raw. */
+CBMLanguage cbm_language_for_file(const char *filename, const char *path);
+
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
 typedef struct cbm_gitignore cbm_gitignore_t;
@@ -153,6 +180,7 @@ typedef struct {
     char *rel_path;       /* relative to repo root (heap-allocated) */
     CBMLanguage language; /* detected language */
     int64_t size;         /* file size in bytes */
+    int64_t mtime_ns;     /* modification time, ns (whole seconds on Windows) */
 } cbm_file_info_t;
 
 typedef struct {

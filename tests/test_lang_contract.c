@@ -463,11 +463,10 @@ TEST(contract_python_relative_import) {
 
 /* Python: relative aliased from-import must CALLS the real def (execute). */
 TEST(contract_python_aliased_from_import_calls) {
-    static const LangFile f[] = {
-        {"gate.py", "def execute(x):\n    return x\n"},
-        {"router.py",
-         "from .gate import execute as bridge_execute\n\n\n"
-         "def submit_task(y):\n    return bridge_execute(y)\n"}};
+    static const LangFile f[] = {{"gate.py", "def execute(x):\n    return x\n"},
+                                 {"router.py",
+                                  "from .gate import execute as bridge_execute\n\n\n"
+                                  "def submit_task(y):\n    return bridge_execute(y)\n"}};
     LangProj lp;
     cbm_store_t *store = lang_index_files(&lp, f, 2);
     ASSERT_TRUE(store != NULL);
@@ -560,10 +559,8 @@ TEST(contract_python_absolute_aliased_from_import_calls) {
 
 /* Python: unresolvable module + alias must emit no CALLS (no invented edge). */
 TEST(contract_python_ghost_module_aliased_from_import_no_calls) {
-    static const LangFile f[] = {
-        {"router.py",
-         "from ghost_module import nope as alias\n\n\n"
-         "def submit_task(y):\n    return alias(y)\n"}};
+    static const LangFile f[] = {{"router.py", "from ghost_module import nope as alias\n\n\n"
+                                               "def submit_task(y):\n    return alias(y)\n"}};
     LangProj lp;
     cbm_store_t *store = lang_index_files(&lp, f, 1);
     ASSERT_TRUE(store != NULL);
@@ -1073,6 +1070,7 @@ static const char *ALL_EDGE_TYPES[] = {"CALLS",
                                        "REFERENCES_FILE",
                                        "SEMANTICALLY_RELATED",
                                        "SIMILAR_TO",
+                                       "SPAWNS",
                                        "TESTS_FILE",
                                        "TESTS",
                                        "TRPC_CALLS",
@@ -1760,10 +1758,11 @@ TEST(contract_edge_parallel_service_edges) {
     if (store) {
         sqlite3_stmt *stmt = NULL;
         sqlite3 *db = cbm_store_get_db(store);
-        if (db && sqlite3_prepare_v2(db,
-                                    "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
-                                    "AND properties != '' AND json_valid(properties)=0;",
-                                    -1, &stmt, NULL) == SQLITE_OK &&
+        if (db &&
+            sqlite3_prepare_v2(db,
+                               "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                               "AND properties != '' AND json_valid(properties)=0;",
+                               -1, &stmt, NULL) == SQLITE_OK &&
             sqlite3_step(stmt) == SQLITE_ROW) {
             invalid_props = sqlite3_column_int(stmt, 0);
         }
