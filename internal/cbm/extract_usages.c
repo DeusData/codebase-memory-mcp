@@ -1779,9 +1779,25 @@ static uint32_t active_lexical_scope_id(const WalkState *state) {
 static uint32_t lexical_ancestor_of_kind(const WalkState *state, uint32_t start_id,
                                          bool want_function, bool want_block);
 
-static bool python_default_value_reference(TSNode node) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+/* One step up: on the occurrence cursor when there is one, else with
+ * ts_node_parent, which descends from the ROOT, so a climb costs O(depth^2). */
+static TSNode usage_parent_step(TSTreeCursor *cursor, TSNode current) {
+    if (cursor) {
+        return ts_tree_cursor_goto_parent(cursor) ? ts_tree_cursor_current_node(cursor)
+                                                  : (TSNode){0};
+    }
+    usage_slow_parent_fallback_test_note();
+    return ts_node_parent(current);
+}
+
+/* Asked for every Python usage, and a deep expression puts O(depth) parents
+ * above each one. A tree without errors climbs them on the walk cursor, like
+ * python_scope_directive_kind; a tree with errors keeps ts_node_parent. */
+static bool python_default_value_reference(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
+    TSTreeCursor *cursor =
+        ts_node_has_error(ctx->root) ? NULL : reset_occurrence_cursor(state, node);
+    for (TSNode parent = usage_parent_step(cursor, node); !ts_node_is_null(parent);
+         parent = usage_parent_step(cursor, parent)) {
         const char *kind = ts_node_type(parent);
         /* A nested executable scope inside the default owns its own lookups;
          * only a direct default expression is evaluated in the declaring
@@ -1802,10 +1818,10 @@ static bool python_default_value_reference(TSNode node) {
     return false;
 }
 
-static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, const WalkState *state,
-                                                TSNode node) {
+static uint32_t usage_lexical_scope_id_for_node(CBMExtractCtx *ctx, WalkState *state, TSNode node) {
     uint32_t scope_id = active_lexical_scope_id(state);
-    if (!ctx || ctx->language != CBM_LANG_PYTHON || !python_default_value_reference(node)) {
+    if (!ctx || ctx->language != CBM_LANG_PYTHON ||
+        !python_default_value_reference(ctx, state, node)) {
         return scope_id;
     }
     uint32_t function_id = lexical_ancestor_of_kind(state, scope_id, true, false);
@@ -1881,13 +1897,41 @@ static bool ensure_lexical_binding_capacity(WalkState *state) {
 }
 
 static bool lexical_ancestor_kind(TSNode node, const char *kind) {
-    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
-         parent = ts_node_parent(parent)) {
+    for (TSNode parent = usage_parent_step(NULL, node); !ts_node_is_null(parent);
+         parent = usage_parent_step(NULL, parent)) {
         if (strcmp(ts_node_type(parent), kind) == 0) {
             return true;
         }
     }
     return false;
+}
+
+/* Is `node` a name listed by a Python global/nonlocal statement? The grammar
+ * makes those names direct children of the statement, so in a tree without
+ * errors one parent step on the walk cursor answers it. The full climb above
+ * steps with ts_node_parent, which descends from the ROOT each time: O(depth^2)
+ * per identifier, asked for every Python identifier, so one deep arithmetic
+ * expression went cubic. Error recovery can put a name under an ERROR child of
+ * the statement, so a tree with errors keeps the full climb. */
+static CBMPythonDirectiveKind python_scope_directive_kind(CBMExtractCtx *ctx, WalkState *state,
+                                                          TSNode node) {
+    if (ts_node_has_error(ctx->root)) {
+        if (lexical_ancestor_kind(node, "global_statement")) {
+            return CBM_PYTHON_DIRECTIVE_GLOBAL;
+        }
+        return lexical_ancestor_kind(node, "nonlocal_statement") ? CBM_PYTHON_DIRECTIVE_NONLOCAL
+                                                                 : 0;
+    }
+    TSNode parent;
+    const char *field;
+    if (!occurrence_parent(reset_occurrence_cursor(state, node), node, &parent, &field)) {
+        return 0;
+    }
+    const char *kind = ts_node_type(parent);
+    if (strcmp(kind, "global_statement") == 0) {
+        return CBM_PYTHON_DIRECTIVE_GLOBAL;
+    }
+    return strcmp(kind, "nonlocal_statement") == 0 ? CBM_PYTHON_DIRECTIVE_NONLOCAL : 0;
 }
 
 static TSNode declared_function_name_owner(TSNode node, const CBMLangSpec *spec) {
@@ -2236,13 +2280,11 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     TSNode function_declaration = declared_function_name_owner(node, spec);
     TSNode class_declaration = declared_class_name_owner(node, spec);
 
-    if (ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"))) {
+    CBMPythonDirectiveKind scope_directive =
+        ctx->language == CBM_LANG_PYTHON ? python_scope_directive_kind(ctx, state, node) : 0;
+    if (scope_directive) {
         uint32_t function_id = lexical_ancestor_of_kind(state, current_id, true, false);
-        CBMPythonDirectiveKind directive = lexical_ancestor_kind(node, "global_statement")
-                                               ? CBM_PYTHON_DIRECTIVE_GLOBAL
-                                               : CBM_PYTHON_DIRECTIVE_NONLOCAL;
-        record_python_directive(state, function_id, name, directive);
+        record_python_directive(state, function_id, name, scope_directive);
         return;
     }
 
@@ -2709,8 +2751,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     }
 
     bool python_scope_directive =
-        ctx->language == CBM_LANG_PYTHON && (lexical_ancestor_kind(node, "global_statement") ||
-                                             lexical_ancestor_kind(node, "nonlocal_statement"));
+        ctx->language == CBM_LANG_PYTHON && python_scope_directive_kind(ctx, state, node) != 0;
     if (python_scope_directive || is_binding_occurrence(ctx, node, spec, state)) {
         char *binding_name = reference_name(ctx, node);
         if (binding_name && binding_name[0] && !cbm_is_keyword(binding_name, ctx->language)) {
