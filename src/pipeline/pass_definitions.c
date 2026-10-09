@@ -864,6 +864,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 }
                 cbm_free(CBM_MEM_CLASS_EXTRACT, local_cache);
             }
+            cbm_work_arena_release();
             return CBM_NOT_FOUND;
         }
 
@@ -992,6 +993,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         total_calls += result->calls.count;
 
         if (local_cache) {
+            /* The cache lives through every later pass: hold the result as the
+             * parallel extract does (pass_parallel.c), without its tree (the
+             * cross-file LSP re-parses) and compacted. */
+            cbm_free_tree(result);
+            cbm_result_compact(result);
             local_cache[i] = result;
         } else {
             /* Cache unavailable: imports for this file can still only
@@ -1004,6 +1010,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_free_result(result);
         }
     }
+    cbm_work_arena_release(); /* the working arena compaction kept between files */
 
     /* Phase 2: now that all extraction results are cached and Module
      * nodes for every file are in the graph, walk the cache again to
