@@ -164,6 +164,8 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"form", CBM_LANG_FORM},
     {"magma", CBM_LANG_MAGMA},
     {"wolfram", CBM_LANG_WOLFRAM},
+    {"jinja2", CBM_LANG_JINJA2},
+    {"jinja", CBM_LANG_JINJA2},
 };
 
 #define LANG_NAME_TABLE_SIZE (sizeof(LANG_NAME_TABLE) / sizeof(LANG_NAME_TABLE[0]))
