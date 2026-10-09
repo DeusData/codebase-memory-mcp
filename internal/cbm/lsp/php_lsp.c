@@ -19,6 +19,7 @@
 
 #include "php_lsp.h"
 #include "lsp_node_iter.h"
+#include "../cbm.h"
 #include "../helpers.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -4489,6 +4490,9 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
                            TSTree *cached_tree, CBMResolvedCallArray *out) {
     if (!arena || !source || source_len <= 0 || !out)
         return;
+    /* The retained source is the file on disk; read it the way the per-file
+     * extract did, so the cached tree and node text agree (#2000). */
+    source = cbm_php_mask_inline_html(arena, source, source_len);
 
     TSParser *parser = NULL;
     TSTree *tree = cached_tree;

@@ -107,6 +107,65 @@ TEST(phplsp_local_method_via_typed_param) {
     PASS();
 }
 
+/* #2000: with no cached tree (a result spilled under the memory budget comes
+ * back without one) the cross-file pass re-parses the on-disk source itself.
+ * It must blank inline HTML exactly as the per-file extract does, or a file's
+ * tail would lose cross-file resolution only when that file spilled. */
+static int find_resolved_arr(const CBMResolvedCallArray *arr, const char *callerSub,
+                             const char *calleeSub) {
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, callerSub) && rc->callee_qn &&
+            strstr(rc->callee_qn, calleeSub))
+            return i;
+    }
+    return -1;
+}
+
+TEST(phplsp_cross_reparse_reads_past_inline_html_issue2000) {
+    const char *src = "<?php\n"
+                      "function gamma() { return 2; }\n"
+                      "?>\n"
+                      "<div class=\"box\">\n"
+                      "  <p>plain markup after the closing tag</p>\n"
+                      "</div>\n"
+                      "<?php\n"
+                      "function delta(Mailer $m) { return $m->send(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.gamma",
+         .short_name = "gamma",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.main.delta",
+         .short_name = "delta",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.mailer.Mailer",
+         .short_name = "Mailer",
+         .label = "Class",
+         .def_module_qn = "test.mailer"},
+        {.qualified_name = "test.mailer.Mailer.send",
+         .short_name = "send",
+         .label = "Method",
+         .def_module_qn = "test.mailer",
+         .receiver_type = "test.mailer.Mailer"},
+    };
+    const char *imp_names[] = {"Mailer"};
+    const char *imp_qns[] = {"test.mailer.Mailer"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_php_lsp_cross(&arena, src, (int)strlen(src), "test.main", defs, 4, imp_names, imp_qns,
+                          1, NULL, &out);
+
+    ASSERT_GTE(find_resolved_arr(&out, "main.delta", "Mailer.send"), 0);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── 3. Arrow function with typed parameter ───────────────────── */
 
 TEST(phplsp_arrow_function_typed_param) {
@@ -5314,6 +5373,7 @@ SUITE(php_lsp) {
     /* Phase 1 baseline regressions */
     RUN_TEST(phplsp_local_method_via_new_assignment);
     RUN_TEST(phplsp_local_method_via_typed_param);
+    RUN_TEST(phplsp_cross_reparse_reads_past_inline_html_issue2000);
     RUN_TEST(phplsp_arrow_function_typed_param);
     RUN_TEST(phplsp_static_call_resolved);
     RUN_TEST(phplsp_self_and_parent);

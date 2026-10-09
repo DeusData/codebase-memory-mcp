@@ -783,6 +783,192 @@ TEST(php_function) {
     PASS();
 }
 
+/* #2000: inline HTML between `?>` and `<?php` is valid PHP, but the php_only
+ * grammar has no rule for it, so everything after the first `?>` fell into an
+ * ERROR region and never reached the graph. */
+static const CBMCall *find_call_named(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0)
+            return &r->calls.items[i];
+    }
+    return NULL;
+}
+
+static int php_def_line(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, name) == 0)
+            return (int)r->defs.items[i].start_line;
+    }
+    return -1;
+}
+
+TEST(php_inline_html_tail_reaches_graph_issue2000) {
+    CBMFileResult *r = extract("<?php\n"
+                               "function gamma() { return 2; }\n"
+                               "?>\n"
+                               "<div class=\"box\">\n"
+                               "  <p>plain markup after the closing tag</p>\n"
+                               "</div>\n"
+                               "<?php\n"
+                               "function delta() { return gamma(); }\n",
+                               CBM_LANG_PHP, "t", "inline_html.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "gamma"));
+    ASSERT(has_def(r, "Function", "delta"));
+    /* Lines are in original-file coordinates. */
+    ASSERT_EQ(php_def_line(r, "gamma"), 2);
+    ASSERT_EQ(php_def_line(r, "delta"), 8);
+    const CBMCall *c = find_call_named(r, "gamma");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(strstr(c->enclosing_func_qn, "delta"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* View-file shapes: echo tags keep their calls, and control structures that
+ * are opened in one PHP block and closed in a later one still parse. */
+TEST(php_inline_html_template_shapes_issue2000) {
+    CBMFileResult *r = extract("<!DOCTYPE html>\n"
+                               "<html><head><title><?= page_title($page) ?></title></head>\n"
+                               "<body>\n"
+                               "<?php if ($user): ?>\n"
+                               "  <p>Hello <?=$user->name?></p>\n"
+                               "<?php else: ?>\n"
+                               "  <a href=\"/login\">log in</a>\n"
+                               "<?php endif; ?>\n"
+                               "<?php foreach ($items as $item) { ?>\n"
+                               "  <li><?php echo render_item($item); ?></li>\n"
+                               "<?php } ?>\n"
+                               "<?php function footer_links() { return nav_links(); } ?>\n"
+                               "</body></html>\n",
+                               CBM_LANG_PHP, "t", "view.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "page_title"));
+    ASSERT(has_call(r, "render_item"));
+    ASSERT(has_def(r, "Function", "footer_links"));
+    ASSERT_EQ(php_def_line(r, "footer_links"), 12);
+    ASSERT(has_call(r, "nav_links"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `?>` only leaves PHP mode from code or a one-line comment. Inside strings,
+ * heredoc, nowdoc and block comments it is text; `#[` is an attribute, not a
+ * comment; `<?xml` in markup is not an open tag. */
+TEST(php_inline_html_close_tag_in_literals_issue2000) {
+    CBMFileResult *r = extract("<?php\n"
+                               "$a = 'single ?> quoted';\n"
+                               "$b = \"double ?> quoted \\\" still\";\n"
+                               "$c = <<<EOT\n"
+                               "  heredoc ?> body\n"
+                               "  EOT;\n"
+                               "$d = <<<'NOW'\n"
+                               "nowdoc ?> body\n"
+                               "NOW;\n"
+                               "/* block ?> comment */\n"
+                               "#[Pure]\n"
+                               "function one() { return 1; }\n"
+                               "// line comment ends here ?>\n"
+                               "<?xml version=\"1.0\"?><note/>\n"
+                               "<?php\n"
+                               "function two() { return one(); }\n",
+                               CBM_LANG_PHP, "t", "literals.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "one"));
+    ASSERT(has_def(r, "Function", "two"));
+    ASSERT_EQ(php_def_line(r, "two"), 16);
+    ASSERT(has_call(r, "one"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Markup is blanked, never parsed: code-shaped text outside the PHP tags must
+ * not produce definitions or calls, wherever it sits. */
+TEST(php_inline_html_markup_never_reaches_graph_issue2000) {
+    CBMFileResult *r = extract("<p>function before() { return leakBefore(); }</p>\n"
+                               "<?php\n"
+                               "function real() { return 1; }\n"
+                               "?>\n"
+                               "<p>function fake() { return leak(); }</p>\n"
+                               "<script>function jsFake() { leakScript(); }</script>\n"
+                               "<?xml version=\"1.0\"?><x>function xmlFake() { leakXml(); }</x>\n"
+                               "<?php\n"
+                               "function after() { return real(); }\n"
+                               "?>\n"
+                               "<p>class Tail { function tailFake() { leakTail(); } }</p>\n",
+                               CBM_LANG_PHP, "t", "markup.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "real"));
+    ASSERT(has_def(r, "Function", "after"));
+    ASSERT(has_call(r, "real"));
+    ASSERT_FALSE(has_def_any(r, "before"));
+    ASSERT_FALSE(has_def_any(r, "fake"));
+    ASSERT_FALSE(has_def_any(r, "jsFake"));
+    ASSERT_FALSE(has_def_any(r, "xmlFake"));
+    ASSERT_FALSE(has_def_any(r, "Tail"));
+    ASSERT_FALSE(has_def_any(r, "tailFake"));
+    ASSERT_FALSE(has_call(r, "leak"));
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The mask hands back the caller's buffer, uncopied, when nothing needs
+ * rewriting, and a same-length rewrite otherwise. The pointer alone cannot
+ * tell copy-on-write from an eager copy, so the arena's allocation total is
+ * sampled around each call: no bytes for `plain` and `quoted`, a copy for
+ * `mixed`. */
+TEST(php_inline_html_mask_copies_only_on_write_issue2000) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *plain = "<?php\nfunction a() { return 1; }\n";
+    const char *quoted = "<?php\n$s = '?>';\n/* ?> */\n$h = <<<EOT\n?>\nEOT;\n";
+    const char *mixed = "<?php\nfunction a() {}\n?>\n<b>x</b>\n";
+
+    size_t before = cbm_arena_total(&arena);
+    ASSERT(cbm_php_mask_inline_html(&arena, plain, (int)strlen(plain)) == plain);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
+    ASSERT(cbm_php_mask_inline_html(&arena, quoted, (int)strlen(quoted)) == quoted);
+    ASSERT_EQ(cbm_arena_total(&arena), before);
+
+    before = cbm_arena_total(&arena);
+    const char *masked = cbm_php_mask_inline_html(&arena, mixed, (int)strlen(mixed));
+    ASSERT(cbm_arena_total(&arena) > before);
+    ASSERT(masked != mixed);
+    ASSERT_EQ((int)strlen(masked), (int)strlen(mixed));
+    ASSERT_STR_EQ(masked, "<?php\nfunction a() {}\n; \n        \n");
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* A trailing `?>` (common at the end of older class files) is not a partial
+ * parse, and CRLF line endings keep their line numbers. */
+TEST(php_inline_html_trailing_close_tag_crlf_issue2000) {
+    CBMFileResult *r = extract("<?php\r\n"
+                               "class Repo {\r\n"
+                               "    public function find($id) { return $id; }\r\n"
+                               "}\r\n"
+                               "?>\r\n",
+                               CBM_LANG_PHP, "t", "Repo.php");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Repo"));
+    ASSERT(has_def(r, "Method", "find"));
+    ASSERT_EQ(php_def_line(r, "find"), 3);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Ruby --- */
 TEST(ruby_class) {
     CBMFileResult *r = extract("class Animal\n  def initialize(name)\n    @name = name\n  end\n  "
@@ -10405,6 +10591,12 @@ SUITE(extraction) {
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
     RUN_TEST(php_function);
+    RUN_TEST(php_inline_html_tail_reaches_graph_issue2000);
+    RUN_TEST(php_inline_html_template_shapes_issue2000);
+    RUN_TEST(php_inline_html_close_tag_in_literals_issue2000);
+    RUN_TEST(php_inline_html_markup_never_reaches_graph_issue2000);
+    RUN_TEST(php_inline_html_mask_copies_only_on_write_issue2000);
+    RUN_TEST(php_inline_html_trailing_close_tag_crlf_issue2000);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
     RUN_TEST(csharp_class);
