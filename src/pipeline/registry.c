@@ -1206,8 +1206,10 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
     const char *primary =
         name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn) ? name : derived;
     index_under_name(r, primary, owned_qn, lang);
-    /* '#' is a QN fence; no extractor mints one for a definition today (Rust
-     * cfg twins are variants of one plain QN). A grammar that starts
+    /* '#' is a QN fence; no extractor mints one for a REGISTERED definition
+     * today (Rust cfg twins are variants of one plain QN; a C macro's QN ends in
+     * "#macro", but Macro is no registry label, so it never gets here). A
+     * grammar that starts
      * minting a '#' opts into this second key by doing so, whatever it means by
      * the fence: its symbols become reachable under the passed name as well,
      * and they share that name's bucket with everything else filed under it.

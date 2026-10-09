@@ -3,6 +3,7 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
+#include "foundation/hash_table.h"
 #include "foundation/log.h" // cbm_log_error
 #include "discover/test_conventions.h"
 #include "foundation/sha256.h"
@@ -212,6 +213,9 @@ enum { RT_PAIR_SIZE = 2 };
 // Forward declarations
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
+static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                           const char *kind, char *name);
+static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused);
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
 static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
@@ -542,6 +546,13 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
     for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
         const char *dk = ts_node_type(decl);
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
+            if (cbm_c_qualifier_is_recovered(decl)) {
+                /* `API RetT name(...)` misread as `RetT::name` (MISSING "::"):
+                 * RetT is the return type, not a class. Keep looking for a real
+                 * qualifier on the name side. */
+                decl = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+                continue;
+            }
             qid = decl;
             break;
         }
@@ -4941,6 +4952,11 @@ static TSNode find_c_params(TSNode func_node) {
             return params;
         }
         TSNode nested = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        /* `API RetT *name(...)` misread as `RetT::*name(...)` (MISSING "::"):
+         * the function declarator is on the qualifier's name side. */
+        if (ts_node_is_null(nested) && cbm_c_qualifier_is_recovered(decl)) {
+            nested = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+        }
         /* tree-sitter-cpp and tree-sitter-cuda do not assign the nested
          * function declarator a `declarator` field when a reference return
          * wraps it (`Item& operator[](int)`).  That wrapper has one named child;
@@ -5049,6 +5065,63 @@ static bool is_c_declarator_lang(CBMLanguage lang) {
     return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
            lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
            lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC;
+}
+
+/* C-family `struct X` / `union X` / `enum X` / `class X` WITHOUT a body is a
+ * reference to the type — a forward declaration, a variable, parameter or field
+ * type, a sizeof operand, the aliased side of `typedef struct X Y;` — never its
+ * definition. Minting a def for it put a one-line Class/Enum node on the type's
+ * QN: when the definition shares that QN (same file, or a same-stem .h/.c pair,
+ * whose module QNs coincide), the later or smaller-path reference displaced the
+ * definition, and elsewhere it left a phantom type node in every file that
+ * merely mentions the type (`struct timeval` in redis-cli.c). */
+static bool is_c_tag_reference(CBMLanguage lang, TSNode node, const char *kind) {
+    if (!is_c_declarator_lang(lang)) {
+        return false;
+    }
+    if (strcmp(kind, "struct_specifier") != 0 && strcmp(kind, "union_specifier") != 0 &&
+        strcmp(kind, "enum_specifier") != 0 && strcmp(kind, "class_specifier") != 0) {
+        return false;
+    }
+    return ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("body")));
+}
+
+/* Languages whose plain `enum` is UNSCOPED: its enumerators are names of the
+ * scope that holds the enum, not of the enum (C, C++ and its CUDA dialect,
+ * Objective-C). `XXH_OK` of `typedef enum { XXH_OK, XXH_ERROR } XXH_errorcode;`
+ * is written and looked up as plain XXH_OK, so its QN is `<scope>.XXH_OK`. */
+static bool c_enum_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_OBJC;
+}
+
+/* Is a struct, union or class around an unscoped enum the scope of its
+ * enumerators? In C++ (and CUDA; every .h is parsed as C++) it is: the
+ * enumerator is `Brush::ROUND`. C and Objective-C have no struct scope for
+ * ordinary identifiers: an enum declared inside a struct puts its enumerators
+ * in the scope around the struct and the code names them unqualified, so the
+ * struct is no segment of their QN. */
+static bool c_enum_scope_is_class(CBMLanguage lang) {
+    return lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA;
+}
+
+/* C++11 `enum class X` / `enum struct X`: the scoping keyword is an anonymous
+ * token child between `enum` and the body. Its enumerators stay `X::A`. */
+static bool c_enum_is_scoped(TSNode enum_node) {
+    TSNode body = ts_node_child_by_field_name(enum_node, TS_FIELD("body"));
+    uint32_t stop = ts_node_is_null(body) ? UINT32_MAX : ts_node_start_byte(body);
+    uint32_t nc = ts_node_child_count(enum_node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(enum_node, i);
+        if (ts_node_start_byte(c) >= stop) {
+            break;
+        }
+        if (!ts_node_is_named(c) &&
+            (strcmp(ts_node_type(c), "class") == 0 || strcmp(ts_node_type(c), "struct") == 0)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Render the canonical return type into `out`; returns how many qualifiers and
@@ -7024,6 +7097,58 @@ static void extract_py_field_types(CBMExtractCtx *ctx, TSNode class_node, const 
     }
 }
 
+/* Name of a C# namespace declaration node (block or file-scoped), or NULL. */
+static const char *cs_namespace_decl_name(CBMArena *a, TSNode ns, const char *source) {
+    TSNode nm = ts_node_child_by_field_name(ns, TS_FIELD("name"));
+    if (ts_node_is_null(nm)) {
+        return NULL;
+    }
+    const char *text = cbm_node_text(a, nm, source);
+    return text && text[0] ? text : NULL;
+}
+
+/* Declared namespace of a C# type declaration: every enclosing namespace
+ * block (outer to inner) under an optional file-scoped namespace, which the
+ * grammar may attach either as an ancestor or as a preceding sibling of the
+ * compilation unit's members. NULL = global namespace. The file-level
+ * namespace_name keeps only the FIRST namespace of a file, which mislabels
+ * every type of a multi-namespace file (#2120). */
+static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *source) {
+    const char *acc = NULL;
+    bool file_scoped = false;
+    TSNode top = node;
+    for (TSNode cur = ts_node_parent(node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        const char *k = ts_node_type(cur);
+        bool is_file_scoped = strcmp(k, "file_scoped_namespace_declaration") == 0;
+        if (is_file_scoped || strcmp(k, "namespace_declaration") == 0) {
+            const char *name = cs_namespace_decl_name(a, cur, source);
+            if (name) {
+                acc = acc ? cbm_arena_sprintf(a, "%s.%s", name, acc) : name;
+            }
+            file_scoped = file_scoped || is_file_scoped;
+        }
+        top = cur;
+    }
+    if (file_scoped) {
+        return acc;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t n = ts_node_named_child_count(top);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(top, i);
+        if (ts_node_start_byte(c) >= start) {
+            break;
+        }
+        if (strcmp(ts_node_type(c), "file_scoped_namespace_declaration") == 0) {
+            const char *name = cs_namespace_decl_name(a, c, source);
+            if (name) {
+                return acc ? cbm_arena_sprintf(a, "%s.%s", name, acc) : name;
+            }
+        }
+    }
+    return acc;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
@@ -7032,6 +7157,26 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         return;
     }
     if (extract_sql_ddl_class_def(ctx, node, kind)) {
+        return;
+    }
+    if (is_c_tag_reference(ctx->language, node, kind)) {
+        return;
+    }
+    /* A C/C++ typedef carries no `name` field (the alias names live in its
+     * declarators), so the generic path below always dropped it. */
+    if (is_c_declarator_lang(ctx->language) && strcmp(kind, "type_definition") == 0) {
+        extract_c_typedef(ctx, node, spec);
+        return;
+    }
+    /* An anonymous C-family enum (`enum { A, B };`, also as a variable's or
+     * member's type) has no Enum def to mint, but its enumerators are names of
+     * the enclosing scope all the same. Inside a typedef, extract_c_typedef
+     * names the enum and emits them. */
+    if (c_enum_lang(ctx->language) && strcmp(kind, "enum_specifier") == 0 &&
+        ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("name")))) {
+        if (!doc_kind_is(doc_parent(ctx, node), "type_definition")) {
+            extract_enum_members(ctx, node, NULL);
+        }
         return;
     }
 
@@ -7286,27 +7431,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             }
             break;
         }
-        case CBM_LANG_C:
-        case CBM_LANG_CPP: { // `typedef struct { … } Name;`: the aggregate is
-                             // anonymous and the typedef's declarator names it.
-                             // A pointer/array/function declarator names another
-                             // type, not the aggregate, so only a plain
-                             // type_identifier counts.
-            if (strcmp(kind, "struct_specifier") != 0 && strcmp(kind, "union_specifier") != 0 &&
-                strcmp(kind, "enum_specifier") != 0) {
-                break;
-            }
-            TSNode parent = ts_node_parent(node);
-            if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "type_definition") != 0) {
-                break;
-            }
-            TSNode declarator = ts_node_child_by_field_name(parent, TS_FIELD("declarator"));
-            if (!ts_node_is_null(declarator) &&
-                strcmp(ts_node_type(declarator), "type_identifier") == 0) {
-                name_node = declarator;
-            }
-            break;
-        }
+        /* C/C++ `typedef struct { … } Name;` is named by extract_c_typedef from
+         * the type_definition; naming the anonymous specifier here as well
+         * emitted Name twice (members twice, a false variant). */
         default:
             break;
         }
@@ -7319,6 +7446,16 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     if (!name || !name[0]) {
         return;
     }
+    emit_class_def(ctx, node, spec, kind, name);
+}
+
+/* Emit the class-like def for `node` under `name`, plus its members (enum
+ * members, methods, fields, class variables). Split from extract_class_def so a
+ * C `typedef struct { ... } Name;` can name its anonymous struct after the
+ * typedef (extract_c_typedef). */
+static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                           const char *kind, char *name) {
+    CBMArena *a = ctx->arena;
 
     // For nested classes, prefix with enclosing class QN (e.g., Outer.Inner).
     // Top-level classes use the language-aware module QN so Java/Go don't double
@@ -7412,6 +7549,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
+    if (ctx->language == CBM_LANG_CSHARP && !ctx->enclosing_class_qn) {
+        def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
+    }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
@@ -7483,6 +7623,139 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             }
         }
     }
+}
+
+/* The alias a C typedef declarator introduces: the type_identifier at the end
+ * of its pointer / array / function / parenthesized declarator chain
+ * (`typedef int (*cmp_fn)(const void *, const void *);` names cmp_fn). The C
+ * grammar lexes stdint-style names as primitive_type (`typedef unsigned
+ * uint32_t;` in a compat header), so that leaf counts as well. */
+static TSNode c_typedef_alias_node(TSNode decl) {
+    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
+        const char *dk = ts_node_type(decl);
+        if (strcmp(dk, "type_identifier") == 0 || strcmp(dk, "primitive_type") == 0) {
+            return decl;
+        }
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        decl = inner;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+/* C/C++ `typedef`: one def per alias name its declarators introduce.
+ *   typedef struct { ... } Name;    -> the anonymous struct IS Name: Class/Enum
+ *                                      Name with its fields / enum members
+ *   typedef struct Tag { ... } Tag; -> nothing extra: the struct def Tag (the
+ *                                      walk reaches the specifier) is the entity
+ *   typedef struct Tag Name;        -> Type Name (alias; the struct is a
+ *   typedef struct Tag Tag;            reference, see is_c_tag_reference). An
+ *   typedef unsigned int Name;         identity alias of an incomplete struct is
+ *   typedef int (*Name)(int);          often the only declaration of an opaque
+ *                                      handle type in the repo.
+ * The type_definition span and the doc comment above it belong to every alias.
+ * QN scheme unchanged: <module>.<Name>, or <enclosing class>.<Name> inside a
+ * C++ class body. drop_c_typedefs_shadowed_by_tags then removes an alias whose
+ * QN a struct/union/enum definition in the same file holds. */
+static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    CBMArena *a = ctx->arena;
+    TSNode type = ts_node_child_by_field_name(node, TS_FIELD("type"));
+    const char *tk = ts_node_is_null(type) ? "" : ts_node_type(type);
+    bool tag_kind = strcmp(tk, "struct_specifier") == 0 || strcmp(tk, "union_specifier") == 0 ||
+                    strcmp(tk, "enum_specifier") == 0 || strcmp(tk, "class_specifier") == 0;
+    bool has_body =
+        tag_kind && !ts_node_is_null(ts_node_child_by_field_name(type, TS_FIELD("body")));
+    TSNode tag_node = {0};
+    if (tag_kind) {
+        tag_node = ts_node_child_by_field_name(type, TS_FIELD("name"));
+    }
+    /* Only a tag DEFINED here makes a same-named alias redundant. */
+    const char *tag =
+        (ts_node_is_null(tag_node) || !has_body) ? NULL : cbm_node_text(a, tag_node, ctx->source);
+    bool anonymous_body = has_body && ts_node_is_null(tag_node);
+
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    for (; more; more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        const char *field = ts_tree_cursor_current_field_name(&cursor);
+        if (!field || strcmp(field, "declarator") != 0) {
+            continue;
+        }
+        TSNode decl = ts_tree_cursor_current_node(&cursor);
+        TSNode alias_node = c_typedef_alias_node(decl);
+        char *name = ts_node_is_null(alias_node) ? NULL : cbm_node_text(a, alias_node, ctx->source);
+        if (!name || !name[0] || (tag && strcmp(tag, name) == 0)) {
+            continue;
+        }
+        if (anonymous_body && ts_node_eq(decl, alias_node)) {
+            /* its doc is the comment above the typedef (doc_anchor_c) */
+            emit_class_def(ctx, type, spec, tk, name);
+            anonymous_body = false; /* a second plain name is an alias of the first */
+            continue;
+        }
+        CBMDefinition def;
+        memset(&def, 0, sizeof(def));
+        def.name = name;
+        def.qualified_name =
+            ctx->enclosing_class_qn
+                ? cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name)
+                : cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+        def.label = "Type";
+        def.file_path = ctx->rel_path;
+        def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+        def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+        def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
+        def.is_exported = cbm_is_exported(name, ctx->language);
+        def.docstring = extract_docstring(ctx, node, name);
+        cbm_defs_push(&ctx->result->defs, a, def);
+    }
+    ts_tree_cursor_delete(&cursor);
+    /* No plain declarator named the anonymous enum (`typedef enum {A, B} *p;`):
+     * its enumerators are still names of the enclosing scope. */
+    if (anonymous_body && c_enum_lang(ctx->language) && strcmp(tk, "enum_specifier") == 0) {
+        extract_enum_members(ctx, type, NULL);
+    }
+}
+
+/* `typedef struct X X;` plus `struct X { ... };` in one file give the alias and
+ * the definition one QN, and the later line would win the graph upsert. The
+ * definition (fields, enum members, span) is the entity: drop the alias. Only
+ * defs from `first` on (this extraction pass) are considered, so the
+ * preprocessed rescue pass never filters the raw pass's defs. */
+static void drop_c_typedefs_shadowed_by_tags(CBMExtractCtx *ctx, int first) {
+    CBMDefArray *defs = &ctx->result->defs;
+    bool any_alias = false;
+    for (int i = first; i < defs->count && !any_alias; i++) {
+        any_alias = defs->items[i].label && strcmp(defs->items[i].label, "Type") == 0;
+    }
+    if (!any_alias) {
+        return;
+    }
+    CBMHashTable *tags = cbm_ht_create(CBM_SZ_64);
+    if (!tags) {
+        return;
+    }
+    for (int i = first; i < defs->count; i++) {
+        const CBMDefinition *d = &defs->items[i];
+        if (d->label && d->qualified_name &&
+            (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Enum") == 0)) {
+            cbm_ht_set(tags, d->qualified_name, (void *)d);
+        }
+    }
+    int w = first;
+    for (int i = first; i < defs->count; i++) {
+        const CBMDefinition *d = &defs->items[i];
+        if (d->label && d->qualified_name && strcmp(d->label, "Type") == 0 &&
+            cbm_ht_has(tags, d->qualified_name)) {
+            continue;
+        }
+        defs->items[w++] = defs->items[i];
+    }
+    defs->count = w;
+    cbm_ht_free(tags);
 }
 
 // Find the body/members node inside a class node
@@ -8375,40 +8648,144 @@ static bool is_enum_member_kind(const char *kind) {
            strcmp(kind, "enumerator") == 0;
 }
 
+/* How an enum's members are named.
+ *
+ * The member QN is `<enum QN>.<member>`, with one exception: a C-family
+ * UNSCOPED enum (c_enum_lang, not `enum class` / `enum struct`). Its enumerators
+ * live in the scope that holds the enum, so their QN is `<scope QN>.<member>`
+ * and `class_qn` -- NULL for an anonymous enum -- is not a segment. That scope
+ * is the module, or in C++ the enclosing namespace or class; a C or
+ * Objective-C struct is none (c_enum_scope_is_class). Every C-family
+ * enumerator of a named enum carries `parent_class` = the enum's QN, which is
+ * what ties a flattened enumerator to its enum. */
+typedef struct {
+    const char *class_qn; /* the enum's QN; NULL for an anonymous enum */
+    bool c_enum;          /* a C-family enum_specifier */
+    bool flat;            /* the member QN leaves the enum's name out */
+} enum_member_scope_t;
+
+/* One enum member -> a Variable def. `doc_node` is the node whose leading
+ * comments document it: the member itself, or the ERROR that opens its slot
+ * in a macro-wrapped C list (see extract_c_enum_members). */
+static void push_enum_member(CBMExtractCtx *ctx, TSNode member, TSNode doc_node,
+                             const enum_member_scope_t *scope) {
+    CBMArena *a = ctx->arena;
+    TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
+    if (ts_node_is_null(mname)) {
+        mname = cbm_find_child_by_kind(member, "identifier");
+    }
+    if (ts_node_is_null(mname)) {
+        return;
+    }
+    char *member_name = cbm_node_text(a, mname, ctx->source);
+    if (!member_name || !member_name[0]) {
+        return;
+    }
+    CBMDefinition mdef;
+    memset(&mdef, 0, sizeof(mdef));
+    mdef.name = member_name;
+    if (!scope->flat) {
+        mdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", scope->class_qn, member_name);
+    } else if (ctx->enclosing_class_qn && c_enum_scope_is_class(ctx->language)) {
+        mdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, member_name);
+    } else {
+        mdef.qualified_name =
+            cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, member_name, ctx->language);
+    }
+    if (scope->c_enum && scope->class_qn) {
+        mdef.parent_class = scope->class_qn;
+    }
+    mdef.label = "Variable";
+    mdef.file_path = ctx->rel_path;
+    mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
+    mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
+    mdef.docstring = extract_member_docstring(ctx, doc_node);
+    cbm_defs_push(&ctx->result->defs, a, mdef);
+}
+
+typedef struct {
+    int depth;     /* parentheses an ERROR child opened and none closed yet */
+    bool open;     /* the current slot has no constant yet */
+    bool has_head; /* an ERROR opened the current slot: `head` is that node */
+    TSNode head;
+} c_enum_slot_t;
+
+/* The parentheses and slot separators an ERROR child of the list carries. */
+static void c_enum_slot_scan_error(TSNode err, c_enum_slot_t *slot) {
+    if (slot->open && !slot->has_head) {
+        slot->head = err;
+        slot->has_head = true;
+    }
+    uint32_t n = ts_node_child_count(err);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *k = ts_node_type(ts_node_child(err, i));
+        if (strcmp(k, "(") == 0) {
+            slot->depth++;
+        } else if (strcmp(k, ")") == 0) {
+            if (slot->depth > 0) {
+                slot->depth--;
+            }
+        } else if (strcmp(k, ",") == 0 && slot->depth == 0) {
+            slot->open = true;
+            slot->has_head = false;
+        }
+    }
+}
+
+/* A C-family enumerator_list under error recovery. A macro in the list --
+ *     CURLOPT(CURLOPT_URL, CURLOPTTYPE_STRINGPOINT, 2),
+ *     CURLINFO_SPEED CURL_DEPRECATED(7.55.0, "...") = CURLINFO_DOUBLE + 9,
+ * -- is not enumerator grammar: the parser keeps every bare identifier it can
+ * as an `enumerator` and wraps the rest in ERROR nodes, so macro arguments and
+ * value operands come back as constants that do not exist (and, flattened,
+ * would take the plain QN of the macro they really are). The constant is the
+ * enumerator that OPENS a slot: the first one after `{` or after a `,` outside
+ * parentheses. A macro call that opens the slot hands that role to its first
+ * argument (the X-macro form), and the comment above the call documents it.
+ * A well-formed list has one enumerator per slot, so nothing changes there. */
+static void extract_c_enum_members(CBMExtractCtx *ctx, TSNode body,
+                                   const enum_member_scope_t *scope) {
+    c_enum_slot_t slot = {.depth = 0, .open = true, .has_head = false, .head = body};
+    TSTreeCursor cur = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cur);
+            const char *ck = ts_node_type(child);
+            if (strcmp(ck, ",") == 0) {
+                if (slot.depth == 0) {
+                    slot.open = true;
+                    slot.has_head = false;
+                }
+            } else if (strcmp(ck, "ERROR") == 0) {
+                c_enum_slot_scan_error(child, &slot);
+            } else if (strcmp(ck, "enumerator") == 0 && slot.open) {
+                push_enum_member(ctx, child, slot.has_head ? slot.head : child, scope);
+                slot.open = false;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+}
+
 /* Extract enum members as Variable nodes (C#, Java, TypeScript, C++). */
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
-    CBMArena *a = ctx->arena;
     TSNode body = find_class_body(node, ctx->language);
     if (ts_node_is_null(body)) {
+        return;
+    }
+    enum_member_scope_t scope = {.class_qn = class_qn, .c_enum = false, .flat = false};
+    scope.c_enum = c_enum_lang(ctx->language) && strcmp(ts_node_type(node), "enum_specifier") == 0;
+    scope.flat = scope.c_enum && (!class_qn || !c_enum_is_scoped(node));
+    if (scope.c_enum) {
+        extract_c_enum_members(ctx, body, &scope);
         return;
     }
     uint32_t mc = ts_node_named_child_count(body);
     for (uint32_t mi = 0; mi < mc; mi++) {
         TSNode member = ts_node_named_child(body, mi);
-        if (!is_enum_member_kind(ts_node_type(member))) {
-            continue;
+        if (is_enum_member_kind(ts_node_type(member))) {
+            push_enum_member(ctx, member, member, &scope);
         }
-        TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
-        if (ts_node_is_null(mname)) {
-            mname = cbm_find_child_by_kind(member, "identifier");
-        }
-        if (ts_node_is_null(mname)) {
-            continue;
-        }
-        char *member_name = cbm_node_text(a, mname, ctx->source);
-        if (!member_name || !member_name[0]) {
-            continue;
-        }
-        CBMDefinition mdef;
-        memset(&mdef, 0, sizeof(mdef));
-        mdef.name = member_name;
-        mdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, member_name);
-        mdef.label = "Variable";
-        mdef.file_path = ctx->rel_path;
-        mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
-        mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
-        mdef.docstring = extract_member_docstring(ctx, member);
-        cbm_defs_push(&ctx->result->defs, a, mdef);
     }
 }
 
@@ -10371,6 +10748,202 @@ static void wd_push_children_reverse(wd_stack_t *s, TSNode node, const char *enc
     free(kids);
 }
 
+/* 1-based line of the `}` that closes the `{` at `open`, or 0 when it does not
+ * close before `limit`. Counts only the first branch of every #if group (the
+ * first-branch projection rule of the C rescue in cbm.c): `#ifdef X struct {
+ * #else union { #endif` opens one brace, not two. Comments, string and char
+ * literals are skipped; dropped branches are ignored wholesale. */
+enum { C_BRACE_PP_DEPTH = 64 };
+
+static bool c_brace_directive_is(const char *p, const char *e, const char *w) {
+    size_t n = strlen(w);
+    return (size_t)(e - p) >= n && strncmp(p, w, n) == 0 &&
+           ((size_t)(e - p) == n || !isalpha((unsigned char)p[n]));
+}
+
+static uint32_t c_matching_brace_line(const char *src, uint32_t open, uint32_t limit,
+                                      uint32_t open_row) {
+    uint8_t branch[C_BRACE_PP_DEPTH];
+    uint8_t keep[C_BRACE_PP_DEPTH];
+    int pp = 0;
+    int depth = 0;
+    uint32_t row = open_row;
+    bool line_start = false;
+    for (uint32_t i = open; i < limit; i++) {
+        char c = src[i];
+        if (c == '\n') {
+            row++;
+            line_start = true;
+            continue;
+        }
+        if (line_start && (c == ' ' || c == '\t')) {
+            continue;
+        }
+        if (line_start && c == '#') {
+            const char *p = src + i + 1;
+            const char *e = src + limit;
+            while (p < e && (*p == ' ' || *p == '\t')) {
+                p++;
+            }
+            if (c_brace_directive_is(p, e, "if") || c_brace_directive_is(p, e, "ifdef") ||
+                c_brace_directive_is(p, e, "ifndef")) {
+                if (pp >= C_BRACE_PP_DEPTH) {
+                    return 0;
+                }
+                const char *q = p + 2;
+                while (q < e && isalpha((unsigned char)*q)) {
+                    q++;
+                }
+                while (q < e && (*q == ' ' || *q == '\t')) {
+                    q++;
+                }
+                bool zero = c_brace_directive_is(p, e, "if") && q < e && *q == '0' &&
+                            (q + 1 >= e || !isalnum((unsigned char)q[1]));
+                branch[pp] = 0;
+                keep[pp] = zero ? 1 : 0;
+                pp++;
+            } else if (c_brace_directive_is(p, e, "elif") || c_brace_directive_is(p, e, "else") ||
+                       c_brace_directive_is(p, e, "elifdef") ||
+                       c_brace_directive_is(p, e, "elifndef")) {
+                if (pp > 0) {
+                    branch[pp - 1] = branch[pp - 1] < UINT8_MAX ? branch[pp - 1] + 1 : UINT8_MAX;
+                } else {
+                    /* the next branch of a group opened before the brace: drop
+                     * everything up to that group's #endif */
+                    branch[0] = 1;
+                    keep[0] = 0;
+                    pp = 1;
+                }
+            } else if (c_brace_directive_is(p, e, "endif") && pp > 0) {
+                pp--;
+            }
+            /* skip the directive's logical line, backslash continuations included */
+            for (;;) {
+                while (i + 1 < limit && src[i + 1] != '\n') {
+                    i++;
+                }
+                if (i + 1 < limit && src[i] == '\\') {
+                    i++; /* onto the continued line's newline */
+                    row++;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+        line_start = false;
+        bool active = true;
+        for (int k = 0; k < pp && active; k++) {
+            active = branch[k] == keep[k];
+        }
+        if (!active) {
+            continue;
+        }
+        if (c == '/' && i + 1 < limit && src[i + 1] == '*') {
+            for (i += 2; i + 1 < limit && !(src[i] == '*' && src[i + 1] == '/'); i++) {
+                row += src[i] == '\n';
+            }
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < limit && src[i + 1] == '/') {
+            while (i + 1 < limit && src[i + 1] != '\n') {
+                i++;
+            }
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            for (i++; i < limit && src[i] != c && src[i] != '\n'; i++) {
+                if (src[i] == '\\' && i + 1 < limit) {
+                    i++;
+                    row += src[i] == '\n';
+                }
+            }
+            if (i < limit && src[i] == '\n') {
+                i--; /* unterminated literal: let the loop count the newline */
+            }
+            continue;
+        }
+        if (c == '{') {
+            depth++;
+        } else if (c == '}' && --depth == 0) {
+            return row + TS_LINE_OFFSET;
+        }
+    }
+    return 0;
+}
+
+/* tree-sitter can give up on a whole region and leave a definition head as loose
+ * ERROR tokens: `struct task_struct {` in the kernel's include-guarded sched.h is
+ * never recovered as a struct_specifier, so the type had no definition node (its
+ * only nodes were references, now dropped by is_c_tag_reference). The tokens
+ * `struct|union|class|enum NAME {` can only start a definition of NAME; recover it
+ * with its span up to the matching brace (members stay with the ERROR region). */
+static void recover_c_error_tag_heads(CBMExtractCtx *ctx, TSNode error_node) {
+    CBMArena *a = ctx->arena;
+    /* One linear cursor pass with a three-token window: a file-level ERROR can
+     * hold every top-level token of the file as a flat sibling, where indexed
+     * child access is quadratic (see wd_collect_children). */
+    TSTreeCursor cursor = ts_tree_cursor_new(error_node);
+    TSNode win[3];
+    memset(win, 0, sizeof(win));
+    uint32_t seen = 0;
+    /* Once one head never closes, later heads in this region will not either:
+     * do not rescan to the region end for each of them. */
+    bool unclosed = false;
+    bool more = ts_tree_cursor_goto_first_child(&cursor);
+    for (; more; more = ts_tree_cursor_goto_next_sibling(&cursor)) {
+        win[0] = win[1];
+        win[1] = win[2];
+        win[2] = ts_tree_cursor_current_node(&cursor);
+        if (++seen < 3) {
+            continue;
+        }
+        TSNode kw = win[0];
+        TSNode name_node = win[1];
+        TSNode brace = win[2];
+        if (ts_node_is_named(kw)) {
+            continue;
+        }
+        const char *k = ts_node_type(kw);
+        bool is_enum = strcmp(k, "enum") == 0;
+        if (!is_enum && strcmp(k, "struct") != 0 && strcmp(k, "union") != 0 &&
+            strcmp(k, "class") != 0) {
+            continue;
+        }
+        if (strcmp(ts_node_type(name_node), "type_identifier") != 0 || ts_node_is_named(brace) ||
+            strcmp(ts_node_type(brace), "{") != 0) {
+            continue;
+        }
+        char *name = cbm_node_text(a, name_node, ctx->source);
+        if (!name || !name[0]) {
+            continue;
+        }
+        uint32_t end_line = unclosed ? 0
+                                     : c_matching_brace_line(ctx->source, ts_node_start_byte(brace),
+                                                             ts_node_end_byte(error_node),
+                                                             ts_node_start_point(brace).row);
+        unclosed = end_line == 0;
+        CBMDefinition def;
+        memset(&def, 0, sizeof(def));
+        def.name = name;
+        def.qualified_name =
+            ctx->enclosing_class_qn
+                ? cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name)
+                : cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+        def.label = is_enum ? "Enum" : "Class";
+        def.file_path = ctx->rel_path;
+        def.start_line = ts_node_start_point(kw).row + TS_LINE_OFFSET;
+        def.end_line = end_line ? end_line : ts_node_end_point(error_node).row + TS_LINE_OFFSET;
+        def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
+        def.is_exported = cbm_is_exported(name, ctx->language);
+        /* The doc comment sits before the ERROR node when the head opens it. */
+        def.docstring = extract_docstring(ctx, seen == 3 ? error_node : kw, name);
+        cbm_defs_push(&ctx->result->defs, a, def);
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
 // Push nested class nodes from a class body container onto the defs stack.
 // Iteratively walks into wrapper nodes (field_declaration, template_declaration).
 static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_stack_t *s,
@@ -10719,17 +11292,16 @@ static void extract_janet_def(CBMExtractCtx *ctx, TSNode node) {
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
-// Languages that use the C preprocessor and therefore have #define macros.
-static bool is_c_preprocessor_lang(CBMLanguage lang) {
-    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
-           lang == CBM_LANG_GLSL || lang == CBM_LANG_OBJC || lang == CBM_LANG_ISPC;
-}
-
-// C/C++ preprocessor macros become Macro nodes (#375):
+// C/C++ preprocessor macros become Macro nodes (#375), in the languages of
+// cbm_is_c_preprocessor_lang:
 //   #define SIMPLE 1          -> preproc_def
 //   #define FN(x) (2 * (x))   -> preproc_function_def
 // The name is the `name` field; a function-like macro's parameter list is kept
 // as the signature. The macro body (a preproc_arg) is not descended into.
+// The QN is `<module>.<NAME>#macro` (CBM_MACRO_QN_SUFFIX): macros have a
+// namespace of their own, so a rename macro (`#define XXH32 XXH_NAME2(...)`) or
+// an #else stand-in (`#define match(c, m) TRUE`) never competes with the
+// function, type or enumerator of the same name for one node.
 static void extract_c_macro_def(CBMExtractCtx *ctx, TSNode node) {
     CBMArena *a = ctx->arena;
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
@@ -10741,10 +11313,15 @@ static void extract_c_macro_def(CBMExtractCtx *ctx, TSNode node) {
         return;
     }
 
+    const char *plain_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    if (!plain_qn) {
+        return;
+    }
+
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_arena_sprintf(a, "%s" CBM_MACRO_QN_SUFFIX, plain_qn);
     def.label = "Macro";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -11019,13 +11596,18 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         if (ctx->language == CBM_LANG_KOTLIN && strcmp(kind, "ERROR") == 0) {
             recover_kotlin_error_classes(ctx, node);
         }
+        /* C/C++: a definition head left as loose ERROR tokens (additive, as
+         * above — descent below still visits the region's parsed subtrees). */
+        if (is_c_declarator_lang(ctx->language) && strcmp(kind, "ERROR") == 0) {
+            recover_c_error_tag_heads(ctx, node);
+        }
 
         if (ctx->language == CBM_LANG_ELIXIR && strcmp(kind, "call") == 0) {
             extract_elixir_call(ctx, node, spec);
             continue;
         }
 
-        if (is_c_preprocessor_lang(ctx->language) &&
+        if (cbm_is_c_preprocessor_lang(ctx->language) &&
             (strcmp(kind, "preproc_def") == 0 || strcmp(kind, "preproc_function_def") == 0)) {
             // Gated to full/advanced index modes — macros dominate extraction on
             // macro-dense codebases (e.g. the Linux kernel). See #375.
@@ -11186,7 +11768,13 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {
     }
 
     // Walk AST for function/class definitions
-    walk_defs(ctx, ctx->root, spec, 0);
+    if (is_c_declarator_lang(ctx->language)) {
+        int first = ctx->result->defs.count;
+        walk_defs(ctx, ctx->root, spec, 0);
+        drop_c_typedefs_shadowed_by_tags(ctx, first);
+    } else {
+        walk_defs(ctx, ctx->root, spec, 0);
+    }
 
     // Extract module-level variables
     extract_variables(ctx, ctx->root, spec);

@@ -64,9 +64,14 @@ int tf_maybe_run_git_facts_diff_probe(int argc, char **argv) {
          * Re-enter the existing exact-diff test; the parent process remains untouched.
          * An inherited CBM_TEST_ONLY_FILE (a narrowed CI run) is cleared: the runner
          * unions it with CBM_TEST_ONLY, and one naming this suite would re-run the
-         * spawning test, which spawns again. */
+         * spawning test, which spawns again. An inherited CBM_TEST_COVERAGE_DIR (a
+         * coverage-map run) is cleared too: with it the child would start a coverage
+         * run of its own, which refuses the per-test LLVM_PROFILE_FILE it inherits.
+         * Without it the child's profile goes to that file, credited to the spawning
+         * test like any other child process. */
         if (cbm_setenv("GIT_DIFF_OPTS", "--unified=999", 1) != 0 ||
             cbm_setenv("CBM_TEST_ONLY_FILE", "", 1) != 0 ||
+            cbm_unsetenv("CBM_TEST_COVERAGE_DIR") != 0 ||
             cbm_setenv(
                 "CBM_TEST_ONLY",
                 "test_impact_git:test_git_facts_diff_uses_merge_base_zero_context_and_nul_metadata",

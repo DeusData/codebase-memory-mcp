@@ -722,6 +722,17 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
                                            const char *resolved_qn, const cbm_gbuf_t *gbuf,
                                            const char *project_name, const char *rel_path);
 
+/* Base-class twin: true when a Python base spelling (`unittest.TestCase`,
+ * `TestCase` under `from unittest import TestCase`, `ut.TestCase` under
+ * `import unittest as ut`) is bound by an EXTERNAL import whose chain
+ * contradicts `base_qn` -- the INHERITS / embedded-type resolution must then
+ * leave the base unresolved. False for every other language. Shared by
+ * pass_semantic.c, pass_parallel.c and pass_lsp_cross.c. */
+bool cbm_python_external_base_contradicts(CBMLanguage lang, const CBMImportArray *imports,
+                                          const char *base_spelling, const char *base_qn,
+                                          const cbm_gbuf_t *gbuf, const char *project_name,
+                                          const char *rel_path);
+
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
 
@@ -1233,8 +1244,17 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
                                                cbm_file_hash_t **out, int *out_count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
- * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 5 };
+ * graph/manifest semantic change makes prior exact-input indexes unsafe.
+ *   4 (upstream): C-family node identities changed. A preprocessor macro's QN
+ *      ends in "#macro"; unscoped C/C++/Objective-C enumerators are
+ *      `<scope>.<NAME>` (the enum name is no longer a segment); typedef names,
+ *      anonymous-enum constants and macro-prefixed functions are nodes; a
+ *      bodyless `struct X` is no node.
+ *   5: unresolved-call evidence capture and candidate indexing.
+ *   6: integrate the C-family identities into version-5 indexes. Those indexes
+ *      still hold old QNs for unchanged files and must rebuild in full once.
+ * The unresolved-call coverage threshold remains independent. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 6 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

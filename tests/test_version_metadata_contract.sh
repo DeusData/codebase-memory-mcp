@@ -107,8 +107,8 @@ SURFACES=(
     "pkg/go/cmd/codebase-memory-mcp/main.go|release"
     "pkg/chocolatey/codebase-memory-mcp.nuspec|release"
     "pkg/chocolatey/tools/chocolateyInstall.ps1|release"
+    "pkg/scoop/codebase-memory-mcp.json|release"
     "pkg/homebrew/Formula/codebase-memory-mcp.rb|pin:0.10.3"
-    "pkg/scoop/codebase-memory-mcp.json|pin:0.11.0"
     "pkg/aur/PKGBUILD|pin:0.8.1"
     "pkg/aur/.SRCINFO|pin:0.8.1"
 )
@@ -119,7 +119,6 @@ SURFACES=(
 # AND every sha256 it pins, then move the entry to "release" above.
 PIN_REASONS=(
     "pkg/homebrew/Formula/codebase-memory-mcp.rb|pins 4 per-asset sha256 (darwin/linux x arm/intel); last re-pinned for v0.10.3"
-    "pkg/scoop/codebase-memory-mcp.json|pins 2 per-asset sha256 (Windows amd64 + arm64 zip); last re-pinned for v0.11.0"
     "pkg/aur/PKGBUILD|pins sha256sums_x86_64 + sha256sums_aarch64; last re-pinned for v0.8.1"
     "pkg/aur/.SRCINFO|generated from PKGBUILD, so it must move with it, not before it"
 )

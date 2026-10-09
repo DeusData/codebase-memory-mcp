@@ -750,8 +750,9 @@ static const tool_def_t TOOLS[] = {
      "\"project\"]}"},
 
     {"index_status",
-     "Project readiness, counts, root, and coverage gaps. diagnostics adds coverage rows; verbose "
-     "adds Git paths. Best-effort only; verify cited paths with check_index_coverage.",
+     "Project readiness, counts, root, watch state, and coverage gaps. diagnostics adds coverage "
+     "rows; verbose adds Git paths. Best-effort only; verify cited paths with "
+     "check_index_coverage.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"verbose\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Add worktree/"
      "shadow Git paths for index-location debugging.\"},"
@@ -1410,7 +1411,8 @@ static const int SUPPORTED_VERSION_COUNT =
 static const char MCP_SERVER_INSTRUCTIONS[] =
     "Graph first: search_graph for symbols, trace_path for relationships, get_code_snippet for "
     "source, query_graph for multi-hop, and get_architecture for overview. Use search_code/grep "
-    "for literals or coverage gaps. Indexes auto-refresh. Check cited-path coverage; paginate.";
+    "for literals or coverage gaps. The session project's index auto-refreshes; re-index others. "
+    "Check cited-path coverage; paginate.";
 
 static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
     "analysis tool profile: read-only graph work via search_graph, trace_path, "
@@ -1792,6 +1794,9 @@ struct cbm_mcp_server {
     bool background_tasks;            /* per-server update/auto-index work enabled */
     struct cbm_watcher *watcher;      /* external watcher ref (not owned) */
     struct cbm_config *config;        /* external config ref (not owned) */
+    /* index_status watch visibility (#2167) */
+    cbm_mcp_watch_status_fn watch_status_fn;
+    void *watch_status_context;
     cbm_mcp_index_executor_fn index_executor;
     void *index_executor_context;
     cbm_mcp_index_status_fn index_status_provider; /* #2144; NULL outside the daemon */
@@ -1876,6 +1881,14 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
     if (srv) {
         srv->watcher = w;
+    }
+}
+
+void cbm_mcp_server_set_watch_status_provider(cbm_mcp_server_t *srv, cbm_mcp_watch_status_fn fn,
+                                              void *context) {
+    if (srv) {
+        srv->watch_status_fn = fn;
+        srv->watch_status_context = context;
     }
 }
 
@@ -6942,6 +6955,40 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     return result;
 }
 
+/* index_status "watch" object (#2167): is this project kept fresh by the
+ * background watcher right now, and if not, why. Auto-sync covers the active
+ * MCP session's project only; anything else needs index_repository again. */
+static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                  const char *project) {
+    cbm_mcp_watch_status_t status = {0};
+    if (srv->watch_status_fn) {
+        srv->watch_status_fn(srv->watch_status_context, project, &status);
+    } else {
+        status.reason = "no_watcher";
+    }
+    yyjson_mut_val *watch = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, watch, "watched", status.watched);
+    if (status.watched) {
+        yyjson_mut_obj_add_str(doc, watch, "strategy", status.strategy ? status.strategy : "");
+        yyjson_mut_obj_add_int(doc, watch, "poll_interval_ms", status.poll_interval_ms);
+        if (status.last_scan_unix_s > 0) {
+            char when[CBM_SZ_32];
+            time_t t = (time_t)status.last_scan_unix_s;
+            struct tm tm;
+            cbm_gmtime_r(&t, &tm);
+            if (strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", &tm) > 0) {
+                yyjson_mut_obj_add_strcpy(doc, watch, "last_scan_at", when);
+            }
+        }
+    } else {
+        yyjson_mut_obj_add_str(doc, watch, "reason", status.reason ? status.reason : "unknown");
+        yyjson_mut_obj_add_str(doc, watch, "hint",
+                               "Auto-sync watches only the active MCP session's project; "
+                               "re-run index_repository to refresh this index.");
+    }
+    yyjson_mut_obj_add_val(doc, root, "watch", watch);
+}
+
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
@@ -7013,6 +7060,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                 doc, root, "hint",
                 "Project is empty. Re-run index_repository(repo_path=...) to populate.");
         }
+        add_watch_status_json(srv, doc, root, project);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -8602,6 +8650,17 @@ static long node_resolution_score(const cbm_node_t *n) {
         } else if (strcmp(n->label, "Module") != 0 && strcmp(n->label, "File") != 0) {
             label_rank = RES_RANK_OTHER;
         }
+    }
+    /* Tie rule (CBM_MACRO_QN_SUFFIX): a name that is both a definition and a C
+     * macro -- a typedef or enumerator next to its rename macro -- resolves to
+     * the definition. The macro scores just under every other definition, and
+     * still above Module/File; without this a one-line typedef and its macro
+     * tie on span and the name reads as ambiguous. */
+    size_t qn_len = n->qualified_name ? strlen(n->qualified_name) : 0;
+    size_t fence_len = sizeof(CBM_MACRO_QN_SUFFIX) - SKIP_ONE;
+    if (label_rank == RES_RANK_OTHER && qn_len > fence_len &&
+        strcmp(n->qualified_name + qn_len - fence_len, CBM_MACRO_QN_SUFFIX) == 0) {
+        return RES_RANK_OTHER * (long)RES_LABEL_WEIGHT - SKIP_ONE;
     }
     long span = (long)n->end_line - (long)n->start_line;
     if (span < 0) {
@@ -13367,6 +13426,23 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
                                         &tier_count);
         result =
             snippet_from_tier(srv, tier_nodes, tier_count, qn, "suffix", include_neighbors, args);
+    }
+
+    /* Tier 3: the C-macro namespace. A macro's QN is `<module>.<NAME>#macro`
+     * (CBM_MACRO_QN_SUFFIX), out of reach of '%.X'. Tried only when no
+     * definition answered to the name above (tie rule), for a short name, a
+     * partial QN, or the macro's plain QN. */
+    if (!result) {
+        char macro_qn[CBM_SZ_512];
+        int macro_len = snprintf(macro_qn, sizeof(macro_qn), "%s" CBM_MACRO_QN_SUFFIX, qn);
+        if (macro_len > 0 && (size_t)macro_len < sizeof(macro_qn)) {
+            tier_nodes = NULL;
+            tier_count = 0;
+            cbm_store_find_nodes_by_qn_suffix(store, effective_project, macro_qn, &tier_nodes,
+                                              &tier_count);
+            result = snippet_from_tier(srv, tier_nodes, tier_count, qn, "suffix", include_neighbors,
+                                       args);
+        }
     }
     free(qn);
     free(project);

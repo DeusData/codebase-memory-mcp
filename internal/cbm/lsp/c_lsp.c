@@ -5349,20 +5349,42 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
 
     // Navigate declarator to find name and parameters
     TSNode cur = decl;
+    // Set after stepping through a recovered `RetT::name` (see
+    // cbm_c_qualifier_is_recovered): that path names the function with a
+    // type_identifier, and the "scope" is the return type, not a class.
+    bool recovered = false;
     for (int depth = 0; depth < 10 && !ts_node_is_null(cur); depth++) {
         const char *dk = ts_node_type(cur);
 
         if (strcmp(dk, "function_declarator") == 0) {
             TSNode fdecl = ts_node_child_by_field_name(cur, "declarator", 10);
             params_node = ts_node_child_by_field_name(cur, "parameters", 10);
+            // `API RetT name(...)`: the real name sits in an ERROR before the
+            // parameters; the declarator identifier is the return type.
+            TSNode real = cbm_c_recovered_func_name(cur);
+            if (!ts_node_is_null(real)) {
+                func_name = c_node_text(ctx, real);
+                break;
+            }
             cur = fdecl;
             continue;
         }
-        if (strcmp(dk, "pointer_declarator") == 0 || strcmp(dk, "reference_declarator") == 0) {
+        if (strcmp(dk, "pointer_declarator") == 0 || strcmp(dk, "reference_declarator") == 0 ||
+            (recovered && strcmp(dk, "pointer_type_declarator") == 0)) {
             if (ts_node_named_child_count(cur) > 0)
                 cur = ts_node_named_child(cur, ts_node_named_child_count(cur) - 1);
             else
                 break;
+            continue;
+        }
+        if (recovered && strcmp(dk, "type_identifier") == 0) {
+            func_name = c_node_text(ctx, cur);
+            break;
+        }
+        if ((strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) &&
+            cbm_c_qualifier_is_recovered(cur)) {
+            cur = ts_node_child_by_field_name(cur, "name", 4);
+            recovered = true;
             continue;
         }
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
@@ -5404,7 +5426,9 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
         break;
     }
 
-    if (!func_name || !func_name[0])
+    // A keyword "name" is an error-recovery artifact (see cbm_c_reserved_func_name):
+    // the def extractor mints no node for it, so no caller QN may name it either.
+    if (!func_name || !func_name[0] || cbm_c_reserved_func_name(func_name))
         return;
 
     const char *func_qn = cbm_test_definition_owner_qn(ctx->test_definition_owners, func_node);

@@ -1132,23 +1132,38 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
     if (direct) {
         return direct;
     }
-    if (project_name && project_name[0]) {
-        size_t proj_len = strlen(project_name);
-        if (!(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.')) {
-            size_t callee_len = strlen(callee_qn);
-            if (proj_len <= SIZE_MAX - callee_len - 2U) {
-                size_t prefixed_len = proj_len + 1U + callee_len;
-                char *prefixed_qn = (char *)malloc(prefixed_len + 1U);
-                if (prefixed_qn) {
-                    memcpy(prefixed_qn, project_name, proj_len);
-                    prefixed_qn[proj_len] = '.';
-                    memcpy(prefixed_qn + proj_len + 1U, callee_qn, callee_len + 1U);
-                    const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, prefixed_qn);
-                    free(prefixed_qn);
-                    if (prefixed) {
-                        return prefixed;
-                    }
+    /* Exact retries, in tie-rule order (CBM_MACRO_QN_SUFFIX): the definition
+     * first -- the QN as given, then with the project prefix -- and only when
+     * neither names a node the C-preprocessor macro of that name, in the same
+     * two spellings. The macro case is a prototype the C resolver knows whose
+     * only node in the graph is its rename macro (`extern T f(...);` plus
+     * `#define f f_v2`). One buffer, "<project>.<callee_qn>#macro", serves all
+     * three retries. */
+    size_t proj_len = (project_name && project_name[0]) ? strlen(project_name) : 0;
+    size_t callee_len = strlen(callee_qn);
+    size_t suffix_len = sizeof(CBM_MACRO_QN_SUFFIX) - 1U;
+    bool add_prefix = proj_len > 0 && !(strncmp(callee_qn, project_name, proj_len) == 0 &&
+                                        callee_qn[proj_len] == '.');
+    if (proj_len <= SIZE_MAX - callee_len - suffix_len - 2U) {
+        char *buf = (char *)malloc(proj_len + 1U + callee_len + suffix_len + 1U);
+        if (buf) {
+            char *own = buf + proj_len + 1U; /* callee_qn inside the buffer */
+            if (proj_len > 0) {
+                memcpy(buf, project_name, proj_len);
+            }
+            buf[proj_len] = '.';
+            memcpy(own, callee_qn, callee_len + 1U);
+            const cbm_gbuf_node_t *hit = add_prefix ? cbm_gbuf_find_by_qn(gbuf, buf) : NULL;
+            if (!hit) {
+                memcpy(own + callee_len, CBM_MACRO_QN_SUFFIX, suffix_len + 1U);
+                hit = cbm_gbuf_find_by_qn(gbuf, own);
+                if (!hit && add_prefix) {
+                    hit = cbm_gbuf_find_by_qn(gbuf, buf);
                 }
+            }
+            free(buf);
+            if (hit) {
+                return hit;
             }
         }
     }

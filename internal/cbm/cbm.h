@@ -267,10 +267,26 @@ typedef struct {
      * HTTP_CALLS edge to base + path. Tail fields: zero-init stays valid. */
     const char *http_client;
     const char *http_base_url;
+    /* Set when this FILE holds two or more definitions with this QN and label
+     * (`#if`/`#else` twins, a macro redefined per platform, overloads): the
+     * graph keeps one node per QN, and this lists every one of those
+     * definitions' line spans, the surviving one included, as a JSON array
+     * sorted by start line, in graph_buffer.c's variants schema:
+     * [{"file_path":"a.c","start_line":10,"end_line":14},
+     *  {"file_path":"a.c","start_line":20,"end_line":26}].
+     * Carried by the definition the graph keeps for the file (the last by
+     * start line), which makes it the node's `variants` property. NULL on
+     * every other definition, and in every language outside
+     * cbm_is_c_preprocessor_lang. */
+    const char *variants;
     /* Callable identity (#2061): offset of the signature suffix inside
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
+    /* C# only: declared namespace of a TOP-LEVEL type (NULL for nested types,
+     * the global namespace and every other language). Per type, because the
+     * file-level namespace_name records only a file's first namespace. */
+    const char *decl_namespace;
     CBMTestDefinitionRole test_role; /* NONE preserves legacy helper/test-file semantics */
     /* Configured raw definitions only; zero for all legacy rows. Exact spans
      * are bound to the owning result's source identity before cross-file use. */
@@ -287,6 +303,17 @@ typedef struct {
 } CBMCallArg;
 
 #define CBM_MAX_CALL_ARGS 8
+
+/* The qualified name of a C-preprocessor macro (`#define NAME ...` in C, C++,
+ * CUDA, Objective-C, GLSL, ISPC) is `<module QN>.<NAME>#macro`. C keeps macros
+ * apart from ordinary identifiers, so a macro and a function, type, variable or
+ * enumerator may legally share a name in one file; the fence gives the macro
+ * an identity of its own, and the plain `<module QN>.<NAME>` always belongs to
+ * the definition. `name` stays NAME and the label stays "Macro".
+ *
+ * Tie rule for anything that resolves a NAME or a plain QN to a node: the
+ * definition is the target, and the macro only when no definition is visible. */
+#define CBM_MACRO_QN_SUFFIX "#macro"
 
 /* Byte offsets are meaningful only within the source buffer that produced
  * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those

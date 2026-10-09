@@ -204,6 +204,24 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
     *pos = p;
 }
 
+/* Append an already-serialized JSON value verbatim: ,"key":<json>. Atomic like
+ * append_json_string. For `variants`, which extraction builds as a JSON array
+ * of objects (cbm.h). Twin of pass_parallel.c -- keep both in sync. */
+static void append_json_raw(char *buf, size_t bufsize, size_t *pos, const char *key,
+                            const char *json) {
+    if (!json || json[0] == '\0') {
+        return;
+    }
+    size_t required = strlen(key) + strlen(json) + PD_JSON_FIELD_OVERHEAD;
+    if (*pos + required + PD_ESC_SPACE > bufsize) {
+        return; /* whole field would not fit — skip it atomically */
+    }
+    int w = snprintf(buf + *pos, bufsize - *pos, ",\"%s\":%s", key, json);
+    if (w > 0 && (size_t)w < bufsize - *pos) {
+        *pos += (size_t)w;
+    }
+}
+
 /* Append a JSON array of strings: ,"key":["a","b","c"]. Atomic like
  * append_json_string: emitted only if the whole array fits. */
 static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const char *key,
@@ -291,6 +309,9 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+    /* Right after the docstring: the buffer is sized for exactly these two
+     * uncapped fields (pd_props_buf), so neither can be squeezed out. */
+    append_json_raw(buf, bufsize, &pos, "variants", def->variants);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -328,16 +349,21 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
 }
 
 /* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring field, which has no length cap (a field that does not
- * fit is dropped whole). Returns `stack` for a def without a docstring, or
- * when the larger buffer cannot be allocated. Twin of pass_parallel.c -- keep
- * both in sync. */
+ * serialized docstring and variants fields, which have no length cap (a field
+ * that does not fit is dropped whole). Returns `stack` for a def with neither,
+ * or when the larger buffer cannot be allocated. Twin of pass_parallel.c --
+ * keep both in sync. */
 static char *pd_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
-    if (!def->docstring || !def->docstring[0]) {
+    size_t need = *size;
+    if (def->docstring && def->docstring[0]) {
+        need += strlen("docstring") + def_json_escaped_len(def->docstring) + PD_JSON_FIELD_OVERHEAD;
+    }
+    if (def->variants && def->variants[0]) {
+        need += strlen("variants") + strlen(def->variants) + PD_JSON_FIELD_OVERHEAD;
+    }
+    if (need == *size) {
         return stack;
     }
-    size_t need =
-        *size + strlen("docstring") + def_json_escaped_len(def->docstring) + PD_JSON_FIELD_OVERHEAD;
     char *buf = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, need);
     if (!buf) {
         return stack;

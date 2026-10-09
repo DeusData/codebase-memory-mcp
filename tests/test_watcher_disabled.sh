@@ -39,18 +39,27 @@ esac
 [[ -x "${BINARY}" ]] || { echo "missing binary: ${BINARY}" >&2; exit 2; }
 command -v git >/dev/null 2>&1 || { echo "git required for fixture" >&2; exit 2; }
 
-work="$(mktemp -d)"
+# A private runtime directory, not only a private cache: daemon admission is
+# decided per runtime directory, so in the account-wide one a released CBM that
+# a developer has in use refuses this build ("a conflicting CBM process is
+# active") and the test could never start. With the helper's root these daemons
+# never meet a developer's real one. Its root is short enough for the socket
+# path; everything this test creates lives under it.
+# shellcheck source=../scripts/test-runtime.sh
+source "${ROOT}/scripts/test-runtime.sh"
+cbm_test_runtime_init
+work="${CBM_TEST_RUNTIME_ROOT}/work"
+mkdir "${work}"
 
-# Every run gets its own CBM_CACHE_DIR, and the daemon endpoint is derived from
-# it, so these daemons are private to the test and can never touch a developer's
-# real one. Retire them on any exit path regardless.
+# Every run gets its own CBM_CACHE_DIR (and so its own daemon log). Retire the
+# daemons on any exit path, then let the helper remove the root.
 cleanup() {
   local cache
   for cache in "${work}"/cache-*; do
     [[ -d "${cache}" ]] || continue
     CBM_CACHE_DIR="${cache}" "${BINARY}" daemon stop >/dev/null 2>&1 || true
   done
-  rm -rf "${work}"
+  cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
 

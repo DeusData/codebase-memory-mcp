@@ -988,16 +988,109 @@ static TSNode resolve_qualified_name(TSNode decl) {
     return null_node;
 }
 
+bool cbm_c_qualifier_is_recovered(TSNode qid) {
+    if (ts_node_is_null(qid)) {
+        return false;
+    }
+    uint32_t nc = ts_node_child_count(qid);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(qid, i);
+        if (!ts_node_is_named(c) && strcmp(ts_node_type(c), "::") == 0) {
+            return ts_node_is_missing(c);
+        }
+    }
+    return false;
+}
+
+/* A function DEFINITION's parameter list: empty, `(void)`, or every parameter
+ * named (variadic `...` allowed). A function-like macro invocation that only
+ * looks like a declarator — `TEST_BEGIN(test_name)`, whose one "parameter" is
+ * an untyped identifier read as a type — fails this, so its macro name is never
+ * mistaken for the defined function's name. */
+static bool c_params_name_every_parameter(TSNode params) {
+    enum { MAX_PARAMS_CHECKED = 64 }; /* indexed child access: keep it small */
+    uint32_t nc = ts_node_named_child_count(params);
+    if (nc > MAX_PARAMS_CHECKED) {
+        return false;
+    }
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode p = ts_node_named_child(params, i);
+        const char *pk = ts_node_type(p);
+        if (strcmp(pk, "comment") == 0 || strcmp(pk, "variadic_parameter") == 0) {
+            continue;
+        }
+        if (!ts_node_is_null(ts_node_child_by_field_name(p, TS_FIELD("declarator")))) {
+            continue;
+        }
+        /* `(void)`: the one parameter is an unnamed primitive type. */
+        TSNode type = ts_node_child_by_field_name(p, TS_FIELD("type"));
+        if (nc != 1 || ts_node_is_null(type) || strcmp(ts_node_type(type), "primitive_type") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TSNode cbm_c_recovered_func_name(TSNode func_declarator) {
+    TSNode null_node = {0};
+    if (ts_node_is_null(func_declarator) ||
+        strcmp(ts_node_type(func_declarator), "function_declarator") != 0) {
+        return null_node;
+    }
+    TSNode params = ts_node_child_by_field_name(func_declarator, TS_FIELD("parameters"));
+    if (ts_node_is_null(params) || !c_params_name_every_parameter(params)) {
+        return null_node;
+    }
+    TSNode err = ts_node_prev_sibling(params);
+    if (ts_node_is_null(err) || strcmp(ts_node_type(err), "ERROR") != 0) {
+        return null_node;
+    }
+    /* Only the macro-prefix shape: the ERROR holds nothing but bare identifiers
+     * (the real name, possibly after further attribute macros). Any other token
+     * means the region is not a declaration this rule can vouch for. */
+    enum { MAX_PREFIX_TOKENS = 4 };
+    uint32_t nc = ts_node_child_count(err);
+    if (nc == 0 || nc > MAX_PREFIX_TOKENS) {
+        return null_node;
+    }
+    TSNode last = null_node;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(err, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "identifier") != 0 && strcmp(ck, "type_identifier") != 0) {
+            return null_node;
+        }
+        last = c;
+    }
+    return last;
+}
+
 // Resolve function name from C/C++/CUDA/GLSL declarator chain. Shared canonical
 // implementation — see the header for the full rationale (#438).
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
     TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    /* Set once a recovered `RetT::name` qualifier was stepped through: on that
+     * path the C++ grammar names the function with a type_identifier. */
+    bool recovered = false;
     for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
         const char *dk = ts_node_type(decl);
-        if (is_c_terminal_name(dk)) {
+        if (is_c_terminal_name(dk) || (recovered && strcmp(dk, "type_identifier") == 0)) {
             return decl;
         }
+        if (strcmp(dk, "function_declarator") == 0) {
+            TSNode real = cbm_c_recovered_func_name(decl);
+            if (!ts_node_is_null(real)) {
+                return real;
+            }
+        }
         if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
+            if (cbm_c_qualifier_is_recovered(decl)) {
+                /* `API RetT name(...)`: the "scope" is the return type, the name
+                 * side carries the real declarator chain. */
+                decl = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+                recovered = true;
+                continue;
+            }
             return resolve_qualified_name(decl);
         }
         TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
@@ -1013,6 +1106,36 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
     return null_node;
 }
 
+/* The C-declarator grammars: same set resolve_func_name_c_family routes through
+ * cbm_resolve_c_declarator_name_node. */
+static bool c_declarator_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
+           lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC;
+}
+
+bool cbm_c_reserved_func_name(const char *name) {
+    /* Statement/operator keywords: error recovery over preprocessor-split code
+     * reads `else if (a) (b) {` as a definition `else if(...) {...}`. */
+    static const char *const kw[] = {"if",       "else", "for",     "while",   "do",
+                                     "switch",   "case", "default", "return",  "break",
+                                     "continue", "goto", "sizeof",  "typedef", NULL};
+    if (!name) {
+        return false;
+    }
+    for (const char *const *k = kw; *k; k++) {
+        if (strcmp(name, *k) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_is_c_preprocessor_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_GLSL || lang == CBM_LANG_OBJC || lang == CBM_LANG_ISPC;
+}
+
 // Convert a resolved function/method name node to its name string. Most nodes
 // map directly to their text, but a C++ conversion-operator's `operator_cast`
 // node spans the full "operator bool() const" — this grammar folds the parameter
@@ -1023,6 +1146,12 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
 // `if (obj)`) misses.
 char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source, CBMLanguage lang) {
     char *text = cbm_node_text(a, name_node, source);
+    /* A C keyword is never a function name: the definition is an error-recovery
+     * artifact. No name means no def and no call scope (calls inside fall back
+     * to the enclosing scope), the same as any unnamed definition. */
+    if (text && c_declarator_lang(lang) && cbm_c_reserved_func_name(text)) {
+        return NULL;
+    }
     if (text && strcmp(ts_node_type(name_node), "operator_cast") == 0) {
         char *paren = strchr(text, '(');
         if (paren) {

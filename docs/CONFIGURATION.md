@@ -88,10 +88,16 @@ Current keys:
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
-| `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+| `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Only an open MCP session's own project is ever watched; `index_status` reports the current state in its `watch` object. |
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+
+For a watched project, `index_status` names the polling method in `watch.strategy`:
+`git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
+`watch_non_git` file-tree scan), `none` (a non-git root that is registered but never
+polled, the default for a plain directory) or `pending` (registered; the first poll
+has not run yet).
 
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is

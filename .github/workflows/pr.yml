@@ -65,8 +65,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The PR merge commit and its base parent: the change to select for.
-          fetch-depth: 2
+          # Full history: the engine certifies the history it diffs and refuses
+          # a shallow clone, so a depth-2 checkout always answered `all`.
+          fetch-depth: 0
           persist-credentials: false
       - name: Build this checkout's engine
         run: |
@@ -281,8 +282,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The PR merge commit and its base parent: the diff to predict for.
-          fetch-depth: 2
+          # Full history: the engine (test-impact select) certifies the history
+          # it diffs and refuses a shallow clone ("Graft or shallow state
+          # prevents history certification"), which made every shadow answer
+          # run_all (GIT_UNAVAILABLE). About 400 MiB, this job only.
+          fetch-depth: 0
           persist-credentials: false
       - name: Fetch the latest released binary
         id: release

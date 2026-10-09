@@ -478,6 +478,24 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
+/* Append an already-serialized JSON value verbatim: ,"key":<json>. Atomic like
+ * append_json_string. For `variants`, which extraction builds as a JSON array
+ * of objects (cbm.h). Twin of pass_definitions.c -- keep both in sync. */
+static void append_json_raw(char *buf, size_t bufsize, size_t *pos, const char *key,
+                            const char *json) {
+    if (!json || json[0] == '\0') {
+        return;
+    }
+    size_t required = strlen(key) + strlen(json) + PP_JSON_FIELD_OVERHEAD;
+    if (*pos + required + PP_ESC_SPACE > bufsize) {
+        return; /* whole field would not fit — skip it atomically */
+    }
+    int w = snprintf(buf + *pos, bufsize - *pos, ",\"%s\":%s", key, json);
+    if (w > 0 && (size_t)w < bufsize - *pos) {
+        *pos += (size_t)w;
+    }
+}
+
 static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
@@ -518,6 +536,9 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
+    /* Right after the docstring: the buffer is sized for exactly these two
+     * uncapped fields (pp_props_buf), so neither can be squeezed out. */
+    append_json_raw(buf, bufsize, &pos, "variants", def->variants);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
     append_json_string(buf, bufsize, &pos, "parent_class", def->parent_class);
@@ -703,16 +724,21 @@ typedef struct {
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring field, which has no length cap (a field that does not
- * fit is dropped whole). Returns `stack` for a def without a docstring, or
- * when the larger buffer cannot be allocated. Twin of pass_definitions.c --
+ * serialized docstring and variants fields, which have no length cap (a field
+ * that does not fit is dropped whole). Returns `stack` for a def with neither,
+ * or when the larger buffer cannot be allocated. Twin of pass_definitions.c --
  * keep both in sync. */
 static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
-    if (!def->docstring || !def->docstring[0]) {
+    size_t need = *size;
+    if (def->docstring && def->docstring[0]) {
+        need += strlen("docstring") + pp_json_escaped_len(def->docstring) + PP_JSON_FIELD_OVERHEAD;
+    }
+    if (def->variants && def->variants[0]) {
+        need += strlen("variants") + strlen(def->variants) + PP_JSON_FIELD_OVERHEAD;
+    }
+    if (need == *size) {
         return stack;
     }
-    size_t need =
-        *size + strlen("docstring") + pp_json_escaped_len(def->docstring) + PP_JSON_FIELD_OVERHEAD;
     char *buf = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, need);
     if (!buf) {
         return stack;
@@ -3690,16 +3716,27 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
     cbm_pipeline_lsp_field_index_free(&field_index);
 }
 
+/* The per-file facts the base-class gate needs beyond the import map. */
+typedef struct {
+    const CBMImportArray *imports;
+    const char *rel;
+    CBMLanguage lang;
+} pp_file_scope_t;
+
 /* Resolve base_classes → INHERITS edges for one definition. */
 static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                  const CBMDefinition *def, const cbm_gbuf_node_t *node,
-                                 const char *mq, const char **ik, const char **iv, int ic) {
+                                 const pp_file_scope_t *fs, const char *mq, const char **ik,
+                                 const char **iv, int ic) {
     if (!def->base_classes) {
         return;
     }
     for (int b = 0; def->base_classes[b]; b++) {
         const char *bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic);
-        if (!bqn) {
+        /* Same external-base gate as the sequential semantic pass. */
+        if (!bqn ||
+            cbm_python_external_base_contradicts(fs->lang, fs->imports, def->base_classes[b], bqn,
+                                                 rc->main_gbuf, rc->project_name, fs->rel)) {
             continue;
         }
         const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
@@ -3786,8 +3823,10 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
 
 /* Resolve INHERITS + DECORATES + IMPLEMENTS for one file. */
 static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
-                                  CBMFileResult *result, const char *module_qn,
-                                  const char **imp_keys, const char **imp_vals, int imp_count) {
+                                  CBMFileResult *result, const char *rel, CBMLanguage lang,
+                                  const char *module_qn, const char **imp_keys,
+                                  const char **imp_vals, int imp_count) {
+    const pp_file_scope_t fs = {&result->imports, rel, lang};
     for (int d = 0; d < result->defs.count; d++) {
         CBMDefinition *def = &result->defs.items[d];
         if (!def->qualified_name) {
@@ -3797,7 +3836,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (!node) {
             continue;
         }
-        resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_inherits(rc, ws, def, node, &fs, module_qn, imp_keys, imp_vals, imp_count);
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
@@ -4238,7 +4277,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── INHERITS + DECORATES + IMPLEMENTS ──────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_semantic(rc, ws, result, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_semantic(rc, ws, result, rel, lang, module_qn, imp_keys, imp_vals, imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_semantic, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 

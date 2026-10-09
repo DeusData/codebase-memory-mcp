@@ -26,12 +26,14 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
+#include "foundation/str_util.h"   // cbm_json_escape — variants file_path
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
 #endif
+#include <limits.h> // INT_MAX
 #include <stdint.h> // uint32_t, uint64_t, int64_t
 #include <stdlib.h>
 #include <string.h>
@@ -2171,6 +2173,459 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
     return buf;
 }
 
+/* ── Same-file duplicate definitions: the `variants` property ──────────────
+ *
+ * The graph keeps one node per qualified name. When one file defines a QN more
+ * than once under one label -- both branches of an #if, a macro redefined per
+ * platform, C++ overloads -- the node shows the winner's span and the other
+ * definitions leave no trace. The member the graph keeps gets the group's
+ * spans as CBMDefinition.variants (format in cbm.h), so the surviving node
+ * carries them.
+ *
+ * C-preprocessor languages only (cbm_is_c_preprocessor_lang, the caller's
+ * gate): conditional compilation is what the property describes. A repeated
+ * QN elsewhere is a different matter -- a JSON file repeats one key thousands
+ * of times -- and gets no list.
+ *
+ * Computed here from this file's defs alone: a pure function of the file,
+ * hence deterministic, identical on the sequential and the parallel path, and
+ * owned by the file under incremental re-extraction. Two defs with the same
+ * span are one definition seen twice and count once; a group left with a
+ * single span gets nothing. */
+
+typedef struct {
+    uint64_t key; /* hash of (QN, label) */
+    uint32_t start;
+    uint32_t end;
+    int idx; /* index into result->defs */
+} cbm_variant_ref_t;
+
+static int cbm_variant_ref_cmp(const void *pa, const void *pb) {
+    const cbm_variant_ref_t *a = (const cbm_variant_ref_t *)pa;
+    const cbm_variant_ref_t *b = (const cbm_variant_ref_t *)pb;
+    if (a->key != b->key) {
+        return a->key < b->key ? -1 : 1;
+    }
+    if (a->start != b->start) {
+        return a->start < b->start ? -1 : 1;
+    }
+    if (a->end != b->end) {
+        return a->end < b->end ? -1 : 1;
+    }
+    return (a->idx > b->idx) - (a->idx < b->idx);
+}
+
+/* FNV-1a over the QN, a separator and the label. */
+static uint64_t cbm_variant_key(const char *qn, const char *label) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *p = qn; *p; p++) {
+        h = (h ^ (unsigned char)*p) * 1099511628211ULL;
+    }
+    h = (h ^ 0xffU) * 1099511628211ULL;
+    for (const char *p = label; *p; p++) {
+        h = (h ^ (unsigned char)*p) * 1099511628211ULL;
+    }
+    return h;
+}
+
+/* refs[0..n) is one (QN, label) group in span order: give every member the
+ * list of the group's distinct spans. */
+static void cbm_variant_assign(CBMFileResult *result, const cbm_variant_ref_t *refs, int n) {
+    /* ,{"file_path":"","start_line":4294967295,"end_line":4294967295} + path;
+     * cbm_json_escape writes at most 6 bytes per source byte (\u00XX). */
+    enum { VARIANT_ENTRY_FIXED = 64, JSON_ESCAPE_GROWTH = 6 };
+    int distinct = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == 0 || refs[i].start != refs[i - 1].start || refs[i].end != refs[i - 1].end) {
+            distinct++;
+        }
+    }
+    if (distinct < 2) {
+        return;
+    }
+    const char *path = result->defs.items[refs[0].idx].file_path;
+    size_t path_cap = (path ? strlen(path) : 0) * JSON_ESCAPE_GROWTH + 1;
+    if (path_cap > INT_MAX) {
+        return;
+    }
+    char *esc = (char *)cbm_arena_alloc(&result->arena, path_cap);
+    if (!esc) {
+        return;
+    }
+    (void)cbm_json_escape(esc, (int)path_cap, path ? path : "");
+    size_t cap = (size_t)distinct * (VARIANT_ENTRY_FIXED + strlen(esc)) + 3;
+    char *json = (char *)cbm_arena_alloc(&result->arena, cap);
+    if (!json) {
+        return;
+    }
+    size_t pos = 0;
+    json[pos++] = '[';
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && refs[i].start == refs[i - 1].start && refs[i].end == refs[i - 1].end) {
+            continue;
+        }
+        /* graph_buffer.c's variants schema, so its same-QN merge and every
+         * reader of the node (the test-impact engine) see one format. */
+        int w = snprintf(json + pos, cap - pos,
+                         "%s{\"file_path\":\"%s\",\"start_line\":%u,\"end_line\":%u}",
+                         pos > 1 ? "," : "", esc, refs[i].start, refs[i].end);
+        if (w <= 0 || (size_t)w >= cap - pos) {
+            return; /* cannot happen: cap covers the longest entry */
+        }
+        pos += (size_t)w;
+    }
+    json[pos++] = ']';
+    json[pos] = '\0';
+    /* Only the definition the graph keeps for this file carries the list: the
+     * one with the largest start line (cbm_gbuf_upsert_node's same-file rule;
+     * every member starting on that line, since arrival order breaks that
+     * tie). Giving it to all n members would serialize an n-entry list n
+     * times -- quadratic on a file that defines one name very often. */
+    uint32_t last_start = refs[n - 1].start;
+    for (int i = n - 1; i >= 0 && refs[i].start == last_start; i--) {
+        result->defs.items[refs[i].idx].variants = json;
+    }
+}
+
+static void cbm_mark_def_variants(CBMFileResult *result) {
+    enum { VARIANT_STACK_REFS = 128 };
+    int n = result->defs.count;
+    if (n < 2) {
+        return;
+    }
+    cbm_variant_ref_t stack[VARIANT_STACK_REFS];
+    cbm_variant_ref_t *refs = stack;
+    if (n > VARIANT_STACK_REFS) {
+        refs = (cbm_variant_ref_t *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)n * sizeof(*refs));
+        if (!refs) {
+            return;
+        }
+    }
+    const CBMDefinition *defs = result->defs.items;
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (defs[i].qualified_name && defs[i].label) {
+            refs[m].key = cbm_variant_key(defs[i].qualified_name, defs[i].label);
+            refs[m].start = defs[i].start_line;
+            refs[m].end = defs[i].end_line;
+            refs[m].idx = i;
+            m++;
+        }
+    }
+    qsort(refs, (size_t)m, sizeof(*refs), cbm_variant_ref_cmp);
+    for (int i = 0; i < m;) {
+        int j = i + 1;
+        while (j < m && refs[j].key == refs[i].key) {
+            j++;
+        }
+        /* [i, j) shares one key. That is one (QN, label) group unless two
+         * keys collided, so split it by real equality, keeping span order. */
+        int lo = i;
+        while (j - i >= 2 && lo < j) {
+            const CBMDefinition *lead = &defs[refs[lo].idx];
+            int hi = lo + 1;
+            for (int k = lo + 1; k < j; k++) {
+                const CBMDefinition *d = &defs[refs[k].idx];
+                if (strcmp(lead->qualified_name, d->qualified_name) == 0 &&
+                    strcmp(lead->label, d->label) == 0) {
+                    cbm_variant_ref_t moved = refs[k];
+                    memmove(&refs[hi + 1], &refs[hi], (size_t)(k - hi) * sizeof(*refs));
+                    refs[hi++] = moved;
+                }
+            }
+            if (hi - lo >= 2) {
+                cbm_variant_assign(result, &refs[lo], hi - lo);
+            }
+            lo = hi;
+        }
+        i = j;
+    }
+    if (refs != stack) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, refs);
+    }
+}
+
+/* ── First-branch projection rescue (C/C++/CUDA) ───────────────────────────
+ *
+ * The raw parse sees every #if branch at once. When branches split a brace
+ * (`#ifndef X (a)) { #else (b)) { #endif`) or a directive sits inside an
+ * expression, the braces stop balancing and an ERROR region swallows whole
+ * functions: they get no node at all (curl ossl_connect_step2). The #961
+ * rescue re-parses the preprocessed source, but with no build defines a
+ * whole-file guard (`#ifdef USE_OPENSSL`) leaves nothing to parse. The
+ * projection below needs no defines: every conditional group keeps exactly one
+ * branch (the first; for `#if 0` the #else), so the kept text is one
+ * consistent configuration the author wrote. Directive lines and dropped
+ * branches become spaces with newlines kept, so every byte keeps its line and
+ * column and a def found there needs no remapping. */
+
+enum { CBM_PROJ_MAX_DEPTH = 64 };
+
+typedef struct {
+    uint8_t branch; /* index of the branch being scanned (0 = the #if part) */
+    uint8_t keep;   /* branch that survives: 0, or 1 for `#if 0` */
+} cbm_proj_frame_t;
+
+/* Directive name after '#' and optional blanks, as [*name, *name + return). */
+static int cbm_proj_directive(const char *p, const char *e, const char **name) {
+    while (p < e && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p >= e || *p != '#') {
+        return 0;
+    }
+    p++;
+    while (p < e && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    const char *n = p;
+    while (p < e && isalpha((unsigned char)*p)) {
+        p++;
+    }
+    *name = n;
+    return (int)(p - n);
+}
+
+static bool cbm_proj_word_is(const char *n, int len, const char *w) {
+    return (size_t)len == strlen(w) && strncmp(n, w, (size_t)len) == 0;
+}
+
+/* `#if 0` (the dead-code idiom): the condition is the single token 0. */
+static bool cbm_proj_if_zero(const char *after, const char *e) {
+    while (after < e && (*after == ' ' || *after == '\t')) {
+        after++;
+    }
+    if (after >= e || *after != '0') {
+        return false;
+    }
+    after++;
+    while (after < e && (*after == ' ' || *after == '\t' || *after == '\r')) {
+        after++;
+    }
+    return after >= e || (after + 1 < e && after[0] == '/' && (after[1] == '/' || after[1] == '*'));
+}
+
+/* Track block-comment state across one line, skipping string and char
+ * literals, so a `#if` inside a block comment is not taken for a directive. */
+static bool cbm_proj_scan_comments(const char *p, const char *e, bool in_comment) {
+    while (p < e) {
+        if (in_comment) {
+            if (p + 1 < e && p[0] == '*' && p[1] == '/') {
+                in_comment = false;
+                p += 2;
+                continue;
+            }
+            p++;
+            continue;
+        }
+        if (*p == '"' || *p == '\'') {
+            char q = *p++;
+            while (p < e && *p != q) {
+                p += (*p == '\\' && p + 1 < e) ? 2 : 1;
+            }
+            p++;
+            continue;
+        }
+        if (p + 1 < e && p[0] == '/' && p[1] == '/') {
+            return false;
+        }
+        if (p + 1 < e && p[0] == '/' && p[1] == '*') {
+            in_comment = true;
+            p += 2;
+            continue;
+        }
+        p++;
+    }
+    return in_comment;
+}
+
+static void cbm_proj_blank(char *p, const char *e) {
+    for (; p < e; p++) {
+        if (*p != '\n') {
+            *p = ' ';
+        }
+    }
+}
+
+/* Heap copy of `src` with the first-branch projection applied, or NULL when
+ * the source has no conditional group (nothing to project), nests deeper than
+ * CBM_PROJ_MAX_DEPTH, or allocation fails. Caller frees with cbm_free. */
+static char *cbm_first_branch_projection(const char *src, int len) {
+    char *out = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, src, (size_t)len);
+    out[len] = '\0';
+    cbm_proj_frame_t frames[CBM_PROJ_MAX_DEPTH];
+    int depth = 0;
+    bool any_group = false;
+    bool in_comment = false;
+    bool continuation = false; /* previous conditional-directive line ended in '\' */
+    const char *end = out + len;
+    for (char *line = out; line < end;) {
+        char *nl = memchr(line, '\n', (size_t)(end - line));
+        char *eol = nl ? nl : (char *)end;
+        bool active = true;
+        for (int i = 0; i < depth && active; i++) {
+            active = frames[i].branch == frames[i].keep;
+        }
+        bool blank = !active || continuation;
+        bool was_continuation = continuation;
+        continuation = false;
+        const char *name = NULL;
+        int nlen = (!in_comment && !was_continuation) ? cbm_proj_directive(line, eol, &name) : 0;
+        bool conditional = false;
+        if (nlen > 0) {
+            if (cbm_proj_word_is(name, nlen, "if") || cbm_proj_word_is(name, nlen, "ifdef") ||
+                cbm_proj_word_is(name, nlen, "ifndef")) {
+                if (depth >= CBM_PROJ_MAX_DEPTH) {
+                    cbm_free(CBM_MEM_CLASS_EXTRACT, out);
+                    return NULL;
+                }
+                bool zero =
+                    cbm_proj_word_is(name, nlen, "if") && cbm_proj_if_zero(name + nlen, eol);
+                frames[depth].branch = 0;
+                frames[depth].keep = zero ? 1 : 0;
+                depth++;
+                conditional = any_group = true;
+            } else if (cbm_proj_word_is(name, nlen, "elif") ||
+                       cbm_proj_word_is(name, nlen, "elifdef") ||
+                       cbm_proj_word_is(name, nlen, "elifndef") ||
+                       cbm_proj_word_is(name, nlen, "else")) {
+                if (depth > 0 && frames[depth - 1].branch < UINT8_MAX) {
+                    frames[depth - 1].branch++;
+                }
+                conditional = true;
+            } else if (cbm_proj_word_is(name, nlen, "endif")) {
+                if (depth > 0) {
+                    depth--;
+                }
+                conditional = true;
+            }
+        }
+        if (conditional) {
+            blank = true;
+            char *last = eol;
+            while (last > line && (last[-1] == '\r' || last[-1] == ' ' || last[-1] == '\t')) {
+                last--;
+            }
+            continuation = last > line && last[-1] == '\\';
+        } else if (was_continuation) {
+            char *last = eol;
+            while (last > line && (last[-1] == '\r' || last[-1] == ' ' || last[-1] == '\t')) {
+                last--;
+            }
+            continuation = last > line && last[-1] == '\\';
+        }
+        in_comment = cbm_proj_scan_comments(line, eol, in_comment);
+        if (blank) {
+            cbm_proj_blank(line, eol);
+        }
+        line = nl ? nl + 1 : (char *)end;
+    }
+    if (!any_group) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, out);
+        return NULL;
+    }
+    return out;
+}
+
+/* Only a parse that lost structure wholesale is worth a second parse: the raw
+ * root is itself an ERROR, or one top-most error region spans this many lines.
+ * Small local errors (a macro the grammar cannot read) are the common case —
+ * about half the kernel's C files have one — and the projection cannot fix
+ * them; the gate keeps the extra parse to ~1% of kernel C bytes (sampled). */
+enum { CBM_PROJ_MIN_ERROR_LINES = 20 };
+
+/* Adopt from the projection only what the raw pass lost: a Function/Method
+ * def that overlaps a raw ERROR region, whose QN no def already holds, whose
+ * name is on its first raw line, and whose span has definition syntax (the
+ * #961 gates). Everything else the projected walk produced is discarded. */
+static void cbm_rescue_defs_from_projection(CBMExtractCtx *raw_ctx, const TSLanguage *ts_lang) {
+    CBMFileResult *result = raw_ctx->result;
+    if (!ts_node_has_error(raw_ctx->root)) {
+        return;
+    }
+    cbm_error_regions_t regs = {{0}, {0}, 0, 0};
+    bool broken = strcmp(ts_node_type(raw_ctx->root), "ERROR") == 0;
+    if (broken) {
+        /* The whole file failed: every line is error territory. */
+        regs.starts[0] = 1;
+        regs.ends[0] = ts_node_end_point(raw_ctx->root).row + 1;
+        regs.count = 1;
+    } else {
+        cbm_collect_error_regions(raw_ctx->root, &regs, raw_ctx->source, raw_ctx->source_len);
+        for (int r = 0; r < regs.count && !broken; r++) {
+            broken = regs.ends[r] >= regs.starts[r] + CBM_PROJ_MIN_ERROR_LINES;
+        }
+    }
+    if (!broken) {
+        return;
+    }
+    char *projected = cbm_first_branch_projection(raw_ctx->source, raw_ctx->source_len);
+    if (!projected) {
+        return;
+    }
+    TSParser *parser = get_thread_parser(ts_lang, raw_ctx->language);
+    TSTree *tree = NULL;
+    if (parser) {
+        ts_parser_reset(parser);
+        TSParseOptions opts = {0};
+        /* The projection keeps the raw source's length and line structure,
+         * so it is parsed under the same terminated-last-line rule (#2078). */
+        tree = cbm_parse_source(parser, projected, (uint32_t)raw_ctx->source_len, opts);
+    }
+    CBMHashTable *held = tree ? cbm_ht_create(CBM_SZ_256) : NULL;
+    if (held) {
+        for (int i = 0; i < result->defs.count; i++) {
+            if (result->defs.items[i].qualified_name) {
+                cbm_ht_set(held, result->defs.items[i].qualified_name, &result->defs.items[i]);
+            }
+        }
+        CBMExtractCtx pctx = {
+            .arena = raw_ctx->arena,
+            .scratch = raw_ctx->scratch,
+            .result = result,
+            .source = projected,
+            .source_len = raw_ctx->source_len,
+            .language = raw_ctx->language,
+            .project = raw_ctx->project,
+            .rel_path = raw_ctx->rel_path,
+            .module_qn = result->module_qn,
+            .root = ts_tree_root_node(tree),
+        };
+        int before = result->defs.count;
+        cbm_extract_definitions_without_module(&pctx);
+        int w = before;
+        for (int i = before; i < result->defs.count; i++) {
+            CBMDefinition *d = &result->defs.items[i];
+            bool adopt = d->name && d->qualified_name && cbm_def_label_is_callable(d->label) &&
+                         !cbm_ht_has(held, d->qualified_name);
+            bool overlaps = false;
+            for (int r = 0; adopt && r < regs.count && !overlaps; r++) {
+                overlaps = d->start_line <= regs.ends[r] && d->end_line >= regs.starts[r];
+            }
+            adopt =
+                adopt && overlaps &&
+                cbm_line_contains(raw_ctx->source, raw_ctx->source_len, d->start_line, d->name) &&
+                cbm_span_contains_callable_def(raw_ctx->source, raw_ctx->source_len, d->start_line,
+                                               d->end_line, d->name);
+            if (adopt) {
+                result->defs.items[w++] = *d;
+                cbm_ht_set(held, result->defs.items[w - 1].qualified_name,
+                           &result->defs.items[w - 1]);
+            }
+        }
+        result->defs.count = w;
+        cbm_ht_free(held);
+    }
+    if (tree) {
+        ts_tree_delete(tree);
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, projected);
+}
+
 /* Public entry: run the extraction and journal completion. The DONE mark on
  * every ordinary return (including error/timeout results) tells the crash
  * supervisor this file did NOT kill the worker — only a file whose S has no
@@ -2982,6 +3437,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
             cbm_preprocessed_source_free(preprocessed);
         }
         atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
+
+        /* Functions both the raw parse and the #961 preprocessed rescue lost
+         * (whole-file feature guards, directives inside expressions). Runs
+         * only when the raw tree has errors and the file has #if groups. */
+        cbm_rescue_defs_from_projection(&ctx, ts_lang);
     }
 
     // Bottleneck call-context metrics. Each call is attributed to the INNERMOST
@@ -3132,6 +3592,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                 }
             }
         }
+    }
+
+    /* The def list is final here (raw walk, preprocessed and projection rescues). */
+    if (cbm_is_c_preprocessor_lang(language)) {
+        cbm_mark_def_variants(result);
     }
 
     result->imports_count = result->imports.count;

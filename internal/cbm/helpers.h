@@ -58,6 +58,37 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 
+// tree-sitter error recovery around an unknown leading macro: `API RetT name(...)`
+// (`XXH_PUBLIC_API XXH64_hash_t XXH64(...)`, `JEMALLOC_ALWAYS_INLINE T *f(...)`)
+// carries one identifier more than the declaration grammar admits, so the parser
+// recovers in one of two shapes, and neither names the function:
+//   - C++ inserts a zero-width MISSING "::" and reads `RetT name` as the
+//     out-of-line name `RetT::name`; with a pointer return, the name side is a
+//     pointer_type_declarator that wraps the function_declarator;
+//   - C and C++ keep RetT as the declarator identifier and put the real name in
+//     an ERROR node directly before the parameter list.
+// cbm_c_qualifier_is_recovered: true when `qid` (a qualified_identifier or
+// scoped_identifier) is the first shape, i.e. its "::" token is MISSING.
+// cbm_c_recovered_func_name: the real name node of the second shape for a
+// function_declarator, or a null node when the declarator is not that shape.
+// Shared by every C-family declarator walk (defs, call scope, params, C LSP) so
+// the def QN and every caller QN agree on the recovered name.
+bool cbm_c_qualifier_is_recovered(TSNode qid);
+TSNode cbm_c_recovered_func_name(TSNode func_declarator);
+
+// True for a C keyword that error recovery can surface as a function "name"
+// (`else if (a) (b) {` split by #ifdef reads as a definition named `if`).
+// cbm_func_name_node_text returns NULL for these in the C-declarator grammars,
+// so neither a def nor a call scope is minted; the C LSP applies the same test.
+bool cbm_c_reserved_func_name(const char *name);
+
+// True for the languages whose `#define`s become Macro nodes: C, C++, CUDA,
+// GLSL, Objective-C and ISPC. The one predicate for what follows from the C
+// preprocessor: the `#macro` QN namespace (CBM_MACRO_QN_SUFFIX) and the
+// `variants` property (CBMDefinition.variants), because #if branches are what
+// lets one of these files define a name more than once.
+bool cbm_is_c_preprocessor_lang(CBMLanguage lang);
+
 // Convert a resolved function/method name node to its name string, normalizing a
 // C++ conversion-operator's `operator_cast` node (which spans the full
 // "operator bool() const") down to "operator bool". Shared by the defs and

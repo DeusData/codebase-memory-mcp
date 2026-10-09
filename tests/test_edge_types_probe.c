@@ -546,6 +546,84 @@ TEST(handles_gin_go) {
     PASS();
 }
 
+/* #686: Go router groups. Fiber (and Gin/Echo, same syntax) build the external
+ * path from `grp := app.Group("/admin")` plus `grp.Post("/x")`, so the full
+ * path is never one literal at the registration site. The Route must carry
+ * the composed path, including nested groups (`v1 := api.Group("/v1")`) and
+ * groups built inline (`app.Group("/x").Get(...)`). Controls: a route on the
+ * root app keeps its own path, a variable later re-bound to a different group
+ * uses the binding in effect at the call, and a non-literal group prefix
+ * leaves the route unprefixed (never guessed). Exact Route set on BOTH the
+ * sequential and the parallel pipeline. */
+static const EtFile et_fiber_groups_issue686[] = {
+    {"main.go",
+     "package main\n\n"
+     "import \"github.com/gofiber/fiber/v2\"\n\n"
+     "func health(c *fiber.Ctx) error { return nil }\n"
+     "func getUser(c *fiber.Ctx) error { return nil }\n"
+     "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
+     "func listOrders(c *fiber.Ctx) error { return nil }\n"
+     "func ping(c *fiber.Ctx) error { return nil }\n"
+     "func report(c *fiber.Ctx) error { return nil }\n"
+     "func dyn(c *fiber.Ctx) error { return nil }\n\n"
+     "func main() {\n"
+     "    app := fiber.New()\n"
+     "    app.Get(\"/health\", health)\n"
+     "    api := app.Group(\"/api\")\n"
+     "    v1 := api.Group(\"/v1\", authMiddleware)\n"
+     "    v1.Get(\"/users/:id\", getUser)\n"
+     "    admin := app.Group(\"/admin\")\n"
+     "    admin.Post(\"/customers/:id\", updateCustomer)\n"
+     "    grp := api.Group(\"/shop\")\n"
+     "    grp.Get(\"/orders\", listOrders)\n"
+     "    grp = app.Group(\"/internal\")\n"
+     "    grp.Get(\"/ping\", ping)\n"
+     "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
+     "    prefix := \"/p\"\n"
+     "    dg := app.Group(prefix)\n"
+     "    dg.Get(\"/dyn\", dyn)\n"
+     "    app.Listen(\":3000\")\n"
+     "}\n\n"
+     "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
+
+static const char *et_fiber_groups_issue686_routes[] = {
+    "/health",      "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
+    "/internal/ping", "/reports/daily",  "/dyn",                 NULL};
+
+TEST(handles_fiber_group_prefix_sequential_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
+                                     false, NULL));
+    PASS();
+}
+
+TEST(handles_fiber_group_prefix_parallel_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
+                                     true, NULL));
+    PASS();
+}
+
+/* #686 control for the same mechanism on Gin: `v1 := r.Group("/v1")` with the
+ * idiomatic brace block. */
+TEST(handles_gin_group_prefix_issue686) {
+    static const EtFile f[] = {
+        {"main.go",
+         "package main\n\n"
+         "import \"github.com/gin-gonic/gin\"\n\n"
+         "func listOrders(c *gin.Context) {}\n"
+         "func createOrder(c *gin.Context) {}\n\n"
+         "func main() {\n"
+         "    r := gin.Default()\n"
+         "    v1 := r.Group(\"/v1\")\n"
+         "    {\n"
+         "        v1.GET(\"/orders\", listOrders)\n"
+         "        v1.POST(\"/orders\", createOrder)\n"
+         "    }\n"
+         "}\n"}};
+    static const char *routes[] = {"/v1/orders", "/v1/orders", NULL}; /* GET + POST */
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* Spring (Java) — class-level @RequestMapping must prefix method mappings.
  * Reproduce-first: a HANDLES count alone can pass with partial routes
  * ("/orders"), but callers/search_graph need the actual endpoint names
@@ -2507,6 +2585,9 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_express_ts);
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
+    RUN_TEST(handles_fiber_group_prefix_sequential_issue686);
+    RUN_TEST(handles_fiber_group_prefix_parallel_issue686);
+    RUN_TEST(handles_gin_group_prefix_issue686);
     RUN_TEST(handles_spring_java);
     RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);

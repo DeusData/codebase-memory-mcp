@@ -385,6 +385,13 @@ cbm_store_t *cbm_store_open_path_existing(const char *db_path);
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Every following query open calls `hook(ctx)` inside its first-access
+ * section (after the first read, the process-wide lock still held) until the
+ * hook is cleared with NULL. Test builds only. */
+void cbm_store_query_first_access_hook_for_testing(void (*hook)(void *ctx), void *ctx);
+#endif
+
 /* Validate and seal an existing DB for atomic replacement without creating or
  * migrating its schema. Returns OK when sealed, NOT_FOUND when the bytes are
  * definitely corrupt/incompatible and should be quarantined, or ERR when the

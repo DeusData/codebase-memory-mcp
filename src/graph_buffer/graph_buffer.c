@@ -993,6 +993,20 @@ static void gb_record_variants(cbm_gbuf_node_t *survivor, const char *a_label, c
 
 /* ── Node operations ─────────────────────────────────────────────── */
 
+/* First key of the canonical same-QN collision order: how strong a claim the
+ * entity has on a qualified name. A macro is the weakest: when a "Macro" and
+ * a definition share a QN, the definition, which carries the body, the
+ * signature and every edge, owns it whichever comes first.
+ *
+ * C-preprocessor macros no longer get here: their QN carries its own
+ * namespace (`...#macro`, CBM_MACRO_QN_SUFFIX) and cannot equal a definition's.
+ * The case left is Chialisp, whose `defmacro` / `defmac` defs are labelled
+ * "Macro" under a plain QN: a macro and a `defun` of one name in one file, or
+ * in a same-stem `.clsp` / `.clib` pair (one module QN). */
+static int gb_qn_claim_rank(const char *label) {
+    return (label && strcmp(label, "Macro") == 0) ? 0 : 1;
+}
+
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json) {
@@ -1036,8 +1050,13 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * of the same entity with new content) replaces the earlier one,
          * deterministically, because intra-file arrival order is fixed. A
          * full tie is the same entity re-upserted → refresh in place.
-         * Kind-disambiguated QNs (the real cure) remain a follow-up. */
-        int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+         * Ahead of all of these, a definition beats a macro
+         * (gb_qn_claim_rank). Kind-disambiguated QNs (the real cure) remain
+         * a follow-up. */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(label);
+        if (c == 0) {
+            c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - start_line;
         }
@@ -1649,9 +1668,13 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
          * the node set (and every downstream consumer) run to run. Winner =
          * smallest file_path, then LARGEST start_line, then largest
          * name/label — one total order, commutative, scheduling-free; a full
-         * tie is the same entity → refresh from src. */
-        int c = strcmp(sn->file_path ? sn->file_path : "",
+         * tie is the same entity → refresh from src. A definition beats a
+         * macro ahead of all of these (gb_qn_claim_rank). */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(sn->label);
+        if (c == 0) {
+            c = strcmp(sn->file_path ? sn->file_path : "",
                        existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - sn->start_line;
         }
