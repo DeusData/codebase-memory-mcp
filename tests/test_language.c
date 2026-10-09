@@ -683,13 +683,13 @@ static bool write_probe_file(const char *path, const char *content) {
     return true;
 }
 
-TEST(lang_cls_vb6_class_module_unsupported) {
+TEST(lang_cls_vb6_class_module) {
     char path[256];
     snprintf(path, sizeof(path), "%s/test_lang_vb6.cls", cbm_tmpdir());
     ASSERT_TRUE(write_probe_file(path, "VERSION 1.0 CLASS\r\nBEGIN\r\n  MultiUse = -1  'True\r\n"
                                        "END\r\nAttribute VB_Name = \"Widget\"\r\n"
                                        "Option Explicit\r\n\r\nPublic Sub Go()\r\nEnd Sub\r\n"));
-    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_COUNT);
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_VB6);
     remove(path);
     PASS();
 }
@@ -716,13 +716,13 @@ TEST(lang_cls_objectscript_stays_objectscript) {
     PASS();
 }
 
-TEST(lang_frm_vb6_form_unsupported) {
+TEST(lang_frm_vb6_form) {
     char path[256];
     snprintf(path, sizeof(path), "%s/test_lang_vb6.frm", cbm_tmpdir());
     ASSERT_TRUE(write_probe_file(path, "VERSION 5.00\r\nBegin VB.Form Form1 \r\n"
                                        "   Caption         =   \"Hi\"\r\nEnd\r\n"
                                        "Attribute VB_Name = \"Form1\"\r\nOption Explicit\r\n"));
-    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_COUNT);
+    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_VB6);
     remove(path);
     PASS();
 }
@@ -894,6 +894,18 @@ TEST(lang_ext_chialisp) {
     ASSERT_EQ(cbm_language_for_extension(".clinc"), CBM_LANG_CHIALISP);
     /* .clj stays Clojure — the Chialisp extensions must not widen it. */
     ASSERT_EQ(cbm_language_for_extension(".clj"), CBM_LANG_CLOJURE);
+    PASS();
+}
+
+TEST(lang_ext_vb6) {
+    ASSERT_EQ(cbm_language_for_extension(".bas"), CBM_LANG_VB6);
+    ASSERT_EQ(cbm_language_for_extension(".ctl"), CBM_LANG_VB6);
+    ASSERT_EQ(cbm_language_for_extension(".dsr"), CBM_LANG_VB6);
+    ASSERT_EQ(cbm_language_for_extension(".pag"), CBM_LANG_VB6);
+    /* Shared extensions keep their table owner; discover sniffs content. */
+    ASSERT_EQ(cbm_language_for_extension(".cls"), CBM_LANG_APEX);
+    ASSERT_EQ(cbm_language_for_extension(".frm"), CBM_LANG_FORM);
+    ASSERT_STR_EQ(cbm_language_name(CBM_LANG_VB6), "Visual Basic 6");
     PASS();
 }
 
@@ -1370,7 +1382,7 @@ TEST(lang_classify_matches_every_content_rule) {
         {"b.m", "function f(x)\n  return x;\nend function;\n", CBM_LANG_MAGMA, cbm_disambiguate_m},
         {"c.m", "intrinsic Foo(x) -> RngIntElt\n{}\n", CBM_LANG_MAGMA, cbm_disambiguate_m},
         {"d.m", "% a comment\nx = 1;\n", CBM_LANG_MATLAB, cbm_disambiguate_m},
-        {"e.cls", "VERSION 1.0 CLASS\r\nAttribute VB_Name = \"W\"\r\n", CBM_LANG_COUNT,
+        {"e.cls", "VERSION 1.0 CLASS\r\nAttribute VB_Name = \"W\"\r\n", CBM_LANG_VB6,
          cbm_disambiguate_cls},
         {"f.cls", "/// doc\nClass Demo.Person Extends %Persistent\n{\n}\n",
          CBM_LANG_OBJECTSCRIPT_UDL, cbm_disambiguate_cls},
@@ -1385,7 +1397,7 @@ TEST(lang_classify_matches_every_content_rule) {
          cbm_disambiguate_cfc},
         {"m.cfc", "<cfquery name=\"q\">select 1</cfquery>\n", CBM_LANG_CFML, cbm_disambiguate_cfc},
         {"n.cfc", "component {\n  function f() {}\n}\n", CBM_LANG_CFSCRIPT, cbm_disambiguate_cfc},
-        {"o.frm", "VERSION 5.00\r\nBegin VB.Form Form1\r\n", CBM_LANG_COUNT, cbm_disambiguate_frm},
+        {"o.frm", "VERSION 5.00\r\nBegin VB.Form Form1\r\n", CBM_LANG_VB6, cbm_disambiguate_frm},
         {"p.frm", "#procedure foo\nLocal F = a;\n", CBM_LANG_FORM, cbm_disambiguate_frm},
         {"q.res", "RSRC\0\0\0\1binary", CBM_LANG_COUNT, cbm_disambiguate_res},
         {"r.res", "let x = 1\n", CBM_LANG_RESCRIPT, cbm_disambiguate_res},
@@ -1655,10 +1667,10 @@ SUITE(language) {
     RUN_TEST(lang_cfc_tag_after_license_comment);
     RUN_TEST(lang_cfc_script_after_license_comment);
     RUN_TEST(lang_cfc_default_on_read_fail);
-    RUN_TEST(lang_cls_vb6_class_module_unsupported);
+    RUN_TEST(lang_cls_vb6_class_module);
     RUN_TEST(lang_cls_apex_stays_apex);
     RUN_TEST(lang_cls_objectscript_stays_objectscript);
-    RUN_TEST(lang_frm_vb6_form_unsupported);
+    RUN_TEST(lang_frm_vb6_form);
     RUN_TEST(lang_frm_form_stays_form);
     RUN_TEST(lang_res_binary_resource_unsupported);
     RUN_TEST(lang_res_rescript_stays_rescript);
@@ -1675,6 +1687,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_nim);
     RUN_TEST(lang_ext_scheme);
     RUN_TEST(lang_ext_chialisp);
+    RUN_TEST(lang_ext_vb6);
     RUN_TEST(lang_ext_fennel);
     RUN_TEST(lang_ext_fish);
     RUN_TEST(lang_ext_awk);
