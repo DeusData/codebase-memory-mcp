@@ -30,11 +30,13 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "callable_sig.h" /* cbm_qn_callable_base_len_named: overloads share the name key */
 
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -91,6 +93,10 @@ typedef struct {
     uint8_t *lang;
 } qn_array_t;
 
+typedef struct {
+    uint64_t defaults;
+    uint8_t count;
+} swift_signature_t;
 _Static_assert(CBM_LANG_COUNT <= UINT8_MAX, "CBMLanguage must fit the per-entry lang byte");
 
 struct cbm_registry {
@@ -104,6 +110,7 @@ struct cbm_registry {
 
     /* byName: simpleName → qn_array_t* (heap-owned) */
     CBMHashTable *by_name;
+    CBMHashTable *swift_signatures; /* borrowed exact-map keys; owned values */
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -1121,6 +1128,12 @@ static void free_qn_array(const char *key, void *value, void *ud) {
     free((void *)key);
 }
 
+static void free_swift_signature(const char *key, void *value, void *ud) {
+    (void)key;
+    (void)ud;
+    free(value);
+}
+
 void cbm_registry_free(cbm_registry_t *r) {
     if (!r) {
         return;
@@ -1128,6 +1141,10 @@ void cbm_registry_free(cbm_registry_t *r) {
     /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    if (r->swift_signatures) {
+        cbm_ht_foreach(r->swift_signatures, free_swift_signature, NULL);
+        cbm_ht_free(r->swift_signatures);
+    }
     cbm_ht_foreach(r->exact, free_label, NULL);
     cbm_ht_free(r->exact);
     for (int i = 0; i < r->label_pool_n; i++) {
@@ -1262,6 +1279,33 @@ void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qual
     if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
         index_under_name(r, name, owned_qn, lang);
     }
+}
+
+void cbm_registry_set_swift_signature(cbm_registry_t *r, const char *qualified_name,
+                                      uint64_t default_mask, uint8_t param_count) {
+    if (!r || !qualified_name) {
+        return;
+    }
+    const char *owned = cbm_ht_get_key(r->exact, qualified_name);
+    if (!owned) {
+        return;
+    }
+    if (!r->swift_signatures) {
+        r->swift_signatures = cbm_ht_create(CBM_SZ_512);
+        if (!r->swift_signatures) {
+            return;
+        }
+    }
+    swift_signature_t *sig = cbm_ht_get(r->swift_signatures, owned);
+    if (!sig) {
+        sig = malloc(sizeof(*sig));
+        if (!sig) {
+            return;
+        }
+        cbm_ht_set(r->swift_signatures, owned, sig);
+    }
+    sig->defaults = default_mask;
+    sig->count = param_count;
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -1834,6 +1878,425 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     return res;
 }
 
+/* Read labels from the signature-qualified QN. Types may contain commas in
+ * tuples, generic arguments or function types, so only top-level commas split
+ * parameters. The type text is used only to recognize a trailing closure. */
+typedef struct {
+    int parens;
+    int brackets;
+    int angles;
+} swift_parameter_depth_t;
+
+static void swift_parameter_depth_step(swift_parameter_depth_t *depth, char ch, char previous) {
+    switch (ch) {
+    case '(':
+        depth->parens++;
+        break;
+    case ')':
+        if (depth->parens > 0) {
+            depth->parens--;
+        }
+        break;
+    case '[':
+        depth->brackets++;
+        break;
+    case ']':
+        if (depth->brackets > 0) {
+            depth->brackets--;
+        }
+        break;
+    case '<':
+        depth->angles++;
+        break;
+    case '>':
+        if (depth->angles > 0 && previous != '=') {
+            depth->angles--;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static bool swift_type_wraps(const char *start, const char *end) {
+    if (*start != '(') {
+        return false;
+    }
+    swift_parameter_depth_t depth = {0};
+    bool comma = false;
+    for (const char *p = start; p < end; p++) {
+        swift_parameter_depth_step(&depth, *p, p == start ? '\0' : p[-SKIP_ONE]);
+        if (*p == ')' && depth.parens == 0) {
+            return p == end - SKIP_ONE && !comma;
+        }
+        if (*p == ',' && depth.parens == SKIP_ONE && depth.brackets == 0 && depth.angles == 0) {
+            comma = true;
+        }
+    }
+    return false;
+}
+
+static bool swift_type_is_closure(const char *start, const char *end) {
+    while (start < end) {
+        if (end[-SKIP_ONE] == '?') {
+            end--;
+            continue;
+        }
+        if (!swift_type_wraps(start, end)) {
+            break;
+        }
+        start++;
+        end--;
+    }
+    swift_parameter_depth_t depth = {0};
+    for (const char *p = start; p + SKIP_ONE < end; p++) {
+        if (*p == '=' && p[SKIP_ONE] == '>' && depth.parens == 0 && depth.brackets == 0 &&
+            depth.angles == 0) {
+            return true;
+        }
+        swift_parameter_depth_step(&depth, *p, p == start ? '\0' : p[-SKIP_ONE]);
+    }
+    return false;
+}
+
+enum { SWIFT_MAX_PARAMETERS = 64, SWIFT_INCOMPATIBLE = -1 };
+
+typedef struct {
+    const char *labels[SWIFT_MAX_PARAMETERS];
+    size_t label_lens[SWIFT_MAX_PARAMETERS];
+    bool closures[SWIFT_MAX_PARAMETERS];
+    bool variadics[SWIFT_MAX_PARAMETERS];
+    unsigned count;
+} swift_parameters_t;
+
+/* Exact match for a later trailing closure's label. NULL and empty labels
+ * never match, so a call with no captured label binds nothing by label. */
+static bool swift_label_matches(const char *label, const char *want, size_t want_len) {
+    return label && label[0] && strlen(label) == want_len && memcmp(label, want, want_len) == 0;
+}
+
+/* Whether trailing closure used may bind signature parameter i. The first
+ * unlabelled closure skips a default or variadic parameter only if a required
+ * parameter precedes the first parameter matching the next trailing label. */
+static bool swift_trailing_binds(const swift_signature_t *meta, const CBMCall *call,
+                                 const swift_parameters_t *params, unsigned i, unsigned total,
+                                 unsigned used) {
+    if (used >= total || !params->closures[i]) {
+        return false;
+    }
+    if (used > 0) {
+        const char *tl = call->swift_trailing_labels ? call->swift_trailing_labels[used] : NULL;
+        return swift_label_matches(tl, params->labels[i], params->label_lens[i]);
+    }
+    if (!params->variadics[i] && (meta->defaults & (UINT64_C(1) << i)) == 0) {
+        return true;
+    }
+    const char *next_label = total > SKIP_ONE && call->swift_trailing_labels
+                                 ? call->swift_trailing_labels[SKIP_ONE]
+                                 : NULL;
+    for (unsigned j = i + SKIP_ONE; j < params->count; j++) {
+        if (swift_label_matches(next_label, params->labels[j], params->label_lens[j])) {
+            break;
+        }
+        if (!params->variadics[j] && (meta->defaults & (UINT64_C(1) << j)) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool swift_parameter_add(swift_parameters_t *params, const char *entry, const char *end) {
+    if (params->count >= SWIFT_MAX_PARAMETERS) {
+        return false;
+    }
+    const char *colon = memchr(entry, ':', (size_t)(end - entry));
+    if (!colon) {
+        return false;
+    }
+    unsigned i = params->count;
+    params->labels[i] = entry;
+    params->label_lens[i] = (size_t)(colon - entry);
+    params->variadics[i] = end > colon + SKIP_ONE && end[-SKIP_ONE] == '~';
+    const char *type_end = params->variadics[i] ? end - SKIP_ONE : end;
+    params->closures[i] = swift_type_is_closure(colon + SKIP_ONE, type_end);
+    params->count++;
+    return true;
+}
+
+/* Declaration requirements distinguish nodes, without proving applicability. */
+static size_t swift_generic_prefix_len(const char *sig, size_t n) {
+    unsigned depth = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (sig[i] == '<') {
+            depth++;
+        } else if (sig[i] == '>' && (i == 0 || sig[i - SKIP_ONE] != '=')) {
+            if (depth == 0) {
+                return 0;
+            }
+            if (--depth == 0) {
+                return i + SKIP_ONE;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Split only at top-level commas; preserve the closure/variadic spelling rules. */
+static bool swift_parameters_read(const char *qn, const char *name, const swift_signature_t *meta,
+                                  swift_parameters_t *params) {
+    size_t base_len = cbm_qn_callable_base_len_named(qn, name);
+    const char *sig = qn + base_len;
+    size_t n = cbm_callable_return_offset(sig);
+    const size_t async_len = sizeof("async") - SKIP_ONE;
+    if (n >= async_len && memcmp(sig + n - async_len, "async", async_len) == 0) {
+        n -= async_len;
+    }
+    /* Declaration generic requirements distinguish nodes, but do not prove
+     * applicability. Read only params when selecting compatible candidates. */
+    if (n && sig[0] == '<') {
+        size_t i = swift_generic_prefix_len(sig, n);
+        if (i == 0 || i >= n) {
+            return false;
+        }
+        sig += i;
+        n -= i;
+    }
+    if (n < PAIR_LEN || sig[0] != '(' || sig[n - SKIP_ONE] != ')' || strchr(sig, '#')) {
+        return false;
+    }
+    const char *entry = sig + SKIP_ONE;
+    const char *end = sig + n - SKIP_ONE;
+    swift_parameter_depth_t depth = {0};
+    for (const char *p = entry; p <= end; p++) {
+        bool boundary = p == end || (*p == ',' && depth.parens == 0 && depth.brackets == 0 &&
+                                     depth.angles == 0);
+        if (boundary) {
+            if (p > entry && !swift_parameter_add(params, entry, p)) {
+                return false;
+            }
+            entry = p + SKIP_ONE;
+            continue;
+        }
+        char previous = p == entry ? '\0' : p[-SKIP_ONE];
+        swift_parameter_depth_step(&depth, *p, previous);
+    }
+    return params->count == meta->count;
+}
+
+static bool swift_argument_label_matches(const swift_parameters_t *params, const CBMCall *call,
+                                         unsigned i, int arg) {
+    if (arg >= call->arg_count) {
+        return false;
+    }
+    const char *given = call->args[arg].keyword;
+    if (!given) {
+        given = "_";
+    }
+    return strlen(given) == params->label_lens[i] &&
+           memcmp(given, params->labels[i], params->label_lens[i]) == 0;
+}
+
+static int swift_variadic_advance(const CBMCall *call, int arg, bool label_matches) {
+    if (!label_matches) {
+        return arg;
+    }
+    arg++;
+    while (arg < call->arg_count && !call->args[arg].keyword) {
+        arg++;
+    }
+    return arg;
+}
+
+static uint16_t swift_trailing_advance(const swift_parameters_t *params,
+                                       const swift_signature_t *meta, const CBMCall *call,
+                                       unsigned i, unsigned total, uint16_t states) {
+    uint16_t next = 0;
+    for (unsigned used = 0; used < total; used++) {
+        if ((states & (UINT16_C(1) << used)) &&
+            swift_trailing_binds(meta, call, params, i, total, used)) {
+            next |= (uint16_t)(UINT16_C(1) << (used + SKIP_ONE));
+        }
+    }
+    return next;
+}
+
+static void swift_parameter_advance(const swift_parameters_t *params, const swift_signature_t *meta,
+                                    const CBMCall *call, unsigned i, unsigned total, int arg,
+                                    uint16_t states, uint16_t *next) {
+    uint16_t trailing =
+        arg == call->arg_count ? swift_trailing_advance(params, meta, call, i, total, states) : 0;
+    if (params->variadics[i] || (meta->defaults & (UINT64_C(1) << i))) {
+        /* After explicit arguments, preserve the first eligible trailing
+         * binding instead of skipping it to a later one. */
+        next[arg] |= states & (uint16_t)~(trailing >> SKIP_ONE);
+    }
+    if (swift_argument_label_matches(params, call, i, arg)) {
+        int end = params->variadics[i] ? swift_variadic_advance(call, arg, true) : arg + SKIP_ONE;
+        next[end] |= states;
+        if (params->variadics[i] && end == call->arg_count) {
+            next[end] |= swift_trailing_advance(params, meta, call, i, total, states);
+        }
+    }
+    next[arg] |= trailing;
+}
+
+static bool swift_parameters_match(const swift_parameters_t *params, const swift_signature_t *meta,
+                                   const CBMCall *call) {
+    /* Preserve the legacy bool as one unlabelled closure for manual callers. */
+    unsigned trailing_total = call->swift_trailing_count;
+    if (trailing_total == 0 && call->swift_trailing_closure) {
+        trailing_total = SKIP_ONE;
+    }
+    /* Each argument cursor retains the reachable trailing-closure counts.
+     * A matching label must not greedily consume an earlier default when
+     * the same label is needed by a later required parameter. */
+    uint16_t states[CBM_MAX_CALL_ARGS + SKIP_ONE] = {SKIP_ONE};
+    for (unsigned i = 0; i < params->count; i++) {
+        uint16_t next[CBM_MAX_CALL_ARGS + SKIP_ONE] = {0};
+        for (int arg = 0; arg <= call->arg_count; arg++) {
+            if (!states[arg]) {
+                continue;
+            }
+            swift_parameter_advance(params, meta, call, i, trailing_total, arg, states[arg], next);
+        }
+        memcpy(states, next, sizeof(states));
+    }
+    return (states[call->arg_count] & (UINT16_C(1) << trailing_total)) != 0;
+}
+
+static bool swift_signature_matches(const char *qn, const char *name, const swift_signature_t *meta,
+                                    const CBMCall *call) {
+    if (!meta || meta->count == UINT8_MAX || call->arg_count < 0 ||
+        call->arg_count > CBM_MAX_CALL_ARGS || (call->arg_count > 0 && !call->args) ||
+        call->swift_args_truncated || call->swift_trailing_truncated ||
+        call->swift_trailing_count > CBM_MAX_TRAILING_CLOSURES) {
+        return false;
+    }
+    swift_parameters_t params;
+    params.count = 0;
+    if (!swift_parameters_read(qn, name, meta, &params)) {
+        return false;
+    }
+    return swift_parameters_match(&params, meta, call);
+}
+
+/* Keep receiver choice ahead of general import/name choice. Without a module,
+ * this path still uses the deterministic distance tie-break, as before. */
+static const char *swift_choose_receiver(const char **matches, int matched, const char *name,
+                                         const CBMCall *call, const char *module_qn,
+                                         const char **import_vals, int import_count) {
+    if (!strchr(call->callee_name, '.')) {
+        return NULL;
+    }
+    size_t callee_len = strlen(call->callee_name);
+    const char *receiver_matches[REG_MAX_CANDIDATES];
+    int receiver_count = 0;
+    for (int i = 0; i < matched; i++) {
+        size_t base = cbm_qn_callable_base_len_named(matches[i], name);
+        if (base >= callee_len &&
+            memcmp(matches[i] + base - callee_len, call->callee_name, callee_len) == 0 &&
+            (base == callee_len || matches[i][base - callee_len - SKIP_ONE] == '.')) {
+            receiver_matches[receiver_count++] = matches[i];
+        }
+    }
+    if (receiver_count == 0) {
+        return NULL;
+    }
+    const char *reachable[REG_MAX_CANDIDATES];
+    int reachable_count = 0;
+    if (import_vals) {
+        for (int i = 0; i < receiver_count; i++) {
+            if (is_import_reachable(receiver_matches[i], import_vals, import_count)) {
+                reachable[reachable_count++] = receiver_matches[i];
+            }
+        }
+    }
+    const char **preferred = reachable_count > 0 ? reachable : receiver_matches;
+    int preferred_count = reachable_count > 0 ? reachable_count : receiver_count;
+    return best_by_import_distance(preferred, NULL, preferred_count, module_qn);
+}
+
+static const char *swift_choose_candidate(const char **matches, int matched, const char *name,
+                                          const CBMCall *call, const char *module_qn,
+                                          const char **import_vals, int import_count) {
+    const char *chosen =
+        swift_choose_receiver(matches, matched, name, call, module_qn, import_vals, import_count);
+    if (chosen) {
+        return chosen;
+    }
+    const char *reachable[REG_MAX_CANDIDATES];
+    int reachable_count = 0;
+    if (import_vals) {
+        for (int i = 0; i < matched; i++) {
+            if (is_import_reachable(matches[i], import_vals, import_count)) {
+                reachable[reachable_count++] = matches[i];
+            }
+        }
+    }
+    if (reachable_count > 0) {
+        chosen = module_qn ? best_by_import_distance(reachable, NULL, reachable_count, module_qn)
+                           : reachable[0];
+    }
+    if (!chosen) {
+        chosen =
+            module_qn ? best_by_import_distance(matches, NULL, matched, module_qn) : matches[0];
+    }
+    return chosen;
+}
+
+int cbm_registry_swift_candidates(const cbm_registry_t *r, const CBMCall *call,
+                                  const char *module_qn, const char **import_vals, int import_count,
+                                  const char **out, int out_cap) {
+    if (!r || !r->swift_signatures || !call || !call->callee_name || !out || out_cap < SKIP_ONE) {
+        return 0;
+    }
+    const char *name = simple_name(call->callee_name);
+    qn_array_t *bucket = cbm_ht_get(r->by_name, name);
+    if (!bucket) {
+        return 0;
+    }
+    if (bucket->count > REG_MAX_CANDIDATES) {
+        for (int i = 0; i < bucket->count; i++) {
+            if (cbm_ht_get(r->swift_signatures, bucket->items[i])) {
+                return SWIFT_INCOMPATIBLE;
+            }
+        }
+        return 0;
+    }
+    const char *matches[REG_MAX_CANDIDATES];
+    int matched = 0;
+    bool has_swift = false;
+    for (int i = 0; i < bucket->count; i++) {
+        const char *qn = bucket->items[i];
+        swift_signature_t *meta = cbm_ht_get(r->swift_signatures, qn);
+        has_swift |= meta != NULL;
+        if (meta && receiver_chain_admits(call->callee_name, qn) &&
+            swift_signature_matches(qn, name, meta, call)) {
+            matches[matched++] = qn;
+        }
+    }
+    if (matched == 0) {
+        return has_swift ? SWIFT_INCOMPATIBLE : 0;
+    }
+    const char *chosen =
+        swift_choose_candidate(matches, matched, name, call, module_qn, import_vals, import_count);
+    if (!chosen) {
+        return 0;
+    }
+    size_t chosen_base = cbm_qn_callable_base_len_named(chosen, name);
+    int found = 0;
+    for (int i = 0; i < matched; i++) {
+        size_t base = cbm_qn_callable_base_len_named(matches[i], name);
+        if (base == chosen_base && memcmp(matches[i], chosen, base) == 0) {
+            if (found == out_cap) {
+                return SWIFT_INCOMPATIBLE;
+            }
+            out[found++] = matches[i];
+        }
+    }
+    return found;
+}
+
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
 
 /* Method QNs are path-based: <project>.<dirs>.<file stem>.<Class>.<method>.
@@ -2118,14 +2581,14 @@ int cbm_registry_find_ending_with(const cbm_registry_t *r, const char *suffix, c
 
     /* Build ".suffix" target */
     size_t slen = strlen(suffix);
-    char *target = malloc(slen + REG_SUFFIX_ALLOC);
+    char *target = cbm_alloc(CBM_MEM_CLASS_OTHER, slen + REG_SUFFIX_ALLOC);
     target[0] = '.';
     memcpy(target + SKIP_ONE, suffix, slen + SKIP_ONE);
 
     struct few_ctx ctx = {target, slen + SKIP_ONE, NULL, 0, 0};
     cbm_ht_foreach(r->exact, few_scan, &ctx);
 
-    free(target);
+    cbm_free(CBM_MEM_CLASS_OTHER, target);
     *out = ctx.results;
     return ctx.count;
 }

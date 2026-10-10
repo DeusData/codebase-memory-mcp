@@ -1,6 +1,5 @@
 /*
- * test_callable_sig.c — golden tables for the signature-qualified callable
- * identity builder and its inverse (#2061, plumbing: no language enabled).
+ * test_callable_sig.c — golden tables for signature-qualified callable identity (#2061).
  */
 #include "test_framework.h"
 #include "callable_sig.h"
@@ -123,8 +122,9 @@ static const sig_case_t k_cases[] = {
      "HTTPMethod = .post, headers: [String: String]? = nil, handler: @escaping (Int) -> Void, "
      "xs: Int..., io: inout Swift.Int, t: (a: Int, String)) -> UploadRequest { }\n}",
      "function_declaration", 0,
-     "(_:Data,to:URLConvertible,method:HTTPMethod,headers:[String:String]?,handler:(Int)=>Void,"
-     "xs:Int~,io:inout Int,t:(a:Int,String))"},
+     "<T:Encodable>(_:Data,to:URLConvertible,method:HTTPMethod,headers:[String:String]?,handler:("
+     "Int)=>Void,"
+     "xs:Int~,io:inout Swift/Int,t:(a:Int,String))=>UploadRequest"},
     {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
      "class Session {\n  func upload(_ data: Data, with request: URLRequest) {}\n}",
      "function_declaration", 0, "(_:Data,with:URLRequest)"},
@@ -132,11 +132,52 @@ static const sig_case_t k_cases[] = {
      "init_declaration", 0, "(frame:CGRect)"},
     {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
      "class C { subscript(index i: Int) -> Int { return 0 } }", "subscript_declaration", 0,
-     "(index:Int)"},
+     "(index:Int)=>Int"},
     {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
-     "class C { static func + (l: C, r: C) -> C { l } }", "function_declaration", 0, "(l:C,r:C)"},
+     "class C { static func + (l: C, r: C) -> C { l } }", "function_declaration", 0,
+     "(l:C,r:C)=>C"},
     {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func extra() {}", "function_declaration", 0,
      "()"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f<T>(_ x: T) {}", "function_declaration",
+     0, "<T>(_:T)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f<T: Equatable>(_ x: T) {}",
+     "function_declaration", 0, "<T:Equatable>(_:T)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f<T>(_ x: T) where T: Equatable {}",
+     "function_declaration", 0, "<T;where T:Equatable>(_:T)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f<T>(_ x: T) where T.Element == Int {}",
+     "function_declaration", 0, "<T;where T/Element==Int>(_:T)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
+     "func f < T > ( _ x : T ) where T . Element == Int { }", "function_declaration", 0,
+     "<T;where T/Element==Int>(_:T)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f(_ x: Int) async {}",
+     "function_declaration", 0, "(_:Int)async"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f(body: () async -> Void) {}",
+     "function_declaration", 0, "(body:()async=>Void)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f<T>(_ x: T) where T == () -> Void {}",
+     "function_declaration", 0, "<T;where T==()=>Void>(_:T)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func work(_ x: A.Item) {}",
+     "function_declaration", 0, "(_:A/Item)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func work(_ x: B.Item) {}",
+     "function_declaration", 0, "(_:B/Item)"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func pick() -> Int { 1 }",
+     "function_declaration", 0, "()=>Int"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func pick() -> String { \"x\" }",
+     "function_declaration", 0, "()=>String"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
+     "func f(_ x: [A.Item], body: (B.Item) -> A.Item) async -> (A.Item, [B.Item]) {}",
+     "function_declaration", 0, "(_:[A/Item],body:(B/Item)=>A/Item)async=>(A/Item,[B/Item])"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
+     "func f ( _ x : [ A /* comment */ . Item ], body : ( B.Item ) -> A.Item ) async "
+     "-> ( A.Item, [ B.Item ] ) {}",
+     "function_declaration", 0, "(_:[A/Item],body:(B/Item)=>A/Item)async=>(A/Item,[B/Item])"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, "func f() -> (A.Item) -> B.Item {}",
+     "function_declaration", 0, "()=>(A/Item)=>B/Item"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
+     "func f<T,U>(_ x: T, _ y: U) -> Int where T == Box<[Int]>, U == () -> Void {}",
+     "function_declaration", 0, "<T,U;where T==Box<[Int]>,U==()=>Void>(_:T,_:U)=>Int"},
+    {CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED,
+     "func f<T,U>(_ x: T, _ y: U) -> Int where T == Box<() -> Void>, U == () -> Void {}",
+     "function_declaration", 0, "<T,U;where T==Box<()=>Void>,U==()=>Void>(_:T,_:U)=>Int"},
     /* Scala: every clause flattened, by-name and repeated parameters. */
     {CBM_LANG_SCALA, CBM_CALLABLE_ID_TYPED,
      "class A {\n  def work[T <: AnyRef](xs: List[T], n: => Int, rest: String*)(implicit ord: "
@@ -220,16 +261,39 @@ TEST(callable_sig_cap_keeps_identity) {
     char *qn = cbm_arena_sprintf(&a, "p.A.f%s", sa);
     ASSERT_EQ(cbm_qn_callable_base_len(qn), strlen("p.A.f"));
     cbm_arena_destroy(&a);
+    n = (size_t)snprintf(src_a, sizeof(src_a), "func f() -> (");
+    for (int i = 0; i < 24; i++) {
+        n += (size_t)snprintf(src_a + n, sizeof(src_a) - n, "%sA.VeryLongType%d", i ? "," : "", i);
+    }
+    memcpy(src_b, src_a, n);
+    snprintf(src_a + n, sizeof(src_a) - n, ",A.Last) {}");
+    snprintf(src_b + n, sizeof(src_b) - n, ",B.Last) {}");
+    cbm_arena_init(&a);
+    sa =
+        sig_of(&a, CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, src_a, "function_declaration", 0);
+    sa2 =
+        sig_of(&a, CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, src_a, "function_declaration", 0);
+    sb =
+        sig_of(&a, CBM_LANG_SWIFT, CBM_CALLABLE_ID_LABELED_TYPED, src_b, "function_declaration", 0);
+    ASSERT_NOT_NULL(sa);
+    ASSERT_NOT_NULL(sb);
+    ASSERT_TRUE(strlen(sa) <= CBM_CALLABLE_SIG_MAX);
+    ASSERT_STR_EQ(sa, sa2);
+    ASSERT_STR_NEQ(sa, sb);
+    qn = cbm_arena_sprintf(&a, "p.A.f%s", sa);
+    ASSERT_EQ(cbm_qn_callable_base_len(qn), strlen("p.A.f"));
+    cbm_arena_destroy(&a);
     PASS();
 }
 
-/* PR1 is plumbing: no language mints a suffix yet. */
-TEST(callable_sig_every_language_is_none) {
+/* Swift is enabled; the other languages keep their historical QNs. */
+TEST(callable_sig_only_swift_enabled) {
     CBMArena a;
     cbm_arena_init(&a);
     const char *src = "class A { void f(int x) {} }";
     for (int lang = 0; lang < CBM_LANG_COUNT; lang++) {
-        ASSERT_EQ(cbm_callable_identity((CBMLanguage)lang), CBM_CALLABLE_ID_NONE);
+        ASSERT_EQ(cbm_callable_identity((CBMLanguage)lang),
+                  lang == CBM_LANG_SWIFT ? CBM_CALLABLE_ID_LABELED_TYPED : CBM_CALLABLE_ID_NONE);
     }
     TSParser *parser = ts_parser_new();
     ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_JAVA));
@@ -244,6 +308,27 @@ TEST(callable_sig_every_language_is_none) {
     PASS();
 }
 
+TEST(callable_sig_swift_default_parameters) {
+    const char *src = "class C { func f(a: Int, b: String = \"x\", c: () -> Void) {} }";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_SWIFT)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    TSNode method = {0};
+    int left = 0;
+    ASSERT_TRUE(find_nth(ts_tree_root_node(tree), "function_declaration", &left, &method));
+    CBMArena a;
+    cbm_arena_init(&a);
+    ASSERT_STR_EQ(cbm_callable_sig(&a, method, src, CBM_LANG_SWIFT), "(a:Int,b:String,c:()=>Void)");
+    uint8_t count = 0;
+    ASSERT_EQ(cbm_swift_default_mask(method, src, &count), UINT64_C(1) << 1);
+    ASSERT_EQ(count, 3);
+    cbm_arena_destroy(&a);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
 /* The inverse is the identity on every historical QN shape. */
 TEST(callable_sig_base_len_unsuffixed_is_full) {
     static const char *const qns[] = {
@@ -267,6 +352,9 @@ TEST(callable_sig_base_len_unsuffixed_is_full) {
         "proj.lib/(group)/page",
         "proj.C.+",
         "proj.A.unary_!",
+        "p.f()=>",
+        "p.f()=>[Int",
+        "p.f()=>Int)",
     };
     for (size_t i = 0; i < sizeof(qns) / sizeof(qns[0]); i++) {
         ASSERT_EQ(cbm_qn_callable_base_len(qns[i]), strlen(qns[i]));
@@ -290,6 +378,13 @@ TEST(callable_sig_base_len_suffixed) {
         {"p.S.f<typename,int>(const vector<T>&,int(*)(int))const&&", "p.S.f"},
         {"p.C.Work<T,U>(ref int)", "p.C.Work"},
         {"p.Session.upload(_:Data,to:URL)", "p.Session.upload"},
+        {"p.S.pick()=>Int", "p.S.pick"},
+        {"p.S.pick()=>String", "p.S.pick"},
+        {"p.S.<(_:A,_:A)=>Bool", "p.S.<"},
+        {"p.S.>(_:A,_:A)=>Bool", "p.S.>"},
+        {"p.S.<<T>(_:T,_:T)=>Bool", "p.S.<"},
+        {"p.S.pick()async=>(A/Item)=>B/Item", "p.S.pick"},
+        {"p.S.pick<T;where T==()=>Void>(_:T)=>[A/Item]", "p.S.pick"},
         {"p.K.work(this:String,(Int)=>Unit)", "p.K.work"},
         {"p.O.initWithFrame(_:style:)", "p.O.initWithFrame"},
         {"p.C.+(l:C,r:C)", "p.C.+"},
@@ -340,7 +435,8 @@ TEST(callable_sig_registry_by_name_uses_base_leaf) {
 SUITE(callable_sig) {
     RUN_TEST(callable_sig_golden_table);
     RUN_TEST(callable_sig_cap_keeps_identity);
-    RUN_TEST(callable_sig_every_language_is_none);
+    RUN_TEST(callable_sig_only_swift_enabled);
+    RUN_TEST(callable_sig_swift_default_parameters);
     RUN_TEST(callable_sig_base_len_unsuffixed_is_full);
     RUN_TEST(callable_sig_base_len_suffixed);
     RUN_TEST(callable_sig_leaf_splitters_skip_suffix);

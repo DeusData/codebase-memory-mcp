@@ -17,8 +17,10 @@
  *     bytes is the early-cutoff key: a body edit reserializes identically.
  */
 #include "pipeline/lsp_surface.h"
+#include "foundation/constants.h"
 #include "pipeline/pipeline_internal.h"
 
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,6 +129,28 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         }
     }
     yyjson_mut_obj_add_val(doc, root, "reg", reg);
+
+    yyjson_mut_val *swift = NULL;
+    for (int i = 0; result && i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (!d->qn_sig_off || !d->qualified_name) {
+            continue;
+        }
+        if (!swift) {
+            swift = yyjson_mut_arr(doc);
+        }
+        yyjson_mut_val *o = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, o, "q", d->qualified_name);
+        char defaults[CBM_SZ_16 + SKIP_ONE];
+        (void)snprintf(defaults, sizeof(defaults), "%016llx",
+                       (unsigned long long)d->swift_default_mask);
+        yyjson_mut_obj_add_strcpy(doc, o, "d", defaults);
+        yyjson_mut_obj_add_int(doc, o, "p", d->swift_param_count);
+        yyjson_mut_arr_add_val(swift, o);
+    }
+    if (swift) {
+        yyjson_mut_obj_add_val(doc, root, "swift", swift);
+    }
 
     /* #1916: an axios instance binding's baseURL is consumed by the files
      * that import it (their HTTP_CALLS compose base + path), so a changed

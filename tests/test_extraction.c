@@ -2374,6 +2374,46 @@ TEST(swift_method_call) {
     PASS();
 }
 
+TEST(swift_multiple_trailing_closure_extraction) {
+    CBMFileResult *r =
+        extract("func outer() { service.handle { nested() } onError: { recover() } }\n"
+                "func one() { service.run { nested() } }\n"
+                "func incomplete() { service.handle { } onError: { recover( } }\n",
+                CBM_LANG_SWIFT, "t", "Calls.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    CBMCall *multi = NULL;
+    CBMCall *single = NULL;
+    CBMCall *incomplete = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "service.handle") == 0) {
+            if (call->start_line == 1) {
+                multi = call;
+            } else {
+                incomplete = call;
+            }
+        } else if (call->callee_name && strcmp(call->callee_name, "service.run") == 0) {
+            single = call;
+        }
+    }
+    ASSERT_NOT_NULL(multi);
+    ASSERT_NOT_NULL(single);
+    ASSERT_NOT_NULL(incomplete);
+    ASSERT_EQ(multi->swift_trailing_count, 2);
+    ASSERT_TRUE(multi->swift_trailing_closure);
+    ASSERT_FALSE(multi->swift_trailing_truncated);
+    ASSERT_NOT_NULL(multi->swift_trailing_labels);
+    ASSERT_NULL(multi->swift_trailing_labels[0]);
+    ASSERT_STR_EQ(multi->swift_trailing_labels[1], "onError");
+    ASSERT_EQ(single->swift_trailing_count, 1);
+    ASSERT_FALSE(single->swift_trailing_truncated);
+    ASSERT_EQ(incomplete->swift_trailing_count, 2);
+    ASSERT_TRUE(incomplete->swift_trailing_truncated);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(swift_constructor_call) {
     CBMFileResult *r =
         extract("func create() { let x = MyClass() }\n", CBM_LANG_SWIFT, "t", "create.swift");
@@ -10295,6 +10335,97 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     PASS();
 }
 
+TEST(swift_trailing_closure_boundaries_survive_compact_and_spill) {
+    const char *src = "func eight() { service.eight { } first: { } second: { } third: { } "
+                      "fourth: { } fifth: { } sixth: { } seventh: { } }\n"
+                      "func nine() { service.nine { } first: { } second: { } third: { } "
+                      "fourth: { } fifth: { } sixth: { } seventh: { } eighth: { } }\n";
+    const char *callees[] = {"service.eight", "service.nine"};
+    const char *labels[] = {NULL,     "first", "second", "third",
+                            "fourth", "fifth", "sixth",  "seventh"};
+    CBMFileResult *r = extract(src, CBM_LANG_SWIFT, "t", "TrailingBounds.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->cached_tree);
+    ASSERT_FALSE(ts_node_has_error(ts_tree_root_node(r->cached_tree)));
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    cbm_result_spill_t *sp = cbm_result_spill_open(dir, 1, 1);
+    ASSERT_NOT_NULL(sp);
+    CBMFileResult *loaded[2] = {NULL, NULL};
+    const CBMCall *loaded_calls[2][2] = {{NULL, NULL}, {NULL, NULL}};
+
+    /* Check real extraction, compaction, and both independently loaded copies. */
+    for (int stage = 0; stage < 4; stage++) {
+        CBMFileResult *current = r;
+        if (stage == 1) {
+            cbm_result_compact(r);
+        } else if (stage >= 2) {
+            loaded[stage - 2] = cbm_result_spill_load(sp, 0);
+            current = loaded[stage - 2];
+        }
+        ASSERT_NOT_NULL(current);
+        ASSERT_FALSE(current->has_error);
+        if (stage > 0) {
+            ASSERT_EQ(current->arena.nblocks, 1);
+        }
+        for (int c = 0; c < 2; c++) {
+            ASSERT_EQ(count_calls_named(current, callees[c]), 1);
+            const CBMCall *call = find_call_by_callee(current, callees[c]);
+            ASSERT_NOT_NULL(call);
+            ASSERT_EQ(call->swift_trailing_count, 8);
+            ASSERT_TRUE(call->swift_trailing_closure);
+            ASSERT_EQ(call->swift_trailing_truncated, c == 1);
+            ASSERT_NOT_NULL(call->swift_trailing_labels);
+            if (stage > 0) {
+                uintptr_t lo = (uintptr_t)current->arena.blocks[0];
+                uintptr_t array = (uintptr_t)call->swift_trailing_labels;
+                size_t bytes = 8 * sizeof(*call->swift_trailing_labels);
+                ASSERT(current->arena.used >= bytes);
+                ASSERT(array >= lo && array - lo <= current->arena.used - bytes);
+            }
+            ASSERT_NULL(call->swift_trailing_labels[0]);
+            for (int i = 1; i < 8; i++) {
+                ASSERT_NOT_NULL(call->swift_trailing_labels[i]);
+                size_t label_bytes = strlen(labels[i]) + 1;
+                if (stage > 0) {
+                    uintptr_t lo = (uintptr_t)current->arena.blocks[0];
+                    uintptr_t label = (uintptr_t)call->swift_trailing_labels[i];
+                    ASSERT(label >= lo && label - lo < current->arena.used);
+                    ASSERT(label_bytes <= current->arena.used - (label - lo));
+                }
+                ASSERT_MEM_EQ(call->swift_trailing_labels[i], labels[i], label_bytes);
+            }
+            if (stage >= 2) {
+                loaded_calls[stage - 2][c] = call;
+            }
+        }
+        if (stage == 1) {
+            ASSERT_TRUE(cbm_result_spill_park(sp, 0, 0, r));
+            r = NULL; /* Park owns and frees the compacted result. */
+        }
+    }
+
+    ASSERT(loaded[0] != loaded[1]);
+    ASSERT(loaded[0]->arena.blocks[0] != loaded[1]->arena.blocks[0]);
+    for (int c = 0; c < 2; c++) {
+        ASSERT(loaded_calls[0][c]->swift_trailing_labels !=
+               loaded_calls[1][c]->swift_trailing_labels);
+        for (int i = 1; i < 8; i++) {
+            ASSERT(loaded_calls[0][c]->swift_trailing_labels[i] !=
+                   loaded_calls[1][c]->swift_trailing_labels[i]);
+        }
+    }
+
+    cbm_free_result(loaded[1]);
+    cbm_free_result(loaded[0]);
+    cbm_result_spill_close(sp);
+    cbm_rmdir(dir);
+    PASS();
+}
+
 /* The low-disk guard, pinned through the free-space seam rather than the host
  * disk: one byte under the floor refuses (spilling onto a nearly full disk is
  * a worse failure than the memory pressure it relieves), the floor itself
@@ -10580,6 +10711,8 @@ SUITE(extraction) {
     RUN_TEST(swift_struct);
     RUN_TEST(swift_simple_call);
     RUN_TEST(swift_method_call);
+    RUN_TEST(swift_multiple_trailing_closure_extraction);
+    RUN_TEST(swift_trailing_closure_boundaries_survive_compact_and_spill);
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
     RUN_TEST(swift_force_unwrap_scanner_shift);

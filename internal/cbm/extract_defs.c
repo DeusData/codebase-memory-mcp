@@ -1,4 +1,5 @@
 #include "cbm.h"
+#include "callable_sig.h"
 #include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
 #include "doclink.h" // cbm_doclink_note_doc_line
 #include "helpers.h"
@@ -6510,6 +6511,23 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_test = rust_def_is_test(def.decorators);
     }
 
+    if (ctx->language == CBM_LANG_SWIFT) {
+        if (!def.qualified_name) {
+            return;
+        }
+        const char *sig = cbm_callable_sig(a, func_node, ctx->source, ctx->language);
+        if (!sig) {
+            return;
+        }
+        def.qn_sig_off = (uint32_t)strlen(def.qualified_name);
+        def.qualified_name = cbm_arena_sprintf(a, "%s%s", def.qualified_name, sig);
+        if (!def.qualified_name) {
+            return;
+        }
+        def.swift_default_mask =
+            cbm_swift_default_mask(func_node, ctx->source, &def.swift_param_count);
+    }
+
     // C++/CUDA: GoogleTest macros are test functions (#1266).
     if (is_gtest || def.test_role == CBM_TEST_ROLE_CASE) {
         def.is_test = true;
@@ -8057,6 +8075,21 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     memset(&def, 0, sizeof(def));
     def.name = name;
     def.qualified_name = method_qn;
+    if (ctx->language == CBM_LANG_SWIFT) {
+        if (!method_qn) {
+            return;
+        }
+        const char *sig = cbm_callable_sig(a, child, ctx->source, ctx->language);
+        if (!sig) {
+            return;
+        }
+        def.qn_sig_off = (uint32_t)strlen(method_qn);
+        def.qualified_name = cbm_arena_sprintf(a, "%s%s", method_qn, sig);
+        if (!def.qualified_name) {
+            return;
+        }
+        def.swift_default_mask = cbm_swift_default_mask(child, ctx->source, &def.swift_param_count);
+    }
     def.label = "Method";
     def.file_path = ctx->rel_path;
     def.parent_class = class_qn;

@@ -285,6 +285,9 @@ typedef struct {
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
+    /* Swift only: defaulted parameters, indexed in declaration order. */
+    uint64_t swift_default_mask;
+    uint8_t swift_param_count;
     /* C# only: declared namespace of a TOP-LEVEL type (NULL for nested types,
      * the global namespace and every other language). Per type, because the
      * file-level namespace_name records only a file's first namespace. */
@@ -311,6 +314,9 @@ typedef struct {
 } CBMCallArg;
 
 #define CBM_MAX_CALL_ARGS 8
+/* Swift trailing-closure capture bound (#2061): more than this on one call
+ * marks the call truncated and the overload matcher fails closed. */
+#define CBM_MAX_TRAILING_CLOSURES 8
 
 /* The qualified name of a C-preprocessor macro (`#define NAME ...` in C, C++,
  * CUDA, Objective-C, GLSL, ISPC) is `<module QN>.<NAME>#macro`. C keeps macros
@@ -367,6 +373,20 @@ typedef struct {
                                      // (self.compiler.apply_converters()). An object the
                                      // class owns, not a parameter: read by the weak-member
                                      // guard's unique-name exemption. Default false.
+    bool swift_trailing_closure;
+    bool swift_args_truncated;
+    /* Swift multi-trailing-closure capture (#2061). `swift_trailing_closure`
+     * stays the "there is at least one trailing closure" flag manual callers
+     * and existing tests set; `swift_trailing_count` is the actual number
+     * captured (0 => fall back to the bool, treated as one unlabelled closure).
+     * `swift_trailing_labels[i]` is closure i's argument label from the
+     * grammar's `lambda_literal (simple_identifier ':')*` sequence (NULL when
+     * unlabelled; entry 0 is always unlabelled). More closures than
+     * CBM_MAX_TRAILING_CLOSURES sets `swift_trailing_truncated`, and the
+     * overload matcher then fails closed rather than guessing a partial set. */
+    uint8_t swift_trailing_count;
+    bool swift_trailing_truncated;
+    const char **swift_trailing_labels;
 } CBMCall;
 
 // What an import statement names, when the syntax says so. Only PHP's

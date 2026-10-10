@@ -415,11 +415,12 @@ static const cbm_gbuf_node_t *collapse(const pdfr_index_t *x, nodeset_t *s) {
         }
     }
     const cbm_gbuf_node_t *f = s->v[0];
+    const char *first_name = f->name ? f->name : "";
     for (int i = 1; i < s->n; i++) {
         const cbm_gbuf_node_t *n = s->v[i];
+        const char *name = n->name ? n->name : "";
         if (strcmp(n->file_path ? n->file_path : "", f->file_path ? f->file_path : "") != 0 ||
-            n->start_line != f->start_line ||
-            strcmp(n->name ? n->name : "", f->name ? f->name : "") != 0) {
+            n->start_line != f->start_line || strcmp(name, first_name) != 0) {
             return NULL;
         }
     }

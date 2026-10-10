@@ -17,6 +17,7 @@
  */
 #include "test_framework.h"
 #include "lang_specs.h"
+#include "callable_sig.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -74,9 +75,9 @@ typedef struct {
 static int qn_has_terminal_name(const char *qn, const char *name) {
     if (!qn || !name)
         return 0;
-    size_t qn_len = strlen(qn);
+    size_t qn_len = cbm_qn_callable_base_len(qn);
     size_t name_len = strlen(name);
-    if (name_len > qn_len || strcmp(qn + qn_len - name_len, name) != 0)
+    if (name_len > qn_len || strncmp(qn + qn_len - name_len, name, name_len) != 0)
         return 0;
     if (name_len == qn_len)
         return 1;

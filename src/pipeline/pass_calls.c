@@ -12,6 +12,8 @@
 #include "foundation/constants.h"
 
 enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
+static const double PC_SWIFT_SINGLE_CONF = 0.90;
+static const double PC_SWIFT_AMBIGUOUS_CONF = 0.55;
 /* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
  * resolution is empty (external, unindexed client library) — see #523. */
 #define PC_SVC_PATTERN_CONF 0.5
@@ -754,15 +756,45 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         }
     }
 
-    /* #2053: a Rust call the LSP placed on an EXTERNAL symbol (std's
-     * Path::join, a seeded crate API) is resolved — it just has no graph node.
-     * The textual registry would bind it to a same-named project method
-     * instead, so skip it and let the empty-resolution service fallbacks below
-     * classify the call. MUST match pass_parallel.c. */
+    /* Swift label-compatible overload selection (#2061). count > 0: emit an
+     * edge to every compatible candidate and stop. count < 0: project symbols
+     * share this name but none matches the call's labels — a bare-name
+     * registry match would bind a WRONG overload, so resolution is skipped
+     * and the call falls through as unresolved; the empty-resolution service
+     * fallbacks below still run, mirroring the Swift block in pass_parallel.c
+     * (service edges survive overload suppression, per #523/#606/#856).
+     * count == 0: no overload metadata for this name — resolve normally. */
+    int swift_candidates = 0;
+    if (lang == CBM_LANG_SWIFT) {
+        const char *candidates[CBM_SZ_256];
+        swift_candidates = cbm_registry_swift_candidates(ctx->registry, call, module_qn, imp_vals,
+                                                         imp_count, candidates, CBM_SZ_256);
+        if (swift_candidates > 0) {
+            int emitted = 0;
+            for (int i = 0; i < swift_candidates; i++) {
+                const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, candidates[i]);
+                if (target && target->id != source_node->id) {
+                    cbm_resolution_t selected = {.qualified_name = candidates[i],
+                                                 .strategy = "swift_labels",
+                                                 .confidence = swift_candidates == SKIP_ONE
+                                                                   ? PC_SWIFT_SINGLE_CONF
+                                                                   : PC_SWIFT_AMBIGUOUS_CONF,
+                                                 .candidate_count = swift_candidates};
+                    emit_classified_edge(ctx, call, source_node, target, &selected, module_qn,
+                                         imp_keys, imp_vals, imp_count, false, route_mount);
+                    emitted++;
+                }
+            }
+            return emitted > 0 ? SKIP_ONE : 0;
+        }
+    }
+
+    /* A Rust call the LSP placed on an EXTERNAL symbol has no graph node. The
+     * textual registry must not bind it to a same-named project method. */
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
-    if (!rust_external) {
+    if (swift_candidates >= 0 && !rust_external) {
         res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
                                    imp_count);
         /* Cross-language veto: a name-only guess never binds another
