@@ -236,6 +236,11 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 
 // Get "name" field from a node
 static TSNode func_name_node(TSNode node) {
+    const char *node_type = ts_node_type(node);
+    if (strcmp(node_type, "init_declaration") == 0 ||
+        strcmp(node_type, "deinit_declaration") == 0) {
+        return node;
+    }
     TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name)) {
         /* Protobuf rpc: name is in rpc_name child, not "name" field */
