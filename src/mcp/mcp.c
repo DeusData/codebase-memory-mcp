@@ -72,6 +72,7 @@ enum {
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
+#include "foundation/hash_table.h"
 #include "foundation/arena.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
@@ -6577,11 +6578,13 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
 
     yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
     yyjson_mut_val *pu_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *unresolved_files = yyjson_mut_arr(doc);
     yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_files = yyjson_mut_arr(doc);
     int pp_n = 0;
     int pu_n = 0;
+    int unresolved_n = 0;
     int sk_n = 0;
     int ni_dir_n = 0;
     int ni_file_n = 0;
@@ -6611,6 +6614,11 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
                 yyjson_mut_arr_add_val(pu_files, fe);
             }
             pu_n++;
+        } else if (strcmp(kind, "unresolved_calls") == 0) {
+            if (unresolved_n < sample_limit) {
+                yyjson_mut_arr_add_strcpy(doc, unresolved_files, rows[i].rel_path);
+            }
+            unresolved_n++;
         } else if (strcmp(kind, "not_indexed_dir") == 0) {
             if (ni_dir_n < sample_limit) {
                 yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
@@ -6668,6 +6676,12 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     yyjson_mut_obj_add_bool(doc, pu, "truncated", pu_n > COVERAGE_FILE_CAP);
     yyjson_mut_obj_add_val(doc, root, "parse_unusable", pu);
 
+    yyjson_mut_val *unresolved = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, unresolved, "files", unresolved_files);
+    yyjson_mut_obj_add_int(doc, unresolved, "count", unresolved_n);
+    yyjson_mut_obj_add_bool(doc, unresolved, "truncated", unresolved_n > sample_limit);
+    yyjson_mut_obj_add_val(doc, root, "unresolved_calls", unresolved);
+
     yyjson_mut_val *sk = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, sk, "files", sk_files);
     yyjson_mut_obj_add_int(doc, sk, "count", sk_n);
@@ -6705,7 +6719,7 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     }
     yyjson_mut_obj_add_val(doc, root, "not_indexed", ni);
 
-    if (sample_limit > 0 && (pp_n > 0 || sk_n > 0)) {
+    if (sample_limit > 0 && (pp_n > 0 || sk_n > 0 || unresolved_n > 0)) {
         yyjson_mut_obj_add_str(
             doc, root, "coverage_note",
             "Best-effort signal, not a completeness guarantee: parse_partial files WERE indexed, "
@@ -6713,7 +6727,9 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
             "(tree-sitter error recovery still salvages some). skipped files were not indexed at "
             "all. Prefer text search (grep) for flagged files/ranges. Files absent from this list "
             "are NOT guaranteed to be fully indexed. (not_indexed entries are a separate, "
-            "BY-DESIGN class — deliberate ignore rules, not failures.)");
+            "BY-DESIGN class — deliberate ignore rules, not failures.) "
+            "Unresolved callsites need source verification because CALLS totals may be "
+            "incomplete.");
     }
 }
 
@@ -6925,6 +6941,43 @@ static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
     yyjson_mut_arr_add_val(array, item);
 }
 
+enum { COVERAGE_EXCLUDED_PREFIX_LENGTH = 11 };
+
+enum {
+    COVERAGE_STATUS_PARSE,
+    COVERAGE_STATUS_EXCLUDED,
+    COVERAGE_STATUS_SKIPPED,
+    COVERAGE_STATUS_UNRESOLVED,
+    COVERAGE_STATUS_PASSES
+};
+
+static const char *coverage_row_status(const char *kind, int pass) {
+    kind = kind ? kind : "";
+    if (pass == COVERAGE_STATUS_PARSE) {
+        if (strcmp(kind, "parse_unusable") == 0) {
+            return "unusable";
+        }
+        if (strcmp(kind, "parse_partial") == 0) {
+            return "partial";
+        }
+    }
+    if (pass == COVERAGE_STATUS_EXCLUDED &&
+        strncmp(kind, "not_indexed", COVERAGE_EXCLUDED_PREFIX_LENGTH) == 0) {
+        return "excluded";
+    }
+    if (pass == COVERAGE_STATUS_SKIPPED && kind[0] && strcmp(kind, "unresolved_calls") != 0) {
+        return "skipped";
+    }
+    if (pass == COVERAGE_STATUS_UNRESOLVED && strcmp(kind, "unresolved_calls") == 0) {
+        return "unresolved_calls";
+    }
+    return NULL;
+}
+
+static bool coverage_unresolved_complete(bool have_meta, const cbm_coverage_meta_t *meta) {
+    return have_meta && meta->unresolved_calls_complete;
+}
+
 static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
                                    const char *requested_path, const char *recording_status,
                                    bool generation_matches, bool lookup_ok,
@@ -6939,26 +6992,14 @@ static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
             break;
         }
     }
-    for (int pass = 0; pass < 3; pass++) {
+    for (int pass = 0; pass < COVERAGE_STATUS_PASSES; pass++) {
         for (int i = 0; i < count; i++) {
             if (exact && (!rows[i].rel_path || strcmp(rows[i].rel_path, requested_path) != 0)) {
                 continue;
             }
-            const char *kind = rows[i].kind ? rows[i].kind : "";
-            /* "parse_unusable" must be named here. Without its own case it
-             * falls through to the catch-all below and reports "skipped",
-             * which is wrong in the way that matters: the file WAS indexed. */
-            if (pass == 0 && strcmp(kind, "parse_unusable") == 0) {
-                return "unusable";
-            }
-            if (pass == 0 && strcmp(kind, "parse_partial") == 0) {
-                return "partial";
-            }
-            if (pass == 1 && strncmp(kind, "not_indexed", 11) == 0) {
-                return "excluded";
-            }
-            if (pass == 2 && kind[0]) {
-                return "skipped";
+            const char *status = coverage_row_status(rows[i].kind, pass);
+            if (status) {
+                return status;
             }
         }
     }
@@ -6977,6 +7018,9 @@ static const char *coverage_recommended_action(const char *status, const char *f
     }
     if (strcmp(status, "partial") == 0) {
         return "read_ranges_and_verify_scope";
+    }
+    if (strcmp(status, "unresolved_calls") == 0) {
+        return "read_source_and_verify_calls";
     }
     if (strcmp(status, "unusable") == 0) {
         /* The ranges cover nearly the whole file, so sending a reader to them
@@ -7061,6 +7105,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                            have_meta ? meta.ignored_files_total : 0);
     yyjson_mut_obj_add_bool(doc, meta_obj, "hash_records_complete",
                             have_meta && meta.hash_records_complete);
+    yyjson_mut_obj_add_bool(doc, meta_obj, "unresolved_calls_complete",
+                            coverage_unresolved_complete(have_meta, &meta));
     yyjson_mut_obj_add_int(doc, meta_obj, "coverage_version",
                            have_meta ? meta.coverage_version : 0);
     yyjson_mut_obj_add_bool(doc, meta_obj, "generation_matches", generation_matches);
@@ -9569,6 +9615,207 @@ static int clamp_mcp_depth(int depth, const char *tool) {
     return depth;
 }
 
+typedef struct {
+    const cbm_node_t *roots;
+    int root_count;
+    const cbm_traverse_result_t *outbound;
+    const cbm_traverse_result_t *inbound;
+    bool include_tests;
+    bool do_outbound;
+    bool do_inbound;
+} trace_coverage_scope_t;
+
+typedef struct {
+    cbm_store_t *store;
+    const char *project;
+    CBMHashTable *callers;
+    CBMHashTable *targets;
+    bool unresolved_out;
+    bool unresolved_in;
+} trace_coverage_match_t;
+
+static bool trace_coverage_add_node(CBMHashTable *table, const cbm_node_t *node) {
+    if (!table || !node->qualified_name) {
+        return true;
+    }
+    cbm_ht_set(table, node->qualified_name, (void *)node);
+    return cbm_ht_has(table, node->qualified_name);
+}
+
+static bool trace_coverage_add_visited(CBMHashTable *table, const cbm_traverse_result_t *tr,
+                                       bool include_tests) {
+    if (!table) {
+        return true;
+    }
+    for (int i = 0; i < tr->visited_count; i++) {
+        const cbm_node_t *node = &tr->visited[i].node;
+        if ((include_tests || !is_test_file(node->file_path)) &&
+            !trace_coverage_add_node(table, node)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool trace_coverage_build_sets(trace_coverage_match_t *match,
+                                      const trace_coverage_scope_t *scope) {
+    for (int i = 0; i < scope->root_count; i++) {
+        if (!trace_coverage_add_node(match->callers, &scope->roots[i]) ||
+            !trace_coverage_add_node(match->targets, &scope->roots[i])) {
+            return false;
+        }
+    }
+    return trace_coverage_add_visited(match->callers, scope->outbound, scope->include_tests) &&
+           trace_coverage_add_visited(match->targets, scope->inbound, scope->include_tests);
+}
+
+static bool trace_coverage_may_target_project(const trace_coverage_match_t *match,
+                                              const char *name) {
+    if (!name || !name[0]) {
+        return true;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_name(match->store, match->project, name, &nodes, &count);
+    /* An unsuccessful lookup cannot prove that the callee is outside the
+     * project. Free the allocated result even when it contains zero rows. */
+    bool possible = rc != CBM_STORE_OK;
+    for (int i = 0; i < count && !possible; i++) {
+        const char *label = nodes[i].label;
+        possible = label && strcmp(label, "File") != 0 && strcmp(label, "Folder") != 0 &&
+                   strcmp(label, "Project") != 0 && strcmp(label, "Module") != 0 &&
+                   strcmp(label, "Package") != 0 && strcmp(label, "Section") != 0;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return possible;
+}
+
+static void trace_coverage_match_site(trace_coverage_match_t *match, const char *rel_path,
+                                      yyjson_val *site) {
+    const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
+    const char *leaf = yyjson_get_str(yyjson_obj_get(site, "leaf"));
+    const cbm_node_t *caller_node =
+        match->callers && caller ? cbm_ht_get(match->callers, caller) : NULL;
+    int line = yyjson_get_int(yyjson_obj_get(site, "line"));
+    /* The producer joins the exact byte span to the extractor's innermost
+     * caller. Check its file and source range too; never match a containing
+     * factory merely because its range overlaps. */
+    if (caller_node && caller_node->file_path && strcmp(caller_node->file_path, rel_path) == 0 &&
+        (line <= 0 || (line >= caller_node->start_line && line <= caller_node->end_line)) &&
+        trace_coverage_may_target_project(match, leaf)) {
+        match->unresolved_out = true;
+    }
+}
+
+static void trace_coverage_match_row(trace_coverage_match_t *match, const cbm_coverage_row_t *row) {
+    yyjson_doc *detail = yyjson_read(row->detail, strlen(row->detail), 0);
+    yyjson_val *sites = detail ? yyjson_doc_get_root(detail) : NULL;
+    if (!yyjson_is_arr(sites)) {
+        match->unresolved_out = true;
+    } else {
+        size_t idx;
+        size_t max;
+        yyjson_val *site;
+        yyjson_arr_foreach(sites, idx, max, site) {
+            if (!yyjson_is_obj(site) || yyjson_get_bool(yyjson_obj_get(site, "truncated"))) {
+                match->unresolved_out = true;
+                break;
+            }
+            trace_coverage_match_site(match, row->rel_path, site);
+        }
+    }
+    if (detail) {
+        yyjson_doc_free(detail);
+    }
+}
+
+typedef struct {
+    trace_coverage_match_t *match;
+    CBMHashTable *files;
+    bool ok;
+} trace_coverage_query_t;
+
+static void trace_coverage_query_file(const char *key, void *value, void *userdata) {
+    (void)key;
+    const cbm_node_t *caller = value;
+    trace_coverage_query_t *query = userdata;
+    const char *path = caller->file_path;
+    if (!query->ok || query->match->unresolved_out || !path || cbm_ht_has(query->files, path)) {
+        return;
+    }
+    cbm_ht_set(query->files, path, value);
+    if (!cbm_ht_has(query->files, path)) {
+        query->ok = false;
+        return;
+    }
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    query->ok = cbm_store_coverage_get_unresolved_path(query->match->store, query->match->project,
+                                                       path, &rows, &count) == CBM_STORE_OK;
+    for (int i = 0; query->ok && i < count; i++) {
+        trace_coverage_match_row(query->match, &rows[i]);
+    }
+    cbm_store_free_coverage(rows, count);
+}
+
+static void trace_coverage_query_candidate(const char *key, void *value, void *userdata) {
+    (void)value;
+    trace_coverage_query_t *query = userdata;
+    if (!query->ok || query->match->unresolved_in) {
+        return;
+    }
+    query->ok =
+        cbm_store_coverage_has_unresolved_candidate(query->match->store, query->match->project, key,
+                                                    &query->match->unresolved_in) == CBM_STORE_OK;
+}
+
+static bool trace_coverage_query_evidence(trace_coverage_match_t *match,
+                                          const trace_coverage_scope_t *scope) {
+    trace_coverage_query_t query = {.match = match, .ok = true};
+    if (scope->do_outbound) {
+        query.files = cbm_ht_create(0);
+        if (!query.files) {
+            return false;
+        }
+        cbm_ht_foreach(match->callers, trace_coverage_query_file, &query);
+        cbm_ht_free(query.files);
+    }
+    if (scope->do_inbound) {
+        cbm_ht_foreach(match->targets, trace_coverage_query_candidate, &query);
+    }
+    return query.ok;
+}
+
+static bool trace_coverage_meta_available(cbm_store_t *store, const char *project) {
+    cbm_coverage_meta_t meta = {0};
+    int rc = cbm_store_coverage_meta_get(store, project, &meta);
+    bool available = rc == CBM_STORE_OK &&
+                     meta.coverage_version >= CBM_UNRESOLVED_CALL_COVERAGE_VERSION &&
+                     meta.unresolved_calls_complete;
+    cbm_store_coverage_meta_clear(&meta);
+    return available;
+}
+
+static void trace_call_coverage(cbm_store_t *store, const char *project,
+                                const trace_coverage_scope_t *scope, bool includes_calls,
+                                bool *unresolved_out, bool *unresolved_in) {
+    if (!includes_calls) {
+        return;
+    }
+    trace_coverage_match_t match = {.store = store,
+                                    .project = project,
+                                    .callers = scope->do_outbound ? cbm_ht_create(0) : NULL,
+                                    .targets = scope->do_inbound ? cbm_ht_create(0) : NULL};
+    bool ok = trace_coverage_meta_available(store, project) &&
+              (!scope->do_outbound || match.callers) && (!scope->do_inbound || match.targets) &&
+              trace_coverage_build_sets(&match, scope) &&
+              trace_coverage_query_evidence(&match, scope);
+    *unresolved_out = ok ? match.unresolved_out : scope->do_outbound;
+    *unresolved_in = ok ? match.unresolved_in : scope->do_inbound;
+    cbm_ht_free(match.callers);
+    cbm_ht_free(match.targets);
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = get_project_arg(args);
@@ -9905,6 +10152,27 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     bool optional_fields_omitted = false;
     char *json = NULL;
 
+    bool trace_includes_calls = false;
+    for (int i = 0; i < edge_type_count; i++) {
+        if (strcmp(edge_types[i], "CALLS") == 0) {
+            trace_includes_calls = true;
+            break;
+        }
+    }
+    bool unresolved_out = false;
+    bool unresolved_in = false;
+    trace_coverage_scope_t coverage_scope = {.roots = nodes,
+                                             .root_count = node_count,
+                                             .outbound = &tr_out,
+                                             .inbound = &tr_in,
+                                             .include_tests = include_tests,
+                                             .do_outbound = do_outbound,
+                                             .do_inbound = do_inbound};
+    trace_call_coverage(store, project, &coverage_scope, trace_includes_calls, &unresolved_out,
+                        &unresolved_in);
+    const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
+    const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
+
 render_trace_output:;
     int rows_left = row_target;
     out_len = requested_out_len < rows_left ? requested_out_len : rows_left;
@@ -9993,7 +10261,7 @@ render_trace_output:;
         bool flat_trace = render_risk || render_data_flow;
         if (do_outbound) {
             cbm_tree_scalar_int(&sb, "callees_total", out_total);
-            cbm_tree_scalar_str(&sb, "callees_total_relation", tr_out.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callees_total_relation", out_relation);
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callees", &view_out, render_risk, include_tests,
                                   render_data_flow, render_evidence, &out_edge_ctx);
@@ -10004,7 +10272,7 @@ render_trace_output:;
         }
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
-            cbm_tree_scalar_str(&sb, "callers_total_relation", tr_in.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callers_total_relation", in_relation);
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callers", &view_in, render_risk, include_tests,
                                   render_data_flow, render_evidence, &in_edge_ctx);
@@ -10070,8 +10338,7 @@ render_trace_output:;
         }
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
-            yyjson_mut_obj_add_str(doc, root, "callees_total_relation",
-                                   tr_out.truncated ? "gte" : "eq");
+            yyjson_mut_obj_add_str(doc, root, "callees_total_relation", out_relation);
             yyjson_mut_obj_add_val(
                 doc, root, "callees",
                 bfs_to_tree_json(doc, &view_out, risk_labels && emit_optional_fields, include_tests,
@@ -10080,8 +10347,7 @@ render_trace_output:;
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
-            yyjson_mut_obj_add_str(doc, root, "callers_total_relation",
-                                   tr_in.truncated ? "gte" : "eq");
+            yyjson_mut_obj_add_str(doc, root, "callers_total_relation", in_relation);
             yyjson_mut_obj_add_val(
                 doc, root, "callers",
                 bfs_to_tree_json(doc, &view_in, risk_labels && emit_optional_fields, include_tests,
@@ -10139,13 +10405,11 @@ render_trace_output:;
                 cbm_sb_init(&floor);
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
-                    cbm_tree_scalar_str(&floor, "callees_total_relation",
-                                        tr_out.truncated ? "gte" : "eq");
+                    cbm_tree_scalar_str(&floor, "callees_total_relation", out_relation);
                 }
                 if (do_inbound) {
                     cbm_tree_scalar_int(&floor, "callers_total", in_total);
-                    cbm_tree_scalar_str(&floor, "callers_total_relation",
-                                        tr_in.truncated ? "gte" : "eq");
+                    cbm_tree_scalar_str(&floor, "callers_total_relation", in_relation);
                 }
                 cbm_tree_scalar_bool(&floor, "has_more", floor_has_more);
                 if (floor_has_more) {
@@ -10170,12 +10434,11 @@ render_trace_output:;
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",
-                                           tr_out.truncated ? "gte" : "eq");
+                                           out_relation);
                 }
                 if (do_inbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callers_total", in_total);
-                    yyjson_mut_obj_add_str(floor_doc, floor, "callers_total_relation",
-                                           tr_in.truncated ? "gte" : "eq");
+                    yyjson_mut_obj_add_str(floor_doc, floor, "callers_total_relation", in_relation);
                 }
                 yyjson_mut_obj_add_bool(floor_doc, floor, "has_more", floor_has_more);
                 if (floor_has_more) {
@@ -10678,11 +10941,12 @@ static bool is_parse_unusable(const cbm_file_error_t *e) {
     return e->phase && strcmp(e->phase, "parse_unusable") == 0;
 }
 
-/* Either coverage phase. Both mean the file WAS indexed, so both must stay out
+/* All coverage phases mean the file WAS indexed, so they must stay out
  * of skipped[] — a reader who sees a file there believes it is absent from the
  * graph entirely. */
-static bool is_parse_coverage(const cbm_file_error_t *e) {
-    return is_parse_partial(e) || is_parse_unusable(e);
+static bool is_indexed_coverage(const cbm_file_error_t *e) {
+    return is_parse_partial(e) || is_parse_unusable(e) ||
+           (e->phase && strcmp(e->phase, "unresolved_calls") == 0);
 }
 
 /* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
@@ -10692,17 +10956,20 @@ static bool is_parse_coverage(const cbm_file_error_t *e) {
  * and, if a per-run logfile was written, "logfile": "<path>".
  * The run status stays "indexed" — a skipped file is the expected handled
  * outcome, not a failure. errs[] is borrowed (copied into doc) and may contain
- * parse_partial and parse_unusable entries, which are filtered out here (both
- * reported separately by add_parse_partial_summary). */
+ * parse_partial, parse_unusable, and unresolved_calls entries. These describe
+ * indexed files and are counted separately from skips. */
 static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_file_error_t *errs, int count, const char *logfile) {
     int skips = 0;
+    int unresolved = 0;
     for (int i = 0; i < count; i++) {
-        if (!is_parse_coverage(&errs[i])) {
+        unresolved += errs[i].phase && strcmp(errs[i].phase, "unresolved_calls") == 0;
+        if (!is_indexed_coverage(&errs[i])) {
             skips++;
         }
     }
     yyjson_mut_obj_add_int(doc, root, "skipped_count", skips);
+    yyjson_mut_obj_add_int(doc, root, "unresolved_calls_count", unresolved);
     if (logfile && logfile[0]) {
         yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
     }
@@ -10713,7 +10980,7 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_val *files = yyjson_mut_arr(doc);
     int shown = 0;
     for (int i = 0; i < count && shown < INDEX_SKIPPED_FILE_CAP; i++) {
-        if (is_parse_coverage(&errs[i])) {
+        if (is_indexed_coverage(&errs[i])) {
             continue;
         }
         yyjson_mut_val *fe = yyjson_mut_obj(doc);

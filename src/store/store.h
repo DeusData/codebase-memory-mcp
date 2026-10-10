@@ -723,7 +723,9 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 /* One best-effort coverage row: a file the indexer could not fully cover.
  * kind "parse_partial" = indexed but the parse tree had ERROR/MISSING regions
  * (detail = 1-based line ranges "12-40,88-90"); skip kinds "read"/"extract"/
- * "oversized" = not indexed at all (detail = reason). Stored in the separate
+ * "oversized" = not indexed at all (detail = reason). "unresolved_calls" is
+ * indexed source whose invocation targets were not resolved (detail = JSON
+ * array of caller, leaf, source byte span, and reason). Stored in the separate
  * index_coverage table — coverage is metadata ABOUT the graph, never mixed
  * into the graph itself. */
 typedef struct {
@@ -732,9 +734,15 @@ typedef struct {
     const char *detail;
 } cbm_coverage_row_t;
 
+/* Older generations lack precise caller attribution and resolver candidates,
+ * so their exact trace totals cannot be trusted until the project is reindexed. */
+enum { CBM_UNRESOLVED_CALL_COVERAGE_VERSION = 5 };
+
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or
  * "unavailable"; it is deliberately separate from hash_records_complete.
+ * unresolved_calls_complete describes only unresolved invocation capture;
+ * false keeps CALLS totals conservative without voiding other coverage.
  * Strings returned by cbm_store_coverage_meta_get are heap-owned. */
 typedef struct {
     const char *project;
@@ -746,6 +754,7 @@ typedef struct {
     int ignored_files_total;
     int coverage_version;
     bool hash_records_complete;
+    bool unresolved_calls_complete;
 } cbm_coverage_meta_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for
@@ -774,6 +783,14 @@ int cbm_store_coverage_get_path(cbm_store_t *s, const char *project, const char 
  * ancestor that covers the scope. Prefix matching is segment-boundary safe. */
 int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char *scope,
                                  cbm_coverage_row_t **out, int *count);
+/* Fetch bounded unresolved invocation diagnostics for one exact caller file. */
+int cbm_store_coverage_get_unresolved_path(cbm_store_t *s, const char *project,
+                                           const char *rel_path, cbm_coverage_row_t **out,
+                                           int *count);
+/* Indexed candidate existence; truncated/malformed evidence also returns true
+ * because omitted candidates cannot prove an exact inbound total. */
+int cbm_store_coverage_has_unresolved_candidate(cbm_store_t *s, const char *project,
+                                                const char *candidate, bool *out);
 
 /* Fetch/free the metadata paired with the current coverage row set. */
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);

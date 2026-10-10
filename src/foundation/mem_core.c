@@ -67,7 +67,7 @@ static mem_class_stats_t g_classes[CBM_MEM_CLASS_COUNT];
 
 static const char *const g_class_names[CBM_MEM_CLASS_COUNT] = {
     "other",   "gbuf_node", "gbuf_edge", "gbuf_string", "gbuf_index", "extract",   "arena",
-    "ts_tree", "semantic",  "dump",      "store",       "hash_table", "dyn_array",
+    "ts_tree", "semantic",  "dump",      "store",       "hash_table", "dyn_array", "resolve",
 };
 
 const char *cbm_mem_class_name(cbm_mem_class_t cls) {

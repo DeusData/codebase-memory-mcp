@@ -66,6 +66,7 @@ typedef enum {
     CBM_MEM_CLASS_STORE,       /* SQLite (bound mem methods) + store batches and row buffers */
     CBM_MEM_CLASS_HASH_TABLE,  /* CBMHashTable buckets/entries not claimed by an owner class */
     CBM_MEM_CLASS_DYN_ARRAY,   /* CBM_DYN_ARRAY item storage (every cbm_da_* user) */
+    CBM_MEM_CLASS_RESOLVE,     /* call resolution evidence and coverage capture */
     CBM_MEM_CLASS_COUNT
 } cbm_mem_class_t;
 

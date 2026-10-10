@@ -1279,8 +1279,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      properties are read with their escapes, admission is best-first and
  *      every edge carries "p"; doc_link_candidates holds doc section -> code
  *      candidates. An index built before has the old pairs and no
- *      candidates, so it rebuilds once on upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 7 };
+ *      candidates, so it rebuilds once on upgrade.
+ *   8: combine these changes with unresolved-call evidence capture and its
+ *      candidate index. This branch's earlier versions 5 and 6 did not have
+ *      the document-link and TF-IDF layers; upstream version 7 did not have
+ *      unresolved-call capture. Both require a full rebuild on upgrade.
+ * The unresolved-call coverage threshold remains independent. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1382,6 +1387,19 @@ void cbm_pipeline_discard_stage(const char *stage_path);
  * Takes ownership; dump_and_persist_hashes writes them into the staging
  * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
+/* One entry per call, owned by the current file's resolve pass. Candidate
+ * strings are borrowed from the graph and copied by coverage capture. */
+typedef struct {
+    const char *candidate_qn;
+    bool calls_emitted;
+} CBMCallEvidence;
+void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
+                                          const CBMFileResult *result,
+                                          const CBMCallEvidence *evidence);
+void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p);
+void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count,
+                                       bool *complete);
+
 /* The run's doc_link_unresolved rows and failure flag (doc_links.h), taken
  * over by the pipeline (set replaces and frees earlier rows; NULL p frees).
  * A full run publishes them from dump_and_persist_hashes; an incremental
