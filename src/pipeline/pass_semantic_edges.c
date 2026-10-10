@@ -31,6 +31,7 @@
 #include "foundation/profile.h"
 
 #include <ctype.h>
+#include <float.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -2112,26 +2113,57 @@ static int doc_section_tokens(const cbm_gbuf_node_t *n, const char *body, char *
     return count;
 }
 
-/* Dot product and shared-term count of two ascending term lists. */
-static float doc_terms_dot(const int *ia, const float *wa, int na, const int *ib, const float *wb,
-                           int nb, int *shared) {
+/* Dot product and shared-term count of a section and an ascending term list
+ * (a function's, a file's). The section is held densely, secw/secmark indexed
+ * by term with its terms marked `stamp`, so the cost is b's length alone, not
+ * the section's (up to SEM_DOC_MAX_TOKENS terms) added to it. The shared terms
+ * are met in ascending order, as a merge of the two lists would meet them. */
+static float doc_terms_dot_dense(const float *secw, const int *secmark, int stamp, const int *ib,
+                                 const float *wb, int nb, int *shared) {
     float dot = 0.0F;
-    int a = 0;
-    int b = 0;
     *shared = 0;
-    while (a < na && b < nb) {
-        if (ia[a] == ib[b]) {
-            dot += wa[a] * wb[b];
+    for (int b = 0; b < nb; b++) {
+        int t = ib[b];
+        if (secmark[t] == stamp) {
+            dot += secw[t] * wb[b];
             (*shared)++;
-            a++;
-            b++;
-        } else if (ia[a] < ib[b]) {
-            a++;
-        } else {
-            b++;
         }
     }
     return dot;
+}
+
+/* The candidates a section's results read, moved to the front: those that
+ * the full cmp_doc_cand order puts in the top k, and every one scoring floor
+ * or more. Everything left out scores below both, so sorting the kept prefix
+ * gives the full sort's prefix exactly. Returns how many are kept. */
+static int doc_cand_prefix(doc_cand_t *c, int nc, int k, float floor) {
+    if (nc <= k) {
+        return nc;
+    }
+    float top[SEM_DOC_TOP_K];
+    int n = 0;
+    for (int i = 0; i < nc; i++) { /* the k best scores, descending */
+        float v = c[i].score;
+        if (n == k && v <= top[k - SKIP_ONE]) {
+            continue;
+        }
+        int j = n < k ? n++ : k - SKIP_ONE;
+        while (j > 0 && top[j - SKIP_ONE] < v) {
+            top[j] = top[j - SKIP_ONE];
+            j--;
+        }
+        top[j] = v;
+    }
+    float cut = top[k - SKIP_ONE] < floor ? top[k - SKIP_ONE] : floor;
+    int kept = 0;
+    for (int i = 0; i < nc; i++) {
+        if (c[i].score >= cut) {
+            doc_cand_t t = c[kept];
+            c[kept++] = c[i];
+            c[i] = t;
+        }
+    }
+    return kept;
 }
 
 static float terms_norm(const float *w, int n) {
@@ -2602,6 +2634,7 @@ typedef struct {
     const char *const *home;  /* per section: its doc's home ("" = the root) */
     const doc_files_t *files;
     int file_key_df;
+    int nterms; /* the corpus's terms: the dense section vector's length */
     doc_result_t *res;
     _Atomic int next;
 } doc_ctx_t;
@@ -2634,8 +2667,8 @@ static void doc_name_evidence(const doc_ctx_t *dc, const int *sidx, int ns, doc_
 
 /* The section's best CBM_SEM_DOC_FILE_K whole files, retrieved by the
  * section's key terms over the files' postings, scored by cosine. */
-static void doc_section_files(doc_ctx_t *dc, int s, const int *sidx, const float *sw, int ns,
-                              float snorm, int *fstamp, doc_cand_t *fc) {
+static void doc_section_files(doc_ctx_t *dc, int s, const int *sidx, int ns, float snorm,
+                              const float *secw, const int *secmark, int *fstamp, doc_cand_t *fc) {
     const doc_files_t *df = dc->files;
     doc_result_t *r = &dc->res[s];
     int nc = 0;
@@ -2655,11 +2688,12 @@ static void doc_section_files(doc_ctx_t *dc, int s, const int *sidx, const float
     for (int c = 0; c < nc; c++) {
         int f = fc[c].func;
         int len = df->off[f + SKIP_ONE] - df->off[f];
-        float dot = doc_terms_dot(sidx, sw, ns, df->idx + df->off[f], df->w + df->off[f], len,
-                                  &fc[c].shared);
+        float dot = doc_terms_dot_dense(secw, secmark, s, df->idx + df->off[f], df->w + df->off[f],
+                                        len, &fc[c].shared);
         float denom = snorm * df->norm[f];
         fc[c].score = denom > 0.0F ? dot / denom : 0.0F;
     }
+    nc = doc_cand_prefix(fc, nc, CBM_SEM_DOC_FILE_K, FLT_MAX); /* the best files only */
     if (nc > 1) {
         qsort(fc, (size_t)nc, sizeof(fc[0]), cmp_doc_cand);
     }
@@ -2694,7 +2728,8 @@ static void doc_section_local(doc_ctx_t *dc, int s, const doc_cand_t *cands, int
 }
 
 static void doc_section_one(doc_ctx_t *dc, int s, int *stamp, doc_cand_t *cands, int *sidx,
-                            float *sw, char *body, int *fstamp, doc_cand_t *fc) {
+                            float *sw, char *body, int *fstamp, doc_cand_t *fc, float *secw,
+                            int *secmark) {
     doc_result_t *r = &dc->res[s];
     r->n = 0;
     r->nlocal = 0;
@@ -2709,6 +2744,10 @@ static void doc_section_one(doc_ctx_t *dc, int s, int *stamp, doc_cand_t *cands,
         cbm_free(CBM_MEM_CLASS_SEMANTIC, tokens[t]);
     }
     float snorm = terms_norm(sw, ns);
+    for (int k = 0; k < ns; k++) { /* the section, dense */
+        secw[sidx[k]] = sw[k];
+        secmark[sidx[k]] = s;
+    }
     int nc = 0;
     for (int k = 0; k < ns && snorm > 0.0F; k++) {
         int t = sidx[k];
@@ -2725,11 +2764,13 @@ static void doc_section_one(doc_ctx_t *dc, int s, int *stamp, doc_cand_t *cands,
     }
     for (int c = 0; c < nc; c++) {
         const cbm_sem_func_t *fn = &dc->funcs[cands[c].func];
-        float dot = doc_terms_dot(sidx, sw, ns, fn->tfidf_indices, fn->tfidf_weights, fn->tfidf_len,
-                                  &cands[c].shared);
+        float dot = doc_terms_dot_dense(secw, secmark, s, fn->tfidf_indices, fn->tfidf_weights,
+                                        fn->tfidf_len, &cands[c].shared);
         float denom = snorm * dc->fnorm[cands[c].func];
         cands[c].score = denom > 0.0F ? dot / denom : 0.0F;
     }
+    /* the top SEM_DOC_TOP_K, and the local ones down to CBM_SEM_DOC_MIN_SCORE */
+    nc = doc_cand_prefix(cands, nc, SEM_DOC_TOP_K, CBM_SEM_DOC_MIN_SCORE);
     if (nc > 1) {
         qsort(cands, (size_t)nc, sizeof(cands[0]), cmp_doc_cand);
     }
@@ -2742,7 +2783,7 @@ static void doc_section_one(doc_ctx_t *dc, int s, int *stamp, doc_cand_t *cands,
         doc_name_evidence(dc, sidx, ns, hit);
     }
     doc_section_local(dc, s, cands, nc, sidx, ns);
-    doc_section_files(dc, s, sidx, sw, ns, snorm, fstamp, fc);
+    doc_section_files(dc, s, sidx, ns, snorm, secw, secmark, fstamp, fc);
 }
 
 static void doc_section_worker(int worker_id, void *ctx_ptr) {
@@ -2757,7 +2798,13 @@ static void doc_section_worker(int worker_id, void *ctx_ptr) {
     int *sidx = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)SEM_DOC_MAX_TOKENS * sizeof(int));
     float *sw = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)SEM_DOC_MAX_TOKENS * sizeof(float));
     char *body = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, SEM_DOC_TEXT_MAX);
-    if (stamp && cands && fstamp && fc && sidx && sw && body) {
+    float *secw =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)dc->nterms + SKIP_ONE) * sizeof(float));
+    int *secmark = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)dc->nterms + SKIP_ONE) * sizeof(int));
+    if (stamp && cands && fstamp && fc && sidx && sw && body && secw && secmark) {
+        for (int t = 0; t < dc->nterms; t++) {
+            secmark[t] = -1;
+        }
         for (int f = 0; f < dc->func_count; f++) {
             stamp[f] = -1;
         }
@@ -2769,7 +2816,7 @@ static void doc_section_worker(int worker_id, void *ctx_ptr) {
             if (s >= dc->nsec) {
                 break;
             }
-            doc_section_one(dc, s, stamp, cands, sidx, sw, body, fstamp, fc);
+            doc_section_one(dc, s, stamp, cands, sidx, sw, body, fstamp, fc, secw, secmark);
         }
     }
     cbm_free(CBM_MEM_CLASS_SEMANTIC, stamp);
@@ -2779,6 +2826,8 @@ static void doc_section_worker(int worker_id, void *ctx_ptr) {
     cbm_free(CBM_MEM_CLASS_SEMANTIC, sidx);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, sw);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, body);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, secw);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, secmark);
 }
 
 static const char *const DOC_KIND_NAME[CBM_SEM_DOC_KIND_COUNT] = {"function", "local", "file",
@@ -3047,6 +3096,7 @@ static void phase6c_doc_sections(cbm_pipeline_ctx_t *ctx, const cbm_sem_func_t *
                         .home = (const char *const *)place.home,
                         .files = &files,
                         .file_key_df = file_key_df,
+                        .nterms = nterms,
                         .res = res};
         atomic_init(&dc.next, 0);
         cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
