@@ -5716,7 +5716,7 @@ TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate) {
     PASS();
 }
 
-TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
+TEST(tool_list_projects_stays_complete_across_store_switches_issue1115) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-list-lean-XXXXXX", cbm_tmpdir());
     ASSERT_NOT_NULL(cbm_mkdtemp(cache));
@@ -5773,6 +5773,38 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     bool tree_not_duplicated = tree_response && !strstr(tree_response, "structuredContent");
     bool page_truthful = page && strstr(page, "projects: 5") && strstr(page, "returned: 5") &&
                          strstr(page, "has_more: true") && strstr(page, "next_offset: 5");
+    bool projects_resolve_after_switches = true;
+    for (int i = PROJECTS - 1; i >= 0; i--) {
+        char project[32];
+        char args[96];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+
+        char *status_response = cbm_mcp_handle_tool(srv, "index_status", args);
+        char *status = extract_text_content(status_response);
+        if (!status || !strstr(status, "ready")) {
+            projects_resolve_after_switches = false;
+        }
+        free(status);
+        free(status_response);
+
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"entry\"}",
+                 project);
+        char *search_response = cbm_mcp_handle_tool(srv, "search_graph", args);
+        char *search = extract_text_content(search_response);
+        if (!search || !strstr(search, "entry")) {
+            projects_resolve_after_switches = false;
+        }
+        free(search);
+        free(search_response);
+    }
+    char *post_switch_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":50}");
+    char *post_switch = extract_text_content(post_switch_response);
+    bool list_complete_after_switches =
+        post_switch && strstr(post_switch, "total: 12") && strstr(post_switch, "lean-project-00") &&
+        strstr(post_switch, "lean-project-11");
+    free(post_switch);
+    free(post_switch_response);
     bool json_direct = false;
     bool json_structured = json_response && strstr(json_response, "structuredContent");
     yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
@@ -5809,6 +5841,8 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     ASSERT_TRUE(tree_is_leaner);
     ASSERT_TRUE(tree_not_duplicated);
     ASSERT_TRUE(page_truthful);
+    ASSERT_TRUE(projects_resolve_after_switches);
+    ASSERT_TRUE(list_complete_after_switches);
     ASSERT_TRUE(json_direct);
     ASSERT_TRUE(json_structured);
     PASS();
@@ -23736,7 +23770,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_budget_bounds_first_row_and_json_escaping);
     RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
-    RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
+    RUN_TEST(tool_list_projects_stays_complete_across_store_switches_issue1115);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
