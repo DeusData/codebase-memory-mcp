@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "foundation/compat_fs.h"
+#include "foundation/mem_core.h"
 #include "foundation/log.h"
 #include "sqlite3.h"
 #include "store/store.h"
@@ -254,6 +255,50 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
  * guessing. The proxy load stays edge-free and property-free, which is
  * where the old full load actually spent its time. */
 
+/* `qn` and `parent` without the project prefix. */
+static const char *delta_rel(const char *project, const char *qn) {
+    size_t pl = project ? strlen(project) : 0;
+    if (qn && pl && strncmp(qn, project, pl) == 0 && qn[pl] == '.') {
+        return qn + pl + 1;
+    }
+    return qn ? qn : "";
+}
+
+/* A proxy's properties carrying `parent` when owner + "." + name is not the
+ * node's own (relative) QN, merged with the http client keys if any; NULL
+ * when the owner adds nothing (CBM_MEM_CLASS_OTHER; the caller frees). */
+static char *delta_owner_props(const char *project, const char *name, const char *qn,
+                               const char *parent, const char *client_props) {
+    const char *rel = delta_rel(project, qn);
+    const char *prel = delta_rel(project, parent);
+    size_t pl = strlen(prel);
+    size_t nl = name ? strlen(name) : 0;
+    if (strlen(rel) == pl + 1 + nl && strncmp(rel, prel, pl) == 0 && rel[pl] == '.' &&
+        (nl == 0 || memcmp(rel + pl + 1, name, nl) == 0)) {
+        return NULL;
+    }
+    size_t cap = 2 * strlen(parent) + (client_props ? strlen(client_props) : 0) + 32;
+    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t k = 0;
+    k += (size_t)snprintf(out + k, cap - k, "{\"parent_class\":\"");
+    for (const char *p = parent; *p && k + 3 < cap; p++) {
+        if (*p == '"' || *p == '\\') {
+            out[k++] = '\\';
+        }
+        out[k++] = *p;
+    }
+    out[k++] = '"';
+    if (client_props && client_props[0] == '{' && client_props[1] && client_props[1] != '}') {
+        snprintf(out + k, cap - k, ",%s", client_props + 1);
+    } else {
+        snprintf(out + k, cap - k, "}");
+    }
+    return out;
+}
+
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
@@ -292,7 +337,13 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * compose `api.get('/p')` against its unchanged wrapper exactly as a full
      * build does. Only the two keys, only on the rare Module/Variable rows
      * that carry them; every other proxy stays "{}". Proxies are never
-     * written back (cbm_delta_patch skips id <= max_db_id). */
+     * written back (cbm_delta_patch skips id <= max_db_id).
+     *
+     * The other: a node's parent_class where it changes the name the node
+     * goes by -- a Go method's QN has no receiver, a class-body variable's QN
+     * no class. A document naming `Order.Reset` binds such a node through
+     * its owner (doc_links_pdf.c), so a re-resolved document needs it too.
+     * Only where owner + name differs from the QN (delta_owner_props). */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -300,7 +351,11 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " CASE WHEN label IN ('Module','Variable')"
             " AND instr(properties, '\"http_client\"') > 0"
             " THEN json_object('http_client', json_extract(properties, '$.http_client'),"
-            " 'http_base_url', json_extract(properties, '$.http_base_url')) END"
+            " 'http_base_url', json_extract(properties, '$.http_base_url')) END,"
+            " start_line, end_line,"
+            " CASE WHEN label IN ('Method','Variable')"
+            " AND instr(properties, '\"parent_class\"') > 0"
+            " THEN json_extract(properties, '$.parent_class') END"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -318,10 +373,20 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         const char *qn = (const char *)sqlite3_column_text(stmt, 3);
         const char *fp = (const char *)sqlite3_column_text(stmt, 4);
         const char *client_props = (const char *)sqlite3_column_text(stmt, 5);
+        /* Lines too: a document reference that names a line range binds the
+         * definition holding it (doc_links_md.c), in a re-resolved document as
+         * in a full build. */
+        int start_line = sqlite3_column_int(stmt, 6);
+        int end_line = sqlite3_column_int(stmt, 7);
+        const char *parent = (const char *)sqlite3_column_text(stmt, 8);
+        char *owner_props =
+            parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
-        int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", 0, 0,
-                                           client_props ? client_props : "{}");
+        int64_t got =
+            cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line, end_line,
+                                 owner_props ? owner_props : (client_props ? client_props : "{}"));
+        cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
         if (got != id) {
             /* A QN collision inside the preseed set would silently split
              * identity between RAM and disk; the run cannot be trusted. */

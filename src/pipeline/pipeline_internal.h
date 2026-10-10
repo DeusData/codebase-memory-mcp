@@ -392,6 +392,16 @@ typedef struct {
      * the incremental and probe routes still hand the cache array to passes
      * that index it directly, so they keep results in memory (follow-up). */
     bool spill_allowed;
+
+    /* Doc-comment references -> MENTIONS (doc_links.h). doc_links is the
+     * run's resolver state while the resolve phase runs (NULL otherwise);
+     * doc_link_base holds the stored scopes of the files an incremental run
+     * does not re-extract (borrowed from the route that loaded them);
+     * doc_links_failed records a failed build so publication can mark it. */
+    struct cbm_doclinks *doc_links;
+    const struct cbm_doclink_scope *doc_link_base;
+    int doc_link_base_count;
+    bool doc_links_failed;
 } cbm_pipeline_ctx_t;
 
 /* Origin-aware LSP returns only success/failure. Never retain partial output
@@ -517,6 +527,12 @@ void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
 
 /* Log the store counters, close and delete the store, drop the latch. */
 void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
+
+/* The File node of `rel` in `gbuf` (NULL when it has none): the one lookup
+ * for "this file as an edge source", by the name cbm_pipeline_fqn_compute
+ * gives every File node. */
+const cbm_gbuf_node_t *cbm_pipeline_file_node(const cbm_gbuf_t *gbuf, const char *project,
+                                              const char *rel);
 
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
@@ -1245,16 +1261,31 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe.
- *   4 (upstream): C-family node identities changed. A preprocessor macro's QN
- *      ends in "#macro"; unscoped C/C++/Objective-C enumerators are
- *      `<scope>.<NAME>` (the enum name is no longer a segment); typedef names,
- *      anonymous-enum constants and macro-prefixed functions are nodes; a
- *      bodyless `struct X` is no node.
- *   5: unresolved-call evidence capture and candidate indexing.
- *   6: integrate the C-family identities into version-5 indexes. Those indexes
- *      still hold old QNs for unchanged files and must rebuild in full once.
+ *   4: C-family node identities changed. A preprocessor macro's QN ends in
+ *      "#macro"; unscoped C/C++/Objective-C enumerators are `<scope>.<NAME>`
+ *      (the enum name is no longer a segment); typedef names, anonymous-enum
+ *      constants and macro-prefixed functions are nodes; a bodyless
+ *      `struct X` is no node. An index written before this holds the old
+ *      QNs for every unchanged file, so it is rebuilt in full once.
+ *   5: doc-comment references became MENTIONS edges and doc_link_unresolved
+ *      rows, and C# LSP surfaces carry the doc-link scope ("dl"); an index
+ *      built before has neither, so it rebuilds once on upgrade.
+ *   6: documents became link sources: Markdown, reStructuredText and AsciiDoc
+ *      sections and PDF pages hold MENTIONS edges into the code, ADR records
+ *      are nodes, and AsciiDoc files, PDFs and a Sphinx project's extra
+ *      source suffixes are indexed. An index built before has none of this
+ *      for its unchanged documents, so it rebuilds once on upgrade.
+ *   7: SEMANTICALLY_RELATED changed: TF-IDF compares vocabulary, string
+ *      properties are read with their escapes, admission is best-first and
+ *      every edge carries "p"; doc_link_candidates holds doc section -> code
+ *      candidates. An index built before has the old pairs and no
+ *      candidates, so it rebuilds once on upgrade.
+ *   8: combine these changes with unresolved-call evidence capture and its
+ *      candidate index. This branch's earlier versions 5 and 6 did not have
+ *      the document-link and TF-IDF layers; upstream version 7 did not have
+ *      unresolved-call capture. Both require a full rebuild on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 6 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1277,6 +1308,23 @@ typedef struct {
      * into the staging store (delta patch); publish then skips the
      * wholesale delete+rewrite. */
     bool surfaces_in_place;
+    /* The generation's doc_link_unresolved rows (complete: an incremental
+     * route passes the merge of carried-forward and fresh rows), and whether
+     * the doc-link layer failed for it (publish then adds the error marker
+     * row that index_status reports as doc_links.status = "error"). */
+    const cbm_doc_link_row_t *doc_link_rows;
+    int doc_link_row_count;
+    bool doc_links_failed;
+    /* Doc -> code candidates of this generation (pass_semantic_edges; may be
+     * NULL: none found, or a mode without the semantic pass), written into
+     * the staging store with the graph. */
+    const cbm_doc_candidate_t *doc_candidates;
+    int doc_candidate_count;
+    /* True when the staging store already holds this generation's
+     * candidates: the delta clone keeps the previous generation's rows (its
+     * proxy buffer has no section text or function tokens to recompute
+     * them); a row whose node is gone resolves to nothing when read. */
+    bool doc_candidates_in_place;
 } cbm_pipeline_generation_t;
 
 /* Serialize and fully populate a sibling staging database, then atomically
@@ -1351,6 +1399,22 @@ void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_pat
 void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p);
 void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count,
                                        bool *complete);
+
+/* The run's doc_link_unresolved rows and failure flag (doc_links.h), taken
+ * over by the pipeline (set replaces and frees earlier rows; NULL p frees).
+ * A full run publishes them from dump_and_persist_hashes; an incremental
+ * route takes them back for its carry-forward merge. `ran` stays false until
+ * a doc-link phase hands rows over, so a route that never resolved can tell. */
+void cbm_pipeline_set_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t *rows, int count,
+                                    bool failed);
+void cbm_pipeline_take_doc_link_rows(cbm_pipeline_t *p, cbm_doc_link_row_t **rows, int *count,
+                                     bool *failed, bool *ran);
+
+/* Hand the run's doc -> code candidates (pass_semantic_edges) to the
+ * pipeline. Takes ownership (rows and strings in CBM_MEM_CLASS_STORE, released
+ * with cbm_store_doc_candidates_free); a NULL p frees them. NULL/0 clears. */
+void cbm_pipeline_set_doc_candidates(cbm_pipeline_t *p, cbm_doc_candidate_t *rows, int count);
+const cbm_doc_candidate_t *cbm_pipeline_doc_candidates(const cbm_pipeline_t *p, int *count);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

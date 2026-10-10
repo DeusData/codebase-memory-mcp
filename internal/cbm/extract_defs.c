@@ -1,5 +1,6 @@
 #include "cbm.h"
-#include "arena.h" // CBMArena, cbm_arena_alloc/strdup/sprintf
+#include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
+#include "doclink.h" // cbm_doclink_note_doc_line
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
@@ -220,7 +221,8 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
 static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
-                                    const CBMLangSpec *spec);
+                                    const CBMLangSpec *spec, int fields_from);
+static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from);
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                   const CBMLangSpec *spec);
@@ -1366,6 +1368,7 @@ typedef struct {
     doc_span_t *items; /* trivia directly before the anchor, in source order */
     int count;
     int cap;
+    bool failed;           /* a missing span must not become shared documentation */
     bool code_before;      /* a non-trivia sibling precedes items[0] */
     uint32_t code_erow;    /* ... its effective end row */
     uint32_t code_eb;      /* ... its end byte (Kotlin gap scan) */
@@ -1493,8 +1496,17 @@ static doc_span_t doc_span_of(TSNode n, const char *src, uint8_t kind) {
 static void doc_push_span(CBMArena *a, doc_trivia_t *t, const doc_span_t *sp) {
     if (t->count == t->cap) {
         int ncap = t->cap ? t->cap * DOC_SPAN_GROW : DOC_SPAN_INIT_CAP;
-        doc_span_t *grown = (doc_span_t *)cbm_arena_alloc(a, (size_t)ncap * sizeof(doc_span_t));
+        doc_span_t *grown;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_SPAN)) {
+            grown = NULL;
+        } else
+#endif
+        {
+            grown = (doc_span_t *)cbm_arena_alloc(a, (size_t)ncap * sizeof(doc_span_t));
+        }
         if (!grown) {
+            t->failed = true;
             return;
         }
         if (t->count > 0) {
@@ -1917,6 +1929,15 @@ static void doc_collect_kotlin(CBMExtractCtx *ctx, TSNode parent, TSNode anchor,
     }
 }
 
+/* A doc comment was lost because memory ran out. For a language whose doc
+ * comments are read for links, the doc-link layer must not then report a
+ * complete graph (CBMDocLinkArray.failed). */
+static void doc_lost(CBMExtractCtx *ctx) {
+    if (ctx->result && cbm_doclink_lang_supported(ctx->language)) {
+        ctx->result->doc_links.failed = true;
+    }
+}
+
 /* Leading trivia of `anchor`, in source order. */
 static void doc_collect_trivia(CBMExtractCtx *ctx, TSNode anchor, doc_trivia_t *t) {
     memset(t, 0, sizeof(*t));
@@ -1933,11 +1954,14 @@ static void doc_collect_trivia(CBMExtractCtx *ctx, TSNode anchor, doc_trivia_t *
         found = doc_collect_cursor(ctx, parent, anchor, t);
     }
     if (!found) {
+        bool failed = t->failed;
         memset(t, 0, sizeof(*t));
-        return;
-    }
-    if (t->count == 0 && ctx->language == CBM_LANG_KOTLIN) {
+        t->failed = failed;
+    } else if (t->count == 0 && ctx->language == CBM_LANG_KOTLIN) {
         doc_collect_kotlin(ctx, parent, anchor, t);
+    }
+    if (t->failed) {
+        doc_lost(ctx);
     }
 }
 
@@ -2034,10 +2058,14 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
     int kept = 0;
     bool words = false;
     size_t total = 0;
+    uint32_t first_row = 0;
     for (int k = first; k <= last; k++) {
         const doc_span_t *sp = &t->items[k];
         if (!doc_span_kept(src, sp, go_directives)) {
             continue;
+        }
+        if (kept == 0) {
+            first_row = sp->srow;
         }
         total += (size_t)(sp->eb - sp->sb) + SKIP_ONE;
         words = words || doc_has_words(src + sp->sb, sp->eb - sp->sb);
@@ -2046,8 +2074,17 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
     if (kept == 0 || !words) {
         return NULL;
     }
-    char *buf = (char *)cbm_arena_alloc(ctx->arena, total + SKIP_ONE);
+    char *buf;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (cbm_doclink_test_fail_alloc(CBM_DOCLINK_ALLOC_TEXT)) {
+        buf = NULL;
+    } else
+#endif
+    {
+        buf = (char *)cbm_arena_alloc(ctx->arena, total + SKIP_ONE);
+    }
     if (!buf) {
+        doc_lost(ctx);
         return NULL;
     }
     size_t w = 0;
@@ -2065,9 +2102,16 @@ static const char *doc_run_text(CBMExtractCtx *ctx, const doc_trivia_t *t, int f
             buf[w++] = '\n';
         }
         memcpy(buf + w, src + sp->sb, eb - sp->sb);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        cbm_doclink_test_note_doc_work(eb - sp->sb, 0, 0);
+#endif
         w += eb - sp->sb;
     }
     buf[w] = '\0';
+    /* Doc-link references need their source lines: the text's line k is the
+     * source line first_row + k (one comment per line, or a block keeping
+     * its own newlines). */
+    cbm_doclink_note_doc_line(ctx, buf, first_row + SKIP_ONE);
     return buf;
 }
 
@@ -2149,10 +2193,17 @@ static const char *doc_from_trivia(CBMExtractCtx *ctx, const doc_trivia_t *t,
     return doc_run_text(ctx, t, doc_run_first(lang, t, near), near, lang == CBM_LANG_GO);
 }
 
-static const char *doc_for_anchor(CBMExtractCtx *ctx, TSNode anchor) {
+static const char *doc_for_anchor_status(CBMExtractCtx *ctx, TSNode anchor, bool *complete) {
     doc_trivia_t t;
     doc_collect_trivia(ctx, anchor, &t);
+    if (complete) {
+        *complete = !t.failed;
+    }
     return doc_from_trivia(ctx, &t, ts_node_start_point(anchor).row);
+}
+
+static const char *doc_for_anchor(CBMExtractCtx *ctx, TSNode anchor) {
+    return doc_for_anchor_status(ctx, anchor, NULL);
 }
 
 static bool doc_kind_is(TSNode n, const char *kind) {
@@ -2641,11 +2692,19 @@ static const char *extract_docstring(CBMExtractCtx *ctx, TSNode node, const char
 }
 
 /* Doc of a Field, Variable, enum member or Macro (code languages only). */
-static const char *extract_member_docstring(CBMExtractCtx *ctx, TSNode node) {
+static const char *extract_member_docstring_status(CBMExtractCtx *ctx, TSNode node,
+                                                   bool *complete) {
     if (!doc_lang_member_docs(ctx->language)) {
+        if (complete) {
+            *complete = true;
+        }
         return NULL;
     }
-    return doc_for_anchor(ctx, doc_anchor(ctx, node));
+    return doc_for_anchor_status(ctx, doc_anchor(ctx, node), complete);
+}
+
+static const char *extract_member_docstring(CBMExtractCtx *ctx, TSNode node) {
+    return extract_member_docstring_status(ctx, node, NULL);
 }
 
 /* Go package comment: the comment group touching `package`, directives
@@ -7563,13 +7622,16 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     }
 
     // Extract methods inside the class
+    int methods_from = ctx->result->defs.count;
     extract_class_methods(ctx, node, class_qn, spec);
 
     // Extract typed struct/class fields (for cross-file LSP type resolution)
+    int fields_from = ctx->result->defs.count;
     extract_class_fields(ctx, node, class_qn, spec);
+    fence_fields_named_like_methods(ctx, methods_from, fields_from);
 
-    // Extract class-level variables (field declarations)
-    extract_class_variables(ctx, node, class_qn, spec);
+    // Extract class-level variables (field declarations not already Fields)
+    extract_class_variables(ctx, node, class_qn, spec, fields_from);
 
     if (ctx->language == CBM_LANG_PYTHON) {
         extract_py_field_types(ctx, node, class_qn);
@@ -8523,8 +8585,8 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
  * from `name` only where a language scopes a variable below the module — Nix,
  * whose binding names are attrpaths (`a.b.c = …` is name `c`, QN suffix `a.b.c`).
  * Pass NULL to use `name` for both. */
-static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
-                            TSNode node) {
+static void push_var_def_qn_doc(CBMExtractCtx *ctx, const char *name, const char *qn_name,
+                                TSNode node, const char *doc) {
     if (!name || !name[0] || strcmp(name, "_") == 0) {
         return;
     }
@@ -8546,8 +8608,16 @@ static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = cbm_is_exported(name, ctx->language);
-    def.docstring = extract_member_docstring(ctx, node);
+    def.docstring = doc;
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
+                            TSNode node) {
+    if (!name || !name[0] || strcmp(name, "_") == 0) {
+        return;
+    }
+    push_var_def_qn_doc(ctx, name, qn_name, node, extract_member_docstring(ctx, node));
 }
 
 static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
@@ -8619,6 +8689,17 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
         push_var_def(ctx, fname, node);
         return;
     }
+    /* All declarators have this field as their documentation anchor. Keep one
+     * immutable arena string, while each variable retains its own identity:
+     * the doc-link driver takes the references of that one text once, from
+     * the first declarator. A text that could not be collected whole is no
+     * doc of any of them (doc_lost has marked the file's doc links failed);
+     * it is not looked up again per declarator. */
+    bool complete = false;
+    const char *doc = extract_member_docstring_status(ctx, node, &complete);
+    if (!complete) {
+        doc = NULL;
+    }
     uint32_t n = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < n; i++) {
         TSNode child = ts_node_named_child(node, i);
@@ -8634,7 +8715,8 @@ static void extract_csharp_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                     id = cbm_find_child_by_kind(decl, "identifier");
                 }
                 if (!ts_node_is_null(id)) {
-                    push_var_def(ctx, cbm_node_text(a, id, ctx->source), decl);
+                    const char *name = cbm_node_text(a, id, ctx->source);
+                    push_var_def_qn_doc(ctx, name, NULL, decl, doc);
                 }
             }
         }
@@ -10185,6 +10267,15 @@ static TSNode resolve_field_name_node(TSNode child) {
         return null_node;
     }
     const char *nk = ts_node_type(name_node);
+    /* Java `private static final String PROP = "v";`: the declarator holds the
+     * initializer too, so its text named the Field `PROP = "v"`; its name is
+     * the declarator's own name field */
+    if (strcmp(nk, "variable_declarator") == 0) {
+        TSNode inner = ts_node_child_by_field_name(name_node, TS_FIELD("name"));
+        if (!ts_node_is_null(inner)) {
+            return inner;
+        }
+    }
     if (strcmp(nk, "pointer_declarator") == 0 || strcmp(nk, "array_declarator") == 0) {
         TSNode inner = ts_node_child_by_field_name(name_node, TS_FIELD("declarator"));
         if (!ts_node_is_null(inner)) {
@@ -10583,9 +10674,59 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
     member_iter_done(&it);
 }
 
-// Extract class-level variables (field declarations inside class bodies)
+static int cmp_cstr_ptr(const void *pa, const void *pb) {
+    return strcmp(*(const char *const *)pa, *(const char *const *)pb);
+}
+
+// A field and a method of one class body may share a name (Java `count` and
+// `count()`), and the graph keeps one node per qualified name, so one of them
+// was lost. The field then takes the qualified name `<Owner>.<name>#field`
+// (the `base#suffix` fence of `#macro` and the Rust cfg twins; the registry
+// still files it under its plain name). Only a collision in the same body
+// renames, so every other field keeps its name. The body's methods are the
+// defs [methods_from, fields_from), its fields [fields_from, count); a sorted
+// copy of the method names keeps a large class linear-logarithmic.
+static void fence_fields_named_like_methods(CBMExtractCtx *ctx, int methods_from, int fields_from) {
+    CBMDefinition *defs = ctx->result->defs.items;
+    int fields_to = ctx->result->defs.count;
+    if (fields_from >= fields_to || methods_from >= fields_from) {
+        return;
+    }
+    const char **qns = (const char **)cbm_arena_alloc(
+        ctx->arena, (size_t)(fields_from - methods_from) * sizeof(const char *));
+    if (!qns) {
+        return;
+    }
+    size_t n = 0;
+    for (int i = methods_from; i < fields_from; i++) {
+        if (defs[i].qualified_name && strcmp(defs[i].label, "Method") == 0) {
+            qns[n++] = defs[i].qualified_name;
+        }
+    }
+    if (n == 0) {
+        return;
+    }
+    qsort(qns, n, sizeof(qns[0]), cmp_cstr_ptr);
+    for (int i = fields_from; i < fields_to; i++) {
+        const char *qn = defs[i].qualified_name;
+        if (qn && strcmp(defs[i].label, "Field") == 0 &&
+            bsearch(&qn, qns, n, sizeof(qns[0]), cmp_cstr_ptr)) {
+            char *fenced = cbm_arena_sprintf(ctx->arena, "%s#field", qn);
+            if (fenced) {
+                defs[i].qualified_name = fenced;
+            }
+        }
+    }
+}
+
+// Extract class-level variables (field declarations inside class bodies).
+// A declaration that extract_class_fields already made a Field (the defs from
+// `fields_from` on) is not minted again: Java, C# and Solidity list the same
+// kind as field and variable, and the second copy was a Variable with the
+// module's qualified name (`demo.query.filters` for field Query.filters),
+// which collided with package paths.
 static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
-                                    const CBMLangSpec *spec) {
+                                    const CBMLangSpec *spec, int fields_from) {
     if (!spec->variable_node_types || !spec->variable_node_types[0]) {
         return;
     }
@@ -10595,6 +10736,10 @@ static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const
         return;
     }
 
+    /* the Fields of this body, in body order: walked alongside the children */
+    int fields_to = ctx->result->defs.count;
+    int fi = fields_from;
+
     /* Record the declaring class on every variable minted from this body (see
      * push_var_def_qn); saved/restored so module-level minting stays bare. */
     const char *saved_parent = ctx->var_parent_class;
@@ -10603,9 +10748,19 @@ static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const
     member_iter_init(&it, body, ctx->language, true);
     TSNode child;
     while (member_iter_next(&it, &child)) {
-        if (cbm_kind_in_set(child, spec->variable_node_types)) {
-            extract_var_names(ctx, child, spec);
+        if (!cbm_kind_in_set(child, spec->variable_node_types)) {
+            continue;
         }
+        int line = (int)ts_node_start_point(child).row + TS_LINE_OFFSET;
+        while (fi < fields_to && (strcmp(ctx->result->defs.items[fi].label, "Field") != 0 ||
+                                  (int)ctx->result->defs.items[fi].start_line < line)) {
+            fi++;
+        }
+        if (fi < fields_to && (int)ctx->result->defs.items[fi].start_line == line &&
+            spec->field_node_types && cbm_kind_in_set(child, spec->field_node_types)) {
+            continue; /* already a Field of this class */
+        }
+        extract_var_names(ctx, child, spec);
     }
     member_iter_done(&it);
     ctx->var_parent_class = saved_parent;

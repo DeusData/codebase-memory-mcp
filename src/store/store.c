@@ -78,6 +78,7 @@ enum {
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/compat_regex.h"
 #include "callable_sig.h"        /* cbm_qn_callable_base_len: base-match tier */
 #include "foundation/mem_core.h" /* cbm_alloc: pattern buffers */
@@ -2947,6 +2948,8 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     return CBM_STORE_OK;
 }
 
+static int doc_links_table_state(cbm_store_t *s);
+
 int cbm_store_delete_project(cbm_store_t *s, const char *name) {
     if (!s || !s->db || !name) {
         return CBM_STORE_ERR;
@@ -2960,6 +2963,30 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
         "DELETE FROM index_coverage_meta WHERE project = ?1;",
         "DELETE FROM projects WHERE name = ?1 || '::missed';",
     };
+    /* doc_link_unresolved exists only in databases published by a build that
+     * writes it; an older database has nothing to clean. */
+    int doc_links_state = doc_links_table_state(s);
+    if (doc_links_state < 0) {
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    if (doc_links_state > 0) {
+        sqlite3_stmt *dl = NULL;
+        if (sqlite3_prepare_v2(s->db, "DELETE FROM doc_link_unresolved WHERE project = ?1;",
+                               CBM_NOT_FOUND, &dl, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "delete project doc_links prepare");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+        bind_text(dl, SKIP_ONE, name);
+        int dl_rc = sqlite3_step(dl);
+        sqlite3_finalize(dl);
+        if (dl_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "delete project doc_links");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+    }
     for (size_t i = 0; i < sizeof(cleanup_sql) / sizeof(cleanup_sql[0]); i++) {
         sqlite3_stmt *cleanup = NULL;
         if (sqlite3_prepare_v2(s->db, cleanup_sql[i], CBM_NOT_FOUND, &cleanup, NULL) != SQLITE_OK) {
@@ -4860,6 +4887,509 @@ void cbm_store_free_coverage(cbm_coverage_row_t *rows, int count) {
         free((char *)rows[i].detail);
     }
     free(rows);
+}
+
+/* ── Doc-link unresolved references ─────────────────────────────── */
+
+/* Created at publish, not in init_schema: a database written by an older
+ * build simply has no table, and readers treat that as "no doc-link data"
+ * instead of failing (no index-format change). */
+static const char DOC_LINKS_DDL[] = "CREATE TABLE IF NOT EXISTS doc_link_unresolved ("
+                                    "  project TEXT NOT NULL,"
+                                    "  rel_path TEXT NOT NULL,"
+                                    "  line INTEGER NOT NULL DEFAULT 0,"
+                                    "  syntax TEXT NOT NULL DEFAULT '',"
+                                    "  raw TEXT NOT NULL DEFAULT '',"
+                                    "  reason TEXT NOT NULL"
+                                    ");"
+                                    "CREATE INDEX IF NOT EXISTS idx_doc_link_unresolved_path "
+                                    "ON doc_link_unresolved(project, rel_path);";
+
+/* 1 = the table exists, 0 = it does not, -1 = the probe failed. */
+static int doc_links_table_state(cbm_store_t *s) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                           "AND name = 'doc_link_unresolved';",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links probe prepare");
+        return CBM_NOT_FOUND;
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) {
+        return SKIP_ONE;
+    }
+    if (rc == SQLITE_DONE) {
+        return 0;
+    }
+    store_set_error_sqlite(s, "doc_links probe");
+    return CBM_NOT_FOUND;
+}
+
+int cbm_store_doc_links_replace(cbm_store_t *s, const char *project, const cbm_doc_link_row_t *rows,
+                                int count) {
+    if (!s || !s->db || !project || count < 0 || (count > 0 && !rows)) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, DOC_LINKS_DDL) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, "BEGIN;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *del = NULL;
+    if (sqlite3_prepare_v2(s->db, "DELETE FROM doc_link_unresolved WHERE project = ?1;",
+                           CBM_NOT_FOUND, &del, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links delete prepare");
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    bind_text(del, SKIP_ONE, project);
+    int rc = sqlite3_step(del);
+    sqlite3_finalize(del);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "doc_links delete");
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "INSERT INTO doc_link_unresolved "
+                           "(project, rel_path, line, syntax, raw, reason) "
+                           "VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
+                           CBM_NOT_FOUND, &ins, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links insert prepare");
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!rows[i].rel_path || !rows[i].reason) {
+            continue;
+        }
+        bind_text(ins, SKIP_ONE, project);
+        bind_text(ins, ST_COL_2, rows[i].rel_path);
+        sqlite3_bind_int(ins, ST_COL_3, rows[i].line);
+        bind_text(ins, CBM_SZ_4, rows[i].syntax ? rows[i].syntax : "");
+        bind_text(ins, CBM_SZ_5, rows[i].raw ? rows[i].raw : "");
+        bind_text(ins, CBM_SZ_6, rows[i].reason);
+        if (sqlite3_step(ins) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "doc_links insert");
+            sqlite3_finalize(ins);
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+        sqlite3_reset(ins);
+    }
+    sqlite3_finalize(ins);
+    return exec_sql(s, "COMMIT;");
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_uint_fast64_t doc_links_sample_field_copies = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t doc_links_sample_copied_bytes = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t doc_links_sample_requested_bytes = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t doc_links_sample_max_request_bytes = ATOMIC_VAR_INIT(0);
+static atomic_int doc_links_sample_alloc_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+static atomic_bool doc_links_sample_alloc_failed = ATOMIC_VAR_INIT(false);
+
+void cbm_store_doc_links_test_sample_stats_reset(void) {
+    atomic_store_explicit(&doc_links_sample_field_copies, 0, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_copied_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_requested_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_max_request_bytes, 0, memory_order_relaxed);
+}
+
+void cbm_store_doc_links_test_sample_stats(cbm_doc_links_sample_test_stats_t *out) {
+    if (!out) {
+        return;
+    }
+    out->field_copies = atomic_load_explicit(&doc_links_sample_field_copies, memory_order_relaxed);
+    out->copied_bytes = atomic_load_explicit(&doc_links_sample_copied_bytes, memory_order_relaxed);
+    out->requested_bytes =
+        atomic_load_explicit(&doc_links_sample_requested_bytes, memory_order_relaxed);
+    out->max_request_bytes =
+        atomic_load_explicit(&doc_links_sample_max_request_bytes, memory_order_relaxed);
+}
+
+void cbm_store_doc_links_test_fail_sample_alloc_after(int successful_copies) {
+    atomic_store_explicit(&doc_links_sample_alloc_failed, false, memory_order_relaxed);
+    atomic_store_explicit(&doc_links_sample_alloc_countdown,
+                          successful_copies < 0 ? CBM_NOT_FOUND : successful_copies,
+                          memory_order_relaxed);
+}
+
+bool cbm_store_doc_links_test_sample_alloc_failed(void) {
+    return atomic_load_explicit(&doc_links_sample_alloc_failed, memory_order_relaxed);
+}
+#endif
+
+/* Copy the exact bytes requested by the sample query, including embedded NUL.
+ * Counters observe this allocation and copy, never the original column length. */
+static char *doc_links_sample_copy(const void *source, size_t length) {
+    if (length == SIZE_MAX || (length && !source)) {
+        return NULL;
+    }
+    size_t bytes = length + SKIP_ONE;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add_explicit(&doc_links_sample_requested_bytes, bytes, memory_order_relaxed);
+    uint_fast64_t maximum =
+        atomic_load_explicit(&doc_links_sample_max_request_bytes, memory_order_relaxed);
+    while (maximum < bytes && !atomic_compare_exchange_weak_explicit(
+                                  &doc_links_sample_max_request_bytes, &maximum, bytes,
+                                  memory_order_relaxed, memory_order_relaxed)) {}
+    if (graph_compare_test_countdown_fires(&doc_links_sample_alloc_countdown)) {
+        atomic_store_explicit(&doc_links_sample_alloc_failed, true, memory_order_relaxed);
+        return NULL;
+    }
+#endif
+    char *copy = cbm_alloc(CBM_MEM_CLASS_STORE, bytes);
+    if (copy) {
+        if (length) {
+            memcpy(copy, source, length);
+        }
+        copy[length] = '\0';
+#ifdef CBM_ENABLE_TEST_SEAMS
+        atomic_fetch_add_explicit(&doc_links_sample_field_copies, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&doc_links_sample_copied_bytes, bytes, memory_order_relaxed);
+#endif
+    }
+    return copy;
+}
+
+/* Full getters and the original summary API retain their C-string behavior. */
+static char *doc_links_field_copy(const char *source, bool sample) {
+    if (!sample || !source) {
+        return cbm_mem_strdup(CBM_MEM_CLASS_STORE, source);
+    }
+    return doc_links_sample_copy(source, strlen(source));
+}
+
+/* Run a row query (columns rel_path, line, syntax, raw, reason) with the
+ * project bound to ?1 and an optional integer limit bound to ?2. */
+static int doc_links_query(cbm_store_t *s, const char *sql, const char *project, int limit,
+                           cbm_doc_link_row_t **out, int *count) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links get prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    if (limit >= 0) {
+        sqlite3_bind_int(stmt, ST_COL_2, limit);
+    }
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_doc_link_row_t *arr = cbm_alloc(CBM_MEM_CLASS_STORE, (size_t)cap * sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int scan_rc;
+    while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cbm_doc_link_row_t *grown =
+                cbm_realloc(CBM_MEM_CLASS_STORE, arr, (size_t)cap * ST_GROWTH * sizeof(*arr));
+            if (!grown) {
+                sqlite3_finalize(stmt);
+                cbm_store_free_doc_links(arr, n);
+                return CBM_STORE_ERR;
+            }
+            arr = grown;
+            cap *= ST_GROWTH;
+        }
+        cbm_doc_link_row_t *r = &arr[n];
+        r->rel_path = doc_links_field_copy((const char *)sqlite3_column_text(stmt, 0), limit >= 0);
+        r->line = sqlite3_column_int(stmt, SKIP_ONE);
+        r->syntax =
+            doc_links_field_copy((const char *)sqlite3_column_text(stmt, ST_COL_2), limit >= 0);
+        r->raw =
+            doc_links_field_copy((const char *)sqlite3_column_text(stmt, ST_COL_3), limit >= 0);
+        r->reason =
+            doc_links_field_copy((const char *)sqlite3_column_text(stmt, CBM_SZ_4), limit >= 0);
+        n++;
+        if (!r->rel_path || !r->syntax || !r->raw || !r->reason) {
+            sqlite3_finalize(stmt);
+            cbm_store_free_doc_links(arr, n);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (scan_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "doc_links scan");
+        cbm_store_free_doc_links(arr, n);
+        return CBM_STORE_ERR;
+    }
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_doc_links_get(cbm_store_t *s, const char *project, cbm_doc_link_row_t **out,
+                            int *count, bool *table_present) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (table_present) {
+        *table_present = false;
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    int state = doc_links_table_state(s);
+    if (state < 0) {
+        return CBM_STORE_ERR;
+    }
+    if (state == 0) {
+        return CBM_STORE_OK;
+    }
+    if (table_present) {
+        *table_present = true;
+    }
+    return doc_links_query(s,
+                           "SELECT rel_path, line, syntax, raw, reason FROM doc_link_unresolved "
+                           "WHERE project = ?1 ORDER BY rel_path, line, raw, syntax, reason;",
+                           project, CBM_NOT_FOUND, out, count);
+}
+
+int cbm_store_doc_links_summary(cbm_store_t *s, const char *project,
+                                cbm_doc_link_reason_count_t **reasons, int *reason_count,
+                                cbm_doc_link_row_t **samples, int *sample_count, int sample_limit,
+                                bool *table_present) {
+    if (!reasons || !reason_count || !samples || !sample_count) {
+        return CBM_STORE_ERR;
+    }
+    *reasons = NULL;
+    *reason_count = 0;
+    *samples = NULL;
+    *sample_count = 0;
+    if (table_present) {
+        *table_present = false;
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    int state = doc_links_table_state(s);
+    if (state < 0) {
+        return CBM_STORE_ERR;
+    }
+    if (state == 0) {
+        return CBM_STORE_OK;
+    }
+    if (table_present) {
+        *table_present = true;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT reason, COUNT(*) FROM doc_link_unresolved WHERE project = ?1 "
+                           "GROUP BY reason ORDER BY reason;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links summary prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int cap = ST_INIT_CAP_8;
+    int n = 0;
+    cbm_doc_link_reason_count_t *arr = cbm_alloc(CBM_MEM_CLASS_STORE, (size_t)cap * sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int scan_rc;
+    while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cbm_doc_link_reason_count_t *grown =
+                cbm_realloc(CBM_MEM_CLASS_STORE, arr, (size_t)cap * ST_GROWTH * sizeof(*arr));
+            if (!grown) {
+                sqlite3_finalize(stmt);
+                cbm_store_free_doc_link_reasons(arr, n);
+                return CBM_STORE_ERR;
+            }
+            arr = grown;
+            cap *= ST_GROWTH;
+        }
+        arr[n].reason =
+            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, 0));
+        arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
+        n++;
+        if (!arr[n - SKIP_ONE].reason) {
+            sqlite3_finalize(stmt);
+            cbm_store_free_doc_link_reasons(arr, n);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (scan_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "doc_links summary scan");
+        cbm_store_free_doc_link_reasons(arr, n);
+        return CBM_STORE_ERR;
+    }
+    if (sample_limit > 0 &&
+        doc_links_query(s,
+                        "SELECT rel_path, line, syntax, raw, reason FROM doc_link_unresolved "
+                        "WHERE project = ?1 ORDER BY reason, rel_path, line, raw LIMIT ?2;",
+                        project, sample_limit, samples, sample_count) != CBM_STORE_OK) {
+        cbm_store_free_doc_link_reasons(arr, n);
+        return CBM_STORE_ERR;
+    }
+    *reasons = arr;
+    *reason_count = n;
+    return CBM_STORE_OK;
+}
+
+/* Both substr and length operate on bytes; ORDER BY retains the original
+ * columns, so projection cannot change which fifty source rows are sampled. */
+static bool doc_links_preview_field(sqlite3_stmt *stmt, int column, size_t cap,
+                                    cbm_doc_link_preview_text_t *out) {
+    /* SQLite's BLOB substr returns SQL NULL for a zero-byte BLOB. Its
+     * separately computed integer length distinguishes that from a NULL
+     * source or a failed nonempty projection. */
+    if (sqlite3_column_type(stmt, column + SKIP_ONE) != SQLITE_INTEGER) {
+        return false;
+    }
+    sqlite3_int64 original = sqlite3_column_int64(stmt, column + SKIP_ONE);
+    int projection_type = sqlite3_column_type(stmt, column);
+    if (original < 0 ||
+        (projection_type != SQLITE_BLOB && (projection_type != SQLITE_NULL || original != 0))) {
+        return false;
+    }
+    const void *source = sqlite3_column_blob(stmt, column);
+    int bytes = sqlite3_column_bytes(stmt, column);
+    if (bytes < 0 || (size_t)bytes > cap || (bytes && !source)) {
+        return false;
+    }
+    uint64_t expected = (uint64_t)original < cap ? (uint64_t)original : cap;
+    if ((uint64_t)bytes != expected) {
+        return false;
+    }
+    out->text = doc_links_sample_copy(source, (size_t)bytes);
+    if (!out->text) {
+        return false;
+    }
+    out->length = (size_t)bytes;
+    out->original_bytes = (uint64_t)original;
+    return true;
+}
+
+int cbm_store_doc_links_preview(cbm_store_t *s, const char *project,
+                                cbm_doc_link_preview_row_t **out, int *count, bool *table_present) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (table_present) {
+        *table_present = false;
+    }
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    int state = doc_links_table_state(s);
+    if (state < 0) {
+        return CBM_STORE_ERR;
+    }
+    if (!state) {
+        return CBM_STORE_OK;
+    }
+    if (table_present) {
+        *table_present = true;
+    }
+    sqlite3_stmt *stmt = NULL;
+    static const char sql[] =
+        "SELECT substr(CAST(d.rel_path AS BLOB),1,?2),length(CAST(d.rel_path AS BLOB)),"
+        "d.line,substr(CAST(d.syntax AS BLOB),1,?3),length(CAST(d.syntax AS BLOB)),"
+        "substr(CAST(d.raw AS BLOB),1,?2),length(CAST(d.raw AS BLOB)),"
+        "substr(CAST(d.reason AS BLOB),1,?3),length(CAST(d.reason AS BLOB)) "
+        "FROM doc_link_unresolved AS d WHERE d.project=?1 "
+        "ORDER BY d.reason,d.rel_path,d.line,d.raw LIMIT ?4;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links preview prepare");
+        return CBM_STORE_ERR;
+    }
+    const int long_cap = CBM_DOC_LINK_PREVIEW_LONG_BYTES + CBM_DOC_LINK_PREVIEW_LOOKAHEAD;
+    const int short_cap = CBM_DOC_LINK_PREVIEW_SHORT_BYTES + CBM_DOC_LINK_PREVIEW_LOOKAHEAD;
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, ST_COL_2, long_cap) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, ST_COL_3, short_cap) != SQLITE_OK ||
+        sqlite3_bind_int(stmt, ST_COL_4, CBM_DOC_LINK_PREVIEW_ROWS) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_links preview bind");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    cbm_doc_link_preview_row_t *rows =
+        cbm_calloc(CBM_MEM_CLASS_STORE, CBM_DOC_LINK_PREVIEW_ROWS * sizeof(*rows));
+    if (!rows) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int n = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n == CBM_DOC_LINK_PREVIEW_ROWS) {
+            store_set_error(s, "doc_links preview row limit");
+            sqlite3_finalize(stmt);
+            cbm_store_free_doc_link_previews(rows, n);
+            return CBM_STORE_ERR;
+        }
+        cbm_doc_link_preview_row_t *row = &rows[n++];
+        row->line = sqlite3_column_int(stmt, ST_COL_2);
+        if (!doc_links_preview_field(stmt, 0, (size_t)long_cap, &row->rel_path) ||
+            !doc_links_preview_field(stmt, ST_COL_3, (size_t)short_cap, &row->syntax) ||
+            !doc_links_preview_field(stmt, ST_COL_5, (size_t)long_cap, &row->raw) ||
+            !doc_links_preview_field(stmt, ST_COL_7, (size_t)short_cap, &row->reason)) {
+            store_set_error(s, "doc_links preview copy failed");
+            sqlite3_finalize(stmt);
+            cbm_store_free_doc_link_previews(rows, n);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "doc_links preview scan");
+        cbm_store_free_doc_link_previews(rows, n);
+        return CBM_STORE_ERR;
+    }
+    *out = rows;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_free_doc_link_previews(cbm_doc_link_preview_row_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].rel_path.text);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].syntax.text);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].raw.text);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].reason.text);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, rows);
+}
+
+void cbm_store_free_doc_links(cbm_doc_link_row_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].rel_path);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].syntax);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].raw);
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)rows[i].reason);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, rows);
+}
+
+void cbm_store_free_doc_link_reasons(cbm_doc_link_reason_count_t *reasons, int count) {
+    if (!reasons) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_free(CBM_MEM_CLASS_STORE, (char *)reasons[i].reason);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, reasons);
 }
 
 /* ── FindNodesByFileOverlap ─────────────────────────────────────── */
@@ -10354,6 +10884,178 @@ int cbm_adr_validate_section_keys(const char **keys, int count, char *errbuf, in
         }
     }
     return CBM_STORE_OK;
+}
+
+/* ── Doc -> code candidates ─────────────────────────────────────── */
+
+static const char DOC_CANDIDATES_DDL[] =
+    "CREATE TABLE IF NOT EXISTS doc_link_candidates ("
+    "  project TEXT NOT NULL,"
+    "  section_qn TEXT NOT NULL,"
+    "  target_qn TEXT NOT NULL,"
+    "  rank INTEGER NOT NULL,"
+    "  score REAL NOT NULL,"
+    "  p REAL NOT NULL,"
+    "  evidence TEXT NOT NULL DEFAULT ''"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_doc_link_candidates_section "
+    "ON doc_link_candidates(project, section_qn);"
+    "CREATE INDEX IF NOT EXISTS idx_doc_link_candidates_target "
+    "ON doc_link_candidates(project, target_qn);";
+
+int cbm_store_doc_candidates_replace(cbm_store_t *s, const char *project,
+                                     const cbm_doc_candidate_t *rows, int count) {
+    if (!s || !s->db || !project || count < 0 || (count > 0 && !rows)) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, DOC_CANDIDATES_DDL) != CBM_STORE_OK || exec_sql(s, "BEGIN;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *del = NULL;
+    sqlite3_stmt *ins = NULL;
+    bool ok = sqlite3_prepare_v2(s->db, "DELETE FROM doc_link_candidates WHERE project = ?1;",
+                                 CBM_NOT_FOUND, &del, NULL) == SQLITE_OK &&
+              sqlite3_prepare_v2(s->db,
+                                 "INSERT INTO doc_link_candidates "
+                                 "(project, section_qn, target_qn, rank, score, p, evidence) "
+                                 "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+                                 CBM_NOT_FOUND, &ins, NULL) == SQLITE_OK;
+    if (ok) {
+        bind_text(del, SKIP_ONE, project);
+        ok = sqlite3_step(del) == SQLITE_DONE;
+    }
+    for (int i = 0; ok && i < count; i++) {
+        if (!rows[i].section_qn || !rows[i].target_qn) {
+            continue;
+        }
+        bind_text(ins, SKIP_ONE, project);
+        bind_text(ins, ST_COL_2, rows[i].section_qn);
+        bind_text(ins, ST_COL_3, rows[i].target_qn);
+        sqlite3_bind_int(ins, ST_COL_4, rows[i].rank);
+        sqlite3_bind_double(ins, ST_COL_5, rows[i].score);
+        sqlite3_bind_double(ins, ST_COL_6, rows[i].p);
+        bind_text(ins, CBM_SZ_7, rows[i].evidence ? rows[i].evidence : "");
+        ok = sqlite3_step(ins) == SQLITE_DONE;
+        sqlite3_reset(ins);
+    }
+    sqlite3_finalize(del);
+    sqlite3_finalize(ins);
+    if (!ok) {
+        store_set_error_sqlite(s, "doc_candidates replace");
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+    return exec_sql(s, "COMMIT;");
+}
+
+/* Does the database hold the candidates table? CBM_STORE_NOT_FOUND: no (a
+ * database written by an older build). */
+static int doc_candidates_table(cbm_store_t *s) {
+    sqlite3_stmt *probe = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                           "name='doc_link_candidates' LIMIT 1;",
+                           CBM_NOT_FOUND, &probe, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_candidates probe");
+        return CBM_STORE_ERR;
+    }
+    int rc = sqlite3_step(probe);
+    sqlite3_finalize(probe);
+    if (rc == SQLITE_DONE) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (rc != SQLITE_ROW) {
+        store_set_error_sqlite(s, "doc_candidates probe step");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+/* Run a prepared candidates query (project ?1, key ?2, limit ?3; columns
+ * section_qn, target_qn, rank, score, p, evidence) into *out; finalizes it. */
+static int doc_candidates_read(sqlite3_stmt *stmt, const char *project, const char *key, int limit,
+                               cbm_doc_candidate_t **out, int *count) {
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, key);
+    sqlite3_bind_int(stmt, ST_COL_3, limit);
+    cbm_doc_candidate_t *rows = cbm_calloc(CBM_MEM_CLASS_STORE, (size_t)limit * sizeof(*rows));
+    if (!rows) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int n = 0;
+    while (n < limit && sqlite3_step(stmt) == SQLITE_ROW) {
+        rows[n].section_qn =
+            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, 0));
+        rows[n].target_qn =
+            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        rows[n].rank = sqlite3_column_int(stmt, ST_COL_2);
+        rows[n].score = sqlite3_column_double(stmt, ST_COL_3);
+        rows[n].p = sqlite3_column_double(stmt, ST_COL_4);
+        rows[n].evidence =
+            cbm_mem_strdup(CBM_MEM_CLASS_STORE, (const char *)sqlite3_column_text(stmt, ST_COL_5));
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    *out = rows;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+static int doc_candidates_query(cbm_store_t *s, const char *sql, const char *project,
+                                const char *key, int limit, cbm_doc_candidate_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    int rc = doc_candidates_table(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "doc_candidates get");
+        return CBM_STORE_ERR;
+    }
+    return doc_candidates_read(stmt, project, key, limit, out, count);
+}
+
+int cbm_store_doc_candidates_get(cbm_store_t *s, const char *project, const char *section_qn,
+                                 const char *target_qn, int limit, cbm_doc_candidate_t **out,
+                                 int *count) {
+    if (!s || !s->db || !project || !out || !count || (!section_qn == !target_qn) || limit <= 0) {
+        return CBM_STORE_ERR;
+    }
+    const char *sql = section_qn ? "SELECT section_qn, target_qn, rank, score, p, evidence FROM "
+                                   "doc_link_candidates WHERE project=?1 AND section_qn=?2 "
+                                   "ORDER BY p DESC, score DESC, target_qn LIMIT ?3;"
+                                 : "SELECT section_qn, target_qn, rank, score, p, evidence FROM "
+                                   "doc_link_candidates WHERE project=?1 AND target_qn=?2 "
+                                   "ORDER BY p DESC, score DESC, section_qn LIMIT ?3;";
+    return doc_candidates_query(s, sql, project, section_qn ? section_qn : target_qn, limit, out,
+                                count);
+}
+
+int cbm_store_doc_candidates_for_path(cbm_store_t *s, const char *project, const char *file_path,
+                                      int limit, cbm_doc_candidate_t **out, int *count) {
+    if (!s || !s->db || !project || !file_path || !file_path[0] || !out || !count || limit <= 0) {
+        return CBM_STORE_ERR;
+    }
+    static const char SQL[] = "SELECT c.section_qn, c.target_qn, c.rank, c.score, c.p, c.evidence "
+                              "FROM doc_link_candidates c JOIN nodes n "
+                              "ON n.project = c.project AND n.qualified_name = c.target_qn "
+                              "WHERE c.project=?1 AND ((n.label='File' AND n.file_path=?2) OR "
+                              "(n.label='Folder' AND n.file_path <> '' AND "
+                              "substr(?2, 1, length(n.file_path) + 1) = n.file_path || '/')) "
+                              "ORDER BY c.p DESC, c.score DESC, c.section_qn LIMIT ?3;";
+    return doc_candidates_query(s, SQL, project, file_path, limit, out, count);
+}
+
+void cbm_store_doc_candidates_free(cbm_doc_candidate_t *rows, int count) {
+    for (int i = 0; rows && i < count; i++) {
+        cbm_free(CBM_MEM_CLASS_STORE, (void *)rows[i].section_qn);
+        cbm_free(CBM_MEM_CLASS_STORE, (void *)rows[i].target_qn);
+        cbm_free(CBM_MEM_CLASS_STORE, (void *)rows[i].evidence);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, rows);
 }
 
 void cbm_adr_sections_free(cbm_adr_sections_t *s) {

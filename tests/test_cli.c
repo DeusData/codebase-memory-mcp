@@ -17174,6 +17174,71 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+/* Hash `len` bytes fed in `chunk`-sized pieces (0 = one update) to hex. */
+static void sha256_chunked_hex(const uint8_t *data, size_t len, size_t chunk,
+                               char out[CBM_SHA256_HEX_LEN + 1]) {
+    static const char hex[] = "0123456789abcdef";
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    size_t step = chunk == 0 ? len : chunk;
+    for (size_t off = 0; off < len; off += step) {
+        cbm_sha256_update(&ctx, data + off, len - off < step ? len - off : step);
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+/* #2441: block compression runs on ARMv8 SHA2 / x86 SHA-NI when the CPU has
+ * them. The hardware path must agree with the portable transform bit for bit
+ * at every length around the block and padding boundaries, for every way the
+ * input is split across update calls, and on the NIST million-'a' vector that
+ * runs 15,625 blocks through it. */
+TEST(cli_sha256_hardware_matches_portable_issue2441) {
+    enum { MAX_LEN = (1 << 20) + 13 };
+    uint8_t *data = malloc(MAX_LEN);
+    ASSERT_NOT_NULL(data);
+    uint32_t x = 0x2441u;
+    for (size_t i = 0; i < MAX_LEN; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        data[i] = (uint8_t)x;
+    }
+    static const size_t big[] = {4096, 65535, 65536, 65537, MAX_LEN};
+    static const size_t chunks[] = {0, 1, 3, 55, 63, 64, 65, 1000};
+    char hw[CBM_SHA256_HEX_LEN + 1];
+    char portable[CBM_SHA256_HEX_LEN + 1];
+    for (size_t n = 0; n < 300 + sizeof(big) / sizeof(big[0]); n++) {
+        size_t len = n < 300 ? n : big[n - 300];
+        for (size_t c = 0; c < sizeof(chunks) / sizeof(chunks[0]); c++) {
+            if (len > 70000 && chunks[c] != 0 && chunks[c] < 64) {
+                continue; /* byte-sized updates over 1 MiB add time, not coverage */
+            }
+            cbm_sha256_force_portable_for_testing(false);
+            sha256_chunked_hex(data, len, chunks[c], hw);
+            cbm_sha256_force_portable_for_testing(true);
+            sha256_chunked_hex(data, len, chunks[c], portable);
+            cbm_sha256_force_portable_for_testing(false);
+            ASSERT_STR_EQ(hw, portable);
+        }
+    }
+    memset(data, 'a', 1000000);
+    sha256_chunked_hex(data, 1000000, 0, hw);
+    ASSERT_STR_EQ(hw, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    free(data);
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Every Apple arm64 CPU has the SHA2 extension: a portable answer here
+     * means the probe or dispatch broke, and startup is slow again. */
+    ASSERT_STR_EQ(cbm_sha256_backend_name_for_testing(), "arm-sha2");
+#endif
+    PASS();
+}
+
 /* #1544: v0.10.2 deleted the ui/standard chooser AND the flags that drove it,
  * so `update --ui` — a command people had in scripts and aliases — started
  * failing with "unknown update option". Retiring a choice is fine; breaking the
@@ -17669,6 +17734,7 @@ SUITE(cli) {
     RUN_TEST(cli_progress_sink_preserves_explicit_verbose_diagnostics);
     RUN_TEST(cli_progress_sink_serializes_concurrent_callbacks);
     RUN_TEST(cli_sha256_file_matches_known_vector);
+    RUN_TEST(cli_sha256_hardware_matches_portable_issue2441);
     RUN_TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star);
     RUN_TEST(cli_checksum_manifest_rejects_invalid_missing_and_conflicting_digest);
     RUN_TEST(cli_checksum_manifest_rejects_oversized_input);

@@ -1818,6 +1818,13 @@ extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
 extern void suite_doclinks(void);
+extern void suite_doc_mentions(void);
+extern void suite_doc_mentions_cost(void);
+extern void suite_doc_mentions_msbuild(void);
+extern void suite_doc_links_md(void);
+extern void suite_doc_links_pdf(void);
+extern void suite_doc_links_rst(void);
+extern void suite_doc_links_adoc(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
@@ -2280,6 +2287,15 @@ int main(int argc, char **argv) {
 
     /* Markdown file reference link */
     RUN_SELECTED_SUITE(doclinks);
+
+    /* Doc-comment references -> MENTIONS */
+    RUN_SELECTED_SUITE(doc_mentions);
+    RUN_SELECTED_SUITE(doc_mentions_cost);
+    RUN_SELECTED_SUITE(doc_mentions_msbuild);
+    RUN_SELECTED_SUITE(doc_links_md);
+    RUN_SELECTED_SUITE(doc_links_pdf);
+    RUN_SELECTED_SUITE(doc_links_rst);
+    RUN_SELECTED_SUITE(doc_links_adoc);
 
     /* Infrastructure scanning */
     RUN_SELECTED_SUITE(infrascan);

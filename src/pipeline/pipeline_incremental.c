@@ -21,11 +21,13 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/doc_links.h"
 #include "store/store.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
+#include "foundation/mem_core.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -33,6 +35,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/sha256.h"
 #include "result_spill.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1370,12 +1373,32 @@ typedef struct {
     int fatal_rc; /* configured probe failures cannot decline to a full retry */
     cbm_lsp_surface_row_t *stored_rows; /* whole previous generation */
     int stored_count;
+    /* The previous generation's doc_link_unresolved rows: carried forward for
+     * the files the repair does not re-extract. */
+    cbm_doc_link_row_t *doc_rows;
+    int doc_row_count;
 } closure_plan_t;
 
 static void closure_plan_free(closure_plan_t *plan) {
     free(plan->files);
     cbm_store_free_lsp_surfaces(plan->stored_rows, plan->stored_count);
+    cbm_store_free_doc_links(plan->doc_rows, plan->doc_row_count);
     memset(plan, 0, sizeof(*plan));
+}
+
+/* Add a heap copy of `name` to a heap-keyed name set (value = key; released
+ * by surface_name_set_free). No-op when present; false when the copy could
+ * not be made. */
+static bool surface_name_set_put(CBMHashTable *set, const char *name) {
+    if (!name[0] || cbm_ht_get(set, name)) {
+        return true;
+    }
+    char *copy = strdup(name);
+    if (!copy) {
+        return false;
+    }
+    cbm_ht_set(set, copy, copy);
+    return true;
 }
 
 /* Short names a surface JSON defines ("lsp"[].sn plus "reg"[].n), as a
@@ -1403,11 +1426,8 @@ static CBMHashTable *surface_name_set(const char *defs_json) {
         yyjson_val *item;
         yyjson_arr_foreach(arrs[a], idx, max, item) {
             const char *name = yyjson_get_str(yyjson_obj_get(item, arr_keys[a]));
-            if (name && name[0] && !cbm_ht_get(set, name)) {
-                char *copy = strdup(name);
-                if (copy) {
-                    cbm_ht_set(set, copy, copy);
-                }
+            if (name) {
+                (void)surface_name_set_put(set, name);
             }
         }
     }
@@ -1459,6 +1479,218 @@ static int surface_added_names(const char *stored_json, const char *fresh_json, 
     surface_name_set_free(stored_set);
     surface_name_set_free(fresh_set);
     return rc;
+}
+
+/* ── Doc-link closure rules ───────────────────────────────────────
+ *
+ * MENTIONS edges are owned by their source file like CALLS: a re-extracted
+ * file rewrites its own edges and doc_link_unresolved rows, and the files
+ * with edges INTO a changed file are dependents. What the edge set cannot
+ * see is decided by the language's resolver hooks (doc_links.h), never here:
+ *   - a scope input (a file without a scope of its own that sets the scope of
+ *     a language's files; no language has one today): a change declines to
+ *     FULL;
+ *   - a scope delta ("dl" surface key) the language calls GLOBAL can re-route
+ *     or re-classify references in files with no edge into the changed file:
+ *     FULL, exactly like an added name. A deleted file with a scope is GLOBAL.
+ *     C#'s MSBuild project files come in here: each has a scope blob, and any
+ *     change to it is GLOBAL (it sets the global usings of a whole project);
+ *   - a REMOVED name can make another file's unresolved reference resolve (an
+ *     overload group shrinks) or change its reason: the files whose rows
+ *     mention it re-resolve with the closure. */
+
+/* Add s[0..n) to a heap-keyed name set. false when it cannot be recorded (too
+ * long for a key, or out of memory): callers fail closed. */
+static bool name_set_add_n(CBMHashTable *set, const char *s, size_t n) {
+    char key[CBM_SZ_1K];
+    if (n >= sizeof(key)) {
+        return false;
+    }
+    memcpy(key, s, n);
+    key[n] = '\0';
+    return surface_name_set_put(set, key);
+}
+
+/* The "dl" scope of a surface JSON (a CBM_MEM_CLASS_OTHER block; NULL when it
+ * has none). false when the row's scope cannot be read: the caller declines. */
+static bool surface_dl_scope(const char *defs_json, char **out) {
+    return cbm_doclinks_scope_from_surface_json(defs_json, out) == 0;
+}
+
+/* cbm_doclink_name_fn over a heap-keyed name set. */
+static bool removed_name_put(void *ud, const char *name, size_t len) {
+    return name_set_add_n((CBMHashTable *)ud, name, len);
+}
+
+typedef struct {
+    CBMHashTable *fresh;
+    CBMHashTable *removed;
+    bool failed;
+} removed_walk_t;
+
+static void removed_name_visitor(const char *key, void *value, void *userdata) {
+    (void)value;
+    removed_walk_t *walk = (removed_walk_t *)userdata;
+    if ((!walk->fresh || !cbm_ht_get(walk->fresh, key)) &&
+        !name_set_add_n(walk->removed, key, strlen(key))) {
+        walk->failed = true;
+    }
+}
+
+/* Short names of `stored_json` absent from `fresh_json` (all of them when
+ * fresh_json is NULL: a deleted file). */
+static int surface_removed_names(const char *stored_json, const char *fresh_json,
+                                 CBMHashTable *removed) {
+    CBMHashTable *stored_set = surface_name_set(stored_json);
+    CBMHashTable *fresh_set = fresh_json ? surface_name_set(fresh_json) : NULL;
+    if (!stored_set || (fresh_json && !fresh_set)) {
+        surface_name_set_free(stored_set);
+        surface_name_set_free(fresh_set);
+        return CBM_NOT_FOUND;
+    }
+    removed_walk_t walk = {.fresh = fresh_set, .removed = removed, .failed = false};
+    cbm_ht_foreach(stored_set, removed_name_visitor, &walk);
+    surface_name_set_free(stored_set);
+    surface_name_set_free(fresh_set);
+    return walk.failed ? CBM_NOT_FOUND : 0;
+}
+
+/* The doc-link view of one changed (fresh_json set) or deleted (fresh_json
+ * NULL) file: the names it no longer declares go to `removed`. false when the
+ * change cannot be repaired file by file (the rules above) or the stored data
+ * cannot be read -- either way the caller declines. */
+static bool doc_scope_repairable(const char *stored_json, const char *fresh_json,
+                                 CBMHashTable *removed) {
+    char *stored_dl = NULL;
+    char *fresh_dl = NULL;
+    bool ok = surface_dl_scope(stored_json, &stored_dl) &&
+              (!fresh_json || surface_dl_scope(fresh_json, &fresh_dl)) &&
+              cbm_doclinks_scope_delta(stored_dl, fresh_dl, removed_name_put, removed) ==
+                  CBM_DOCLINK_DELTA_LOCAL &&
+              surface_removed_names(stored_json, fresh_json, removed) == 0;
+    cbm_free(CBM_MEM_CLASS_OTHER, stored_dl);
+    cbm_free(CBM_MEM_CLASS_OTHER, fresh_dl);
+    return ok;
+}
+
+typedef struct {
+    CBMHashTable *closure;
+    CBMHashTable *files;
+    int added;
+} row_dep_walk_t;
+
+/* Add a row-named dependent to the closure when discovery still has it (a
+ * deleted file's rows are dropped by the carry-forward anyway). */
+static void row_dep_visitor(const char *key, void *value, void *userdata) {
+    (void)value;
+    row_dep_walk_t *walk = (row_dep_walk_t *)userdata;
+    if (!cbm_ht_get(walk->files, key) || cbm_ht_get(walk->closure, key)) {
+        return;
+    }
+    cbm_ht_set(walk->closure, key, (void *)key);
+    walk->added++;
+}
+
+/* Files whose unresolved doc-link rows mention a removed name as an
+ * identifier token. Keys are borrowed from `rows`. */
+/* A byte of an identifier as the resolvers read one: a letter, a digit, '_',
+ * and every byte of a multi-byte character (doc_links_cs.c ident_ok). */
+static bool doc_row_ident_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c >= CBM_SZ_128;
+}
+
+/* True when the identifier raw[0, n) is one of the removed names -- of any
+ * length. When memory runs out the answer is yes: re-resolving a file that
+ * did not need it costs time, keeping a stale row costs correctness. */
+static bool doc_row_token_removed(const CBMHashTable *removed, const char *s, size_t n) {
+    char small[CBM_SZ_512];
+    char *tok = n < sizeof(small) ? small : (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, n + SKIP_ONE);
+    if (!tok) {
+        return true;
+    }
+    memcpy(tok, s, n);
+    tok[n] = '\0';
+    bool hit = cbm_ht_get(removed, tok) != NULL;
+    if (tok != small) {
+        cbm_free(CBM_MEM_CLASS_OTHER, tok);
+    }
+    return hit;
+}
+
+static void doc_row_name_dependents(const cbm_doc_link_row_t *rows, int n,
+                                    const CBMHashTable *removed, CBMHashTable *out_paths) {
+    if (!removed || cbm_ht_count(removed) == 0) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        const char *raw = rows[i].raw;
+        const char *rel = rows[i].rel_path;
+        if (!raw || !rel || !rel[0] || cbm_ht_get(out_paths, rel)) {
+            continue;
+        }
+        for (const char *p = raw; *p;) {
+            while (*p && !doc_row_ident_byte((unsigned char)*p)) {
+                p++;
+            }
+            const char *s = p;
+            while (*p && doc_row_ident_byte((unsigned char)*p)) {
+                p++;
+            }
+            size_t tl = (size_t)(p - s);
+            if (tl > 0 && doc_row_token_removed(removed, s, tl)) {
+                cbm_ht_set(out_paths, rel, (void *)rel);
+                break;
+            }
+        }
+    }
+}
+
+/* Doc-link carry-forward state of the legacy partial route: the previous
+ * rows, the stored scopes of the files it does not re-extract, and the set
+ * of re-extracted or deleted paths whose old rows it replaces. */
+typedef struct {
+    cbm_doc_link_row_t *old_rows;
+    int old_count;
+    cbm_doclink_scope_t *scopes;
+    int scope_count;
+    CBMHashTable *replaced; /* heap keys (value = key) */
+    bool ok;
+} legacy_doc_t;
+
+static void legacy_doc_load(legacy_doc_t *d, cbm_store_t *store, const char *project,
+                            const cbm_file_info_t *changed, int ci, char *const *deleted,
+                            int deleted_count) {
+    memset(d, 0, sizeof(*d));
+    d->replaced = cbm_ht_create(CBM_SZ_64);
+    d->ok = d->replaced != NULL;
+    for (int i = 0; d->ok && i < ci; i++) {
+        d->ok = name_set_add_n(d->replaced, changed[i].rel_path, strlen(changed[i].rel_path));
+    }
+    for (int i = 0; d->ok && i < deleted_count; i++) {
+        d->ok = name_set_add_n(d->replaced, deleted[i], strlen(deleted[i]));
+    }
+    if (d->ok && cbm_store_doc_links_get(store, project, &d->old_rows, &d->old_count, NULL) !=
+                     CBM_STORE_OK) {
+        d->ok = false;
+    }
+    cbm_lsp_surface_row_t *surf = NULL;
+    int surf_count = 0;
+    if (d->ok && cbm_store_get_lsp_surfaces(store, project, &surf, &surf_count) == CBM_STORE_OK &&
+        cbm_doclinks_scopes_from_surfaces(surf, surf_count, d->replaced, &d->scopes,
+                                          &d->scope_count) != 0) {
+        d->ok = false;
+    }
+    cbm_store_free_lsp_surfaces(surf, surf_count);
+    if (!d->ok) {
+        cbm_log_error("doc_links.error", "phase", "legacy_carry_forward", "reason", "read");
+    }
+}
+
+static void legacy_doc_free(legacy_doc_t *d) {
+    cbm_store_free_doc_links(d->old_rows, d->old_count);
+    cbm_doclinks_free_scopes(d->scopes, d->scope_count);
+    surface_name_set_free(d->replaced);
+    memset(d, 0, sizeof(*d));
 }
 
 /* Run parallel or sequential extract+resolve for changed files. Any failure
@@ -1656,9 +1888,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             module_def_index = cbm_pxc_build_module_def_index(all_defs, all_def_count);
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_doclinks_begin(ctx, changed_files, ci, cache);
         rc = cbm_parallel_resolve(
             ctx, changed_files, ci, cache, &shared_ids, worker_count, all_defs, all_def_count,
             closure ? closure->def_modules : def_modules, module_def_index, registries_arg);
+        cbm_doclinks_end(ctx);
 
     cross_resolve_cleanup:
         if (module_def_index) {
@@ -1727,6 +1961,9 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         }
         if (rc == 0) {
             rc = cbm_pipeline_check_cancel(ctx);
+        }
+        if (rc == 0) {
+            (void)cbm_pipeline_pass_doc_links(ctx, changed_files, ci);
         }
         if (owns_cache) {
             free_incremental_result_cache(cache, ci);
@@ -1834,12 +2071,20 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
 }
 /* Publish the test-only legacy partial result through the same atomic
  * generation boundary as full indexing. */
+typedef struct {
+    const cbm_doc_link_row_t *rows;
+    int count;
+    bool failed;
+} legacy_doc_rows_t;
+
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             atomic_int *cancelled, const cbm_file_hash_t *manifest,
                             int manifest_count, const char *adr_content,
                             const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template,
-                            const cbm_lsp_surface_row_t *surface_rows, int surface_row_count) {
+                            const cbm_lsp_surface_row_t *surface_rows, int surface_row_count,
+                            legacy_doc_rows_t doc, const cbm_doc_candidate_t *doc_candidates,
+                            int doc_candidate_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_generation_t generation = {
@@ -1855,6 +2100,11 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         .coverage_meta = meta_template ? *meta_template : (cbm_coverage_meta_t){0},
         .surface_rows = surface_rows,
         .surface_row_count = surface_row_count,
+        .doc_link_rows = doc.rows,
+        .doc_link_row_count = doc.count,
+        .doc_links_failed = doc.failed,
+        .doc_candidates = doc_candidates,
+        .doc_candidate_count = doc_candidate_count,
     };
     int rc = cbm_pipeline_publish_generation(&generation);
     cbm_log_info("incremental.dump", "rc", itoa_buf(rc), "elapsed_ms",
@@ -2117,13 +2367,24 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     char **changed_paths = NULL;
     char **dependents = NULL;
     int dependent_count = 0;
+    /* body-edited files (surface unchanged) and the documents bound to their
+     * lines, which re-resolve with them */
+    const char **body_targets = NULL;
+    int body_target_count = 0;
+    char **line_docs = NULL;
+    int line_doc_count = 0;
     cbm_lsp_surface_row_t *probe_rows = NULL;
     int probe_count = 0;
     cbm_file_info_t *probe_files = NULL;
     cbm_path_alias_collection_t *plan_aliases = NULL;
     int n_changed = 0;
     int n_deleted = 0;
-    if (!fresh_by_path || !files_by_path || !stored_by_path || !closure_set) {
+    int n_row_dependents = 0;
+    /* names a changed or deleted file no longer declares (doc-link rows) */
+    CBMHashTable *removed_names = cbm_ht_create(CBM_SZ_64);
+    CBMHashTable *row_deps = cbm_ht_create(CBM_SZ_64);
+    if (!fresh_by_path || !files_by_path || !stored_by_path || !closure_set || !removed_names ||
+        !row_deps) {
         decline = "alloc";
         goto done;
     }
@@ -2200,6 +2461,14 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         decline = "no_file_delta";
         goto done;
     }
+    /* A doc-link scope input scopes files other than itself and has no scope
+     * blob the surface comparison below could judge. */
+    for (int i = 0; i < n_changed + n_deleted; i++) {
+        if (cbm_doclinks_is_scope_input(changed_paths[i])) {
+            decline = "doc_scope_input_changed";
+            goto done;
+        }
+    }
 
     /* Load the previous generation's surfaces and probe the changed files'
      * fresh ones. Missing rows fail closed. */
@@ -2208,6 +2477,27 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         plan->stored_count == 0) {
         decline = "no_surface_rows";
         goto done;
+    }
+    /* The previous doc_link_unresolved rows: carried forward by the repair.
+     * A generation without them, or one whose doc-link layer failed, cannot
+     * be repaired file by file. */
+    {
+        bool doc_present = false;
+        if (cbm_store_doc_links_get(store, project, &plan->doc_rows, &plan->doc_row_count,
+                                    &doc_present) != CBM_STORE_OK) {
+            decline = "doc_links_read_failed";
+            goto done;
+        }
+        if (!doc_present) {
+            decline = "doc_links_missing";
+            goto done;
+        }
+        for (int i = 0; i < plan->doc_row_count; i++) {
+            if (!plan->doc_rows[i].rel_path || !plan->doc_rows[i].rel_path[0]) {
+                decline = "doc_links_error";
+                goto done;
+            }
+        }
     }
     CBMHashTable *rows_by_path = cbm_ht_create((size_t)plan->stored_count * PAIR_LEN);
     if (!rows_by_path) {
@@ -2249,13 +2539,15 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     /* Early cutoff per changed file; surface-changed files seed the
      * dependent query. Deleted files always seed it. */
     int n_surface_changed = 0;
+    /* dep_targets, then the body-edited files (body_targets) in the same block */
     const char **dep_targets =
-        (const char **)calloc((size_t)(n_changed + n_deleted), sizeof(char *));
+        (const char **)calloc((size_t)(n_changed + n_deleted + n_changed), sizeof(char *));
     if (!dep_targets) {
         cbm_ht_free(rows_by_path);
         decline = "alloc";
         goto done;
     }
+    body_targets = dep_targets + n_changed + n_deleted;
     int dep_target_count = 0;
     for (int i = 0; i < n_changed; i++) {
         const cbm_lsp_surface_row_t *stored_row = cbm_ht_get(rows_by_path, changed_paths[i]);
@@ -2273,32 +2565,60 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
             goto done;
         }
         if (strcmp(stored_row->surface_sha, fresh_row->surface_sha) == 0) {
-            continue; /* body edit: the file re-resolves, nobody else does */
+            /* body edit: the file re-resolves, and of the others only the
+             * documents bound to its lines (below) */
+            body_targets[body_target_count++] = changed_paths[i];
+            continue;
         }
         bool added = false;
+        const char *why = NULL;
         if (surface_added_names(stored_row->defs_json, fresh_row->defs_json, &added) != 0 ||
             added) {
+            why = "added_definition_names";
+        } else if (!doc_scope_repairable(stored_row->defs_json, fresh_row->defs_json,
+                                         removed_names)) {
+            why = "doc_scope_changed";
+        }
+        if (why) {
             free(dep_targets);
             cbm_ht_free(rows_by_path);
-            decline = "added_definition_names";
+            decline = why;
             goto done;
         }
         n_surface_changed++;
         dep_targets[dep_target_count++] = changed_paths[i];
     }
+    bool gone_scope_changed = false; /* a deleted file takes its declarations along */
     for (int i = 0; i < n_deleted; i++) {
         dep_targets[dep_target_count++] = changed_paths[n_changed + i];
+        const cbm_lsp_surface_row_t *gone = cbm_ht_get(rows_by_path, changed_paths[n_changed + i]);
+        if (gone && !doc_scope_repairable(gone->defs_json, NULL, removed_names)) {
+            gone_scope_changed = true;
+        }
     }
     cbm_ht_free(rows_by_path);
 
-    if (dep_target_count > 0 &&
-        cbm_store_get_dependent_files(store, project, dep_targets, dep_target_count, &dependents,
-                                      &dependent_count) != CBM_STORE_OK) {
-        free(dep_targets);
+    /* A body edit keeps a file's names but moves its lines: a document that
+     * bound a reference by lines (`file#L3-L9`, :lines:) would keep a stale
+     * target, so the documents with edges into a body-edited file re-resolve
+     * too (added to the closure below). */
+    bool dep_failed =
+        (dep_target_count > 0 &&
+         cbm_store_get_dependent_files(store, project, dep_targets, dep_target_count, &dependents,
+                                       &dependent_count) != CBM_STORE_OK) ||
+        (body_target_count > 0 &&
+         cbm_store_get_dependent_files(store, project, body_targets, body_target_count, &line_docs,
+                                       &line_doc_count) != CBM_STORE_OK);
+    free(dep_targets); /* body_targets with it */
+    body_targets = NULL;
+    if (dep_failed) {
         decline = "dependent_query_failed";
         goto done;
     }
-    free(dep_targets);
+    if (gone_scope_changed) {
+        decline = "doc_scope_changed";
+        goto done;
+    }
 
     /* Closure = changed ∪ dependents. Every member must be in the current
      * discovery (a dependent outside it cannot be re-resolved). */
@@ -2321,6 +2641,24 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
                                      n_changed + n_deleted, n_changed, dependents, dependent_count);
     if (decline) {
         goto done;
+    }
+    /* the documents bound to a body-edited file's lines; code files stay out:
+     * their references bind names, which a body edit keeps */
+    for (int i = 0; i < line_doc_count; i++) {
+        const cbm_file_info_t *info = cbm_ht_get(files_by_path, line_docs[i]);
+        if (info && cbm_doclinks_binds_lines(info->language) &&
+            !cbm_ht_get(closure_set, line_docs[i])) {
+            cbm_ht_set(closure_set, line_docs[i], line_docs[i]);
+            n_row_dependents++;
+        }
+    }
+    /* Files whose unresolved doc-link references name something a changed or
+     * deleted file no longer declares re-resolve too. */
+    doc_row_name_dependents(plan->doc_rows, plan->doc_row_count, removed_names, row_deps);
+    {
+        row_dep_walk_t walk = {.closure = closure_set, .files = files_by_path, .added = 0};
+        cbm_ht_foreach(row_deps, row_dep_visitor, &walk);
+        n_row_dependents = walk.added;
     }
     /* closure_count == 0 is legitimate: a deleted-only delta with no
      * dependents has nothing to re-parse, but the purge itself still needs
@@ -2352,7 +2690,8 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     cbm_log_info("incremental.closure_plan", "changed", itoa_buf(n_changed), "surface_changed",
                  itoa_buf(n_surface_changed), "deleted", itoa_buf(n_deleted), "dependents",
                  itoa_buf(dependent_count));
-    cbm_log_info("incremental.closure_plan_done", "closure", itoa_buf(plan->count), "elapsed_ms",
+    cbm_log_info("incremental.closure_plan_done", "closure", itoa_buf(plan->count),
+                 "doc_link_dependents", itoa_buf(n_row_dependents), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
 done:
@@ -2360,16 +2699,20 @@ done:
     free(probe_files);
     cbm_store_free_lsp_surfaces(probe_rows, probe_count);
     cbm_store_free_dependent_files(dependents, dependent_count);
+    cbm_store_free_dependent_files(line_docs, line_doc_count);
     free(changed_paths);
     cbm_ht_free(fresh_by_path);
     cbm_ht_free(files_by_path);
     cbm_ht_free(stored_by_path);
     cbm_ht_free(closure_set);
+    cbm_ht_free(row_deps); /* keys borrowed from plan->doc_rows */
+    surface_name_set_free(removed_names);
     if (decline) {
         cbm_log_info("incremental.closure_decline", "reason", decline, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
         cbm_store_free_lsp_surfaces(plan->stored_rows, plan->stored_count);
         int fatal_rc = plan->fatal_rc;
+        cbm_store_free_doc_links(plan->doc_rows, plan->doc_row_count);
         memset(plan, 0, sizeof(*plan));
         plan->fatal_rc = fatal_rc;
         return 0;
@@ -2439,6 +2782,13 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int manifest_count = 0;
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
+    cbm_doclink_scope_t *doc_base = NULL;
+    int doc_base_count = 0;
+    cbm_doc_link_row_t *doc_fresh = NULL;
+    int doc_fresh_count = 0;
+    cbm_doc_link_row_t *doc_rows = NULL;
+    int doc_row_count = 0;
+    bool doc_failed = false;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_stage_clone(db_path, &stage) != 0) {
@@ -2611,6 +2961,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
     path_aliases =
         cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
+    /* Doc-link scopes of every file this repair does not re-extract. */
+    if (cbm_doclinks_scopes_from_surfaces(plan->stored_rows, plan->stored_count, stale_surface_set,
+                                          &doc_base, &doc_base_count) != 0) {
+        cbm_log_error("delta.err", "phase", "doc_link_scopes");
+        goto out;
+    }
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
@@ -2626,6 +2982,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        .doc_link_base = doc_base,
+        .doc_link_base_count = doc_base_count,
     };
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
@@ -2671,6 +3029,19 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     cbm_log_info("delta.repair", "files", itoa_buf(ci), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+
+    /* Doc-link rows: the previous rows of every file not re-extracted (or
+     * deleted), then this repair's. */
+    {
+        bool doc_ran = false;
+        cbm_pipeline_take_doc_link_rows(p, &doc_fresh, &doc_fresh_count, &doc_failed, &doc_ran);
+        doc_failed = doc_failed || !doc_ran;
+        if (cbm_doclinks_merge_rows(plan->doc_rows, plan->doc_row_count, stale_surface_set,
+                                    doc_fresh, doc_fresh_count, &doc_rows, &doc_row_count) != 0) {
+            cbm_log_error("delta.err", "phase", "doc_link_rows");
+            goto out;
+        }
+    }
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_delta_patch(staging, project, gbuf, max_db_id, snapshot, snapshot_count) != 0) {
@@ -2835,6 +3206,10 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             .surface_rows = NULL,
             .surface_row_count = 0,
             .surfaces_in_place = true,
+            .doc_link_rows = doc_rows,
+            .doc_link_row_count = doc_row_count,
+            .doc_links_failed = doc_failed,
+            .doc_candidates_in_place = true, /* the clone keeps the previous rows */
         };
         cbm_store_close(staging);
         staging = NULL;
@@ -2861,6 +3236,9 @@ out:
     }
     cbm_delta_free_snapshot(snapshot, snapshot_count);
     surface_name_set_free(stale_surface_set);
+    cbm_doclinks_free_scopes(doc_base, doc_base_count);
+    cbm_doclinks_free_rows(doc_fresh, doc_fresh_count);
+    cbm_doclinks_free_rows(doc_rows, doc_row_count);
     if (cr_arena_live) {
         cbm_store_free_lsp_surfaces(cr.fresh_rows, cr.fresh_count);
         if (cr.def_modules) {
@@ -2897,6 +3275,25 @@ out:
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
+
+/* The stored generation's doc-link layer is usable: its doc_link_unresolved
+ * table exists and records no failure of the layer. */
+static bool incr_doc_links_current(cbm_store_t *store, const char *project) {
+    cbm_doc_link_reason_count_t *reasons = NULL;
+    int reason_count = 0;
+    cbm_doc_link_row_t *samples = NULL;
+    int sample_count = 0;
+    bool present = false;
+    bool current = cbm_store_doc_links_summary(store, project, &reasons, &reason_count, &samples,
+                                               &sample_count, 0, &present) == CBM_STORE_OK &&
+                   present;
+    for (int i = 0; current && i < reason_count; i++) {
+        current = strcmp(reasons[i].reason, "error") != 0;
+    }
+    cbm_store_free_doc_link_reasons(reasons, reason_count);
+    cbm_store_free_doc_links(samples, sample_count);
+    return current;
+}
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
@@ -2947,7 +3344,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
         const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
         bool metadata_current = incremental_metadata_current(meta_rc, &meta, mode_name);
-        bool exact = metadata_current &&
+        /* A generation whose doc-link layer is missing or failed is not
+         * current even with identical inputs: index_status tells the user to
+         * re-run, and the re-run has to rebuild. */
+        bool doc_links_current = metadata_current && incr_doc_links_current(store, project);
+        bool exact = doc_links_current &&
                      cbm_pipeline_semantic_manifests_equal(stored, stored_count, baseline_manifest,
                                                            baseline_count);
         cbm_store_coverage_meta_clear(&meta);
@@ -2992,7 +3393,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             if (closure_plan.fatal_rc) {
                 return closure_plan.fatal_rc;
             }
-            cbm_log_info("incremental.force_full", "reason", "semantic_manifest_changed");
+            cbm_log_info("incremental.force_full", "reason",
+                         metadata_current && !doc_links_current ? "doc_links_not_current"
+                                                                : "semantic_manifest_changed");
             return CBM_PIPELINE_FORCE_FULL_REINDEX;
         }
     }
@@ -3161,6 +3564,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
+    legacy_doc_t legacy_doc;
+    legacy_doc_load(&legacy_doc, store, project, changed_files, ci, deleted, deleted_count);
     cbm_store_close(store);
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
@@ -3232,6 +3637,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        .doc_link_base = legacy_doc.scopes,
+        .doc_link_base_count = legacy_doc.scope_count,
     };
 
     for (int i = 0; i < ci; i++) {
@@ -3291,8 +3698,28 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         free(saved_adr);
         cbm_gbuf_free(existing);
+        legacy_doc_free(&legacy_doc);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
+
+    /* Doc-link rows: previous rows of the files not re-extracted, then this
+     * run's. A failed carry-forward read is a failed doc-link layer. */
+    cbm_doc_link_row_t *doc_rows = NULL;
+    int doc_row_count = 0;
+    bool doc_failed = false;
+    {
+        cbm_doc_link_row_t *fresh = NULL;
+        int fresh_count = 0;
+        bool ran = false;
+        cbm_pipeline_take_doc_link_rows(p, &fresh, &fresh_count, &doc_failed, &ran);
+        doc_failed = doc_failed || !ran || !legacy_doc.ok;
+        if (cbm_doclinks_merge_rows(legacy_doc.old_rows, legacy_doc.old_count, legacy_doc.replaced,
+                                    fresh, fresh_count, &doc_rows, &doc_row_count) != 0) {
+            doc_failed = true;
+        }
+        cbm_doclinks_free_rows(fresh, fresh_count);
+    }
+    legacy_doc_free(&legacy_doc);
 
     /* Coverage rows (#963): merge = previous FAILURE rows for files NOT
      * re-extracted this run + this run's fresh entries (changed files replace
@@ -3392,6 +3819,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         free(saved_adr);
         cbm_gbuf_free(existing);
+        cbm_doclinks_free_rows(doc_rows, doc_row_count);
         return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
                                                           : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
@@ -3421,9 +3849,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * re-parsed files have no codec output, and publishing a stale row
      * would satisfy a future closure plan with yesterday's surface; an
      * empty table just routes the next incremental to a full rebuild. */
-    int persist_rc =
-        dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p), manifest,
-                         manifest_count, saved_adr, cov, cov_n, &coverage_meta, NULL, 0);
+    legacy_doc_rows_t doc_out = {.rows = doc_rows, .count = doc_row_count, .failed = doc_failed};
+    /* Doc candidates: the post-passes ran the semantic pass over the whole
+     * rehydrated project, so this run's rows are complete. */
+    int doc_cand_n = 0;
+    const cbm_doc_candidate_t *doc_cands = cbm_pipeline_doc_candidates(p, &doc_cand_n);
+    int persist_rc = dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p),
+                                      manifest, manifest_count, saved_adr, cov, cov_n,
+                                      &coverage_meta, NULL, 0, doc_out, doc_cands, doc_cand_n);
+    cbm_doclinks_free_rows(doc_rows, doc_row_count);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
     free(saved_adr);
     free(cov);

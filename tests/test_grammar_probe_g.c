@@ -399,12 +399,13 @@ TEST(probe_markdown_no_class_variable) {
 /* ══════════════════════════════════════════════════════════════════
  * GROUP 6 — RST (.rst)
  *
- * RST golden histogram: Module:1 (pure-data).
- * reStructuredText headings are NOT extracted as Section nodes (unlike Markdown).
+ * RST golden histogram: Module:1,Section:1.
+ * reStructuredText titles are Section nodes, like Markdown headings
+ * (doclink_rst.c).
  * ══════════════════════════════════════════════════════════════════ */
 
-/* RST: document with sections → Module:1, no Section nodes. */
-TEST(probe_rst_module_only) {
+/* RST: a document with two titles → Module:1 and a Section per title. */
+TEST(probe_rst_sections) {
     GpgMetrics m = gpg_metrics("docs.rst", "Project Title\n"
                                            "=============\n"
                                            "\n"
@@ -415,9 +416,9 @@ TEST(probe_rst_module_only) {
                                            "\n"
                                            "Run ``pip install mypackage``.\n");
     ASSERT_TRUE(m.ok);
-    /* GREEN: RST produces only a Module node (no Section nodes extracted). */
+    /* GREEN: a Module node and the two titles' Section nodes. */
     ASSERT_TRUE(m.modules == 1);
-    ASSERT_TRUE(m.sections == 0);
+    ASSERT_TRUE(m.sections == 2);
     PASS();
 }
 
@@ -1063,7 +1064,7 @@ SUITE(grammar_probe_g) {
     RUN_TEST(probe_markdown_no_class_variable);
 
     /* RST */
-    RUN_TEST(probe_rst_module_only);
+    RUN_TEST(probe_rst_sections);
     RUN_TEST(probe_rst_no_crash);
 
     /* JSON */

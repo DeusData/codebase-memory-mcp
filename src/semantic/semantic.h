@@ -206,11 +206,122 @@ const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
 /* Free corpus. */
 void cbm_sem_corpus_free(cbm_sem_corpus_t *corpus);
 
+/* The TF-IDF terms of one function: one entry per distinct corpus token whose
+ * idf is above 0, weighted term frequency x idf, in ascending token-index
+ * order (the order the TF-IDF cosine merges on). `token_index[t]` is the
+ * corpus index of tokens[t] (-1 when unknown); NULL looks each token up by
+ * name. `indices` and `weights` hold at least `count` entries. Returns the
+ * number of terms written. */
+int cbm_sem_tfidf_terms(const cbm_sem_corpus_t *corpus, char *const *tokens, const int *token_index,
+                        int count, int *indices, float *weights);
+
 /* ── Combined scoring ────────────────────────────────────────────── */
 
 /* Compute combined similarity score between two functions. */
 float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
                              const cbm_sem_config_t *cfg);
+
+/* The signal values cbm_sem_combined_score weighs, for measuring them one by
+ * one: each similarity in [0, 1] (minhash 0 when either side has none),
+ * proximity a multiplier in [1.0, 1.10]. `near_copy`: the pair is a SIMILAR_TO
+ * copy, which the combined score sets to 0. */
+typedef struct {
+    float tfidf;
+    float ri;
+    float minhash;
+    float api;
+    float type;
+    float decorator;
+    float struct_profile;
+    float proximity;
+    bool near_copy;
+} cbm_sem_signals_t;
+
+void cbm_sem_signal_values(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
+                           cbm_sem_signals_t *out);
+
+/* cbm_sem_combined_score from the signal values (the same arithmetic). */
+float cbm_sem_combine(const cbm_sem_signals_t *s, const cbm_sem_config_t *cfg);
+
+/* Best-first admission under a per-function edge budget. Pair k joins
+ * functions fa[k] and fb[k] with scores[k]; pairs are taken by descending
+ * score, ties in ascending k (the caller's canonical order), and pair k is
+ * admitted when eligible[k] and both functions have fewer than max_edges
+ * admitted pairs. counts holds one zeroed slot per function and is updated.
+ * Returns false (nothing admitted) when the order cannot be allocated. */
+bool cbm_sem_admit_best_first(const float *scores, const int *fa, const int *fb,
+                              const bool *eligible, int n, int max_edges, int *counts,
+                              bool *admitted);
+
+/* The string value of "key" in a properties JSON object, unescaped into buf
+ * (cut at bufsize - 1); NULL when the key is absent. Escapes are honoured:
+ * \" \\ \/ keep their character, \n \t \r \b \f and \uXXXX become a space (a
+ * separator for the tokenizer), so a value holding a quote is read whole. */
+const char *cbm_sem_json_str(const char *json, const char *key, char *buf, int bufsize);
+
+/* The probability that an admitted SEMANTICALLY_RELATED pair is related, by
+ * its score as stored (three decimals): the judged precision of blind-judged
+ * held-out samples (the edge property "p"). */
+float cbm_sem_calibrated_p(float score);
+
+/* Doc -> code candidates: a section's best CBM_SEM_DOC_TOP_K non-test
+ * functions by TF-IDF, stored when their tfidf is at least
+ * CBM_SEM_DOC_MIN_SCORE, each with the judged probability that the section is
+ * about the function. */
+#define CBM_SEM_DOC_TOP_K 5
+#define CBM_SEM_DOC_MIN_SCORE 0.20F
+
+/* A section's document format, by its file's extension: candidates are
+ * judged, and stored, per format. */
+typedef enum {
+    CBM_SEM_DOC_FMT_OTHER = 0,
+    CBM_SEM_DOC_FMT_MARKDOWN,
+    CBM_SEM_DOC_FMT_RST, /* .rst, and .txt: a .txt file only has sections as Sphinx source */
+    CBM_SEM_DOC_FMT_ADOC,
+    CBM_SEM_DOC_FMT_PDF,
+    CBM_SEM_DOC_FMT_COUNT,
+} cbm_sem_doc_format_t;
+cbm_sem_doc_format_t cbm_sem_doc_format(const char *path);
+
+/* Where a candidate sits relative to the doc's home folder (the folder whose
+ * code the doc documents, see pass_semantic_edges.c): the home is the
+ * repository root (the doc documents the whole project), or the candidate is
+ * inside or outside the home. */
+typedef enum {
+    CBM_SEM_DOC_POS_GLOBAL = 0,
+    CBM_SEM_DOC_POS_LOCAL,
+    CBM_SEM_DOC_POS_OUTSIDE,
+    CBM_SEM_DOC_POS_COUNT,
+} cbm_sem_doc_pos_t;
+
+/* What a candidate points at: one of a section's best CBM_SEM_DOC_TOP_K
+ * functions; a function inside the home below that top K (at most
+ * CBM_SEM_DOC_LOCAL_K per section); a whole file; the doc's home folder. */
+typedef enum {
+    CBM_SEM_DOC_KIND_FUNCTION = 0,
+    CBM_SEM_DOC_KIND_LOCAL,
+    CBM_SEM_DOC_KIND_FILE,
+    CBM_SEM_DOC_KIND_FOLDER,
+    CBM_SEM_DOC_KIND_COUNT,
+} cbm_sem_doc_kind_t;
+#define CBM_SEM_DOC_LOCAL_K 2
+#define CBM_SEM_DOC_FILE_K 3
+
+/* The probability that a section of format fmt is about a candidate of this
+ * kind and position with this tfidf, from the judged curves; 0 when that band
+ * is not stored (judged below 0.20) or has no judged curve. A folder
+ * candidate has no score: cbm_sem_doc_folder_p. */
+float cbm_sem_doc_calibrated_p(cbm_sem_doc_format_t fmt, cbm_sem_doc_kind_t kind,
+                               cbm_sem_doc_pos_t pos, float score);
+
+/* The probability that the doc at doc_path documents its home folder, by
+ * the doc's kind (a README or index file, or any other doc); 0 = not
+ * stored. */
+float cbm_sem_doc_folder_p(cbm_sem_doc_format_t fmt, const char *doc_path);
+
+/* p as stored and shown: two decimals, half up (0.225 -> 0.23, 0.325 ->
+ * 0.33; the epsilon absorbs the float representation of a judged x.xx5). */
+double cbm_sem_p_2dp(float p);
 
 /* Module proximity multiplier based on file paths. */
 float cbm_sem_proximity(const char *path_a, const char *path_b);

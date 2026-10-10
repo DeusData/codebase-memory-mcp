@@ -373,6 +373,19 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_channels.c \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/extract_dbt.c \
+    $(CBM_DIR)/doclink.c \
+    $(CBM_DIR)/doclink_cs.c \
+    $(CBM_DIR)/doclink_md.c \
+    $(CBM_DIR)/doclink_rst.c \
+    $(CBM_DIR)/doclink_py.c \
+    $(CBM_DIR)/doc_adr.c \
+    $(CBM_DIR)/doc_pdf.c \
+    $(CBM_DIR)/doc_adoc.c \
+    $(CBM_DIR)/pdf/pdf_obj.c \
+    $(CBM_DIR)/pdf/pdf_font.c \
+    $(CBM_DIR)/pdf/pdf_text.c \
+    $(CBM_DIR)/pdf/pdf_tables.c \
+    $(CBM_DIR)/pdf/pdf_unicode.c \
     $(CBM_DIR)/sql_values.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/cpp_branch_views.c \
@@ -493,6 +506,13 @@ PIPELINE_SRCS = \
     src/pipeline/pass_configures.c \
     src/pipeline/pass_configlink.c \
     src/pipeline/pass_doclinks.c \
+    src/pipeline/doc_links.c \
+    src/pipeline/doc_links_cs.c \
+    src/pipeline/doc_links_md.c \
+    src/pipeline/doc_links_pdf.c \
+    src/pipeline/doc_links_rst.c \
+    src/pipeline/doc_links_adoc.c \
+    src/pipeline/doc_links_msbuild.c \
     src/pipeline/pass_route_nodes.c \
     src/pipeline/pass_enrichment.c \
     src/pipeline/pass_envscan.c \
@@ -754,7 +774,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 

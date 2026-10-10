@@ -23,9 +23,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "cbm.h" /* cbm_label_is_relation — reg-only surface membership */
+#include "cbm.h"     /* cbm_label_is_relation — reg-only surface membership */
+#include "doclink.h" /* cbm_doclink_portable_scope — the "dl" key */
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/sha256.h"
+#include "pipeline/doc_links.h" /* cbm_doclinks_storable_scope */
 #include "pipeline/worker_pool.h"
 #include "yyjson/yyjson.h"
 
@@ -148,6 +151,30 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
     }
     if (http) {
         yyjson_mut_obj_add_val(doc, root, "http", http);
+    }
+
+    /* The doc-link scope (doclink.h): what other files' doc-comment
+     * references resolve against -- namespaces, usings, type and member
+     * declarations -- without line numbers, so a body edit keeps it. A
+     * changed scope changes the hash, and the closure planner reads it to
+     * decide whether a repair can stay local. Written only for files that
+     * have one: every other file's surface bytes stay exactly as they were.
+     * The defs decoder ignores this key; cbm_doclinks_scopes_from_surfaces
+     * reads it back for the files an incremental run does not re-extract. */
+    if (result && result->doc_scope) {
+        /* a scope this run's reader refuses is stored as its language's
+         * rejected marker: a later run then treats the file as this one does
+         * (doc_links.h, scope_accepted) */
+        char *marker = NULL;
+        const char *kept = cbm_doclinks_storable_scope(result->doc_scope, &marker);
+        char *portable = kept ? cbm_doclink_portable_scope(kept) : NULL;
+        cbm_free(CBM_MEM_CLASS_OTHER, marker);
+        if (!portable) {
+            yyjson_mut_doc_free(doc);
+            return NULL; /* a missing scope would diverge silently: fail the row */
+        }
+        yyjson_mut_obj_add_strcpy(doc, root, "dl", portable);
+        cbm_free(CBM_MEM_CLASS_OTHER, portable);
     }
 
     char *json = yyjson_mut_write(doc, 0, out_len);

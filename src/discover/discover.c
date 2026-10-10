@@ -16,6 +16,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/mem_core.h"
 #include "foundation/workspace.h"
 #include "foundation/platform.h"
 #ifdef _WIN32
@@ -888,13 +889,159 @@ static int safe_stat(const char *abs_path, struct stat *st, bool *is_symlink) {
 #endif
 }
 
+/* ── Sphinx documentation sets ────────────────────────────────────
+ * A directory with a conf.py is a Sphinx documentation set, and its
+ * `source_suffix` says which file suffixes are reStructuredText (Django's
+ * docs are `.txt`). A file of such a suffix in the set's subtree, of no
+ * language by its name, is reST; a nested conf.py starts its own set. conf.py
+ * is read as text (the first SPHINX_CONF_READ bytes) and never run. */
+
+enum {
+    SPHINX_SUFFIXES = 4,    /* extra reST suffixes one set declares */
+    SPHINX_SUFFIX_LEN = 16, /* ".txt", ".rest": a longer one is no suffix */
+    SPHINX_CONF_READ = 65536,
+};
+
+typedef struct {
+    char ext[SPHINX_SUFFIXES][SPHINX_SUFFIX_LEN];
+    int count;
+} sphinx_suffixes_t;
+
+/* The quoted string at s[i] ('...' or "..."): its span; false otherwise. */
+static bool sphinx_quoted(const char *s, size_t n, size_t i, size_t *a, size_t *b) {
+    if (i >= n || (s[i] != '\'' && s[i] != '"')) {
+        return false;
+    }
+    const char *close = memchr(s + i + SKIP_ONE, s[i], n - i - SKIP_ONE);
+    if (!close) {
+        return false;
+    }
+    *a = i + SKIP_ONE;
+    *b = (size_t)(close - s);
+    return true;
+}
+
+static void sphinx_add(sphinx_suffixes_t *out, const char *s, size_t n) {
+    if (n < PAIR_LEN || n >= SPHINX_SUFFIX_LEN || s[0] != '.' || out->count >= SPHINX_SUFFIXES ||
+        (n == strlen(".rst") && memcmp(s, ".rst", n) == 0)) {
+        return;
+    }
+    for (size_t i = SKIP_ONE; i < n; i++) {
+        if (!isalnum((unsigned char)s[i]) && s[i] != '_' && s[i] != '-') {
+            return;
+        }
+    }
+    memcpy(out->ext[out->count], s, n);
+    out->ext[out->count][n] = '\0';
+    out->count++;
+}
+
+/* `source_suffix = '.txt'`, `= ['.rst', '.txt']` or
+ * `= {'.rst': 'restructuredtext', '.txt': 'restructuredtext'}` (a dict
+ * entry counts only when it maps to restructuredtext). */
+static void sphinx_parse(const char *s, size_t n, sphinx_suffixes_t *out) {
+    static const char key[] = "source_suffix";
+    size_t kl = strlen(key);
+    for (size_t line = 0; line < n;) {
+        const char *nl = memchr(s + line, '\n', n - line);
+        size_t end = nl ? (size_t)(nl - s) : n;
+        size_t i = line + kl;
+        if (end >= i && memcmp(s + line, key, kl) == 0) {
+            while (i < n && (s[i] == ' ' || s[i] == '\t')) {
+                i++;
+            }
+            if (i < n && s[i] == '=') {
+                i++;
+                while (i < n && (s[i] == ' ' || s[i] == '\t')) {
+                    i++;
+                }
+                char open = i < n ? s[i] : '\0';
+                char close = '\0';
+                if (open == '[' || open == '(' || open == '{') {
+                    close = open == '[' ? ']' : (open == '(' ? ')' : '}');
+                }
+                /* the value: up to its closing bracket, or this line */
+                size_t stop = end;
+                if (close) {
+                    const char *c = memchr(s + i, close, n - i);
+                    stop = c ? (size_t)(c - s) : end;
+                }
+                size_t k = i;
+                while (k < stop) {
+                    size_t a;
+                    size_t b;
+                    if (!sphinx_quoted(s, stop, k, &a, &b)) {
+                        k++;
+                        continue;
+                    }
+                    k = b + SKIP_ONE;
+                    if (open != '{') {
+                        sphinx_add(out, s + a, b - a);
+                        continue;
+                    }
+                    while (k < stop && (s[k] == ' ' || s[k] == ':')) {
+                        k++;
+                    }
+                    size_t va;
+                    size_t vb;
+                    if (sphinx_quoted(s, stop, k, &va, &vb)) {
+                        if (vb - va == strlen("restructuredtext") &&
+                            memcmp(s + va, "restructuredtext", vb - va) == 0) {
+                            sphinx_add(out, s + a, b - a);
+                        }
+                        k = vb + SKIP_ONE;
+                    }
+                }
+                return; /* the first assignment */
+            }
+        }
+        line = end + SKIP_ONE;
+    }
+}
+
+/* The documentation set this directory starts, if it has a conf.py. */
+static bool sphinx_load(const char *dir, sphinx_suffixes_t *out) {
+    char conf[CBM_SZ_4K];
+    if (snprintf(conf, sizeof(conf), "%s/conf.py", dir) >= (int)sizeof(conf)) {
+        return false;
+    }
+    struct stat st;
+    if (wide_stat(conf, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    FILE *f = cbm_fopen(conf, "rb");
+    if (!f) {
+        return false;
+    }
+    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, SPHINX_CONF_READ);
+    size_t n = buf ? fread(buf, SKIP_ONE, SPHINX_CONF_READ, f) : 0;
+    (void)fclose(f);
+    memset(out, 0, sizeof(*out));
+    if (buf) {
+        sphinx_parse(buf, n, out);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, buf);
+    return true;
+}
+
+static bool sphinx_is_rst(const sphinx_suffixes_t *set, const char *name) {
+    size_t nl = strlen(name);
+    for (int i = 0; set && i < set->count; i++) {
+        size_t el = strlen(set->ext[i]);
+        if (nl > el && strcmp(name + nl - el, set->ext[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Process a single regular file entry during directory walk. */
 static void walk_dir_process_file(const char *abs_path, const char *rel_path, const char *name,
                                   const cbm_discover_opts_t *opts,
                                   const gitignore_link_t *ignore_chain,
                                   const cbm_gitignore_t *global_gi,
-                                  const cbm_gitignore_t *cbmignore, const struct stat *st,
-                                  file_list_t *out) {
+                                  const cbm_gitignore_t *cbmignore, const sphinx_suffixes_t *sphinx,
+                                  const struct stat *st, file_list_t *out) {
     const char *skip_reason =
         file_skip_reason(name, rel_path, opts, ignore_chain, global_gi, cbmignore, st->st_size);
     if (skip_reason) {
@@ -906,6 +1053,9 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
         return;
     }
     CBMLanguage lang = detect_file_language(name, abs_path);
+    if (lang == CBM_LANG_COUNT && sphinx_is_rst(sphinx, name)) {
+        lang = CBM_LANG_RST; /* its documentation set's source_suffix */
+    }
     if (lang == CBM_LANG_COUNT) {
         return;
     }
@@ -916,6 +1066,7 @@ typedef struct {
     char dir[CBM_SZ_4K];
     char prefix[CBM_SZ_4K];
     const gitignore_link_t *ignore_chain; /* deepest .gitignore governing this dir */
+    sphinx_suffixes_t sphinx;             /* the documentation set's extra reST suffixes */
 } walk_frame_t;
 /* Initial capacity only — the stack grows on demand. A single directory can
  * hold more pending sibling frames than any fixed cap (dotnet/runtime has 855
@@ -973,6 +1124,7 @@ static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
         return;
     }
     slot->ignore_chain = parent->ignore_chain;
+    slot->sphinx = parent->sphinx;
     ws->top++;
 }
 
@@ -1021,7 +1173,7 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         }
     } else if (S_ISREG(st.st_mode)) {
         walk_dir_process_file(abs_path, rel_path, entry->name, opts, frame->ignore_chain, global_gi,
-                              cbmignore, &st, out);
+                              cbmignore, &frame->sphinx, &st, out);
     }
 }
 
@@ -1113,6 +1265,11 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
                 break;
             }
             frame.ignore_chain = link;
+        }
+
+        sphinx_suffixes_t set;
+        if (sphinx_load(frame.dir, &set)) {
+            frame.sphinx = set; /* a (nested) documentation set starts here */
         }
 
         cbm_dir_t *d = cbm_opendir(frame.dir);

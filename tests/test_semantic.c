@@ -355,6 +355,311 @@ TEST(sem_corpus_index_accessors_match_name_lookups) {
     PASS();
 }
 
+/* ── TF-IDF terms and the combined score ─────────────────────────── */
+
+static int sem_terms_of(const cbm_sem_corpus_t *c, char **tokens, int n, cbm_sem_func_t *f,
+                        int *indices, float *weights) {
+    memset(f, 0, sizeof(*f));
+    f->tfidf_indices = indices;
+    f->tfidf_weights = weights;
+    f->tfidf_len = cbm_sem_tfidf_terms(c, tokens, NULL, n, indices, weights);
+    return f->tfidf_len;
+}
+
+/* Two functions share a TF-IDF term only when they share the word. Until
+ * 2026-10 the term key was the token's POSITION: any two functions of equal
+ * length matched on every term, so the signal measured length (a held-out
+ * judged sample: admitted-edge precision 0.713 -> 0.742 with the fix). */
+TEST(sem_tfidf_terms_compare_vocabulary_not_positions) {
+    cbm_sem_corpus_t *c = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(c);
+    static char *parse[] = {"parse", "header", "value"};
+    static char *render[] = {"render", "widget", "frame"};
+    static char *reparse[] = {"value", "parse", "header", "parse", "absent"};
+    static char *other[] = {"queue", "drain"};
+    cbm_sem_corpus_add_doc(c, (const char **)parse, 3);
+    cbm_sem_corpus_add_doc(c, (const char **)render, 3);
+    cbm_sem_corpus_add_doc(c, (const char **)reparse, 4); /* "absent" stays out */
+    cbm_sem_corpus_add_doc(c, (const char **)other, 2);
+    cbm_sem_corpus_finalize(c);
+
+    cbm_sem_func_t fa;
+    cbm_sem_func_t fb;
+    cbm_sem_func_t fc;
+    int ia[3];
+    int ib[3];
+    int ic[5];
+    float wa[3];
+    float wb[3];
+    float wc[5];
+    ASSERT_EQ(sem_terms_of(c, parse, 3, &fa, ia, wa), 3);
+    ASSERT_EQ(sem_terms_of(c, render, 3, &fb, ib, wb), 3);
+    /* A repeated word is one term, its weight twice the idf; an unknown word
+     * is no term; terms ascend by token index. */
+    ASSERT_EQ(sem_terms_of(c, reparse, 5, &fc, ic, wc), 3);
+    ASSERT_TRUE(ic[0] < ic[1] && ic[1] < ic[2]);
+    int at_parse = ic[0] == cbm_sem_corpus_token_index(c, "parse")   ? 0
+                   : ic[1] == cbm_sem_corpus_token_index(c, "parse") ? 1
+                                                                     : 2;
+    ASSERT_EQ(ic[at_parse], cbm_sem_corpus_token_index(c, "parse"));
+    ASSERT_FLOAT_EQ(wc[at_parse], 2.0F * cbm_sem_corpus_idf(c, "parse"), 1e-6);
+
+    cbm_sem_signals_t s;
+    cbm_sem_signal_values(&fa, &fb, &s);
+    ASSERT_FLOAT_EQ(s.tfidf, 0.0F, 1e-6); /* same length, no shared word */
+    cbm_sem_signal_values(&fa, &fc, &s);
+    ASSERT_TRUE(s.tfidf > 0.9F); /* the same words, other order and length */
+    cbm_sem_corpus_free(c);
+    PASS();
+}
+
+/* cbm_sem_combine is the weighted sum of the signals, times the proximity
+ * multiplier, clamped to [0, 1]; a SIMILAR_TO near copy scores 0. And
+ * cbm_sem_combined_score is exactly that, applied to cbm_sem_signal_values. */
+TEST(sem_combine_weighs_signals) {
+    cbm_sem_config_t cfg = cbm_sem_get_config();
+    cbm_sem_signals_t s = {.tfidf = 0.5F, .ri = 0.25F, .proximity = 1.0F};
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&s, &cfg), cfg.w_tfidf * 0.5F + cfg.w_ri * 0.25F, 1e-6);
+    s.proximity = 1.10F;
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&s, &cfg), (cfg.w_tfidf * 0.5F + cfg.w_ri * 0.25F) * 1.10F,
+                    1e-6);
+    cbm_sem_signals_t all = {.tfidf = 1.0F,
+                             .ri = 1.0F,
+                             .minhash = 1.0F,
+                             .api = 1.0F,
+                             .type = 1.0F,
+                             .decorator = 1.0F,
+                             .struct_profile = 1.0F,
+                             .proximity = 1.10F};
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&all, &cfg), 1.0F, 0.0); /* clamped */
+    all.near_copy = true;
+    ASSERT_FLOAT_EQ(cbm_sem_combine(&all, &cfg), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_combine(NULL, &cfg), 0.0F, 0.0);
+
+    cbm_sem_corpus_t *c = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(c);
+    static char *one[] = {"open", "socket", "port"};
+    static char *two[] = {"open", "socket", "host", "retry"};
+    cbm_sem_corpus_add_doc(c, (const char **)one, 3);
+    cbm_sem_corpus_add_doc(c, (const char **)two, 4);
+    cbm_sem_corpus_finalize(c);
+    cbm_sem_func_t fa;
+    cbm_sem_func_t fb;
+    int ia[3];
+    int ib[4];
+    float wa[3];
+    float wb[4];
+    sem_terms_of(c, one, 3, &fa, ia, wa);
+    sem_terms_of(c, two, 4, &fb, ib, wb);
+    fa.file_path = "net/dial.go";
+    fb.file_path = "net/listen.go";
+    cbm_sem_signals_t v;
+    cbm_sem_signal_values(&fa, &fb, &v);
+    ASSERT_FLOAT_EQ(cbm_sem_combined_score(&fa, &fb, &cfg), cbm_sem_combine(&v, &cfg), 0.0);
+    cbm_sem_corpus_free(c);
+    PASS();
+}
+
+/* Over budget, a function keeps its BEST partners, not its first ones (a
+ * held-out judged sample: the pairs first-come admitted over budget were 0 of
+ * 17 related). Equal scores keep the canonical order; an ineligible pair is
+ * never admitted and takes no budget. */
+TEST(sem_admit_best_first_keeps_the_best) {
+    /* function 0 has four partners in canonical order, budget 2 */
+    const float scores[] = {0.80F, 0.90F, 0.95F, 0.99F, 0.90F};
+    const int fa[] = {0, 0, 0, 0, 5};
+    const int fb[] = {1, 2, 3, 4, 6};
+    const bool eligible[] = {true, true, true, false, true};
+    int counts[7] = {0};
+    bool admitted[5];
+    ASSERT_TRUE(cbm_sem_admit_best_first(scores, fa, fb, eligible, 5, 2, counts, admitted));
+    ASSERT_FALSE(admitted[0]); /* first-come would have kept 0.80 */
+    ASSERT_TRUE(admitted[1]);
+    ASSERT_TRUE(admitted[2]);
+    ASSERT_FALSE(admitted[3]); /* the best score, but recorded only */
+    ASSERT_TRUE(admitted[4]);
+    ASSERT_EQ(counts[0], 2);
+    ASSERT_EQ(counts[4], 0);
+
+    /* ties: the earlier pair in canonical order wins the last slot */
+    const float tied[] = {0.85F, 0.85F};
+    const int ta[] = {0, 0};
+    const int tb[] = {1, 2};
+    const bool all[] = {true, true};
+    int tcounts[3] = {0};
+    bool tadmitted[2];
+    ASSERT_TRUE(cbm_sem_admit_best_first(tied, ta, tb, all, 2, 1, tcounts, tadmitted));
+    ASSERT_TRUE(tadmitted[0]);
+    ASSERT_FALSE(tadmitted[1]);
+    PASS();
+}
+
+/* p by the stored (three-decimal) score: the judged bands, monotone. */
+TEST(sem_calibrated_p_bands) {
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.750F), 0.626F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.772F), 0.626F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.773F), 0.760F, 0.0);
+    /* the cut sits at the stored precision (0.773), not the raw quartile:
+     * a stored "0.773" and a stored "0.772" never share a band */
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.7729F), 0.626F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(0.838F), 0.760F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_calibrated_p(1.000F), 0.760F, 0.0);
+    float last = 0.0F;
+    for (int milli = 750; milli <= 1000; milli++) {
+        float p = cbm_sem_calibrated_p((float)milli / 1000.0F);
+        ASSERT_TRUE(p >= last);
+        last = p;
+    }
+    PASS();
+}
+
+static float docp(cbm_sem_doc_format_t fmt, cbm_sem_doc_kind_t kind, cbm_sem_doc_pos_t pos,
+                  float score) {
+    return cbm_sem_doc_calibrated_p(fmt, kind, pos, score);
+}
+
+/* Doc -> code candidates, Markdown (sample 7): p by kind and position --
+ * functions outside the doc's home never stored, inside it from 0.30, for a
+ * doc of the whole project (samples 4 and 7 pooled) from 0.30 too; local
+ * extras 0.32 inside the home
+ * only; whole files from 0.40; nothing below CBM_SEM_DOC_MIN_SCORE; every
+ * curve monotone. A format without a judged curve stores nothing. */
+TEST(sem_doc_calibrated_p_bands) {
+    const cbm_sem_doc_format_t md = CBM_SEM_DOC_FMT_MARKDOWN;
+    const cbm_sem_doc_kind_t fn = CBM_SEM_DOC_KIND_FUNCTION;
+    const cbm_sem_doc_pos_t global = CBM_SEM_DOC_POS_GLOBAL;
+    const cbm_sem_doc_pos_t local = CBM_SEM_DOC_POS_LOCAL;
+    const cbm_sem_doc_pos_t outside = CBM_SEM_DOC_POS_OUTSIDE;
+    ASSERT_FLOAT_EQ(docp(md, fn, local, 0.199F), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, fn, local, CBM_SEM_DOC_MIN_SCORE), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, fn, local, 0.30F), 0.325F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, fn, local, 0.40F), 0.525F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, fn, global, 0.299F), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, fn, global, 0.30F), 0.217F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, fn, global, 0.40F), 0.509F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, fn, outside, 0.90F), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, CBM_SEM_DOC_KIND_LOCAL, local, 0.199F), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, CBM_SEM_DOC_KIND_LOCAL, local, 0.20F), 0.317F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, CBM_SEM_DOC_KIND_LOCAL, local, 0.90F), 0.317F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, CBM_SEM_DOC_KIND_FILE, outside, 0.399F), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, CBM_SEM_DOC_KIND_FILE, outside, 0.40F), 0.30F, 0.0);
+    ASSERT_FLOAT_EQ(docp(md, CBM_SEM_DOC_KIND_FOLDER, local, 0.90F), 0.0F, 0.0);
+    static const cbm_sem_doc_kind_t KINDS[] = {CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_KIND_LOCAL,
+                                               CBM_SEM_DOC_KIND_FILE};
+    for (size_t k = 0; k < sizeof(KINDS) / sizeof(KINDS[0]); k++) {
+        for (int pos = 0; pos < CBM_SEM_DOC_POS_COUNT; pos++) {
+            float last = 0.0F;
+            for (int milli = 0; milli <= 1000; milli++) {
+                float s = (float)milli / 1000.0F;
+                float p = docp(md, KINDS[k], (cbm_sem_doc_pos_t)pos, s);
+                ASSERT_TRUE(p >= last);
+                last = p;
+                ASSERT_TRUE(pos != CBM_SEM_DOC_POS_OUTSIDE || KINDS[k] == CBM_SEM_DOC_KIND_FILE ||
+                            p == 0.0F);
+                ASSERT_FLOAT_EQ(docp(CBM_SEM_DOC_FMT_OTHER, KINDS[k], (cbm_sem_doc_pos_t)pos, s),
+                                0.0F, 0.0);
+                ASSERT_FLOAT_EQ(docp(CBM_SEM_DOC_FMT_PDF, KINDS[k], (cbm_sem_doc_pos_t)pos, s),
+                                0.0F, 0.0);
+            }
+        }
+    }
+    ASSERT_FLOAT_EQ(docp(CBM_SEM_DOC_FMT_COUNT, fn, global, 0.9F), 0.0F, 0.0);
+    /* a home folder: README and index docs only, Markdown only */
+    ASSERT_FLOAT_EQ(cbm_sem_doc_folder_p(md, "pkg/mail/README.md"), 0.867F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_folder_p(md, "pkg/mail/docs/index.mdx"), 0.867F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_folder_p(md, "pkg/mail/readme"), 0.867F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_folder_p(md, "pkg/mail/guide.md"), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_folder_p(md, "pkg/mail/README-old.md"), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_folder_p(CBM_SEM_DOC_FMT_RST, "pkg/mail/index.rst"), 0.0F, 0.0);
+    ASSERT_FLOAT_EQ(cbm_sem_doc_folder_p(md, NULL), 0.0F, 0.0);
+    /* reST (sample 6): 0.20-0.30 judged 0.125, not stored */
+    const cbm_sem_doc_format_t rst = CBM_SEM_DOC_FMT_RST;
+    ASSERT_FLOAT_EQ(
+        cbm_sem_doc_calibrated_p(rst, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, 0.25F),
+        0.0F, 0.0);
+    ASSERT_FLOAT_EQ(
+        cbm_sem_doc_calibrated_p(rst, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, 0.30F),
+        0.35F, 0.0);
+    ASSERT_FLOAT_EQ(
+        cbm_sem_doc_calibrated_p(rst, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, 0.40F),
+        0.625F, 0.0);
+    /* AsciiDoc (sample 6): every band at or above the floor is stored */
+    const cbm_sem_doc_format_t adoc = CBM_SEM_DOC_FMT_ADOC;
+    ASSERT_FLOAT_EQ(
+        cbm_sem_doc_calibrated_p(adoc, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, 0.199F),
+        0.0F, 0.0);
+    ASSERT_FLOAT_EQ(
+        cbm_sem_doc_calibrated_p(adoc, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, 0.20F),
+        0.225F, 0.0);
+    ASSERT_FLOAT_EQ(
+        cbm_sem_doc_calibrated_p(adoc, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, 0.35F),
+        0.25F, 0.0);
+    ASSERT_FLOAT_EQ(
+        cbm_sem_doc_calibrated_p(adoc, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, 0.90F),
+        0.50F, 0.0);
+    for (int milli = 0; milli <= 1000; milli++) {
+        float s = (float)milli / 1000.0F;
+        ASSERT_TRUE(
+            cbm_sem_doc_calibrated_p(rst, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, s) >=
+            cbm_sem_doc_calibrated_p(rst, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL,
+                                     s - 0.001F));
+        ASSERT_TRUE(
+            cbm_sem_doc_calibrated_p(adoc, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL, s) >=
+            cbm_sem_doc_calibrated_p(adoc, CBM_SEM_DOC_KIND_FUNCTION, CBM_SEM_DOC_POS_GLOBAL,
+                                     s - 0.001F));
+    }
+    PASS();
+}
+
+/* p is stored and shown at two decimals, half up, whatever the float
+ * representation of the judged value (0.225F is 0.22499999...). */
+TEST(sem_p_two_decimals_half_up) {
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.225F), 0.23, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.325F), 0.33, 1e-12); /* float 0.32499998... */
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.525F), 0.53, 1e-12); /* float 0.52499997... */
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.324F), 0.32, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.317F), 0.32, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.867F), 0.87, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.625F), 0.63, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.548F), 0.55, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.36F), 0.36, 1e-12);
+    ASSERT_FLOAT_EQ(cbm_sem_p_2dp(0.0F), 0.0, 1e-12);
+    PASS();
+}
+
+/* A section's format comes from its file's extension, case-insensitively;
+ * a .txt section is reStructuredText (plain text has no sections). */
+TEST(sem_doc_format_by_extension) {
+    ASSERT_EQ(cbm_sem_doc_format("docs/guide.md"), CBM_SEM_DOC_FMT_MARKDOWN);
+    ASSERT_EQ(cbm_sem_doc_format("README.MARKDOWN"), CBM_SEM_DOC_FMT_MARKDOWN);
+    ASSERT_EQ(cbm_sem_doc_format("docs/index.rst"), CBM_SEM_DOC_FMT_RST);
+    ASSERT_EQ(cbm_sem_doc_format("docs/topics/db.txt"), CBM_SEM_DOC_FMT_RST);
+    ASSERT_EQ(cbm_sem_doc_format("manual/intro.adoc"), CBM_SEM_DOC_FMT_ADOC);
+    ASSERT_EQ(cbm_sem_doc_format("paper.pdf"), CBM_SEM_DOC_FMT_PDF);
+    ASSERT_EQ(cbm_sem_doc_format("src/main.go"), CBM_SEM_DOC_FMT_OTHER);
+    ASSERT_EQ(cbm_sem_doc_format("v1.2/NOTES"), CBM_SEM_DOC_FMT_OTHER);
+    ASSERT_EQ(cbm_sem_doc_format(NULL), CBM_SEM_DOC_FMT_OTHER);
+    PASS();
+}
+
+/* A properties string holding a quote is read whole, and escapes are not
+ * glued to the next word (until 2026-10 the read stopped at the first quote
+ * and kept "\n" raw, so "\nreturn" became the token "nreturn"). */
+TEST(sem_json_str_honours_escapes) {
+    static const char json[] =
+        "{\"docstring\":\"Say \\\"hi\\\" to\\nthe user \\u00e9 now\",\"bt\":\"x\"}";
+    char buf[64];
+    ASSERT_NOT_NULL(cbm_sem_json_str(json, "docstring", buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "Say \"hi\" to the user   now");
+    ASSERT_NOT_NULL(cbm_sem_json_str(json, "bt", buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "x");
+    ASSERT_NULL(cbm_sem_json_str(json, "absent", buf, sizeof(buf)));
+    char small[6];
+    ASSERT_NOT_NULL(cbm_sem_json_str(json, "docstring", small, sizeof(small)));
+    ASSERT_STR_EQ(small, "Say \""); /* cut at the buffer, still terminated */
+    PASS();
+}
+
 TEST(sem_corpus_add_null_doc) {
     cbm_sem_corpus_t *c = cbm_sem_corpus_new();
     ASSERT_NOT_NULL(c);
@@ -531,6 +836,14 @@ SUITE(semantic) {
     RUN_TEST(sem_corpus_add_one_doc);
     RUN_TEST(sem_corpus_idf);
     RUN_TEST(sem_corpus_index_accessors_match_name_lookups);
+    RUN_TEST(sem_tfidf_terms_compare_vocabulary_not_positions);
+    RUN_TEST(sem_combine_weighs_signals);
+    RUN_TEST(sem_admit_best_first_keeps_the_best);
+    RUN_TEST(sem_calibrated_p_bands);
+    RUN_TEST(sem_doc_calibrated_p_bands);
+    RUN_TEST(sem_doc_format_by_extension);
+    RUN_TEST(sem_p_two_decimals_half_up);
+    RUN_TEST(sem_json_str_honours_escapes);
     RUN_TEST(sem_corpus_add_null_doc);
     RUN_TEST(sem_corpus_free_null);
     RUN_TEST(sem_get_config_defaults);

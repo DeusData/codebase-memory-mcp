@@ -14,6 +14,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
+#include "semantic/semantic.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
 #include "foundation/sha256.h"
@@ -1941,6 +1942,74 @@ static int fixture_node_count(cbm_store_t *store, const char *project, const cha
         cbm_store_free_nodes(nodes, count);
     }
     return found;
+}
+
+/* Edges of `edge_type` from the node named `source_name` to the node named
+ * `target_name` that carries `target_label`. */
+static int labeled_edge_count(cbm_store_t *s, const char *project, const char *edge_type,
+                              const char *source_name, const char *target_name,
+                              const char *target_label) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.name && target.label &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.name, target_name) == 0 &&
+            strcmp(target.label, target_label) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* A Java field and a same-named method of one class keep their own nodes (the
+ * field is fenced `<Owner>.<name>#field`), and a write or a read of the field
+ * reaches the field, never the method; the method keeps its calls. The setter
+ * writing its own namesake was a self-edge before, so it was dropped. */
+TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fieldfence_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "src/demo/Starter.java"),
+                  "package demo;\n\npublic class Starter {\n"
+                  "    private String executable;\n\n"
+                  "    public Starter executable(String path) {\n"
+                  "        this.executable = path;\n"
+                  "        return this;\n    }\n\n"
+                  "    public String show() {\n        return executable;\n    }\n\n"
+                  "    public static void run() {\n"
+                  "        new Starter().executable(\"x\").show();\n    }\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fence.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(named_node_count(store, project, "executable"), 2);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "executable", "executable", "Field"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "WRITES", "executable", "executable", "Method"),
+              0);
+    ASSERT_EQ(labeled_edge_count(store, project, "USAGE", "show", "executable", "Field"), 1);
+    ASSERT_EQ(labeled_edge_count(store, project, "USAGE", "show", "executable", "Method"), 0);
+    ASSERT_EQ(labeled_edge_count(store, project, "CALLS", "run", "executable", "Method"), 1);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_cleanup(tmp);
+    PASS();
 }
 
 typedef struct {
@@ -19076,6 +19145,590 @@ TEST(pipeline_semantic_batched_matches_unbatched) {
     PASS();
 }
 
+/* CBM_SEM_PAIR_SIGNALS (+ _FLOOR) is the semantic engine's measuring
+ * harness: it records each scored pair with its signal values, from a floor
+ * below the threshold up. Recording must never change the graph: the same
+ * SEMANTICALLY_RELATED rows with and without it, one admitted line per edge,
+ * and every pair under the threshold recorded but never admitted. */
+TEST(pipeline_semantic_pair_signals_never_change_the_graph) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_semsig_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char *const subjects[] = {"User", "Server", "Client", "Cache", "Queue", "Mail"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        char file[64];
+        snprintf(file, sizeof(file), "%s_config.go", subjects[i]);
+        write_sem_family(tmp, file, subjects[i]);
+    }
+    char db_plain[512];
+    char db_signals[512];
+    char tsv[512];
+    snprintf(db_plain, sizeof(db_plain), "%s/plain.db", tmp);
+    snprintf(db_signals, sizeof(db_signals), "%s/signals.db", tmp);
+    snprintf(tsv, sizeof(tsv), "%s/pairs.tsv", tmp);
+
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1); /* as above: admits the near-duplicates */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_plain, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_setenv("CBM_SEM_PAIR_SIGNALS", tsv, 1);
+    cbm_setenv("CBM_SEM_PAIR_SIGNALS_FLOOR", "0.05", 1);
+    p = cbm_pipeline_new(tmp, db_signals, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEM_PAIR_SIGNALS");
+    cbm_unsetenv("CBM_SEM_PAIR_SIGNALS_FLOOR");
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    cbm_pipeline_free(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *sp = cbm_store_open_path(db_plain);
+    cbm_store_t *ss = cbm_store_open_path(db_signals);
+    ASSERT_NOT_NULL(sp);
+    ASSERT_NOT_NULL(ss);
+    int edges = 0;
+    ASSERT_TRUE(
+        sem_same_rows(cbm_store_get_db(sp), cbm_store_get_db(ss),
+                      "SELECT s.qualified_name, t.qualified_name, e.properties FROM edges e "
+                      "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                      "WHERE e.type = 'SEMANTICALLY_RELATED' ORDER BY 1, 2",
+                      &edges));
+    ASSERT_GT(edges, 0);
+    cbm_store_close(sp);
+    cbm_store_close(ss);
+
+    /* qa qb score tfidf ri minhash api type decorator struct proximity
+     * same_file admitted loc_a loc_b */
+    FILE *f = cbm_fopen(tsv, "r");
+    ASSERT_NOT_NULL(f);
+    char line[4096];
+    int lines = 0;
+    int admitted = 0;
+    int below = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *field[16];
+        int n = 0;
+        for (char *tok = strtok(line, "\t\n"); tok && n < 16; tok = strtok(NULL, "\t\n")) {
+            field[n++] = tok;
+        }
+        ASSERT_EQ(n, 15);
+        float score = strtof(field[2], NULL);
+        bool is_admitted = strcmp(field[12], "1") == 0;
+        if (score < 0.3F) {
+            below++;
+            ASSERT_FALSE(is_admitted);
+        }
+        admitted += is_admitted ? 1 : 0;
+        lines++;
+    }
+    fclose(f);
+    ASSERT_EQ(admitted, edges);
+    ASSERT_GT(below, 0); /* the floor recorded pairs under the threshold */
+    ASSERT_GT(lines, admitted);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Every SEMANTICALLY_RELATED edge carries "p": the calibrated probability for
+ * its score AS STORED (three decimals), so one shown score has one p. */
+TEST(pipeline_semantic_edges_carry_p) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_semp_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char *const subjects[] = {"User", "Server", "Client", "Cache", "Queue", "Mail"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        char file[64];
+        snprintf(file, sizeof(file), "%s_config.go", subjects[i]);
+        write_sem_family(tmp, file, subjects[i]);
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/p.db", tmp);
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1); /* as above: admits the near-duplicates */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    cbm_pipeline_free(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT properties FROM edges WHERE type = 'SEMANTICALLY_RELATED'",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    int edges = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *props = (const char *)sqlite3_column_text(st, 0);
+        ASSERT_NOT_NULL(props);
+        yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *score = yyjson_obj_get(yyjson_doc_get_root(doc), "score");
+        yyjson_val *pv = yyjson_obj_get(yyjson_doc_get_root(doc), "p");
+        ASSERT_TRUE(score && yyjson_is_num(score));
+        ASSERT_TRUE(pv && yyjson_is_num(pv));
+        double want = cbm_sem_calibrated_p((float)yyjson_get_num(score));
+        ASSERT_FLOAT_EQ(yyjson_get_num(pv), want, 0.006);
+        yyjson_doc_free(doc);
+        edges++;
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    ASSERT_GT(edges, 0);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* The p a stored candidate row must carry: the curve of the row's kind and
+ * position (read from its evidence) at its score, two decimals; -1 for an
+ * unknown kind or position. *is_function: a function candidate (top 5). */
+static double doc_row_want(const char *evidence, cbm_sem_doc_format_t fmt, float score,
+                           bool *is_function) {
+    static const struct {
+        const char *name;
+        cbm_sem_doc_kind_t kind;
+    } KINDS[] = {{"\"kind\":\"function\"", CBM_SEM_DOC_KIND_FUNCTION},
+                 {"\"kind\":\"local\"", CBM_SEM_DOC_KIND_LOCAL},
+                 {"\"kind\":\"file\"", CBM_SEM_DOC_KIND_FILE}};
+    static const struct {
+        const char *name;
+        cbm_sem_doc_pos_t pos;
+    } POSITIONS[] = {{"\"position\":\"global\"", CBM_SEM_DOC_POS_GLOBAL},
+                     {"\"position\":\"local\"", CBM_SEM_DOC_POS_LOCAL},
+                     {"\"position\":\"outside\"", CBM_SEM_DOC_POS_OUTSIDE}};
+    int k = -1;
+    int p = -1;
+    for (int i = 0; evidence && i < 3; i++) {
+        k = k < 0 && strstr(evidence, KINDS[i].name) ? i : k;
+        p = p < 0 && strstr(evidence, POSITIONS[i].name) ? i : p;
+    }
+    *is_function = k == 0;
+    return k < 0 || p < 0 ? -1.0
+                          : cbm_sem_p_2dp(cbm_sem_doc_calibrated_p(fmt, KINDS[k].kind,
+                                                                   POSITIONS[p].pos, score));
+}
+
+/* Count a section's stored doc -> code candidates (section QN containing
+ * heading) and check each row's shape: a function within the top
+ * CBM_SEM_DOC_TOP_K (top: the best of them), score at or above the floor, p
+ * the curve of its kind and position at two decimals, never a test
+ * function. Returns -1 on a bad row. */
+static int doc_candidate_rows_for(cbm_store_t *s, const char *heading, char *top, size_t top_sz) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(s),
+                           "SELECT target_qn, rank, score, p, evidence FROM doc_link_candidates "
+                           "WHERE instr(section_qn, ?1) > 0 ORDER BY rank",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, heading, -1, SQLITE_TRANSIENT);
+    int n = 0;
+    bool ok = true;
+    bool have_top = false;
+    while (ok && sqlite3_step(st) == SQLITE_ROW) {
+        const char *target = (const char *)sqlite3_column_text(st, 0);
+        int rank = sqlite3_column_int(st, 1);
+        double score = sqlite3_column_double(st, 2);
+        double p = sqlite3_column_double(st, 3);
+        bool is_function = false;
+        double want = doc_row_want((const char *)sqlite3_column_text(st, 4),
+                                   CBM_SEM_DOC_FMT_MARKDOWN, (float)score, &is_function);
+        ok = target && rank >= 1 && (!is_function || rank <= CBM_SEM_DOC_TOP_K) &&
+             score >= (double)CBM_SEM_DOC_MIN_SCORE && p == want && !strstr(target, ".Test");
+        if (ok && is_function && !have_top && top) {
+            snprintf(top, top_sz, "%s", target);
+            have_top = true;
+        }
+        n++;
+    }
+    sqlite3_finalize(st);
+    return ok ? n : -1;
+}
+
+/* Doc -> code candidates end to end: a full index publishes a section's
+ * calibrated candidates (the best match first, a test function never, a
+ * changelog section none), and a delta-route reindex keeps them -- its proxy
+ * buffer cannot recompute them, so the clone's rows must survive. */
+TEST(pipeline_doc_candidates_published_and_kept_by_delta) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doccand_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char *const subjects[] = {"User", "Server", "Client", "Cache", "Queue", "Mail"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        char file[64];
+        snprintf(file, sizeof(file), "%s_config.go", subjects[i]);
+        write_sem_family(tmp, file, subjects[i]);
+    }
+    /* A test whose comment is the section's own text: the best match of all,
+     * and still never a candidate. */
+    write_temp_file(tmp, "mail_config_test.go",
+                    "package main\n\n"
+                    "// TestParseMailConfig: the mail config file is parsed by ParseMailConfig,\n"
+                    "// which loads the mail config from disk and validates the mail config\n"
+                    "// fields before anything reads them. Missing fields fail the validation,\n"
+                    "// and the parsed mail config can be written back to disk afterwards.\n"
+                    "func TestParseMailConfig(t *testing.T) {\n"
+                    "\tParseMailConfig(\"mail.conf\")\n}\n");
+    write_temp_file(tmp, "README.md",
+                    "# Mail configuration\n\n"
+                    "The mail config file is parsed by ParseMailConfig, which loads the mail "
+                    "config from disk and validates the mail config fields before anything "
+                    "reads them. Missing fields fail the validation, and the parsed mail "
+                    "config can be written back to disk afterwards.\n\n"
+                    "## Changelog\n\n"
+                    "The mail config loader now validates missing fields and writes the mail "
+                    "config back to disk after parsing, so a parsed mail config file always "
+                    "carries every field it needs.\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/doccand.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    char top[512] = "";
+    int mail = doc_candidate_rows_for(s, "Mail-configuration", top, sizeof(top));
+    int changelog = doc_candidate_rows_for(s, "Changelog", NULL, 0);
+    cbm_store_close(s);
+    ASSERT_GT(mail, 0);
+    ASSERT_NOT_NULL(strstr(top, "Mail"));
+    ASSERT_EQ(changelog, 0);
+
+    /* Delta route: an edit that keeps every definition name (closure repair
+     * declines added names and new files -- the name must match the fixture's
+     * case exactly, or a case-sensitive filesystem gets a new file); the
+     * candidates are kept as they were. */
+    char edited[512];
+    snprintf(edited, sizeof(edited), "%s/User_config.go", tmp);
+    FILE *ef = cbm_fopen(edited, "a");
+    ASSERT_NOT_NULL(ef);
+    (void)fputs("\n// edited after the first index\n", ef);
+    (void)fclose(ef);
+    cbm_pipeline_incremental_test_reset_faults();
+    p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_pipeline_free(p);
+    s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    char top_after[512] = "";
+    int mail_after = doc_candidate_rows_for(s, "Mail-configuration", top_after, sizeof(top_after));
+    cbm_store_close(s);
+    ASSERT_EQ(mail_after, mail);
+    ASSERT_STR_EQ(top_after, top);
+    th_rmtree(tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    PASS();
+}
+
+/* One Python family per subject: parse / load / validate / write, each with
+ * a docstring, so the functions' corpus has the subject words to match. */
+static void write_py_family(const char *base, const char *subject) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.py", base, subject);
+    char body[4096];
+    snprintf(body, sizeof(body),
+             "def parse_%s_config(path):\n"
+             "    \"\"\"Parse the %s config file and return the parsed %s settings.\"\"\"\n"
+             "    return load_%s_config(path)\n\n"
+             "def load_%s_config(path):\n"
+             "    \"\"\"Load the %s config from disk and validate every %s field.\"\"\"\n"
+             "    cfg = {}\n    validate_%s_config(cfg)\n    return cfg\n\n"
+             "def validate_%s_config(cfg):\n"
+             "    \"\"\"Check the %s config for missing fields.\"\"\"\n"
+             "    return cfg is not None\n\n"
+             "def write_%s_config(path, cfg):\n"
+             "    \"\"\"Write the %s config back to disk after validating it.\"\"\"\n"
+             "    validate_%s_config(cfg)\n",
+             subject, subject, subject, subject, subject, subject, subject, subject, subject,
+             subject, subject, subject, subject);
+    th_write_file(path, body);
+}
+
+/* The candidate count, and the bad rows, of one section (its QN contains
+ * heading and its file ends in ext): p must be the format's curve value at
+ * two decimals and the tfidf at or above the format's first stored band. */
+static int doc_rows_of(cbm_store_t *s, const char *heading, const char *ext,
+                       cbm_sem_doc_format_t fmt, const char *forbidden_target, int *bad) {
+    sqlite3_stmt *st = NULL;
+    *bad = 0;
+    if (sqlite3_prepare_v2(
+            cbm_store_get_db(s),
+            "SELECT c.target_qn, c.score, c.p, c.evidence FROM doc_link_candidates c "
+            "JOIN nodes n ON n.qualified_name = c.section_qn "
+            "WHERE instr(c.section_qn, ?1) > 0 AND n.file_path LIKE ?2",
+            -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    char like[32];
+    snprintf(like, sizeof(like), "%%%s", ext);
+    sqlite3_bind_text(st, 1, heading, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, like, -1, SQLITE_TRANSIENT);
+    int n = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *target = (const char *)sqlite3_column_text(st, 0);
+        float score = (float)sqlite3_column_double(st, 1);
+        double p = sqlite3_column_double(st, 2);
+        bool is_function = false;
+        double want =
+            doc_row_want((const char *)sqlite3_column_text(st, 3), fmt, score, &is_function);
+        *bad += want <= 0.0 || p != want ||
+                (forbidden_target && target && strstr(target, forbidden_target));
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Candidates never repeat an exact link: a section whose code span names a
+ * function (a MENTIONS edge) does not also list that function as a
+ * candidate. And each format carries its own judged curve: reST stores only
+ * from tfidf 0.30, with reST's p. */
+TEST(pipeline_doc_candidates_skip_exact_links_and_use_format_curves) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_docfmt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char *const subjects[] = {"mail", "cache", "queue", "user", "server", "client"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        write_py_family(tmp, subjects[i]);
+    }
+    char docs[512];
+    snprintf(docs, sizeof(docs), "%s/docs", tmp);
+    ASSERT_TRUE(cbm_mkdir_p(docs, 0755));
+    write_temp_file(tmp, "docs/mail.md",
+                    "# Mail settings\n\n"
+                    "The mail config file is parsed by `mail.parse_mail_config`, which loads "
+                    "the mail config from disk and validates every mail field before the "
+                    "parsed mail settings are returned to the caller for use.\n");
+    write_temp_file(tmp, "docs/mail.rst",
+                    "Mail loading\n============\n\n"
+                    "Load the mail config from disk and validate every mail field: missing "
+                    "mail fields fail the validation, and the loaded mail config is written "
+                    "back to disk after validating it.\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/docfmt.db", tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    /* the exact link exists ... */
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT count(*) FROM edges e JOIN nodes a ON a.id = e.source_id "
+                                 "JOIN nodes b ON b.id = e.target_id WHERE e.type = 'MENTIONS' "
+                                 "AND a.label = 'Section' AND a.file_path = 'docs/mail.md' "
+                                 "AND b.name = 'parse_mail_config'",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    int linked = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    /* ... and is not repeated as a candidate, while the rest of the section's
+     * candidates are stored on the Markdown curve */
+    int md_bad = 0;
+    int rst_bad = 0;
+    int md = doc_rows_of(s, "Mail-settings", ".md", CBM_SEM_DOC_FMT_MARKDOWN, ".parse_mail_config",
+                         &md_bad);
+    int rst = doc_rows_of(s, "Mail-loading", ".rst", CBM_SEM_DOC_FMT_RST, NULL, &rst_bad);
+    cbm_store_close(s);
+    th_rmtree(tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    ASSERT_EQ(linked, 1);
+    ASSERT_GT(md, 0);
+    ASSERT_EQ(md_bad, 0);
+    ASSERT_GT(rst, 0);
+    ASSERT_EQ(rst_bad, 0);
+    PASS();
+}
+
+/* Lines of a CBM_SEM_DOC_SIGNALS dump whose section file, kind, position,
+ * home and target file equal the given values (NULL: any). */
+static int doc_signal_count(const char *dump, const char *sec_file, const char *kind,
+                            const char *pos, const char *home, const char *target_file) {
+    FILE *f = cbm_fopen(dump, "r");
+    if (!f) {
+        return -1;
+    }
+    char line[4096];
+    int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *col[12];
+        int nc = 0;
+        for (char *p = line; nc < 12; nc++) {
+            col[nc] = p;
+            char *tab = strchr(p, '\t');
+            if (!tab) {
+                nc++;
+                break;
+            }
+            *tab = '\0';
+            p = tab + 1;
+        }
+        if (nc != 12) {
+            continue;
+        }
+        char *colon = strrchr(col[5], ':');
+        if (colon) {
+            *colon = '\0';
+        }
+        colon = strrchr(col[6], ':');
+        if (colon) {
+            *colon = '\0';
+        }
+        n += (!sec_file || strcmp(col[5], sec_file) == 0) && (!kind || strcmp(col[9], kind) == 0) &&
+             (!pos || strcmp(col[10], pos) == 0) && (!home || strcmp(col[11], home) == 0) &&
+             (!target_file || strcmp(col[6], target_file) == 0);
+    }
+    fclose(f);
+    return n;
+}
+
+/* Document position: a doc's home is its folder (a docs folder documents its
+ * parent; a folder without code climbs to one with code; the root = the
+ * whole project); a candidate inside the home is local, elsewhere outside;
+ * a doc with a home below the root gets its home folder as a candidate;
+ * whole files are candidates; local functions below the top 5 are added. */
+TEST(pipeline_doc_candidates_home_position_and_kinds) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_docpos_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char dir[512];
+    static const char *const pkgs[] = {"pkg/mail",      "pkg/mail/sub", "pkg/cache", "pkg/queue",
+                                       "pkg/mail/docs", "docs",         "guides"};
+    for (size_t i = 0; i < sizeof(pkgs) / sizeof(pkgs[0]); i++) {
+        snprintf(dir, sizeof(dir), "%s/%s", tmp, pkgs[i]);
+        ASSERT_TRUE(cbm_mkdir_p(dir, 0755));
+    }
+    snprintf(dir, sizeof(dir), "%s/pkg/mail", tmp);
+    write_py_family(dir, "mail");
+    snprintf(dir, sizeof(dir), "%s/pkg/mail/sub", tmp);
+    write_py_family(dir, "mail");
+    snprintf(dir, sizeof(dir), "%s/pkg/cache", tmp);
+    write_py_family(dir, "cache");
+    snprintf(dir, sizeof(dir), "%s/pkg/queue", tmp);
+    write_py_family(dir, "queue");
+    static const char body[] =
+        "The mail config file is parsed, loaded from disk and validated: every mail "
+        "field is checked, missing mail fields fail the validation, and the parsed mail "
+        "settings are written back to disk after validating the mail config.\n";
+    static const char *const doc_files[] = {"pkg/mail/README.md", "pkg/mail/docs/guide.md",
+                                            "docs/overview.md", "guides/notes.md"};
+    for (size_t i = 0; i < sizeof(doc_files) / sizeof(doc_files[0]); i++) {
+        char text[1024];
+        snprintf(text, sizeof(text), "# Mail config %d\n\n%s", (int)i, body);
+        write_temp_file(tmp, doc_files[i], text);
+    }
+    char db[512];
+    char dump[512];
+    snprintf(db, sizeof(db), "%s/docpos.db", tmp);
+    snprintf(dump, sizeof(dump), "%s/signals.tsv", tmp);
+    cbm_setenv("CBM_SEM_DOC_SIGNALS", dump, 1);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    cbm_unsetenv("CBM_SEM_DOC_SIGNALS");
+    ASSERT_EQ(rc, 0);
+
+    const char *readme = "pkg/mail/README.md";
+    const char *guide = "pkg/mail/docs/guide.md";
+    /* homes: the package; its docs folder documents the package; top-level
+     * docs and a folder without code document the whole project */
+    int readme_lines = doc_signal_count(dump, readme, NULL, NULL, NULL, NULL);
+    int readme_home = doc_signal_count(dump, readme, NULL, NULL, "pkg/mail", NULL);
+    int guide_lines = doc_signal_count(dump, guide, NULL, NULL, NULL, NULL);
+    int guide_home = doc_signal_count(dump, guide, NULL, NULL, "pkg/mail", NULL);
+    int overview_lines = doc_signal_count(dump, "docs/overview.md", NULL, NULL, NULL, NULL);
+    int overview_root = doc_signal_count(dump, "docs/overview.md", NULL, "global", ".", NULL);
+    int notes_lines = doc_signal_count(dump, "guides/notes.md", NULL, NULL, NULL, NULL);
+    int notes_root = doc_signal_count(dump, "guides/notes.md", NULL, "global", ".", NULL);
+    /* positions */
+    int local_fn =
+        doc_signal_count(dump, readme, "function", "local", "pkg/mail", "pkg/mail/mail.py");
+    int local_sub =
+        doc_signal_count(dump, readme, NULL, "local", "pkg/mail", "pkg/mail/sub/mail.py");
+    int outside_fn = doc_signal_count(dump, readme, "function", "outside", NULL, NULL);
+    int wrong_local = doc_signal_count(dump, readme, NULL, "local", NULL, "pkg/cache/cache.py");
+    /* kinds */
+    int folders = doc_signal_count(dump, NULL, "folder", "local", NULL, "pkg/mail");
+    int folder_readme = doc_signal_count(dump, readme, "folder", "local", "pkg/mail", "pkg/mail");
+    int root_folders = doc_signal_count(dump, "docs/overview.md", "folder", NULL, NULL, NULL) +
+                       doc_signal_count(dump, "guides/notes.md", "folder", NULL, NULL, NULL);
+    int files = doc_signal_count(dump, readme, "file", "local", NULL, NULL);
+    int extras = doc_signal_count(dump, readme, "local", "local", "pkg/mail", NULL);
+    /* stored: the README's home folder (a README: p 0.87), not the guide's
+     * (another doc), no function outside the home, every row on its curve */
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT c.score, c.p, c.evidence, n.file_path FROM "
+                                 "doc_link_candidates c JOIN nodes n ON n.qualified_name = "
+                                 "c.section_qn",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    int stored_folders = 0;
+    int stored_outside = 0;
+    int off_curve = 0;
+    double folder_p = 0.0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *ev = (const char *)sqlite3_column_text(st, 2);
+        const char *path = (const char *)sqlite3_column_text(st, 3);
+        double p = sqlite3_column_double(st, 1);
+        if (ev && strstr(ev, "\"kind\":\"folder\"")) {
+            stored_folders++;
+            folder_p = p;
+            off_curve += strcmp(path, readme) != 0;
+            continue;
+        }
+        stored_outside +=
+            ev && strstr(ev, "\"position\":\"outside\"") && strstr(ev, "\"kind\":\"function\"");
+        bool is_function = false;
+        off_curve += p != doc_row_want(ev, CBM_SEM_DOC_FMT_MARKDOWN,
+                                       (float)sqlite3_column_double(st, 0), &is_function);
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    th_rmtree(tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    ASSERT_GT(readme_lines, 0);
+    ASSERT_EQ(readme_home, readme_lines);
+    ASSERT_GT(guide_lines, 0);
+    ASSERT_EQ(guide_home, guide_lines);
+    ASSERT_GT(overview_lines, 0);
+    ASSERT_EQ(overview_root, overview_lines);
+    ASSERT_GT(notes_lines, 0);
+    ASSERT_EQ(notes_root, notes_lines);
+    ASSERT_GT(local_fn, 0);
+    ASSERT_GT(local_sub, 0);
+    ASSERT_GT(outside_fn, 0);
+    ASSERT_EQ(wrong_local, 0);
+    ASSERT_EQ(folders, 2); /* README and the docs guide; one per doc, never per section */
+    ASSERT_EQ(folder_readme, 1);
+    ASSERT_EQ(root_folders, 0);
+    ASSERT_GT(files, 0);
+    ASSERT_GT(extras, 0);
+    ASSERT_EQ(stored_folders, 1);
+    ASSERT_FLOAT_EQ(folder_p, 0.87, 1e-9);
+    ASSERT_EQ(stored_outside, 0);
+    ASSERT_EQ(off_curve, 0);
+    PASS();
+}
+
 TEST(pipeline_semantic_edges_no_functions) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_nofunc_XXXXXX");
@@ -19653,6 +20306,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
@@ -19993,6 +20647,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
     RUN_TEST(pipeline_semantic_edges_no_functions);
     RUN_TEST(pipeline_semantic_batched_matches_unbatched);
+    RUN_TEST(pipeline_semantic_pair_signals_never_change_the_graph);
+    RUN_TEST(pipeline_semantic_edges_carry_p);
+    RUN_TEST(pipeline_doc_candidates_published_and_kept_by_delta);
+    RUN_TEST(pipeline_doc_candidates_skip_exact_links_and_use_format_curves);
+    RUN_TEST(pipeline_doc_candidates_home_position_and_kinds);
     RUN_TEST(pipeline_cpp_static_factory_pointer_receiver_issue1153);
     RUN_TEST(pipeline_cpp_static_factory_reference_receiver_issue1153);
     RUN_TEST(pipeline_cpp_static_factory_unique_ptr_receiver_issue1153);

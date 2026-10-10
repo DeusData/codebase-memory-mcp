@@ -276,6 +276,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->http_client);
     cr_str(c, &d->http_base_url);
     cr_str(c, &d->variants);
+    cr_list(c, &d->extra_props);
     cr_str(c, &d->decl_namespace);
 }
 
@@ -395,6 +396,12 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_str(c, &r->error_msg);
     cr_str(c, &r->error_ranges);
     cr_str(c, &r->module_doc);
+    cr_array(c, (void **)&r->doc_links.items, r->doc_links.count, sizeof(CBMDocLink));
+    for (int i = 0; i < r->doc_links.count && r->doc_links.items; i++) {
+        cr_str(c, &r->doc_links.items[i].source_qn);
+        cr_str(c, &r->doc_links.items[i].raw);
+    }
+    cr_str(c, &r->doc_scope);
     cr_blob(c, (const void **)&r->source, r->source ? (size_t)r->source_len + SKIP_ONE : 0);
 }
 
@@ -534,6 +541,7 @@ void cbm_result_compact(CBMFileResult *result) {
     tmp.infra_bindings.cap = tmp.infra_bindings.count;
     tmp.channels.cap = tmp.channels.count;
     tmp.field_types.cap = tmp.field_types.count;
+    tmp.doc_links.cap = tmp.doc_links.count;
 
     /* A composite kept its per-unit results only so shallow-copied strings
      * stayed valid; every string is now a copy of its own. */

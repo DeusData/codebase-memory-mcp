@@ -13,6 +13,11 @@
 typedef bool (*cbm_mcp_quarantine_test_hook_fn)(void *context, const char *step);
 typedef bool (*cbm_mcp_command_test_hook_fn)(void *context, const char *command);
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* One-shot sample JSON string-copy allocation failure, not a backing-pool
+ * growth event: 0 is next, 4 is fifth, -1 disables. Setting clears consumption. */
+void cbm_mcp_doc_links_test_fail_sample_alloc_after(int successful_copies);
+bool cbm_mcp_doc_links_test_sample_alloc_failed(void);
+
 typedef void (*cbm_mcp_auto_index_count_test_hook_fn)(void *context);
 #endif
 

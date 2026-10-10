@@ -745,7 +745,9 @@ mode. `index_status` keeps describing the published graph and its freshness.
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `SPAWNS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `SPAWNS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `MENTIONS`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+
+`MENTIONS` links a documented definition to the code its doc comment references (C# `<see cref>`, `<seealso cref>`, `<exception cref>`, `<inheritdoc cref>`), one edge per pair with `via`, `syntax`, `tier` (`exact` or `unique`), first `line` and `count`. A reference is bound only when it names exactly one definition under the language's own lookup rules; the rest are counted by reason in `index_status` under `doc_links` (samples with `diagnostics='full'`).
 
 ### Qualified Names
 

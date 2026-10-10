@@ -255,7 +255,12 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                                                                    imp_keys, imp_count)) {
                 continue;
             }
-            tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            /* a plain value reference names the field twin of a same-named
+             * method; a callable-reference candidate keeps the method */
+            bool value_ref = usage->kind == CBM_USAGE_VALUE && !usage->may_be_call_reference;
+            tgt = cbm_gbuf_find_by_qn(
+                ctx->gbuf, value_ref ? cbm_registry_value_target(ctx->registry, res.qualified_name)
+                                     : res.qualified_name);
             /* #1928: the registry fallback is a bare-name guess — never let it
              * bind a reference across a language boundary (the LSP-backed
              * semantic branch above is not affected). */
@@ -381,7 +386,8 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
             continue;
         }
 
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(
+            ctx->gbuf, cbm_registry_value_target(ctx->registry, res.qualified_name));
         if (!tgt || src->id == tgt->id) {
             continue;
         }

@@ -586,6 +586,48 @@ TEST(java_class) {
     PASS();
 }
 
+/* A class field is one Field. Java, C# and Solidity list the field
+ * declaration as a variable kind too, and the class-body variable pass minted
+ * a second node: a Variable with the module's qualified name (Query.filters
+ * became `demo.query.filters`, the name of a package a documentation code
+ * span then bound). Languages whose class variables are no Field keep them. */
+TEST(class_field_is_one_field_not_also_a_variable) {
+    CBMFileResult *r = extract("package demo.query;\npublic class Query {\n"
+                               "    private Object filters;\n"
+                               "    private static final String PROP = \"v\";\n}\n",
+                               CBM_LANG_JAVA, "t", "Query.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Field", "filters"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "filters"), 0);
+    /* an initialized field is named by its declarator's name, not its text
+     * (`PROP = "v"` was the Field's name, so only the duplicate was findable) */
+    ASSERT_EQ(count_defs_named(r, "Field", "PROP"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "PROP"), 0);
+    cbm_free_result(r);
+    r = extract("namespace Demo {\n  public class Q {\n    private int count;\n  }\n}\n",
+                CBM_LANG_CSHARP, "t", "Q.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Field", "count"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "count"), 0);
+    cbm_free_result(r);
+    r = extract("pragma solidity ^0.8.0;\ncontract Q {\n    uint256 public total;\n}\n",
+                CBM_LANG_SOLIDITY, "t", "Q.sol");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Field", "total"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "total"), 0);
+    cbm_free_result(r);
+    /* no Field for these: their class variables stay */
+    r = extract("class Q {\n    var count: Int = 0\n}\n", CBM_LANG_SWIFT, "t", "Q.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Variable", "count"), 1);
+    cbm_free_result(r);
+    r = extract("extends Node\nclass Inner:\n    var x = 1\n", CBM_LANG_GDSCRIPT, "t", "q.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Variable", "x"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(java_method) {
     CBMFileResult *r = extract(
         "public class Svc { public void doWork() {} public int compute(int x) { return x; } }",
@@ -7430,6 +7472,37 @@ static const CBMDefinition *c1_def_qn(CBMFileResult *r, const char *qn) {
     return NULL;
 }
 
+static bool qn_ends_with(const CBMDefinition *d, const char *tail) {
+    size_t n = d && d->qualified_name ? strlen(d->qualified_name) : 0;
+    size_t t = strlen(tail);
+    return n >= t && strcmp(d->qualified_name + n - t, tail) == 0;
+}
+
+/* A field and a same-named method of one class body would share one qualified
+ * name (one node per QN): the field is fenced `<Owner>.<name>#field` and the
+ * method keeps the plain name. A field without a namesake keeps its name, and
+ * so does a nested class's field named like a method of the outer class. */
+TEST(field_named_like_method_is_fenced) {
+    CBMFileResult *r = extract("package demo;\npublic class Starter {\n"
+                               "    private String executable;\n"
+                               "    private String dir;\n"
+                               "    public Starter executable(String p) { return this; }\n"
+                               "    public void size() {}\n"
+                               "    static class Inner { int size; }\n}\n",
+                               CBM_LANG_JAVA, "t", "Starter.java");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *field = c1_def(r, "Field", "executable");
+    const CBMDefinition *method = c1_def(r, "Method", "executable");
+    ASSERT_NOT_NULL(field);
+    ASSERT_NOT_NULL(method);
+    ASSERT_TRUE(qn_ends_with(field, "Starter.executable#field"));
+    ASSERT_TRUE(qn_ends_with(method, "Starter.executable"));
+    ASSERT_TRUE(qn_ends_with(c1_def(r, "Field", "dir"), "Starter.dir"));
+    ASSERT_TRUE(qn_ends_with(c1_def(r, "Field", "size"), "Inner.size"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* The def with this label and name that starts on `line`. */
 static const CBMDefinition *c1_def_at(CBMFileResult *r, const char *label, const char *name,
                                       int line) {
@@ -10398,6 +10471,8 @@ SUITE(extraction) {
     /* OOP */
     RUN_TEST(java_class);
     RUN_TEST(java_method);
+    RUN_TEST(class_field_is_one_field_not_also_a_variable);
+    RUN_TEST(field_named_like_method_is_fenced);
     RUN_TEST(java_interface);
     RUN_TEST(java_interface_no_duplicate_function_issue1234);
     RUN_TEST(java_enum_dedup_preserves_calls_issue1234);

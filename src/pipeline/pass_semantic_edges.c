@@ -30,6 +30,8 @@
 #include "foundation/platform.h"
 #include "foundation/profile.h"
 
+#include <ctype.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -71,6 +73,7 @@ typedef struct {
     int64_t target_id;
     float score;
     bool same_file;
+    bool below; /* under the threshold: recorded for CBM_SEM_PAIR_SIGNALS only, never admitted */
     /* Canonical admission keys (determinism): func index of the discovering
      * side, its candidate rank, and the partner's func index. The sequential
      * admission pass replays pairs in (i, c) order so which pairs win the
@@ -93,7 +96,7 @@ static void deferred_buf_init(deferred_edge_buf_t *buf) {
 }
 
 static void deferred_buf_push(deferred_edge_buf_t *buf, int64_t src, int64_t tgt, float score,
-                              bool same_file, int i, int j, int c) {
+                              bool same_file, bool below, int i, int j, int c) {
     if (buf->count >= buf->cap) {
         int nc = buf->cap < CBM_SZ_256 ? CBM_SZ_256 : buf->cap * GROW;
         deferred_edge_t *grown =
@@ -108,6 +111,7 @@ static void deferred_buf_push(deferred_edge_buf_t *buf, int64_t src, int64_t tgt
                                                  .target_id = tgt,
                                                  .score = score,
                                                  .same_file = same_file,
+                                                 .below = below,
                                                  .i = i,
                                                  .j = j,
                                                  .c = c};
@@ -325,29 +329,9 @@ static const char *file_ext(const char *path) {
     return dot ? dot : "";
 }
 
-/* Extract a JSON string value by key (simple strstr-based, no full parse). */
+/* Extract a JSON string value by key, escapes honoured (cbm_sem_json_str). */
 static const char *json_str_value(const char *json, const char *key, char *buf, int bufsize) {
-    if (!json || !key) {
-        return NULL;
-    }
-    char search[CBM_SZ_64];
-    snprintf(search, sizeof(search), "\"%s\":\"", key);
-    const char *start = strstr(json, search);
-    if (!start) {
-        return NULL;
-    }
-    start += strlen(search);
-    const char *end = strchr(start, '"');
-    if (!end) {
-        return NULL;
-    }
-    int len = (int)(end - start);
-    if (len >= bufsize) {
-        len = bufsize - SKIP_ONE;
-    }
-    memcpy(buf, start, (size_t)len);
-    buf[len] = '\0';
-    return buf;
+    return cbm_sem_json_str(json, key, buf, bufsize);
 }
 
 /* Extract a JSON array of strings by key. Returns count. */
@@ -724,19 +708,10 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
             token_index[t] = cbm_sem_corpus_token_index(vc->corpus, tokens[t]);
         }
 
-        /* TF-IDF weights */
+        /* TF-IDF terms, keyed by corpus token (cbm_sem_tfidf_terms). */
         int *indices = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)tc * sizeof(int));
         float *weights = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)tc * sizeof(float));
-        int tfidf_len = 0;
-        for (int t = 0; t < tc; t++) {
-            float idf = token_index ? cbm_sem_corpus_idf_at(vc->corpus, token_index[t])
-                                    : cbm_sem_corpus_idf(vc->corpus, tokens[t]);
-            if (idf > 0.0F) {
-                indices[tfidf_len] = t;
-                weights[tfidf_len] = idf;
-                tfidf_len++;
-            }
-        }
+        int tfidf_len = cbm_sem_tfidf_terms(vc->corpus, tokens, token_index, tc, indices, weights);
         vc->funcs[f].tfidf_indices = indices;
         vc->funcs[f].tfidf_weights = weights;
         vc->funcs[f].tfidf_len = tfidf_len;
@@ -833,6 +808,7 @@ typedef struct {
     uint64_t *signatures;
     int *edge_counts; /* budget applied sequentially in phase6b (determinism) */
     cbm_sem_config_t cfg;
+    float record_floor; /* kept from here up; under the threshold: signals dump only */
     int func_count;
 
     /* LSH buckets (read-only during scoring) */
@@ -927,13 +903,13 @@ static void score_try_emit(score_ctx_t *sc, int i, int j, int c, deferred_edge_b
         return;
     }
     float score = cbm_sem_combined_score(&sc->funcs[i], &sc->funcs[j], &sc->cfg);
-    if (score < sc->cfg.threshold) {
+    if (score < sc->record_floor) {
         return;
     }
     bool same_file = sc->funcs[i].file_path && sc->funcs[j].file_path &&
                      strcmp(sc->funcs[i].file_path, sc->funcs[j].file_path) == 0;
-    deferred_buf_push(my_buf, sc->funcs[i].node_id, sc->funcs[j].node_id, score, same_file, i, j,
-                      c);
+    deferred_buf_push(my_buf, sc->funcs[i].node_id, sc->funcs[j].node_id, score, same_file,
+                      score < sc->cfg.threshold, i, j, c);
 }
 
 static void score_worker(int worker_id, void *ctx_ptr) {
@@ -1138,8 +1114,31 @@ static int cmp_deferred_edge_canonical(const void *pa, const void *pb) {
  * and apply the per-node max_edges budget HERE — single-threaded — so the
  * admitted edge set is a pure function of the (canonically sorted) inputs,
  * independent of worker count and scheduling. */
+/* CBM_SEM_PAIR_SIGNALS=<path>: one line per recorded pair (from the record
+ * floor up, CBM_SEM_PAIR_SIGNALS_FLOOR, default the threshold), in canonical
+ * order: both qualified names, the score, every signal value and whether the
+ * pair was admitted. The measuring harness for the semantic engine: judged
+ * samples are drawn from it, stratified by score. Off unless set. */
+static void pair_signals_line(FILE *f, const cbm_gbuf_t *gbuf, const cbm_sem_func_t *funcs,
+                              const deferred_edge_t *de, bool admitted) {
+    cbm_sem_signals_t s;
+    cbm_sem_signal_values(&funcs[de->i], &funcs[de->j], &s);
+    const cbm_gbuf_node_t *a = cbm_gbuf_find_by_id(gbuf, de->source_id);
+    const cbm_gbuf_node_t *b = cbm_gbuf_find_by_id(gbuf, de->target_id);
+    (void)fprintf(
+        f,
+        "%s\t%s\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.4f\t%d\t%d"
+        "\t%s:%d-%d\t%s:%d-%d\n",
+        a && a->qualified_name ? a->qualified_name : "?",
+        b && b->qualified_name ? b->qualified_name : "?", (double)de->score, (double)s.tfidf,
+        (double)s.ri, (double)s.minhash, (double)s.api, (double)s.type, (double)s.decorator,
+        (double)s.struct_profile, (double)s.proximity, de->same_file ? 1 : 0, admitted ? 1 : 0,
+        a && a->file_path ? a->file_path : "?", a ? a->start_line : 0, a ? a->end_line : 0,
+        b && b->file_path ? b->file_path : "?", b ? b->start_line : 0, b ? b->end_line : 0);
+}
+
 static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_bufs, int worker_count,
-                               int *edge_counts, int max_edges) {
+                               int *edge_counts, int max_edges, const cbm_sem_func_t *funcs) {
     int total_pairs = 0;
     for (int w = 0; w < worker_count; w++) {
         total_pairs += worker_bufs[w].count;
@@ -1175,32 +1174,76 @@ static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_buf
      * chase the near-threshold SEMANTICALLY_RELATED flicker: find the pair that
      * flips, then compare its score between runs. */
     FILE *pair_dump = NULL;
+    FILE *signals = NULL;
     {
         char dump_path[CBM_SZ_1K];
         if (cbm_safe_getenv("CBM_SEM_PAIR_DUMP", dump_path, sizeof(dump_path), NULL)) {
             pair_dump = cbm_fopen(dump_path, "w");
         }
+        if (funcs && cbm_safe_getenv("CBM_SEM_PAIR_SIGNALS", dump_path, sizeof(dump_path), NULL)) {
+            signals = cbm_fopen(dump_path, "w");
+        }
+    }
+
+    /* Admission: best-first by score under the per-function budget
+     * (cbm_sem_admit_best_first); the dumps and the edge inserts below keep
+     * the canonical order. */
+    float *scores = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)n * sizeof(float));
+    int *fa = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)n * sizeof(int));
+    int *fb = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)n * sizeof(int));
+    bool *eligible = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)n * sizeof(bool));
+    bool *admitted = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)n * sizeof(bool));
+    bool ranked = scores && fa && fb && eligible && admitted;
+    for (int e = 0; ranked && e < n; e++) {
+        scores[e] = pairs[e].score;
+        fa[e] = pairs[e].i;
+        fb[e] = pairs[e].j;
+        eligible[e] = !pairs[e].below;
+    }
+    ranked = ranked && cbm_sem_admit_best_first(scores, fa, fb, eligible, n, max_edges, edge_counts,
+                                                admitted);
+    if (!ranked) {
+        cbm_log_warn("semantic_edges.admission", "reason", "out_of_memory", "pairs", itoa_log(n));
     }
 
     int total_edges = 0;
-    for (int e = 0; e < n; e++) {
+    for (int e = 0; ranked && e < n; e++) {
         deferred_edge_t *de = &pairs[e];
+        if (de->below) {
+            if (signals) {
+                pair_signals_line(signals, gbuf, funcs, de, false);
+            }
+            continue;
+        }
         if (pair_dump) {
             fprintf(pair_dump, "%d %d %.9g\n", de->i, de->j, (double)de->score);
         }
-        if (edge_counts[de->i] >= max_edges || edge_counts[de->j] >= max_edges) {
+        if (signals) {
+            pair_signals_line(signals, gbuf, funcs, de, admitted[e]);
+        }
+        if (!admitted[e]) {
             continue;
         }
+        /* p from the score as stored, so one shown score carries one p. */
+        char score_text[CBM_SZ_32];
+        snprintf(score_text, sizeof(score_text), "%.3f", (double)de->score);
         char props[PROPS_BUF];
-        snprintf(props, sizeof(props), "{\"score\":%.3f,\"same_file\":%s}", de->score,
-                 de->same_file ? "true" : "false");
+        snprintf(props, sizeof(props), "{\"score\":%s,\"same_file\":%s,\"p\":%.2f}", score_text,
+                 de->same_file ? "true" : "false",
+                 (double)cbm_sem_calibrated_p(strtof(score_text, NULL)));
         cbm_gbuf_insert_edge(gbuf, de->source_id, de->target_id, "SEMANTICALLY_RELATED", props);
-        edge_counts[de->i]++;
-        edge_counts[de->j]++;
         total_edges++;
     }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, scores);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fa);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fb);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, eligible);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, admitted);
     if (pair_dump) {
         (void)fclose(pair_dump);
+    }
+    if (signals) {
+        (void)fclose(signals);
     }
     cbm_free(CBM_MEM_CLASS_SEMANTIC, pairs);
     return total_edges;
@@ -1542,13 +1585,14 @@ static void sem_corpus_dump(const cbm_sem_corpus_t *corpus, const char *suffix) 
 /* Phase 6a: score candidate pairs in parallel and collect deferred edges. */
 static void phase6a_score_candidates(cbm_sem_func_t *funcs, uint64_t *signatures, int *edge_counts,
                                      sem_bucket_t **band_buckets, cbm_sem_config_t cfg,
-                                     deferred_edge_buf_t *worker_bufs, int func_count,
-                                     int worker_count) {
+                                     float record_floor, deferred_edge_buf_t *worker_bufs,
+                                     int func_count, int worker_count) {
     score_ctx_t sc = {
         .funcs = funcs,
         .signatures = signatures,
         .edge_counts = edge_counts,
         .cfg = cfg,
+        .record_floor = record_floor,
         .func_count = func_count,
         .band_buckets = (void *)band_buckets,
         .worker_bufs = worker_bufs,
@@ -1619,14 +1663,30 @@ static int run_scoring_phase(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs, uint64_t *
         deferred_buf_init(&worker_bufs[w]);
     }
 
+    /* The measuring harness may record pairs below the threshold (never
+     * admitted): CBM_SEM_PAIR_SIGNALS_FLOOR, only with CBM_SEM_PAIR_SIGNALS. */
+    float record_floor = cfg.threshold;
+    {
+        char path[CBM_SZ_1K]; /* the dump path: a buffer too short reads as unset */
+        char buf[CBM_SZ_64];
+        if (cbm_safe_getenv("CBM_SEM_PAIR_SIGNALS", path, sizeof(path), NULL) &&
+            cbm_safe_getenv("CBM_SEM_PAIR_SIGNALS_FLOOR", buf, sizeof(buf), NULL)) {
+            float floor_value = strtof(buf, NULL);
+            if (floor_value > 0.0F && floor_value < cfg.threshold) {
+                record_floor = floor_value;
+            }
+        }
+    }
+
     CBM_PROF_START(t_phase6a);
     sem_state_dump(funcs, func_count);
-    phase6a_score_candidates(funcs, signatures, edge_counts, band_buckets, cfg, worker_bufs,
-                             func_count, worker_count);
+    phase6a_score_candidates(funcs, signatures, edge_counts, band_buckets, cfg, record_floor,
+                             worker_bufs, func_count, worker_count);
     CBM_PROF_END_N("semantic_edges", "6a_score_parallel", t_phase6a, func_count);
 
     CBM_PROF_START(t_phase6b);
-    int total = phase6b_merge_edges(gbuf, worker_bufs, worker_count, edge_counts, cfg.max_edges);
+    int total =
+        phase6b_merge_edges(gbuf, worker_bufs, worker_count, edge_counts, cfg.max_edges, funcs);
     CBM_PROF_END_N("semantic_edges", "6b_edge_merge_seq", t_phase6b, total);
 
     cbm_free(CBM_MEM_CLASS_SEMANTIC, worker_bufs);
@@ -1812,6 +1872,1233 @@ static cbm_sem_corpus_t *run_token_phases_batched(cbm_gbuf_t *gbuf, cbm_sem_func
 
 /* ── Pass entry point ────────────────────────────────────────────── */
 
+/* ── Phase 6c: doc sections -> functions (candidate generator) ───── */
+
+/* Doc -> code candidates: for every Section node that can be about code, the
+ * functions whose TF-IDF terms best match the section's heading + body, over
+ * the FUNCTIONS' corpus (sections never change a function-pair score).
+ *   Gate: no candidates for sections whose heading names a release (v1.2), a
+ *   changelog, licence, contributing, links, contents, install or support
+ *   kind of section, whose body has fewer than SEM_DOC_MIN_WORDS words, or
+ *   whose body is mostly links.
+ *   Targets: never a test function (by path or name); candidates come from
+ *   the section's key terms (held by at most one in SEM_DOC_KEY_DF_DIV
+ *   functions, or SEM_DOC_KEY_DF_MIN) and are scored on every shared term.
+ * Stored (doc_link_candidates, never graph edges): a section's best
+ * CBM_SEM_DOC_TOP_K with tfidf >= CBM_SEM_DOC_MIN_SCORE, each with its judged
+ * probability (cbm_sem_doc_calibrated_p) -- candidates for an agent to
+ * verify, not links.
+ * CBM_SEM_DOC_SIGNALS=<path> also dumps every section's best SEM_DOC_TOP_K:
+ * section and function qualified names, tfidf, rank, shared terms, both
+ * locations, and the name evidence (the function's name tokens present in the
+ * section, and the highest idf among them) -- the population the judged
+ * calibration samples are drawn from. */
+enum {
+    SEM_DOC_TOP_K = 10,
+    SEM_DOC_KEY_DF_MIN = 50,
+    SEM_DOC_KEY_DF_DIV = 20,
+    SEM_DOC_MAX_TOKENS = 1024,
+    SEM_DOC_TEXT_MAX = 8192,
+    SEM_DOC_NAME_TOKENS = 16,
+    SEM_DOC_MIN_WORDS = 20,
+    SEM_DOC_LINK_PCT_MAX = 20, /* links per 100 body words */
+    SEM_DOC_WORD_MIN_LEN = 3,
+};
+
+typedef struct {
+    float score;
+    int func;
+    int shared;
+} doc_cand_t;
+
+typedef struct {
+    int func;
+    float tfidf;
+    int rank;
+    int shared;
+    int name_shared; /* the function's NAME tokens present in the section */
+    float name_idf;  /* the highest idf among them (0: none) */
+} doc_hit_t;
+
+typedef struct {
+    int file;
+    float tfidf;
+    int rank;
+    int shared;
+} doc_file_hit_t;
+
+typedef struct {
+    doc_hit_t hits[SEM_DOC_TOP_K];
+    int n;
+    doc_hit_t local[CBM_SEM_DOC_LOCAL_K]; /* inside the home, below the top CBM_SEM_DOC_TOP_K */
+    int nlocal;
+    doc_file_hit_t files[CBM_SEM_DOC_FILE_K];
+    int nfiles;
+} doc_result_t;
+
+static int cmp_doc_cand(const void *pa, const void *pb) {
+    const doc_cand_t *a = pa;
+    const doc_cand_t *b = pb;
+    if (a->score != b->score) {
+        return a->score > b->score ? -1 : 1;
+    }
+    return (a->func > b->func) - (a->func < b->func);
+}
+
+static int cmp_section_node(const void *pa, const void *pb) {
+    const cbm_gbuf_node_t *a = *(const cbm_gbuf_node_t *const *)pa;
+    const cbm_gbuf_node_t *b = *(const cbm_gbuf_node_t *const *)pb;
+    int c = strcmp(a->qualified_name ? a->qualified_name : "",
+                   b->qualified_name ? b->qualified_name : "");
+    if (c) {
+        return c;
+    }
+    return (a->start_line > b->start_line) - (a->start_line < b->start_line);
+}
+
+/* Heading kinds that are about the project, not about code: a release
+ * number, or one of these words (a trailing '*' matches any ending). */
+static const char *const DOC_SKIP_HEADING[] = {"changelog",
+                                               "change log",
+                                               "release note*",
+                                               "what's new",
+                                               "license",
+                                               "licence",
+                                               "contribut*",
+                                               "acknowledg*",
+                                               "credits",
+                                               "sponsor*",
+                                               "author*",
+                                               "code of conduct",
+                                               "security policy",
+                                               "links",
+                                               "references",
+                                               "resources",
+                                               "further reading",
+                                               "table of contents",
+                                               "contents",
+                                               "toc",
+                                               "installation",
+                                               "install",
+                                               "getting started",
+                                               "support",
+                                               "community",
+                                               "faq",
+                                               "roadmap",
+                                               "todo",
+                                               NULL};
+
+static bool doc_word_char(char c) {
+    return isalnum((unsigned char)c) || c == '\'';
+}
+
+/* Does lowercase heading lc contain word (or word* as a prefix) at a word start? */
+static bool doc_heading_has(const char *lc, const char *word) {
+    size_t wl = strlen(word);
+    bool prefix = wl > 0 && word[wl - SKIP_ONE] == '*';
+    size_t ml = prefix ? wl - SKIP_ONE : wl;
+    for (const char *p = lc; *p; p++) {
+        if (strncmp(p, word, ml) != 0) {
+            continue;
+        }
+        if (p > lc && doc_word_char(p[-SKIP_ONE])) {
+            continue;
+        }
+        if (!prefix && doc_word_char(p[ml])) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+/* A release-number heading: "v1.2", "1.2.3", "[0.12.15]", "Gin v1.11.0". */
+static bool doc_heading_is_release(const char *lc) {
+    for (const char *p = lc; *p; p++) {
+        if (p > lc && doc_word_char(p[-SKIP_ONE])) {
+            continue;
+        }
+        const char *q = *p == 'v' ? p + SKIP_ONE : p;
+        if (!isdigit((unsigned char)*q)) {
+            continue;
+        }
+        while (isdigit((unsigned char)*q)) {
+            q++;
+        }
+        if (*q == '.' && isdigit((unsigned char)q[SKIP_ONE])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Can this section be about code? (heading kind, body length, link share) */
+static bool doc_section_gated(const cbm_gbuf_node_t *sec, char *body) {
+    char lc[CBM_SZ_256];
+    size_t n = 0;
+    for (const char *p = sec->name ? sec->name : ""; *p && n + SKIP_ONE < sizeof(lc); p++) {
+        lc[n++] = (char)tolower((unsigned char)*p);
+    }
+    lc[n] = '\0';
+    if (doc_heading_is_release(lc)) {
+        return false;
+    }
+    for (int k = 0; DOC_SKIP_HEADING[k]; k++) {
+        if (doc_heading_has(lc, DOC_SKIP_HEADING[k])) {
+            return false;
+        }
+    }
+    if (!json_str_value(sec->properties_json, "docstring", body, SEM_DOC_TEXT_MAX)) {
+        return false;
+    }
+    int words = 0;
+    int links = 0;
+    int run = 0;
+    for (const char *p = body;; p++) {
+        if (isalpha((unsigned char)*p)) {
+            run++;
+            continue;
+        }
+        words += run >= SEM_DOC_WORD_MIN_LEN ? SKIP_ONE : 0;
+        run = 0;
+        if (!*p) {
+            break;
+        }
+        if (strncmp(p, "http://", sizeof("http://") - SKIP_ONE) == 0 ||
+            strncmp(p, "https://", sizeof("https://") - SKIP_ONE) == 0 ||
+            strncmp(p, "](", sizeof("](") - SKIP_ONE) == 0) {
+            links++;
+        }
+    }
+    return words >= SEM_DOC_MIN_WORDS && links * 100 < SEM_DOC_LINK_PCT_MAX * words;
+}
+
+/* A test file: in a test directory, or a test file name. */
+static bool doc_is_test_path(const char *path) {
+    static const char *const DIRS[] = {"test/",  "tests/",    "__tests__/", "testing/",  "spec/",
+                                       "specs/", "testdata/", "fixture/",   "fixtures/", NULL};
+    path = path ? path : "";
+    for (int k = 0; DIRS[k]; k++) {
+        for (const char *p = path; (p = strstr(p, DIRS[k])) != NULL; p++) {
+            if (p == path || p[-SKIP_ONE] == '/') {
+                return true;
+            }
+        }
+    }
+    const char *base = strrchr(path, '/');
+    base = base ? base + SKIP_ONE : path;
+    return strncmp(base, "test_", sizeof("test_") - SKIP_ONE) == 0 || strstr(base, "_test.") ||
+           strstr(base, ".test.") || strstr(base, ".spec.") || strstr(base, "Test.") ||
+           strstr(base, "Tests.");
+}
+
+/* A test function, by its file or name. */
+static bool doc_is_test_function(const cbm_gbuf_node_t *fn) {
+    if (doc_is_test_path(fn ? fn->file_path : NULL)) {
+        return true;
+    }
+    const char *name = fn && fn->name ? fn->name : "";
+    return strncmp(name, "test_", sizeof("test_") - SKIP_ONE) == 0 ||
+           (strncmp(name, "Test", sizeof("Test") - SKIP_ONE) == 0 &&
+            (isupper((unsigned char)name[4]) || name[4] == '_'));
+}
+
+/* The section's tokens (heading + body); the caller frees each token. */
+static int doc_section_tokens(const cbm_gbuf_node_t *n, const char *body, char **tokens) {
+    int count = cbm_sem_tokenize(n->name, tokens, SEM_DOC_MAX_TOKENS);
+    if (body && count < SEM_DOC_MAX_TOKENS) {
+        count += cbm_sem_tokenize(body, tokens + count, SEM_DOC_MAX_TOKENS - count);
+    }
+    return count;
+}
+
+/* Dot product and shared-term count of two ascending term lists. */
+static float doc_terms_dot(const int *ia, const float *wa, int na, const int *ib, const float *wb,
+                           int nb, int *shared) {
+    float dot = 0.0F;
+    int a = 0;
+    int b = 0;
+    *shared = 0;
+    while (a < na && b < nb) {
+        if (ia[a] == ib[b]) {
+            dot += wa[a] * wb[b];
+            (*shared)++;
+            a++;
+            b++;
+        } else if (ia[a] < ib[b]) {
+            a++;
+        } else {
+            b++;
+        }
+    }
+    return dot;
+}
+
+static float terms_norm(const float *w, int n) {
+    float s = 0.0F;
+    for (int k = 0; k < n; k++) {
+        s += w[k] * w[k];
+    }
+    return sqrtf(s);
+}
+
+/* ── Phase 6c: whole files and the doc's home folder ── */
+
+/* Whole-file candidates: a file's terms are the sum of its non-test
+ * functions' TF-IDF vectors and the TF-IDF vectors of its other definitions'
+ * names (a config file's keys are Variable nodes), cut to its
+ * SEM_DOC_FILE_TERMS heaviest terms (ties by token index), so a file's vector
+ * costs at most what one long function's does. */
+enum { SEM_DOC_FILE_TERMS = 64 };
+static const char *const DOC_FILE_DEF_LABELS[] = {"Class",    "Struct", "Interface", "Enum",
+                                                  "Type",     "Trait",  "Field",     "Variable",
+                                                  "Constant", "Macro",  NULL};
+
+typedef struct {
+    int count;
+    const cbm_gbuf_node_t **node; /* per file: its File node */
+    int *off;                     /* count + 1: each file's terms in idx / w */
+    int *idx;
+    float *w;
+    float *norm;
+    int *post_off; /* nterms + 1: the files holding each term */
+    int *post_f;
+    CBMHashTable *by_path; /* file path (graph-owned) -> file index + 1 */
+} doc_files_t;
+
+typedef struct {
+    int idx;
+    float w;
+} doc_term_t;
+
+static int cmp_term_idx(const void *pa, const void *pb) {
+    const doc_term_t *a = pa;
+    const doc_term_t *b = pb;
+    return (a->idx > b->idx) - (a->idx < b->idx);
+}
+
+static int cmp_term_heavy(const void *pa, const void *pb) {
+    const doc_term_t *a = pa;
+    const doc_term_t *b = pb;
+    if (a->w != b->w) {
+        return a->w > b->w ? -1 : 1;
+    }
+    return (a->idx > b->idx) - (a->idx < b->idx);
+}
+
+static void doc_files_free(doc_files_t *df) {
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, df->node);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, df->off);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, df->idx);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, df->w);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, df->norm);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, df->post_off);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, df->post_f);
+    if (df->by_path) {
+        cbm_ht_free(df->by_path);
+    }
+    memset(df, 0, sizeof(*df));
+}
+
+static int doc_file_of(const doc_files_t *df, const char *path) {
+    return path ? (int)(intptr_t)cbm_ht_get(df->by_path, path) - SKIP_ONE : -SKIP_ONE;
+}
+
+/* The scratch terms of one file: append n terms, growing the buffer. */
+typedef struct {
+    doc_term_t *t;
+    int n;
+    int cap;
+} doc_scratch_t;
+
+static bool doc_scratch_add(doc_scratch_t *sc, const int *idx, const float *w, int n) {
+    if (sc->n + n > sc->cap) {
+        int cap = sc->cap ? sc->cap : CBM_SZ_256;
+        while (cap < sc->n + n) {
+            cap *= 2;
+        }
+        doc_term_t *t = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, sc->t, (size_t)cap * sizeof(*t));
+        if (!t) {
+            return false;
+        }
+        sc->t = t;
+        sc->cap = cap;
+    }
+    for (int k = 0; k < n; k++) {
+        sc->t[sc->n++] = (doc_term_t){.idx = idx[k], .w = w[k]};
+    }
+    return true;
+}
+
+/* Sum the scratch terms per token and keep the heaviest SEM_DOC_FILE_TERMS,
+ * written at df->idx/w + off in ascending token order; returns how many. */
+static int doc_scratch_reduce(doc_scratch_t *sc, doc_files_t *df, int off) {
+    if (sc->n == 0) {
+        return 0;
+    }
+    qsort(sc->t, (size_t)sc->n, sizeof(*sc->t), cmp_term_idx);
+    int m = 0;
+    for (int k = 0; k < sc->n; k++) {
+        if (m > 0 && sc->t[m - SKIP_ONE].idx == sc->t[k].idx) {
+            sc->t[m - SKIP_ONE].w += sc->t[k].w;
+        } else {
+            sc->t[m++] = sc->t[k];
+        }
+    }
+    if (m > SEM_DOC_FILE_TERMS) {
+        qsort(sc->t, (size_t)m, sizeof(*sc->t), cmp_term_heavy);
+        m = SEM_DOC_FILE_TERMS;
+        qsort(sc->t, (size_t)m, sizeof(*sc->t), cmp_term_idx);
+    }
+    for (int k = 0; k < m; k++) {
+        df->idx[off + k] = sc->t[k].idx;
+        df->w[off + k] = sc->t[k].w;
+    }
+    return m;
+}
+
+/* The definitions (non-function) of every indexed non-test file, grouped by
+ * file: def_off (count + 1) into def_node. */
+static bool doc_files_defs(const cbm_gbuf_t *gbuf, const doc_files_t *df, int **def_off,
+                           const cbm_gbuf_node_t ***def_node) {
+    *def_off = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)df->count + SKIP_ONE) * sizeof(int));
+    if (!*def_off) {
+        return false;
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        int *cursor =
+            pass ? cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)df->count * sizeof(int)) : NULL;
+        if (pass && !cursor) {
+            return false;
+        }
+        for (int l = 0; DOC_FILE_DEF_LABELS[l]; l++) {
+            const cbm_gbuf_node_t **nodes = NULL;
+            int n = 0;
+            if (cbm_gbuf_find_by_label(gbuf, DOC_FILE_DEF_LABELS[l], &nodes, &n) != 0) {
+                continue;
+            }
+            for (int i = 0; i < n; i++) {
+                int f = nodes[i]->name ? doc_file_of(df, nodes[i]->file_path) : -SKIP_ONE;
+                if (f >= 0 && !pass) {
+                    (*def_off)[f + SKIP_ONE]++;
+                } else if (f >= 0) {
+                    (*def_node)[(*def_off)[f] + cursor[f]++] = nodes[i];
+                }
+            }
+        }
+        if (!pass) {
+            for (int f = 0; f < df->count; f++) {
+                (*def_off)[f + SKIP_ONE] += (*def_off)[f];
+            }
+            *def_node = cbm_alloc(CBM_MEM_CLASS_SEMANTIC,
+                                  ((size_t)(*def_off)[df->count] + SKIP_ONE) * sizeof(**def_node));
+            if (!*def_node) {
+                return false;
+            }
+        }
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, cursor);
+    }
+    return true;
+}
+
+/* The scratch terms of one definition's name. */
+static bool doc_scratch_name(doc_scratch_t *sc, const cbm_sem_corpus_t *corpus, const char *name) {
+    char *tok[SEM_DOC_NAME_TOKENS];
+    int idx[SEM_DOC_NAME_TOKENS];
+    float w[SEM_DOC_NAME_TOKENS];
+    int nt = cbm_sem_tokenize(name, tok, SEM_DOC_NAME_TOKENS);
+    int nw = nt > 0 ? cbm_sem_tfidf_terms(corpus, tok, NULL, nt, idx, w) : 0;
+    for (int t = 0; t < nt; t++) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, tok[t]);
+    }
+    return doc_scratch_add(sc, idx, w, nw);
+}
+
+/* Each file's term vector, norm, and the term -> files postings. */
+static bool doc_files_vectors(const cbm_gbuf_t *gbuf, doc_files_t *df, const cbm_sem_func_t *funcs,
+                              const int *ffile, int func_count, const cbm_sem_corpus_t *corpus,
+                              int nterms) {
+    int *fn_off = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)df->count + SKIP_ONE) * sizeof(int));
+    int *fn_list = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)func_count + SKIP_ONE) * sizeof(int));
+    int *def_off = NULL;
+    const cbm_gbuf_node_t **def_node = NULL;
+    doc_scratch_t sc = {0};
+    bool ok = fn_off && fn_list && doc_files_defs(gbuf, df, &def_off, &def_node);
+    for (int f = 0; ok && f < func_count; f++) {
+        fn_off[ffile[f] + SKIP_ONE] += ffile[f] >= 0;
+    }
+    for (int i = 0; ok && i < df->count; i++) {
+        fn_off[i + SKIP_ONE] += fn_off[i];
+    }
+    for (int f = 0; ok && f < func_count; f++) {
+        if (ffile[f] >= 0) {
+            fn_list[fn_off[ffile[f]]++] = f; /* fn_off[i] ends at file i's end: shifted below */
+        }
+    }
+    for (int i = df->count; ok && i > 0; i--) {
+        fn_off[i] = fn_off[i - SKIP_ONE];
+    }
+    if (ok) {
+        fn_off[0] = 0;
+    }
+    for (int i = 0; ok && i < df->count; i++) {
+        sc.n = 0;
+        for (int k = fn_off[i]; ok && k < fn_off[i + SKIP_ONE]; k++) {
+            const cbm_sem_func_t *fn = &funcs[fn_list[k]];
+            ok = doc_scratch_add(&sc, fn->tfidf_indices, fn->tfidf_weights, fn->tfidf_len);
+        }
+        for (int k = def_off[i]; ok && k < def_off[i + SKIP_ONE]; k++) {
+            ok = doc_scratch_name(&sc, corpus, def_node[k]->name);
+        }
+        int m = ok ? doc_scratch_reduce(&sc, df, df->off[i]) : 0;
+        df->off[i + SKIP_ONE] = df->off[i] + m;
+        df->norm[i] = terms_norm(df->w + df->off[i], m);
+        for (int k = 0; k < m; k++) {
+            df->post_off[df->idx[df->off[i] + k] + SKIP_ONE]++;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, sc.t);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fn_off);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fn_list);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, def_off);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, def_node);
+    if (!ok) {
+        return false;
+    }
+    for (int t = 0; t < nterms; t++) {
+        df->post_off[t + SKIP_ONE] += df->post_off[t];
+    }
+    df->post_f =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)df->post_off[nterms] + SKIP_ONE) * sizeof(int));
+    int *cursor = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)nterms + SKIP_ONE) * sizeof(int));
+    ok = df->post_f && cursor;
+    for (int i = 0; ok && i < df->count; i++) {
+        for (int k = df->off[i]; k < df->off[i + SKIP_ONE]; k++) {
+            int t = df->idx[k];
+            df->post_f[df->post_off[t] + cursor[t]++] = i;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, cursor);
+    return ok;
+}
+
+/* The indexed non-test files (their File nodes) with their term vectors;
+ * ffile[f] = function f's file (-1: a test function or no File node). */
+static bool doc_files_build(const cbm_gbuf_t *gbuf, const cbm_sem_func_t *funcs, int func_count,
+                            const bool *is_test, const cbm_sem_corpus_t *corpus, int nterms,
+                            doc_files_t *df, int *ffile) {
+    memset(df, 0, sizeof(*df));
+    const cbm_gbuf_node_t **files = NULL;
+    int nfiles = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "File", &files, &nfiles) != 0) {
+        nfiles = 0;
+    }
+    df->by_path = cbm_ht_create_in(CBM_MEM_CLASS_SEMANTIC, (uint32_t)nfiles + SKIP_ONE);
+    df->node = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)nfiles + SKIP_ONE) * sizeof(*df->node));
+    if (!df->by_path || !df->node) {
+        return false;
+    }
+    for (int i = 0; i < nfiles; i++) {
+        const char *path = files[i]->file_path;
+        if (path && path[0] && !doc_is_test_path(path) && !cbm_ht_has(df->by_path, path)) {
+            df->node[df->count] = files[i];
+            cbm_ht_set(df->by_path, path, (void *)(intptr_t)(df->count + SKIP_ONE));
+            df->count++;
+        }
+    }
+    for (int f = 0; f < func_count; f++) {
+        const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_id(gbuf, funcs[f].node_id);
+        ffile[f] = is_test[f] || !fn ? -SKIP_ONE : doc_file_of(df, fn->file_path);
+    }
+    size_t cap = (size_t)df->count * SEM_DOC_FILE_TERMS + SKIP_ONE;
+    df->off = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)df->count + SKIP_ONE) * sizeof(int));
+    df->idx = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, cap * sizeof(int));
+    df->w = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, cap * sizeof(float));
+    df->norm = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)df->count + SKIP_ONE) * sizeof(float));
+    df->post_off = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)nterms + SKIP_ONE) * sizeof(int));
+    return df->off && df->idx && df->w && df->norm && df->post_off &&
+           doc_files_vectors(gbuf, df, funcs, ffile, func_count, corpus, nterms);
+}
+
+/* A doc's home folder: the folder whose code it documents. From the doc's
+ * directory, a docs folder (doc, docs, documentation: the deepest one)
+ * documents its parent; then climb while the folder holds no indexed code
+ * (a non-test file with terms). "" = the repository root: the doc documents
+ * the whole project. Returns an allocated string (NULL: out of memory). */
+static bool doc_dir_is_docs(const char *name, size_t n) {
+    static const char *const DOCS[] = {"doc", "docs", "documentation", NULL};
+    for (int k = 0; DOCS[k]; k++) {
+        if (strlen(DOCS[k]) == n && strncasecmp(name, DOCS[k], n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *doc_home(const char *doc_path, const CBMHashTable *code_dirs) {
+    const char *slash = doc_path ? strrchr(doc_path, '/') : NULL;
+    size_t len = slash ? (size_t)(slash - doc_path) : 0;
+    char *dir = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, len + SKIP_ONE);
+    if (!dir) {
+        return NULL;
+    }
+    memcpy(dir, doc_path ? doc_path : "", len);
+    dir[len] = '\0';
+    size_t cut = len + SKIP_ONE; /* the deepest docs folder's start (none) */
+    for (size_t a = 0; a < len;) {
+        const char *end = strchr(dir + a, '/');
+        size_t b = end ? (size_t)(end - dir) : len;
+        if (doc_dir_is_docs(dir + a, b - a)) {
+            cut = a;
+        }
+        a = b + SKIP_ONE;
+    }
+    if (cut <= len) {
+        len = cut > 0 ? cut - SKIP_ONE : 0; /* the docs folder's parent */
+        dir[len] = '\0';
+    }
+    while (len > 0 && !cbm_ht_has(code_dirs, dir)) {
+        const char *up = strrchr(dir, '/');
+        len = up ? (size_t)(up - dir) : 0;
+        dir[len] = '\0';
+    }
+    return dir;
+}
+
+/* Every folder holding indexed code: the directories (and their ancestors)
+ * of the files with terms; keys owned by the table's caller (freed by
+ * doc_code_dirs_free). */
+static void doc_free_key(const char *key, void *value, void *userdata) {
+    (void)value;
+    (void)userdata;
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)key);
+}
+
+static void doc_code_dirs_free(CBMHashTable *dirs) {
+    if (dirs) {
+        cbm_ht_foreach(dirs, doc_free_key, NULL);
+        cbm_ht_free(dirs);
+    }
+}
+
+static CBMHashTable *doc_code_dirs(const doc_files_t *df) {
+    CBMHashTable *dirs = cbm_ht_create_in(CBM_MEM_CLASS_SEMANTIC, CBM_SZ_256);
+    for (int i = 0; dirs && i < df->count; i++) {
+        const char *path = df->node[i]->file_path;
+        if (df->off[i + SKIP_ONE] == df->off[i]) {
+            continue;
+        }
+        for (const char *p = strchr(path, '/'); p; p = strchr(p + SKIP_ONE, '/')) {
+            size_t n = (size_t)(p - path);
+            char *key = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, n + SKIP_ONE);
+            if (!key) {
+                doc_code_dirs_free(dirs);
+                return NULL;
+            }
+            memcpy(key, path, n);
+            key[n] = '\0';
+            if (cbm_ht_has(dirs, key)) {
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, key);
+            } else {
+                cbm_ht_set(dirs, key, (void *)(intptr_t)SKIP_ONE);
+            }
+        }
+    }
+    return dirs;
+}
+
+/* A candidate's position: inside the home (or the home folder itself),
+ * outside it, or no position (the home is the repository root). */
+static cbm_sem_doc_pos_t doc_position(const char *home, const char *path) {
+    if (!home || !home[0]) {
+        return CBM_SEM_DOC_POS_GLOBAL;
+    }
+    size_t n = strlen(home);
+    return path && strncmp(path, home, n) == 0 && (path[n] == '/' || path[n] == '\0')
+               ? CBM_SEM_DOC_POS_LOCAL
+               : CBM_SEM_DOC_POS_OUTSIDE;
+}
+
+static const char *doc_position_name(cbm_sem_doc_pos_t pos) {
+    return pos == CBM_SEM_DOC_POS_LOCAL     ? "local"
+           : pos == CBM_SEM_DOC_POS_OUTSIDE ? "outside"
+                                            : "global";
+}
+
+/* Per section: its doc's home, whether it is its doc's first section (the
+ * one a folder candidate starts from), and the Folder nodes by path. */
+typedef struct {
+    char **home;
+    bool *first;
+    CBMHashTable *folders; /* folder path (graph-owned) -> Folder node */
+} doc_place_t;
+
+static void doc_place_free(doc_place_t *pl, int nsec) {
+    for (int s = 0; pl->home && s < nsec; s++) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, pl->home[s]);
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, pl->home);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, pl->first);
+    if (pl->folders) {
+        cbm_ht_free(pl->folders);
+    }
+    memset(pl, 0, sizeof(*pl));
+}
+
+static bool doc_place_build(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t **secs, int nsec,
+                            const doc_files_t *df, doc_place_t *pl) {
+    memset(pl, 0, sizeof(*pl));
+    pl->home = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)nsec * sizeof(*pl->home));
+    pl->first = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)nsec * sizeof(*pl->first));
+    pl->folders = cbm_ht_create_in(CBM_MEM_CLASS_SEMANTIC, CBM_SZ_256);
+    CBMHashTable *firsts = cbm_ht_create_in(CBM_MEM_CLASS_SEMANTIC, CBM_SZ_256);
+    CBMHashTable *dirs = doc_code_dirs(df);
+    bool ok = pl->home && pl->first && pl->folders && firsts && dirs;
+    for (int s = 0; ok && s < nsec; s++) {
+        pl->home[s] = doc_home(secs[s]->file_path, dirs);
+        ok = pl->home[s] != NULL;
+        const char *path = secs[s]->file_path;
+        if (ok && path) {
+            int prev = (int)(intptr_t)cbm_ht_get(firsts, path) - SKIP_ONE;
+            if (prev < 0 || secs[s]->start_line < secs[prev]->start_line) {
+                cbm_ht_set(firsts, path, (void *)(intptr_t)(s + SKIP_ONE));
+            }
+        }
+    }
+    for (int s = 0; ok && s < nsec; s++) {
+        const char *path = secs[s]->file_path;
+        pl->first[s] = path && (int)(intptr_t)cbm_ht_get(firsts, path) == s + SKIP_ONE;
+    }
+    const cbm_gbuf_node_t **folders = NULL;
+    int nfold = 0;
+    if (ok && cbm_gbuf_find_by_label(gbuf, "Folder", &folders, &nfold) == 0) {
+        for (int i = 0; i < nfold; i++) {
+            if (folders[i]->file_path && folders[i]->file_path[0]) {
+                cbm_ht_set(pl->folders, folders[i]->file_path, (void *)folders[i]);
+            }
+        }
+    }
+    if (firsts) {
+        cbm_ht_free(firsts);
+    }
+    doc_code_dirs_free(dirs);
+    return ok;
+}
+
+typedef struct {
+    const cbm_sem_func_t *funcs;
+    int func_count;
+    const cbm_sem_corpus_t *corpus;
+    const cbm_gbuf_node_t **secs;
+    int nsec;
+    const int *post_off;
+    const int *post_f;
+    int key_df;
+    const float *fnorm;
+    const bool *is_test;
+    const int *name_off; /* per function: its name tokens' corpus indices */
+    const int *name_idx;
+    const char *const *fpath; /* per function: its file */
+    const char *const *home;  /* per section: its doc's home ("" = the root) */
+    const doc_files_t *files;
+    int file_key_df;
+    doc_result_t *res;
+    _Atomic int next;
+} doc_ctx_t;
+
+/* Name-field evidence of one hit: the function's name tokens that the
+ * section holds (sidx ascending), and the highest idf among them. */
+static void doc_name_evidence(const doc_ctx_t *dc, const int *sidx, int ns, doc_hit_t *hit) {
+    hit->name_shared = 0;
+    hit->name_idf = 0.0F;
+    for (int k = dc->name_off[hit->func]; k < dc->name_off[hit->func + SKIP_ONE]; k++) {
+        int t = dc->name_idx[k];
+        int lo = 0;
+        int hi = ns - SKIP_ONE;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (sidx[mid] == t) {
+                float idf = cbm_sem_corpus_idf_at(dc->corpus, t);
+                hit->name_shared++;
+                hit->name_idf = idf > hit->name_idf ? idf : hit->name_idf;
+                break;
+            }
+            if (sidx[mid] < t) {
+                lo = mid + SKIP_ONE;
+            } else {
+                hi = mid - SKIP_ONE;
+            }
+        }
+    }
+}
+
+/* The section's best CBM_SEM_DOC_FILE_K whole files, retrieved by the
+ * section's key terms over the files' postings, scored by cosine. */
+static void doc_section_files(doc_ctx_t *dc, int s, const int *sidx, const float *sw, int ns,
+                              float snorm, int *fstamp, doc_cand_t *fc) {
+    const doc_files_t *df = dc->files;
+    doc_result_t *r = &dc->res[s];
+    int nc = 0;
+    for (int k = 0; k < ns && snorm > 0.0F; k++) {
+        int t = sidx[k];
+        if (df->post_off[t + SKIP_ONE] - df->post_off[t] > dc->file_key_df) {
+            continue;
+        }
+        for (int p = df->post_off[t]; p < df->post_off[t + SKIP_ONE]; p++) {
+            int f = df->post_f[p];
+            if (fstamp[f] != s) {
+                fstamp[f] = s;
+                fc[nc++] = (doc_cand_t){.func = f};
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) {
+        int f = fc[c].func;
+        int len = df->off[f + SKIP_ONE] - df->off[f];
+        float dot = doc_terms_dot(sidx, sw, ns, df->idx + df->off[f], df->w + df->off[f], len,
+                                  &fc[c].shared);
+        float denom = snorm * df->norm[f];
+        fc[c].score = denom > 0.0F ? dot / denom : 0.0F;
+    }
+    if (nc > 1) {
+        qsort(fc, (size_t)nc, sizeof(fc[0]), cmp_doc_cand);
+    }
+    for (int c = 0; c < nc && c < CBM_SEM_DOC_FILE_K; c++) {
+        r->files[r->nfiles++] = (doc_file_hit_t){
+            .file = fc[c].func, .tfidf = fc[c].score, .rank = c + SKIP_ONE, .shared = fc[c].shared};
+    }
+}
+
+/* Up to CBM_SEM_DOC_LOCAL_K functions inside the section's home that rank
+ * below the top CBM_SEM_DOC_TOP_K, at CBM_SEM_DOC_MIN_SCORE or more (cands
+ * sorted best first). */
+static void doc_section_local(doc_ctx_t *dc, int s, const doc_cand_t *cands, int nc,
+                              const int *sidx, int ns) {
+    doc_result_t *r = &dc->res[s];
+    const char *home = dc->home[s];
+    for (int c = CBM_SEM_DOC_TOP_K; home && home[0] && c < nc && r->nlocal < CBM_SEM_DOC_LOCAL_K;
+         c++) {
+        if (cands[c].score < CBM_SEM_DOC_MIN_SCORE) {
+            break;
+        }
+        if (doc_position(home, dc->fpath[cands[c].func]) != CBM_SEM_DOC_POS_LOCAL) {
+            continue;
+        }
+        doc_hit_t *hit = &r->local[r->nlocal++];
+        *hit = (doc_hit_t){.func = cands[c].func,
+                           .tfidf = cands[c].score,
+                           .rank = c + SKIP_ONE,
+                           .shared = cands[c].shared};
+        doc_name_evidence(dc, sidx, ns, hit);
+    }
+}
+
+static void doc_section_one(doc_ctx_t *dc, int s, int *stamp, doc_cand_t *cands, int *sidx,
+                            float *sw, char *body, int *fstamp, doc_cand_t *fc) {
+    doc_result_t *r = &dc->res[s];
+    r->n = 0;
+    r->nlocal = 0;
+    r->nfiles = 0;
+    if (!doc_section_gated(dc->secs[s], body)) {
+        return;
+    }
+    char *tokens[SEM_DOC_MAX_TOKENS];
+    int count = doc_section_tokens(dc->secs[s], body, tokens);
+    int ns = cbm_sem_tfidf_terms(dc->corpus, tokens, NULL, count, sidx, sw);
+    for (int t = 0; t < count; t++) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, tokens[t]);
+    }
+    float snorm = terms_norm(sw, ns);
+    int nc = 0;
+    for (int k = 0; k < ns && snorm > 0.0F; k++) {
+        int t = sidx[k];
+        if (dc->post_off[t + SKIP_ONE] - dc->post_off[t] > dc->key_df) {
+            continue;
+        }
+        for (int p = dc->post_off[t]; p < dc->post_off[t + SKIP_ONE]; p++) {
+            int f = dc->post_f[p];
+            if (stamp[f] != s && !dc->is_test[f]) {
+                stamp[f] = s;
+                cands[nc++] = (doc_cand_t){.func = f};
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) {
+        const cbm_sem_func_t *fn = &dc->funcs[cands[c].func];
+        float dot = doc_terms_dot(sidx, sw, ns, fn->tfidf_indices, fn->tfidf_weights, fn->tfidf_len,
+                                  &cands[c].shared);
+        float denom = snorm * dc->fnorm[cands[c].func];
+        cands[c].score = denom > 0.0F ? dot / denom : 0.0F;
+    }
+    if (nc > 1) {
+        qsort(cands, (size_t)nc, sizeof(cands[0]), cmp_doc_cand);
+    }
+    for (int c = 0; c < nc && c < SEM_DOC_TOP_K; c++) {
+        doc_hit_t *hit = &r->hits[r->n++];
+        *hit = (doc_hit_t){.func = cands[c].func,
+                           .tfidf = cands[c].score,
+                           .rank = c + SKIP_ONE,
+                           .shared = cands[c].shared};
+        doc_name_evidence(dc, sidx, ns, hit);
+    }
+    doc_section_local(dc, s, cands, nc, sidx, ns);
+    doc_section_files(dc, s, sidx, sw, ns, snorm, fstamp, fc);
+}
+
+static void doc_section_worker(int worker_id, void *ctx_ptr) {
+    (void)worker_id;
+    doc_ctx_t *dc = ctx_ptr;
+    int nf = dc->files->count;
+    int *stamp = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)dc->func_count * sizeof(int));
+    doc_cand_t *cands =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)dc->func_count * sizeof(doc_cand_t));
+    int *fstamp = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)nf + SKIP_ONE) * sizeof(int));
+    doc_cand_t *fc = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)nf + SKIP_ONE) * sizeof(*fc));
+    int *sidx = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)SEM_DOC_MAX_TOKENS * sizeof(int));
+    float *sw = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)SEM_DOC_MAX_TOKENS * sizeof(float));
+    char *body = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, SEM_DOC_TEXT_MAX);
+    if (stamp && cands && fstamp && fc && sidx && sw && body) {
+        for (int f = 0; f < dc->func_count; f++) {
+            stamp[f] = -1;
+        }
+        for (int f = 0; f < nf; f++) {
+            fstamp[f] = -1;
+        }
+        while (true) {
+            int s = atomic_fetch_add_explicit(&dc->next, SKIP_ONE, memory_order_relaxed);
+            if (s >= dc->nsec) {
+                break;
+            }
+            doc_section_one(dc, s, stamp, cands, sidx, sw, body, fstamp, fc);
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, stamp);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, cands);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fstamp);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fc);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, sidx);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, sw);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, body);
+}
+
+static const char *const DOC_KIND_NAME[CBM_SEM_DOC_KIND_COUNT] = {"function", "local", "file",
+                                                                  "folder"};
+
+/* The doc's home Folder node, for the doc's first section (NULL: another
+ * section, or the home is the repository root). */
+static const cbm_gbuf_node_t *doc_home_folder(const doc_place_t *pl, int s) {
+    return pl->first[s] && pl->home[s][0] ? cbm_ht_get(pl->folders, pl->home[s]) : NULL;
+}
+
+static cbm_sem_doc_pos_t doc_target_position(const char *home, const cbm_gbuf_node_t *target,
+                                             cbm_sem_doc_kind_t kind) {
+    return kind == CBM_SEM_DOC_KIND_FOLDER ? CBM_SEM_DOC_POS_LOCAL
+                                           : doc_position(home, target->file_path);
+}
+
+/* One CBM_SEM_DOC_SIGNALS line: section and target qualified names, tfidf,
+ * rank, shared terms, both locations, the name evidence, then the kind, the
+ * position and the doc's home ("." = the repository root). */
+static void doc_signal_line(FILE *out, const cbm_gbuf_node_t *sec, const cbm_gbuf_node_t *t,
+                            const doc_hit_t *hit, cbm_sem_doc_kind_t kind, const char *home) {
+    (void)fprintf(out, "%s\t%s\t%.6f\t%d\t%d\t%s:%d-%d\t%s:%d-%d\t%d\t%.6f\t%s\t%s\t%s\n",
+                  sec->qualified_name ? sec->qualified_name : "?",
+                  t && t->qualified_name ? t->qualified_name : "?", (double)hit->tfidf, hit->rank,
+                  hit->shared, sec->file_path ? sec->file_path : "?", sec->start_line,
+                  sec->end_line, t && t->file_path ? t->file_path : "?", t ? t->start_line : 0,
+                  t ? t->end_line : 0, hit->name_shared, (double)hit->name_idf, DOC_KIND_NAME[kind],
+                  t ? doc_position_name(doc_target_position(home, t, kind)) : "?",
+                  home[0] ? home : ".");
+}
+
+static void doc_section_lines(FILE *out, const cbm_gbuf_t *gbuf, const doc_ctx_t *dc,
+                              const doc_place_t *pl, int s) {
+    const cbm_gbuf_node_t *sec = dc->secs[s];
+    const doc_result_t *r = &dc->res[s];
+    for (int h = 0; h < r->n + r->nlocal; h++) {
+        const doc_hit_t *hit = h < r->n ? &r->hits[h] : &r->local[h - r->n];
+        const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_id(gbuf, dc->funcs[hit->func].node_id);
+        doc_signal_line(out, sec, fn, hit,
+                        h < r->n ? CBM_SEM_DOC_KIND_FUNCTION : CBM_SEM_DOC_KIND_LOCAL, pl->home[s]);
+    }
+    for (int h = 0; h < r->nfiles; h++) {
+        const doc_file_hit_t *fh = &r->files[h];
+        doc_hit_t hit = {.tfidf = fh->tfidf, .rank = fh->rank, .shared = fh->shared};
+        doc_signal_line(out, sec, dc->files->node[fh->file], &hit, CBM_SEM_DOC_KIND_FILE,
+                        pl->home[s]);
+    }
+    const cbm_gbuf_node_t *folder = doc_home_folder(pl, s);
+    if (folder) {
+        doc_hit_t hit = {.rank = SKIP_ONE};
+        doc_signal_line(out, sec, folder, &hit, CBM_SEM_DOC_KIND_FOLDER, pl->home[s]);
+    }
+}
+
+/* Does the section already link the target exactly (a MENTIONS edge)? A
+ * candidate for that pair would only repeat a fact the graph holds. */
+static bool doc_pair_linked(const cbm_gbuf_t *gbuf, int64_t sec_id, int64_t fn_id) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, sec_id, "MENTIONS", &edges, &n) != 0) {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        if (edges[i]->target_id == fn_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    cbm_doc_candidate_t *rows;
+    int n;
+} doc_rows_t;
+
+/* Append the candidate (section -> target) when its judged p is above 0 and
+ * the graph does not link the pair exactly; false: out of memory (the row at
+ * rw->n may hold partial strings). */
+static bool doc_row_add(doc_rows_t *rw, const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sec,
+                        const cbm_gbuf_node_t *target, const doc_hit_t *hit,
+                        cbm_sem_doc_kind_t kind, const char *home) {
+    if (!target || !target->qualified_name || !sec->qualified_name) {
+        return true;
+    }
+    cbm_sem_doc_pos_t pos = doc_target_position(home, target, kind);
+    cbm_sem_doc_format_t fmt = cbm_sem_doc_format(sec->file_path);
+    float p = kind == CBM_SEM_DOC_KIND_FOLDER
+                  ? cbm_sem_doc_folder_p(fmt, sec->file_path)
+                  : cbm_sem_doc_calibrated_p(fmt, kind, pos, hit->tfidf);
+    if (p <= 0.0F || doc_pair_linked(gbuf, sec->id, target->id)) {
+        return true; /* not stored for this band, kind or format; or linked exactly */
+    }
+    char ev[CBM_SZ_128];
+    snprintf(ev, sizeof(ev),
+             "{\"shared_terms\":%d,\"name_tokens\":%d,\"kind\":\"%s\",\"position\":\"%s\"}",
+             hit->shared, hit->name_shared, DOC_KIND_NAME[kind], doc_position_name(pos));
+    rw->rows[rw->n] = (cbm_doc_candidate_t){
+        .section_qn = cbm_mem_strdup(CBM_MEM_CLASS_STORE, sec->qualified_name),
+        .target_qn = cbm_mem_strdup(CBM_MEM_CLASS_STORE, target->qualified_name),
+        .rank = hit->rank,
+        .score = hit->tfidf,
+        .p = cbm_sem_p_2dp(p),
+        .evidence = cbm_mem_strdup(CBM_MEM_CLASS_STORE, ev)};
+    const cbm_doc_candidate_t *row = &rw->rows[rw->n];
+    if (!row->section_qn || !row->target_qn || !row->evidence) {
+        return false;
+    }
+    rw->n++;
+    return true;
+}
+
+static bool doc_section_rows(doc_rows_t *rw, const cbm_gbuf_t *gbuf, const doc_ctx_t *dc,
+                             const doc_place_t *pl, int s) {
+    const cbm_gbuf_node_t *sec = dc->secs[s];
+    const doc_result_t *r = &dc->res[s];
+    bool ok = true;
+    for (int h = 0; ok && h < r->n + r->nlocal; h++) {
+        const doc_hit_t *hit = h < r->n ? &r->hits[h] : &r->local[h - r->n];
+        if (h < r->n && (hit->rank > CBM_SEM_DOC_TOP_K || hit->tfidf < CBM_SEM_DOC_MIN_SCORE)) {
+            continue;
+        }
+        ok =
+            doc_row_add(rw, gbuf, sec, cbm_gbuf_find_by_id(gbuf, dc->funcs[hit->func].node_id), hit,
+                        h < r->n ? CBM_SEM_DOC_KIND_FUNCTION : CBM_SEM_DOC_KIND_LOCAL, pl->home[s]);
+    }
+    for (int h = 0; ok && h < r->nfiles; h++) {
+        const doc_file_hit_t *fh = &r->files[h];
+        doc_hit_t hit = {.tfidf = fh->tfidf, .rank = fh->rank, .shared = fh->shared};
+        ok = doc_row_add(rw, gbuf, sec, dc->files->node[fh->file], &hit, CBM_SEM_DOC_KIND_FILE,
+                         pl->home[s]);
+    }
+    doc_hit_t first = {.rank = SKIP_ONE};
+    return ok && doc_row_add(rw, gbuf, sec, doc_home_folder(pl, s), &first, CBM_SEM_DOC_KIND_FOLDER,
+                             pl->home[s]);
+}
+
+/* The stored candidates of every section -- its best CBM_SEM_DOC_TOP_K
+ * functions at CBM_SEM_DOC_MIN_SCORE or more, its local functions below them,
+ * its best files, and (for a doc's first section) the doc's home folder --
+ * each with its judged p, in CBM_MEM_CLASS_STORE for
+ * cbm_store_doc_candidates_free; p at two decimals, as on
+ * SEMANTICALLY_RELATED edges. */
+static cbm_doc_candidate_t *doc_candidate_rows(const cbm_gbuf_t *gbuf, const doc_ctx_t *dc,
+                                               const doc_place_t *pl, int *out_count) {
+    int n = 0;
+    for (int s = 0; s < dc->nsec; s++) {
+        const doc_result_t *r = &dc->res[s];
+        n += (r->n < CBM_SEM_DOC_TOP_K ? r->n : CBM_SEM_DOC_TOP_K) + r->nlocal + r->nfiles +
+             SKIP_ONE;
+    }
+    *out_count = 0;
+    doc_rows_t rw = {.rows = n > 0 ? cbm_calloc(CBM_MEM_CLASS_STORE, (size_t)n * sizeof(*rw.rows))
+                                   : NULL};
+    if (!rw.rows) {
+        return NULL;
+    }
+    for (int s = 0; s < dc->nsec; s++) {
+        if (!doc_section_rows(&rw, gbuf, dc, pl, s)) {
+            cbm_store_doc_candidates_free(rw.rows, rw.n + SKIP_ONE);
+            return NULL;
+        }
+    }
+    *out_count = rw.n;
+    return rw.rows;
+}
+
+static void phase6c_doc_sections(cbm_pipeline_ctx_t *ctx, const cbm_sem_func_t *funcs,
+                                 int func_count, const cbm_sem_corpus_t *corpus, int worker_count) {
+    const cbm_gbuf_t *gbuf = ctx->gbuf;
+    if (!corpus || func_count <= 0) {
+        return;
+    }
+    const cbm_gbuf_node_t **found = NULL;
+    int nsec = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Section", &found, &nsec) != 0 || nsec == 0) {
+        return;
+    }
+    int nterms = cbm_sem_corpus_token_count(corpus);
+    const cbm_gbuf_node_t **secs = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)nsec * sizeof(*secs));
+    int *post_off = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)nterms + SKIP_ONE) * sizeof(int));
+    float *fnorm = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)func_count * sizeof(float));
+    bool *is_test = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)func_count * sizeof(bool));
+    int *name_off =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)func_count + SKIP_ONE) * sizeof(int));
+    int *name_idx = cbm_alloc(CBM_MEM_CLASS_SEMANTIC,
+                              ((size_t)func_count * SEM_DOC_NAME_TOKENS + SKIP_ONE) * sizeof(int));
+    doc_result_t *res = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)nsec * sizeof(doc_result_t));
+    const char **fn_paths =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)func_count * sizeof(*fn_paths));
+    int *ffile = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)func_count * sizeof(int));
+    doc_files_t files = {0};
+    doc_place_t place = {0};
+    int *post_f = NULL;
+    int *cursor = NULL;
+    FILE *out = NULL;
+    if (secs && post_off && fnorm && is_test && name_off && name_idx && res && fn_paths && ffile) {
+        for (int f = 0; f < func_count; f++) {
+            for (int k = 0; k < funcs[f].tfidf_len; k++) {
+                post_off[funcs[f].tfidf_indices[k] + SKIP_ONE]++;
+            }
+            fnorm[f] = terms_norm(funcs[f].tfidf_weights, funcs[f].tfidf_len);
+            const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_id(gbuf, funcs[f].node_id);
+            is_test[f] = doc_is_test_function(fn);
+            fn_paths[f] = fn && fn->file_path ? fn->file_path : "";
+            char *tok[SEM_DOC_NAME_TOKENS];
+            int nt = fn && fn->name ? cbm_sem_tokenize(fn->name, tok, SEM_DOC_NAME_TOKENS) : 0;
+            int base = name_off[f];
+            int m = 0;
+            for (int t = 0; t < nt; t++) {
+                int idx = cbm_sem_corpus_token_index(corpus, tok[t]);
+                bool dup = false;
+                for (int u = 0; u < m; u++) {
+                    dup = dup || name_idx[base + u] == idx;
+                }
+                if (idx >= 0 && !dup) {
+                    name_idx[base + m++] = idx;
+                }
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, tok[t]);
+            }
+            name_off[f + SKIP_ONE] = base + m;
+        }
+        for (int t = 0; t < nterms; t++) {
+            post_off[t + SKIP_ONE] += post_off[t];
+        }
+        post_f =
+            cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)post_off[nterms] + SKIP_ONE) * sizeof(int));
+        cursor = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)nterms + SKIP_ONE) * sizeof(int));
+    }
+    if (post_f && cursor) {
+        for (int f = 0; f < func_count; f++) {
+            for (int k = 0; k < funcs[f].tfidf_len; k++) {
+                int t = funcs[f].tfidf_indices[k];
+                post_f[post_off[t] + cursor[t]++] = f;
+            }
+        }
+        memcpy(secs, found, (size_t)nsec * sizeof(*secs));
+        qsort(secs, (size_t)nsec, sizeof(*secs), cmp_section_node);
+    }
+    bool placed =
+        post_f && cursor &&
+        doc_files_build(gbuf, funcs, func_count, is_test, corpus, nterms, &files, ffile) &&
+        doc_place_build(gbuf, secs, nsec, &files, &place);
+    if (placed) {
+        int key_df = func_count / SEM_DOC_KEY_DF_DIV;
+        if (key_df < SEM_DOC_KEY_DF_MIN) {
+            key_df = SEM_DOC_KEY_DF_MIN;
+        }
+        int file_key_df = files.count / SEM_DOC_KEY_DF_DIV;
+        if (file_key_df < SEM_DOC_KEY_DF_MIN) {
+            file_key_df = SEM_DOC_KEY_DF_MIN;
+        }
+        doc_ctx_t dc = {.funcs = funcs,
+                        .func_count = func_count,
+                        .corpus = corpus,
+                        .secs = secs,
+                        .nsec = nsec,
+                        .post_off = post_off,
+                        .post_f = post_f,
+                        .key_df = key_df,
+                        .fnorm = fnorm,
+                        .is_test = is_test,
+                        .name_off = name_off,
+                        .name_idx = name_idx,
+                        .fpath = fn_paths,
+                        .home = (const char *const *)place.home,
+                        .files = &files,
+                        .file_key_df = file_key_df,
+                        .res = res};
+        atomic_init(&dc.next, 0);
+        cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
+        cbm_parallel_for(worker_count, doc_section_worker, &dc, opts);
+        int row_count = 0;
+        cbm_doc_candidate_t *rows = doc_candidate_rows(gbuf, &dc, &place, &row_count);
+        cbm_pipeline_set_doc_candidates(ctx->pipeline, rows, row_count);
+        cbm_log_info("pass.semantic.doc_candidates", "sections", itoa_log(nsec), "files",
+                     itoa_log(files.count), "rows", itoa_log(row_count));
+        char path[CBM_SZ_1K];
+        out = cbm_safe_getenv("CBM_SEM_DOC_SIGNALS", path, sizeof(path), NULL)
+                  ? cbm_fopen(path, "w")
+                  : NULL;
+        for (int s = 0; out && s < nsec; s++) {
+            doc_section_lines(out, gbuf, &dc, &place, s);
+        }
+        /* CBM_SEM_DOC_FUNCS=<path>: every function with its location and the
+         * test flag, for measuring candidates the TF-IDF generator does not
+         * produce (judged samples only). */
+        char fpath[CBM_SZ_1K];
+        FILE *fout = cbm_safe_getenv("CBM_SEM_DOC_FUNCS", fpath, sizeof(fpath), NULL)
+                         ? cbm_fopen(fpath, "w")
+                         : NULL;
+        for (int f = 0; fout && f < func_count; f++) {
+            const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_id(gbuf, funcs[f].node_id);
+            (void)fprintf(fout, "%s\t%s:%d-%d\t%d\n",
+                          fn && fn->qualified_name ? fn->qualified_name : "?",
+                          fn && fn->file_path ? fn->file_path : "?", fn ? fn->start_line : 0,
+                          fn ? fn->end_line : 0, is_test[f] ? 1 : 0);
+        }
+        if (fout) {
+            (void)fclose(fout);
+        }
+    }
+    if (out) {
+        (void)fclose(out);
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, cursor);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, post_f);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, secs);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, post_off);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fnorm);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, is_test);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, name_off);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, name_idx);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, res);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, fn_paths);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, ffile);
+    doc_place_free(&place, nsec);
+    doc_files_free(&files);
+}
+
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     /* Controlled by pipeline mode (moderate/full), not env var */
     cbm_log_info("pass.start", "pass", "semantic_edges");
@@ -1899,6 +3186,9 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
         run_scoring_phase(gbuf, funcs, signatures, band_buckets, cfg, func_count, worker_count);
 
     sem_mem_mark("6_score");
+
+    /* Phase 6c: doc sections -> function candidates (doc_link_candidates). */
+    phase6c_doc_sections(ctx, funcs, func_count, corpus, worker_count);
 
     /* Phase 7: Cleanup */
     CBM_PROF_START(t_phase7);
