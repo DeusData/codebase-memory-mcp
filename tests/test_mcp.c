@@ -4256,6 +4256,154 @@ TEST(tool_search_graph_bm25_applies_label_filter) {
     PASS();
 }
 
+/* #2386: the label filter must choose the BM25 candidate window, not trim it
+ * afterwards. 2001 Functions fill the window ahead of 3 Classes that rank
+ * strictly lower (longer file_path), so a post-window filter returns 0 Classes
+ * while reporting a saturated window. */
+static char *bm25_label_window_search(cbm_mcp_server_t *srv, const char *label_json) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2386,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-label-window\",\"query\":\"windowneedle\","
+             "\"label\":%s,\"limit\":10,\"format\":\"json\"}}}",
+             label_json);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_label_filter_selects_candidate_window) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-label-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-label-window"), CBM_STORE_OK);
+
+    for (int i = 0; i < 2001; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.fn_%04d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "many.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.cls_%d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Class",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "deeply/nested/package/layout/registry.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    /* The rare label comes back in full, and the window is not saturated. */
+    char *inner = bm25_label_window_search(srv, "\"Class\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_0\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_2\""));
+    ASSERT_NULL(strstr(inner, "\"Function\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+    free(inner);
+
+    /* The common label still overflows its own window and says so. */
+    inner = bm25_label_window_search(srv, "\"Function\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    /* A label carrying FTS5 syntax is never spliced into MATCH: the query
+     * stays in BM25 mode and the exact label check matches nothing. */
+    inner = bm25_label_window_search(srv, "\"Class\\\" OR windowneedle\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Scoping the MATCH to a label must not reorder that label's rows: a
+ * label-filtered query lists its rows in the same order as the unfiltered
+ * query does. The fixture's four `table` Methods differ in row length, which
+ * is exactly what a scored label phrase would re-weight. */
+TEST(tool_search_graph_bm25_label_scope_keeps_rank_order) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-find");
+    bm25_findability_fixture(store, "bm25-find");
+
+    char *all_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2387,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"limit\":20,\"format\":\"json\"}}}");
+    char *methods_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2388,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"label\":\"Method\","
+             "\"limit\":20,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(all_resp);
+    ASSERT_NOT_NULL(methods_resp);
+    char *all = extract_text_content(all_resp);
+    char *methods = extract_text_content(methods_resp);
+    free(all_resp);
+    free(methods_resp);
+    ASSERT_NOT_NULL(all);
+    ASSERT_NOT_NULL(methods);
+    ASSERT_NOT_NULL(strstr(methods, "\"total\":4"));
+
+    static const char *const qns[] = {
+        "\"bm25-find.core.Table.Table.unquoted\"",
+        "\"bm25-find.core.Table.Table.describe\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name_mysql\"",
+    };
+    enum { QN_COUNT = sizeof(qns) / sizeof(qns[0]) };
+    for (int i = 0; i < QN_COUNT; i++) {
+        for (int j = 0; j < QN_COUNT; j++) {
+            if (i == j) {
+                continue;
+            }
+            const char *ai = strstr(all, qns[i]);
+            const char *aj = strstr(all, qns[j]);
+            const char *mi = strstr(methods, qns[i]);
+            const char *mj = strstr(methods, qns[j]);
+            ASSERT_NOT_NULL(ai);
+            ASSERT_NOT_NULL(aj);
+            ASSERT_NOT_NULL(mi);
+            ASSERT_NOT_NULL(mj);
+            ASSERT_EQ(ai < aj, mi < mj);
+        }
+    }
+    free(all);
+    free(methods);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* The definition whose NAME is the query ranks first: the `Table` class above
  * its own methods and above test methods that repeat "table" three times; the
  * `get_object_or_404` function above the test methods that contain it. */
@@ -23722,6 +23870,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
     RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+    RUN_TEST(tool_search_graph_bm25_label_filter_selects_candidate_window);
+    RUN_TEST(tool_search_graph_bm25_label_scope_keeps_rank_order);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
