@@ -919,9 +919,9 @@ TEST(cross_language_config_caller_drops_unique_name_too) {
  * to be settled by bucket position, i.e. by the order files were registered:
  * two indexes of one kernel tree differed by 632 CALLS edges, `dev_name`
  * landing on any of twenty same-named struct fields or on nothing at all.
- * The tie is now a function of the candidate set: the least nested
- * definition, then the smaller QN — whichever order the registry was built
- * in (O9). */
+ * The tie is now a function of the candidate set: the more plainly callable
+ * candidate (the function over the fields), then the smaller QN, whichever
+ * order the registry was built in (O9). */
 TEST(registry_tie_break_is_independent_of_registration_order) {
     const char *cands[] = {
         "proj.drivers.media.cec.i2c.ch7322.ch7322_conn_match.dev_name", /* struct field */
@@ -951,7 +951,7 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     ASSERT_STR_EQ(f.strategy, "suffix_match");
     ASSERT_STR_EQ(b.strategy, "suffix_match");
 
-    /* Equal depth: the smaller QN, from either order. */
+    /* Equal kind: the smaller QN, from either order. */
     cbm_registry_t *lex_a = cbm_registry_new();
     cbm_registry_t *lex_b = cbm_registry_new();
     cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
@@ -965,7 +965,7 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     ASSERT_STR_EQ(la.qualified_name, "proj.include.linux.scatterlist.sg_next");
     ASSERT_STR_EQ(lb.qualified_name, "proj.include.linux.scatterlist.sg_next");
 
-    /* Proximity still outranks depth: the sibling wins over a shallower stranger. */
+    /* Proximity outranks the tie order: the sibling wins over a shallower stranger. */
     cbm_registry_t *near = cbm_registry_new();
     cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
     cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
@@ -979,6 +979,99 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     cbm_registry_free(lex_a);
     cbm_registry_free(lex_b);
     cbm_registry_free(near);
+    PASS();
+}
+
+/* A call names something callable. When same-named candidates tie, a method
+ * must not lose to a property or field that merely shares its name. Exposed
+ * (Kotlin): `cities.selectAll().where { ... }` bound to the property
+ * `AbstractQuery.where` instead of the jdbc `Query.where` function, because the
+ * two QNs have the same depth and "exposed-core" sorts first; main moved 785 ->
+ * 1,648 Kotlin CALLS edges onto Variable/Field targets this way. */
+TEST(registry_tie_prefers_callable_over_property) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(
+        r, "where",
+        "proj.exposed-core.src.main.kotlin.org.jetbrains.exposed.v1.core.AbstractQuery.where",
+        "Variable");
+    cbm_registry_add(r, "where",
+                     "proj.exposed-jdbc.src.main.kotlin.org.jetbrains.exposed.v1.jdbc.Query.where",
+                     "Method");
+    /* A deeper method still beats a shallower field: kind decides before order. */
+    cbm_registry_add(r, "limit", "proj.exposed-core.Table.limit", "Field");
+    cbm_registry_add(r, "limit", "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit", "Method");
+
+    const char *caller =
+        "proj.exposed-tests.src.test.kotlin.org.jetbrains.exposed.v1.tests.SelectTests";
+    cbm_resolution_t w = cbm_registry_resolve(r, "where", caller, NULL, NULL, 0);
+    cbm_resolution_t l = cbm_registry_resolve(r, "limit", caller, NULL, NULL, 0);
+    ASSERT_STR_EQ(w.qualified_name,
+                  "proj.exposed-jdbc.src.main.kotlin.org.jetbrains.exposed.v1.jdbc.Query.where");
+    ASSERT_STR_EQ(l.qualified_name, "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Nesting depth says nothing about which same-named method a call means.
+ * django: `Model.objects.filter(...)` from tests/ tied between
+ * `QuerySet.filter` and the template `Library.filter`; "least nested wins"
+ * picked Library (one segment shallower) for most of the ~5,600 `objects.X`
+ * calls (QuerySet share 57 % -> 24 %). Equal-kind ties now fall to the QN
+ * order alone, which is still a pure function of the candidate set (O9). */
+TEST(registry_tie_ignores_nesting_depth) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "filter", "proj.django.template.library.Library.filter", "Method");
+    cbm_registry_add(r, "filter", "proj.django.db.models.query.QuerySet.filter", "Method");
+    cbm_resolution_t f =
+        cbm_registry_resolve(r, "filter", "proj.tests.lookup.tests", NULL, NULL, 0);
+    ASSERT_STR_EQ(f.qualified_name, "proj.django.db.models.query.QuerySet.filter");
+    ASSERT_STR_EQ(f.strategy, "suffix_match");
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* .NET reference assemblies (`src/libraries/<Asm>/ref/<Asm>.cs`) declare every
+ * public member of an assembly with a `throw null` body in one shallow file.
+ * A call that ties between such a stub and the implementation must reach the
+ * implementation: dotnet/runtime had 14.1 % of its CALLS on ref/ stubs (4.9 %
+ * in v0.11.0) once ties preferred the shallower, then the smaller ("ref" <
+ * "src") QN. The preference is C#'s alone: elsewhere a `ref` directory is an
+ * ordinary name. */
+TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
+    cbm_registry_t *r = cbm_registry_new();
+    /* Shallower stub vs deeper implementation (MemoryStream). */
+    cbm_registry_add_lang(
+        r, "MemoryStream",
+        "proj.src.libraries.System.Runtime.ref.System.Runtime.MemoryStream.MemoryStream", "Method",
+        CBM_LANG_CSHARP);
+    cbm_registry_add_lang(
+        r, "MemoryStream",
+        "proj.src.libraries.System.Private.CoreLib.src.System.IO.MemoryStream.MemoryStream",
+        "Method", CBM_LANG_CSHARP);
+    /* Equal depth, "ref" sorts before "src" (WithCancellation). */
+    cbm_registry_add_lang(r, "WithCancellation",
+                          "proj.src.libraries.System.Linq.Parallel.ref.System.Linq."
+                          "ParallelEnumerable.WithCancellation",
+                          "Method", CBM_LANG_CSHARP);
+    cbm_registry_add_lang(r, "WithCancellation",
+                          "proj.src.libraries.System.Linq.Parallel.src.System.Linq."
+                          "ParallelEnumerable.WithCancellation",
+                          "Method", CBM_LANG_CSHARP);
+    /* Not C#: a `ref` directory gets no special treatment. */
+    cbm_registry_add_lang(r, "resolve", "proj.lib.ref.Resolver.resolve", "Method", CBM_LANG_JAVA);
+    cbm_registry_add_lang(r, "resolve", "proj.lib.src.Resolver.resolve", "Method", CBM_LANG_JAVA);
+
+    const char *caller = "proj.src.libraries.System.Security.Cryptography.src.CapiHelper";
+    cbm_resolution_t ms = cbm_registry_resolve(r, "MemoryStream", caller, NULL, NULL, 0);
+    cbm_resolution_t wc = cbm_registry_resolve(r, "WithCancellation", caller, NULL, NULL, 0);
+    cbm_resolution_t jv = cbm_registry_resolve(r, "resolve", "proj.app.Main", NULL, NULL, 0);
+    ASSERT_STR_EQ(
+        ms.qualified_name,
+        "proj.src.libraries.System.Private.CoreLib.src.System.IO.MemoryStream.MemoryStream");
+    ASSERT_STR_EQ(wc.qualified_name, "proj.src.libraries.System.Linq.Parallel.src.System.Linq."
+                                     "ParallelEnumerable.WithCancellation");
+    ASSERT_STR_EQ(jv.qualified_name, "proj.lib.ref.Resolver.resolve");
+    cbm_registry_free(r);
     PASS();
 }
 
@@ -1643,6 +1736,9 @@ SUITE(registry) {
     RUN_TEST(same_module_vetoed_across_languages);
     RUN_TEST(cross_language_config_caller_drops_unique_name_too);
     RUN_TEST(registry_tie_break_is_independent_of_registration_order);
+    RUN_TEST(registry_tie_prefers_callable_over_property);
+    RUN_TEST(registry_tie_ignores_nesting_depth);
+    RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(call_onto_field_follows_language_and_shape);
