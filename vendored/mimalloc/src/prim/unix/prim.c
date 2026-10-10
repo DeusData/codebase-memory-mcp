@@ -500,7 +500,18 @@ int _mi_prim_decommit(void* start, size_t size, bool* needs_recommit) {
     // decommit: use MADV_DONTNEED as it decreases rss immediately (unlike MADV_FREE)
     err = unix_madvise(start, size, MADV_DONTNEED);
   #endif
-  #if !MI_DEBUG && MI_SECURE<=2
+  // codebase-memory-mcp local change (2026-10-10): macOS always takes the
+  // recommit path that upstream reserves for MI_DEBUG / MI_SECURE>2 builds.
+  // In the release path a purged range stays "committed" and is re-accounted as
+  // a whole with MADV_FREE_REUSE when the arena hands it out again
+  // (arena.c, _mi_os_reuse), so macOS charges its pages to phys_footprint
+  // whether or not they are touched; recommitting instead charges only the
+  // pages that are written. Measured on the indexer (Apple arm64, macOS 26.6),
+  // peak phys_footprint release -> this change, wall time unchanged and the
+  // graph byte-identical: TypeScript 1.98 -> 1.09 GB, kubernetes 2.92 -> 1.88 GB,
+  // dotnet/runtime 12.7 -> 10.6 GB, linux kernel 16.0 -> 13.5 GB. Other
+  // platforms keep upstream's behaviour (MADV_DONTNEED drops RSS at once).
+  #if !MI_DEBUG && MI_SECURE<=2 && !defined(__APPLE__)
     *needs_recommit = false;
   #else
     *needs_recommit = true;
