@@ -19816,7 +19816,9 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        /* server/discover is the modern connect probe. -32601 stays so the
+         * client falls back to initialize; that miss is not an error (#2433). */
+        cbm_log_mcp_request(req.method, NULL, strcmp(req.method, "server/discover") != 0, dur_us);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;

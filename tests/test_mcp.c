@@ -2357,6 +2357,59 @@ TEST(server_handle_unknown_method) {
     PASS();
 }
 
+/* Issue #2433: a modern client probes server/discover before initialize.
+ * The -32601 stays so it falls back; only that probe is logged as info. */
+TEST(server_handle_discover_probe_logs_info) {
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel prev_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32601"));
+    ASSERT_NOT_NULL(strstr(resp, "Method not found"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=server/discover"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "level=info"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NULL(strstr(mcp_log_buf, "level=warn"));
+    ASSERT_NULL(strstr(mcp_log_buf, "status=error"));
+    free(resp);
+
+    mcp_log_buf[0] = '\0';
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"unknown/method\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "-32601"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=unknown/method"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "level=warn"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=error"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"initialize\","
+                                      "\"params\":{\"protocolVersion\":\"2026-07-28\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "2025-11-25"));
+    ASSERT_NULL(strstr(resp, "2026-07-28"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"resources\":[]"));
+    ASSERT_NULL(strstr(resp, "-32601"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(prev_level);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  TOOL HANDLERS (via server_handle)
  * ══════════════════════════════════════════════════════════════════ */
@@ -23679,6 +23732,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_prompts_get_validates_arguments);
     RUN_TEST(server_handle_logs_request_without_params);
     RUN_TEST(server_handle_unknown_method);
+    RUN_TEST(server_handle_discover_probe_logs_info);
 
     /* Server handle — edge cases */
     RUN_TEST(server_handle_invalid_json);
