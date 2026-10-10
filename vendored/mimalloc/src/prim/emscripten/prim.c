@@ -1,5 +1,5 @@
 /* ----------------------------------------------------------------------------
-Copyright (c) 2018-2025, Microsoft Research, Daan Leijen, Alon Zakai
+Copyright (c) 2018-2026, Microsoft Research, Daan Leijen, Alon Zakai
 This is free software; you can redistribute it and/or modify it under the
 terms of the MIT license. A copy of the license can be found in the file
 "LICENSE" at the root of this distribution.
@@ -61,7 +61,6 @@ void _mi_prim_mem_init( mi_os_mem_config_t* config) {
 extern void emmalloc_free(void*);
 
 int _mi_prim_free(void* addr, size_t size) {
-  if (size==0) return 0;
   emmalloc_free(addr);
   return 0;
 }
@@ -77,7 +76,7 @@ extern void* emmalloc_memalign(size_t alignment, size_t size);
 int _mi_prim_alloc(void* hint_addr, size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr) {
   MI_UNUSED(try_alignment); MI_UNUSED(allow_large); MI_UNUSED(commit); MI_UNUSED(hint_addr);
   *is_large = false;
-  // TODO: Track the highest address ever seen; first uses of it are zeroes.
+  // todo: Track the highest address ever seen; first uses of it are zeroes.
   //       That assumes no one else uses sbrk but us (they could go up,
   //       scribble, and then down), but we could assert on that perhaps.
   *is_zero = false;
@@ -101,7 +100,7 @@ int _mi_prim_alloc(void* hint_addr, size_t size, size_t try_alignment, bool comm
 
 int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
   MI_UNUSED(addr); MI_UNUSED(size);
-  // See TODO above.
+  // See todo above.
   *is_zero = false;
   return 0;
 }
@@ -155,7 +154,8 @@ size_t _mi_prim_numa_node_count(void) {
 #include <emscripten/html5.h>
 
 mi_msecs_t _mi_prim_clock_now(void) {
-  return emscripten_date_now();
+  // todo: use a monotonic clock instead
+  return emscripten_date_now();  
 }
 
 
@@ -185,12 +185,12 @@ void _mi_prim_out_stderr( const char* msg) {
 // Environment
 //----------------------------------------------------------------
 
-bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
+int _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   // For code size reasons, do not support environ customization for now.
   MI_UNUSED(name);
   MI_UNUSED(result);
   MI_UNUSED(result_size);
-  return false;
+  return 0; // not found
 }
 
 
@@ -212,7 +212,7 @@ bool _mi_prim_random_buf(void* buf, size_t buf_len) {
 
 // use pthread local storage keys to detect thread ending
 // (and used with MI_TLS_PTHREADS for the default theap)
-pthread_key_t _mi_heap_default_key = (pthread_key_t)(-1);
+pthread_key_t _mi_heap_default_key = MI_PTHREAD_KEY_INVALID;
 
 static void mi_pthread_done(void* value) {
   if (value!=NULL) {
@@ -221,18 +221,20 @@ static void mi_pthread_done(void* value) {
 }
 
 void _mi_prim_thread_init_auto_done(void) {
-  mi_assert_internal(_mi_heap_default_key == (pthread_key_t)(-1));
+  mi_assert_internal(_mi_heap_default_key == MI_PTHREAD_KEY_INVALID);
   pthread_key_create(&_mi_heap_default_key, &mi_pthread_done);
 }
 
 void _mi_prim_thread_done_auto_done(void) {
-  if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // do not leak the key, see issue #809
-    pthread_key_delete(_mi_heap_default_key);
+  pthread_key_t key = _mi_heap_default_key;
+  if (key != MI_PTHREAD_KEY_INVALID) {  // do not leak the key, see issue #809
+    _mi_heap_default_key = MI_PTHREAD_KEY_INVALID;
+    pthread_key_delete(key);
   }
 }
 
 void _mi_prim_thread_associate_default_theap(mi_theap_t* theap) {
-  if (_mi_heap_default_key != (pthread_key_t)(-1)) {  // can happen during recursive invocation on freeBSD
+  if (_mi_heap_default_key != MI_PTHREAD_KEY_INVALID) {  // can happen during recursive invocation on freeBSD
     pthread_setspecific(_mi_heap_default_key, theap);
   }
 }

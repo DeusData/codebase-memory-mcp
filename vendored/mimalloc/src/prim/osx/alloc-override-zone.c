@@ -7,7 +7,7 @@ terms of the MIT license. A copy of the license can be found in the file
 
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
-
+#include "mimalloc/prim-tls.h"  // _mi_thread_is_initialized
 #if defined(MI_MALLOC_OVERRIDE)
 
 #if !defined(__APPLE__)
@@ -71,8 +71,14 @@ static void* zone_valloc(malloc_zone_t* zone, size_t size) {
 }
 
 static void zone_free(malloc_zone_t* zone, void* p) {
-  if (mi_any_heap_contains(p)) {
-    mi_free(p); // with the page_map and pagemap_commit=1 we can use the regular free
+  if mi_likely(mi_any_heap_contains(p)) {
+    if mi_likely(_mi_thread_is_initialized()) {
+      mi_free(p); // with the page_map and pagemap_commit=1 we can use the regular free
+    }
+    else {
+      // during thread shutdown `_pthread_tsd_cleanup` may call `zone_free` on a pointer that was allocated in another subproc.
+      _mi_free_subproc_safe(p); 
+    }
   }
   else if (!is_mimalloc_zone(zone)) {  // can happen due to interpose
     zone->free(zone,p);
@@ -134,7 +140,6 @@ static boolean_t zone_claimed_address(malloc_zone_t* zone, void* p) {
   return mi_is_in_heap_region(p);
 }
 
-
 /* ------------------------------------------------------
    Introspection members
 ------------------------------------------------------ */
@@ -194,6 +199,14 @@ static boolean_t intro_zone_locked(malloc_zone_t* zone) {
   return false;
 }
 
+// Required whenever the zone advertises version >= 9: macOS calls this from the
+// atfork_child handler (_malloc_fork_child) without a NULL check. mimalloc keeps
+// no zone-level locks that need reinitializing after fork, so a no-op is safe.
+// Leaving it NULL makes the forked child jump to address 0 and crash while forking.
+static void intro_reinit_lock(malloc_zone_t* zone) {
+  MI_UNUSED(zone);
+}
+
 
 /* ------------------------------------------------------
   At process start, override the default allocator
@@ -218,6 +231,9 @@ static malloc_introspection_t mi_introspect = {
 #if defined(MAC_OS_X_VERSION_10_6) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_6) && !defined(__ppc__)
   .statistics = &intro_statistics,
   .zone_locked = &intro_zone_locked,
+#endif  
+#if defined(MAC_OS_X_VERSION_10_12) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_12) && !defined(__ppc__)
+  .reinit_lock = &intro_reinit_lock,
 #endif
 };
 

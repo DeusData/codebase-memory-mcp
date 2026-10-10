@@ -134,8 +134,9 @@ static bool mi_random_is_initialized(mi_random_ctx_t* ctx) {
 
 void _mi_random_split(mi_random_ctx_t* ctx, mi_random_ctx_t* ctx_new) {
   mi_assert_internal(mi_random_is_initialized(ctx));
-  mi_assert_internal(ctx != ctx_new);
-  chacha_split(ctx, (uintptr_t)ctx_new /*nonce*/, ctx_new);
+  mi_assert_internal(ctx != ctx_new);  
+  const uintptr_t nonce_rnd = _mi_random_next(ctx);
+  chacha_split(ctx, (uintptr_t)ctx_new ^ nonce_rnd /*nonce*/, ctx_new);
 }
 
 uintptr_t _mi_random_next(mi_random_ctx_t* ctx) {
@@ -193,6 +194,7 @@ static void mi_random_init_ex(mi_random_ctx_t* ctx, bool use_weak) {
     ctx->weak = false;
   }
   chacha_init(ctx, key, (uintptr_t)ctx /*nonce*/ );
+  _mi_memzero(key, sizeof(key));
 }
 
 void _mi_random_init(mi_random_ctx_t* ctx) {

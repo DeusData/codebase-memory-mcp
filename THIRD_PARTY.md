@@ -117,9 +117,10 @@ License summary:
 | wyhash | `internal/cbm/vendored/wyhash/` | Unlicense (public domain) | [wangyi-fudan/wyhash](https://github.com/wangyi-fudan/wyhash) |
 
 Local modifications to these libraries are documented next to the
-vendored sources (currently only SQLite: `vendored/sqlite3/PATCHES.md`,
-raising the Unix VFS `MAX_PATHNAME` ceiling from 512 to 4096 to match
-CBM's 4 KiB path support). Patches must be reapplied on every upstream
+vendored sources: `vendored/sqlite3/PATCHES.md` documents the Unix VFS
+`MAX_PATHNAME` ceiling increase from 512 to 4096 to match CBM's 4 KiB path
+support; `vendored/mimalloc/PATCHES.md` documents the reproducible version
+banner patch and upstream source pin. Patches must be reapplied on every upstream
 refresh and are covered by `scripts/vendored-checksums.txt`.
 
 The graph-UI HTTP server is a first-party implementation
