@@ -1171,6 +1171,14 @@ char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source,
     if (text && lang == CBM_LANG_NIX) {
         cbm_nix_strip_attr_quotes(text);
     }
+    /* Haskell infix-form operator definition: `a <+> b = …` resolves to the bare
+     * `operator` node `<+>`, while the prefix form `(<+>) a b = …` is named by its
+     * `prefix_id` text `(<+>)`. Parenthesise here, not in the resolver, so both
+     * forms mint the same name and the def name and the call-scope QN, which both
+     * route through this function, cannot disagree (#2440). */
+    if (text && lang == CBM_LANG_HASKELL && strcmp(ts_node_type(name_node), "operator") == 0) {
+        return cbm_arena_sprintf(a, "(%s)", text);
+    }
     return text;
 }
 

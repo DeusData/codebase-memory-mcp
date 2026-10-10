@@ -1693,6 +1693,33 @@ TEST(haskell_function) {
     PASS();
 }
 
+/* #2440: an infix-form definition (`a <+> b = ...`, ``x `plus` y = ...``) has
+ * no `name` field; its first named child is an `infix` node whose first child
+ * is the LEFT OPERAND, so the def was named `a` / `x`. It must be named after
+ * the operator, consistent with the prefix form `(<+>) a b = ...`. */
+TEST(haskell_infix_definition_name) {
+    CBMFileResult *r = extract("module M where\n"
+                               "\n"
+                               "(<+>) :: Int -> Int -> Int\n"
+                               "a <+> b = a + b\n"
+                               "\n"
+                               "plus :: Int -> Int -> Int\n"
+                               "x `plus` y = x + y\n"
+                               "\n"
+                               "f :: Int\n"
+                               "f = 1 <+> 2\n",
+                               CBM_LANG_HASKELL, "t", "M.hs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "f"));
+    ASSERT(has_def(r, "Function", "plus"));
+    ASSERT(has_def(r, "Function", "(<+>)"));
+    ASSERT_FALSE(has_def(r, "Function", "a"));
+    ASSERT_FALSE(has_def(r, "Function", "x"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- OCaml --- */
 TEST(ocaml_function) {
     CBMFileResult *r =
@@ -10530,6 +10557,7 @@ SUITE(extraction) {
     RUN_TEST(elixir_function);
     RUN_TEST(elixir_call_string_argument);
     RUN_TEST(haskell_function);
+    RUN_TEST(haskell_infix_definition_name);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
 
