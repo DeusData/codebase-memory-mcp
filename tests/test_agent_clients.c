@@ -162,7 +162,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         "qoder",     "kimi",        "gitlab-duo",    "rovo-dev", "amp",      "devin",
         "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
         "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
-        "omp",
+        "omp",       "agentty",
     };
     static const uint32_t expected_capabilities[] = {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
@@ -184,6 +184,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
         CBM_AGENT_CAP_MCP,
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL,
     };
     ASSERT_EQ(cbm_agent_client_count(), CBM_AGENT_CLIENT_COUNT);
     ASSERT_EQ(CBM_AGENT_CLIENT_COUNT, sizeof(expected) / sizeof(expected[0]));

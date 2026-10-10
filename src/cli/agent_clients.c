@@ -76,6 +76,9 @@ static const cbm_agent_client_profile_t agent_profiles[CBM_AGENT_CLIENT_COUNT] =
     {CBM_AGENT_CLIENT_OMP, "omp", "Oh My Pi (omp)", CBM_AGENT_STABLE,
      CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT, "omp", agent_install_callback,
      agent_remove_callback},
+    {CBM_AGENT_CLIENT_AGENTTY, "agentty", "agentty", CBM_AGENT_STABLE,
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL, "agentty", agent_install_callback,
+     agent_remove_callback},
 };
 
 size_t cbm_agent_client_count(void) {
@@ -601,6 +604,15 @@ int cbm_agent_client_resolve_path(cbm_agent_client_id_t id,
             int written = snprintf(path_out, path_out_size, "%s", options->cody_config_path);
             return written >= 0 && (size_t)written < path_out_size ? 0 : -1;
         }
+    case CBM_AGENT_CLIENT_AGENTTY: {
+        char override[1024];
+        if (cbm_agent_env_config_override("AGENTTY_MCP_CONFIG", options->home_dir, override,
+                                          sizeof(override))) {
+            int written = snprintf(path_out, path_out_size, "%s", override);
+            return written >= 0 && (size_t)written < path_out_size ? 0 : -1;
+        }
+        return agent_join_path(path_out, path_out_size, options->home_dir, ".agentty/mcp.json");
+    }
     default:
         return -1;
     }
@@ -663,6 +675,8 @@ static int agent_client_marker_path(cbm_agent_client_id_t id,
         return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent");
     case CBM_AGENT_CLIENT_PI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pi/agent");
+    case CBM_AGENT_CLIENT_AGENTTY:
+        return agent_join_path(path_out, path_out_size, options->home_dir, ".agentty");
     default:
         return 1;
     }
@@ -1466,6 +1480,7 @@ static bool agent_json_client(cbm_agent_client_id_t id) {
     case CBM_AGENT_CLIENT_IBM_BOB_SHELL:
     case CBM_AGENT_CLIENT_POCHI:
     case CBM_AGENT_CLIENT_SOURCEGRAPH_CODY:
+    case CBM_AGENT_CLIENT_AGENTTY:
         return true;
     case CBM_AGENT_CLIENT_CONTINUE:
     case CBM_AGENT_CLIENT_PI:
@@ -1487,6 +1502,41 @@ int cbm_agent_client_install_mcp(cbm_agent_client_id_t id, const char *config_pa
     }
     return agent_json_client(id) ? agent_json_edit(id, config_path, binary_path, false)
                                  : CBM_AGENT_EDIT_NOT_APPLICABLE;
+}
+
+bool cbm_agent_env_config_override(const char *env_name, const char *home_dir, char *resolved,
+                                   size_t resolved_size) {
+    if (!env_name || !resolved || resolved_size == 0U) {
+        return false;
+    }
+    char value[1024];
+    const char *configured = getenv(env_name);
+    if (!configured || configured[0] == '\0' || strlen(configured) >= sizeof(value)) {
+        return false;
+    }
+    snprintf(value, sizeof(value), "%s", configured);
+    /* Expand a leading ~ against the home directory, matching the
+     * CLAUDE_CONFIG_DIR / GROK_HOME handling in cli.c. */
+    if (value[0] == '~' && (value[1] == '\0' || value[1] == '/')) {
+        if (!home_dir || home_dir[0] == '\0') {
+            return false;
+        }
+        char expanded[1024];
+        int written = value[1] == '\0'
+                          ? snprintf(expanded, sizeof(expanded), "%s", home_dir)
+                          : snprintf(expanded, sizeof(expanded), "%s%s", home_dir, value + 1);
+        if (written < 0 || (size_t)written >= sizeof(expanded) ||
+            (size_t)written >= resolved_size) {
+            return false;
+        }
+        snprintf(resolved, resolved_size, "%s", expanded);
+        return true;
+    }
+    if (strlen(value) >= resolved_size) {
+        return false;
+    }
+    snprintf(resolved, resolved_size, "%s", value);
+    return true;
 }
 
 int cbm_agent_client_remove_mcp(cbm_agent_client_id_t id, const char *config_path,

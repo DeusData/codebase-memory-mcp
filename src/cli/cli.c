@@ -9646,6 +9646,10 @@ static void install_agent_client_registry(const char *home, const char *binary_p
             install_pi_durable_context(home, binary_path, force, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_OMP) {
             install_omp_durable_context(&registry, force, dry_run);
+        } else if (profile->id == CBM_AGENT_CLIENT_AGENTTY) {
+            char skills_dir[CLI_BUF_1K];
+            snprintf(skills_dir, sizeof(skills_dir), "%s/.agentty/skills", home);
+            install_agent_skill(profile->display_name, skills_dir, force, dry_run);
         }
     }
 }
@@ -10807,6 +10811,10 @@ const char *cbm_cli_clients_token_for_testing(size_t index) {
 }
 void cbm_cli_set_client_selection_for_testing(const char *spec) {
     g_client_selection = spec;
+}
+bool cbm_cli_selects_registry_client_for_testing(const char *stable_id) {
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_by_stable_id(stable_id);
+    return profile && cli_clients_selects_registry_client(g_client_selection, profile->id);
 }
 #endif
 
@@ -12135,6 +12143,10 @@ static void uninstall_agent_client_registry(const char *home, bool dry_run) {
             uninstall_pi_durable_context(home, dry_run);
         } else if (profile->id == CBM_AGENT_CLIENT_OMP) {
             uninstall_omp_durable_context(&registry, dry_run);
+        } else if (profile->id == CBM_AGENT_CLIENT_AGENTTY) {
+            char skills_dir[CLI_BUF_1K];
+            snprintf(skills_dir, sizeof(skills_dir), "%s/.agentty/skills", home);
+            uninstall_agent_skill(profile->display_name, skills_dir, dry_run);
         }
     }
 }
