@@ -1693,6 +1693,81 @@ TEST(haskell_function) {
     PASS();
 }
 
+/* #2439: the vendored grammar lexes an escaped char literal with
+ * /'\\[^ ]*'/, whose `[^ ]*` also matches newlines and quotes. With only
+ * newlines between `'\n'` and the next definition's primed name, the char
+ * token runs from `'\n` through `g'`, so `f` swallows `g'` and `g'` gets no
+ * node. Each top-level definition must keep its own node and span. */
+TEST(haskell_escaped_char_does_not_swallow_primed_def) {
+    CBMFileResult *r = extract("module M where\n"
+                               "\n"
+                               "f = '\\n'\n"
+                               "\n"
+                               "g' = 2\n"
+                               "\n"
+                               "h = 3\n",
+                               CBM_LANG_HASKELL, "t", "M.hs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *f = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "f") == 0) {
+            f = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ((int)f->end_line, 3);
+    ASSERT(has_def(r, "Function", "g'"));
+    ASSERT(has_def(r, "Function", "h"));
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Append the text of every `char` node under root to out, space-separated. */
+static void haskell_char_texts(TSNode root, const char *src, char *out, size_t out_sz) {
+    TSTreeCursor c = ts_tree_cursor_new(root);
+    size_t len = 0;
+    for (;;) {
+        TSNode n = ts_tree_cursor_current_node(&c);
+        if (strcmp(ts_node_type(n), "char") == 0 && len < out_sz) {
+            uint32_t s = ts_node_start_byte(n);
+            uint32_t e = ts_node_end_byte(n);
+            len += (size_t)snprintf(out + len, out_sz - len, "%.*s ", (int)(e - s), src + s);
+        }
+        if (ts_tree_cursor_goto_first_child(&c)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&c)) {
+            if (!ts_tree_cursor_goto_parent(&c)) {
+                ts_tree_cursor_delete(&c);
+                return;
+            }
+        }
+    }
+}
+
+/* #2439, same-line form: the old regex ran from the first `'\` to the last
+ * `'` before a space, so `['\n','\t']` lexed as ONE char token with no parse
+ * error. Each literal must be its own token, and the escapes that contain a
+ * quote or a backslash (`'\''`, `'\\'`) must still lex whole. */
+TEST(haskell_escaped_char_list_lexes_each_literal) {
+    const char *src = "x = ['\\n','\\t','\\'','\\\\','\\x41','\\SOH','a']\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_HASKELL)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+    char got[128] = "";
+    haskell_char_texts(root, src, got, sizeof(got));
+    bool has_error = ts_node_has_error(root);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    ASSERT_FALSE(has_error);
+    ASSERT_STR_EQ(got, "'\\n' '\\t' '\\'' '\\\\' '\\x41' '\\SOH' 'a' ");
+    PASS();
+}
+
 /* --- OCaml --- */
 TEST(ocaml_function) {
     CBMFileResult *r =
@@ -10530,6 +10605,8 @@ SUITE(extraction) {
     RUN_TEST(elixir_function);
     RUN_TEST(elixir_call_string_argument);
     RUN_TEST(haskell_function);
+    RUN_TEST(haskell_escaped_char_does_not_swallow_primed_def);
+    RUN_TEST(haskell_escaped_char_list_lexes_each_literal);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
 
