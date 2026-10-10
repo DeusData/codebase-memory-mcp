@@ -1377,6 +1377,107 @@ CBMLanguage cbm_disambiguate_res(const char *path) {
     return lang_res_bytes(head, n);
 }
 
+/* A make rule's targets end at a ':' followed by whitespace or the end of the
+ * file, which skips drive-letter colons ("C:/", "C:\"). */
+static bool is_rule_colon(const char *p, bool whole_file) {
+    char next = p[SKIP_ONE];
+    return *p == ':' && (next == ' ' || next == '\t' || next == '\r' || next == '\n' ||
+                         (next == '\0' && whole_file));
+}
+
+/* Bytes of D whitespace at p, or 0: space, tab, vertical tab, form feed, CR
+ * and the UTF-8 line and paragraph separators U+2028/U+2029, all of which split
+ * D tokens. '\n' ends the line and is the caller's. */
+static size_t d_space_len(const char *p) {
+    if (*p == ' ' || *p == '\t' || *p == '\v' || *p == '\f' || *p == '\r') {
+        return SKIP_ONE;
+    }
+    if (strncmp(p, "\xE2\x80\xA8", SLEN("\xE2\x80\xA8")) == 0 ||
+        strncmp(p, "\xE2\x80\xA9", SLEN("\xE2\x80\xA9")) == 0) {
+        return SLEN("\xE2\x80\xA8");
+    }
+    return 0;
+}
+
+/* True if the line at p is a make rule "target...: prereq..." whose targets all
+ * look like paths (contain '/', '\' or '.'); a backslash-escaped space stays
+ * inside its target. D source fails this: "public:", "@safe:", "extern(C):"
+ * and "import a.b : c" all have a non-path word or D punctuation before the
+ * colon. An attribute ('@', as in "@1.0:") or a comment between tokens
+ * ("public/+ +/:") is D even with a '.' or '/' before the colon, so a target
+ * holding either is never dep-info. */
+static bool is_dep_rule_line(const char *p, bool whole_file) {
+    bool in_target = false;
+    bool path_like = false;
+    bool any_target = false;
+    for (; *p && *p != '\n'; p++) {
+        if (is_rule_colon(p, whole_file)) {
+            return in_target ? path_like : any_target;
+        }
+        size_t space = d_space_len(p);
+        if (space) {
+            if (in_target && !path_like) {
+                return false;
+            }
+            in_target = false;
+            path_like = false;
+            p += space - SKIP_ONE;
+            continue;
+        }
+        if (strchr("(){};=\"',@", *p)) {
+            return false;
+        }
+        if (*p == '/' && (p[SKIP_ONE] == '*' || p[SKIP_ONE] == '+' || p[SKIP_ONE] == '/')) {
+            return false;
+        }
+        in_target = true;
+        any_target = true;
+        path_like = path_like || *p == '/' || *p == '\\' || *p == '.';
+        if (*p == '\\' && p[SKIP_ONE] == ' ') {
+            p++; /* escaped space: part of this target */
+        }
+    }
+    return false;
+}
+
+/* Disambiguate .d files: shared by D source and make-style dependency files
+ * written by rustc/cargo (target/<profile>/deps/<crate>-<hash>.d), gcc/clang -MD
+ * and CMake (<object>.o.d). Those are "target: prereq ..." rules, often tens of
+ * KB on one line, which the D grammar parses slowly into nothing but a module
+ * node, so they are reported as unsupported (CBM_LANG_COUNT). Defaults to D on
+ * any doubt (preserves existing behaviour). `n` is the count of head bytes buf
+ * was made from. */
+static CBMLanguage lang_d_text(const char *buf, size_t n) {
+    /* A colon at the end of buf only ends the rule if nothing was cut off. */
+    bool whole_file = n < LANG_PROBE_HEAD && strlen(buf) == n;
+
+    const char *p = buf;
+    if (strncmp(p, "\xEF\xBB\xBF", SLEN("\xEF\xBB\xBF")) == 0) {
+        p += SLEN("\xEF\xBB\xBF");
+    }
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    /* A shebang or a leading D comment (including the DUB single-file
+     * "/+ dub.sdl:" recipe) is D; dep-info never starts that way. */
+    if (*p == '#' ||
+        (p[0] == '/' && (p[SKIP_ONE] == '/' || p[SKIP_ONE] == '*' || p[SKIP_ONE] == '+'))) {
+        return CBM_LANG_DLANG;
+    }
+    return is_dep_rule_line(p, whole_file) ? CBM_LANG_COUNT : CBM_LANG_DLANG;
+}
+
+CBMLanguage cbm_disambiguate_d(const char *path) {
+    unsigned char head[LANG_PROBE_HEAD];
+    size_t n = 0;
+    if (!lang_read_head(path, head, sizeof(head), &n)) {
+        return CBM_LANG_DLANG;
+    }
+    char buf[LANG_PROBE_HEAD + SKIP_ONE];
+    lang_head_text(buf, LANG_PROBE_HEAD, head, n);
+    return lang_d_text(buf, n);
+}
+
 /* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
  * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
  * with a line of the form "Class <UppercasePackage>..."; VB6 class modules
@@ -1555,6 +1656,13 @@ static const char *lang_probe_extension(const char *filename) {
     return (dot && lang_name_in(dot, PROBED)) ? dot : NULL;
 }
 
+/* .d is shared by D and make-style dep-info (cargo, gcc -MD). Probe only while
+ * .d maps to D, so a user override to another language wins. */
+static bool lang_probe_d(CBMLanguage lang, const char *filename) {
+    const char *dot = strrchr(filename, '.');
+    return lang == CBM_LANG_DLANG && dot && strcmp(dot, ".d") == 0;
+}
+
 /* "<Export generator=" in the first line-probe bytes: an ObjectScript Studio
  * export, which is XML by name. */
 static bool lang_objectscript_export(const unsigned char *head, size_t n) {
@@ -1576,6 +1684,9 @@ size_t cbm_language_probe_bytes_with(const cbm_userconfig_t *config, const char 
     const char *ext = lang_probe_extension(filename);
     if (ext) {
         return strcmp(ext, ".cfc") == 0 ? LANG_PROBE_CFC : LANG_PROBE_HEAD;
+    }
+    if (lang_probe_d(lang, filename)) {
+        return LANG_PROBE_HEAD;
     }
     return lang == CBM_LANG_XML ? LANG_PROBE_LINE : 0;
 }
@@ -1620,6 +1731,11 @@ CBMLanguage cbm_language_classify_with(const cbm_userconfig_t *config, const cha
             /* .res: ReScript, or a binary Godot / Windows resource (#2176) */
             lang = readable ? lang_res_bytes(head, head_len) : CBM_LANG_RESCRIPT;
         }
+    } else if (lang_probe_d(lang, filename)) {
+        /* D, or a make-style dep-info file */
+        char buf[LANG_PROBE_HEAD + SKIP_ONE];
+        lang_head_text(buf, LANG_PROBE_HEAD, head, head_len);
+        lang = readable ? lang_d_text(buf, head_len) : CBM_LANG_DLANG;
     }
     if (lang == CBM_LANG_XML && readable && lang_objectscript_export(head, head_len)) {
         return CBM_LANG_OBJECTSCRIPT_EXPORT;
