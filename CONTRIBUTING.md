@@ -6,7 +6,7 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 
 ## Build from Source
 
-**Prerequisites**: C compiler (gcc or clang), make, zlib, Git. Optional: Node.js 22+ (for graph UI).
+**Build prerequisites**: C compiler (gcc or clang), make, zlib, Git. Optional: Node.js 22+ (for graph UI).\n\n**Contributor check prerequisites**: `scripts/test.sh` also requires `zip`, `python3`, and `curl`. `scripts/lint.sh` requires `cppcheck` and `clang-format`; full lint mode also requires `clang-tidy`.
 
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
