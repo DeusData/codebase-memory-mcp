@@ -933,6 +933,213 @@ TEST(config_toml_managed_keeps_foreign_tables_and_user_keys_issue2228) {
     PASS();
 }
 
+static void cte_count_publications(const char *path, void *context) {
+    (void)path;
+    ++*(int *)context;
+}
+
+TEST(config_toml_codex_recovery_preserves_owned_extras_and_foreign_sections) {
+    char dir[CTE_PATH_CAP], path[CTE_PATH_CAP], actual[CTE_FILE_CAP];
+    static const struct {
+        const char *before;
+        const char *after;
+    } cases[] = {
+        {CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE CTE_MCP_USER_LINES
+         "experimental.flag = true\n" CTE_MCP_FOREIGN,
+         CTE_MCP_PREFIX CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE CTE_MCP_USER_LINES
+         "experimental.flag = true\n" CTE_MCP_END_LINE CTE_MCP_FOREIGN},
+        {CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "startup_timeout_sec = 90",
+         CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE "startup_timeout_sec = 90\n" CTE_MCP_END_LINE},
+        {CTE_MCP_BEGIN_LINE "[mcp_servers.'codebase-memory-mcp']\n"
+                            "command = '/old/codebase-memory-mcp'\n"
+                            "[mcp_servers.codebase-memory-mcp.env]\nRUST_LOG = 'warn'\n"
+                            "[desktop]\nmode = 'steer'\n",
+         CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE
+         "[mcp_servers.codebase-memory-mcp.env]\nRUST_LOG = 'warn'\n" CTE_MCP_END_LINE
+         "[desktop]\nmode = 'steer'\n"},
+        {"\xef\xbb\xbf# >>> codebase-memory-mcp MCP >>>\r\n"
+         "[mcp_servers.codebase-memory-mcp]\r\n"
+         "command = 'C:\\old\\codebase-memory-mcp.exe'\r\nstartup_timeout_sec = 90\r\n"
+         "[desktop]\r\nmode = 'steer'\r\n",
+         "\xef\xbb\xbf# >>> codebase-memory-mcp MCP >>>\r\n"
+         "[mcp_servers.codebase-memory-mcp]\r\ncommand = \"/new/codebase-memory-mcp\"\r\n"
+         "args = []\r\nenv_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\r\n"
+         "startup_timeout_sec = 90\r\n# <<< codebase-memory-mcp MCP <<<\r\n"
+         "[desktop]\r\nmode = 'steer'\r\n"},
+        {CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE
+         "description = '''\n# <<< codebase-memory-mcp MCP <<<\n"
+         "[mcp_servers.codebase-memory-mcp]\ncommand = 'foreign'\n'''\n"
+         "[desktop]\nmode = 'steer'\n",
+         CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE
+         "description = '''\n# <<< codebase-memory-mcp MCP <<<\n"
+         "[mcp_servers.codebase-memory-mcp]\ncommand = 'foreign'\n'''\n" CTE_MCP_END_LINE
+         "[desktop]\nmode = 'steer'\n"},
+        {CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE
+         "[mcp_servers.codebase-memory-mcp.env]\nNOTICE = '''\n# value, not decoration\n'''\n"
+         "\n# desktop settings\n[desktop]\nmode = 'steer'\n",
+         CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE "[mcp_servers.codebase-memory-mcp.env]\nNOTICE = "
+                                              "'''\n# value, not decoration\n'''\n" CTE_MCP_END_LINE
+                                              "\n# desktop settings\n[desktop]\nmode = 'steer'\n"},
+    };
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        ASSERT_EQ(th_write_file(path, cases[i].before), 0);
+        int recovered = 0;
+        int publications = 0;
+        cbm_toml_set_prepublish_hook_for_testing(cte_count_publications, &publications);
+        int rc = cbm_toml_recover_codex_mcp(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE,
+                                            &recovered);
+        cbm_toml_set_prepublish_hook_for_testing(NULL, NULL);
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(recovered, 1);
+        ASSERT_EQ(publications, 1);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, cases[i].after);
+        ASSERT_EQ(
+            cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE), 0);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, cases[i].after);
+        ASSERT_EQ(cte_temp_count(dir), 0U);
+    }
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_toml_codex_recovery_keeps_following_hook_block_intact) {
+    char dir[CTE_PATH_CAP], path[CTE_PATH_CAP], actual[CTE_FILE_CAP];
+    char before[CTE_FILE_CAP];
+    int written = snprintf(before, sizeof(before), "%s%s%s\n%s\n%s%s\n", CTE_MCP_BEGIN_LINE,
+                           CTE_MCP_OLD_TABLE, CTE_MCP_USER_LINES, CTE_CODEX_BEGIN, CTE_CODEX_BLOCK,
+                           CTE_CODEX_END);
+    ASSERT(written > 0);
+    ASSERT((size_t)written < sizeof(before));
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, before), 0);
+    ASSERT_EQ(cte_codex_edit(path, CBM_TOML_CODEX_HOOK_UPSERT, 1), 0);
+    int recovered = 0;
+    ASSERT_EQ(
+        cbm_toml_recover_codex_mcp(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE, &recovered),
+        0);
+    ASSERT_EQ(recovered, 1);
+    ASSERT_EQ(cte_codex_edit(path, CBM_TOML_CODEX_HOOK_UPSERT, 1), 0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    const char *hook = strstr(actual, CTE_CODEX_BEGIN);
+    const char *original_hook = strstr(before, CTE_CODEX_BEGIN);
+    ASSERT_NOT_NULL(hook);
+    ASSERT_NOT_NULL(original_hook);
+    ASSERT_STR_EQ(hook, original_hook);
+    ASSERT_EQ(cbm_toml_upsert_managed_block(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE),
+              0);
+    ASSERT_EQ(cte_codex_edit(path, CBM_TOML_CODEX_HOOK_UPSERT, 1), 0);
+    ASSERT_EQ(
+        cbm_toml_remove_managed_block_owned(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_DECLARATION),
+        0);
+    ASSERT_EQ(cte_codex_edit(path, CBM_TOML_CODEX_HOOK_UPSERT, 1), 0);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_toml_codex_recovery_refuses_ambiguous_ownership) {
+    char dir[CTE_PATH_CAP], path[CTE_PATH_CAP], actual[CTE_FILE_CAP];
+    static const char *cases[] = {
+        CTE_MCP_BEGIN_LINE CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE,
+        CTE_MCP_BEGIN_LINE "[desktop]\nmode = 'steer'\n" CTE_MCP_OLD_TABLE,
+        CTE_MCP_BEGIN_LINE "key = true\n" CTE_MCP_OLD_TABLE,
+        CTE_MCP_BEGIN_LINE "[[mcp_servers.codebase-memory-mcp]]\ncommand = 'codebase-memory-mcp'\n",
+        CTE_MCP_BEGIN_LINE "[mcp_servers.codebase-memory-mcp]\ncommand = '/bin/foreign'\n",
+        CTE_MCP_BEGIN_LINE "[mcp_servers.codebase-memory-mcp]\nstartup_timeout_sec = 90\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "command = '/new/codebase-memory-mcp'\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "args = []\n",
+        CTE_MCP_BEGIN_LINE "[mcp_servers.codebase-memory-mcp]\ncommand = 'codebase-memory-mcp'\n"
+                           "args = ['--foreign']\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "env_vars = ['FOREIGN']\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "env_vars = []\nenv_vars = []\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "command.detail = 'x'\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE
+        "[mcp_servers.codebase-memory-mcp.env_vars]\nA = '1'\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE
+        "[mcp_servers.codebase-memory-mcp.command.detail]\nA = '1'\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE CTE_MCP_OLD_TABLE,
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "[desktop]\nmode = 'steer'\n"
+                                             "[mcp_servers.'codebase-memory-mcp'.env]\nA = '1'\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "[mcp_servers]\n"
+                                             "'codebase-memory-mcp' = {command = 'foreign'}\n",
+        "mcp_servers.'codebase-memory-mcp'.command = 'foreign'\n" CTE_MCP_BEGIN_LINE
+            CTE_MCP_OLD_TABLE,
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "this is not TOML\n",
+        CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE "description = '''unfinished\n",
+    };
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        ASSERT_EQ(th_write_file(path, cases[i]), 0);
+        int recovered = 1;
+        ASSERT_EQ(cbm_toml_recover_codex_mcp(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE,
+                                             &recovered),
+                  -1);
+        ASSERT_EQ(recovered, 0);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, cases[i]);
+        ASSERT_EQ(cte_temp_count(dir), 0U);
+    }
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_toml_codex_recovery_defers_other_marker_states) {
+    char dir[CTE_PATH_CAP], path[CTE_PATH_CAP], actual[CTE_FILE_CAP];
+    static const char *cases[] = {
+        "theme = 'dark'\n",
+        CTE_MCP_OLD_TABLE,
+        CTE_MCP_BEGIN_LINE CTE_MCP_NEW_TABLE CTE_MCP_END_LINE,
+        CTE_MCP_OLD_TABLE CTE_MCP_END_LINE,
+        "[desktop]\ndescription = '''\n" CTE_MCP_BEGIN_LINE "'''\n",
+    };
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        ASSERT_EQ(th_write_file(path, cases[i]), 0);
+        int recovered = 1;
+        ASSERT_EQ(cbm_toml_recover_codex_mcp(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE,
+                                             &recovered),
+                  0);
+        ASSERT_EQ(recovered, 0);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, cases[i]);
+    }
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_toml_codex_recovery_preserves_concurrent_writer) {
+    char dir[CTE_PATH_CAP], path[CTE_PATH_CAP], backup[CTE_PATH_CAP], actual[CTE_FILE_CAP];
+    const char *original = CTE_MCP_BEGIN_LINE CTE_MCP_OLD_TABLE CTE_MCP_USER_LINES;
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT(snprintf(backup, sizeof(backup), "%s/original.toml", dir) > 0);
+    for (int identity = 0; identity < 2; ++identity) {
+        ASSERT_EQ(th_write_file(path, original), 0);
+        cte_precommit_change_t race = {
+            .content = identity ? original : "concurrent = true\n",
+            .backup_path = backup,
+            .replace_identity = identity != 0,
+            .result = -1,
+        };
+        cbm_toml_set_prepublish_hook_for_testing(cte_change_before_commit, &race);
+        int recovered = 1;
+        int rc = cbm_toml_recover_codex_mcp(path, CTE_MCP_BEGIN, CTE_MCP_END, CTE_MCP_NEW_TABLE,
+                                            &recovered);
+        cbm_toml_set_prepublish_hook_for_testing(NULL, NULL);
+        ASSERT_EQ(race.result, 0);
+        ASSERT_EQ(rc, -1);
+        ASSERT_EQ(recovered, 0);
+        ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+        ASSERT_STR_EQ(actual, race.content);
+        ASSERT_EQ(cte_temp_count(dir), 0U);
+        if (identity)
+            ASSERT_EQ(cbm_unlink(backup), 0);
+    }
+    th_cleanup(dir);
+    PASS();
+}
+
 /* Control: without foreign content the output is exactly what the whole-region
  * rewrite always produced — unchanged for the current shape, the new shape for
  * an old one. */
@@ -1750,6 +1957,11 @@ SUITE(config_toml_edit) {
     RUN_TEST(config_toml_managed_idempotent);
     RUN_TEST(config_toml_managed_unbalanced_duplicate_fail_closed);
     RUN_TEST(config_toml_managed_keeps_foreign_tables_and_user_keys_issue2228);
+    RUN_TEST(config_toml_codex_recovery_preserves_owned_extras_and_foreign_sections);
+    RUN_TEST(config_toml_codex_recovery_keeps_following_hook_block_intact);
+    RUN_TEST(config_toml_codex_recovery_refuses_ambiguous_ownership);
+    RUN_TEST(config_toml_codex_recovery_defers_other_marker_states);
+    RUN_TEST(config_toml_codex_recovery_preserves_concurrent_writer);
     RUN_TEST(config_toml_managed_control_without_foreign_content_issue2228);
     RUN_TEST(config_toml_managed_keeps_lead_and_owned_subtable_issue2228);
     RUN_TEST(config_toml_managed_ambiguous_foreign_content_fails_closed_issue2228);

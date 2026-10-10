@@ -3906,8 +3906,18 @@ int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
                                              "env_vars = [\"CBM_CACHE_DIR\", "
                                              "\"CBM_RUNTIME_DIR\"]\n",
                            escaped);
-    if (written < 0 || (size_t)written >= sizeof(block) ||
-        cbm_remove_codex_legacy_mcp(config_path) != 0) {
+    if (written < 0 || (size_t)written >= sizeof(block)) {
+        return CLI_ERR;
+    }
+    int recovered = 0;
+    if (cbm_toml_recover_codex_mcp(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END, block,
+                                   &recovered) != 0) {
+        return CLI_ERR;
+    }
+    if (recovered) {
+        return CLI_OK;
+    }
+    if (cbm_remove_codex_legacy_mcp(config_path) != 0) {
         return CLI_ERR;
     }
     return cbm_toml_upsert_managed_block(config_path, CODEX_MCP_BEGIN, CODEX_MCP_END, block) == 0

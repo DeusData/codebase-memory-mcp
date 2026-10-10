@@ -31,6 +31,14 @@ int cbm_toml_escape_basic_string(const char *input, char *out, size_t out_size);
  * just after it. Content whose ownership is ambiguous fails closed. */
 int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker, const char *block);
+/* Recover a Codex MCP table whose opening marker survived without its closer.
+ * Only a first, contiguous, recognizably owned MCP table is adopted; user
+ * fields and sub-tables are kept and the updated block is published atomically.
+ * Returns 0 with *recovered=1 after recovery, 0 with *recovered=0 when the
+ * normal install path should handle the marker state, or -1 on refusal/error.
+ * Refusal leaves the file untouched; recovered is cleared on every failure. */
+int cbm_toml_recover_codex_mcp(const char *file_path, const char *begin_marker,
+                               const char *end_marker, const char *block, int *recovered);
 /* Removes the whole span between the markers. */
 int cbm_toml_remove_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker);
