@@ -1837,16 +1837,19 @@ TEST(lrp_tsx_usage_import_type_with_decoy) {
     PASS();
 }
 
-/* Python: constructor syntax is an exact call to the materialized Class node. */
+/* Python: ClassName() with a user __init__ is an exact CALLS edge to that
+ * method. The Class node no longer receives the instantiation edge. */
 TEST(lrp_python_usage_instantiation) {
     static const LRP_File f[] = {
         {"model.py", "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py", "from .model import User\n\n\ndef create(name):\n    return User(name)\n"}};
     LRP_Proj lp;
     cbm_store_t *store = lrp_index(&lp, f, 2);
-    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
+    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "__init__") : -1;
+    int class_edge = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
     lrp_cleanup(&lp, store);
     ASSERT_EQ(exact, 1);
+    ASSERT_EQ(class_edge, 0);
     PASS();
 }
 
