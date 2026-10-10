@@ -56,6 +56,7 @@ void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *block, size_t size);
 void __real_free(void *block);
+void __real__aligned_free(void *block);
 char *__real_strdup(const char *text);
 size_t __real__msize(void *block);
 /* Wrappers must call __real_* for anything that is itself wrapped: a plain
@@ -155,7 +156,9 @@ void __wrap__aligned_free(void *block) {
         mi_free(block);
         return;
     }
-    __real_free(block);
+    /* A CRT aligned block has its own bookkeeping header. Plain free is not
+     * its matching deallocator. */
+    __real__aligned_free(block);
 }
 
 void *__wrap_realloc(void *block, size_t size) {
