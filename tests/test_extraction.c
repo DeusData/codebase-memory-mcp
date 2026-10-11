@@ -1572,6 +1572,54 @@ TEST(ts_class) {
     PASS();
 }
 
+TEST(ts_import_type_array_in_generic_object_call_issue2576) {
+    CBMFileResult *r = extract("async function request<T>(): Promise<T> {\n"
+                               "  return undefined as T;\n"
+                               "}\n"
+                               "export const api = {\n"
+                               "  login: (user: string, pass: string) =>\n"
+                               "    request<{ token: string; user: import('./types').User }>(),\n"
+                               "  changePass: (oldPass: string, newPass: string) =>\n"
+                               "    request<{ message: string }>('/auth/change', {}),\n"
+                               "  orders: () =>\n"
+                               "    request<{ data: import('./types').Order[] }>('/orders'),\n"
+                               "};\n"
+                               "export function declarationAfter(): void {}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "api.ts");
+    ASSERT_NOT_NULL(r);
+    int has_api = has_def(r, "Variable", "api");
+    int has_later_declaration = has_def(r, "Function", "declarationAfter");
+    bool parse_incomplete = r->parse_incomplete;
+    cbm_free_result(r);
+    ASSERT(has_api);
+    ASSERT(has_later_declaration);
+    ASSERT_FALSE(parse_incomplete);
+
+    CBMFileResult *invalid = extract("const api = request<{ data: import('./types').Order[ }>('/orders');\n",
+                                     CBM_LANG_TYPESCRIPT, "t", "invalid.ts");
+    ASSERT_NOT_NULL(invalid);
+    bool invalid_parse_incomplete = invalid->parse_incomplete;
+    cbm_free_result(invalid);
+    ASSERT_TRUE(invalid_parse_incomplete);
+
+    CBMFileResult *invalid_call = extract(
+        "const api = request<{ data: import('./types').Order[] }>('/orders';\n",
+        CBM_LANG_TYPESCRIPT, "t", "invalid-call.ts");
+    ASSERT_NOT_NULL(invalid_call);
+    bool invalid_call_parse_incomplete = invalid_call->parse_incomplete;
+    cbm_free_result(invalid_call);
+    ASSERT_TRUE(invalid_call_parse_incomplete);
+
+    CBMFileResult *invalid_identifier = extract(
+        "const api = request<{ data: import('./types').\xc3\x97[] }>('/orders');\n",
+        CBM_LANG_TYPESCRIPT, "t", "invalid-identifier.ts");
+    ASSERT_NOT_NULL(invalid_identifier);
+    bool invalid_identifier_parse_incomplete = invalid_identifier->parse_incomplete;
+    cbm_free_result(invalid_identifier);
+    ASSERT_TRUE(invalid_identifier_parse_incomplete);
+    PASS();
+}
+
 TEST(body_tokens_type_identifier) {
     CBMFileResult *r = extract("function serialize(obj: MyModel): SerializedResult {\n"
                                "  const result: SerializedResult = new SerializedResult();\n"
@@ -10520,6 +10568,7 @@ SUITE(extraction) {
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
     RUN_TEST(ts_class);
+    RUN_TEST(ts_import_type_array_in_generic_object_call_issue2576);
     RUN_TEST(body_tokens_type_identifier);
     RUN_TEST(lua_function);
     RUN_TEST(bash_function);
