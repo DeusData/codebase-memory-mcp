@@ -7,6 +7,7 @@
 
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform_internal.h"
 #include <ctype.h>
 #include <errno.h>
@@ -435,6 +436,76 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
         return platform_copy_environment_value(buf, buf_sz, fallback);
     }
     return NULL;
+}
+
+/* See platform.h. The long-value sibling of cbm_safe_getenv: there is no caller
+ * buffer to overrun, so a PATH past 4 KB is read in full instead of being
+ * refused (#221). Both the wide staging buffer and the UTF-8 result are
+ * allocated through the memory core, which is also the only allocator the
+ * caller may release them with -- keeping the memory-core ratchet honest means
+ * this file adds no raw allocation site to pay for the new read. */
+char *cbm_env_dup(const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+#ifdef _WIN32
+    /* Same wide route as cbm_safe_getenv: _environ holds ANSI-code-page bytes,
+     * so a non-ASCII PATH would arrive mojibake'd or with '?' substituted --
+     * invalid in a Windows path and fatal to every file API downstream. */
+    wchar_t wname[CBM_SZ_256];
+    int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, wname, CBM_SZ_256);
+    if (wn <= 0) {
+        return NULL;
+    }
+    SetLastError(ERROR_SUCCESS);
+    DWORD needed = GetEnvironmentVariableW(wname, NULL, 0U);
+    DWORD lookup_error = GetLastError();
+    if (needed == 0U) {
+        if (lookup_error != ERROR_ENVVAR_NOT_FOUND) {
+            /* Present but empty. Distinct from unset, and callers are entitled
+             * to tell the two apart, so return "" and not NULL. */
+            return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, "");
+        }
+        return NULL;
+    }
+    wchar_t *wvalue = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)needed * sizeof(*wvalue));
+    if (!wvalue) {
+        return NULL;
+    }
+    SetLastError(ERROR_SUCCESS);
+    DWORD got = GetEnvironmentVariableW(wname, wvalue, needed);
+    DWORD read_error = GetLastError();
+    if (got >= needed || (got == 0U && read_error != ERROR_SUCCESS)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, wvalue);
+        return NULL;
+    }
+    int utf8_size =
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wvalue, -1, NULL, 0, NULL, NULL);
+    char *utf8 = utf8_size > 0 ? cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)utf8_size) : NULL;
+    int converted = utf8 ? WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wvalue, -1, utf8,
+                                               utf8_size, NULL, NULL)
+                         : 0;
+    if (!utf8 || converted != utf8_size) {
+        cbm_free(CBM_MEM_CLASS_OTHER, utf8);
+        cbm_free(CBM_MEM_CLASS_OTHER, wvalue);
+        return NULL;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, wvalue);
+    return utf8;
+#else
+    /* Same environ walk as cbm_safe_getenv: getenv() returns a pointer another
+     * thread can invalidate with setenv(), so the value is copied out here. */
+    char **env = CBM_ENVIRON;
+    if (env) {
+        size_t name_len = strlen(name);
+        for (; *env; env++) {
+            if (strncmp(*env, name, name_len) == 0 && (*env)[name_len] == '=') {
+                return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, *env + name_len + SKIP_ONE);
+            }
+        }
+    }
+    return NULL;
+#endif
 }
 
 /* See platform.h. The shape here is the one src/main.c:1104 already uses for

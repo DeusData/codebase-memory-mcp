@@ -152,7 +152,215 @@ TEST(repro_issue221_opencode_pathext_lookup) {
     PASS();
 }
 
+/* ── #221 regression: PATH longer than the old 4 KB copy ───────────────── */
+
+/* Snapshot/restore one environment variable. The suite swaps PATH and the
+ * Windows profile roots, and a leaked swap would poison every later suite. */
+static char *repro221_save_env(const char *name) {
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+static void repro221_restore_env(const char *name, char *saved) {
+    if (saved) {
+        cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv(name);
+    }
+}
+
+/*
+ * repro_issue221_long_path_beyond_four_kb
+ *
+ * find_in_path() used to copy PATH into a fixed 4096-byte stack buffer through
+ * cbm_safe_getenv(). That helper does not truncate -- it REFUSES a value it
+ * cannot fit -- so on a machine whose PATH exceeds 4096 characters the whole
+ * PATH was skipped and every agent on it read as "not installed". That is the
+ * layout the #221 reporter had: mise, npm and scoop each append entries.
+ *
+ * The fixture directory is the LAST PATH entry, so any truncation of the copy
+ * hides exactly the directory under test and nothing else. This case is not
+ * Windows-specific -- the same 4 KB cap hid entries on macOS and Linux.
+ *
+ * RED before the fix (empty result), GREEN after it.
+ */
+TEST(repro_issue221_long_path_beyond_four_kb) {
+    const char *created = th_mktempdir("repro221long");
+    if (!created) {
+        FAIL("th_mktempdir failed");
+    }
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s", created);
+
+#ifdef _WIN32
+    const char *fixture_name = "cbm-repro221-long.cmd";
+    const char *fixture_body = "@echo off\r\nrem fake long-PATH agent\r\n";
+    const char path_delim = ';';
+#else
+    const char *fixture_name = "cbm-repro221-long";
+    const char *fixture_body = "#!/bin/sh\n# fake long-PATH agent\n";
+    const char path_delim = ':';
+#endif
+
+    char fixture_path[1024];
+    snprintf(fixture_path, sizeof(fixture_path), "%s/%s", tmpdir, fixture_name);
+    if (th_write_file(fixture_path, fixture_body) != 0) {
+        th_cleanup(tmpdir);
+        FAIL("could not write the long-PATH fixture");
+    }
+    th_make_executable(fixture_path);
+
+    /*
+     * Filler entries name directories that do not exist: the scan has to walk
+     * past every one of them to reach the fixture, which is appended after the
+     * filler so that it always sits beyond the 4096-byte mark.
+     */
+    enum { FILLER_TARGET = 4600, PATH_CAP = FILLER_TARGET + 1024 };
+    char long_path[PATH_CAP];
+    size_t used = 0U;
+    while (used < (size_t)FILLER_TARGET) {
+        int written = snprintf(long_path + used, sizeof(long_path) - used,
+                               "/nonexistent-repro221-filler%05zu%c", used, path_delim);
+        if (written <= 0 || (size_t)written >= sizeof(long_path) - used) {
+            th_cleanup(tmpdir);
+            FAIL("could not build the long PATH filler");
+        }
+        used += (size_t)written;
+    }
+    ASSERT_GT(used, 4096);
+    int tail = snprintf(long_path + used, sizeof(long_path) - used, "%s", tmpdir);
+    if (tail <= 0 || (size_t)tail >= sizeof(long_path) - used) {
+        th_cleanup(tmpdir);
+        FAIL("could not append the fixture directory to the long PATH");
+    }
+
+    char *saved_path = repro221_save_env("PATH");
+    cbm_setenv("PATH", long_path, 1);
+
+    /* A home that does not exist keeps the PATH-independent fallbacks out of
+     * the way: the fixture's directory is the only place that can satisfy it. */
+    const char *result = cbm_find_cli("cbm-repro221-long", "/nonexistent-repro221-home");
+
+    repro221_restore_env("PATH", saved_path);
+
+    ASSERT_NOT_NULL(result);
+    ASSERT(result[0] != '\0');
+    ASSERT(strncmp(result, tmpdir, strlen(tmpdir)) == 0);
+    ASSERT(strstr(result, "cbm-repro221-long") != NULL);
+
+    th_cleanup(tmpdir);
+    PASS();
+}
+
+/* ── #221 regression: the Windows fallback shim locations ───────────────── */
+
+/*
+ * repro_issue221_windows_fallback_shims
+ *
+ * An agent the PATH scan cannot see must still be found where Windows actually
+ * puts CLIs: %APPDATA%\npm (npm's global bin), %LOCALAPPDATA%\mise\shims,
+ * %USERPROFILE%\scoop\shims, plus the pipx and cargo homes (~\.local\bin,
+ * ~\.cargo\bin) that were already probed before #221 passed and must not be
+ * dropped by the fix.
+ *
+ * Each location is reached through its own seam -- APPDATA / LOCALAPPDATA, or
+ * the home_dir argument -- so this never reads the developer's real profile.
+ * Every shim carries a .cmd extension, which is why the fallback probe needs
+ * the same PATHEXT treatment the PATH scan got.
+ *
+ * Windows-only: the directory layout it asserts is the one Windows installers
+ * produce. */
+TEST(repro_issue221_windows_fallback_shims) {
+#ifndef _WIN32
+    SKIP_PLATFORM("Windows-only: npm/mise/scoop shim fallback layout");
+#else
+    const char *created = th_mktempdir("repro221fb");
+    if (!created) {
+        FAIL("th_mktempdir failed");
+    }
+    char root[512];
+    snprintf(root, sizeof(root), "%s", created);
+
+    char *saved_appdata = repro221_save_env("APPDATA");
+    char *saved_localappdata = repro221_save_env("LOCALAPPDATA");
+    char *saved_userprofile = repro221_save_env("USERPROFILE");
+    char *saved_path = repro221_save_env("PATH");
+
+    /* APPDATA/LOCALAPPDATA/USERPROFILE all point at the fixture root. The
+     * scoop, pipx and cargo entries are built from the home_dir ARGUMENT, so
+     * USERPROFILE here mirrors what a real profile would supply. */
+    cbm_setenv("APPDATA", root, 1);
+    cbm_setenv("LOCALAPPDATA", root, 1);
+    cbm_setenv("USERPROFILE", root, 1);
+    cbm_setenv("PATH", "/nonexistent-repro221-path", 1);
+
+    /* One shim at a time, so the returned path proves which entry matched
+     * rather than merely that something did. Each case removes its shim before
+     * the next one runs, so the earlier entries cannot shadow the later ones. */
+    const struct {
+        const char *subdir;
+        const char *label;
+    } cases[] = {
+        {".local/bin", "pipx home"},         {".cargo/bin", "cargo home"},  {"npm", "APPDATA npm"},
+        {"mise/shims", "LOCALAPPDATA mise"}, {"scoop/shims", "scoop home"},
+    };
+    const char *shim_name = "cbm-repro221-fb.cmd";
+    const size_t case_count = sizeof(cases) / sizeof(cases[0]);
+
+    for (size_t i = 0; i < case_count; i++) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s/%s", root, cases[i].subdir);
+        if (th_mkdir_p(dir) != 0) {
+            repro221_restore_env("PATH", saved_path);
+            repro221_restore_env("USERPROFILE", saved_userprofile);
+            repro221_restore_env("LOCALAPPDATA", saved_localappdata);
+            repro221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("could not create the fallback fixture directory");
+        }
+        char shim[1024];
+        snprintf(shim, sizeof(shim), "%s/%s", dir, shim_name);
+        if (th_write_file(shim, "@echo off\r\nrem fake fallback shim\r\n") != 0) {
+            repro221_restore_env("PATH", saved_path);
+            repro221_restore_env("USERPROFILE", saved_userprofile);
+            repro221_restore_env("LOCALAPPDATA", saved_localappdata);
+            repro221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("could not write the fallback shim");
+        }
+
+        const char *result = cbm_find_cli("cbm-repro221-fb", root);
+        char expected_prefix[512];
+        snprintf(expected_prefix, sizeof(expected_prefix), "%s/%s/", root, cases[i].subdir);
+        bool matched = result != NULL && result[0] != '\0' &&
+                       strncmp(result, expected_prefix, strlen(expected_prefix)) == 0;
+        (void)remove(shim);
+
+        if (!matched) {
+            printf("  fallback case %zu (%s) did not resolve in %s\n", i, cases[i].label, dir);
+            repro221_restore_env("PATH", saved_path);
+            repro221_restore_env("USERPROFILE", saved_userprofile);
+            repro221_restore_env("LOCALAPPDATA", saved_localappdata);
+            repro221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("a Windows fallback shim location was not probed");
+        }
+    }
+
+    repro221_restore_env("PATH", saved_path);
+    repro221_restore_env("USERPROFILE", saved_userprofile);
+    repro221_restore_env("LOCALAPPDATA", saved_localappdata);
+    repro221_restore_env("APPDATA", saved_appdata);
+
+    th_cleanup(root);
+    PASS();
+#endif
+}
+
 /* ── Suite ──────────────────────────────────────────────────────────────── */
 SUITE(repro_issue221) {
     RUN_TEST(repro_issue221_opencode_pathext_lookup);
+    RUN_TEST(repro_issue221_long_path_beyond_four_kb);
+    RUN_TEST(repro_issue221_windows_fallback_shims);
 }

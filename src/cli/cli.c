@@ -22,6 +22,7 @@
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/sha256.h"
 #include "foundation/str_util.h"
 #include "cli/client_adapter.h"
@@ -1124,36 +1125,50 @@ static bool is_executable(const char *path) {
 #endif
 }
 
+/* Windows ships CLIs as extension-bearing shims -- .cmd from npm, .ps1 from
+ * mise, .exe from scoop -- so a bare-name probe never matches there. One
+ * definition serves both the PATH scan and the fallback-directory probe (#221). */
+#ifdef _WIN32
+static const char *const WIN_EXEC_EXTS[] = {".exe", ".cmd", ".bat", ".ps1", NULL};
+#endif
+
 /* Search for an executable named `name` in the PATH environment variable.
- * Returns the full path in `out` (max out_sz) if found, else empty string. */
+ * Returns the full path in `out` (max out_sz) if found, else empty string.
+ *
+ * The PATH copy is sized to the REAL value, not to a fixed 4 KB stack buffer.
+ * That buffer was the first root cause of #221: a Windows dev machine's PATH
+ * routinely runs past 4096 characters, and cbm_safe_getenv() REFUSES a value it
+ * cannot fit rather than truncating it -- so find_in_path() returned false
+ * before looking at a single directory, and opencode (installed through
+ * mise/npm/scoop and present on PATH) read as "not installed". The same 4 KB
+ * cap hid entries on macOS/Linux too; the fix is not Windows-specific. */
 static bool find_in_path(const char *name, char *out, size_t out_sz) {
-    char path_copy[CLI_BUF_4K];
-    if (!cbm_safe_getenv("PATH", path_copy, sizeof(path_copy), NULL)) {
+    char *path_copy = cbm_env_dup("PATH");
+    if (!path_copy) {
         return false;
     }
-    char *saveptr;
+
+    /* One exit. PATH is a full live copy of the environment, the scan has
+     * several ways to stop, and the previous shape returned straight out of the
+     * loop -- which is exactly what leaked a PATH-sized allocation per call. */
+    bool found = false;
+    char *saveptr = NULL;
     char *dir = strtok_r(path_copy, PATH_DELIM, &saveptr);
-    while (dir) {
+    while (dir != NULL && !found) {
         snprintf(out, out_sz, "%s/%s", dir, name);
-        if (is_executable(out)) {
-            return true;
-        }
+        found = is_executable(out);
 #ifdef _WIN32
-        /* On Windows executables carry an extension (PATHEXT). A CLI like
-         * opencode is often installed as a .cmd / .ps1 / .exe shim (e.g. via
-         * mise or npm), so the bare-name probe above misses it (#221). Try the
-         * common executable extensions before moving to the next PATH entry. */
-        static const char *const win_exts[] = {".exe", ".cmd", ".bat", ".ps1", NULL};
-        for (int i = 0; win_exts[i]; i++) {
-            snprintf(out, out_sz, "%s/%s%s", dir, name, win_exts[i]);
-            if (is_executable(out)) {
-                return true;
-            }
+        /* PATHEXT variants for THIS entry, before moving to the next one. */
+        for (int i = 0; !found && WIN_EXEC_EXTS[i] != NULL; i++) {
+            snprintf(out, out_sz, "%s/%s%s", dir, name, WIN_EXEC_EXTS[i]);
+            found = is_executable(out);
         }
 #endif
         dir = strtok_r(NULL, PATH_DELIM, &saveptr);
     }
-    return false;
+
+    cbm_free(CBM_MEM_CLASS_OTHER, path_copy);
+    return found;
 }
 
 const char *cbm_find_cli(const char *name, const char *home_dir) {
@@ -1167,22 +1182,66 @@ const char *cbm_find_cli(const char *name, const char *home_dir) {
     if (!home_dir || !home_dir[0]) {
         return "";
     }
+    /* PATH-independent fallbacks, tried in order. Every home-derived entry is
+     * built from the `home_dir` ARGUMENT and not from cbm_get_home_dir(): a
+     * dry-run scan or a test passes a synthetic home and must not be shown the
+     * host's agents. `/` separators are fine on Windows -- the wide-safe file
+     * layer accepts them, and the rest of this file already composes paths so. */
     enum { NUM_PATHS = 5 };
     char paths[NUM_PATHS][CLI_BUF_512];
-    snprintf(paths[0], sizeof(paths[0]), "/usr/local/bin/%s", name);
-    snprintf(paths[1], sizeof(paths[1]), "%s/.npm/bin/%s", home_dir, name);
-    snprintf(paths[2], sizeof(paths[2]), "%s/.local/bin/%s", home_dir, name);
-    snprintf(paths[3], sizeof(paths[3]), "%s/.cargo/bin/%s", home_dir, name);
-#ifdef __APPLE__
-    snprintf(paths[4], sizeof(paths[4]), "/opt/homebrew/bin/%s", name);
+    memset(paths, 0, sizeof(paths));
+    int n = 0;
+#ifdef _WIN32
+    /* Locations that were already probed on Windows before #221 and are real
+     * there: pipx installs into ~/.local/bin and cargo into ~/.cargo/bin, so
+     * replacing the list rather than extending it would make pipx- and
+     * cargo-installed agents disappear. */
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.local/bin/%s", home_dir, name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.cargo/bin/%s", home_dir, name);
+    /* Windows-shaped locations (issue #221, second root cause): npm puts its
+     * global bin under %APPDATA%\npm, and mise and scoop expose shims under
+     * %LOCALAPPDATA%\mise\shims and %USERPROFILE%\scoop\shims. Each is read
+     * through its own environment seam, so the list stays testable. */
+    const char *appdata = cbm_app_config_dir();
+    if (appdata) {
+        snprintf(paths[n++], sizeof(paths[0]), "%s/npm/%s", appdata, name);
+    }
+    const char *localapp = cbm_app_local_dir();
+    if (localapp) {
+        snprintf(paths[n++], sizeof(paths[0]), "%s/mise/shims/%s", localapp, name);
+    }
+    snprintf(paths[n++], sizeof(paths[0]), "%s/scoop/shims/%s", home_dir, name);
 #else
-    paths[4][0] = '\0';
+    snprintf(paths[n++], sizeof(paths[0]), "/usr/local/bin/%s", name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.npm/bin/%s", home_dir, name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.local/bin/%s", home_dir, name);
+    snprintf(paths[n++], sizeof(paths[0]), "%s/.cargo/bin/%s", home_dir, name);
+#ifdef __APPLE__
+    snprintf(paths[n++], sizeof(paths[0]), "/opt/homebrew/bin/%s", name);
 #endif
-    for (int i = 0; i < NUM_RETRIES; i++) {
-        if (paths[i][0] && is_executable(paths[i])) {
+#endif
+    /* NUM_PATHS, not NUM_RETRIES: both are 5 today, so the old bound only
+     * looked right by coincidence -- what the loop means is the list length. */
+    for (int i = 0; i < NUM_PATHS; i++) {
+        if (!paths[i][0]) {
+            continue;
+        }
+        if (is_executable(paths[i])) {
             snprintf(buf, sizeof(buf), "%s", paths[i]);
             return buf;
         }
+#ifdef _WIN32
+        /* The npm/mise/scoop shims carry an extension, so every fallback
+         * directory needs the same PATHEXT probe the PATH scan got. */
+        for (int e = 0; WIN_EXEC_EXTS[e] != NULL; e++) {
+            char extpath[CLI_BUF_512];
+            snprintf(extpath, sizeof(extpath), "%s%s", paths[i], WIN_EXEC_EXTS[e]);
+            if (is_executable(extpath)) {
+                snprintf(buf, sizeof(buf), "%s", extpath);
+                return buf;
+            }
+        }
+#endif
     }
     return "";
 }
