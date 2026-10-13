@@ -55,8 +55,10 @@ codebase-memory-mcp install          # configure all detected coding agents
 codebase-memory-mcp --version
 codebase-memory-mcp --help
 codebase-memory-mcp update           # update to latest release
-codebase-memory-mcp uninstall        # remove agent configs
+codebase-memory-mcp uninstall        # remove agent configs; keep indexes by default
 ```
+
+Uninstall keeps project indexes with `--yes`, `--no`, or noninteractive input unless you explicitly add `--delete-indexes`. An interactive terminal without the flag asks separately and defaults to keeping them. `--delete-indexes` overrides `--no`; add `--dry-run` to preview without changing files. Kept indexes remain in the cache directory printed by uninstall.
 
 ### CLI Mode
 

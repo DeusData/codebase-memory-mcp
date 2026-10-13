@@ -1,0 +1,85 @@
+/*
+ * MIT License. Copyright (c) 2025 DeusData.
+ *
+ * Uebernommen am 2026-08-28 aus DeusData/codebase-memory-mcp, Branch
+ * feat/atlas-r1, Datei graph-ui/src/lib/types.ts. Der Lizenztext und die Liste
+ * aller uebernommenen Dateien stehen in THIRD_PARTY.md.
+ *
+ * Aenderungen gegenueber dem Original:
+ *  - nur die Typen der Szene behalten: GraphNode, NodeStatus, GraphEdge,
+ *    GraphData. Region, RegionEdge, RegionsPayload, Project, SchemaInfo,
+ *    TabId, ProcessInfo und RepoInfo gehoeren zu Panels, die dieses Projekt
+ *    nicht uebernimmt.
+ *  - LinkedProject entfernt. MissedGraph ist als getrennte Coverage-Ebene
+ *    wieder verfuegbar, mit eigenen Render-IDs und Auswahl-Callbacks.
+ *  - GraphEdge hat seit W9 ein optionales Feld `offset`. Begruendung an dem
+ *    Feld selbst und im Kopf von EdgeLines.tsx.
+ */
+
+/* Graph data types matching the C layout3d.c JSON output */
+
+export interface GraphNode {
+    id: number;
+    x: number;
+    y: number;
+    z: number;
+    label: string;
+    name: string;
+    file_path?: string;
+    qualified_name?: string;
+    start_line?: number;
+    end_line?: number;
+    size: number;
+    color: string;
+    /* Dead-code classification from the backend layout (layout3d.c). */
+    status?: NodeStatus;
+    in_calls?: number;
+    out_calls?: number;
+    /** Indexed documentation when supplied by the logical repository map. */
+    documentation?: string;
+    package_name?: string;
+}
+
+export type NodeStatus =
+    | 'dead'
+    | 'single'
+    | 'entry'
+    | 'test'
+    | 'exported'
+    | 'normal'
+    | 'structural';
+
+export interface GraphEdge {
+    id?: number;
+    /** Recorded representative callsite, when present; not the declaration. */
+    line?: number;
+    /** Resolution provenance supplied by the index, when available. */
+    strategy?: string;
+    confidence?: number;
+    source: number;
+    target: number;
+    type: string;
+    /**
+     * Seitlicher Versatz beim Zeichnen, in Welteinheiten (W9, neu).
+     *
+     * Zwei Symbole koennen mehr als eine Beziehung haben. Ohne Versatz liegt
+     * die zweite Linie auf der ersten und mischt sich additiv zu einer Farbe,
+     * die keine Legende kennt. Die Layout-Antwort des Servers traegt dieses
+     * Feld nicht; gesetzt wird es nur von der Hierarchie-Projektion.
+     */
+    offset?: number;
+}
+
+export interface GraphData {
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+    total_nodes: number;
+    missed_graph?: MissedGraph;
+}
+
+/** File skeleton for recorded coverage gaps; reasons and ranges are not part of this layout. */
+export interface MissedGraph {
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+    offset: { x: number; y: number; z: number };
+}

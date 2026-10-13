@@ -22,6 +22,7 @@
  */
 #include "test_framework.h"
 #include <store/store.h>
+#include "foundation/mem_core.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -275,7 +276,8 @@ TEST(arch_path_scoping) {
     ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
     ASSERT_EQ(scoped_pkg_nodes, 1);
 
-    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") >
+                cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
 
     cbm_architecture_info_t scoped_slash;
     memset(&scoped_slash, 0, sizeof(scoped_slash));
@@ -617,6 +619,145 @@ TEST(adr_delete_not_found) {
 
     ASSERT_TRUE(cbm_store_adr_delete(s, "nonexistent") != CBM_STORE_OK);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Doc -> code candidates: a database without the table reads as "none";
+ * a replace swaps exactly one project's rows; reads go highest p first (then
+ * score) in both directions. */
+TEST(doc_candidates_replace_and_get) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_doc_candidate_t *got = NULL;
+    int n = -1;
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", NULL, 5, &got, &n),
+              CBM_STORE_NOT_FOUND);
+
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "p.secA",
+         .target_qn = "p.f2",
+         .rank = 2,
+         .score = 0.25,
+         .p = 0.36,
+         .evidence = "{\"shared_terms\":3,\"name_tokens\":0}"},
+        {.section_qn = "p.secA",
+         .target_qn = "p.f1",
+         .rank = 1,
+         .score = 0.45,
+         .p = 0.548,
+         .evidence = "{\"shared_terms\":6,\"name_tokens\":1}"},
+        {.section_qn = "p.secB",
+         .target_qn = "p.f1",
+         .rank = 1,
+         .score = 0.32,
+         .p = 0.42,
+         .evidence = ""},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", rows, 3), CBM_STORE_OK);
+    const cbm_doc_candidate_t other = {.section_qn = "q.secA",
+                                       .target_qn = "q.f9",
+                                       .rank = 1,
+                                       .score = 0.5,
+                                       .p = 0.548,
+                                       .evidence = ""};
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "q", &other, 1), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(got[0].target_qn, "p.f1");
+    ASSERT_EQ(got[0].rank, 1);
+    ASSERT_STR_EQ(got[0].evidence, "{\"shared_terms\":6,\"name_tokens\":1}");
+    ASSERT_STR_EQ(got[1].target_qn, "p.f2");
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, "p.f1", 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(got[0].section_qn, "p.secA");
+    ASSERT_STR_EQ(got[1].section_qn, "p.secB");
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, "p.f1", 1, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+
+    /* a replace drops every earlier row of the project, and only of it */
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", &rows[2], 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 0);
+    cbm_store_doc_candidates_free(got, n);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secB", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "q", "q.secA", NULL, 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, "p.f1", 5, &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 0);
+    cbm_store_doc_candidates_free(got, n);
+
+    /* exactly one of section / target */
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", NULL, NULL, 5, &got, &n), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_doc_candidates_get(s, "p", "p.secA", "p.f1", 5, &got, &n), CBM_STORE_ERR);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Whole-file candidates of a path: the rows whose target is the path's File
+ * node or a Folder holding it -- never a sibling folder sharing a name prefix
+ * (pkg/mailer, pk), a function in the file, or another project's rows. */
+TEST(doc_candidates_for_path_file_and_folders) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_doc_candidate_t *got = NULL;
+    int n = -1;
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "pkg/mail/parse.py", 5, &got, &n),
+              CBM_STORE_NOT_FOUND);
+    cbm_store_upsert_project(s, "p", "/tmp/p");
+    const struct {
+        const char *label, *qn, *path;
+    } nodes[] = {{"File", "p.pkg.mail.parse.__file__", "pkg/mail/parse.py"},
+                 {"Function", "p.pkg.mail.parse.parse_mail", "pkg/mail/parse.py"},
+                 {"Folder", "p.pkg.mail", "pkg/mail"},
+                 {"Folder", "p.pkg", "pkg"},
+                 {"Folder", "p.pkg.mailer", "pkg/mailer"},
+                 {"Folder", "p.pk", "pk"}};
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        cbm_node_t node = {.project = "p",
+                           .label = nodes[i].label,
+                           .name = nodes[i].qn,
+                           .qualified_name = nodes[i].qn,
+                           .file_path = nodes[i].path};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &node) > 0);
+    }
+    const cbm_doc_candidate_t rows[] = {
+        {.section_qn = "p.docs.a", .target_qn = "p.pkg.mail.parse.__file__", .p = 0.5},
+        {.section_qn = "p.docs.b", .target_qn = "p.pkg.mail", .p = 0.7},
+        {.section_qn = "p.docs.c", .target_qn = "p.pkg", .p = 0.3},
+        {.section_qn = "p.docs.d", .target_qn = "p.pkg.mailer", .p = 0.9},
+        {.section_qn = "p.docs.e", .target_qn = "p.pk", .p = 0.9},
+        {.section_qn = "p.docs.f", .target_qn = "p.pkg.mail.parse.parse_mail", .p = 0.95},
+    };
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "p", rows, 6), CBM_STORE_OK);
+    const cbm_doc_candidate_t other = {
+        .section_qn = "q.docs.a", .target_qn = "p.pkg.mail", .p = 0.99};
+    ASSERT_EQ(cbm_store_doc_candidates_replace(s, "q", &other, 1), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "pkg/mail/parse.py", 5, &got, &n),
+              CBM_STORE_OK);
+    ASSERT_EQ(n, 3);
+    ASSERT_STR_EQ(got[0].section_qn, "p.docs.b"); /* highest p first */
+    ASSERT_STR_EQ(got[1].section_qn, "p.docs.a");
+    ASSERT_STR_EQ(got[2].section_qn, "p.docs.c");
+    cbm_store_doc_candidates_free(got, n);
+
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "pkg/mail/parse.py", 1, &got, &n),
+              CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    cbm_store_doc_candidates_free(got, n);
+    ASSERT_EQ(cbm_store_doc_candidates_for_path(s, "p", "", 5, &got, &n), CBM_STORE_ERR);
     cbm_store_close(s);
     PASS();
 }
@@ -969,11 +1110,11 @@ static int adr_check_splice(const char *in, const char *name, const char *body,
     return 0;
 }
 
-#define CHECK_SPLICE(in, name, body, expect)                                                       \
-    do {                                                                                           \
-        if (adr_check_splice((in), (name), (body), (expect)) != 0) {                               \
-            return 1;                                                                              \
-        }                                                                                          \
+#define CHECK_SPLICE(in, name, body, expect)                         \
+    do {                                                             \
+        if (adr_check_splice((in), (name), (body), (expect)) != 0) { \
+            return 1;                                                \
+        }                                                            \
     } while (0)
 
 /* THE acceptance property. Every document below is a case where rebuilding
@@ -1088,9 +1229,9 @@ TEST(adr_splice_mixed_line_endings) {
 TEST(adr_splice_matches_headings_across_line_endings) {
     adr_name_collect_t c;
     memset(&c, 0, sizeof(c));
-    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar",
-                                    adr_collect_names, &c),
-              CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar", adr_collect_names, &c),
+        CBM_STORE_OK);
     ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
 
     /* A fenced block with CRLF still hides its heading, and still closes. */
@@ -1214,7 +1355,7 @@ TEST(louvain_basic) {
     /* Triangle and pair different */
     ASSERT_TRUE(comm[1] != comm[4]);
 
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1223,7 +1364,7 @@ TEST(louvain_empty) {
     int count = 0;
     ASSERT_EQ(cbm_louvain(NULL, 0, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 0);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1234,7 +1375,7 @@ TEST(louvain_single_node) {
     ASSERT_EQ(cbm_louvain(nodes, 1, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 1);
     ASSERT_EQ(result[0].node_id, 42);
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1297,7 +1438,45 @@ TEST(louvain_converges) {
     }
     ASSERT_TRUE(same_count >= 8);
 
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    PASS();
+}
+
+/* Both the populated graph and isolated-node path return exactly one owned
+ * output block. The Louvain compatibility entry point shares this contract. */
+TEST(leiden_result_memory_core_ownership) {
+    int64_t nodes[] = {1, 2, 3};
+    cbm_louvain_edge_t edges[] = {{1, 2}, {2, 3}};
+    for (int wrapper = 0; wrapper < 2; wrapper++) {
+        for (int connected = 0; connected < 2; connected++) {
+            size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+            size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+            cbm_louvain_result_t *result = NULL;
+            int count = 0;
+            const cbm_louvain_edge_t *input = connected ? edges : NULL;
+            int edge_count = connected ? 2 : 0;
+            int rc = wrapper ? cbm_louvain(nodes, 3, input, edge_count, &result, &count)
+                             : cbm_leiden(nodes, 3, input, edge_count, 1.0, &result, &count);
+            ASSERT_EQ(rc, CBM_STORE_OK);
+            ASSERT_EQ(count, 3);
+            ASSERT_NOT_NULL(result);
+            ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
+            ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER) >=
+                        bytes + 3 * sizeof(*result));
+            cbm_free(CBM_MEM_CLASS_OTHER, result);
+            ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+            ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
+        }
+    }
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    cbm_louvain_result_t *result = NULL;
+    int count = -1;
+    ASSERT_EQ(cbm_leiden(NULL, 0, NULL, 0, 1.0, &result, &count), CBM_STORE_OK);
+    ASSERT_NULL(result);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
     PASS();
 }
 
@@ -1431,7 +1610,7 @@ TEST(leiden_multilevel_collapses_noise) {
         }
         ASSERT_TRUE(same >= SZ - 1);
     }
-    free(result);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
     PASS();
 }
 
@@ -1463,8 +1642,8 @@ TEST(leiden_resolution_controls_granularity) {
     ASSERT_TRUE(n_hi > n_lo);
     ASSERT_TRUE(leiden_all_communities_connected(lo, N, edges, ne));
     ASSERT_TRUE(leiden_all_communities_connected(hi, N, edges, ne));
-    free(lo);
-    free(hi);
+    cbm_free(CBM_MEM_CLASS_OTHER, lo);
+    cbm_free(CBM_MEM_CLASS_OTHER, hi);
     PASS();
 }
 
@@ -1695,6 +1874,8 @@ SUITE(store_arch) {
     RUN_TEST(adr_upsert);
     RUN_TEST(adr_delete);
     RUN_TEST(adr_delete_not_found);
+    RUN_TEST(doc_candidates_replace_and_get);
+    RUN_TEST(doc_candidates_for_path_file_and_folders);
     RUN_TEST(adr_parse_sections_basic);
     RUN_TEST(adr_parse_sections_all_six);
     RUN_TEST(adr_parse_sections_non_canonical);
@@ -1732,6 +1913,7 @@ SUITE(store_arch) {
     RUN_TEST(louvain_empty);
     RUN_TEST(louvain_single_node);
     RUN_TEST(louvain_converges);
+    RUN_TEST(leiden_result_memory_core_ownership);
     RUN_TEST(leiden_multilevel_collapses_noise);
     RUN_TEST(leiden_resolution_controls_granularity);
     RUN_TEST(arch_clusters_basic);

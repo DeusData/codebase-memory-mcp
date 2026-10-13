@@ -48,6 +48,62 @@ TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     PASS();
 }
 
+/* #1250: client-side navigation is recognised only in the JS/TS family; genuine
+ * HTTP clients and route registrations are never mistaken for it, and with the
+ * file-language gate off nothing is suppressed (no other language's recall). */
+TEST(infrascan_client_navigation_is_js_family_only) {
+    const char *nav[] = {"this.router.navigateByUrl",
+                         "this.router.navigate",
+                         "navigateTo",
+                         "navigate",
+                         "this.navCtrl.navigateForward",
+                         "this.navCtrl.navigateRoot",
+                         "this.navCtrl.navigateBack",
+                         "router.push",
+                         "this.$router.push",
+                         "Router.replace",
+                         "props.history.push",
+                         "browserHistory.replace",
+                         "router.prefetch",
+                         "history.pushState",
+                         "window.history.replaceState",
+                         "this.location.go",
+                         "window.location.assign",
+                         "location.replace",
+                         "goto",
+                         "redirect",
+                         "permanentRedirect"};
+    for (size_t i = 0; i < sizeof(nav) / sizeof(nav[0]); i++) {
+        ASSERT_TRUE(cbm_service_pattern_is_client_navigation(true, nav[i]));
+        ASSERT_FALSE(cbm_service_pattern_is_client_navigation(false, nav[i]));
+    }
+    const char *http[] = {"fetch",
+                          "axios.get",
+                          "axios.post",
+                          "this.http.get",
+                          "this.http.post",
+                          "httpClient.put",
+                          "http",
+                          "api.patch",
+                          "router.get",
+                          "app.post",
+                          "items.push",
+                          "ky.get",
+                          "res.redirect",
+                          "client.go",
+                          "this.gotoApi",
+                          "$http.get",
+                          "navigateApi",
+                          "client.navigateRequest",
+                          "navigateToEndpoint"};
+    for (size_t i = 0; i < sizeof(http) / sizeof(http[0]); i++) {
+        ASSERT_FALSE(cbm_service_pattern_is_client_navigation(true, http[i]));
+    }
+    ASSERT_FALSE(cbm_service_pattern_is_client_navigation(true, NULL));
+    ASSERT_FALSE(cbm_service_pattern_is_client_navigation(true, ""));
+    PASS();
+}
+
 /* ── Service-pattern QN boundaries (distilled from PR #1245) ─────────
  * A library id must sit on an identifier boundary inside the QN. A raw
  * substring match classified "proj.plugin.loader" as gin ("gin.") and
@@ -113,6 +169,8 @@ TEST(infrascan_service_pattern_match_rejects_ids_inside_words) {
         {"gqlalchemy.Memgraph.execute", CBM_SVC_NONE},
         {"celeryconfig.broker_url", CBM_SVC_NONE},
         {"kafkaesque.story.tell", CBM_SVC_NONE},
+        /* "Axios" glued to a lowercase continuation */
+        {"geo.Axiosphere.map", CBM_SVC_NONE},
         {NULL, CBM_SVC_NONE},
     };
     ASSERT_EQ(svc_case_mismatches(cases), 0);
@@ -136,6 +194,11 @@ TEST(infrascan_service_pattern_match_keeps_real_library_qns) {
         {"package:dio/dio.dart", CBM_SVC_HTTP},
         {"dio.Dio.get", CBM_SVC_HTTP},
         {"pkg.net.curl.get", CBM_SVC_HTTP},
+        /* axios under a capitalized default-import binding
+         * (`import Axios from "axios"`) and axios's own instance type */
+        {"Axios.get", CBM_SVC_HTTP},
+        {"Axios.post", CBM_SVC_HTTP},
+        {"AxiosInstance.get", CBM_SVC_HTTP},
         {"curl_exec", CBM_SVC_HTTP},
         {"surf.get", CBM_SVC_HTTP},
         {"hyper.Client.request", CBM_SVC_HTTP},
@@ -225,6 +288,25 @@ TEST(infrascan_service_pattern_match_keeps_real_library_qns) {
     PASS();
 }
 
+/* Document/log extensions are never HTTP routes (distilled from PR #1245):
+ * the arg-URL detector runs for every resolved call, so without the
+ * extension guard `open("/new/file.txt")` minted a Route + HTTP_CALLS.
+ * First segments deliberately avoid the filesystem-root list so ONLY the
+ * extension guard can reject them; `/api/...` marker paths stay routes. */
+TEST(infrascan_http_route_literal_guard_rejects_document_extensions) {
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/new/file.txt", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/guide.md", "read"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/data/app.log", "write"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/fake/path.pdf", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/index.rst", "open"));
+    /* Same extensions under a query string are still files. */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/guide.md?raw=1", "open"));
+    /* Positive controls: extension-less routes and the same callees. */
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/api/items", "requests.get"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/docs/guide", "open"));
+    PASS();
+}
+
 TEST(infrascan_route_nodes_skip_bad_http_url_paths) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_route_guard");
     ASSERT_NOT_NULL(gb);
@@ -305,6 +387,8 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
 
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
+    RUN_TEST(infrascan_http_route_literal_guard_rejects_document_extensions);
+    RUN_TEST(infrascan_client_navigation_is_js_family_only);
     RUN_TEST(infrascan_service_pattern_match_rejects_ids_inside_words);
     RUN_TEST(infrascan_service_pattern_match_keeps_real_library_qns);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);

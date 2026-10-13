@@ -17,6 +17,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/platform.h"
+#include "foundation/compat_fs.h"
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "cbm.h"
@@ -304,6 +305,8 @@ static cbm_gbuf_t *run_sequential_with_lsp_cross(const char *project, const char
  * run_parallel_pipeline does) and records how many results the store parked. */
 static bool g_harness_spill = false;
 static int64_t g_harness_parked = -1;
+/* Opt-in: hand cbm_parallel_resolve the production Tier-2 C# registry. */
+static bool g_harness_cs_registry = false;
 
 static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     const char *project, const char *repo_path, cbm_file_info_t *files, int file_count,
@@ -375,9 +378,17 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
+    /* C# has no per-file cross path (cbm_pxc_run_one has no C# case): production
+     * resolves it only through the Tier-2 registry, so a harness run that opts
+     * in builds that one registry exactly as run_parallel_pipeline does. */
+    CBMCrossLspRegistries harness_registries = {0};
+    if (g_harness_cs_registry && all_defs) {
+        harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
+    }
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
                          def_count, def_modules, module_def_index,
-                         NULL /* cross_registries — tests use per-file path */);
+                         g_harness_cs_registry ? &harness_registries
+                                               : NULL /* tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_pxc_free_module_def_index(module_def_index);
@@ -945,6 +956,157 @@ TEST(gbuf_next_id_accessors) {
     ASSERT_GTE(id, 100);
 
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_raise_next_id_never_lowers) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/");
+    cbm_gbuf_raise_next_id(gb, 100);
+    ASSERT_EQ(cbm_gbuf_next_id(gb), 100);
+    cbm_gbuf_raise_next_id(gb, 40);
+    ASSERT_EQ(cbm_gbuf_next_id(gb), 100);
+    int64_t id = cbm_gbuf_upsert_node(gb, "Function", "foo", "proj.foo", "f.go", 1, 5, "{}");
+    ASSERT_EQ(id, 100);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* Edge ids in the main buffer stay unique through the parallel phases.
+ * Merged worker nodes keep their shared ids, and merged edges take fresh ids
+ * from the main counter after the highest of them, so the main counter can
+ * end above the shared one (12 of 17 infra corpora, deckhouse by 229,233).
+ * The sync after each parallel phase used to set the main counter to the
+ * shared value anyway, and later passes reused the merged edges' ids. Where
+ * the counter ends depends on worker timing, so the seam pins it: right before
+ * each sync the hook takes ID_SYNC_PUSH edge ids from the main buffer. */
+enum { ID_FILES = 64, ID_SYNC_PUSH = 3 };
+
+typedef struct {
+    bool push;
+    int syncs;
+} id_sync_probe_t;
+
+static void id_sync_hook(cbm_gbuf_t *gb, void *ctx) {
+    id_sync_probe_t *probe = ctx;
+    probe->syncs++;
+    const cbm_gbuf_node_t **fns = NULL;
+    int n = 0;
+    if (!probe->push || cbm_gbuf_find_by_label(gb, "Function", &fns, &n) != 0 || n < 2) {
+        return;
+    }
+    char props[CBM_SZ_64];
+    for (int i = 0; i < ID_SYNC_PUSH; i++) {
+        snprintf(props, sizeof(props), "{\"id_sync_probe\":%d}", probe->syncs * ID_SYNC_PUSH + i);
+        cbm_gbuf_insert_edge(gb, fns[0]->id, fns[1]->id, "CALLS", props);
+    }
+}
+
+typedef struct {
+    int edges;
+    int duplicates;
+} edge_id_probe_t;
+
+static void probe_edge_ids(const cbm_gbuf_t *gb, void *ctx) {
+    edge_id_probe_t *probe = ctx;
+    probe->edges = cbm_gbuf_edge_count(gb);
+    probe->duplicates = cbm_gbuf_duplicate_edge_ids(gb);
+}
+
+/* `count` Go files; each function calls the next file's. */
+static bool write_id_fixture(const char *repo, int count) {
+    char path[512];
+    char source[256];
+    for (int i = 0; i < count; i++) {
+        snprintf(path, sizeof(path), "%s/f%02d.go", repo, i);
+        snprintf(source, sizeof(source),
+                 "package main\n\nfunc F%02d() int {\n\treturn F%02d() + 1\n}\n", i,
+                 (i + 1) % count);
+        if (th_write_file(path, source) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(parallel_full_index_keeps_edge_ids_unique) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm_par_ids_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    /* More files than MIN_FILES_FOR_PARALLEL (50): the parallel route. */
+    if (!write_id_fixture(repo, ID_FILES)) {
+        th_rmtree(repo);
+        FAIL("failed to write the edge-id fixture");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ids.db", repo);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    id_sync_probe_t syncs = {.push = true};
+    edge_id_probe_t probe = {0};
+    cbm_pipeline_set_id_sync_hook_for_tests(id_sync_hook, &syncs);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int rc = CBM_NOT_FOUND;
+    if (p) {
+        cbm_pipeline_set_before_dump_hook_for_tests(p, probe_edge_ids, &probe);
+        rc = cbm_pipeline_run(p);
+        cbm_pipeline_free(p);
+    }
+    cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(repo);
+
+    ASSERT_EQ(rc, 0);
+    /* Both full-route syncs (after extract, after resolve) go through the helper. */
+    ASSERT_EQ(syncs.syncs, 2);
+    ASSERT_GT(probe.edges, ID_FILES);
+    ASSERT_EQ(probe.duplicates, 0);
+    PASS();
+}
+
+/* The closure-repair route always runs the parallel phases; both of its
+ * syncs go through the same helper. */
+TEST(parallel_closure_repair_syncs_ids_through_the_helper) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm_par_ids_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    if (!write_id_fixture(repo, 3)) {
+        th_rmtree(repo);
+        FAIL("failed to write the edge-id fixture");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ids.db", repo);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *first = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int first_rc = first ? cbm_pipeline_run(first) : CBM_NOT_FOUND;
+    cbm_pipeline_free(first);
+
+    /* A body-only edit (no new names) routes to closure repair. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/f01.go", repo);
+    int write_rc =
+        th_write_file(path, "package main\n\nfunc F01() int {\n\treturn F02() + 40 + 2\n}\n");
+    id_sync_probe_t syncs = {.push = false};
+    cbm_pipeline_set_id_sync_hook_for_tests(id_sync_hook, &syncs);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int second_rc = second ? cbm_pipeline_run(second) : CBM_NOT_FOUND;
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(second);
+    cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    th_rmtree(repo);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_EQ(write_rc, 0);
+    ASSERT_EQ(second_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(syncs.syncs, 2);
     PASS();
 }
 
@@ -2471,6 +2633,191 @@ static kotlin_implicit_probe_t probe_kotlin_implicit_site(const CBMFileResult *r
         }
     }
     return probe;
+}
+
+/* #2120: two C# projects declare a class with the same simple name in
+ * namespaces that share a root (Contoso.Platform.Identity.UserIdentityInfo vs
+ * Contoso.Platform.BackOffice.Identity.UserIdentityInfo). Graph QNs are
+ * path-derived, so the namespace-prefix lookups never hit a project type and
+ * the short-name fallback scored both variants 0 against the file namespace:
+ * registration order picked the target, ignoring the caller's `using`
+ * directive. Each caller below can see exactly ONE variant (C# binding rules),
+ * so exactly one edge per caller is correct whatever the file order: plain
+ * `using` (both directions), enclosing-namespace proximity, and a
+ * fully-qualified name. The last case is a reference-assembly shape: one file
+ * declaring several namespaces, whose file-level namespace is only the FIRST
+ * one; the decoy is registered first, so a mislabeled namespace falls back to
+ * it. `partial` pieces of one type are separate registry entries, so a member
+ * declared on another piece must still bind to that piece. */
+TEST(parallel_csharp_same_name_class_binds_by_namespace) {
+    static const char platform_src[] =
+        "namespace Contoso.Platform.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char backoffice_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char bo_handler_src[] =
+        "using Contoso.Platform.BackOffice.Identity;\n"
+        "namespace Contoso.Platform.BackOffice.CqrsHandlers;\n"
+        "public class Handler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char pf_handler_src[] =
+        "using Contoso.Platform.Identity;\n"
+        "namespace Contoso.Platform.Api;\n"
+        "public class PlatformHandler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char nested_ns_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity.Claims\n"
+        "{\n"
+        "    public class ClaimReader {\n"
+        "        public string Read(string claim) {\n"
+        "            var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "            return info.ToString();\n"
+        "        }\n"
+        "    }\n"
+        "}\n";
+    static const char fq_src[] = "namespace Contoso.Platform.Reports;\n"
+                                 "public class Report {\n"
+                                 "    public string Build(string claim) {\n"
+                                 "        var info = Contoso.Platform.BackOffice.Identity"
+                                 ".UserIdentityInfo.ParseFromClaim(claim);\n"
+                                 "        return info.ToString();\n"
+                                 "    }\n"
+                                 "}\n";
+    static const char decoy_src[] = "namespace Contoso.Decoy;\n"
+                                    "public class Worker {\n"
+                                    "    public void Start() { }\n"
+                                    "    public void Beta() { }\n"
+                                    "}\n";
+    static const char multi_ns_src[] = "namespace Contoso.Win32 { public class SafeHandle { } }\n"
+                                       "namespace Contoso.Threading {\n"
+                                       "    public class Worker { public void Start() { } }\n"
+                                       "}\n";
+    static const char runner_src[] = "using Contoso.Threading;\n"
+                                     "namespace Contoso.App;\n"
+                                     "public class Runner {\n"
+                                     "    public void Run() {\n"
+                                     "        var w = new Worker();\n"
+                                     "        w.Start();\n"
+                                     "    }\n"
+                                     "}\n";
+    static const char part_a_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Alpha() { } }\n";
+    static const char part_b_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Beta() { } }\n";
+    static const char part_user_src[] = "using Contoso.Parts;\n"
+                                        "namespace Contoso.App;\n"
+                                        "public class PartUser {\n"
+                                        "    public void Use() {\n"
+                                        "        var t = new Thing();\n"
+                                        "        t.Alpha();\n"
+                                        "        t.Beta();\n"
+                                        "    }\n"
+                                        "}\n";
+    const char *project = "cbm_cs_same_name";
+    static const char *rels[] = {
+        "src/Decoy/Worker.cs",
+        "src/Contoso.Platform/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/CqrsHandlers/Handler.cs",
+        "src/Contoso.Platform/Api/PlatformHandler.cs",
+        "src/Contoso.Platform.BackOffice/Identity/Claims/ClaimReader.cs",
+        "src/Contoso.Platform/Reports/Report.cs",
+        "src/Ref/Threading.cs",
+        "src/App/Runner.cs",
+        "src/Parts/Thing.A.cs",
+        "src/Parts/Thing.B.cs",
+        "src/App/PartUser.cs",
+    };
+    const char *srcs[] = {decoy_src,      platform_src,  backoffice_src, bo_handler_src,
+                          pf_handler_src, nested_ns_src, fq_src,         multi_ns_src,
+                          runner_src,     part_a_src,    part_b_src,     part_user_src};
+    enum { N_FILES = 12, N_CHECKS = 13 };
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_same_name_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write C# same-name fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *pf = "cbm_cs_same_name.src.Contoso.Platform.Identity.UserIdentityInfo."
+                     "UserIdentityInfo.ParseFromClaim";
+    const char *bo = "cbm_cs_same_name.src.Contoso.Platform.BackOffice.Identity."
+                     "UserIdentityInfo.UserIdentityInfo.ParseFromClaim";
+    const char *ref_start = "cbm_cs_same_name.src.Ref.Threading.Worker.Start";
+    const char *decoy_start = "cbm_cs_same_name.src.Decoy.Worker.Worker.Start";
+    const char *part_alpha = "cbm_cs_same_name.src.Parts.Thing.A.Thing.Alpha";
+    const char *part_beta = "cbm_cs_same_name.src.Parts.Thing.B.Thing.Beta";
+    const char *decoy_beta = "cbm_cs_same_name.src.Decoy.Worker.Worker.Beta";
+    bool ok[2][N_CHECKS];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
+        ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
+        ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
+        ok[g][3] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", bo, "CALLS");
+        ok[g][4] = has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
+        ok[g][5] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", pf, "CALLS");
+        ok[g][6] = has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
+        ok[g][7] = !has_edge_from_callable_to_qn(gb, "Report.Build", pf, "CALLS");
+        ok[g][8] = has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
+        ok[g][9] = !has_edge_from_callable_to_qn(gb, "Runner.Run", decoy_start, "CALLS");
+        ok[g][10] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
+        ok[g][11] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
+        ok[g][12] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", decoy_beta, "CALLS");
+        for (int k = 0; k < N_CHECKS; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  C# same-name diagnostic %s: using_bo=%d/%d using_pf=%d/%d "
+                   "enclosing_ns=%d/%d fully_qualified=%d/%d multi_ns_file=%d/%d "
+                   "partial=%d/%d/%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10], ok[g][11],
+                   ok[g][12]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
 }
 
 /* External Kotlin protocol targets must not borrow a project method merely
@@ -4536,7 +4883,384 @@ TEST(lsp_target_node_supports_long_prefixed_qualified_name) {
 
 /* ── Suite Registration ──────────────────────────────────────────── */
 
+/* ── PHP vendor-imported types never bind by name (#1186) ─────────── */
+
+/* Foo.php imports `Request` from a vendor namespace no project file declares,
+ * so the import stays unresolved. The project has its own class Request
+ * (another namespace) and a TypeScript function sendAsync. Every edge from
+ * Foo.php that names the vendor Request -- its base class, calls on a
+ * Request-typed receiver, the `new`, the type references -- used to bind by
+ * name to those project symbols. Svc is imported from a declared project
+ * namespace and is the control that must keep resolving. */
+static const struct {
+    const char *rel;
+    CBMLanguage lang;
+    const char *src;
+} k_php_vendor_files[] = {
+    {"lib/Requests/Request.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Http\\Requests;\n\nclass Request {\n"
+     "    public function validated() { return 1; }\n"
+     "    public static function makeIt() { return 2; }\n"
+     "    public function get($k) { return $k; }\n}\n"},
+    {"lib/Services/Svc.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Services;\n\nclass Svc {\n"
+     "    public function go() { return 3; }\n"
+     "    public static function build() { return 4; }\n}\n"},
+    {"web/api.ts", CBM_LANG_TYPESCRIPT, "export function sendAsync(x: number) { return x; }\n"},
+    {"lib/Integrations/Foo.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Http\\Integrations;\n\n"
+     "use Saloon\\Http\\Request;\nuse App\\Services\\Svc;\n\n"
+     "class Foo extends Request {\n"
+     "    public function run(Request $r, Svc $s) {\n"
+     "        $r->validated();\n"
+     "        Request::makeIt();\n"
+     "        $made = new Request();\n"
+     "        $s->go();\n"
+     "        Svc::build();\n"
+     "        $r->get('id');\n"
+     "        return $r->sendAsync(1);\n"
+     "    }\n}\n\n"
+     "class Bar extends Svc {\n}\n"},
+    {"lib/Integrations/Clients.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Http\\Integrations;\n"
+     "use GuzzleHttp\\Client as GuzzleClient;\nuse Kafka\\Producer as KafkaProducer;\n"
+     "class Clients { function run() {\n"
+     " GuzzleClient::get('/api/vendor-health');\n"
+     " KafkaProducer::publish('vendor-orders', 'payload');\n}\n}\n"},
+};
+enum { PHP_VENDOR_FILE_COUNT = (int)(sizeof(k_php_vendor_files) / sizeof(k_php_vendor_files[0])) };
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *type;
+    const char *src_rel;
+    const char *tgt_rel;
+    int count;
+    int source_nodes;
+    bool query_failed;
+} php_file_edge_count_t;
+
+static void php_count_source_edges(const cbm_gbuf_node_t *source, void *ud) {
+    php_file_edge_count_t *c = ud;
+    if (!source->file_path || strcmp(source->file_path, c->src_rel) != 0)
+        return;
+    c->source_nodes++;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(c->gbuf, source->id, c->type, &edges, &count) != 0) {
+        c->query_failed = true;
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(c->gbuf, edges[i]->target_id);
+        if (!target) {
+            c->query_failed = true;
+        } else if (target->file_path && strcmp(target->file_path, c->tgt_rel) == 0) {
+            c->count++;
+        }
+    }
+}
+
+static int php_file_edges(const cbm_gbuf_t *gbuf, const char *type, const char *source,
+                          const char *target) {
+    char *source_qn = cbm_pipeline_fqn_compute("cbm_par_phpvendor", source, "__file__");
+    char *target_qn = cbm_pipeline_fqn_compute("cbm_par_phpvendor", target, "__file__");
+    const cbm_gbuf_node_t *s = source_qn ? cbm_gbuf_find_by_qn(gbuf, source_qn) : NULL;
+    const cbm_gbuf_node_t *t = target_qn ? cbm_gbuf_find_by_qn(gbuf, target_qn) : NULL;
+    bool files_exist = s && t && s->label && t->label && strcmp(s->label, "File") == 0 &&
+                       strcmp(t->label, "File") == 0;
+    free(source_qn);
+    free(target_qn);
+    if (!files_exist)
+        return -1;
+    php_file_edge_count_t c = {.gbuf = gbuf, .type = type, .src_rel = source, .tgt_rel = target};
+    cbm_gbuf_foreach_node(gbuf, php_count_source_edges, &c);
+    return c.query_failed || c.source_nodes == 0 ? -1 : c.count;
+}
+
+static bool php_vendor_extracted_sites(void) {
+    for (int file = 3; file < PHP_VENDOR_FILE_COUNT; file++) {
+        const char *source = k_php_vendor_files[file].src;
+        CBMFileResult *r =
+            cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP, "cbm_par_phpvendor",
+                             k_php_vendor_files[file].rel, 0, NULL, NULL);
+        if (!r)
+            return false;
+        bool ok = r->defs.count > 0 && r->imports.count == 2;
+        const char *core[] = {"validated", "makeIt", "go", "build", "get", "sendAsync"};
+        const char *service[] = {"get", "publish"};
+        const char *const *wanted = file == 3 ? core : service;
+        int wanted_count = file == 3 ? 6 : 2;
+        for (int i = 0; i < wanted_count; i++) {
+            int count = 0;
+            for (int j = 0; j < r->calls.count; j++) {
+                const CBMCall *c = &r->calls.items[j];
+                if (!c->callee_name || !c->enclosing_func_qn ||
+                    strcmp(cbm_pipeline_call_callee_leaf(c->callee_name), wanted[i]) != 0 ||
+                    c->site_end_byte <= c->site_start_byte || c->site_end_byte > strlen(source))
+                    continue;
+                if (file == 4) {
+                    const char *arg = i == 0 ? "/api/vendor-health" : "vendor-orders";
+                    const char *alias = i == 0 ? "GuzzleClient::" : "KafkaProducer::";
+                    /* The extractor names a scoped call by its method alone
+                     * (it keeps only a literal `Route::` scope, #952), so the
+                     * aliased scope is proven on the occurrence text. */
+                    if (!c->first_string_arg || strcmp(c->first_string_arg, arg) != 0 ||
+                        strncmp(source + c->site_start_byte, alias, strlen(alias)) != 0)
+                        continue;
+                }
+                count++;
+            }
+            ok = count == 1 && ok;
+        }
+        cbm_free_result(r);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+static bool php_vendor_service_edge(const cbm_gbuf_t *gb, const char *type, const char *name) {
+    const cbm_gbuf_node_t *source = find_unique_callable_node_by_tail(gb, "Clients.run");
+    if (!source)
+        return false;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gb, source->id, type, &edges, &count) != 0 || count != 1)
+        return false;
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, edges[0]->target_id);
+    return target && target->label && strcmp(target->label, "Route") == 0 &&
+           edges[0]->properties_json && strstr(edges[0]->properties_json, name);
+}
+
+static void php_vendor_edge_fp(const cbm_gbuf_edge_t *edge, void *ud) {
+    if (strcmp(edge->type, "CALLS") == 0 || strcmp(edge->type, "USAGE") == 0 ||
+        strcmp(edge->type, "INHERITS") == 0 || strcmp(edge->type, "IMPORTS") == 0 ||
+        strcmp(edge->type, "HTTP_CALLS") == 0 || strcmp(edge->type, "ASYNC_CALLS") == 0)
+        fp_visit_edge(edge, ud);
+}
+
+/* 1 when the graph holds no vendor-named edge and every control edge. */
+static int php_vendor_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
+    static const char *const foo = "lib/Integrations/Foo.php";
+    static const char *const req = "lib/Requests/Request.php";
+    static const char *const svc = "lib/Services/Svc.php";
+    struct {
+        const char *type;
+        const char *tgt;
+        int want_min;
+        int want_max;
+    } checks[] = {
+        {"INHERITS", req, 0, 0},       {"CALLS", req, 0, 0},       {"USAGE", req, 0, 0},
+        {"CALLS", "web/api.ts", 0, 0}, {"INHERITS", svc, 1, 1},    {"CALLS", svc, 2, 2},
+        {"CALLS", foo, 0, 0},          {"USAGE", svc, 1, 1 << 20},
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        int got = php_file_edges(gbuf, checks[i].type, foo, checks[i].tgt);
+        if (got < checks[i].want_min || got > checks[i].want_max) {
+            printf("  [%s] %s Foo.php -> %s: got %d, want %d..%d\n", driver, checks[i].type,
+                   checks[i].tgt, got, checks[i].want_min, checks[i].want_max);
+            ok = 0;
+        }
+    }
+    return ok && php_vendor_service_edge(gbuf, "HTTP_CALLS", "/api/vendor-health") &&
+           php_vendor_service_edge(gbuf, "ASYNC_CALLS", "vendor-orders");
+}
+
+TEST(parallel_php_vendor_types_never_bind_by_name_issue1186) {
+    ASSERT_TRUE(php_vendor_extracted_sites());
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_phpvendor_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[PHP_VENDOR_FILE_COUNT][512];
+    cbm_file_info_t files[PHP_VENDOR_FILE_COUNT];
+    memset(files, 0, sizeof(files));
+    for (int i = 0; i < PHP_VENDOR_FILE_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, k_php_vendor_files[i].rel);
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", paths[i]);
+        *strrchr(dir, '/') = '\0';
+        cbm_mkdir_p(dir, 0755);
+        FILE *f = fopen(paths[i], "w");
+        if (!f) {
+            th_rmtree(tmpdir);
+            FAIL("fopen failed");
+        }
+        bool wrote = fputs(k_php_vendor_files[i].src, f) >= 0;
+        bool closed = fclose(f) == 0;
+        if (!wrote || !closed) {
+            th_rmtree(tmpdir);
+            FAIL("fixture write failed");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)k_php_vendor_files[i].rel;
+        files[i].language = k_php_vendor_files[i].lang;
+    }
+
+    cbm_gbuf_t *seq = run_sequential_with_lsp_cross_and_mutator(
+        "cbm_par_phpvendor", tmpdir, files, PHP_VENDOR_FILE_COUNT, NULL, NULL, true);
+    cbm_gbuf_t *par = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_phpvendor", tmpdir, files, PHP_VENDOR_FILE_COUNT, 2, NULL, NULL, NULL, true);
+    const size_t saved_budget = cbm_mem_budget();
+    const size_t budget = (size_t)1024 * 1024 * 1024;
+    cbm_mem_set_budget_for_tests(budget);
+    cbm_mem_set_charged_for_tests(budget - budget / 16);
+    g_harness_spill = true;
+    int cached = -1;
+    cbm_gbuf_t *spilled = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_phpvendor", tmpdir, files, PHP_VENDOR_FILE_COUNT, 2, NULL, count_cached_results,
+        &cached, true);
+    int64_t parked = g_harness_parked;
+    g_harness_spill = false;
+    cbm_mem_set_charged_for_tests(0);
+    cbm_mem_set_budget_for_tests(saved_budget);
+    int seq_ok = seq ? php_vendor_graph_ok(seq, "sequential") : 0;
+    int par_ok = par ? php_vendor_graph_ok(par, "parallel") : 0;
+    int spill_ok = spilled ? php_vendor_graph_ok(spilled, "spilled") : 0;
+    graph_fp_t seq_edges = {.gb = seq}, par_edges = {.gb = par};
+    graph_fp_t par_all = {0}, spill_all = {0};
+    if (seq)
+        cbm_gbuf_foreach_edge(seq, php_vendor_edge_fp, &seq_edges);
+    if (par) {
+        cbm_gbuf_foreach_edge(par, php_vendor_edge_fp, &par_edges);
+        par_all = graph_fingerprint(par);
+    }
+    if (spilled)
+        spill_all = graph_fingerprint(spilled);
+    bool edge_parity = seq_edges.count > 0 && seq_edges.count == par_edges.count &&
+                       seq_edges.sum == par_edges.sum && seq_edges.xr == par_edges.xr;
+    bool spill_parity = par_all.count > 0 && par_all.count == spill_all.count &&
+                        par_all.sum == spill_all.sum && par_all.xr == spill_all.xr;
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    cbm_gbuf_free(spilled);
+    th_rmtree(tmpdir);
+    ASSERT_EQ(cached, 0);
+    ASSERT_EQ((int)parked, PHP_VENDOR_FILE_COUNT);
+    ASSERT_TRUE(seq_ok);
+    ASSERT_TRUE(par_ok);
+    ASSERT_TRUE(spill_ok);
+    ASSERT_TRUE(edge_parity);
+    ASSERT_TRUE(spill_parity);
+    PASS();
+}
+
+/* A fresh PHP external row replaces stale evidence for its exact occurrence,
+ * including an older external row, without clearing a real project invocation
+ * of the same method at the next occurrence. Test both old-row orders. */
+TEST(parallel_php_external_row_replaces_only_its_exact_occurrence) {
+    const char *source = "<?php\nnamespace App;\nuse Vendor\\Http\\Request;\n"
+                         "use App\\Project\\Request as LocalRequest;\n"
+                         "class Caller { function run(Request $r, LocalRequest $p) {\n"
+                         " $r->validated();\n $p->validated();\n}\n}\n";
+    const char *project_type = "p.lib.Request.Request";
+    CBMLSPDef defs[] = {
+        {.qualified_name = project_type,
+         .short_name = "Request",
+         .label = "Class",
+         .def_module_qn = "p.lib.Request",
+         .lang = CBM_LANG_PHP},
+        {.qualified_name = "p.lib.Request.Request.validated",
+         .short_name = "validated",
+         .label = "Method",
+         .receiver_type = project_type,
+         .def_module_qn = "p.lib.Request",
+         .lang = CBM_LANG_PHP},
+    };
+    for (int order = 0; order < 2; order++) {
+        CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP, "p",
+                                            "main.php", 0, NULL, NULL);
+        ASSERT_NOT_NULL(r);
+        ASSERT_EQ(r->imports.count, 2);
+        const CBMCall *sites[2] = {0};
+        int count = 0;
+        for (int i = 0; i < r->calls.count; i++) {
+            const CBMCall *call = &r->calls.items[i];
+            if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "Caller.run") &&
+                call->callee_name &&
+                strcmp(cbm_pipeline_call_callee_leaf(call->callee_name), "validated") == 0 &&
+                call->site_end_byte > call->site_start_byte) {
+                ASSERT_TRUE(count < 2);
+                sites[count++] = call;
+            }
+        }
+        ASSERT_EQ(count, 2);
+        if (sites[0]->site_start_byte > sites[1]->site_start_byte) {
+            const CBMCall *swap = sites[0];
+            sites[0] = sites[1];
+            sites[1] = swap;
+        }
+        ASSERT_TRUE(sites[0]->site_end_byte <= sites[1]->site_start_byte);
+        CBMResolvedCall stale = {0};
+        stale.caller_qn = sites[0]->enclosing_func_qn;
+        stale.callee_qn = "p.lib.Request.Request.validated";
+        stale.strategy = "test_stale_project";
+        stale.confidence = 0.99f;
+        stale.kind = CBM_RESOLVED_INVOCATION;
+        stale.site_start_byte = sites[0]->site_start_byte;
+        stale.site_end_byte = sites[0]->site_end_byte;
+        stale.source_origin = sites[0]->source_origin;
+        CBMResolvedCall old_external = stale;
+        old_external.callee_qn = "Old.Vendor.Request.validated";
+        old_external.strategy = "php_external_receiver";
+        CBMResolvedCall separate = stale;
+        separate.strategy = "test_separate_project";
+        separate.site_start_byte = sites[1]->site_start_byte;
+        separate.site_end_byte = sites[1]->site_end_byte;
+        separate.source_origin = sites[1]->source_origin;
+        r->resolved_calls.count = 0;
+        cbm_resolvedcall_push(&r->resolved_calls, &r->arena, order ? old_external : stale);
+        cbm_resolvedcall_push(&r->resolved_calls, &r->arena, order ? stale : old_external);
+        cbm_resolvedcall_push(&r->resolved_calls, &r->arena, separate);
+        const char *targets[2] = {0};
+        for (int i = 0; i < r->imports.count; i++)
+            if (strcmp(r->imports.items[i].local_name, "LocalRequest") == 0)
+                targets[i] = "p.lib.Request.__file__";
+        CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+        const char *keys[] = {"LocalRequest"};
+        const char *vals[] = {project_type};
+        cbm_pxc_run_one_with_php_bindings(CBM_LANG_PHP, r, source, (int)strlen(source), "p.main",
+                                          defs, 2, keys, vals, 1, &bindings);
+        int external_count = 0, project_count = 0;
+        for (int i = 0; i < r->resolved_calls.count; i++) {
+            const CBMResolvedCall *row = &r->resolved_calls.items[i];
+            if (!row->caller_qn || strcmp(row->caller_qn, sites[0]->enclosing_func_qn) != 0 ||
+                row->kind != CBM_RESOLVED_INVOCATION)
+                continue;
+            if (row->site_start_byte == sites[0]->site_start_byte &&
+                row->site_end_byte == sites[0]->site_end_byte &&
+                row->source_origin == sites[0]->source_origin) {
+                ASSERT_STR_EQ(row->callee_qn, "Vendor.Http.Request.validated");
+                ASSERT_STR_EQ(row->strategy, "php_external_receiver");
+                external_count++;
+            } else if (row->site_start_byte == sites[1]->site_start_byte &&
+                       row->site_end_byte == sites[1]->site_end_byte &&
+                       row->source_origin == sites[1]->source_origin) {
+                ASSERT_STR_EQ(row->callee_qn, "p.lib.Request.Request.validated");
+                project_count++;
+            }
+        }
+        ASSERT_EQ(external_count, 1);
+        ASSERT_EQ(project_count, 1);
+        const CBMResolvedCall *vendor =
+            cbm_pipeline_find_lsp_resolution(&r->resolved_calls, sites[0], false);
+        const CBMResolvedCall *project =
+            cbm_pipeline_find_lsp_resolution(&r->resolved_calls, sites[1], false);
+        ASSERT_NOT_NULL(vendor);
+        ASSERT_NOT_NULL(project);
+        ASSERT_STR_EQ(vendor->strategy, "php_external_receiver");
+        ASSERT_STR_EQ(project->callee_qn, "p.lib.Request.Request.validated");
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 SUITE(parallel) {
+    RUN_TEST(parallel_php_external_row_replaces_only_its_exact_occurrence);
+    RUN_TEST(parallel_php_vendor_types_never_bind_by_name_issue1186);
     RUN_TEST(usage_semantic_reference_candidate_trusts_marked_producer);
     RUN_TEST(lsp_bare_segment_skips_preprocessor_spacing);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
@@ -4573,6 +5297,9 @@ SUITE(parallel) {
     RUN_TEST(gbuf_merge_empty_src);
     RUN_TEST(gbuf_merge_src_free_safe);
     RUN_TEST(gbuf_next_id_accessors);
+    RUN_TEST(gbuf_raise_next_id_never_lowers);
+    RUN_TEST(parallel_full_index_keeps_edge_ids_unique);
+    RUN_TEST(parallel_closure_repair_syncs_ids_through_the_helper);
 
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);
@@ -4590,6 +5317,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_typescript_module_value_usage_respects_lexical_shadows);
     RUN_TEST(parallel_typescript_import_namespace_exact_parity);
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
+    RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);

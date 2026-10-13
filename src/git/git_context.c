@@ -2,6 +2,7 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 
@@ -65,19 +66,28 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
+    /* Debug-level stage markers: none of these waits has a deadline, so a
+     * stuck git child is named by the last marker printed (spawn, read or
+     * close). Silent at the default level. */
+    cbm_log_debug("git.capture", "stage", "spawn", "args", git_args);
     FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
 
+    cbm_log_debug("git.capture", "stage", "read", "args", git_args);
     char buf[GIT_OUTPUT_MAX];
     if (!fgets(buf, sizeof(buf), fp)) {
+        cbm_log_debug("git.capture", "stage", "close", "args", git_args, "output", "none");
         cbm_pclose(fp);
+        cbm_log_debug("git.capture", "stage", "done", "args", git_args);
         return CBM_NOT_FOUND;
     }
     trim_newlines(buf);
 
+    cbm_log_debug("git.capture", "stage", "close", "args", git_args);
     int rc = cbm_pclose(fp);
+    cbm_log_debug("git.capture", "stage", "done", "args", git_args);
     if (rc != 0 || buf[0] == '\0') {
         return CBM_NOT_FOUND;
     }

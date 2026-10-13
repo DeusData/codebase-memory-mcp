@@ -1,0 +1,37 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.k8s.example.org
+spec:
+  group: k8s.example.org
+  names:
+    kind: Widget
+    plural: widgets
+  scope: Namespaced
+---
+apiVersion: k8s.example.org/v1
+kind: Widget
+metadata:
+  name: sample
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: web
+spec:
+  ca:
+    secretName: web-ca
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: web-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+spec:
+  secretName: web-tls
+  issuerRef:
+    name: web

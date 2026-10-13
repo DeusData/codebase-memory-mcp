@@ -16,9 +16,11 @@
 #include "pipeline/pass_lsp_cross.h"
 
 #include "pipeline/lsp_surface.h"
+#include "foundation/mem_core.h"
 #include "result_spill.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "callable_sig.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
@@ -32,6 +34,7 @@
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h" /* CBM_TLS */
 
@@ -220,25 +223,47 @@ static bool pxc_base_strategy_is_weak(const char *strategy) {
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
 }
 
+/* One file's base-resolution scope: the registry + import map pass_semantic
+ * uses, plus the facts the external-base gate reads. NULL (the surface-probe
+ * path) keeps every base at its raw spelling. */
+typedef struct {
+    const cbm_registry_t *reg;
+    const char **imp_keys;
+    const char **imp_vals;
+    int imp_count;
+    const CBMImportArray *imports;
+    const cbm_gbuf_t *gbuf;
+    const char *project_name;
+    const char *rel;
+    CBMLanguage lang;
+} pxc_base_scope_t;
+
 /* Resolve one base-class spelling to a project QN. Mirrors
  * pass_semantic.c::resolve_as_class — same registry, same type-like veto —
  * then additionally rejects weak short-name strategies (see above).
  * Returns NULL when the base is not a confidently-known project type;
  * stdlib and third-party bases land here and keep their raw spelling. */
-static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *raw,
-                                       const char *module_qn, const char **imp_keys,
-                                       const char **imp_vals, int imp_count) {
-    if (!reg || !raw || !raw[0]) {
+static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *raw,
+                                       const char *module_qn) {
+    if (!bs || !bs->reg || !raw || !raw[0]) {
         return NULL;
     }
-    cbm_resolution_t res = cbm_registry_resolve(reg, raw, module_qn, imp_keys, imp_vals, imp_count);
+    cbm_resolution_t res = cbm_registry_resolve_lang(bs->reg, raw, module_qn, bs->imp_keys,
+                                                     bs->imp_vals, bs->imp_count, bs->lang);
     if (!res.qualified_name || !res.qualified_name[0]) {
         return NULL;
     }
     if (pxc_base_strategy_is_weak(res.strategy)) {
         return NULL;
     }
-    if (!cbm_label_is_type_like(cbm_registry_label_of(reg, res.qualified_name))) {
+    if (!cbm_label_is_type_like(cbm_registry_label_of(bs->reg, res.qualified_name))) {
+        return NULL;
+    }
+    /* `unittest.TestCase` under an external `import unittest` survives the
+     * weak-strategy veto through the same-module suffix fallback; the shared
+     * external-base gate keeps it at its source spelling. */
+    if (cbm_python_external_base_contradicts(bs->lang, bs->imports, raw, res.qualified_name,
+                                             bs->gbuf, bs->project_name, bs->rel)) {
         return NULL;
     }
     return res.qualified_name;
@@ -248,8 +273,7 @@ static const char *pxc_resolve_base_qn(const cbm_registry_t *reg, const char *ra
  * source spelling. Unresolved entries pass through verbatim so a base the
  * registry does not know keeps working exactly as before. */
 static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
-                                     const cbm_registry_t *reg, const char *module_qn,
-                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+                                     const pxc_base_scope_t *bs, const char *module_qn) {
     if (!bases || !bases[0]) {
         return NULL;
     }
@@ -263,8 +287,7 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
         return pxc_join_pipe(arena, bases);
     }
     for (int i = 0; i < count; i++) {
-        const char *qn =
-            pxc_resolve_base_qn(reg, bases[i], module_qn, imp_keys, imp_vals, imp_count);
+        const char *qn = pxc_resolve_base_qn(bs, bases[i], module_qn);
         resolved[i] = qn ? qn : bases[i];
     }
     resolved[count] = NULL;
@@ -273,12 +296,20 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
 
 static bool pxc_is_jvm_lang(CBMLanguage lang);
 
+/* Leaf of the BASE QN: a callable identity suffix (#2061) never contains
+ * '.', so this equals the historical strrchr split for every QN. */
 static const char *pxc_last_component(const char *qn) {
     if (!qn) {
         return NULL;
     }
-    const char *dot = strrchr(qn, '.');
-    return dot ? dot + 1 : qn;
+    const char *leaf = qn;
+    size_t base_len = cbm_qn_callable_base_len(qn);
+    for (size_t i = 0; i < base_len; i++) {
+        if (qn[i] == '.') {
+            leaf = qn + i + 1;
+        }
+    }
+    return leaf;
 }
 
 /* Every return is arena-owned: the fallback spelling is a copy, never the
@@ -377,7 +408,9 @@ static const char *pxc_qn_leaf(const char *name) {
         return NULL;
     }
     const char *leaf = name;
-    for (const char *p = name; *p; p++) {
+    /* Base only: a callable identity suffix (#2061) may carry ':' labels. */
+    const char *end = name + cbm_qn_callable_base_len(name);
+    for (const char *p = name; p < end; p++) {
         if (*p == '.' || *p == ':' || *p == '/' || *p == '\\') {
             leaf = p + 1;
         }
@@ -390,8 +423,7 @@ static const char *pxc_qn_leaf(const char *name) {
  * pointers into src and into `arena` for synthesised composites. */
 static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const char *module_qn,
                              const char *namespace_name, CBMLanguage lang, CBMLSPDef *dst,
-                             const cbm_registry_t *reg, const char **imp_keys,
-                             const char **imp_vals, int imp_count) {
+                             const pxc_base_scope_t *bs) {
     const char *label = pxc_map_label(arena, src->label);
     if (!label || !src->qualified_name || !src->name)
         return -1;
@@ -409,6 +441,12 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     dst->label = label;
     dst->def_module_qn = module_qn;
     dst->namespace_name = namespace_name ? cbm_arena_strdup(arena, namespace_name) : NULL;
+    /* C# types carry their OWN declared namespace: the file-level one is only
+     * the file's first namespace, wrong for every later namespace (#2120). */
+    if (lang == CBM_LANG_CSHARP && cbm_label_is_type_like(src->label)) {
+        dst->namespace_name =
+            src->decl_namespace ? cbm_arena_strdup(arena, src->decl_namespace) : NULL;
+    }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     /* Single return-type string. The per-language registrars split on '|'
      * for multi-return languages (Go); single-return languages just see one
@@ -417,9 +455,8 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
-    dst->embedded_types = (reg && pxc_lang_resolves_base_qns(lang))
-                              ? pxc_join_base_qns(arena, src->base_classes, reg, module_qn,
-                                                  imp_keys, imp_vals, imp_count)
+    dst->embedded_types = (bs && bs->reg && pxc_lang_resolves_base_qns(lang))
+                              ? pxc_join_base_qns(arena, src->base_classes, bs, module_qn)
                               : pxc_join_pipe(arena, src->base_classes);
     dst->signature_param_types = NULL;
     dst->signature_param_count = 0;
@@ -462,24 +499,28 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     return 0;
 }
 
-/* Go: fold per-field "Field" definitions into their owning struct's
+/* Go and C: fold per-field "Field" definitions into their owning type's
  * field_defs. extract_defs.c emits one flat CBMDefinition per struct field
  * (label "Field", parent_class = owning struct QN, name = field name,
  * return_type = raw type text). Those rows are dropped by pxc_build_lsp_def
- * (pxc_map_label excludes "Field"), so without this fold every Go struct
- * registers with zero fields and field-chain calls (h.svc.Handle) can
- * never resolve. Fields are always declared in the same file as their struct,
- * so scanning the file's own defs covers every case. Runs inside
+ * (pxc_map_label excludes "Field"), so without this fold every struct
+ * registers with zero fields: Go field-chain calls (h.svc.Handle) can never
+ * resolve, and a C member access on a struct from another file (every header)
+ * has no owner to bind. Fields are always declared in the same file as their
+ * struct, so scanning the file's own defs covers every case. Runs inside
  * cbm_pxc_collect_all_defs — one site covers both the prebuilt-registry path
- * and the per-file fallback, since both consume all_defs. */
-static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
-                                      int start, int end) {
+ * and the per-file fallback, since both consume all_defs.
+ *
+ * type_label is the label the language's aggregate carries: "Struct" for Go,
+ * "Class" for a C struct or union. */
+static void pxc_fold_struct_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                   int start, int end, const char *type_label) {
     if (!arena || !result || !defs || start >= end) {
         return;
     }
     for (int si = start; si < end; si++) {
         CBMLSPDef *dst = &defs[si];
-        if (!dst->label || strcmp(dst->label, "Struct") != 0 || !dst->qualified_name) {
+        if (!dst->label || strcmp(dst->label, type_label) != 0 || !dst->qualified_name) {
             continue;
         }
         int count = 0;
@@ -529,6 +570,130 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
     }
 }
 
+/* Python annotation text -> the one type name it declares, or NULL. Strips a
+ * string-literal forward reference and unwraps `Optional[X]`, `X | None` and
+ * `None | X`; anything else with brackets, commas or a real union (generics,
+ * Callable, Union[A, B]) names no single receiver type and is dropped. */
+static const char *pxc_py_annotation_type_name(CBMArena *arena, const char *text) {
+    if (!text) {
+        return NULL;
+    }
+    while (*text == ' ') {
+        text++;
+    }
+    size_t n = strlen(text);
+    while (n > 0 && text[n - 1] == ' ') {
+        n--;
+    }
+    if (n >= 2 && (text[0] == '"' || text[0] == '\'') && text[n - 1] == text[0]) {
+        text++;
+        n -= 2;
+    }
+    static const char *const optional_prefixes[] = {"Optional[", "typing.Optional["};
+    for (size_t i = 0; i < sizeof(optional_prefixes) / sizeof(optional_prefixes[0]); i++) {
+        size_t plen = strlen(optional_prefixes[i]);
+        if (n > plen + 1 && strncmp(text, optional_prefixes[i], plen) == 0 && text[n - 1] == ']') {
+            text += plen;
+            n -= plen + 1;
+            break;
+        }
+    }
+    static const char none_tail[] = " | None";
+    static const char none_head[] = "None | ";
+    const size_t none_len = sizeof(none_tail) - 1;
+    if (n > none_len && strncmp(text + n - none_len, none_tail, none_len) == 0) {
+        n -= none_len;
+    } else if (n > none_len && strncmp(text, none_head, none_len) == 0) {
+        text += none_len;
+        n -= none_len;
+    }
+    if (n == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = text[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.';
+        if (!ok) {
+            return NULL;
+        }
+    }
+    return cbm_arena_strndup(arena, text, n);
+}
+
+/* Python: fold the file's annotated instance fields (result->field_types,
+ * #1277) into their class defs' field_defs as "name:QN|name:QN", the format
+ * py_register_lsp_defs reads. Each annotation resolves through the same
+ * registry + import map, and the same weak-strategy and type-like vetoes, as
+ * the file's base classes (pxc_resolve_base_qn): a field whose type is not a
+ * confidently-known project type is left out rather than guessed. Linear in
+ * the file: one hash of the file's class defs, one pass over its fields. */
+typedef struct {
+    int owner; /* index into defs[], or -1 */
+    const char *type_qn;
+} pxc_py_field_t;
+
+static void pxc_fold_py_field_types(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                    int start, int end, const pxc_base_scope_t *bs,
+                                    const char *module_qn) {
+    int nf = result ? result->field_types.count : 0;
+    if (!arena || nf == 0 || !defs || start >= end || !bs || !bs->reg) {
+        return;
+    }
+    CBMHashTable *by_qn = cbm_ht_create((uint32_t)(end - start));
+    pxc_py_field_t *fields = (pxc_py_field_t *)cbm_arena_alloc(arena, (size_t)nf * sizeof(*fields));
+    /* Per class def: exact buffer size, then the write cursor into it. */
+    size_t *lens = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    size_t *used = (size_t *)cbm_arena_alloc(arena, (size_t)(end - start) * sizeof(size_t));
+    if (!by_qn || !fields || !lens || !used) {
+        cbm_ht_free(by_qn); /* NULL-safe */
+        return;
+    }
+    memset(lens, 0, (size_t)(end - start) * sizeof(size_t));
+    memset(used, 0, (size_t)(end - start) * sizeof(size_t));
+    for (int si = start; si < end; si++) {
+        if (defs[si].label && strcmp(defs[si].label, "Class") == 0 && defs[si].qualified_name) {
+            cbm_ht_set(by_qn, defs[si].qualified_name, &defs[si]);
+        }
+    }
+    for (int f = 0; f < nf; f++) {
+        const CBMFieldType *ft = &result->field_types.items[f];
+        fields[f].owner = -1;
+        fields[f].type_qn = NULL;
+        CBMLSPDef *owner = ft->class_qn ? (CBMLSPDef *)cbm_ht_get(by_qn, ft->class_qn) : NULL;
+        const char *name = owner ? pxc_py_annotation_type_name(arena, ft->type_text) : NULL;
+        const char *qn = name ? pxc_resolve_base_qn(bs, name, module_qn) : NULL;
+        if (!qn || !ft->field_name || !ft->field_name[0]) {
+            continue;
+        }
+        fields[f].owner = (int)(owner - defs);
+        fields[f].type_qn = qn;
+        /* "name:QN" plus one byte for the '|' or the NUL after it. */
+        lens[fields[f].owner - start] += strlen(ft->field_name) + 1 + strlen(qn) + 1;
+    }
+    cbm_ht_free(by_qn);
+    for (int si = start; si < end; si++) {
+        char *buf = lens[si - start] ? (char *)cbm_arena_alloc(arena, lens[si - start]) : NULL;
+        if (buf) {
+            buf[0] = '\0';
+        }
+        defs[si].field_defs = buf;
+    }
+    for (int f = 0; f < nf; f++) {
+        char *buf = fields[f].owner >= 0 ? (char *)defs[fields[f].owner].field_defs : NULL;
+        if (!buf) {
+            continue;
+        }
+        int slot = fields[f].owner - start;
+        int wrote =
+            snprintf(buf + used[slot], lens[slot] - used[slot], "%s%s:%s", used[slot] ? "|" : "",
+                     result->field_types.items[f].field_name, fields[f].type_qn);
+        if (wrote > 0) {
+            used[slot] += (size_t)wrote;
+        }
+    }
+}
+
 /* Carry one Rust type-level impl independently of any method definition.
  * `impl Trait for Type {}` is semantically meaningful even when the block is
  * empty (the trait may provide defaults), so attaching the relation only to
@@ -554,17 +719,21 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
 
 /* Collect a project-wide CBMLSPDef[] from all cached results. Returns a
  * malloc'd array (caller frees) of length *out_count. String fields are
- * borrowed from cache[i]->arena and from def_modules[i] (also borrowed). */
+ * borrowed from cache[i]->arena and from def_modules[i] (also borrowed).
+ * Required configured-owner spill load failure: NULL, *out_count = -1, and
+ * cleared out_def_starts. No partial aggregate is usable in that case. */
 CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
                                     CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count, int *out_def_starts) {
     const cbm_result_spill_t *spill = ctx ? ctx->spill : NULL;
+    bool owner_walk_required = ctx && atomic_load(&ctx->test_definition_owners_seen);
     int total = 0;
     for (int i = 0; i < file_count; i++) {
         int defs = 0;
         int impls = 0;
         if (cache[i]) {
+            owner_walk_required = owner_walk_required || cache[i]->has_test_definition_owners;
             defs = cache[i]->defs.count;
             impls = cache[i]->impl_traits.count;
         } else if (spill && cbm_result_spill_has(spill, i)) {
@@ -599,8 +768,25 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
         CBMFileResult *fr = cache[fi];
         bool fr_loaded = false;
         if (!fr && spill && cbm_result_spill_has(spill, fi)) {
+            /* The test bit applies only here: registry and subsequent direct
+             * loads remain real. Returning immediately forces exactly the
+             * first actual collector spilled-load boundary, without timing. */
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+            bool force_null = owner_walk_required && ctx &&
+                              (ctx->test_fault_mask & CBM_PIPELINE_TEST_FAULT_COLLECT_SPILL_NULL);
+            fr = force_null ? NULL : cbm_result_spill_load(spill, fi);
+#else
             fr = cbm_result_spill_load(spill, fi);
+#endif
             fr_loaded = fr != NULL;
+            if (!fr && owner_walk_required) {
+                free(defs);
+                *out_count = -1;
+                if (out_def_starts) {
+                    memset(out_def_starts, 0, (size_t)(file_count + 1) * sizeof(int));
+                }
+                return NULL;
+            }
         }
         if (!fr)
             continue;
@@ -618,25 +804,33 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
          * that consume resolved base QNs, and only when a caller supplied the
          * pipeline context (the surface-probe path passes NULL and keeps the
          * raw spelling). */
-        const cbm_registry_t *base_reg = NULL;
-        const char **imp_keys = NULL;
-        const char **imp_vals = NULL;
-        int imp_count = 0;
+        pxc_base_scope_t bs = {.imports = &fr->imports,
+                               .project_name = project_name,
+                               .rel = files[fi].rel_path,
+                               .lang = files[fi].language};
         if (ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language)) {
-            base_reg = ctx->registry;
+            bs.reg = ctx->registry;
+            bs.gbuf = ctx->gbuf;
             cbm_pxc_build_import_map(ctx->gbuf, project_name, files[fi].rel_path,
-                                     files[fi].language, fr, &imp_keys, &imp_vals, &imp_count);
+                                     files[fi].language, fr, &bs.imp_keys, &bs.imp_vals,
+                                     &bs.imp_count);
         }
         for (int di = 0; di < fr->defs.count; di++) {
             if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
-                                  files[fi].language, &defs[idx], base_reg, imp_keys, imp_vals,
-                                  imp_count) == 0) {
+                                  files[fi].language, &defs[idx], bs.reg ? &bs : NULL) == 0) {
                 idx++;
             }
         }
-        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
+        if (files[fi].language == CBM_LANG_PYTHON) {
+            pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
+        }
+        cbm_pxc_free_import_map(bs.imp_keys, bs.imp_vals, bs.imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
-            pxc_fold_go_struct_fields(arena, fr, defs, file_start, idx);
+            pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Struct");
+        } else if (files[fi].language == CBM_LANG_C || files[fi].language == CBM_LANG_CPP) {
+            /* Both: a `.h` file is classified C++, and that is where C declares
+             * the structs its `.c` files access. */
+            pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Class");
         }
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < fr->impl_traits.count; ii++) {
@@ -830,10 +1024,20 @@ int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, c
 
     int metadata_count =
         (lang == CBM_LANG_PYTHON || lang == CBM_LANG_KOTLIN) && result ? result->imports.count : 0;
-    if (edge_count == 0 && metadata_count == 0)
+    /* A completed PHP binding snapshot can establish a genuinely empty map.
+     * The ordinary map remains a compatibility projection; only the separate
+     * typed snapshot may prove that an import was left unresolved. */
+    cbm_php_vendor_names_t php_bindings = {0};
+    if (lang == CBM_LANG_PHP)
+        cbm_pipeline_php_vendor_names_build(gbuf, project_name, rel_path, result, &php_bindings);
+    bool authoritative_empty = php_bindings.targets != NULL;
+    cbm_pipeline_php_vendor_names_free(&php_bindings);
+    if (edge_count == 0 && metadata_count == 0 && !authoritative_empty)
         return 0;
 
     size_t capacity = (size_t)edge_count + (size_t)metadata_count;
+    if (capacity == 0)
+        capacity = 1;
     const char **keys = (const char **)calloc(capacity, sizeof(const char *));
     const char **vals = (const char **)calloc(capacity, sizeof(const char *));
     if (!keys || !vals) {
@@ -1042,6 +1246,45 @@ void cbm_pxc_thread_scratch_end(void) {
  * resolved very many cross-calls turned the whole append into O(n^2) and could
  * peg a core for minutes (observed: an index hung in pxc_append_results/strcmp).
  * The key strings live in a scratch arena that is destroyed after the table. */
+/* Replace the records of `src`'s exact parser occurrence with `src`. The
+ * occurrence keeps ONE record: every earlier record there is superseded by
+ * the same evidence, and rewriting each of them would leave identical copies
+ * that the dedup table in pxc_append_results only indexes, never collapses. */
+static void pxc_supersede_occurrence(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
+                                     const CBMResolvedCall *src) {
+    bool replaced = false;
+    int kept = 0;
+    for (int i = 0; i < dst_calls->count; i++) {
+        const CBMResolvedCall *cur = &dst_calls->items[i];
+        bool same_site = cur->caller_qn && cur->kind == src->kind &&
+                         cur->site_start_byte == src->site_start_byte &&
+                         cur->site_end_byte == src->site_end_byte &&
+                         cur->source_origin == src->source_origin &&
+                         strcmp(cur->caller_qn, src->caller_qn) == 0;
+        if (same_site && replaced) {
+            continue; /* dropped: the occurrence already holds the evidence */
+        }
+        if (kept != i) {
+            dst_calls->items[kept] = *cur;
+        }
+        CBMResolvedCall *dst = &dst_calls->items[kept++];
+        if (!same_site) {
+            continue;
+        }
+        replaced = true;
+        dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
+        dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+        dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
+        dst->confidence = src->confidence;
+        dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
+        dst->kind = src->kind;
+        dst->site_start_byte = src->site_start_byte;
+        dst->site_end_byte = src->site_end_byte;
+        dst->source_origin = src->source_origin;
+    }
+    dst_calls->count = kept;
+}
+
 static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_calls,
                                const CBMResolvedCallArray *src_out) {
     if (!dst_calls || !src_out)
@@ -1056,32 +1299,18 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
      * proves that `member` is a declared Cargo workspace member, replace only
      * records for that exact parser occurrence before constructing the dedup
      * table. This preserves distinct same-named calls at other spans while
-     * preventing the stale local result from out-ranking manifest evidence. */
+     * preventing the stale local result from out-ranking manifest evidence.
+     * PHP external-receiver evidence likewise supersedes a speculative local
+     * row at that exact occurrence after complete typed import classification. */
     for (int j = 0; j < src_out->count; j++) {
         const CBMResolvedCall *src = &src_out->items[j];
-        if (!src->strategy || strcmp(src->strategy, "lsp_cross_crate") != 0 || !src->caller_qn ||
-            !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
+        if (!src->strategy ||
+            (strcmp(src->strategy, "lsp_cross_crate") != 0 &&
+             strcmp(src->strategy, "php_external_receiver") != 0) ||
+            !src->caller_qn || !src->callee_qn || src->site_end_byte <= src->site_start_byte) {
             continue;
         }
-        for (int i = 0; i < dst_calls->count; i++) {
-            CBMResolvedCall *dst = &dst_calls->items[i];
-            if (!dst->caller_qn || dst->kind != src->kind ||
-                dst->site_start_byte != src->site_start_byte ||
-                dst->site_end_byte != src->site_end_byte ||
-                dst->source_origin != src->source_origin ||
-                strcmp(dst->caller_qn, src->caller_qn) != 0) {
-                continue;
-            }
-            dst->caller_qn = cbm_arena_strdup(dst_arena, src->caller_qn);
-            dst->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
-            dst->strategy = cbm_arena_strdup(dst_arena, src->strategy);
-            dst->confidence = src->confidence;
-            dst->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
-            dst->kind = src->kind;
-            dst->site_start_byte = src->site_start_byte;
-            dst->site_end_byte = src->site_end_byte;
-            dst->source_origin = src->source_origin;
-        }
+        pxc_supersede_occurrence(dst_arena, dst_calls, src);
     }
 
     for (int i = 0; i < dst_calls->count; i++) {
@@ -1279,6 +1508,14 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count) {
+    cbm_pxc_run_one_with_php_bindings(lang, r, source, source_len, module_qn, defs, def_count,
+                                      imp_names, imp_qns, imp_count, NULL);
+}
+
+void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const char *source,
+                                       int source_len, const char *module_qn, CBMLSPDef *defs,
+                                       int def_count, const char **imp_names, const char **imp_qns,
+                                       int imp_count, const CBMPHPImportBindings *bindings) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -1301,17 +1538,34 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
          * imports — the existing pipeline doesn't carry C-style include
          * resolution as a separate map, so pass NULL/0 and let the LSP
          * fall back to its own #include scan. */
-        cbm_run_c_lsp_cross(&scratch, source, source_len, module_qn, cpp_mode, defs, def_count,
-                            NULL, NULL, 0, tree, &out);
+        if (r->has_test_definition_owners) {
+            if (!cbm_run_c_lsp_cross_with_test_owners(&scratch, source, source_len, module_qn,
+                                                      cpp_mode, defs, def_count, NULL, NULL, 0,
+                                                      tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
+                cbm_pipeline_test_owner_error(r);
+                pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
+                return; /* out may be partial: never append it */
+            }
+        } else {
+            CBMLSPStatus status =
+                cbm_run_c_lsp_cross_status(&scratch, source, source_len, module_qn, cpp_mode, defs,
+                                           def_count, NULL, NULL, 0, tree, &out);
+            if (status != CBM_LSP_COMPLETE)
+                cbm_c_lsp_record_failure(r, status);
+        }
         break;
     }
-    case CBM_LANG_PYTHON:
-        cbm_run_py_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                             imp_qns, imp_count, tree, &out, &synthetic_calls);
-        break;
+    case CBM_LANG_PYTHON: {
+        CBMLSPStatus status = cbm_run_py_lsp_cross_status(&scratch, source, source_len, module_qn,
+                                                          defs, def_count, imp_names, imp_qns,
+                                                          imp_count, tree, &out, &synthetic_calls);
+        if (status != CBM_LSP_COMPLETE)
+            cbm_py_lsp_record_failure(r, status);
+    } break;
     case CBM_LANG_PHP:
-        cbm_run_php_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                              imp_qns, imp_count, tree, &out);
+        cbm_run_php_lsp_cross_with_bindings(&scratch, source, source_len, module_qn, defs,
+                                            def_count, imp_names, imp_qns, imp_count, tree, &out,
+                                            bindings);
         break;
     case CBM_LANG_JAVA:
         cbm_run_java_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
@@ -1418,7 +1672,23 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
                            void *rust_shared_ctx) {
+    cbm_pxc_dispatch_file_with_php_bindings(lang, result, source, source_len, rel, def_module,
+                                            cross_registries, module_def_index, all_defs,
+                                            all_def_count, imp_keys, imp_vals, imp_count,
+                                            rust_shared_get, rust_shared_ctx, NULL);
+}
+
+void cbm_pxc_dispatch_file_with_php_bindings(
+    CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
+    const char *def_module, const CBMCrossLspRegistries *cross_registries,
+    const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
+    const char **imp_keys, const char **imp_vals, int imp_count,
+    CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
+    const CBMPHPImportBindings *bindings) {
     if (result && result->lsp_skipped) {
+        if (result->has_test_definition_owners) {
+            cbm_pipeline_test_owner_error(result);
+        }
         return;
     }
     if (!result) {
@@ -1456,18 +1726,34 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                                                &out);
             used_prebuilt = true;
             break;
-        case CBM_LANG_PYTHON:
-            cbm_run_py_lsp_cross_with_registry(&scratch, source, source_len, def_module, &overlay,
-                                               imp_keys, imp_vals, imp_count, result->cached_tree,
-                                               &out, &synthetic_calls);
+        case CBM_LANG_PYTHON: {
+            CBMLSPStatus status = cbm_run_py_lsp_cross_with_registry_status(
+                &scratch, source, source_len, def_module, &overlay, imp_keys, imp_vals, imp_count,
+                result->cached_tree, &out, &synthetic_calls);
+            if (status != CBM_LSP_COMPLETE)
+                cbm_py_lsp_record_failure(result, status);
+        }
             used_prebuilt = true;
             break;
         case CBM_LANG_C:
         case CBM_LANG_CPP:
         case CBM_LANG_CUDA:
-            cbm_run_c_lsp_cross_with_registry(&scratch, source, source_len, def_module,
-                                              (lang != CBM_LANG_C), &overlay, imp_keys, imp_vals,
-                                              imp_count, result->cached_tree, &out);
+            if (result->has_test_definition_owners) {
+                if (!cbm_run_c_lsp_cross_with_registry_with_test_owners(
+                        &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
+                        imp_keys, imp_vals, imp_count, result->cached_tree, &out,
+                        CBM_SOURCE_ORIGIN_RAW, result)) {
+                    cbm_pipeline_test_owner_error(result);
+                    pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
+                    return; /* no append and no fallback on an invalid proof */
+                }
+            } else {
+                CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status(
+                    &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
+                    imp_keys, imp_vals, imp_count, result->cached_tree, &out);
+                if (status != CBM_LSP_COMPLETE)
+                    cbm_c_lsp_record_failure(result, status);
+            }
             used_prebuilt = true;
             break;
         case CBM_LANG_CSHARP:
@@ -1571,8 +1857,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
         } else {
-            cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count);
+            cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module,
+                                              file_defs, file_def_count, imp_keys, imp_vals,
+                                              imp_count, bindings);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -1582,8 +1869,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
-        cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                        imp_keys, imp_vals, imp_count);
+        cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module, file_defs,
+                                          file_def_count, imp_keys, imp_vals, imp_count, bindings);
     }
     free(filtered);
 }
@@ -1610,8 +1897,16 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
 
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                 int file_count, CBMFileResult **cache) {
-    if (!ctx || !files || file_count <= 0 || !cache)
+    if (!ctx) {
         return 0;
+    }
+    if (!files || file_count <= 0 || !cache) {
+        if (atomic_load(&ctx->test_definition_owners_seen)) {
+            atomic_store(&ctx->test_declarations_failed, 1);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+        return 0;
+    }
 
     cbm_log_info("pass.start", "pass", "lsp_cross", "files", itoa_buf(file_count));
 
@@ -1621,10 +1916,19 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
      * the pointer through the file-static set below. */
     bool have_rust = false;
     for (int i = 0; i < file_count; i++) {
+        if (!cbm_pipeline_test_result_ok(ctx, cache[i])) {
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
         if (cache[i] && files[i].language == CBM_LANG_RUST) {
             have_rust = true;
-            break;
         }
+    }
+    bool owner_walk_required = atomic_load(&ctx->test_definition_owners_seen) != 0;
+    char cross_disabled[CBM_SZ_16];
+    if (owner_walk_required && cbm_safe_getenv("CBM_DISABLE_LSP_CROSS", cross_disabled,
+                                               sizeof(cross_disabled), NULL) != NULL) {
+        atomic_store(&ctx->test_declarations_failed, 1);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
     CBMArena cargo_arena;
     CBMCargoManifest cargo_manifest;
@@ -1637,14 +1941,25 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
 
     /* Per-file module QN cache so we don't recompute it once per def + once
      * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
-    char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
+    char **def_modules = cbm_pipeline_test_force_def_modules_null(ctx)
+                             ? NULL
+                             : (char **)calloc((size_t)file_count, sizeof(char *));
     if (!def_modules) {
         cbm_log_error("pass.err", "pass", "lsp_cross", "phase", "alloc");
+        if (have_rust) {
+            cbm_pxc_set_rust_manifest(NULL);
+            cbm_arena_destroy(&cargo_arena);
+        }
+        if (owner_walk_required) {
+            atomic_store(&ctx->test_declarations_failed, 1);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
         return 0;
     }
 
     int def_count = 0;
-    int *def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
+    int *def_starts =
+        (int *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, ((size_t)file_count + 1) * sizeof(int));
     /* The defs own their strings in the caller-owned seq_cross_arena, which
      * the registries and later passes already borrow from (see below). */
     if (!ctx->seq_cross_arena_live) {
@@ -1654,6 +1969,20 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMLSPDef *all_defs =
         cbm_pxc_collect_all_defs(ctx, &ctx->seq_cross_arena, cache, files, file_count,
                                  ctx->project_name, def_modules, &def_count, def_starts);
+    if (def_count < 0 || (owner_walk_required && (!all_defs || def_count <= 0))) {
+        atomic_store(&ctx->test_declarations_failed, 1);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, def_starts);
+        free(all_defs);
+        for (int i = 0; i < file_count; i++) {
+            free(def_modules[i]);
+        }
+        free(def_modules);
+        if (have_rust) {
+            cbm_pxc_set_rust_manifest(NULL);
+            cbm_arena_destroy(&cargo_arena);
+        }
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     /* Same seam as the parallel driver: serialize per-file surfaces while the
      * result cache is alive. Failure only degrades to a full rebuild on the
      * next incremental run. */
@@ -1665,7 +1994,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
             cbm_pipeline_set_lsp_surfaces(ctx->pipeline, surface_rows, surface_count);
         }
     }
-    free(def_starts);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, def_starts);
 
     /* Shared prepare (mirrors run_parallel_pipeline): inverted module-def
      * index + per-language shared registries, built ONCE for the whole pass.
@@ -1701,8 +2030,16 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     for (int i = 0; i < file_count; i++) {
         if (!cache[i])
             continue;
+        if (!cbm_pipeline_test_result_ok(ctx, cache[i])) {
+            break;
+        }
         CBMLanguage lang = files[i].language;
         if (!cbm_pxc_has_cross_lsp(lang)) {
+            if (cache[i]->has_test_definition_owners) {
+                cbm_pipeline_test_owner_error(cache[i]);
+                (void)cbm_pipeline_test_result_ok(ctx, cache[i]);
+                break;
+            }
             skipped_no_lsp++;
             continue;
         }
@@ -1711,6 +2048,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         char *source = pxc_read_file(files[i].path, &source_len);
         if (!source || source_len <= 0) {
             free(source);
+            if (cache[i]->has_test_definition_owners) {
+                cbm_pipeline_test_owner_error(cache[i]);
+                (void)cbm_pipeline_test_result_ok(ctx, cache[i]);
+                break;
+            }
             skipped_no_source++;
             continue;
         }
@@ -1718,6 +2060,13 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         if (!def_modules[i]) {
             def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
                                                          pxc_module_is_dir(files[i].language));
+        }
+
+        if (!def_modules[i] && cache[i]->has_test_definition_owners) {
+            free(source);
+            cbm_pipeline_test_owner_error(cache[i]);
+            (void)cbm_pipeline_test_result_ok(ctx, cache[i]);
+            break;
         }
 
         const char **imp_keys = NULL;
@@ -1730,15 +2079,27 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
          * file, not to a stale extraction marker (the innocent-quarantine
          * failure mode). */
         cbm_index_mark_start(files[i].rel_path);
-        cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
-                              &cross_registries, module_def_index, all_defs, def_count, imp_keys,
-                              imp_vals, imp_count, NULL, NULL);
+        bool had_error = cache[i]->has_error;
+        cbm_php_vendor_names_t php_bindings;
+        cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                            cache[i], &php_bindings);
+        cbm_pxc_dispatch_file_with_php_bindings(
+            lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
+            &cross_registries, module_def_index, all_defs, def_count, imp_keys, imp_vals, imp_count,
+            NULL, NULL, &php_bindings);
+        cbm_pipeline_php_vendor_names_free(&php_bindings);
         cbm_index_mark_done(files[i].rel_path);
+        if (!had_error && cache[i]->has_error && ctx->pipeline)
+            cbm_pipeline_add_file_error(ctx->pipeline, files[i].rel_path, cache[i]->error_msg,
+                                        "lsp_skipped");
         per_lang_calls++;
         processed++;
 
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
+        if (!cbm_pipeline_test_result_ok(ctx, cache[i])) {
+            break;
+        }
     }
 
     cbm_pxc_free_module_def_index(module_def_index);
@@ -1764,7 +2125,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                  "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",
                  itoa_buf(skipped_no_source), "defs_total", itoa_buf(def_count), "lsp_calls",
                  itoa_buf(per_lang_calls));
-    return 0;
+    return atomic_load(&ctx->test_declarations_failed) ? CBM_PIPELINE_ABORT_PRESERVE_DB : 0;
 }
 
 /* ── Per-module def index (gopls "package summary" pattern) ──── */
@@ -1889,16 +2250,33 @@ static void pxc_mark_module_defs(const CBMModuleDefIndex *idx, bool *selected,
  * (`project.module`). Select the nearest materialized module prefix; the
  * language registry still has to prove the full target QN before an edge is
  * emitted, so this broadens the candidate set without weakening precision. */
-static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local int pxc_import_probe_allocations_left = -1;
+void cbm_pxc_test_import_probe_fail_after(int successful_allocations) {
+    pxc_import_probe_allocations_left = successful_allocations;
+}
+#endif
+
+static bool pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
                                  const CBMLSPDef *all_defs, CBMLanguage caller_lang,
                                  const char *import_qn, int *total) {
     if (!idx || !idx->ht || !import_qn || !import_qn[0]) {
-        return;
+        return true;
     }
-    char *candidate = strdup(import_qn);
-    if (!candidate) {
-        return;
-    }
+    static const char init_seg[] = ".__init__";
+    size_t import_len = strlen(import_qn);
+    if (import_len > SIZE_MAX - sizeof(init_seg))
+        return false;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (pxc_import_probe_allocations_left == 0)
+        return false;
+    if (pxc_import_probe_allocations_left > 0)
+        pxc_import_probe_allocations_left--;
+#endif
+    char *candidate = (char *)malloc(import_len + sizeof(init_seg));
+    if (!candidate)
+        return false;
+    memcpy(candidate, import_qn, import_len + 1);
     bool matched = false;
     for (;;) {
         pxc_module_entry_t *entry = (pxc_module_entry_t *)cbm_ht_get(idx->ht, candidate);
@@ -1909,6 +2287,31 @@ static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
             }
             matched = true;
             break;
+        }
+        if (caller_lang == CBM_LANG_PYTHON) {
+            size_t cand_len = strlen(candidate);
+            memcpy(candidate + cand_len, init_seg, sizeof(init_seg));
+            entry = (pxc_module_entry_t *)cbm_ht_get(idx->ht, candidate);
+            candidate[cand_len] = '\0';
+            /* A suffixed module may be a non-Python directory named __init__.
+             * Only this new probe filters strictly; normal-entry precedence
+             * above remains unchanged. Eligibility is independent of dedup. */
+            bool eligible = false;
+            for (int j = 0; entry && j < entry->count; j++) {
+                int di = entry->indices[j];
+                if (all_defs[di].lang != CBM_LANG_PYTHON)
+                    continue;
+                eligible = true;
+                if (!selected[di]) {
+                    selected[di] = true;
+                    if (total)
+                        (*total)++;
+                }
+            }
+            if (eligible) {
+                matched = true;
+                break;
+            }
         }
         char *dot = strrchr(candidate, '.');
         if (!dot) {
@@ -1940,6 +2343,7 @@ static void pxc_mark_import_defs(const CBMModuleDefIndex *idx, bool *selected,
         }
     }
     free(candidate);
+    return true;
 }
 
 CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_count) {
@@ -2010,7 +2414,8 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
         return NULL;
     }
 
-    bool *selected = (bool *)calloc((size_t)idx->def_count, sizeof(*selected));
+    bool *selected =
+        (bool *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, (size_t)idx->def_count * sizeof(*selected));
     if (!selected) {
         return NULL;
     }
@@ -2018,7 +2423,9 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     int total = 0;
     pxc_mark_module_defs(idx, selected, all_defs, caller_lang, own_module, &total);
     for (int i = 0; i < imp_count; i++) {
-        pxc_mark_import_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total);
+        if (!pxc_mark_import_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total)) {
+            goto failed; /* out_success remains false: dispatcher uses all_defs */
+        }
     }
     if (pxc_is_jvm_lang(caller_lang) && idx->namespace_ht) {
         const char *namespace_key = pxc_namespace_index_key(caller_namespace);
@@ -2027,15 +2434,14 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     }
 
     if (total == 0) {
-        free(selected);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, selected);
         *out_success = true;
         return NULL;
     }
 
     CBMLSPDef *out = (CBMLSPDef *)malloc((size_t)total * sizeof(CBMLSPDef));
     if (!out) {
-        free(selected);
-        return NULL;
+        goto failed;
     }
 
     int n = 0;
@@ -2046,6 +2452,9 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     }
     *out_count = n;
     *out_success = true;
-    free(selected);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, selected);
     return out;
+failed:
+    cbm_free(CBM_MEM_CLASS_EXTRACT, selected);
+    return NULL;
 }

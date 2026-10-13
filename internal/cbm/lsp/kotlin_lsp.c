@@ -489,13 +489,8 @@ static const CBMScope *kt_scope_declaring_name(const CBMScope *scope, const char
     if (!name)
         return NULL;
     for (const CBMScope *current = scope; current; current = current->parent) {
-        for (const CBMScopeChunk *chunk = current->chunks; chunk; chunk = chunk->next) {
-            for (int i = 0; i < chunk->used; i++) {
-                if (chunk->bindings[i].name && strcmp(chunk->bindings[i].name, name) == 0) {
-                    return current;
-                }
-            }
-        }
+        if (cbm_scope_lookup_local(current, name))
+            return current;
     }
     return NULL;
 }
@@ -5415,7 +5410,7 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
             return;
         }
         ts_parser_set_language(parser, tree_sitter_kotlin());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         owns_tree = true;
     }

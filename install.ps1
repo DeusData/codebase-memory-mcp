@@ -134,13 +134,63 @@ Write-Host "  arch:    $Arch"
 Write-Host "  target:  $InstallDir\$BinName"
 Write-Host ""
 
+# Reserve a temporary path that no other process can already own.
+#
+# The staging directory used to be "cbm-install-<Get-Random>" created with
+# -Force. Get-Random is seeded per process and its space is small, and -Force
+# ADOPTS a directory that already exists -- so a directory planted at a guessed
+# name became the installer's staging area, ahead of the owner-only DACL that
+# is applied below. GUID names plus -ErrorAction Stop mean a collision is a
+# retry, never an adoption. The same rule applies to the installer's own
+# sibling temp file: "<dest>.new" was a fixed path in the install directory,
+# reservable by anyone who could write there first. FileMode.CreateNew with
+# FileShare.None reserves an unguessable sibling atomically instead.
+function New-CbmExclusiveSiblingTemp {
+    param([Parameter(Mandatory=$true)][string]$Destination)
+
+    $directory = [System.IO.Path]::GetDirectoryName($Destination)
+    $leaf = [System.IO.Path]::GetFileName($Destination)
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $random = [System.IO.Path]::GetRandomFileName()
+        $candidate = Join-Path $directory ".$leaf.tmp-$random"
+        try {
+            $reservation = [System.IO.File]::Open(
+                $candidate,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+            $reservation.Dispose()
+            return $candidate
+        } catch [System.IO.IOException] {
+            # A collision belongs to another process; reserve a fresh sibling.
+        }
+    }
+    throw "could not reserve an exclusive temporary sibling for $Destination"
+}
+
+function New-CbmExclusiveTempDirectory {
+    param([Parameter(Mandatory=$true)][string]$ParentDirectory)
+
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $candidate = Join-Path $ParentDirectory (
+            "cbm-install-" + [guid]::NewGuid().ToString("N")
+        )
+        try {
+            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+            return $candidate
+        } catch [System.IO.IOException] {
+            # Never adopt or remove a colliding path owned by another process.
+        }
+    }
+    throw "could not reserve an exclusive installer temporary directory"
+}
+
 # Build download URL
 $Archive = "codebase-memory-mcp-windows-$Arch.zip"
 $Url = "$BaseUrl/$Archive"
 
 # Download
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+$TmpDir = New-CbmExclusiveTempDirectory -ParentDirectory ([System.IO.Path]::GetTempPath())
 
 # Give the staging directory a protected owner-only DACL.
 #
@@ -364,13 +414,18 @@ if ($LASTEXITCODE -ne 0) {
 $DownloadedInstaller = Join-Path $TmpDir "install.ps1"
 if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
     $InstallerDest = Join-Path $InstallDir "install.ps1"
-    $InstallerTmp = "$InstallerDest.new"
+    # Reserved inside the try: failing to reserve a sibling is a best-effort
+    # miss like any other step here, not a reason to abort a finished install.
+    $InstallerTmp = $null
     try {
+        $InstallerTmp = New-CbmExclusiveSiblingTemp -Destination $InstallerDest
         Copy-Item -LiteralPath $DownloadedInstaller -Destination $InstallerTmp -Force -ErrorAction Stop
         Move-Item -LiteralPath $InstallerTmp -Destination $InstallerDest -Force -ErrorAction Stop
         Write-Host "Installed updater -> $InstallerDest"
     } catch {
-        Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        if ($InstallerTmp) {
+            Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "note: could not place install.ps1 in $InstallDir (update will explain where to find it)"
     }
 }

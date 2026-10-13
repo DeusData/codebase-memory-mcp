@@ -115,6 +115,12 @@ if command -v npm &>/dev/null && [ -f graph-ui/package-lock.json ]; then
     if [ ! -d graph-ui/node_modules ]; then
         (cd graph-ui && npm ci --ignore-scripts --silent)
     fi
+    # The optional native image-processing package may be absent from the
+    # browser export. Establish that from this candidate's actual app/worker
+    # build, not package-name or platform guesses. Evidence stays outside dist.
+    (cd graph-ui && npm run build)
+    python3 scripts/ui_browser_licenses.py graph-ui
+    python3 tests/test_ui_license_inventory.py
     python3 scripts/license-gate-check-npm.py graph-ui scripts/license-policy.json
 else
     echo "FAIL: npm or graph-ui/package-lock.json unavailable — UI tree unchecked"

@@ -35,8 +35,8 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **162 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **45 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
-- **Built-in graph visualization** — 3D interactive UI at `localhost:9749`, served from the binary itself.
-- **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
+- **CBM Atlas** — the built-in human interface at `localhost:9749`: a reading IDE over the index (explorer and read-only Monaco reader, a semantic twin that follows the caret, flow, bug-hunt and change-scope reading modes, the 3D galaxy, source-cited answers, project management), served from the binary itself.
+- **Infrastructure-as-code indexing** — Dockerfiles, container images, docker compose, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds and compose services, `Image` nodes joining the images that are built and run, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources — a Service walks to the program its container runs.
 - **17 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
@@ -131,15 +131,30 @@ Package-manager setup (npm, PyPI, or Go) verifies and publishes a coherent priva
 
 The ordinary `cli` mode runs one command locally, but it is not disconnected from the daemon above: it connects to the shared coordination daemon — starting one if none is already running — for that same admission barrier plus per-project locks on graph mutations. Its connection is a `cli_session`: it never registers with the background watcher and never starts a UI, and it holds the admission lease only for the command's lifetime. If the command's own connection is what started the daemon, that daemon exits again once the command closes and no other session is attached; if a daemon was already running, the command simply joins and leaves it exactly as found. While the command is running, a temporary monitor separately lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
 
-### Graph Visualization UI
+### CBM Lens Beta — the human interface
 
-The graph UI is built into the binary — every install on every channel has it. Then run it:
+The MCP tools are the agent's interface to the code graph; **CBM Lens Beta** is the human's. It is built into the binary — every install on every channel has it:
 
 ```bash
 codebase-memory-mcp --ui=true --port=9749
 ```
 
 Open `http://localhost:9749` in your browser. The UI is owned by the shared coordination daemon, so concurrent agent sessions do not start duplicate HTTP servers.
+
+CBM Lens builds on **CodeAtlasWeb**, a reading IDE built by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) on the CBM read surface (design and tracking in #1964). It runs air-gapped on loopback, reaches no cloud, and every panel names where its facts come from; what the index did not record is shown as a gap, never filled in with a guess.
+
+When something in CBM Lens does not load, the page has already written it down: its console output, uncaught errors and failed requests go to `${CBM_CACHE_DIR}/logs/ui.log` (default `~/.cache/codebase-memory-mcp/logs/ui.log`, one JSON line per entry, rotated once at 5 MiB). The projects panel (alt+p) shows the tail under "This server", `GET http://localhost:9749/api/ui-log?lines=200` returns it, and a bug report can attach the file.
+
+- **Explorer and reader** — the indexed file tree and a read-only Monaco reader whose source comes from the index.
+- **Semantic twin** — follows the caret: what the symbol under it holds, calls, raises and touches, as facts or as pseudocode, pitched at who is reading.
+- **Reading modes** — `[w]hy am I here` picks a way in (hunt a bug, scope a change, understand the project, pick an entry point); **flow** walks the calls in the order they run; **bug hunt** compares the expected path into a symbol with what `ingest_traces` observed; **change scope** shows what a change reaches and what covers it.
+- **Galaxy** — the persistent 3D graph with focus following in both directions, and a hierarchy view of the entry subgraph.
+- **Command line** — search by meaning while you type; a line ending in `?` builds a source-cited answer from indexed fact cards, with an optional local-model wording pass (a llama-server sidecar you start yourself; off by default, and no model or binary ships).
+- **Live agents** — an opt-in overlay of AI agents working in the same repository, fed by a loopback bridge over tool-hook events (`graph-ui/agents/`).
+- **`[p]rojects`** — index a repository, check or remove an index, edit the project's decision record, and see the server's processes and log.
+- **`[?]help`** — what it reads, what it cannot do, and every key it listens to, derived from the wiring itself.
+
+Open a project with `?project=<name>` in the address, or pick it in the projects panel. The frontend's own README, plan, honesty rules and recorded proof runs live under `graph-ui/`.
 
 ### Auto-Index
 
@@ -151,9 +166,13 @@ codebase-memory-mcp config set auto_index true
 
 When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing git-based change detection. Configurable file limit: `config set auto_index_limit 50000`.
 
+The watcher follows MCP sessions: it watches the project each open MCP session is rooted in (the client's working directory) and stops when the last session for that project closes. A repository indexed with `cli index_repository`, or indexed from a session rooted somewhere else, is not watched — re-run `index_repository` after changing it. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
+
 Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher — useful when working across many projects and you want each session contained to explicit indexing.
 
 To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch` — which is consulted per session — `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
+
+The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
 
 ### Keeping Up to Date
 
@@ -183,7 +202,14 @@ Installed through **npm or pip**? Update with your package manager on every plat
 codebase-memory-mcp uninstall
 ```
 
-Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and deleted only after confirmation.
+Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and **kept by default**. `-y`/`--yes`, `-n`/`--no`, and noninteractive input keep them unless `--delete-indexes` is explicitly given. An interactive terminal without that flag is asked separately; the default answer is to keep them.
+
+```bash
+codebase-memory-mcp uninstall -y --delete-indexes   # also delete every project index
+codebase-memory-mcp uninstall --dry-run --delete-indexes   # preview; change nothing
+```
+
+`--delete-indexes` is explicit consent and takes precedence over `--no`; `--dry-run` always preserves the files. When indexes are kept, uninstall prints their cache directory (`${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}`) and how to remove them.
 
 The install script placed beside the binary is **reported, not deleted** — uninstall prints its path and the `rm` command for it. It is left alone on purpose: it may be your own copy, a symlink into a checkout, or managed by a package manager, and an uninstaller should not delete a file it cannot prove it owns.
 
@@ -213,6 +239,8 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - **`CROSS_*` edges** link nodes across multiple repos indexed under the same store
 - **Multi-galaxy 3D UI layout** for cross-repo architecture visualization
 - **Cross-repo architecture summary** combining services, routes, and dependencies across the indexed fleet
+- **Run status**: `index_status` (and the UI layout next to `linked_projects`) carries a `cross_repo` object, `{"status":"never_run"}` until `index_repository(mode="cross-repo-intelligence")` has run with that project as the source, then `"ran"` with `last_run_at`, `outcome`, `targets`, `projects_scanned`, `total_cross_edges` and `skipped_projects`. That is how you tell "never linked" apart from "linked, nothing matched". The status is stored in the project's own index next to its `CROSS_*` edges, so a reindex that rebuilds the index drops both at once and the status goes back to `never_run`.
+- **Skipped stores**: `target_projects: ["*"]` skips an index built before the #768 schema change rather than failing the whole run. The response lists each one as `skipped_projects: [{"name", "reason": "pre_768_schema", "hint": "reindex this project"}]`.
 
 ### Edge types (selected)
 - `CALLS` — a callable is invoked at the source site
@@ -220,6 +248,12 @@ The install script placed beside the binary is **reported, not deleted** — uni
 - `USAGE` — an identifier is used, but a unique callable target is not proven (including ambiguous or complex expressions)
 - `IMPORTS`, `DEFINES`, `IMPLEMENTS`, `INHERITS`
 - `HTTP_CALLS`, `ASYNC_CALLS` (cross-service)
+- `SPAWNS` — the caller starts another program (`subprocess.run`, `exec.Command`, `posix_spawn`, `Process.Start`, a shell command or Make recipe running a program by path, ...); the target is a `Process` node named after the program, or `<dynamic>` when the program is not a literal. When a shell script, Make recipe, GitHub Actions step or Prow job runs a script of the repository (`./hack/x.sh`, `bash hack/x.sh`), the target is that script's `Module` (else its `File`); `make TARGET` (also `$(MAKE)`, `-C`, `-f`) targets the rule of that target, followed through included makefiles; edges from CI carry `ci` and `job`. A Dockerfile's last stage `ENTRYPOINT` (else `CMD`) spawns what the container runs (`api: dockerfile`): the repository script or source copied into the image, the Go `main` of a binary a stage builds with `go build -o`, else a `Process`
+- `INFRA_MAPS` — a Kubernetes Service to each workload whose pod labels carry every `key: value` of the Service's selector, within one namespace
+- `USAGE` with `ref: image` — a Kubernetes workload (any pod template: containers, initContainers, CronJobs, custom resources) or a docker compose service to the `Image` it runs
+- `DEPLOYS` — what puts manifests, kustomizations or charts on a cluster, to what it puts there: a Flux Kustomization or Argo Application to the kustomizations / manifests / chart of its path, a Flux HelmRelease to its chart (`spec.chart` or `chartRef` → OCIRepository), a shell command or Make recipe (`kubectl apply -f/-k`, `kustomize build | kubectl apply`, `helm install/upgrade/template`), a Go installer loading a chart with the Helm SDK, a Terraform `helm_release`. A chart outside the repository is a shared external `Chart`; the edge says `via` (`flux`, `argo`, `helmrelease`, `kubectl`, `kustomize`, `helm`, `helm-sdk`, `terraform`, ...)
+- `DEPENDS_ON` — a Helm chart to the charts it declares (the local chart for a resolvable `file://` repository, otherwise an external `Chart`; the edge keeps `repository`), and a `go.mod` / `requirements.txt` file to an external `Package`; a Dockerfile to the `Image`s it builds on (`via: from`, `copy-from`); an `Image` to the Dockerfile it is built from (`via: build`; `tool`: `skaffold`, `compose`, `docker-build` for `docker` / `podman` / `nerdctl` / `buildah` build commands in scripts, Make and CI); a compose service to the services its `depends_on` / `links` name
+- `CONFIGURES` — code reading an environment variable to the shared `EnvVar` of that name (`strategy: env_access`); a Kubernetes container, compose service or Dockerfile (`ENV` of the image) setting one to that container's own `EnvVar` (`strategy: env_set`, with `source`: `value`, `configMapKeyRef`, `secretKeyRef`, `fieldRef`, ..., `compose`, `dockerfile` — values are never stored)
 - `EMITS`, `LISTENS_ON` (channels)
 - `DATA_FLOWS` with arg-to-param mapping + field access chains
 - `SIMILAR_TO` (MinHash + LSH near-clone detection, Jaccard scored)
@@ -228,13 +262,13 @@ The install script placed beside the binary is **reported, not deleted** — uni
 ### Indexing pipeline
 - **158 vendored tree-sitter grammars** compiled into the binary
 - **Generic package / module resolution** — bare specifiers like `@myorg/pkg`, `github.com/foo/bar`, `use my_crate::foo` resolved via manifest scanning (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `pubspec.yaml`, `pom.xml`, `build.gradle`, `mix.exs`, `*.gemspec`)
-- **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, Kustomize overlays as graph nodes
+- **Infrastructure-as-code indexing** — Dockerfiles (`Dockerfile.*`, `*.Dockerfile`, `Containerfile`: bases, what the container runs, `ENV`), container images (`Image`: the normalised repository, tag and digest on the edges; a repository built from several Dockerfiles, one per component tag, gets an `Image` per component), docker compose services (`Resource`), Kubernetes manifests (`Resource`), Kustomize overlays (`IMPORTS` to their entries), Helm charts (`Chart`, `DEPENDS_ON`), Terraform / OpenTofu (`.tf`, `.tofu`, `.tfvars`) as graph nodes. A Service walks to the code it runs: Service → workload → `Image` → Dockerfile → `main`
 - **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer (parameter binding, return-type inference, generic substitution, JSX component dispatch, JSDoc inference for plain JS files, namespace + trait + late-static-binding resolution for PHP, file-scoped namespaces + records + LINQ method syntax for C#, class-hierarchy + overload + lambda resolution for Java, extension-function + scope-function resolution for Kotlin, trait-method + UFCS resolution for Rust)
 - **RAM-first pipeline**: LZ4 compression, in-memory SQLite, single dump at end. Memory released after.
 
 ### Distribution & operation
 - **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes and re-indexes automatically
+- **Auto-sync**: Background watcher detects file changes in the project an MCP session is working in and re-indexes it automatically (other indexed repos: re-run `index_repository`)
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
@@ -669,7 +703,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
+| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh only while it is the project of an open MCP session; repos indexed from the CLI or from another project's session need a re-run (`index_status` shows `watch`). Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
@@ -707,7 +741,7 @@ mode. `index_status` keeps describing the published graph and its freshness.
 | Tool | Description |
 |------|-------------|
 | `search_graph` | Structural, BM25, and semantic search. Page structural rows with `offset`/`limit` and ranked semantic rows independently with `semantic_offset`/`semantic_limit`. |
-| `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
+| `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. `mode`: `calls` (default), `data_flow`, `cross_service`, `topology` (Kubernetes objects, routes, controllers and what they deploy — start at a Resource or Route), `deploy` (what a CI job, script or Make rule runs and deploys — outbound from the job, inbound from a chart), `run` (what a Service or workload runs: workload → `Image` → Dockerfile → the program its container starts, with the environment each container is given — outbound from a Service, workload or compose service). |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
@@ -727,11 +761,13 @@ mode. `index_status` keeps describing the published graph and its freshness.
 
 ### Node Labels
 
-`Project`, `Package`, `Folder`, `File`, `Module`, `Class`, `Function`, `Method`, `Interface`, `Enum`, `Type`, `Route`, `Resource`
+`Project`, `Package`, `Folder`, `File`, `Module`, `Section`, `Class`, `Struct`, `Interface`, `Trait`, `Enum`, `Type`, `Function`, `Method`, `Field`, `Variable`, `Constant`, `Macro`, `Decorator`, `Route`, `Channel`, `Table`, `Process`, `EnvVar`, `Resource`, `Chart`, `Image`, `Branch`
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `USAGE`, `INHERITS`, `IMPLEMENTS`, `OVERRIDE`, `DECORATES`, `RAISES`, `THROWS`, `WRITES`, `DATA_FLOWS`, `HTTP_CALLS`, `GRPC_CALLS`, `ASYNC_CALLS`, `EMITS`, `LISTENS_ON`, `HANDLES`, `SPAWNS`, `CONFIGURES`, `INFRA_MAPS`, `DEPENDS_ON`, `REFERENCES_FILE`, `MENTIONS`, `TESTS`, `TESTS_FILE`, `SIMILAR_TO`, `SEMANTICALLY_RELATED`, `FILE_CHANGES_WITH`, `HAS_BRANCH`, and the cross-repo `CROSS_HTTP_CALLS`, `CROSS_GRPC_CALLS`, `CROSS_GRAPHQL_CALLS`, `CROSS_TRPC_CALLS`, `CROSS_ASYNC_CALLS`, `CROSS_CHANNEL`
+
+`MENTIONS` links a documented definition to the code its doc comment references (C# `<see cref>`, `<seealso cref>`, `<exception cref>`, `<inheritdoc cref>`), one edge per pair with `via`, `syntax`, `tier` (`exact` or `unique`), first `line` and `count`. A reference is bound only when it names exactly one definition under the language's own lookup rules; the rest are counted by reason in `index_status` under `doc_links` (samples with `diagnostics='full'`).
 
 ### Qualified Names
 
@@ -762,7 +798,9 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: true)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
+codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
 codebase-memory-mcp config reset auto_index              # reset to default

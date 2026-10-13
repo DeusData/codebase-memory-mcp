@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "foundation/compat_fs.h"
+#include "foundation/mem_core.h"
 #include "foundation/log.h"
 #include "sqlite3.h"
 #include "store/store.h"
@@ -246,6 +247,120 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
     return 0;
 }
 
+int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
+                                const char *const *edge_types) {
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db || !edge_types) {
+        return CBM_NOT_FOUND;
+    }
+    /* One statement: a pair of NOT EXISTS per listed type (target, source),
+     * each served by an (id, type) index. */
+    char sql[CBM_SZ_2K];
+    int len = snprintf(sql, sizeof(sql), "DELETE FROM nodes WHERE project = ?1 AND label = ?2");
+    int t = 0;
+    for (; edge_types[t] && len > 0 && (size_t)len < sizeof(sql); t++) {
+        len += snprintf(sql + len, sizeof(sql) - (size_t)len,
+                        " AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.project = ?1"
+                        " AND e.target_id = nodes.id AND e.type = ?%d)"
+                        " AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.project = ?1"
+                        " AND e.source_id = nodes.id AND e.type = ?%d)",
+                        t + 3, t + 3);
+    }
+    if (t == 0 || len <= 0 || (size_t)len >= sizeof(sql)) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, label, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    for (int i = 0; i < t; i++) {
+        sqlite3_bind_text(stmt, i + 3, edge_types[i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
+}
+
+/* The first column of `sql` (?1 = the project) as arena strings in *out. */
+static int delta_query_strings(cbm_store_t *store, const char *project, const char *sql,
+                               CBMArena *a, const char ***out) {
+    *out = NULL;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    int n = 0;
+    int cap = 0;
+    const char **items = NULL;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *f = (const char *)sqlite3_column_text(stmt, 0);
+        if (!f) {
+            continue;
+        }
+        if (n == cap) {
+            int ncap = cap ? cap * PAIR_LEN : CBM_SZ_16;
+            const char **grown = cbm_arena_alloc(a, (size_t)ncap * sizeof(*grown));
+            if (!grown) {
+                break;
+            }
+            if (n) {
+                memcpy((void *)grown, items, (size_t)n * sizeof(*grown));
+            }
+            items = grown;
+            cap = ncap;
+        }
+        items[n++] = cbm_arena_strdup(a, f);
+    }
+    sqlite3_finalize(stmt);
+    *out = items;
+    return n;
+}
+
+int cbm_delta_build_decl_files(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out) {
+    return delta_query_strings(store, project,
+                               "SELECT file_path FROM nodes WHERE project = ?1 AND label = 'File'"
+                               " AND json_extract(properties, '$.declares_build') = 1",
+                               a, out);
+}
+
+int cbm_delta_image_components(cbm_store_t *store, const char *project, CBMArena *a,
+                               const char ***out) {
+    return delta_query_strings(store, project,
+                               "SELECT qualified_name FROM nodes WHERE project = ?1 AND"
+                               " label = 'Image' AND json_extract(properties, '$.component')"
+                               " IS NOT NULL ORDER BY qualified_name",
+                               a, out);
+}
+
+int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,
+                                    const char *label) {
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "DELETE FROM edges WHERE project = ?1 AND type = ?2 AND source_id IN"
+                           " (SELECT id FROM nodes WHERE project = ?1 AND label = ?3)",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, type, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, label, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
+}
+
 /* Every project node becomes a proxy. The first cut filtered by label and
  * the fail-closed patch immediately found the counterexamples (synthetic
  * Decorator nodes on django; Macro is six of the kernel's 8.5M nodes) — any
@@ -253,6 +368,50 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
  * endpoint must carry its real id in RAM, and curating that set by label is
  * guessing. The proxy load stays edge-free and property-free, which is
  * where the old full load actually spent its time. */
+
+/* `qn` and `parent` without the project prefix. */
+static const char *delta_rel(const char *project, const char *qn) {
+    size_t pl = project ? strlen(project) : 0;
+    if (qn && pl && strncmp(qn, project, pl) == 0 && qn[pl] == '.') {
+        return qn + pl + 1;
+    }
+    return qn ? qn : "";
+}
+
+/* A proxy's properties carrying `parent` when owner + "." + name is not the
+ * node's own (relative) QN, merged with the http client keys if any; NULL
+ * when the owner adds nothing (CBM_MEM_CLASS_OTHER; the caller frees). */
+static char *delta_owner_props(const char *project, const char *name, const char *qn,
+                               const char *parent, const char *client_props) {
+    const char *rel = delta_rel(project, qn);
+    const char *prel = delta_rel(project, parent);
+    size_t pl = strlen(prel);
+    size_t nl = name ? strlen(name) : 0;
+    if (strlen(rel) == pl + 1 + nl && strncmp(rel, prel, pl) == 0 && rel[pl] == '.' &&
+        (nl == 0 || memcmp(rel + pl + 1, name, nl) == 0)) {
+        return NULL;
+    }
+    size_t cap = 2 * strlen(parent) + (client_props ? strlen(client_props) : 0) + 32;
+    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t k = 0;
+    k += (size_t)snprintf(out + k, cap - k, "{\"parent_class\":\"");
+    for (const char *p = parent; *p && k + 3 < cap; p++) {
+        if (*p == '"' || *p == '\\') {
+            out[k++] = '\\';
+        }
+        out[k++] = *p;
+    }
+    out[k++] = '"';
+    if (client_props && client_props[0] == '{' && client_props[1] && client_props[1] != '}') {
+        snprintf(out + k, cap - k, ",%s", client_props + 1);
+    } else {
+        snprintf(out + k, cap - k, "}");
+    }
+    return out;
+}
 
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
     sqlite3 *db = cbm_store_get_db(store);
@@ -292,7 +451,13 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * compose `api.get('/p')` against its unchanged wrapper exactly as a full
      * build does. Only the two keys, only on the rare Module/Variable rows
      * that carry them; every other proxy stays "{}". Proxies are never
-     * written back (cbm_delta_patch skips id <= max_db_id). */
+     * written back (cbm_delta_patch skips id <= max_db_id).
+     *
+     * The other: a node's parent_class where it changes the name the node
+     * goes by -- a Go method's QN has no receiver, a class-body variable's QN
+     * no class. A document naming `Order.Reset` binds such a node through
+     * its owner (doc_links_pdf.c), so a re-resolved document needs it too.
+     * Only where owner + name differs from the QN (delta_owner_props). */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -300,7 +465,11 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " CASE WHEN label IN ('Module','Variable')"
             " AND instr(properties, '\"http_client\"') > 0"
             " THEN json_object('http_client', json_extract(properties, '$.http_client'),"
-            " 'http_base_url', json_extract(properties, '$.http_base_url')) END"
+            " 'http_base_url', json_extract(properties, '$.http_base_url')) END,"
+            " start_line, end_line,"
+            " CASE WHEN label IN ('Method','Variable')"
+            " AND instr(properties, '\"parent_class\"') > 0"
+            " THEN json_extract(properties, '$.parent_class') END"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -318,10 +487,20 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         const char *qn = (const char *)sqlite3_column_text(stmt, 3);
         const char *fp = (const char *)sqlite3_column_text(stmt, 4);
         const char *client_props = (const char *)sqlite3_column_text(stmt, 5);
+        /* Lines too: a document reference that names a line range binds the
+         * definition holding it (doc_links_md.c), in a re-resolved document as
+         * in a full build. */
+        int start_line = sqlite3_column_int(stmt, 6);
+        int end_line = sqlite3_column_int(stmt, 7);
+        const char *parent = (const char *)sqlite3_column_text(stmt, 8);
+        char *owner_props =
+            parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
-        int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", 0, 0,
-                                           client_props ? client_props : "{}");
+        int64_t got =
+            cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line, end_line,
+                                 owner_props ? owner_props : (client_props ? client_props : "{}"));
+        cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
         if (got != id) {
             /* A QN collision inside the preseed set would silently split
              * identity between RAM and disk; the run cannot be trusted. */
@@ -347,6 +526,7 @@ typedef struct {
     sqlite3 *db;
     const char *project;
     int64_t max_db_id;
+    const cbm_gbuf_t *gbuf;
     sqlite3_stmt *node_stmt;
     sqlite3_stmt *edge_stmt;
     sqlite3_stmt *qn_lookup;
@@ -460,6 +640,17 @@ static void delta_patch_node(const cbm_gbuf_node_t *node, void *userdata) {
     ctx->nodes++;
 }
 
+/* An edge of the class recomputed wholesale on every run (an Image's build
+ * edges): the staging graph dropped its old set, so it is written even
+ * between pre-existing nodes. */
+static bool delta_edge_recomputed(const delta_patch_ctx_t *ctx, const cbm_gbuf_edge_t *edge) {
+    if (!ctx->gbuf || strcmp(edge->type, CBM_BUILD_EDGE_TYPE) != 0) {
+        return false;
+    }
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, edge->source_id);
+    return src && src->label && strcmp(src->label, CBM_BUILD_EDGE_SOURCE) == 0;
+}
+
 static void delta_patch_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     delta_patch_ctx_t *ctx = (delta_patch_ctx_t *)userdata;
     if (ctx->failed) {
@@ -468,7 +659,7 @@ static void delta_patch_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     int64_t src = delta_remap_get(ctx, edge->source_id);
     int64_t tgt = delta_remap_get(ctx, edge->target_id);
     if (src <= ctx->max_db_id && tgt <= ctx->max_db_id && src == edge->source_id &&
-        tgt == edge->target_id) {
+        tgt == edge->target_id && !delta_edge_recomputed(ctx, edge)) {
         return; /* both endpoints pre-existed unremapped: already recorded */
     }
     sqlite3_reset(ctx->edge_stmt);
@@ -531,7 +722,10 @@ int cbm_delta_patch(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf, i
     if (cbm_store_begin(store) != CBM_STORE_OK) {
         return CBM_NOT_FOUND;
     }
-    delta_patch_ctx_t ctx = {.db = db, .project = project, .max_db_id = max_db_id};
+    /* This writes the buffer's nodes itself: settle the collision spans first,
+     * as the buffer's own dump and flush do. */
+    cbm_gbuf_settle_variants(gbuf);
+    delta_patch_ctx_t ctx = {.db = db, .project = project, .max_db_id = max_db_id, .gbuf = gbuf};
     if (sqlite3_prepare_v2(db,
                            "SELECT id FROM nodes WHERE project = ?1"
                            " AND qualified_name = ?2",

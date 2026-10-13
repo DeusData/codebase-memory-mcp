@@ -160,14 +160,16 @@ TEST(configlink_key_symbol_short_key_skipped) {
 }
 
 /* Go: TestConfigKeySymbol_CamelCaseNormalization
- * config.json has maxRetryCount, handler.go has getMaxRetryCount() */
+ * config.json has max_retry_count, handler.go has maxRetryCount: camelCase and
+ * snake_case normalize to the same key. (A JSON key links by exact name only,
+ * see configlink_key_symbol_infra_exact_only, so the symbol names it exactly.) */
 TEST(configlink_key_symbol_camel_case) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
 
-    cbm_gbuf_upsert_node(gb, "Variable", "maxRetryCount", "test.config.maxRetryCount",
+    cbm_gbuf_upsert_node(gb, "Variable", "max_retry_count", "test.config.max_retry_count",
                          "config.json", 0, 0, NULL);
 
-    cbm_gbuf_upsert_node(gb, "Function", "getMaxRetryCount", "test.handler.getMaxRetryCount",
+    cbm_gbuf_upsert_node(gb, "Function", "maxRetryCount", "test.handler.maxRetryCount",
                          "handler.go", 0, 0, NULL);
 
     run_configlink(gb, "test", NULL);
@@ -176,6 +178,124 @@ TEST(configlink_key_symbol_camel_case) {
     int count = 0;
     cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
     ASSERT_TRUE(has_strategy(edges, count, "key_symbol"));
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+static int count_key_symbol_edges(cbm_gbuf_t *gb) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        if (edges[i]->properties_json &&
+            strstr(edges[i]->properties_json, "\"strategy\":\"key_symbol\"")) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Keys of infrastructure files (YAML, JSON, HCL, tfvars) link by exact name
+ * only: the substring guess linked a chart's `node_selector` to every
+ * function whose name contains it. In 17 infra repositories 4 of 40 sampled
+ * key_symbol edges were right, all exact and in the same directory tree. */
+TEST(configlink_key_symbol_infra_exact_only) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    cbm_gbuf_upsert_node(gb, "Variable", "node_selector", "test.charts.app.values.node_selector",
+                         "charts/app/values.yaml", 0, 0, NULL);
+    cbm_gbuf_upsert_node(gb, "Function", "GetPodNodeSelectorConfig",
+                         "test.charts.app.gen.GetPodNodeSelectorConfig", "charts/app/gen.go", 0, 0,
+                         NULL);
+    run_configlink(gb, "test", NULL);
+    ASSERT_EQ(count_key_symbol_edges(gb), 0);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* ...and only within the config file's own component (its directory tree):
+ * a stage's JSON schema does not configure an unrelated module's variable. */
+TEST(configlink_key_symbol_infra_scoped_to_component) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    int64_t cfg = cbm_gbuf_upsert_node(gb, "Variable", "cluster_name",
+                                       "test.svc_a.config.cluster_name", "svc-a/config.yaml", 0,
+                                       0, NULL);
+    int64_t inside = cbm_gbuf_upsert_node(gb, "Function", "clusterName",
+                                          "test.svc_a.cmd.main.clusterName", "svc-a/cmd/main.go",
+                                          0, 0, NULL);
+    cbm_gbuf_upsert_node(gb, "Function", "clusterName", "test.svc_b.main.clusterName",
+                         "svc-b/main.go", 0, 0, NULL);
+    run_configlink(gb, "test", NULL);
+    ASSERT_EQ(count_key_symbol_edges(gb), 1);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(edges[0]->source_id, inside);
+    ASSERT_EQ(edges[0]->target_id, cfg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* A conventional config directory (config/, conf/, settings/, ...) belongs to
+ * the component around it. */
+TEST(configlink_key_symbol_config_dir_component) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    cbm_gbuf_upsert_node(gb, "Variable", "cluster_name", "test.config.app.cluster_name",
+                         "config/app.yaml", 0, 0, NULL);
+    cbm_gbuf_upsert_node(gb, "Function", "clusterName", "test.pkg.app.clusterName", "pkg/app.go",
+                         0, 0, NULL);
+    run_configlink(gb, "test", NULL);
+    ASSERT_EQ(count_key_symbol_edges(gb), 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* A Terraform/OpenTofu variable is what a config value sets: a tfvars.json key
+ * links to `variable "<key>"` of its component (the block's Class is named
+ * `variable.<key>`), not to outputs, modules or resources, and not to a
+ * variable of another component (kubespray: contrib/terraform/gcp/tfvars.json
+ * sets contrib/terraform/gcp/modules/.../variables.tf). */
+TEST(configlink_key_symbol_terraform_variable) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    int64_t cfg = cbm_gbuf_upsert_node(gb, "Variable", "ssh_whitelist",
+                                       "test.gcp.tfvars.ssh_whitelist",
+                                       "contrib/terraform/gcp/tfvars.json", 0, 0, NULL);
+    int64_t var = cbm_gbuf_upsert_node(
+        gb, "Class", "variable.ssh_whitelist", "test.gcp.modules.cluster.variable.ssh_whitelist",
+        "contrib/terraform/gcp/modules/cluster/variables.tf", 0, 0, NULL);
+    cbm_gbuf_upsert_node(gb, "Class", "output.ssh_whitelist",
+                         "test.gcp.modules.cluster.output.ssh_whitelist",
+                         "contrib/terraform/gcp/modules/cluster/outputs.tf", 0, 0, NULL);
+    cbm_gbuf_upsert_node(gb, "Class", "variable.ssh_whitelist",
+                         "test.hetzner.variable.ssh_whitelist",
+                         "contrib/terraform/hetzner/variables.tf", 0, 0, NULL);
+    run_configlink(gb, "test", NULL);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(edges[0]->source_id, var);
+    ASSERT_EQ(edges[0]->target_id, cfg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* No count of config keys decides what links: the collector stopped at 4,096. */
+TEST(configlink_key_symbol_no_config_cap) {
+    enum { KEYS = 4200 };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    for (int i = 0; i < KEYS; i++) {
+        char name[CBM_SZ_64];
+        char qn[CBM_SZ_128];
+        snprintf(name, sizeof(name), "limit_alpha_%04d", i);
+        snprintf(qn, sizeof(qn), "test.config.%s", name);
+        cbm_gbuf_upsert_node(gb, "Variable", name, qn, "config.toml", 0, 0, NULL);
+        snprintf(qn, sizeof(qn), "test.main.%s", name);
+        cbm_gbuf_upsert_node(gb, "Function", name, qn, "main.go", 0, 0, NULL);
+    }
+    run_configlink(gb, "test", NULL);
+    ASSERT_EQ(count_key_symbol_edges(gb), KEYS);
     cbm_gbuf_free(gb);
     PASS();
 }
@@ -366,17 +486,18 @@ static cbm_gbuf_t *build_oversized_corpus(bool reverse) {
     return gb;
 }
 
-/* REGRESSION: collect_config_entries/collect_code_entries fill fixed-capacity
- * arrays and stop at the cap, walking gbuf label indexes in insertion order —
- * which under parallel extraction is worker-merge order and varies run to run.
- * Sorting candidates canonically before the cap is what keeps the surviving
- * set, and therefore the emitted CONFIGURES edges, a pure function of the
- * inputs. This test stands in for the scheduling variance by feeding the same
- * corpus in two insertion orders: the emitted edge set must be identical. */
+/* REGRESSION: the collectors walk gbuf label indexes in insertion order --
+ * under parallel extraction worker-merge order, which varies run to run.
+ * They filled fixed-capacity arrays and stopped at a cap, so the surviving
+ * set depended on that order until candidates were sorted first; now no cap
+ * cuts the set at all. This test stands in for the scheduling variance by
+ * feeding the same corpus in two insertion orders: the emitted edge set must
+ * be identical -- and complete, all 9,000 candidates past the old 8,192 cap. */
 TEST(configlink_candidate_truncation_is_order_independent) {
     cbm_gbuf_t *fwd = build_oversized_corpus(false);
     run_configlink(fwd, "test", NULL);
     char *fp_fwd = configures_fingerprint(fwd);
+    int fwd_edges = count_key_symbol_edges(fwd);
 
     cbm_gbuf_t *rev = build_oversized_corpus(true);
     run_configlink(rev, "test", NULL);
@@ -384,7 +505,7 @@ TEST(configlink_candidate_truncation_is_order_independent) {
 
     ASSERT_TRUE(fp_fwd != NULL);
     ASSERT_TRUE(fp_rev != NULL);
-    ASSERT_TRUE(fp_fwd[0] != '\0'); /* the cap must actually have been exercised */
+    ASSERT_EQ(fwd_edges, CL_DET_CANDIDATES);
     ASSERT_STR_EQ(fp_fwd, fp_rev);
 
     free(fp_fwd);
@@ -403,6 +524,11 @@ SUITE(configlink) {
     RUN_TEST(configlink_key_symbol_short_key_skipped);
     RUN_TEST(configlink_key_symbol_camel_case);
     RUN_TEST(configlink_key_symbol_no_false_positive);
+    RUN_TEST(configlink_key_symbol_infra_exact_only);
+    RUN_TEST(configlink_key_symbol_infra_scoped_to_component);
+    RUN_TEST(configlink_key_symbol_config_dir_component);
+    RUN_TEST(configlink_key_symbol_no_config_cap);
+    RUN_TEST(configlink_key_symbol_terraform_variable);
 
     /* Strategy 2: Dependency → Import */
     RUN_TEST(configlink_dep_import_package_json);

@@ -12,6 +12,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/hash_table.h"
+#include "foundation/arena.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
 
@@ -63,18 +64,17 @@ static bool is_dep_section(const char *s) {
 
 /* ── Strategy 1: Config Key → Code Symbol ───────────────────────── */
 
-/* Canonical candidate order (determinism). Both collectors below fill a
- * fixed-capacity array and stop at max_out; the label indexes they walk are
- * gbuf insertion order = parallel-extraction merge order, which varies run to
- * run. On a repo with more candidates than the cap, sorting by a pure content
- * key first is what keeps the surviving set — and therefore the emitted
- * CONFIGURES edges — a function of the inputs rather than of worker
- * scheduling. Tie-breaks stay content-only: node ids are handed out in merge
- * order, so an id tie-break belongs in no canonical comparator. */
+/* Canonical candidate order (determinism). The label indexes the collectors
+ * walk are gbuf insertion order = parallel-extraction merge order, which
+ * varies run to run. Sorting by a pure content key first keeps the candidate
+ * order -- and so the order edges are inserted in -- a function of the inputs
+ * rather than of worker scheduling. (The collectors once stopped at a cap,
+ * where this order also decided WHICH candidates survived; no cap cuts them
+ * now.) Tie-breaks stay content-only: node ids are handed out in merge order,
+ * so an id tie-break belongs in no canonical comparator. */
 enum {
-    CANON_CMP_LESS = -1,   /* qsort: left sorts before right */
-    CANON_CMP_GREATER = 1, /* qsort: left sorts after right */
-    CANON_CAP_BUF = 32     /* decimal rendering of a cap value */
+    CANON_CMP_LESS = -1,  /* qsort: left sorts before right */
+    CANON_CMP_GREATER = 1 /* qsort: left sorts after right */
 };
 
 static int cmp_node_ptr_canonical(const void *pa, const void *pb) {
@@ -100,14 +100,6 @@ static int cmp_node_ptr_canonical(const void *pa, const void *pb) {
     return strcmp(na, nb);
 }
 
-/* A filled-to-capacity collector dropped candidates; say so rather than
- * truncating silently. */
-static void log_candidate_truncation(const char *side, int cap) {
-    char cap_buf[CANON_CAP_BUF];
-    snprintf(cap_buf, sizeof(cap_buf), "%d", cap);
-    cbm_log_info("configlinker.truncated", "side", side, "cap", cap_buf);
-}
-
 /* Heap copy of `nodes` sorted by cmp_node_ptr_canonical. Returns NULL (and
  * leaves the caller on the unsorted borrowed array) only on allocation
  * failure, which degrades determinism but never correctness. */
@@ -124,21 +116,105 @@ static const cbm_gbuf_node_t **canonical_node_copy(const cbm_gbuf_node_t *const 
     return sorted;
 }
 
+/* Infrastructure files: YAML, JSON and HCL (Terraform, OpenTofu, tfvars). A
+ * key_symbol pair with either side in one links by exact name and only inside
+ * the config file's component (user decision 2026-10-10): in 17 infra
+ * repositories 4 of 40 sampled key_symbol edges were right, all of them exact
+ * and within one directory tree; the rest were substring and cross-component
+ * coincidences. Other config formats keep exact + substring matching. */
+static bool cl_is_infra_path(const char *path) {
+    static const char *const exts[] = {".yaml", ".yml",  ".json",   ".tf",
+                                       ".hcl",  ".tofu", ".tfvars", NULL};
+    const char *dot = path ? strrchr(path, '.') : NULL;
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    if (!dot || (slash && dot < slash)) {
+        return false;
+    }
+    for (int i = 0; exts[i]; i++) {
+        if (strcmp(dot, exts[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Length of the config file's component directory: its own directory, or the
+ * one around it when that is a conventional config folder; 0 = the repo root. */
+static size_t cl_component_len(const char *path) {
+    static const char *const config_dirs[] = {"config", "configs", "conf", "settings", "etc", NULL};
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    if (!slash) {
+        return 0;
+    }
+    size_t dir_len = (size_t)(slash - path);
+    const char *base = path;
+    for (const char *p = path; p < slash; p++) {
+        if (*p == '/') {
+            base = p + SKIP_ONE;
+        }
+    }
+    size_t base_len = (size_t)(slash - base);
+    for (int i = 0; config_dirs[i]; i++) {
+        if (base_len == strlen(config_dirs[i]) && strncmp(base, config_dirs[i], base_len) == 0) {
+            return base == path ? 0 : (size_t)(base - path) - SKIP_ONE;
+        }
+    }
+    return dir_len;
+}
+
 typedef struct {
     int64_t node_id;
-    char normalized[CBM_SZ_256];
-    char name[CBM_SZ_256];
-} config_entry_t;
+    const char *file_path; /* borrowed from the graph buffer for the pass */
+    const char *name;      /* borrowed */
+    char *normalized;      /* in the strategy's arena */
+    size_t len;
+    size_t component_len; /* config entries: cl_component_len(file_path) */
+    bool infra;
+} cl_entry_t;
+
+typedef struct {
+    cl_entry_t *items;
+    int count;
+    int cap;
+} cl_entries_t;
+
+static bool cl_entries_push(cl_entries_t *entries, const cbm_gbuf_node_t *node, const char *norm,
+                            CBMArena *arena) {
+    if (entries->count == entries->cap) {
+        int cap = entries->cap ? entries->cap * PAIR_LEN : CBM_SZ_1K;
+        cl_entry_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, entries->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        entries->items = grown;
+        entries->cap = cap;
+    }
+    char *normalized = cbm_arena_strdup(arena, norm);
+    if (!normalized) {
+        return false;
+    }
+    entries->items[entries->count++] = (cl_entry_t){
+        .node_id = node->id,
+        .file_path = node->file_path ? node->file_path : "",
+        .name = node->name ? node->name : "",
+        .normalized = normalized,
+        .len = strlen(normalized),
+        .component_len = cl_component_len(node->file_path),
+        .infra = cl_is_infra_path(node->file_path),
+    };
+    return true;
+}
 
 /* Collect config Variable nodes with ≥2 tokens, each ≥3 chars. */
-static int collect_config_entries(const cbm_gbuf_node_t *const *vars, int var_count,
-                                  config_entry_t *out, int max_out) {
-    int n = 0;
+static bool collect_config_entries(const cbm_gbuf_node_t *const *vars, int var_count,
+                                   cl_entries_t *out, CBMArena *arena) {
     const cbm_gbuf_node_t **sorted = canonical_node_copy(vars, var_count);
     if (sorted) {
         vars = sorted;
     }
-    for (int i = 0; i < var_count && n < max_out; i++) {
+    bool ok = true;
+    for (int i = 0; i < var_count && ok; i++) {
         if (!cbm_has_config_extension(vars[i]->file_path)) {
             continue;
         }
@@ -161,78 +237,168 @@ static int collect_config_entries(const cbm_gbuf_node_t *const *vars, int var_co
             }
             p = end ? end + SKIP_ONE : p + tlen;
         }
-        if (!all_long) {
-            continue;
+        if (all_long) {
+            ok = cl_entries_push(out, vars[i], norm, arena);
         }
-
-        out[n].node_id = vars[i]->id;
-        snprintf(out[n].normalized, sizeof(out[n].normalized), "%s", norm);
-        snprintf(out[n].name, sizeof(out[n].name), "%s", vars[i]->name);
-        n++;
-    }
-    if (n == max_out) {
-        log_candidate_truncation("config", max_out);
     }
     free((void *)sorted);
-    return n;
+    return ok;
+}
+
+static bool cl_is_hcl_path(const char *path) {
+    static const char *const exts[] = {".tf", ".hcl", ".tofu", ".tfvars", NULL};
+    const char *dot = path ? strrchr(path, '.') : NULL;
+    for (int i = 0; dot && exts[i]; i++) {
+        if (strcmp(dot, exts[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The name an HCL symbol matches a config key by. A config value sets a
+ * Terraform/OpenTofu `variable` block, whose Class is named `variable.<name>`:
+ * it matches by <name>. Outputs, modules, resources and a .tfvars file's own
+ * assignments are not what a config key sets; they take no part (NULL). */
+static const char *cl_hcl_variable_name(const cbm_gbuf_node_t *node) {
+    static const char prefix[] = "variable.";
+    if (!node->label || strcmp(node->label, "Class") != 0 || !node->name ||
+        strncmp(node->name, prefix, sizeof(prefix) - SKIP_ONE) != 0) {
+        return NULL;
+    }
+    return node->name + sizeof(prefix) - SKIP_ONE;
 }
 
 /* Collect code nodes (Function/Variable/Class/Struct) not from config files. */
-typedef struct {
-    int64_t node_id;
-    char normalized[CBM_SZ_256];
-} code_entry_t;
-
-static int collect_code_entries(cbm_gbuf_t *gb, code_entry_t *out, int max_out) {
-    int n = 0;
+static bool collect_code_entries(cbm_gbuf_t *gb, cl_entries_t *out, CBMArena *arena) {
     /* "Struct" alongside "Class": a config key may name a Go/Rust/Swift/D struct
      * type, which is now labelled "Struct" — keep it linkable. */
     static const char *labels[] = {"Function", "Variable", "Class", "Struct", NULL};
 
-    for (int li = 0; labels[li] && n < max_out; li++) {
+    bool ok = true;
+    for (int li = 0; labels[li] && ok; li++) {
         const cbm_gbuf_node_t **nodes = NULL;
         int count = 0;
         if (cbm_gbuf_find_by_label(gb, labels[li], &nodes, &count) != 0) {
             continue;
         }
 
-        /* Canonical order before the cap — see cmp_node_ptr_canonical. The cap
-         * spans the whole label list, so a later label can be cut mid-group;
-         * sorting per group keeps that cut a pure function of content. */
+        /* Canonical order -- see cmp_node_ptr_canonical. */
         const cbm_gbuf_node_t **sorted = canonical_node_copy(nodes, count);
         const cbm_gbuf_node_t *const *scan = sorted ? sorted : nodes;
 
-        for (int i = 0; i < count && n < max_out; i++) {
+        for (int i = 0; i < count && ok; i++) {
             if (cbm_has_config_extension(scan[i]->file_path)) {
                 continue;
             }
 
+            const char *match_name = scan[i]->name;
+            if (cl_is_hcl_path(scan[i]->file_path)) {
+                match_name = cl_hcl_variable_name(scan[i]);
+                if (!match_name) {
+                    continue;
+                }
+            }
+
             char norm[CBM_SZ_256];
-            int tokens = cbm_normalize_config_key(scan[i]->name, norm, sizeof(norm));
+            int tokens = cbm_normalize_config_key(match_name, norm, sizeof(norm));
             if (tokens == 0 || norm[0] == '\0') {
                 continue;
             }
-
-            out[n].node_id = scan[i]->id;
-            snprintf(out[n].normalized, sizeof(out[n].normalized), "%s", norm);
-            n++;
+            ok = cl_entries_push(out, scan[i], norm, arena);
         }
         /* gbuf data is borrowed — only the sorted copy is owned */
         free((void *)sorted);
     }
-    if (n == max_out) {
-        log_candidate_truncation("code", max_out);
-    }
-    return n;
+    return ok;
 }
 
-/* The key x symbol comparison of strategy 1, per config key: every pair's
- * verdict depends only on its two strings, so rows run in parallel and the
- * edges are inserted afterwards in the original (config, code) order. One
- * thread compared up to 4,096 x 8,192 pairs -- configlink's 0.93 s on the Go
- * corpus (profile, 2026-09-17). A pair whose lengths rule both verdicts out
- * skips the string calls: an exact match needs equal lengths, a substring one
- * no longer than the code key. */
+/* Code entries (indices, ascending) under one index key. */
+typedef struct {
+    int *items;
+    int count;
+    int cap;
+} cl_posting_t;
+
+static bool cl_posting_add(CBMHashTable *index, const char *key, int idx) {
+    cl_posting_t *posting = cbm_ht_get(index, key);
+    if (!posting) {
+        posting = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*posting));
+        if (!posting) {
+            return false;
+        }
+        cbm_ht_set(index, key, posting);
+    }
+    if (posting->count && posting->items[posting->count - 1] == idx) {
+        return true; /* the same trigram twice in one name */
+    }
+    if (posting->count == posting->cap) {
+        int cap = posting->cap ? posting->cap * PAIR_LEN : CBM_SZ_16;
+        int *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, posting->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        posting->items = grown;
+        posting->cap = cap;
+    }
+    posting->items[posting->count++] = idx;
+    return true;
+}
+
+static void cl_posting_free(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    cl_posting_t *posting = value;
+    cbm_free(CBM_MEM_CLASS_OTHER, posting->items);
+    cbm_free(CBM_MEM_CLASS_OTHER, posting);
+}
+
+enum { CL_TRIGRAM = 3 };
+
+/* Exact index: normalized name -> code entries. Trigram index: every
+ * 3-character run of a non-infra code entry's normalized name -> entries, so a
+ * key's substring candidates are the entries holding its rarest trigram
+ * instead of every code entry (cost follows the matches, no cap needed). */
+static bool cl_build_indexes(const cl_entries_t *code, CBMHashTable *exact, CBMHashTable *trigrams,
+                             CBMArena *arena) {
+    for (int k = 0; k < code->count; k++) {
+        const cl_entry_t *e = &code->items[k];
+        if (!cl_posting_add(exact, e->normalized, k)) {
+            return false;
+        }
+        if (e->infra) {
+            continue; /* infra symbols link by exact name only */
+        }
+        for (size_t i = 0; i + CL_TRIGRAM <= e->len; i++) {
+            char tri[CL_TRIGRAM + SKIP_ONE];
+            memcpy(tri, e->normalized + i, CL_TRIGRAM);
+            tri[CL_TRIGRAM] = '\0';
+            const char *key = cbm_ht_get_key(trigrams, tri);
+            if (!key) {
+                key = cbm_arena_strdup(arena, tri);
+                if (!key) {
+                    return false;
+                }
+            }
+            if (!cl_posting_add(trigrams, key, k)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* A config key's component holds the code file. */
+static bool cl_in_component(const cl_entry_t *config, const cl_entry_t *code) {
+    size_t n = config->component_len;
+    return n == 0 ||
+           (strncmp(code->file_path, config->file_path, n) == 0 && code->file_path[n] == '/');
+}
+
+/* The key x symbol matches of strategy 1, per config key: exact matches from
+ * the exact index, substring matches among the entries holding the key's
+ * rarest trigram. Rows run in parallel; each row's matches are in ascending
+ * code order, and the edges are inserted afterwards in (config, code) order. */
 typedef struct {
     int co;
     double confidence;
@@ -245,29 +411,78 @@ typedef struct {
 } key_match_list_t;
 
 typedef struct {
-    const config_entry_t *config;
-    const size_t *config_len;
-    int config_count;
-    const code_entry_t *code;
-    const size_t *code_len;
-    int code_count;
+    const cl_entries_t *config;
+    const cl_entries_t *code;
+    const CBMHashTable *exact;
+    const CBMHashTable *trigrams;
     key_match_list_t *lists;
     _Atomic int next;
     _Atomic bool failed;
 } key_match_job_t;
 
-static double key_pair_confidence(const char *config_norm, size_t config_len, const char *code_norm,
-                                  size_t code_len) {
-    if (config_len > code_len) {
-        return 0.0;
+static bool key_match_push(key_match_list_t *list, int co, double confidence) {
+    if (list->count == list->cap) {
+        int cap = list->cap ? list->cap * PAIR_LEN : CBM_SZ_16;
+        key_match_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, list->items, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return false;
+        }
+        list->items = grown;
+        list->cap = cap;
     }
-    if (config_len == code_len && memcmp(config_norm, code_norm, code_len) == 0) {
-        return CONF_KEY_EXACT; /* Exact match */
+    list->items[list->count].co = co;
+    list->items[list->count].confidence = confidence;
+    list->count++;
+    return true;
+}
+
+/* The trigram posting of `key` with the fewest entries; NULL when some
+ * trigram occurs in no entry (then no entry holds the key). */
+static const cl_posting_t *cl_rarest_trigram(const CBMHashTable *trigrams, const char *key,
+                                             size_t len) {
+    const cl_posting_t *rarest = NULL;
+    for (size_t i = 0; i + CL_TRIGRAM <= len; i++) {
+        char tri[CL_TRIGRAM + SKIP_ONE];
+        memcpy(tri, key + i, CL_TRIGRAM);
+        tri[CL_TRIGRAM] = '\0';
+        const cl_posting_t *posting = cbm_ht_get(trigrams, tri);
+        if (!posting) {
+            return NULL;
+        }
+        if (!rarest || posting->count < rarest->count) {
+            rarest = posting;
+        }
     }
-    if (strstr(code_norm, config_norm) != NULL) {
-        return CONF_KEY_SUBSTRING; /* Substring match */
+    return rarest;
+}
+
+static bool key_match_row(const key_match_job_t *job, int ci, key_match_list_t *list) {
+    const cl_entry_t *cfg = &job->config->items[ci];
+    const cl_posting_t *exact = cbm_ht_get(job->exact, cfg->normalized);
+    const cl_posting_t *subs =
+        cfg->infra ? NULL : cl_rarest_trigram(job->trigrams, cfg->normalized, cfg->len);
+    int ei = 0;
+    int si = 0;
+    int ecount = exact ? exact->count : 0;
+    int scount = subs ? subs->count : 0;
+    /* Merge both ascending candidate lists so the row stays in code order. */
+    while (ei < ecount || si < scount) {
+        bool take_exact = si >= scount || (ei < ecount && exact->items[ei] <= subs->items[si]);
+        int co = take_exact ? exact->items[ei++] : subs->items[si++];
+        const cl_entry_t *code = &job->code->items[co];
+        double confidence = 0.0;
+        if (take_exact) {
+            bool infra = cfg->infra || code->infra;
+            confidence = (!infra || cl_in_component(cfg, code)) ? CONF_KEY_EXACT : 0.0;
+        } else if (code->len > cfg->len && strstr(code->normalized, cfg->normalized)) {
+            confidence = CONF_KEY_SUBSTRING;
+        }
+        if (confidence > 0.0 && !key_match_push(list, co, confidence)) {
+            return false;
+        }
     }
-    return 0.0;
+    return true;
 }
 
 static void key_match_worker(int worker_id, void *arg) {
@@ -275,30 +490,12 @@ static void key_match_worker(int worker_id, void *arg) {
     key_match_job_t *job = (key_match_job_t *)arg;
     while (!atomic_load_explicit(&job->failed, memory_order_relaxed)) {
         int ci = atomic_fetch_add_explicit(&job->next, SKIP_ONE, memory_order_relaxed);
-        if (ci >= job->config_count) {
+        if (ci >= job->config->count) {
             break;
         }
-        key_match_list_t *list = &job->lists[ci];
-        for (int co = 0; co < job->code_count; co++) {
-            double confidence = key_pair_confidence(job->config[ci].normalized, job->config_len[ci],
-                                                    job->code[co].normalized, job->code_len[co]);
-            if (confidence <= 0.0) {
-                continue;
-            }
-            if (list->count == list->cap) {
-                int cap = list->cap ? list->cap * PAIR_LEN : CBM_SZ_16;
-                key_match_t *grown =
-                    cbm_realloc(CBM_MEM_CLASS_OTHER, list->items, (size_t)cap * sizeof(*grown));
-                if (!grown) {
-                    atomic_store_explicit(&job->failed, true, memory_order_relaxed);
-                    return;
-                }
-                list->items = grown;
-                list->cap = cap;
-            }
-            list->items[list->count].co = co;
-            list->items[list->count].confidence = confidence;
-            list->count++;
+        if (!key_match_row(job, ci, &job->lists[ci])) {
+            atomic_store_explicit(&job->failed, true, memory_order_relaxed);
+            return;
         }
     }
 }
@@ -311,38 +508,30 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
         return 0;
     }
 
-    config_entry_t config_entries[CBM_SZ_4K];
-    int config_count = collect_config_entries(vars, var_count, config_entries, CBM_SZ_4K);
-
-    if (config_count == 0) {
-        return 0;
-    }
-
-    code_entry_t code_entries[CBM_SZ_8K];
-    int code_count = collect_code_entries(gb, code_entries, CBM_SZ_8K);
-
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cl_entries_t config = {0};
+    cl_entries_t code = {0};
+    CBMHashTable *exact = NULL;
+    CBMHashTable *trigrams = NULL;
+    key_match_list_t *lists = NULL;
     int edge_count = 0;
 
-    size_t *config_len = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)config_count * sizeof(size_t));
-    size_t *code_len =
-        cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)(code_count > 0 ? code_count : 1) * sizeof(size_t));
-    key_match_list_t *lists =
-        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)config_count * sizeof(key_match_list_t));
-    bool parallel_ok = config_len && code_len && lists;
-    if (parallel_ok) {
-        for (int ci = 0; ci < config_count; ci++) {
-            config_len[ci] = strlen(config_entries[ci].normalized);
-        }
-        for (int co = 0; co < code_count; co++) {
-            code_len[co] = strlen(code_entries[co].normalized);
-        }
+    bool ok = collect_config_entries(vars, var_count, &config, &arena);
+    if (ok && config.count > 0) {
+        ok = collect_code_entries(gb, &code, &arena);
+        exact = ok ? cbm_ht_create(0) : NULL;
+        trigrams = exact ? cbm_ht_create(0) : NULL;
+        ok = trigrams && cl_build_indexes(&code, exact, trigrams, &arena);
+        lists = ok ? cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)config.count * sizeof(*lists)) : NULL;
+        ok = lists != NULL;
+    }
+    if (ok && lists) {
         key_match_job_t job = {
-            .config = config_entries,
-            .config_len = config_len,
-            .config_count = config_count,
-            .code = code_entries,
-            .code_len = code_len,
-            .code_count = code_count,
+            .config = &config,
+            .code = &code,
+            .exact = exact,
+            .trigrams = trigrams,
             .lists = lists,
         };
         atomic_init(&job.next, 0);
@@ -351,59 +540,44 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
         cbm_parallel_for(
             workers, key_match_worker, &job,
             (cbm_parallel_for_opts_t){.max_workers = workers, .force_pthreads = false});
-        parallel_ok = !atomic_load_explicit(&job.failed, memory_order_relaxed);
+        ok = !atomic_load_explicit(&job.failed, memory_order_relaxed);
     }
-    if (parallel_ok) {
-        for (int ci = 0; ci < config_count; ci++) {
+    if (ok && lists) {
+        for (int ci = 0; ci < config.count; ci++) {
             for (int m = 0; m < lists[ci].count; m++) {
                 const key_match_t *km = &lists[ci].items[m];
                 char props[CBM_SZ_512];
                 snprintf(props, sizeof(props),
                          "{\"strategy\":\"key_symbol\",\"confidence\":%.2f,\"config_key\":\"%s\"}",
-                         km->confidence, config_entries[ci].name);
-
-                cbm_gbuf_insert_edge(gb, code_entries[km->co].node_id, config_entries[ci].node_id,
+                         km->confidence, config.items[ci].name);
+                cbm_gbuf_insert_edge(gb, code.items[km->co].node_id, config.items[ci].node_id,
                                      "CONFIGURES", props);
                 edge_count++;
             }
         }
+    } else if (!ok) {
+        char cfg_buf[CBM_SZ_16];
+        char code_buf[CBM_SZ_16];
+        snprintf(cfg_buf, sizeof(cfg_buf), "%d", config.count);
+        snprintf(code_buf, sizeof(code_buf), "%d", code.count);
+        cbm_log_warn("configlinker.key_symbol.oom", "config", cfg_buf, "code", code_buf);
     }
-    for (int ci = 0; lists && ci < config_count; ci++) {
+
+    for (int ci = 0; lists && ci < config.count; ci++) {
         cbm_free(CBM_MEM_CLASS_OTHER, lists[ci].items);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, lists);
-    cbm_free(CBM_MEM_CLASS_OTHER, config_len);
-    cbm_free(CBM_MEM_CLASS_OTHER, code_len);
-    if (parallel_ok) {
-        return edge_count;
+    if (exact) {
+        cbm_ht_foreach(exact, cl_posting_free, NULL);
+        cbm_ht_free(exact);
     }
-
-    /* Allocation failed: the one-thread comparison, as before. */
-    for (int ci = 0; ci < config_count; ci++) {
-        for (int co = 0; co < code_count; co++) {
-            double confidence = 0.0;
-
-            if (strcmp(config_entries[ci].normalized, code_entries[co].normalized) == 0) {
-                /* Exact match */
-                confidence = CONF_KEY_EXACT;
-            } else if (strstr(code_entries[co].normalized, config_entries[ci].normalized) != NULL) {
-                /* Substring match */
-                confidence = CONF_KEY_SUBSTRING;
-            }
-
-            if (confidence > 0.0) {
-                char props[CBM_SZ_512];
-                snprintf(props, sizeof(props),
-                         "{\"strategy\":\"key_symbol\",\"confidence\":%.2f,\"config_key\":\"%s\"}",
-                         confidence, config_entries[ci].name);
-
-                cbm_gbuf_insert_edge(gb, code_entries[co].node_id, config_entries[ci].node_id,
-                                     "CONFIGURES", props);
-                edge_count++;
-            }
-        }
+    if (trigrams) {
+        cbm_ht_foreach(trigrams, cl_posting_free, NULL);
+        cbm_ht_free(trigrams);
     }
-
+    cbm_free(CBM_MEM_CLASS_OTHER, config.items);
+    cbm_free(CBM_MEM_CLASS_OTHER, code.items);
+    cbm_arena_destroy(&arena);
     return edge_count;
 }
 

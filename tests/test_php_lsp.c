@@ -5310,7 +5310,339 @@ TEST(phplsp_ordinary_same_leaf_calls_join_by_exact_site) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* Typed import evidence is separate from the legacy flattened import map.
+ * All negative checks below first require a real extracted invocation site. */
+#define PHP_VENDOR_REQ "p.lib.Request.Request"
+#define PHP_PROJECT_SVC "p.lib.Svc.Svc"
+#define PHP_TEST_CLASS(q, n, m, l) \
+    {.qualified_name = q, .short_name = n, .label = l, .def_module_qn = m, .lang = CBM_LANG_PHP}
+#define PHP_TEST_METHOD(q, n, r, m) \
+    {.qualified_name = q,           \
+     .short_name = n,               \
+     .label = "Method",             \
+     .receiver_type = r,            \
+     .def_module_qn = m,            \
+     .lang = CBM_LANG_PHP}
+static CBMLSPDef php_vendor_test_defs[] = {
+    PHP_TEST_CLASS(PHP_VENDOR_REQ, "Request", "p.lib.Request", "Class"),
+    PHP_TEST_METHOD(PHP_VENDOR_REQ ".validated", "validated", PHP_VENDOR_REQ, "p.lib.Request"),
+    PHP_TEST_METHOD(PHP_VENDOR_REQ ".makeIt", "makeIt", PHP_VENDOR_REQ, "p.lib.Request"),
+    PHP_TEST_CLASS(PHP_PROJECT_SVC, "Svc", "p.lib.Svc", "Class"),
+    PHP_TEST_METHOD(PHP_PROJECT_SVC ".go", "go", PHP_PROJECT_SVC, "p.lib.Svc"),
+    PHP_TEST_CLASS("p.main.Holder", "Holder", "p.main", "Class"),
+    PHP_TEST_METHOD("p.main.Holder.declaredRequest", "declaredRequest", "p.main.Holder", "p.main"),
+    PHP_TEST_METHOD("p.main.Holder.documentedRequest", "documentedRequest", "p.main.Holder",
+                    "p.main"),
+    PHP_TEST_CLASS("p.lib.Behavior.Behavior", "Behavior", "p.lib.Behavior", "Trait"),
+    PHP_TEST_METHOD("p.lib.Behavior.Behavior.traitTap", "traitTap", "p.lib.Behavior.Behavior",
+                    "p.lib.Behavior"),
+    PHP_TEST_CLASS("p.lib.Helpers.render", "render", "p.lib.Helpers", "Function"),
+};
+#undef PHP_TEST_CLASS
+#undef PHP_TEST_METHOD
+
+static const CBMCall *php_vendor_site(const CBMFileResult *r, const char *caller,
+                                      const char *leaf) {
+    const CBMCall *found = NULL;
+    for (int i = 0; r && i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->enclosing_func_qn && strstr(c->enclosing_func_qn, caller) && c->callee_name &&
+            strcmp(cbm_pipeline_call_callee_leaf(c->callee_name), leaf) == 0 &&
+            c->site_end_byte > c->site_start_byte) {
+            if (found)
+                return NULL;
+            found = c;
+        }
+    }
+    return found;
+}
+
+static const CBMResolvedCall *php_vendor_row(const CBMResolvedCallArray *out, const CBMCall *site,
+                                             const char *callee) {
+    const CBMResolvedCall *found = NULL;
+    for (int i = 0; site && i < out->count; i++) {
+        const CBMResolvedCall *row = &out->items[i];
+        if (row->kind == CBM_RESOLVED_INVOCATION && row->caller_qn && row->callee_qn &&
+            strcmp(row->caller_qn, site->enclosing_func_qn) == 0 &&
+            row->site_start_byte == site->site_start_byte &&
+            row->site_end_byte == site->site_end_byte && strcmp(row->callee_qn, callee) == 0) {
+            found = row;
+        }
+    }
+    return found;
+}
+
+static int php_vendor_project_request_rows(const CBMResolvedCallArray *out) {
+    int count = 0;
+    for (int i = 0; i < out->count; i++) {
+        const char *qn = out->items[i].callee_qn;
+        count += qn && strncmp(qn, PHP_VENDOR_REQ ".", strlen(PHP_VENDOR_REQ) + 1) == 0;
+    }
+    return count;
+}
+
+static void php_vendor_cross(CBMArena *arena, const char *src, CBMResolvedCallArray *out,
+                             const CBMPHPImportBindings *bindings) {
+    const char *names[] = {"Svc"};
+    const char *qns[] = {PHP_PROJECT_SVC};
+    cbm_run_php_lsp_cross_with_bindings(
+        arena, src, (int)strlen(src), "p.main", php_vendor_test_defs,
+        (int)(sizeof(php_vendor_test_defs) / sizeof(php_vendor_test_defs[0])), names, qns, 1, NULL,
+        out, bindings);
+}
+
+TEST(phplsp_vendor_complete_empty_is_distinct_from_unknown) {
+    const char *src = "<?php\nnamespace App;\nuse Vendor\\Http\\Request;\n"
+                      "class Holder { function run(Request $r) { $r->validated(); } }\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 1);
+    const CBMCall *site = php_vendor_site(r, "Holder.run", "validated");
+    ASSERT_NOT_NULL(site);
+    const char *targets[] = {NULL};
+    CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    php_vendor_cross(&arena, src, &out, &bindings);
+    const CBMResolvedCall *external = php_vendor_row(&out, site, "Vendor.Http.Request.validated");
+    ASSERT_NOT_NULL(external);
+    ASSERT_STR_EQ(external->strategy, "php_external_receiver");
+    ASSERT_TRUE(external->confidence >= CBM_LSP_CONFIDENCE_FLOOR);
+    ASSERT_EQ(php_vendor_project_request_rows(&out), 0);
+    cbm_arena_destroy(&arena);
+
+    /* Missing/legacy typed evidence must not manufacture an external marker.
+     * Retaining this old fallback is a bounded compatibility rule, not proof
+     * that the old guessed target describes the vendor class. */
+    for (int mode = 0; mode < 3; mode++) {
+        cbm_arena_init(&arena);
+        memset(&out, 0, sizeof(out));
+        bindings.targets = NULL;
+        if (mode == 2) {
+            cbm_run_php_lsp_cross(
+                &arena, src, (int)strlen(src), "p.main", php_vendor_test_defs,
+                (int)(sizeof(php_vendor_test_defs) / sizeof(php_vendor_test_defs[0])), NULL, NULL,
+                0, NULL, &out);
+        } else {
+            php_vendor_cross(&arena, src, &out, mode == 0 ? NULL : &bindings);
+        }
+        ASSERT_NOT_NULL(php_vendor_row(&out, site, PHP_VENDOR_REQ ".validated"));
+        ASSERT_NULL(php_vendor_row(&out, site, "Vendor.Http.Request.validated"));
+        cbm_arena_destroy(&arena);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(phplsp_vendor_kinds_do_not_erase_external_class_evidence) {
+    const char *src =
+        "<?php\nnamespace App;\n"
+        "use Vendor\\Http\\{Request as Same};\n"
+        "use Lib\\Helpers\\{function render as Same, const VALUE as Same};\n"
+        "use App\\Services\\Svc;\n"
+        "class Holder { function run(Same $r, Svc $s) { $r->validated(); $s->go(); } }\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 4);
+    const char *targets[4] = {0};
+    int classes = 0, functions = 0, constants = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (strcmp(imp->local_name, "Same") == 0) {
+            classes += imp->kind == CBM_IMPORT_KIND_DEFAULT;
+            functions += imp->kind == CBM_IMPORT_KIND_FUNCTION;
+            constants += imp->kind == CBM_IMPORT_KIND_CONST;
+            if (imp->kind != CBM_IMPORT_KIND_DEFAULT)
+                targets[i] = "p.lib.Helpers.__file__";
+        } else {
+            ASSERT_STR_EQ(imp->local_name, "Svc");
+            targets[i] = "p.lib.Svc.__file__";
+        }
+    }
+    ASSERT_EQ(classes, 1);
+    ASSERT_EQ(functions, 1);
+    ASSERT_EQ(constants, 1);
+    const CBMCall *vendor_site = php_vendor_site(r, "Holder.run", "validated");
+    const CBMCall *project_site = php_vendor_site(r, "Holder.run", "go");
+    ASSERT_NOT_NULL(vendor_site);
+    ASSERT_NOT_NULL(project_site);
+    CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    php_vendor_cross(&arena, src, &out, &bindings);
+    const CBMResolvedCall *vendor =
+        php_vendor_row(&out, vendor_site, "Vendor.Http.Request.validated");
+    ASSERT_NOT_NULL(vendor);
+    ASSERT_STR_EQ(vendor->strategy, "php_external_receiver");
+    ASSERT_NOT_NULL(php_vendor_row(&out, project_site, PHP_PROJECT_SVC ".go"));
+    ASSERT_EQ(php_vendor_project_request_rows(&out), 0);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(phplsp_vendor_classification_precedes_field_and_return_refinement) {
+    const char *src = "<?php\nnamespace App;\nuse Vendor\\Http\\Request;\nuse App\\Services\\Svc;\n"
+                      "/** @property Request $documented */\n"
+                      "class Holder {\n"
+                      " public Request $typed;\n"
+                      " function __construct(public Request $promoted) {}\n"
+                      " function declaredRequest(): Request { return $this->typed; }\n"
+                      " /** @return Request */\n"
+                      " function documentedRequest() { return $this->typed; }\n"
+                      " function field() { return $this->typed->validated(); }\n"
+                      " function promotion() { return $this->promoted->validated(); }\n"
+                      " function declared() { return $this->declaredRequest()->validated(); }\n"
+                      " function docReturn() { return $this->documentedRequest()->validated(); }\n"
+                      " function docProperty() { return $this->documented->validated(); }\n"
+                      " function control(Svc $s) { return $s->go(); }\n}\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 2);
+    const char *targets[2] = {0};
+    for (int i = 0; i < r->imports.count; i++)
+        if (strcmp(r->imports.items[i].local_name, "Svc") == 0)
+            targets[i] = "p.lib.Svc.__file__";
+    CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    php_vendor_cross(&arena, src, &out, &bindings);
+    const char *callers[] = {"Holder.field", "Holder.promotion", "Holder.declared",
+                             "Holder.docReturn", "Holder.docProperty"};
+    for (size_t i = 0; i < sizeof(callers) / sizeof(callers[0]); i++) {
+        const CBMCall *site = php_vendor_site(r, callers[i], "validated");
+        ASSERT_NOT_NULL(site);
+        const CBMResolvedCall *row = php_vendor_row(&out, site, "Vendor.Http.Request.validated");
+        ASSERT_NOT_NULL(row);
+        ASSERT_STR_EQ(row->strategy, "php_external_receiver");
+        ASSERT_TRUE(row->confidence >= CBM_LSP_CONFIDENCE_FLOOR);
+    }
+    const CBMCall *control = php_vendor_site(r, "Holder.control", "go");
+    ASSERT_NOT_NULL(control);
+    ASSERT_NOT_NULL(php_vendor_row(&out, control, PHP_PROJECT_SVC ".go"));
+    ASSERT_EQ(php_vendor_project_request_rows(&out), 0);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(phplsp_vendor_trait_does_not_copy_project_trait_methods) {
+    const char *src = "<?php\nnamespace App;\nuse Vendor\\Behavior;\nuse App\\Services\\Svc;\n"
+                      "class Holder { use Behavior;\n"
+                      " function run(Svc $s) { $this->traitTap(); $s->go(); } }\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 2);
+    const CBMCall *site = php_vendor_site(r, "Holder.run", "traitTap");
+    const CBMCall *control = php_vendor_site(r, "Holder.run", "go");
+    ASSERT_NOT_NULL(site);
+    ASSERT_NOT_NULL(control);
+    const char *targets[2] = {0};
+    for (int i = 0; i < r->imports.count; i++)
+        if (strcmp(r->imports.items[i].local_name, "Svc") == 0)
+            targets[i] = "p.lib.Svc.__file__";
+    CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    php_vendor_cross(&arena, src, &out, &bindings);
+    ASSERT_NULL(php_vendor_row(&out, site, "p.lib.Behavior.Behavior.traitTap"));
+    const CBMResolvedCall *copied = php_vendor_row(&out, site, "p.main.Holder.traitTap");
+    ASSERT_TRUE(!copied || !copied->strategy || strcmp(copied->strategy, "php_method_typed") != 0);
+    ASSERT_NOT_NULL(php_vendor_row(&out, control, PHP_PROJECT_SVC ".go"));
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(phplsp_vendor_function_and_const_do_not_veto_project_class_alias) {
+    const char *src =
+        "<?php\nnamespace App;\nuse App\\Project\\Request as Same;\n"
+        "use Vendor\\Helpers\\{function render as Same, const VALUE as Same};\n"
+        "class Holder { function run(Same $r) { $r->validated(); Same::makeIt(); } }\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 3);
+    const char *targets[3] = {0};
+    int class_bindings = 0, other_bindings = 0;
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT_STR_EQ(r->imports.items[i].local_name, "Same");
+        if (r->imports.items[i].kind == CBM_IMPORT_KIND_DEFAULT) {
+            targets[i] = "p.lib.Request.__file__";
+            class_bindings++;
+        } else {
+            other_bindings++;
+        }
+    }
+    ASSERT_EQ(class_bindings, 1);
+    ASSERT_EQ(other_bindings, 2);
+    CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    php_vendor_cross(&arena, src, &out, &bindings);
+    const char *methods[] = {"validated", "makeIt"};
+    const char *qns[] = {PHP_VENDOR_REQ ".validated", PHP_VENDOR_REQ ".makeIt"};
+    for (int i = 0; i < 2; i++) {
+        const CBMCall *site = php_vendor_site(r, "Holder.run", methods[i]);
+        ASSERT_NOT_NULL(site);
+        const CBMResolvedCall *row = php_vendor_row(&out, site, qns[i]);
+        ASSERT_NOT_NULL(row);
+        ASSERT_TRUE(row->strategy && strcmp(row->strategy, "php_external_receiver") != 0);
+        ASSERT_TRUE(row->confidence >= CBM_LSP_CONFIDENCE_FLOOR);
+    }
+    ASSERT_EQ(php_vendor_project_request_rows(&out), 2);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(phplsp_project_function_binding_keeps_its_exact_target) {
+    const char *src = "<?php\nnamespace App;\nuse function Lib\\Helpers\\render as fmt;\n"
+                      "class Holder { function run() { fmt(); } }\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_PHP, "p", "main.php", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT_EQ(r->imports.items[0].kind, CBM_IMPORT_KIND_FUNCTION);
+    const CBMCall *site = php_vendor_site(r, "Holder.run", "fmt");
+    ASSERT_NOT_NULL(site);
+    const char *targets[] = {"p.lib.Helpers.__file__"};
+    CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+    const char *keys[] = {"fmt"};
+    const char *vals[] = {"p.lib.Helpers.render"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_php_lsp_cross_with_bindings(
+        &arena, src, (int)strlen(src), "p.main", php_vendor_test_defs,
+        (int)(sizeof(php_vendor_test_defs) / sizeof(php_vendor_test_defs[0])), keys, vals, 1, NULL,
+        &out, &bindings);
+    const CBMResolvedCall *row = php_vendor_row(&out, site, "p.lib.Helpers.render");
+    ASSERT_NOT_NULL(row);
+    ASSERT_TRUE(row->confidence >= CBM_LSP_CONFIDENCE_FLOOR);
+    ASSERT_TRUE(row->strategy && strcmp(row->strategy, "php_external_receiver") != 0);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(php_lsp) {
+    RUN_TEST(phplsp_project_function_binding_keeps_its_exact_target);
+    RUN_TEST(phplsp_vendor_function_and_const_do_not_veto_project_class_alias);
+    RUN_TEST(phplsp_vendor_complete_empty_is_distinct_from_unknown);
+    RUN_TEST(phplsp_vendor_kinds_do_not_erase_external_class_evidence);
+    RUN_TEST(phplsp_vendor_classification_precedes_field_and_return_refinement);
+    RUN_TEST(phplsp_vendor_trait_does_not_copy_project_trait_methods);
+
     /* Phase 1 baseline regressions */
     RUN_TEST(phplsp_local_method_via_new_assignment);
     RUN_TEST(phplsp_local_method_via_typed_param);

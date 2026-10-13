@@ -3,9 +3,8 @@
 
 Usage: license-gate-check-npm.py <graph-ui-dir> <license-policy.json>
 
-Walks the production tree (the packages whose code is compiled into the UI
-bundle; platform-restricted native build tooling is excluded the same way
-gen-ui-licenses.py excludes it) and fails if ANY package's license is not
+Conservatively walks the production tree (including prebundled dependencies;
+exclusions are shared with gen-ui-licenses.py) and fails if ANY package's license is not
 on the policy allow-list. Packages with no declared license fall back to
 the first line of their shipped license file; if that cannot be resolved
 either, the gate fails — unknown is not allowed.
@@ -15,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+from ui_browser_licenses import verified_browser_exclusions
 
 FILE_HEADER_MAP = {
     "mit license": "MIT",
@@ -81,8 +81,17 @@ def main():
               "is node_modules installed?")
         sys.exit(1)
 
+    try:
+        browser_excluded = verified_browser_exclusions(ui_dir, pkgs)
+    except ValueError as exc:
+        print(f"BLOCKED: cannot verify browser-only package exclusion: {exc}")
+        sys.exit(1)
+
     violations = []
     for (name, version), (lic, pkg_dir) in sorted(pkgs.items()):
+        if (name, version) in browser_excluded:
+            print(f"Not shipped (verified app + worker build): {name}@{version}")
+            continue
         if name in ignored_pkgs:
             continue
         if not lic:
@@ -102,7 +111,7 @@ def main():
         for pkg, lic in violations[:25]:
             print(f"  {pkg}: {lic}")
         sys.exit(1)
-    print(f"OK: {len(pkgs)} bundled npm packages, all allow-listed")
+    print(f"OK: {len(pkgs) - len(browser_excluded)} npm packages covered, all allow-listed")
 
 
 if __name__ == "__main__":

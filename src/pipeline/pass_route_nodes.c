@@ -38,95 +38,6 @@ enum {
 #include <stdio.h>
 #include <string.h>
 
-/* True for characters that may appear in a ":name" route parameter. */
-static inline bool is_route_ident_char(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
-}
-
-/* Canonicalize route-path parameter placeholders to a single "{}" token so that
- * client call sites and server handlers rendezvous on the same Route QN
- * regardless of framework syntax. Each parameter token collapses to "{}":
- *
- *   :name    Express / React-Router / Rails / typical JS API clients
- *   {name}   Axum / Spring / OpenAPI / ASP.NET
- *   <name>   Flask / Rocket (incl. typed "<int:id>")
- *   ${...}   JS template interpolation captured into the path
- *
- * Parameter names are intentionally discarded so the same logical endpoint
- * matches across services that name the path variable differently. Static path
- * text is copied verbatim; the result never exceeds the input length. */
-const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz) {
-    if (out == NULL || out_sz == 0) {
-        /* WHY: cppcheck value-flow follows a caller that passes an as-yet
-         * uninitialized output buffer (e.g. `char cpath[256];`) and flags this
-         * `return out` as uninitvar. False positive: we only return the pointer
-         * here and never read the buffer; returning it (NULL, or a buffer too
-         * small to write into) is the intended early-out contract. */
-        // cppcheck-suppress uninitvar
-        return out;
-    }
-    if (in == NULL) {
-        out[0] = '\0';
-        return out;
-    }
-    const size_t last = out_sz - 1;
-    size_t oi = 0;
-    size_t i = 0;
-    while (in[i] != '\0' && oi < last) {
-        char c = in[i];
-        bool at_seg_start = (oi == 0) || (out[oi - 1] == '/');
-        bool is_param = false;
-
-        if (c == ':' && at_seg_start && is_route_ident_char(in[i + 1])) {
-            i++;
-            while (in[i] != '\0' && is_route_ident_char(in[i])) {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '{') {
-            i++;
-            while (in[i] != '\0' && in[i] != '}' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '}') {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '<') {
-            i++;
-            while (in[i] != '\0' && in[i] != '>' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '>') {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '$' && in[i + 1] == '{') {
-            i += 2;
-            while (in[i] != '\0' && in[i] != '}' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '}') {
-                i++;
-            }
-            is_param = true;
-        }
-
-        if (is_param) {
-            if (oi + 2 > last) {
-                break;
-            }
-            out[oi++] = '{';
-            out[oi++] = '}';
-            continue;
-        }
-        out[oi++] = c;
-        i++;
-    }
-    out[oi] = '\0';
-    return out;
-}
-
 /* Extract a JSON string value by key from properties.
  * Returns pointer into buf (caller provides buffer). NULL if not found. */
 static const char *json_extract(const char *json, const char *key, char *buf, int bufsz) {
@@ -236,6 +147,44 @@ static const char *url_path(const char *url) {
     return path ? path : "/";
 }
 
+/* Route path `needle` inside URL path `hay`, ending where a segment does:
+ * `/items` is in `/api/items` and `/items/42`; `/a` is not in `/acidjunk`
+ * (fastapi: a `/a` prefix route matched every github.com/a... URL). */
+static bool path_has_route(const char *hay, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0) {
+        return false;
+    }
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + SKIP_ONE, needle)) {
+        char c = p[n];
+        bool start = needle[0] == '/' || p == hay || p[-SKIP_ONE] == '/';
+        bool end = needle[n - SKIP_ONE] == '/' || c == '\0' || c == '/' || c == '?' || c == '#';
+        if (start && end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A route prefix's segments (`items`, `api/v1`) as whole segments of a file
+ * path: `app/routers/items.py`, `items/views.py`; `a` is not in
+ * `docs_src/app_testing/main.py`. */
+static bool file_has_segments(const char *path, const char *segs) {
+    size_t n = strlen(segs);
+    if (n == 0) {
+        return false;
+    }
+    for (const char *p = strstr(path, segs); p; p = strstr(p + SKIP_ONE, segs)) {
+        char c = p[n];
+        bool start = p == path || p[-SKIP_ONE] == '/';
+        bool end = segs[n - SKIP_ONE] == '/' || c == '\0' || c == '/' || c == '.';
+        if (start && end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Check if a trailing dash-segment is a hash/project-number (strippable).
  * Returns true if the segment is short alphanumeric but not a meaningful word. */
 static bool is_hash_segment(const char *seg, size_t slen) {
@@ -308,7 +257,7 @@ static bool is_broker_route(const char *qn) {
     static const char *const prefixes[] = {
         "__route__infra__", "__route__pubsub__",          "__route__cloud_tasks__",
         "__route__async__", "__route__cloud_scheduler__", "__route__kafka__",
-        "__route__sqs__"};
+        "__route__sqs__",   "__route__ingress__"};
     if (!qn) {
         return false;
     }
@@ -373,9 +322,12 @@ static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
         }
 
         int path_match =
-            (strlen(handler_path) > SKIP_ONE && (strstr(infra_path, handler_path) != NULL ||
-                                                 strstr(handler_path, infra_path) != NULL));
-        int root_svc_match = (strcmp(handler_path, "/") == 0);
+            (strlen(handler_path) > SKIP_ONE && path_has_route(infra_path, handler_path)) ||
+            (strlen(infra_path) > SKIP_ONE && path_has_route(handler_path, infra_path));
+        /* a root route stands for a URL's service only when its file is that
+         * service's; any prefix or ANY route at `/` matched every URL (a docs
+         * site's chat link took the root handlers) */
+        int root_svc_match = file_matches && strcmp(handler_path, "/") == 0;
         if (path_match || root_svc_match) {
             if (infra_candidate_is_better(handler_route, best)) {
                 best = handler_route;
@@ -564,7 +516,7 @@ static int bridge_funcs_to_prefix(cbm_gbuf_t *gb, const cbm_gbuf_node_t *prefix_
         if (!func->properties_json || !strstr(func->properties_json, "\"route_path\"")) {
             continue;
         }
-        if (prefix_segs && prefix_segs[0] && !strstr(func->file_path, prefix_segs)) {
+        if (prefix_segs && prefix_segs[0] && !file_has_segments(func->file_path, prefix_segs)) {
             continue;
         }
         cbm_gbuf_insert_edge(gb, func->id, prefix_route->id, "HANDLES",
@@ -592,29 +544,37 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
             continue;
         }
 
-        const cbm_gbuf_edge_t **calls_in = NULL;
-        int calls_count = 0;
-        cbm_gbuf_find_edges_by_target_type(gb, prefix_route->id, "CALLS", &calls_in, &calls_count);
-        if (calls_count == 0) {
-            continue;
-        }
-
-        const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[0]->source_id);
-        if (!registrar || !registrar->file_path) {
-            continue;
-        }
-        const char *last_slash = strrchr(registrar->file_path, '/');
-        if (!last_slash) {
-            continue;
-        }
-        int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
-
         const char *prefix_path = prefix_route->name;
         const char *prefix_segs =
             (prefix_path && prefix_path[0] == '/') ? prefix_path + SKIP_ONE : prefix_path;
+        /* A root mount (`app.mount("/", ...)`) names no part of a handler's
+         * path, so nothing tells its handlers from the rest of the directory:
+         * bridging it linked every decorated function there (fastapi: 702
+         * handlers to `/`, then to every infra URL through it). */
+        if (!prefix_segs || !prefix_segs[0]) {
+            continue;
+        }
 
-        connected +=
-            bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len, prefix_segs);
+        const cbm_gbuf_edge_t **calls_in = NULL;
+        int calls_count = 0;
+        cbm_gbuf_find_edges_by_target_type(gb, prefix_route->id, "CALLS", &calls_in, &calls_count);
+
+        /* Every registrar's directory, not the first CALLS edge's: their
+         * order is the workers' merge order, so the first one moved between
+         * runs of the same corpus. Edges dedup, so the union is order-free. */
+        for (int ci = 0; ci < calls_count; ci++) {
+            const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[ci]->source_id);
+            if (!registrar || !registrar->file_path) {
+                continue;
+            }
+            const char *last_slash = strrchr(registrar->file_path, '/');
+            if (!last_slash) {
+                continue;
+            }
+            int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
+            connected += bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len,
+                                                prefix_segs);
+        }
     }
 
     if (connected > 0) {

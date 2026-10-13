@@ -100,8 +100,15 @@ int cbm_gbuf_node_count(const cbm_gbuf_t *gb);
 /* Get the next ID that would be assigned. Used to initialize shared atomic counters. */
 int64_t cbm_gbuf_next_id(const cbm_gbuf_t *gb);
 
-/* Set the next ID counter. Used after merging worker gbufs to sync the main counter. */
+/* Set the next ID counter. Pins it: the delta preseed sets it to the DB's next id. */
 void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id);
+
+/* Raise the next ID counter to at least next_id; never lowers it, so no id
+ * already handed out comes back. Used to sync after merging worker gbufs. */
+void cbm_gbuf_raise_next_id(cbm_gbuf_t *gb, int64_t next_id);
+
+/* Number of edges whose id an earlier edge already carries (0 = ids unique). */
+int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb);
 
 /* Delete all nodes with a label. Cascade-deletes referencing edges. */
 int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
@@ -109,6 +116,13 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
 /* Delete all nodes for a given file path. Cascade-deletes referencing edges.
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
+
+/* Delete every `label` node that no edge of `edge_types` (NULL-terminated)
+ * touches, as source or target (with any edges it still has); returns how
+ * many. For nodes that exist only through such edges and carry no file
+ * (Process, Image): incremental indexing drops them when their last referrer
+ * is gone, as a full index never makes them. */
+int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *const *edge_types);
 
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
@@ -152,6 +166,13 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type);
 /* Delete all edges of a type. */
 int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
 
+/* Delete the edges of `type` whose source node has label `label`. */
+int cbm_gbuf_delete_edges_from_label(cbm_gbuf_t *gb, const char *type, const char *label);
+
+/* Delete edges[0..n) (pointers found in this buffer; the array is sorted in
+ * place). */
+int cbm_gbuf_delete_edges(cbm_gbuf_t *gb, const cbm_gbuf_edge_t **edges, int n);
+
 /* ── Vector storage (for semantic embeddings) ───────────────────── */
 
 /* Store an int8-quantized vector for a node. The vector data is copied.
@@ -187,5 +208,18 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
  * than freeing node->properties_json themselves. Returns 0, or -1 on OOM
  * (the old value is kept). */
 int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json);
+
+/* Write the definition spans gathered from same-QN collisions into each
+ * surviving node's `variants` property. The dump, flush and merge entry
+ * points do it themselves; call it directly only to read a node's
+ * properties_json from the buffer after collisions. */
+void cbm_gbuf_settle_variants(cbm_gbuf_t *gb);
+
+/* Visit every definition span node `n` stands for: the spans gathered from
+ * same-QN collisions (not yet written, or already in its `variants`), else
+ * its own. For passes that place a source line inside a definition. */
+typedef void (*cbm_gbuf_span_fn)(const char *file, int start, int end, void *ud);
+void cbm_gbuf_foreach_span(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *n, cbm_gbuf_span_fn fn,
+                           void *ud);
 
 #endif /* CBM_GRAPH_BUFFER_H */

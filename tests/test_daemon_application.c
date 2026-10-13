@@ -1102,6 +1102,289 @@ TEST(daemon_application_reference_counts_one_shared_watch) {
     PASS();
 }
 
+/* #2167: index_status must say whether a project is kept fresh by the
+ * watcher. Only the MCP session's own project is watched; any other indexed
+ * project reports watched=false with the reason, instead of silently going
+ * stale (the reporter indexed via the CLI and waited for auto-sync). */
+static bool app_test_seed_project_db(const char *cache, const char *project, const char *root,
+                                     char *db_path, size_t db_path_size) {
+    snprintf(db_path, db_path_size, "%s/%s.db", cache, project);
+    cbm_store_t *seed = cbm_store_open_path(db_path);
+    bool seeded = seed && cbm_store_upsert_project(seed, project, root) == CBM_STORE_OK;
+    if (seed) {
+        cbm_store_close(seed);
+    }
+    return seeded;
+}
+
+static void app_test_unlink_project_db(const char *db_path) {
+    char sidecar[APP_TEST_PATH_CAP];
+    if (!db_path[0]) {
+        return;
+    }
+    (void)cbm_unlink(db_path);
+    snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
+    (void)cbm_unlink(sidecar);
+    snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
+    (void)cbm_unlink(sidecar);
+}
+
+/* The tool result embeds the JSON document as escaped text: match
+ * \"key\":value inside it. */
+static bool app_test_response_has(const char *response, const char *key, const char *value) {
+    char needle[APP_TEST_PATH_CAP];
+    snprintf(needle, sizeof(needle), "\\\"%s\\\":%s", key, value);
+    return response && strstr(response, needle) != NULL;
+}
+
+static char *app_test_index_status(const cbm_daemon_runtime_application_callbacks_t *callbacks,
+                                   cbm_daemon_runtime_application_session_t *session,
+                                   const char *project) {
+    char args[APP_TEST_PATH_CAP];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"format\":\"json\"}", project);
+    uint8_t *tool = NULL;
+    uint32_t tool_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    if (!app_test_tool_request("index_status", args, &tool, &tool_length) ||
+        app_test_request(callbacks, session, tool, tool_length, &response, &response_length) !=
+            CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+        free(response);
+        response = NULL;
+    }
+    free(tool);
+    return (char *)response;
+}
+
+TEST(daemon_application_index_status_reports_watch_issue2167) {
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    bool had_cache = old_cache != NULL;
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char root[APP_TEST_PATH_CAP];
+    char other_root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-status-root-XXXXXX", cbm_tmpdir());
+    snprintf(other_root, sizeof(other_root), "%s/cbm-app-status-other-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-app-status-cache-XXXXXX", cbm_tmpdir());
+    bool dirs_ok =
+        cbm_mkdtemp(root) != NULL && cbm_mkdtemp(other_root) != NULL && cbm_mkdtemp(cache) != NULL;
+    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
+    char *other_project = dirs_ok ? cbm_project_name_from_path(other_root) : NULL;
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    char other_db_path[APP_TEST_PATH_CAP] = {0};
+    bool seeded = project && other_project &&
+                  app_test_seed_project_db(cache, project, root, db_path, sizeof(db_path)) &&
+                  app_test_seed_project_db(cache, other_project, other_root, other_db_path,
+                                           sizeof(other_db_path));
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
+    cbm_daemon_application_config_t config = {.watcher = watcher, .config = NULL};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 21);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *ping = NULL;
+    uint32_t ping_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    /* Context + one MCP request registers the session root's watch. */
+    bool registered = seeded && app_test_context_request(root, root, &context, &context_length) &&
+                      app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                                            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}",
+                                            &ping, &ping_length) &&
+                      app_test_request(&callbacks, session, context, context_length, &response,
+                                       &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    registered =
+        registered && app_test_request(&callbacks, session, ping, ping_length, &response,
+                                       &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    registered = registered && cbm_watcher_watch_count(watcher) == 1;
+
+    char *own = registered ? app_test_index_status(&callbacks, session, project) : NULL;
+    char *other = registered ? app_test_index_status(&callbacks, session, other_project) : NULL;
+    bool own_watched = app_test_response_has(own, "watched", "true") &&
+                       app_test_response_has(own, "strategy", "\\\"pending\\\"") &&
+                       app_test_response_has(own, "poll_interval_ms", "5000");
+    bool other_unwatched = app_test_response_has(other, "watched", "false") &&
+                           app_test_response_has(other, "reason", "\\\"not_session_project\\\"");
+
+    callbacks.session_cancel(callbacks.context, session);
+    callbacks.session_close(callbacks.context, session);
+    cbm_daemon_application_free(application);
+    cbm_watcher_stop(watcher);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    free(own);
+    free(other);
+    free(context);
+    free(ping);
+    free(project);
+    free(other_project);
+    app_test_unlink_project_db(db_path);
+    app_test_unlink_project_db(other_db_path);
+    (void)cbm_rmdir(root);
+    (void)cbm_rmdir(other_root);
+    (void)cbm_rmdir(cache);
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else if (!had_cache) {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+
+    ASSERT_TRUE(env_ok);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(registered);
+    ASSERT_TRUE(own_watched);
+    ASSERT_TRUE(other_unwatched);
+    PASS();
+}
+
+/* #2167: watcher_enabled=false leaves the daemon without a watcher; the
+ * session's own project must then say so rather than look watched. */
+TEST(daemon_application_index_status_watcher_disabled_issue2167) {
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    bool had_cache = old_cache != NULL;
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-nowatch-root-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-app-nowatch-cache-XXXXXX", cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
+    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    bool seeded =
+        project && app_test_seed_project_db(cache, project, root, db_path, sizeof(db_path));
+    cbm_daemon_application_config_t config = {.watcher = NULL, .config = NULL};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 22);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    bool context_ok = seeded && app_test_context_request(root, root, &context, &context_length) &&
+                      app_test_request(&callbacks, session, context, context_length, &response,
+                                       &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    char *status = context_ok ? app_test_index_status(&callbacks, session, project) : NULL;
+    bool disabled = app_test_response_has(status, "watched", "false") &&
+                    app_test_response_has(status, "reason", "\\\"watcher_disabled\\\"");
+
+    callbacks.session_cancel(callbacks.context, session);
+    callbacks.session_close(callbacks.context, session);
+    cbm_daemon_application_free(application);
+    free(status);
+    free(context);
+    free(project);
+    app_test_unlink_project_db(db_path);
+    (void)cbm_rmdir(root);
+    (void)cbm_rmdir(cache);
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else if (!had_cache) {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+
+    ASSERT_TRUE(env_ok);
+    ASSERT_TRUE(context_ok);
+    ASSERT_TRUE(disabled);
+    PASS();
+}
+
+/* #2167 with #1948: a non-git root that watch_non_git polls by file-tree scan
+ * reports strategy "tree". "none" stays reserved for a registered root that is
+ * never polled (a plain directory without the opt-in). */
+TEST(daemon_application_index_status_reports_tree_strategy_issue2167) {
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    bool had_cache = old_cache != NULL;
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-tree-root-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-app-tree-cache-XXXXXX", cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
+    bool env_ok = (!had_cache || saved_cache) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    char *project = dirs_ok ? cbm_project_name_from_path(root) : NULL;
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    bool seeded =
+        project && app_test_seed_project_db(cache, project, root, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
+    /* What the daemon host does at startup when watch_non_git is true. */
+    cbm_watcher_set_poll_non_git(watcher, true);
+    cbm_daemon_application_config_t config = {.watcher = watcher, .config = NULL};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 23);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *ping = NULL;
+    uint32_t ping_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    /* Context + one MCP request registers the session root's watch. */
+    bool registered = seeded && app_test_context_request(root, root, &context, &context_length) &&
+                      app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                                            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}",
+                                            &ping, &ping_length) &&
+                      app_test_request(&callbacks, session, context, context_length, &response,
+                                       &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    registered =
+        registered && app_test_request(&callbacks, session, ping, ping_length, &response,
+                                       &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    registered = registered && cbm_watcher_watch_count(watcher) == 1;
+    /* The first poll completes the baseline: the plain directory gets tree
+     * polling and its strategy is published. */
+    if (registered) {
+        (void)cbm_watcher_poll_once(watcher);
+    }
+
+    char *status = registered ? app_test_index_status(&callbacks, session, project) : NULL;
+    bool tree = app_test_response_has(status, "watched", "true") &&
+                app_test_response_has(status, "strategy", "\\\"tree\\\"");
+
+    callbacks.session_cancel(callbacks.context, session);
+    callbacks.session_close(callbacks.context, session);
+    cbm_daemon_application_free(application);
+    cbm_watcher_stop(watcher);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    free(status);
+    free(context);
+    free(ping);
+    free(project);
+    app_test_unlink_project_db(db_path);
+    (void)cbm_rmdir(root);
+    (void)cbm_rmdir(cache);
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else if (!had_cache) {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+
+    ASSERT_TRUE(env_ok);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(registered);
+    ASSERT_TRUE(tree);
+    PASS();
+}
+
 TEST(daemon_application_free_releases_live_watch_once) {
     const char *old_cache = getenv("CBM_CACHE_DIR");
     bool had_cache = old_cache != NULL;
@@ -1349,6 +1632,8 @@ TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
 
 enum { APP_FAKE_MAX_ATTEMPTS = 16 };
 enum { APP_FAKE_ARGS_CAP = 2048 };
+/* Scripted response slot: a CLEAN exit that wrote no response (#1300). */
+static const char APP_FAKE_NO_RESPONSE[] = "<no response>";
 
 typedef struct {
     atomic_int starts;
@@ -1534,7 +1819,16 @@ static cbm_index_worker_poll_t app_fake_worker_poll(void *opaque,
                 ? worker->context->responses[worker->attempt]
                 : "{\"content\":[{\"type\":\"text\",\"text\":\"{"
                   "\\\"status\\\":\\\"indexed\\\"}\"}]}";
-        worker->result.response = outcome == CBM_PROC_CLEAN ? cbm_strdup(response) : NULL;
+        bool silent = response == APP_FAKE_NO_RESPONSE;
+        worker->result.response =
+            outcome == CBM_PROC_CLEAN && !silent ? cbm_strdup(response) : NULL;
+        if (silent) {
+            /* What the supervisor reports for a clean exit without a
+             * response (#1300). */
+            worker->result.response_missing = true;
+            (void)snprintf(worker->result.last_phase, sizeof(worker->result.last_phase), "%s",
+                           "incremental.purge.progress");
+        }
         *result_out = &worker->result;
         return CBM_INDEX_WORKER_POLL_TERMINAL;
     }
@@ -3563,6 +3857,76 @@ TEST(daemon_application_disconnect_before_request_callback_is_sticky) {
     PASS();
 }
 
+/* #1300: a worker that exits cleanly without a response must reach the
+ * client as a named failure: said to be a clean exit with no response, with
+ * the last phase it reached and the worker log to inspect — not the generic
+ * "ended with clean" line. No recovery re-run for a worker that did not
+ * crash. */
+TEST(daemon_application_clean_exit_without_response_is_named_failure_issue1300) {
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.scripted, true);
+    fake.outcomes[0] = CBM_PROC_CLEAN;
+    fake.responses[0] = APP_FAKE_NO_RESPONSE;
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 1300);
+    char root[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-no-response-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    char args[APP_TEST_PATH_CAP + 32];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", root);
+    uint8_t *tool = NULL;
+    uint32_t tool_length = 0;
+    bool setup = application && session && root_ok &&
+                 app_test_context_request(root, root, &context, &context_length) &&
+                 app_test_tool_request("index_repository", args, &tool, &tool_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    setup = setup && app_test_request(&callbacks, session, context, context_length, &response,
+                                      &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    response = NULL;
+    response_length = 0;
+    cbm_daemon_runtime_application_status_t status =
+        setup
+            ? app_test_request(&callbacks, session, tool, tool_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+
+    const char *text = response ? (const char *)response : "";
+    ASSERT_TRUE(setup);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(strstr(text, "without writing a response") != NULL);
+    ASSERT_TRUE(strstr(text, "incremental.purge.progress") != NULL);
+    ASSERT_TRUE(strstr(text, "/tmp/cbm-fake-worker.log") != NULL);
+    ASSERT_TRUE(strstr(text, "indexed") == NULL);
+    ASSERT_EQ(atomic_load(&fake.starts), 1);
+    ASSERT_TRUE(stopped);
+
+    free(response);
+    free(context);
+    free(tool);
+    (void)cbm_rmdir(root);
+    PASS();
+}
+
 TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session) {
     app_watch_race_fixture_t fixture;
     bool fixture_ready = app_watch_race_fixture_init(&fixture, 3021);
@@ -5555,6 +5919,50 @@ TEST(daemon_application_free_reports_retained_live_ownership) {
     PASS();
 }
 
+TEST(daemon_application_tool_error_is_failed_job_even_after_clean_worker_exit) {
+    const char *responses[] = {
+        "{\"content\":[{\"type\":\"text\",\"text\":\"indexed\"}],\"isError\":false}",
+        ("{\"content\":[{\"type\":\"text\",\"text\":\"aborted_previous_preserved\"}],\"isError\":"
+         "true}"),
+        "{\"content\":[{\"type\":\"text\",\"text\":\"persist_failed\"}],\"isError\":true}",
+        "{\"error\":\"malformed worker response\"}",
+    };
+    for (size_t i = 0; i < sizeof(responses) / sizeof(responses[0]); i++) {
+        app_fake_worker_context_t fake;
+        app_fake_worker_context_init(&fake);
+        atomic_store(&fake.scripted, true);
+        fake.outcomes[0] = CBM_PROC_CLEAN;
+        fake.responses[0] = responses[i];
+        cbm_daemon_application_worker_ops_t worker_ops = {
+            .context = &fake,
+            .start = app_fake_worker_start,
+            .poll = app_fake_worker_poll,
+            .cancel = app_fake_worker_cancel,
+            .log_path = app_fake_worker_log_path,
+            .destroy = app_fake_worker_destroy,
+        };
+        cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+        cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+        int result = application ? cbm_daemon_application_index(application, "tool-error-fixture",
+                                                                cbm_tmpdir())
+                                 : -1;
+        bool stopped =
+            application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+        cbm_daemon_application_free(application);
+        ASSERT_NOT_NULL(application);
+        ASSERT_TRUE(stopped);
+        if (i == 0) {
+            ASSERT_EQ(result, 0);
+        } else {
+            ASSERT_LT(result, 0);
+        }
+        /* An honestly reported tool error must not cause crash recovery loops. */
+        ASSERT_EQ(atomic_load(&fake.starts), 1);
+        ASSERT_EQ(atomic_load(&fake.destroys), 1);
+    }
+    PASS();
+}
+
 TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained) {
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
@@ -6423,6 +6831,9 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
+    RUN_TEST(daemon_application_index_status_reports_watch_issue2167);
+    RUN_TEST(daemon_application_index_status_watcher_disabled_issue2167);
+    RUN_TEST(daemon_application_index_status_reports_tree_strategy_issue2167);
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
@@ -6477,5 +6888,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_worker_slice_is_aggregate_over_active_jobs);
     RUN_TEST(daemon_application_over_budget_response_passes_through_without_recovery);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
+    RUN_TEST(daemon_application_tool_error_is_failed_job_even_after_clean_worker_exit);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
+    RUN_TEST(daemon_application_clean_exit_without_response_is_named_failure_issue1300);
 }

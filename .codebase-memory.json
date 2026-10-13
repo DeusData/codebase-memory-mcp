@@ -1,0 +1,59 @@
+{
+  "test_impact": {
+    "version": 1,
+    "tests": {
+      "presets": {
+        "c-cbm": true
+      }
+    },
+    "rules": [
+      {
+        "id": "harness",
+        "paths": ["tests/test_framework.h", "tests/test_helpers.*", "tests/test_main.c"],
+        "action": "run_all"
+      },
+      {
+        "id": "engine",
+        "paths": [".codebase-memory.json", "src/mcp/test_impact*", "src/store/store_impact.*"],
+        "action": "run_all"
+      },
+      {
+        "id": "build",
+        "paths": ["scripts/**", "test-infrastructure/**", "pkg/**"],
+        "action": "run_all"
+      },
+      {
+        "id": "grammars",
+        "paths": ["internal/cbm/vendored/**"],
+        "action": "run_all"
+      },
+      {
+        "id": "fixtures",
+        "paths": ["tests/fixtures/*/**"],
+        "action": "referencing_tests",
+        "key": "path_segment:2"
+      },
+      {
+        "id": "contracts",
+        "paths": ["tests/**/*.{sh,py,json,txt}"],
+        "action": "ignore"
+      },
+      {
+        "id": "notices",
+        "paths": ["NOTICE*", "CHANGELOG*", "THIRD_PARTY*"],
+        "action": "ignore"
+      }
+    ],
+    "unmapped_files": "run_all",
+    "coverage": {
+      "compatibility_paths": [
+        "tests/test_framework.h",
+        "tests/test_main.c",
+        "tests/test_helpers.h",
+        "Makefile.cbm",
+        "scripts/test-impact/coverage-map.py",
+        "scripts/test-impact/coverage-merge.py"
+      ]
+    }
+  }
+}

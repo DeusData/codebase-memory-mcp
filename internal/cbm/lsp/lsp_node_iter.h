@@ -39,4 +39,33 @@ static inline TSNode* cbm_lsp_collect_children(CBMArena* arena, TSNode node, uin
     return kids;
 }
 
+/* Named-children variant (#1527): the same single cursor pass, keeping only
+ * named nodes, so `for (i) ts_node_named_child(node, i)` over a wide node (a
+ * module holding thousands of classes, a body holding thousands of
+ * statements) becomes O(n). Returns NULL and sets *out_n=0 for a node without
+ * named children or on OOM; callers that must not lose children on OOM fall
+ * back to indexed access. */
+static inline TSNode *cbm_lsp_collect_named_children(CBMArena *arena, TSNode node,
+                                                     uint32_t *out_n) {
+    uint32_t nc = ts_node_named_child_count(node);
+    *out_n = 0;
+    if (nc == 0)
+        return NULL;
+    TSNode *kids = (TSNode *)cbm_arena_alloc(arena, (size_t)nc * sizeof(TSNode));
+    if (!kids)
+        return NULL;
+    uint32_t kn = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode c = ts_tree_cursor_current_node(&cur);
+            if (ts_node_is_named(c))
+                kids[kn++] = c;
+        } while (kn < nc && ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    *out_n = kn;
+    return kids;
+}
+
 #endif /* CBM_LSP_NODE_ITER_H */

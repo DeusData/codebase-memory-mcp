@@ -1,0 +1,369 @@
+{
+  "flowHeadClickable": true,
+  "flowTogglesOnHeadClick": true,
+  "flowDarkStyled": true,
+  "flowParticipants": 4,
+  "flowSteps": 6,
+  "flowStepperStops": 11,
+  "stepperMovesEditor": true,
+  "stepperMovesDiagram": true,
+  "stepsListSync": true,
+  "mayRaiseShown": true,
+  "escapeEndsSession": true,
+  "pseudocodeLines": 8,
+  "pseudocodeHasImportsGroup": true,
+  "pseudocodeLineClickNavigates": true,
+  "twinImportsGroupShown": true,
+  "honestBlockShown": true,
+  "port": 4281,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w4c",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "target": "createUser",
+  "timings": {
+    "buildMs": 10754,
+    "serverStartMs": 6895,
+    "totalMs": 36911
+  },
+  "generatedAt": "2026-08-30T18:31:37.485Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4280,
+    "head": {
+      "tag": "BUTTON",
+      "role": "button",
+      "expanded": "true",
+      "focusable": true,
+      "cursor": "pointer",
+      "disabled": false
+    },
+    "opened": {
+      "present": true,
+      "participants": [
+        "userService.ts",
+        "db.ts",
+        "types.ts",
+        "validate.ts"
+      ],
+      "arrows": [
+        {
+          "index": 0,
+          "to": "db.ts",
+          "message": "insert",
+          "current": false
+        },
+        {
+          "index": 1,
+          "to": "userService.ts",
+          "message": "listUsers",
+          "current": false
+        },
+        {
+          "index": 2,
+          "to": "userService.ts",
+          "message": "toUser",
+          "current": false
+        },
+        {
+          "index": 3,
+          "to": "types.ts",
+          "message": "UserEntity",
+          "current": false
+        },
+        {
+          "index": 4,
+          "to": "validate.ts",
+          "message": "ValidationError",
+          "current": false
+        },
+        {
+          "index": 5,
+          "to": "validate.ts",
+          "message": "validateUser",
+          "current": false
+        }
+      ],
+      "raises": [
+        "may raise ValidationError"
+      ],
+      "steps": 11,
+      "activeStep": -1,
+      "activeArrow": -1,
+      "position": "11 steps",
+      "current": "",
+      "backgroundColor": "rgb(19, 27, 24)",
+      "luminance": 0.09516078431372549,
+      "markedStepRows": []
+    },
+    "toggle": {
+      "closedExpanded": "false",
+      "reopenedArrows": 6
+    },
+    "stepper": {
+      "beforeStep": {
+        "path": "src/services/userService.ts",
+        "line": 23
+      },
+      "first": {
+        "present": true,
+        "participants": [
+          "userService.ts",
+          "db.ts",
+          "types.ts",
+          "validate.ts"
+        ],
+        "arrows": [
+          {
+            "index": 0,
+            "to": "db.ts",
+            "message": "insert",
+            "current": false
+          },
+          {
+            "index": 1,
+            "to": "userService.ts",
+            "message": "listUsers",
+            "current": false
+          },
+          {
+            "index": 2,
+            "to": "userService.ts",
+            "message": "toUser",
+            "current": false
+          },
+          {
+            "index": 3,
+            "to": "types.ts",
+            "message": "UserEntity",
+            "current": false
+          },
+          {
+            "index": 4,
+            "to": "validate.ts",
+            "message": "ValidationError",
+            "current": false
+          },
+          {
+            "index": 5,
+            "to": "validate.ts",
+            "message": "validateUser",
+            "current": true
+          }
+        ],
+        "raises": [
+          "may raise ValidationError"
+        ],
+        "steps": 11,
+        "activeStep": 0,
+        "activeArrow": 5,
+        "position": "1 of 11",
+        "current": "1. call validateUser",
+        "backgroundColor": "rgb(19, 27, 24)",
+        "luminance": 0.09516078431372549,
+        "markedStepRows": [
+          0
+        ]
+      },
+      "afterFirst": {
+        "path": "src/services/userService.ts",
+        "line": 24
+      },
+      "second": {
+        "present": true,
+        "participants": [
+          "userService.ts",
+          "db.ts",
+          "types.ts",
+          "validate.ts"
+        ],
+        "arrows": [
+          {
+            "index": 0,
+            "to": "db.ts",
+            "message": "insert",
+            "current": false
+          },
+          {
+            "index": 1,
+            "to": "userService.ts",
+            "message": "listUsers",
+            "current": false
+          },
+          {
+            "index": 2,
+            "to": "userService.ts",
+            "message": "toUser",
+            "current": false
+          },
+          {
+            "index": 3,
+            "to": "types.ts",
+            "message": "UserEntity",
+            "current": false
+          },
+          {
+            "index": 4,
+            "to": "validate.ts",
+            "message": "ValidationError",
+            "current": true
+          },
+          {
+            "index": 5,
+            "to": "validate.ts",
+            "message": "validateUser",
+            "current": false
+          }
+        ],
+        "raises": [
+          "may raise ValidationError"
+        ],
+        "steps": 11,
+        "activeStep": 1,
+        "activeArrow": 4,
+        "position": "2 of 11",
+        "current": "2. construct ValidationError",
+        "backgroundColor": "rgb(19, 27, 24)",
+        "luminance": 0.09516078431372549,
+        "markedStepRows": [
+          1
+        ]
+      },
+      "afterSecond": {
+        "path": "src/services/userService.ts",
+        "line": 27
+      }
+    },
+    "afterEscape": {
+      "present": false,
+      "activeStep": -1,
+      "position": ""
+    },
+    "pseudocode": {
+      "present": true,
+      "title": "Steps in createUser",
+      "lines": [
+        {
+          "order": 1,
+          "kind": "step",
+          "alarm": false,
+          "text": "1. call validateUservalidate.ts:19may raise ValidationErrormakes 1 call of its own"
+        },
+        {
+          "order": 2,
+          "kind": "step",
+          "alarm": false,
+          "text": "2. construct ValidationErrorvalidate.ts:4"
+        },
+        {
+          "order": 3,
+          "kind": "step",
+          "alarm": false,
+          "text": "3. construct UserEntitytypes.ts:37"
+        },
+        {
+          "order": 4,
+          "kind": "step",
+          "alarm": false,
+          "text": "4. call listUsersuserService.ts:18makes 1 call of its own"
+        },
+        {
+          "order": 5,
+          "kind": "step",
+          "alarm": false,
+          "text": "5. call insertdb.ts:31"
+        },
+        {
+          "order": 6,
+          "kind": "step",
+          "alarm": false,
+          "text": "6. call toUseruserService.ts:9"
+        },
+        {
+          "order": 7,
+          "kind": "raise",
+          "alarm": true,
+          "text": "7. may raise ValidationErrorvalidate.ts:23"
+        },
+        {
+          "order": 8,
+          "kind": "env",
+          "alarm": false,
+          "text": "8. read DB_URL from the environmentuserService.ts"
+        }
+      ],
+      "groups": [
+        "What this file pulls in: 2 names not used by this symbol as far as the index shows"
+      ],
+      "imports": [
+        {
+          "usage": "used",
+          "text": "uses insert from ../repo/dbused here"
+        },
+        {
+          "usage": "unused",
+          "text": "query from ../repo/db: imported here, not used by this symbol as far as the index showsnot used here"
+        },
+        {
+          "usage": "unused",
+          "text": "Row from ../repo/db: imported here, not used by this symbol as far as the index showsnot used here"
+        },
+        {
+          "usage": "used",
+          "text": "uses UserEntity from ../typesused here"
+        },
+        {
+          "usage": "used",
+          "text": "uses User from ../typesused here"
+        },
+        {
+          "usage": "used",
+          "text": "uses ValidationError from ../util/validateused here"
+        },
+        {
+          "usage": "used",
+          "text": "uses validateUser from ../util/validateused here"
+        }
+      ],
+      "tally": "5 used by this symbol, 2 not used by it, 0 that CodeAtlas cannot check.",
+      "honest": "Only what the index reported, in the order it reported it.?",
+      "provenance": "1 of 1 symbol in scope contributed steps. Derived from the index and nothing else: every line is a call, a raised error or an environment read that the analysis reported, in the order it reported them. Anything the index did not resolve is absent from this block, not absent from the code. What stands beside a step comes from the relations the index recorded for the symbol that step calls, in the graph this window already loaded: what it can raise, what it calls in turn, and what it reads from the environment. It is not a reading of that symbol's body. A step with nothing beside it is a step whose callee the loaded graph records none of those three for, not a callee that does none of them."
+    },
+    "lineClick": {
+      "clickAt": 6,
+      "kind": "raise",
+      "beforeClick": {
+        "path": "src/services/userService.ts",
+        "line": 27
+      },
+      "afterClick": {
+        "path": "src/util/validate.ts",
+        "line": 23
+      }
+    },
+    "twinImports": {
+      "present": true,
+      "block": "data",
+      "title": "Pulls in",
+      "text": "DATAPulls ininferred5 used by this symbol, 2 not used by it, 0 that CodeAtlas cannot check.insertused here?querynot used here?Rownot used here?UserEntityused here?Userused here?ValidationErrorused here?validateUserused here?The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Whether a name is used is checked against what the index recorded for this symbol alone, which is why an import can be listed as not used here and still be used by the file.",
+      "rows": 7
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 14
+    },
+    "rpcTools": {
+      "index_status": 4,
+      "query_graph": 137,
+      "check_index_coverage": 5,
+      "search_graph": 4,
+      "get_code_snippet": 11
+    }
+  }
+}

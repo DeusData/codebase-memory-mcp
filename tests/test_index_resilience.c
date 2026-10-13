@@ -274,6 +274,118 @@ TEST(index_clean_run_no_logfile) {
     PASS();
 }
 
+/* INV(long-log-override): CBM_INDEX_LOG was copied into the 1 KiB logfile path
+ * with no length check and opened "wb", so an override longer than that
+ * created (or truncated) a file at its cut-off prefix and echoed the cut name
+ * as the run's logfile. A path that does not fit is no logfile: the index still
+ * completes and reports the skip, nothing is written at the cut name (its
+ * directory stays empty), and the response names no logfile. */
+TEST(index_long_log_override_writes_no_cut_path) {
+    enum { RI_PATH_CAP = 1024, RI_DIR_SEGMENTS = 4, RI_SEGMENT = 200, RI_NAME = 255 };
+    RProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_resil_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    rh_to_fwd_slashes(lp.tmpdir);
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 1\n");
+    ri_write_big(lp.tmpdir, "big.py", (size_t)2 * 1024 * 1024); /* ~2 MiB > 1 MiB cap */
+
+    /* Outside the indexed repo: <root>/ddd…(x4) is a real directory, and the
+     * override adds a 255-byte file name, so the whole path runs past 1 KiB and
+     * its first 1023 bytes end inside the file name, in that directory. The
+     * root has its links resolved: the kernel bounds the EXPANDED path, and
+     * under macOS's /tmp -> /private/tmp link a near-1 KiB path can be neither
+     * created nor probed, which would hide the cut-off file. */
+    /* cbm_mkdtemp writes the %TEMP%-expanded path back on Windows, so the
+     * template buffer needs the 256 bytes that compat.h asks for. */
+    char tmpl[256];
+    char logroot[4096];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_resil_log_XXXXXX");
+    if (!cbm_mkdtemp(tmpl)) {
+        rh_cleanup(&lp, NULL);
+        FAIL("mkdtemp failed");
+    }
+    if (!cbm_canonical_path(tmpl, logroot, sizeof(logroot))) {
+        th_rmtree(tmpl);
+        rh_cleanup(&lp, NULL);
+        FAIL("canonical log root failed");
+    }
+    rh_to_fwd_slashes(logroot);
+    char logdir[RI_PATH_CAP];
+    int root_len = snprintf(logdir, sizeof(logdir), "%s", logroot);
+    if (root_len <= 0 ||
+        (size_t)root_len + RI_DIR_SEGMENTS * (RI_SEGMENT + 1) + 2 >= sizeof(logdir)) {
+        th_rmtree(logroot);
+        rh_cleanup(&lp, NULL);
+        FAIL("log root too long for the fixture");
+    }
+    size_t at = (size_t)root_len;
+    for (int s = 0; s < RI_DIR_SEGMENTS; s++) {
+        logdir[at++] = '/';
+        memset(logdir + at, 'd', RI_SEGMENT);
+        at += RI_SEGMENT;
+    }
+    logdir[at] = '\0';
+    char name[RI_NAME + 1];
+    memset(name, 'x', RI_NAME);
+    memcpy(name, "skip-", 5);
+    name[RI_NAME] = '\0';
+    char override[2 * RI_PATH_CAP];
+    snprintf(override, sizeof(override), "%s/%s", logdir, name);
+    char cut[RI_PATH_CAP];
+    snprintf(cut, sizeof(cut), "%.*s", RI_PATH_CAP - 1, override);
+    bool made = cbm_mkdir_p(logdir, 0755) && strlen(override) >= RI_PATH_CAP &&
+                strlen(cut) > strlen(logdir) + 1;
+
+    cbm_setenv("CBM_MAX_FILE_BYTES", "1048576", 1); /* 1 MiB cap */
+    cbm_setenv("CBM_INDEX_LOG", override, 1);
+    char *resp = NULL;
+    cbm_store_t *store = made ? ri_index_capture(&lp, &resp) : NULL;
+    cbm_unsetenv("CBM_MAX_FILE_BYTES");
+    cbm_unsetenv("CBM_INDEX_LOG");
+
+    bool cut_exists = cbm_file_exists(cut);
+    int entries = 0;
+    cbm_dir_t *d = cbm_opendir(logdir);
+    cbm_dirent_t *entry;
+    while (d && (entry = cbm_readdir(d)) != NULL) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            entries++;
+        }
+    }
+    if (d) {
+        cbm_closedir(d);
+    }
+    th_rmtree(logroot);
+
+    ASSERT_TRUE(made);
+    if (!resp) {
+        rh_cleanup(&lp, store);
+        FAIL("no MCP response");
+    }
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *sc = yyjson_obj_get(yyjson_doc_get_root(doc), "structuredContent");
+    ASSERT_NOT_NULL(sc);
+    const char *status = yyjson_get_str(yyjson_obj_get(sc, "status"));
+    ASSERT_NOT_NULL(status);
+    ASSERT_STR_EQ("indexed", status);
+    ASSERT_GTE(yyjson_get_int(yyjson_obj_get(sc, "skipped_count")), 1);
+    if (cut_exists) {
+        printf("  skip log written at the cut-off name ...%s\n", cut + strlen(cut) - 40);
+    }
+    ASSERT_FALSE(cut_exists);
+    ASSERT_EQ(entries, 0);
+    ASSERT_NULL(yyjson_obj_get(sc, "logfile"));
+
+    yyjson_doc_free(doc);
+    free(resp);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 /* INV(parse-partial-reported, #963): a file whose parse tree contains
  * ERROR/MISSING regions (here: the preprocessor-blind #ifdef-split-brace C
  * pattern) is INDEXED — not skipped — and the best-effort coverage signal
@@ -899,6 +1011,7 @@ TEST(index_relative_repo_path_canonicalized) {
 SUITE(index_resilience) {
     RUN_TEST(index_oversized_file_reported);
     RUN_TEST(index_clean_run_no_logfile);
+    RUN_TEST(index_long_log_override_writes_no_cut_path);
     RUN_TEST(index_parse_partial_reported);
     RUN_TEST(index_parse_partial_clears_on_fix);
     RUN_TEST(index_parse_unusable_names_the_range_end);

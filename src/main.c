@@ -33,7 +33,10 @@
 #include "daemon/version_cohort.h"
 #include "mcp/mcp.h"
 #include "mcp/index_supervisor.h"
+#include "mcp/test_impact_engine.h"
 #include "cli/cli.h"
+#include "cli/runtime_settings.h"
+#include "foundation/platform.h"
 #include "cli/progress_sink.h"
 #include "foundation/constants.h"
 
@@ -57,6 +60,8 @@ enum {
      * that never finishes, so a command cannot hang indefinitely. */
     MAIN_STARTUP_CONTENTION_CEILING_MS = 120000,
     MAIN_MCP_STARTUP_TIMEOUT_MS = 30000,
+    MAIN_STARTUP_TIMEOUT_MIN_MS = 1000,
+    MAIN_STARTUP_TIMEOUT_MAX_MS = 600000,
     MAIN_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000,
     MAIN_HOOK_CONNECT_TIMEOUT_MS = 250,
     MAIN_HOOK_REQUEST_TIMEOUT_MS = 1500,
@@ -74,6 +79,25 @@ enum {
      * test_thread_stack_tls_contract.sh keeps the two from converging again. */
     PARENT_WATCHDOG_STACK_SIZE = 256 * CBM_SZ_1K,
 };
+
+/* Daemon startup budget, overridable for loaded hosts: a fixed 30 s races
+ * whatever else the machine is doing (parallel test waves, CI legs), and a
+ * cold daemon on a starved host loses through no fault of its own.
+ * CBM_STARTUP_TIMEOUT_MS, clamped to [1s, 10min]; malformed -> default. */
+static uint32_t main_startup_timeout_ms(void) {
+    const char *raw = cbm_runtime_getenv("CBM_STARTUP_TIMEOUT_MS");
+    if (!raw || !raw[0])
+        return MAIN_MCP_STARTUP_TIMEOUT_MS;
+    char *end = NULL;
+    long value = strtol(raw, &end, 10);
+    if (!end || *end != '\0' || value <= 0)
+        return MAIN_MCP_STARTUP_TIMEOUT_MS;
+    if (value < MAIN_STARTUP_TIMEOUT_MIN_MS)
+        return MAIN_STARTUP_TIMEOUT_MIN_MS;
+    if (value > MAIN_STARTUP_TIMEOUT_MAX_MS)
+        return MAIN_STARTUP_TIMEOUT_MAX_MS;
+    return (uint32_t)value;
+}
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
@@ -1107,7 +1131,7 @@ static void print_help(void) {
            "[--dir=<path>] [--skip-config]\n");
     printf("                                      [--clients=<tokens>]  Run "
            "'install --clients' to list tokens\n");
-    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
+    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run] [--delete-indexes]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
@@ -1279,6 +1303,10 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return cbm_cmd_hook_augment(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "test-impact") == 0) {
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+            return cbm_test_impact_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "install") == 0) {
             return cbm_cmd_install(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
@@ -1455,6 +1483,8 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
     if (!cbm_daemon_ipc_private_directory_secure(canonical_cache)) {
         return MAIN_BUILD_IDENTITY_CACHE_PRIVATE;
     }
+    /* #1717: advice only -- a network-filesystem cache root is accepted. */
+    (void)cbm_daemon_ipc_warn_if_network_cache_root(canonical_cache);
     /* Every cache consumer in this process must use the exact path whose
      * fingerprint joins the account-wide cohort. Keeping an original symlink
      * spelling in the environment would let a later retarget move storage
@@ -1818,7 +1848,7 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
     cbm_daemon_runtime_activation_result_t drain;
     if (!cbm_daemon_runtime_request_activation_shutdown(config->endpoint, config->identity,
                                                         CBM_DAEMON_RUNTIME_ACTIVATION_UPDATE,
-                                                        MAIN_MCP_STARTUP_TIMEOUT_MS, &drain) ||
+                                                        main_startup_timeout_ms(), &drain) ||
         !drain.accepted) {
         (void)fprintf(stderr, "codebase-memory-mcp: the active daemon did not accept the "
                               "upgrade drain; run `codebase-memory-mcp daemon stop`\n");
@@ -1858,7 +1888,7 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
         .identity = &identity,
         .executable_path = executable_path,
         .connect_timeout_ms = MAIN_CONNECT_TIMEOUT_MS,
-        .startup_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
+        .startup_timeout_ms = main_startup_timeout_ms(),
     };
     cbm_daemon_bootstrap_result_t bootstrap;
     cbm_daemon_bootstrap_status_t status =
@@ -2785,6 +2815,16 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    bool configure_stateless =
+        role == CBM_DAEMON_PROCESS_STATELESS && argc > 1 && strcmp(argv[1], "config") == 0;
+    if ((role != CBM_DAEMON_PROCESS_STATELESS && role != CBM_DAEMON_PROCESS_HOOK_CLIENT) ||
+        configure_stateless) {
+        const char *settings_cache = cbm_resolve_cache_dir();
+        if (settings_cache && !cbm_runtime_settings_init(settings_cache)) {
+            (void)fprintf(stderr, "codebase-memory-mcp: could not load saved runtime settings\n");
+            return EXIT_FAILURE;
+        }
+    }
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init();
     /* The library default stays INFO (embedders and the test runner observe
@@ -2843,6 +2883,15 @@ int main(int argc, char **argv) {
             }
             cbm_hook_augment_prefetch_stdin(hook_input);
         }
+        const char *hook_settings_cache = cbm_resolve_cache_dir();
+        if (hook_settings_cache && !cbm_runtime_settings_init(hook_settings_cache)) {
+            return EXIT_SUCCESS;
+        }
+#ifndef _WIN32
+        /* The first deadline bounded input and settings loading; subsequent
+         * processing uses the now-resolved saved deadline. */
+        cbm_hook_augment_arm_deadline();
+#endif
     }
 
     if (role == CBM_DAEMON_PROCESS_STATELESS) {
@@ -3240,7 +3289,7 @@ int main(int argc, char **argv) {
             ? cbm_version_cohort_acquire(client_cohort_manager, &identity,
                                          main_deadline_after(role == CBM_DAEMON_PROCESS_HOOK_CLIENT
                                                                  ? MAIN_HOOK_REQUEST_TIMEOUT_MS
-                                                                 : MAIN_MCP_STARTUP_TIMEOUT_MS),
+                                                                 : main_startup_timeout_ms()),
                                          &client_cohort_lease, &client_cohort_conflict)
             : CBM_VERSION_COHORT_IO;
     if (client_cohort_status != CBM_VERSION_COHORT_OK) {
@@ -3308,7 +3357,7 @@ int main(int argc, char **argv) {
         .identity = &identity,
         .executable_path = executable_path,
         .connect_timeout_ms = MAIN_CONNECT_TIMEOUT_MS,
-        .startup_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
+        .startup_timeout_ms = main_startup_timeout_ms(),
     };
     cbm_daemon_bootstrap_result_t bootstrap_result;
     cbm_daemon_bootstrap_status_t bootstrap_status =

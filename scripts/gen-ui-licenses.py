@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+from ui_browser_licenses import verified_browser_exclusions
 
 
 def collect(ui_dir, dep_tree, out, excluded):
@@ -77,12 +78,20 @@ def main():
     pkgs = set()
     excluded = set()
     collect(ui_dir, tree.get("dependencies"), pkgs, excluded)
+    try:
+        browser_excluded = verified_browser_exclusions(ui_dir, pkgs)
+    except ValueError as exc:
+        print(f"Cannot generate UI notices: {exc}", file=sys.stderr)
+        sys.exit(1)
+    pkgs -= browser_excluded
 
     print("## External Graph UI asset pack — bundled npm packages")
     print()
     print("The `-ui` archives ship a compiled frontend asset pack beside the binary.")
     print("The packages below are its production dependency tree; license texts are")
     print("reproduced verbatim from the packages as installed at build time.")
+    print("The build inventory excludes only the reviewed optional package listed below;")
+    print("other production dependencies remain covered conservatively.")
     print()
 
     for name, version in sorted(pkgs):
@@ -106,6 +115,14 @@ def main():
         print()
         for name, version in sorted(excluded):
             print(f"- {name}@{version}")
+        print()
+
+    if browser_excluded:
+        print("### Installed optional package absent from the browser pack")
+        print()
+        print("Verified against the current application and worker build inputs and asset hashes.")
+        for name, version in sorted(browser_excluded):
+            print(f"- {name}@{version}: Transformers uses its reviewed empty browser stub.")
         print()
 
 
