@@ -1105,6 +1105,44 @@ int cbm_text_upsert_managed_block_limited(const char *file_path, const char *beg
                                      max_document_bytes);
 }
 
+int cbm_text_managed_block_status(const char *file_path, const char *begin_marker,
+                                  const char *end_marker) {
+    size_t begin_len = 0U;
+    size_t end_len = 0U;
+    if (!text_valid_path(file_path) ||
+        text_validate_markers(begin_marker, end_marker, &begin_len, &end_len) != TEXT_OK) {
+        return TEXT_ERROR;
+    }
+    char *data = NULL;
+    size_t len = 0U;
+    text_file_snapshot_t snapshot;
+    if (text_read_file(file_path, &data, &len, &snapshot) != TEXT_OK) {
+        free(data);
+        return TEXT_ERROR;
+    }
+    int result = TEXT_OK;
+    if (snapshot.exists && text_validate_bytes(data, len, 1) != TEXT_OK) {
+        result = TEXT_ERROR;
+    } else if (snapshot.exists) {
+        size_t bom_len = text_bom_length(data, len);
+        text_managed_region_t region;
+        if (text_scan_managed_region(data, len, bom_len, begin_marker, begin_len, end_marker,
+                                     end_len, &region) != TEXT_OK) {
+            result = TEXT_ERROR;
+        } else if (!region.present) {
+            for (size_t pos = bom_len; pos < len; pos++) {
+                char byte = data[pos];
+                if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n') {
+                    result = TEXT_UNOWNED;
+                    break;
+                }
+            }
+        }
+    }
+    free(data);
+    return result;
+}
+
 int cbm_text_remove_managed_block(const char *file_path, const char *begin_marker,
                                   const char *end_marker) {
     size_t begin_len = 0U;
