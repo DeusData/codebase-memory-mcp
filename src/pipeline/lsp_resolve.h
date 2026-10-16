@@ -580,6 +580,19 @@ static inline bool cbm_pipeline_kotlin_external_target(CBMLanguage lang, const c
            strncmp(callee_qn, "javax.", strlen("javax.")) == 0;
 }
 
+/* Java: the LSP typed the receiver as a type OUTSIDE the project (a JDK or
+ * library class, `lsp_external`), so the callee is `java.util.Optional.map`
+ * and no project method. Without this gate the tail/unique-leaf node policy
+ * and then the textual registry bound such a call to whatever project method
+ * shares the leaf (`Optional.map` -> `Filters.map`). Such a call gets no
+ * CALLS edge, as #2053 does for Rust. Pure; unit-tested. */
+static inline bool cbm_pipeline_java_external_target(CBMLanguage lang,
+                                                     const CBMResolvedCall *lsp) {
+    return lang == CBM_LANG_JAVA && lsp && lsp->strategy &&
+           strcmp(lsp->strategy, "lsp_external") == 0 && lsp->callee_qn &&
+           strchr(lsp->callee_qn, '.') != NULL;
+}
+
 /* Rust (#2053): true when the Rust LSP positively resolved a call to a
  * registered symbol that lives OUTSIDE the project — a std/core/alloc seed
  * method (`root.join()` on `root: &Path` -> std.path.Path.join) or a seeded
