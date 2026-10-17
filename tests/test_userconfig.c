@@ -39,7 +39,7 @@ TEST(userconfig_project_basic) {
     char proj[512];
     snprintf(proj, sizeof(proj), "%s/.codebase-memory.json", dir);
     ASSERT_EQ(
-        write_json(proj, "{\"extra_extensions\":{\".blade.php\":\"php\",\".mjs\":\"javascript\"}}"),
+        write_json(proj, "{\"extra_extensions\":{\".blade.php\":\"php\",\".mjs\":\"javascript\",\".html\":\"jinja2\"}}"),
         0);
 
     cbm_userconfig_t *cfg = cbm_userconfig_load(dir);
@@ -47,6 +47,7 @@ TEST(userconfig_project_basic) {
 
     ASSERT_EQ(cbm_userconfig_lookup(cfg, ".blade.php"), CBM_LANG_PHP);
     ASSERT_EQ(cbm_userconfig_lookup(cfg, ".mjs"), CBM_LANG_JAVASCRIPT);
+    ASSERT_EQ(cbm_userconfig_lookup(cfg, ".html"), CBM_LANG_JINJA2);
     ASSERT_EQ(cbm_userconfig_lookup(cfg, ".go"), CBM_LANG_COUNT); /* not in user config */
 
     cbm_userconfig_free(cfg);
