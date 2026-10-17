@@ -11547,7 +11547,7 @@ char *cbm_mcp_index_worker_no_response_failure(const char *args,
     (void)snprintf(hint, sizeof(hint),
                    "Indexing worker exited cleanly (exit 0) without writing a response; the "
                    "index was not published. Last phase reached: %s. Inspect the worker log: %s",
-                   phase, log);
+                   phase ? phase : "(null)", log ? log : "(null)");
     yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
     if (repo_path) {
         yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
