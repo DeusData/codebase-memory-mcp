@@ -21,6 +21,7 @@ enum {
     /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
      * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
     PP_JSON_FIELD_OVERHEAD = 6,
+    PP_SWIFT_PROPS_MARGIN = 80,
     PP_ARGS_MARGIN = 20,
     /* ,"line":<int> -> comma + key (7) + colon + up to 10 digits + NUL. */
     PP_LINE_MARGIN = 24,
@@ -39,6 +40,8 @@ enum {
 #define PP_NSEC_PER_SEC 1000000000ULL
 #define PP_USEC_PER_MS 1000000ULL
 #define PP_HALF_CONF 0.5
+static const double PP_SWIFT_SINGLE_CONF = 0.90;
+static const double PP_SWIFT_AMBIGUOUS_CONF = 0.55;
 #define PP_FIELD_HINT_CONF 0.85
 enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 
@@ -538,6 +541,12 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    if (def->qn_sig_off && bufsize - pos > PP_SWIFT_PROPS_MARGIN) {
+        pos += (size_t)snprintf(
+            buf + pos, bufsize - pos, ",\"swift_defaults\":\"%016llx\",\"swift_params\":%u",
+            (unsigned long long)def->swift_default_mask, (unsigned)def->swift_param_count);
+    }
+    append_json_string(buf, bufsize, &pos, "swift_selector", def->swift_selector);
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     /* Right after the docstring: the buffer is sized for exactly these three
      * uncapped fields (pp_props_buf), so none can be squeezed out. */
@@ -732,12 +741,16 @@ typedef struct {
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring, variants and variant_key fields, which have no length
+ * serialized selector, docstring, variants and variant_key fields, which have no length
  * cap (a field that does not fit is dropped whole). Returns `stack` for a def
  * with none of them, or when the larger buffer cannot be allocated. Twin of
  * pass_definitions.c -- keep both in sync. */
 static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     size_t need = *size;
+    if (def->swift_selector) {
+        need += strlen("swift_selector") + pp_json_escaped_len(def->swift_selector) +
+                PP_JSON_FIELD_OVERHEAD;
+    }
     if (def->docstring && def->docstring[0]) {
         need += strlen("docstring") + pp_json_escaped_len(def->docstring) + PP_JSON_FIELD_OVERHEAD;
     }
@@ -1782,6 +1795,11 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
      * (helpers.c) — see pass_definitions.c for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        if (def->qn_sig_off) {
+            cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
+                                             def->swift_default_mask, def->swift_param_count,
+                                             def->swift_selector);
+        }
         (*reg_entries)++;
     }
     char marked[CBM_SZ_4K];
@@ -3403,6 +3421,39 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
                                   imp_count, false, route_mount, lang);
                 continue;
+            }
+        }
+
+        if (lang == CBM_LANG_SWIFT && !lsp_target) {
+            const char *candidates[CBM_SZ_256];
+            int count = cbm_registry_swift_candidates(rc->registry, call, module_qn, imp_vals,
+                                                      imp_count, candidates, CBM_SZ_256);
+            if (count > 0) {
+                for (int i = 0; i < count; i++) {
+                    const cbm_gbuf_node_t *target =
+                        cbm_gbuf_find_by_qn(rc->main_gbuf, candidates[i]);
+                    if (!target || target->id == source_node->id) {
+                        continue;
+                    }
+                    cbm_resolution_t selected = {.qualified_name = candidates[i],
+                                                 .strategy = "swift_labels",
+                                                 .confidence = count == SKIP_ONE
+                                                                   ? PP_SWIFT_SINGLE_CONF
+                                                                   : PP_SWIFT_AMBIGUOUS_CONF,
+                                                 .candidate_count = count};
+                    emit_service_edge(ws->local_edge_buf, source_node, target, call, &selected,
+                                      module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                                      imp_count, false, route_mount, lang);
+                    ws->calls_resolved++;
+                }
+                continue;
+            }
+            if (count < 0) {
+                /* Same-named Swift symbols exist but none is label-compatible:
+                 * clear the bare-name match (it would bind a wrong overload)
+                 * and fall through as unresolved — the empty-resolution
+                 * fallbacks below still run. Mirrors pass_calls.c. */
+                res = (cbm_resolution_t){0};
             }
         }
 

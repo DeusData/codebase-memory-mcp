@@ -276,6 +276,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->http_client);
     cr_str(c, &d->http_base_url);
     cr_str(c, &d->variants);
+    cr_str(c, &d->swift_selector);
     cr_list(c, &d->extra_props);
     cr_str(c, &d->decl_namespace);
     cr_str(c, &d->variant_key);
@@ -302,6 +303,12 @@ static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {
         call->args = NULL;
         call->arg_count = 0;
     }
+    /* Swift trailing-closure labels are a bounded counted string list. */
+    int labels = call->swift_trailing_count;
+    if (labels > CBM_MAX_TRAILING_CLOSURES) {
+        labels = CBM_MAX_TRAILING_CLOSURES;
+    }
+    cr_counted_list(c, &call->swift_trailing_labels, labels);
 }
 
 /* Facts have counted lists, not sentinel arrays. Bail before touching a failed
