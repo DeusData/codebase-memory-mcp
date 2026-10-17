@@ -2357,6 +2357,22 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         }
     }
 
+    /* Relative non-module files can have a File QN that does not match the
+     * module QN above. Resolve the exact file after module and sibling lookup. */
+    if (imp->module_path[0] == '.' &&
+        (imp->module_path[1] == '/' ||
+         (imp->module_path[1] == '.' && imp->module_path[2] == '/'))) {
+        char *resolved = cbm_pipeline_resolve_relative_import(source_rel, imp->module_path);
+        if (resolved) {
+            const cbm_gbuf_node_t *file =
+                cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, resolved);
+            free(resolved);
+            if (file) {
+                return file;
+            }
+        }
+    }
+
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,
      * `use App\Utils\Helper` name a NAMESPACE (or a member of it) that the
      * path-based QN cannot express.  Try the full module path and progressively
