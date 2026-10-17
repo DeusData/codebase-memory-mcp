@@ -193,6 +193,156 @@ TEST(doc_links_md_repeated_headings) {
     PASS();
 }
 
+/* MENTIONS edges from the Section whose qualified name ends with `src` to the
+ * node whose qualified name ends with `tgt`. */
+static int rep_edge(const char *db, const char *src, const char *tgt) {
+    char props[512];
+    int n = 0;
+    dm_edge(db, src, tgt, props, sizeof(props), &n);
+    return n;
+}
+
+/* #2586: two `## Implementation` headings under different parents had one
+ * qualified name, so the graph kept one Section (the last) and the references
+ * under both went to the File. A repeated heading is now qualified by the
+ * headings above it; a unique heading keeps its name alone. */
+TEST(doc_links_md_repeated_headings_by_parent_issue2586) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_rep_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "docs/repeated.md"), "# Service A\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::balance`.\n"
+                                                    "\n"
+                                                    "# Service B\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::post_entry`.\n"
+                                                    "\n"
+                                                    "```mermaid\n"
+                                                    "graph LR\n"
+                                                    "  Ledger --> Balance\n"
+                                                    "```\n"
+                                                    "\n"
+                                                    "## Notes\n"
+                                                    "\n"
+                                                    "See `src/ledger.py`.\n");
+    th_write_file(TH_PATH(tmp, "src/ledger.py"), "def post_entry(ledger, amount):\n"
+                                                 "    ledger.append(amount)\n"
+                                                 "    return balance(ledger)\n"
+                                                 "\n"
+                                                 "\n"
+                                                 "def balance(ledger):\n"
+                                                 "    return sum(ledger)\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/md.db", tmp);
+    ASSERT_EQ(dm_index(tmp, db, NULL), 0);
+
+    /* two Sections, each qualified by its parent heading */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND name = 'Implementation' AND file_path = 'docs/repeated.md'"),
+              2);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-A.Implementation' "
+                           "AND start_line = 3"),
+              1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-B.Implementation' "
+                           "AND start_line = 9"),
+              1);
+    /* unique headings keep their names */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' AND "
+                           "(qualified_name LIKE '%.repeated.Service-A' OR "
+                           "qualified_name LIKE '%.repeated.Notes')"),
+              2);
+
+    /* each reference from its own Section, none from the File */
+    ASSERT_EQ(rep_edge(db, "Service-A.Implementation", "ledger.balance"), 1);
+    ASSERT_EQ(rep_edge(db, "Service-B.Implementation", "ledger.post_entry"), 1);
+    ASSERT_EQ(rep_edge(db, "Service-A.Implementation", "ledger.post_entry"), 0);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "WHERE e.type = 'MENTIONS' AND s.label = 'File' "
+                           "AND s.file_path = 'docs/repeated.md'"),
+              0);
+
+    /* the diagram under the second heading is that Section's */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'DEFINES' "
+                           "AND t.label = 'Diagram' "
+                           "AND s.qualified_name LIKE '%.Service-B.Implementation'"),
+              1);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
+/* #2586 review: a heading text may hold dots, so `# Service-A.Implementation`
+ * named the same as the qualified `## Implementation` under `# Service A`.
+ * The unique heading keeps its name; the qualified one takes `~2`. Five
+ * headings, five Sections, every reference from its own. */
+TEST(doc_links_md_repeated_heading_name_collision_issue2586) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_col_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "docs/repeated.md"), "# Service A\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::balance`.\n"
+                                                    "\n"
+                                                    "# Service B\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::post_entry`.\n"
+                                                    "\n"
+                                                    "# Service-A.Implementation\n"
+                                                    "\n"
+                                                    "See `src/ledger.py`.\n");
+    th_write_file(TH_PATH(tmp, "src/ledger.py"), "def post_entry(ledger, amount):\n"
+                                                 "    ledger.append(amount)\n"
+                                                 "    return balance(ledger)\n"
+                                                 "\n"
+                                                 "\n"
+                                                 "def balance(ledger):\n"
+                                                 "    return sum(ledger)\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/md.db", tmp);
+    ASSERT_EQ(dm_index(tmp, db, NULL), 0);
+
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND file_path = 'docs/repeated.md'"),
+              5);
+    /* the unique heading keeps its name; the qualified one moves aside */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-A.Implementation' "
+                           "AND start_line = 13"),
+              1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-A.Implementation~2' "
+                           "AND start_line = 3"),
+              1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-B.Implementation' "
+                           "AND start_line = 9"),
+              1);
+
+    /* each reference from its own Section, none from the File */
+    ASSERT_EQ(rep_edge(db, "Service-A.Implementation~2", "ledger.balance"), 1);
+    ASSERT_EQ(rep_edge(db, "Service-B.Implementation", "ledger.post_entry"), 1);
+    ASSERT_EQ(rep_edge(db, "repeated.Service-A.Implementation", "ledger.py.__file__"), 1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "WHERE e.type = 'MENTIONS' AND s.label = 'File' "
+                           "AND s.file_path = 'docs/repeated.md'"),
+              0);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
 typedef struct {
     const char *text;
     CBMDocLinkMdShape shape;
@@ -863,6 +1013,8 @@ SUITE(doc_links_md) {
     dm_ship_held_families();
     RUN_TEST(doc_links_md_extract_tokens);
     RUN_TEST(doc_links_md_repeated_headings);
+    RUN_TEST(doc_links_md_repeated_headings_by_parent_issue2586);
+    RUN_TEST(doc_links_md_repeated_heading_name_collision_issue2586);
     RUN_TEST(doc_links_md_classify_span);
     RUN_TEST(doc_links_md_resolve);
     RUN_TEST(doc_links_md_incremental);

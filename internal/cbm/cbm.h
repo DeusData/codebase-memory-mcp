@@ -1041,6 +1041,9 @@ typedef struct {
      * POD section index. */
     void *doc_memo;
     void *doc_pod_index;
+    /* Markdown: the sorted names of the file's headings (extract_defs.c),
+     * NULL until the first heading; allocated in `scratch`. */
+    void *md_headings;
     const cbm_test_declarations_t *test_declarations; /* borrowed for this call only */
     bool test_declarations_raw_source;
     struct CBMTestDefinitionMatch *test_definition_matches; /* traversal scratch */

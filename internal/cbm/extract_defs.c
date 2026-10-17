@@ -7030,13 +7030,15 @@ static const char *extract_markdown_section_body(CBMExtractCtx *ctx, TSNode head
 
 /* Push a config-language definition that carries prose. push_simple_class_def
  * delegates here with no docstring. */
-static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
-                                      const char *label, const char *docstring) {
+/* Push a definition whose qualified name ends with `qn_name` (already QN-safe)
+ * rather than with its name. */
+static void push_class_def_qn(CBMExtractCtx *ctx, TSNode node, char *name, const char *qn_name,
+                              const char *label, const char *docstring) {
     CBMArena *a = ctx->arena;
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_safe_segment(a, name));
+    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_name);
     def.label = label;
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -7044,6 +7046,11 @@ static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *nam
     def.is_exported = true;
     def.docstring = docstring;
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
+                                      const char *label, const char *docstring) {
+    push_class_def_qn(ctx, node, name, qn_safe_segment(ctx->arena, name), label, docstring);
 }
 
 static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
@@ -7143,6 +7150,231 @@ static char *extract_markdown_heading_name(CBMArena *a, TSNode node, const char 
         }
     }
     return trim_heading_name(name);
+}
+
+/* #2586: a heading name that repeats in a file (`## Implementation` under two
+ * parents) gave its Sections one qualified name, so the graph kept one node
+ * and the references under them fell back to the File. A repeated heading's
+ * qualified name therefore takes the names of the headings above it as well
+ * (`Service-A.Implementation`). A heading whose name is unique in the file
+ * keeps its name alone, always. A heading text may itself hold dots, so a
+ * qualified name can equal another heading's final name (`# Service-A.
+ * Implementation`): the qualified one then takes `~2`, `~3`, ... until no
+ * other heading of the file has that name. Headings that repeat under the
+ * same parents too still share a name, as before. All final names are
+ * settled once per file, on the first heading. */
+typedef struct {
+    uint32_t start;      /* the heading node's first byte */
+    TSNode node;         /* valid while the file's tree is */
+    const char *seg;     /* the heading's own QN-safe name */
+    const char *key;     /* repeated only: the chain's segments, '\n'-joined */
+    const char *qn_name; /* the final QN segment */
+    bool repeated;
+} md_heading_t;
+
+typedef struct {
+    md_heading_t *v; /* in document order */
+    int count;
+} md_headings_t;
+
+/* The QN-safe name of a heading node, or NULL. */
+static const char *md_heading_segment(CBMExtractCtx *ctx, CBMArena *a, TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (!is_markdown_heading_kind(kind)) {
+        return NULL;
+    }
+    char *name = extract_markdown_heading_name(a, node, kind, ctx->source);
+    return name ? qn_safe_segment(a, name) : NULL;
+}
+
+/* Visit every heading of the file: count them (v NULL), or fill v. */
+static int md_collect_headings(CBMExtractCtx *ctx, CBMArena *a, md_heading_t *v, int cap) {
+    int n = 0;
+    if (ts_node_is_null(ctx->root)) {
+        return 0;
+    }
+    TSTreeCursor cur = ts_tree_cursor_new(ctx->root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cur);
+        if (is_markdown_heading_kind(ts_node_type(node))) {
+            if (!v) {
+                n++;
+            } else if (n < cap) {
+                const char *seg = md_heading_segment(ctx, a, node);
+                if (seg) {
+                    v[n++] = (md_heading_t){.start = ts_node_start_byte(node),
+                                            .node = node,
+                                            .seg = seg,
+                                            .qn_name = seg};
+                }
+            }
+        } else if (ts_tree_cursor_goto_first_child(&cur)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cur)) {
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                ts_tree_cursor_delete(&cur);
+                return n;
+            }
+        }
+    }
+}
+
+static int md_by_seg(const void *x, const void *y) {
+    return strcmp((*(const md_heading_t *const *)x)->seg, (*(const md_heading_t *const *)y)->seg);
+}
+
+static int md_by_name(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    int c = strcmp(p->qn_name, q->qn_name);
+    return c ? c : (p->start > q->start) - (p->start < q->start);
+}
+
+/* A repeated heading's chain: the names of the headings above it and its own,
+ * dot-joined (its QN segment) and '\n'-joined (its identity: a QN-safe name
+ * holds no whitespace). tree-sitter-markdown nests each heading's `section` in
+ * the section of the heading above it. False on allocation failure. */
+static bool md_heading_chain(CBMExtractCtx *ctx, CBMArena *a, md_heading_t *h) {
+    const char *dotted = h->seg;
+    const char *key = h->seg;
+    TSNode sec = ts_node_parent(h->node);
+    while (!ts_node_is_null(sec) && strcmp(ts_node_type(sec), "section") == 0) {
+        TSNode up = ts_node_parent(sec);
+        if (ts_node_is_null(up) || strcmp(ts_node_type(up), "section") != 0) {
+            break;
+        }
+        const char *above = ts_node_named_child_count(up) > 0
+                                ? md_heading_segment(ctx, a, ts_node_named_child(up, 0))
+                                : NULL;
+        if (above) {
+            dotted = cbm_arena_sprintf(a, "%s.%s", above, dotted);
+            key = cbm_arena_sprintf(a, "%s\n%s", above, key);
+            if (!dotted || !key) {
+                return false;
+            }
+        }
+        sec = up;
+    }
+    h->qn_name = dotted;
+    h->key = key;
+    return true;
+}
+
+static bool md_name_taken(const md_headings_t *hs, const char *name) {
+    for (int i = 0; i < hs->count; i++) {
+        if (strcmp(hs->v[i].qn_name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Within a run of headings that share a final name: a unique heading keeps
+ * it, or else the first chain does; every other chain takes the first free
+ * `~N`. Headings with one chain (the same headings) move together. */
+static bool md_split_run(CBMArena *a, md_headings_t *hs, md_heading_t **run, int n) {
+    const char *keep = run[0]->key; /* NULL: a unique heading keeps the name */
+    for (int i = 0; i < n; i++) {
+        if (!run[i]->repeated) {
+            keep = NULL;
+        }
+    }
+    const char *base = run[0]->qn_name;
+    for (int i = 0; i < n; i++) {
+        md_heading_t *h = run[i];
+        if (!h->repeated || (keep && strcmp(h->key, keep) == 0) || strcmp(h->qn_name, base) != 0) {
+            continue; /* the name's keeper, or a chain already moved */
+        }
+        const char *name = NULL;
+        for (int k = PAIR_LEN; !name || md_name_taken(hs, name); k++) {
+            name = cbm_arena_sprintf(a, "%s~%d", base, k);
+            if (!name) {
+                return false;
+            }
+        }
+        for (int j = i; j < n; j++) {
+            if (run[j]->repeated && strcmp(run[j]->key, h->key) == 0) {
+                run[j]->qn_name = name;
+            }
+        }
+    }
+    return true;
+}
+
+static bool md_settle_names(CBMExtractCtx *ctx, CBMArena *a, md_headings_t *hs) {
+    int n = hs->count;
+    md_heading_t **by = (md_heading_t **)cbm_arena_alloc(a, (size_t)n * sizeof(*by));
+    if (!by) {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        by[i] = &hs->v[i];
+        hs->v[i].qn_name = hs->v[i].seg;
+    }
+    qsort(by, (size_t)n, sizeof(*by), md_by_seg);
+    for (int i = 1; i < n; i++) {
+        if (strcmp(by[i]->seg, by[i - SKIP_ONE]->seg) == 0) {
+            by[i]->repeated = by[i - SKIP_ONE]->repeated = true;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (hs->v[i].repeated && !md_heading_chain(ctx, a, &hs->v[i])) {
+            return false;
+        }
+    }
+    qsort(by, (size_t)n, sizeof(*by), md_by_name);
+    for (int i = 0; i < n;) {
+        int j = i + SKIP_ONE;
+        while (j < n && strcmp(by[j]->qn_name, by[i]->qn_name) == 0) {
+            j++;
+        }
+        if (j - i > SKIP_ONE && !md_split_run(a, hs, by + i, j - i)) {
+            return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+static const md_headings_t *md_headings(CBMExtractCtx *ctx) {
+    if (ctx->md_headings) {
+        return (const md_headings_t *)ctx->md_headings;
+    }
+    CBMArena *a = doc_scratch(ctx);
+    md_headings_t *hs = (md_headings_t *)cbm_arena_alloc(a, sizeof(*hs));
+    if (!hs) {
+        return NULL;
+    }
+    int cap = md_collect_headings(ctx, a, NULL, 0);
+    hs->v = cap > 0 ? (md_heading_t *)cbm_arena_alloc(a, (size_t)cap * sizeof(md_heading_t)) : NULL;
+    hs->count = hs->v ? md_collect_headings(ctx, a, hs->v, cap) : 0;
+    if (hs->count > SKIP_ONE && !md_settle_names(ctx, a, hs)) {
+        hs->count = 0; /* every heading keeps its own name, as before */
+    }
+    ctx->md_headings = hs;
+    return hs;
+}
+
+/* The QN segment of a heading: its own name unless the file's names say
+ * otherwise. */
+static const char *md_heading_qn_name(CBMExtractCtx *ctx, TSNode heading, const char *seg) {
+    const md_headings_t *hs = md_headings(ctx);
+    uint32_t start = ts_node_start_byte(heading);
+    int lo = 0;
+    int hi = hs ? hs->count : 0;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (hs->v[mid].start < start) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    if (hs && lo < hs->count && hs->v[lo].start == start && strcmp(hs->v[lo].seg, seg) == 0) {
+        return hs->v[lo].qn_name;
+    }
+    return seg;
 }
 
 // INI: extract section name from section node.
@@ -7246,7 +7478,10 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         return false;
     }
 
-    if (name && name[0]) {
+    if (name && name[0] && ctx->language == CBM_LANG_MARKDOWN) {
+        const char *seg = qn_safe_segment(a, name);
+        push_class_def_qn(ctx, node, name, md_heading_qn_name(ctx, node, seg), label, docstring);
+    } else if (name && name[0]) {
         push_simple_class_def_doc(ctx, node, name, label, docstring);
     }
     return true;
