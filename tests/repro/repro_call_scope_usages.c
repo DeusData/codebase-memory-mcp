@@ -147,6 +147,50 @@ static CBMFileResult *extract_case(const char *tag, const char *source, CBMLangu
         }                                                                                      \
     } while (0)
 
+static void check_anonymous_callback_calls(const char *tag, const char *source,
+                                           CBMLanguage language, const char *filename,
+                                           int *failure_count) {
+    int failures = 0;
+    CBMFileResult *r = extract_case(tag, source, language, filename);
+    if (!r) {
+        (*failure_count)++;
+        return;
+    }
+    CHECK_CLEAN(tag, r);
+    CHECK_COUNT(tag, "registrar_dispatcher_call", call_count(r, "registrar", "dispatcher"), 1);
+    CHECK_COUNT(tag, "anonymous_body_not_registrar_call", call_count(r, "registrar", "target"), 0);
+    CHECK_COUNT(tag, "dispatcher_direct_call", call_count(r, "dispatcher", "target"), 1);
+    cbm_free_result(r);
+    *failure_count += failures;
+}
+
+TEST(repro_call_scope_anonymous_callbacks_do_not_inherit_registrar) {
+    static const char cpp[] = "void target() {}\n"
+                              "void dispatcher() { target(); }\n"
+                              "void registrar() { dispatcher([]() { target(); }); }\n";
+    static const char javascript[] = "function target() {}\n"
+                                     "function dispatcher(callback) { target(); callback(); }\n"
+                                     "function registrar() { dispatcher(() => { target(); }); }\n";
+    static const char python[] = "def target():\n"
+                                 "    pass\n"
+                                 "def dispatcher(callback):\n"
+                                 "    target()\n"
+                                 "    callback()\n"
+                                 "def registrar():\n"
+                                 "    dispatcher(lambda: target())\n";
+    static const char rust[] = "fn target() {}\n"
+                               "fn dispatcher(callback: impl Fn()) { target(); callback(); }\n"
+                               "fn registrar() { dispatcher(|| { target(); }); }\n";
+    int failures = 0;
+    check_anonymous_callback_calls("anonymous_cpp", cpp, CBM_LANG_CPP, "main.cpp", &failures);
+    check_anonymous_callback_calls("anonymous_javascript", javascript, CBM_LANG_JAVASCRIPT,
+                                   "main.js", &failures);
+    check_anonymous_callback_calls("anonymous_python", python, CBM_LANG_PYTHON, "main.py", &failures);
+    check_anonymous_callback_calls("anonymous_rust", rust, CBM_LANG_RUST, "main.rs", &failures);
+    ASSERT_EQ(failures, 0);
+    PASS();
+}
+
 /* The two textual `foo` occurrences have different roles: the first is the
  * invoked callee, while the second is a function value passed as an argument. */
 TEST(repro_call_scope_same_spelling_callee_and_argument) {
@@ -656,6 +700,7 @@ SUITE(repro_call_scope_usages) {
     RUN_TEST(repro_call_scope_same_spelling_callee_and_argument);
     RUN_TEST(repro_call_scope_nested_calls_retain_each_argument);
     RUN_TEST(repro_call_scope_inline_callback_body_usage);
+    RUN_TEST(repro_call_scope_anonymous_callbacks_do_not_inherit_registrar);
     RUN_TEST(repro_call_scope_member_and_computed_components);
     RUN_TEST(repro_call_scope_constructor_and_generic_arguments);
     RUN_TEST(repro_call_scope_c_function_pointer_invocation_and_arguments);
