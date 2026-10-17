@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             goos: linux
             goarch: amd64
             cc: gcc
