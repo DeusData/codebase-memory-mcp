@@ -2536,6 +2536,117 @@ TEST(pipeline_js_route_not_bound_to_python_builtin_incremental) {
     PASS();
 }
 
+/* FD1: a method defined in another file than its type must get its
+ * DEFINES_METHOD edge on every venue. The sequential definitions pass linked
+ * the edge while it was still registering files, so a method whose type lived
+ * in a file the directory walk returns LATER found no parent: on helm and
+ * prometheus the sequential venue (CBM_WORKERS=1) lost 236 DEFINES_METHOD
+ * edges, and the IMPLEMENTS / OVERRIDE edges derived from them, that the
+ * parallel venue keeps. Each of the two files holds one type and the method of
+ * the OTHER file's type, so whichever order the walk returns them in, one
+ * method precedes its type: the case fails without depending on directory
+ * order. */
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int alpha_method; /* FdmAlpha -[DEFINES_METHOD]-> FdmAlphaGet */
+    int beta_method;  /* FdmBeta -[DEFINES_METHOD]-> FdmBetaGet */
+} CrossFileMethodObservation;
+
+static const char FDM_X_GO[] = "package fdm\n"
+                               "\n"
+                               "type FdmBeta struct{ n int }\n"
+                               "\n"
+                               "func (a *FdmAlpha) FdmAlphaGet() int { return a.n }\n";
+
+static const char FDM_Y_GO[] = "package fdm\n"
+                               "\n"
+                               "type FdmAlpha struct{ n int }\n"
+                               "\n"
+                               "func (b *FdmBeta) FdmBetaGet() int { return b.n }\n";
+
+static int write_cross_file_method_fixture(const char *dir, int pad) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/x.go", dir);
+    if (th_write_file(path, FDM_X_GO) != 0) {
+        return -1;
+    }
+    snprintf(path, sizeof(path), "%s/y.go", dir);
+    if (th_write_file(path, FDM_Y_GO) != 0) {
+        return -1;
+    }
+    for (int i = 0; i < pad; i++) {
+        char source[128];
+        snprintf(path, sizeof(path), "%s/fdm_pad_%02d.go", dir, i);
+        snprintf(source, sizeof(source), "package fdm\n\nfunc fdmPad%02d() int { return %d }\n", i,
+                 i);
+        if (th_write_file(path, source) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static CrossFileMethodObservation run_cross_file_method_case(bool parallel, int pad) {
+    CrossFileMethodObservation o = {.run_rc = -1, .alpha_method = -1, .beta_method = -1};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fd1_method_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return o;
+    }
+    if (write_cross_file_method_fixture(tmp, pad) == 0) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/fdm.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o.run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            o.store_opened = store != NULL;
+            if (store && project) {
+                o.alpha_method =
+                    named_edge_count(store, project, "DEFINES_METHOD", "FdmAlpha", "FdmAlphaGet");
+                o.beta_method =
+                    named_edge_count(store, project, "DEFINES_METHOD", "FdmBeta", "FdmBetaGet");
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return o;
+}
+
+TEST(pipeline_cross_file_method_defines_method_sequential) {
+    CrossFileMethodObservation o = run_cross_file_method_case(false, 0);
+    ASSERT_EQ(o.run_rc, 0);
+    ASSERT_TRUE(o.store_opened);
+    ASSERT_EQ(o.alpha_method, 1);
+    ASSERT_EQ(o.beta_method, 1);
+    PASS();
+}
+
+/* The same input through both resolvers: 55 fillers exceed
+ * MIN_FILES_FOR_PARALLEL, CBM_INDEX_SINGLE_THREAD keeps the first run
+ * sequential and CBM_WORKERS sends the second through pass_parallel.c. */
+TEST(pipeline_cross_file_method_defines_method_venue_parity) {
+    CrossFileMethodObservation seq = run_cross_file_method_case(false, 55);
+    CrossFileMethodObservation par = run_cross_file_method_case(true, 55);
+    ASSERT_EQ(seq.run_rc, 0);
+    ASSERT_EQ(par.run_rc, 0);
+    ASSERT_TRUE(seq.store_opened);
+    ASSERT_TRUE(par.store_opened);
+    ASSERT_EQ(par.alpha_method, 1);
+    ASSERT_EQ(par.beta_method, 1);
+    ASSERT_EQ(seq.alpha_method, par.alpha_method);
+    ASSERT_EQ(seq.beta_method, par.beta_method);
+    PASS();
+}
+
 static bool test_buffer_appendf(char *buffer, size_t capacity, size_t *used, const char *format,
                                 ...) {
     if (!buffer || !used || *used >= capacity) {
@@ -23593,6 +23704,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_parallel);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_incremental);
+    RUN_TEST(pipeline_cross_file_method_defines_method_sequential);
+    RUN_TEST(pipeline_cross_file_method_defines_method_venue_parity);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
     RUN_TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker);
