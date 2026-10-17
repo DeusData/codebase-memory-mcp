@@ -22,7 +22,9 @@
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/str_util.h"
+#include "foundation/json_writer.h" /* cbm_json_writer_allocator */
 #include "graph_buffer/graph_buffer.h"
+#include "pipeline/helm_template.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "cbm.h"
@@ -249,6 +251,402 @@ static bool tf_plain_name(const char *s) {
 }
 
 /* One `resource "helm_release" "<name>" { ... }` block. */
+/* ── helm_release values (for pass_k8s.c's release images) ────────── */
+
+/* The expression inside wrapper nodes. */
+static TSNode tf_unwrap(TSNode n) {
+    while (tf_type(n, "expression") || tf_type(n, "literal_value") ||
+           tf_type(n, "collection_value") || tf_type(n, "template_expr")) {
+        if (ts_node_named_child_count(n) != SKIP_ONE) {
+            break;
+        }
+        n = ts_node_named_child(n, 0);
+    }
+    return n;
+}
+
+/* A heredoc's text (a `<<-` one dedented); NULL when it interpolates. */
+static char *tf_heredoc(const tf_t *t, TSNode n) {
+    TSNode open = {0};
+    TSNode close = {0};
+    bool dedent = false;
+    for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
+        TSNode c = ts_node_named_child(n, i);
+        if (tf_type(c, "heredoc_start")) {
+            uint32_t b = ts_node_start_byte(c);
+            dedent = ts_node_end_byte(c) - b >= 3 && t->src[b + PAIR_LEN] == '-';
+        } else if (tf_type(c, "heredoc_identifier")) {
+            if (ts_node_is_null(open)) {
+                open = c;
+            } else {
+                close = c;
+            }
+        } else if (!tf_type(c, "template_literal")) {
+            return NULL; /* an interpolation or a directive: no literal */
+        }
+    }
+    if (ts_node_is_null(open) || ts_node_is_null(close)) {
+        return NULL;
+    }
+    const char *b = t->src + ts_node_end_byte(open);
+    const char *e = t->src + ts_node_start_byte(close);
+    const char *nl = memchr(b, '\n', (size_t)(e - b));
+    b = nl ? nl + SKIP_ONE : e;
+    while (e > b && e[-1] != '\n') {
+        e--; /* the closing line's indentation */
+    }
+    size_t indent = (size_t)-1;
+    for (const char *p = b; dedent && p < e;) {
+        const char *le = memchr(p, '\n', (size_t)(e - p));
+        le = le ? le : e;
+        size_t sp = 0;
+        while (p + sp < le && (p[sp] == ' ' || p[sp] == '\t')) {
+            sp++;
+        }
+        if (p + sp < le && sp < indent) {
+            indent = sp;
+        }
+        p = le + (le < e ? SKIP_ONE : 0);
+    }
+    if (!dedent || indent == (size_t)-1) {
+        indent = 0;
+    }
+    char *out = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)(e - b) + SKIP_ONE);
+    size_t k = 0;
+    for (const char *p = b; out && p < e;) {
+        const char *le = memchr(p, '\n', (size_t)(e - p));
+        le = le ? le + SKIP_ONE : e;
+        size_t skip = 0;
+        while (skip < indent && p + skip < le && (p[skip] == ' ' || p[skip] == '\t')) {
+            skip++;
+        }
+        memcpy(out + k, p + skip, (size_t)(le - p) - skip);
+        k += (size_t)(le - p) - skip;
+        p = le;
+    }
+    if (out) {
+        out[k] = '\0';
+    }
+    return out;
+}
+
+/* An HCL literal as JSON: a string without interpolation, a number, a bool,
+ * null, a tuple or object of those; NULL: anything else. */
+static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
+    n = tf_unwrap(n);
+    if (tf_type(n, "string_lit") || tf_type(n, "quoted_template")) {
+        char buf[CBM_SZ_4K];
+        size_t len = 0;
+        buf[0] = '\0';
+        for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
+            TSNode c = ts_node_named_child(n, i);
+            if (tf_type(c, "quoted_template_start") || tf_type(c, "quoted_template_end")) {
+                continue;
+            }
+            if (!tf_type(c, "template_literal")) {
+                return NULL;
+            }
+            uint32_t b = ts_node_start_byte(c);
+            if (!tf_add(buf, sizeof(buf), &len, t->src + b, ts_node_end_byte(c) - b)) {
+                return NULL;
+            }
+        }
+        size_t k = 0; /* \" \\ \n \t */
+        for (size_t i = 0; i < len; i++) {
+            if (buf[i] == '\\' && i + SKIP_ONE < len) {
+                char c = buf[++i];
+                buf[k++] = c == 'n' ? '\n' : c == 't' ? '\t' : c;
+            } else {
+                buf[k++] = buf[i];
+            }
+        }
+        return yyjson_mut_strncpy(doc, buf, k);
+    }
+    if (tf_type(n, "heredoc_template")) {
+        char *s = tf_heredoc(t, n);
+        yyjson_mut_val *v = s ? yyjson_mut_strcpy(doc, s) : NULL;
+        cbm_free(CBM_MEM_CLASS_OTHER, s);
+        return v;
+    }
+    uint32_t b = ts_node_start_byte(n);
+    uint32_t e = ts_node_end_byte(n);
+    if (tf_type(n, "numeric_lit")) {
+        char buf[CBM_SZ_64];
+        snprintf(buf, sizeof(buf), "%.*s", (int)(e - b), t->src + b);
+        return yyjson_mut_real(doc, strtod(buf, NULL));
+    }
+    if (tf_type(n, "bool_lit")) {
+        return yyjson_mut_bool(doc, e - b == strlen("true") && strncmp(t->src + b, "true", 4) == 0);
+    }
+    if (tf_type(n, "null_lit")) {
+        return yyjson_mut_null(doc);
+    }
+    if (tf_type(n, "tuple")) {
+        yyjson_mut_val *arr = yyjson_mut_arr(doc);
+        for (uint32_t i = 0; arr && i < ts_node_named_child_count(n); i++) {
+            TSNode c = ts_node_named_child(n, i);
+            if (tf_type(c, "tuple_start") || tf_type(c, "tuple_end")) {
+                continue;
+            }
+            yyjson_mut_val *v = tf_json(t, doc, c);
+            if (!v) {
+                return NULL;
+            }
+            yyjson_mut_arr_append(arr, v);
+        }
+        return arr;
+    }
+    if (tf_type(n, "object")) {
+        yyjson_mut_val *obj = yyjson_mut_obj(doc);
+        for (uint32_t i = 0; obj && i < ts_node_named_child_count(n); i++) {
+            TSNode c = ts_node_named_child(n, i);
+            if (!tf_type(c, "object_elem")) {
+                continue;
+            }
+            TSNode kn = tf_unwrap(ts_node_child_by_field_name(c, "key", (uint32_t)strlen("key")));
+            TSNode vn = ts_node_child_by_field_name(c, "val", (uint32_t)strlen("val"));
+            yyjson_mut_val *key = NULL;
+            if (tf_type(kn, "variable_expr") && ts_node_named_child_count(kn) == SKIP_ONE) {
+                TSNode id = ts_node_named_child(kn, 0);
+                uint32_t kb = ts_node_start_byte(id);
+                key = yyjson_mut_strncpy(doc, t->src + kb, ts_node_end_byte(id) - kb);
+            } else {
+                key = tf_json(t, doc, kn);
+            }
+            yyjson_mut_val *val = tf_json(t, doc, vn);
+            if (!key || !yyjson_mut_is_str(key) || !val) {
+                return NULL;
+            }
+            (void)yyjson_mut_obj_put(obj, key, val);
+        }
+        return obj;
+    }
+    return NULL;
+}
+
+/* A repository file's text (cbm_alloc), NULL when unreadable. */
+static char *tf_read_repo(const tf_t *t, const char *path, size_t *len) {
+    char full[CBM_SZ_4K];
+    snprintf(full, sizeof(full), "%s/%s", t->ctx->repo_path, path);
+    FILE *f = cbm_fopen(full, "rb");
+    if (!f) {
+        return NULL;
+    }
+    char *buf = NULL;
+    size_t cap = 0;
+    char chunk[CBM_SZ_4K];
+    size_t r;
+    *len = 0;
+    while ((r = fread(chunk, SKIP_ONE, sizeof(chunk), f)) > 0) {
+        if (*len + r + SKIP_ONE > cap) {
+            cap = (*len + r + SKIP_ONE) * PAIR_LEN;
+            char *g = cbm_realloc(CBM_MEM_CLASS_OTHER, buf, cap);
+            if (!g) {
+                cbm_free(CBM_MEM_CLASS_OTHER, buf);
+                (void)fclose(f);
+                return NULL;
+            }
+            buf = g;
+        }
+        memcpy(buf + *len, chunk, r);
+        *len += r;
+    }
+    (void)fclose(f);
+    if (buf) {
+        buf[*len] = '\0';
+    }
+    return buf;
+}
+
+/* A `values = [...]` item as values: a YAML string / heredoc, file(<path>)
+ * of a repository file, yamlencode / jsonencode of a literal; NULL: none of
+ * those. */
+static yyjson_mut_val *tf_values_item(const tf_t *t, yyjson_mut_doc *doc, TSNode item, CBMArena *a,
+                                      const char ***files, int *nfiles) {
+    TSNode n = tf_unwrap(item);
+    if (tf_type(n, "function_call")) {
+        TSNode fn = ts_node_named_child(n, 0);
+        TSNode args = {0};
+        for (uint32_t i = 0; i < ts_node_named_child_count(n); i++) {
+            if (tf_type(ts_node_named_child(n, i), "function_arguments")) {
+                args = ts_node_named_child(n, i);
+            }
+        }
+        if (ts_node_is_null(fn) || ts_node_is_null(args) ||
+            ts_node_named_child_count(args) != SKIP_ONE) {
+            return NULL;
+        }
+        uint32_t fb = ts_node_start_byte(fn);
+        size_t fl = ts_node_end_byte(fn) - fb;
+        TSNode arg = ts_node_named_child(args, 0);
+        if ((fl == strlen("yamlencode") && strncmp(t->src + fb, "yamlencode", fl) == 0) ||
+            (fl == strlen("jsonencode") && strncmp(t->src + fb, "jsonencode", fl) == 0)) {
+            return tf_json(t, doc, arg);
+        }
+        if (fl == strlen("file") && strncmp(t->src + fb, "file", fl) == 0) {
+            char v[CBM_SZ_1K];
+            char path[CBM_SZ_1K];
+            if (!t->ctx->repo_path || !tf_string(t->src, t->mdir, arg, v, sizeof(v)) ||
+                !tf_repo_path(t->mdir, v, path, sizeof(path))) {
+                return NULL;
+            }
+            const char **grown = cbm_arena_alloc(a, (size_t)(*nfiles + SKIP_ONE) * sizeof(*grown));
+            if (grown) {
+                if (*nfiles) {
+                    memcpy(grown, *files, (size_t)*nfiles * sizeof(*grown));
+                }
+                grown[(*nfiles)++] = cbm_arena_strdup(a, path);
+                *files = grown;
+            }
+            size_t len = 0;
+            char *buf = tf_read_repo(t, path, &len);
+            yyjson_mut_val *out = buf ? cbm_helm_values_parse(doc, buf, len) : NULL;
+            cbm_free(CBM_MEM_CLASS_OTHER, buf);
+            return out;
+        }
+        return NULL;
+    }
+    yyjson_mut_val *s = tf_json(t, doc, n);
+    return yyjson_mut_is_str(s)
+               ? cbm_helm_values_parse(doc, yyjson_mut_get_str(s), yyjson_mut_get_len(s))
+               : NULL;
+}
+
+/* A `set` entry (name / value / type) applied to root; false when it is no
+ * literal. */
+static bool tf_set_entry(yyjson_mut_doc *doc, yyjson_mut_val *root, yyjson_mut_val *entry) {
+    yyjson_mut_val *nm = yyjson_mut_obj_get(entry, "name");
+    yyjson_mut_val *val = yyjson_mut_obj_get(entry, "value");
+    yyjson_mut_val *ty = yyjson_mut_obj_get(entry, "type");
+    if (!yyjson_mut_is_str(nm) || !val) {
+        return false;
+    }
+    char vbuf[CBM_SZ_64];
+    const char *v = NULL;
+    if (yyjson_mut_is_str(val)) {
+        v = yyjson_mut_get_str(val);
+    } else if (yyjson_mut_is_real(val)) {
+        snprintf(vbuf, sizeof(vbuf), "%.17g", yyjson_mut_get_real(val));
+        v = vbuf;
+    } else if (yyjson_mut_is_bool(val)) {
+        v = yyjson_mut_get_bool(val) ? "true" : "false";
+    }
+    bool as_string = yyjson_mut_is_str(ty) && strcmp(yyjson_mut_get_str(ty), "string") == 0;
+    return v && cbm_helm_values_set(doc, root, yyjson_mut_get_str(nm), v, as_string);
+}
+
+/* A `set` block's attributes as an object; NULL when one is no literal. */
+static yyjson_mut_val *tf_set_block(const tf_t *t, yyjson_mut_doc *doc, TSNode block) {
+    yyjson_mut_val *entry = yyjson_mut_obj(doc);
+    for (uint32_t j = 0; entry && j < ts_node_named_child_count(block); j++) {
+        TSNode sb = ts_node_named_child(block, j);
+        if (!tf_type(sb, "body")) {
+            continue;
+        }
+        for (uint32_t k = 0; k < ts_node_named_child_count(sb); k++) {
+            TSNode at = ts_node_named_child(sb, k);
+            if (!tf_type(at, "attribute") || ts_node_named_child_count(at) < PAIR_LEN) {
+                continue;
+            }
+            TSNode key = ts_node_named_child(at, 0);
+            uint32_t b = ts_node_start_byte(key);
+            yyjson_mut_val *v = tf_json(t, doc, ts_node_named_child(at, SKIP_ONE));
+            if (!v) {
+                return NULL;
+            }
+            yyjson_mut_obj_add(entry,
+                               yyjson_mut_strncpy(doc, t->src + b, ts_node_end_byte(key) - b), v);
+        }
+    }
+    return entry;
+}
+
+/* The values a helm_release body gives its chart -- `values` items
+ * coalesced in order, then each `set` -- as JSON (cbm_alloc); NULL when a
+ * part is no literal. set_sensitive is never read. */
+static char *tf_release_values(const tf_t *t, TSNode body, const char ***files, int *nfiles) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(cbm_json_writer_allocator());
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    bool ok = root != NULL;
+    for (int pass = 0; ok && pass < PAIR_LEN; pass++) {
+        for (uint32_t i = 0; ok && i < ts_node_named_child_count(body); i++) {
+            TSNode a = ts_node_named_child(body, i);
+            TSNode key = ts_node_named_child(a, 0);
+            uint32_t kb = ts_node_is_null(key) ? 0 : ts_node_start_byte(key);
+            size_t kl = ts_node_is_null(key) ? 0 : ts_node_end_byte(key) - kb;
+            bool is_set = kl == strlen("set") && strncmp(t->src + kb, "set", kl) == 0;
+            bool is_values = kl == strlen("values") && strncmp(t->src + kb, "values", kl) == 0;
+            /* set_list values are not read: the release's values are partial */
+            if (kl == strlen("set_list") && strncmp(t->src + kb, "set_list", kl) == 0) {
+                ok = false;
+                break;
+            }
+            if (pass == 0 && is_values && tf_type(a, "attribute")) {
+                TSNode list = tf_unwrap(ts_node_named_child(a, SKIP_ONE));
+                ok = tf_type(list, "tuple");
+                for (uint32_t j = 0; ok && j < ts_node_named_child_count(list); j++) {
+                    TSNode it = ts_node_named_child(list, j);
+                    if (tf_type(it, "tuple_start") || tf_type(it, "tuple_end")) {
+                        continue;
+                    }
+                    yyjson_mut_val *v = tf_values_item(t, doc, it, t->arena, files, nfiles);
+                    ok = v && yyjson_mut_is_obj(v);
+                    root = ok ? cbm_helm_values_coalesce(doc, root, v) : root;
+                }
+            } else if (pass == SKIP_ONE && is_set && tf_type(a, "block")) {
+                yyjson_mut_val *entry = tf_set_block(t, doc, a);
+                ok = entry && tf_set_entry(doc, root, entry);
+            } else if (pass == SKIP_ONE && is_set && tf_type(a, "attribute")) {
+                /* provider v3: set = [{ name, value, type }, ...] */
+                yyjson_mut_val *list = tf_json(t, doc, ts_node_named_child(a, SKIP_ONE));
+                ok = yyjson_mut_is_arr(list);
+                size_t idx, max;
+                yyjson_mut_val *entry;
+                yyjson_mut_arr_foreach(list, idx, max, entry) {
+                    ok = ok && tf_set_entry(doc, root, entry);
+                }
+            }
+        }
+    }
+    char *out = NULL;
+    if (ok) {
+        size_t len = 0;
+        out = yyjson_mut_val_write_opts(root, 0, cbm_json_writer_allocator(), &len, NULL);
+    }
+    if (doc) {
+        yyjson_mut_doc_free(doc);
+    }
+    return out;
+}
+
+static void tf_release_push(tf_t *t, int64_t src, int64_t chart, TSNode body) {
+    cbm_pipeline_ctx_t *ctx = t->ctx;
+    if (ctx->tf_release_n == ctx->tf_release_cap) {
+        int cap = ctx->tf_release_cap ? ctx->tf_release_cap * PAIR_LEN : CBM_SZ_16;
+        cbm_tf_release_t *g =
+            cbm_realloc(CBM_MEM_CLASS_OTHER, ctx->tf_releases, (size_t)cap * sizeof(*g));
+        if (!g) {
+            return;
+        }
+        ctx->tf_releases = g;
+        ctx->tf_release_cap = cap;
+    }
+    const char **files = NULL;
+    int nfiles = 0;
+    ctx->tf_releases[ctx->tf_release_n++] =
+        (cbm_tf_release_t){src, chart, tf_release_values(t, body, &files, &nfiles)};
+    /* the values files it reads, like a kustomization's valuesFile: an edit of
+     * one alone renders the release again (pipeline_incremental.c) */
+    for (int i = 0; i < nfiles; i++) {
+        const char *mqn = cbm_fqn_module(t->arena, ctx->project_name, files[i]);
+        const cbm_gbuf_node_t *mod = mqn ? cbm_gbuf_find_by_qn(ctx->gbuf, mqn) : NULL;
+        if (mod && mod->id != src) {
+            cbm_gbuf_insert_edge(ctx->gbuf, src, mod->id, "IMPORTS", "{\"local_name\":\"values\"}");
+            t->edges++;
+        }
+    }
+}
+
 static void tf_helm_release(tf_t *t, TSNode block, const char *name) {
     TSNode body = {0};
     for (uint32_t i = 0; i < ts_node_named_child_count(block); i++) {
@@ -320,6 +718,7 @@ static void tf_helm_release(tf_t *t, TSNode block, const char *name) {
              external ? ",\"external\":true" : "", (int)ts_node_start_point(block).row + SKIP_ONE);
     cbm_gbuf_insert_edge(t->ctx->gbuf, src, tgt, "DEPLOYS", props);
     t->edges++;
+    tf_release_push(t, src, tgt, body);
 }
 
 /* The text of a string_lit label: "helm_release" -> helm_release. */

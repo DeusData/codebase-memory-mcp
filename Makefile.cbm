@@ -537,6 +537,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
+    src/pipeline/helm_template.c \
     src/pipeline/pass_operator.c \
     src/pipeline/pass_shell.c \
     src/pipeline/pass_terraform.c \

@@ -15,6 +15,7 @@
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/helm_template.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
 #include "semantic/semantic.h"
@@ -4202,6 +4203,135 @@ TEST(incremental_helm_values_edit_keeps_chart_edge) {
     ASSERT_EQ(before, 1);
     ASSERT_EQ(after, 1);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A werf `.helm` dir is a chart without Chart.yaml (pass_k8s.c): its values
+ * file CONFIGURES the werf Chart, an edge a closure repair of the values file
+ * alone does not hold, so the edit rebuilds, like one beside a Chart.yaml. */
+TEST(incremental_werf_values_edit_keeps_chart_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_werfchart_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "werf.yaml", "project: site\nconfigVersion: 1\n");
+    write_temp_file(tmp, ".helm/values.yaml", "replicas: 1\n");
+    write_temp_file(tmp, ".helm/templates/svc.yaml",
+                    "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/werfchart.db", tmp);
+    static const char edge[] =
+        "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+        "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.file_path='.helm/values.yaml' AND "
+        "t.label='Chart' AND t.name='site'";
+    int before = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, edge) : -1;
+    write_temp_file(tmp, ".helm/values.yaml", "replicas: 3\n");
+    int after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, edge) : -1;
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    ASSERT_EQ(before, 1);
+    ASSERT_EQ(after, 1);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    PASS();
+}
+
+/* A kustomization's helmCharts valuesFile (an IMPORTS {local_name:
+ * valuesFile} target) feeds the image the release renders: the values file
+ * edited alone rebuilds, and the release's image follows the edit. */
+TEST(incremental_release_values_edit_rebuilds) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_relvalues_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "kz/kustomization.yaml",
+                    "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
+                    "helmCharts:\n  - name: app\n    releaseName: kapp\n"
+                    "    valuesFile: values-prod.yaml\n");
+    write_temp_file(tmp, "kz/values-prod.yaml", "image:\n  tag: \"2.0\"\n");
+    write_temp_file(tmp, "kz/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n");
+    write_temp_file(tmp, "kz/charts/app/values.yaml",
+                    "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n");
+    write_temp_file(tmp, "kz/charts/app/templates/deploy.yaml",
+                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n"
+                    "  template:\n    spec:\n      containers:\n        - name: app\n"
+                    "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/relvalues.db", tmp);
+    static const char v2[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS' AND "
+                             "json_extract(properties,'$.image')='ghcr.io/acme/app:2.0'";
+    static const char v3[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS' AND "
+                             "json_extract(properties,'$.image')='ghcr.io/acme/app:3.0'";
+    int before = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, v2) : -1;
+    write_temp_file(tmp, "kz/values-prod.yaml", "image:\n  tag: \"3.0\"\n");
+    int rc = k8s_inc_index(tmp, db_path);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    int stale = rc == 0 ? k8s_inc_count(db_path, v2) : -1;
+    int after = rc == 0 ? k8s_inc_count(db_path, v3) : -1;
+    th_rmtree(tmp);
+    ASSERT_EQ(before, 1);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(stale, 0);
+    ASSERT_EQ(after, 1);
+    PASS();
+}
+
+/* Helm's values as its templates see them (helm_template.c): go-yaml v2
+ * scalars -- YAML 1.1 booleans, every number a float64 printed like Go's %v
+ * -- --set typing (int64, bool, null, a leading-zero string), coalesce where
+ * a null deletes, and a field of a missing map an error: no value. */
+TEST(helm_values_follow_helm_semantics) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    ASSERT_NOT_NULL(doc);
+    static const char src[] = "tag: 1.10\nbig: 20231010\nm: 1000000\nyes_: yes\noff_: Off\n"
+                              "nul: ~\nq: \"1.10\"\noct: 0755\nkeep: k\ngone: g\n";
+    yyjson_mut_val *v = cbm_helm_values_parse(doc, src, strlen(src));
+    ASSERT_NOT_NULL(v);
+    char buf[64];
+    ASSERT_TRUE(cbm_helm_scalar_text(yyjson_mut_obj_get(v, "tag"), buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "1.1");
+    ASSERT_TRUE(cbm_helm_scalar_text(yyjson_mut_obj_get(v, "big"), buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "2.023101e+07");
+    ASSERT_TRUE(cbm_helm_scalar_text(yyjson_mut_obj_get(v, "m"), buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "1e+06");
+    ASSERT_TRUE(cbm_helm_scalar_text(yyjson_mut_obj_get(v, "oct"), buf, sizeof(buf)));
+    ASSERT_STR_EQ(buf, "493");
+    ASSERT_TRUE(yyjson_mut_is_true(yyjson_mut_obj_get(v, "yes_")));
+    ASSERT_TRUE(yyjson_mut_is_false(yyjson_mut_obj_get(v, "off_")));
+    ASSERT_TRUE(yyjson_mut_is_null(yyjson_mut_obj_get(v, "nul")));
+    ASSERT_STR_EQ(yyjson_mut_get_str(yyjson_mut_obj_get(v, "q")), "1.10");
+    ASSERT_TRUE(cbm_helm_values_set(doc, v, "a\\.b.c[1]", "007", false));
+    ASSERT_TRUE(cbm_helm_values_set(doc, v, "n", "42", false));
+    ASSERT_TRUE(cbm_helm_values_set(doc, v, "s", "42", true));
+    yyjson_mut_val *ab = yyjson_mut_obj_get(v, "a.b");
+    ASSERT_NOT_NULL(ab);
+    yyjson_mut_val *c = yyjson_mut_obj_get(ab, "c");
+    ASSERT_TRUE(yyjson_mut_is_arr(c));
+    ASSERT_TRUE(yyjson_mut_is_null(yyjson_mut_arr_get(c, 0)));
+    ASSERT_STR_EQ(yyjson_mut_get_str(yyjson_mut_arr_get(c, 1)), "007");
+    ASSERT_TRUE(yyjson_mut_is_int(yyjson_mut_obj_get(v, "n")));
+    ASSERT_TRUE(yyjson_mut_is_str(yyjson_mut_obj_get(v, "s")));
+    static const char over[] = "gone: null\nkeep: x\nnew: 1\n";
+    yyjson_mut_val *o = cbm_helm_values_parse(doc, over, strlen(over));
+    yyjson_mut_val *m = cbm_helm_values_coalesce(doc, v, o);
+    ASSERT_NULL(yyjson_mut_obj_get(m, "gone"));
+    ASSERT_STR_EQ(yyjson_mut_get_str(yyjson_mut_obj_get(m, "keep")), "x");
+    ASSERT_NOT_NULL(yyjson_mut_obj_get(m, "new"));
+    ASSERT_STR_EQ(yyjson_mut_get_str(yyjson_mut_obj_get(v, "keep")), "k"); /* base untouched */
+    /* a template: a missing last key renders "", a field of it is an error */
+    static const char tpl[] = "image: \"{{ .Values.keep }}:{{ .Values.none }}\"\n"
+                              "image: \"{{ .Values.none.repo }}\"\n";
+    CBMArena a;
+    cbm_arena_init_lazy(&a, CBM_SZ_4K);
+    cbm_helm_probe_t probes[2] = {{.line = 1}, {.line = 2}};
+    cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, NULL, probes, 2);
+    ASSERT_EQ(probes[0].n, 1);
+    ASSERT_STR_EQ(probes[0].image[0], "k:");
+    ASSERT_EQ(probes[1].n, 1);
+    ASSERT_NULL(probes[1].image[0]);
+    cbm_arena_destroy(&a);
+    yyjson_mut_doc_free(doc);
     PASS();
 }
 
@@ -23930,6 +24060,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_env_edit_replaces_scoped_envvars);
     RUN_TEST(incremental_image_split_change_rebuilds);
     RUN_TEST(incremental_helm_values_edit_keeps_chart_edge);
+    RUN_TEST(incremental_werf_values_edit_keeps_chart_edge);
+    RUN_TEST(incremental_release_values_edit_rebuilds);
+    RUN_TEST(helm_values_follow_helm_semantics);
     RUN_TEST(incremental_compose_dotenv_change_rebuilds);
     RUN_TEST(incremental_dockerfile_edit_keeps_docker_build_edges);
     RUN_TEST(incremental_second_build_declarer_keeps_the_edge);

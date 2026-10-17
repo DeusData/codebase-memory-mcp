@@ -4445,6 +4445,7 @@ static char *gpf_chart_edges(const GpfFile *files, int nfiles) {
             "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT CASE WHEN "
             "s.label='File' THEN s.file_path ELSE s.name END || ' -> ' || t.label || ':' || "
             "t.name || ' (' || e.type || coalesce(' ' || json_extract(e.properties,'$.ref'), '') "
+            "|| coalesce(' ' || json_extract(e.properties,'$.phase'), '') "
             "|| ')' AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
             "t.id=e.target_id WHERE e.project=?1 AND ((s.label='Chart' AND e.type='DEPLOYS') OR "
             "(t.label='Chart' AND e.type='CONFIGURES')) ORDER BY x)";
@@ -4462,8 +4463,8 @@ static char *gpf_chart_edges(const GpfFile *files, int nfiles) {
 
 /* A chart deploys what its templates render: Chart -DEPLOYS {via: chart}->
  * each object of its templates/ (a subchart's objects are the subchart's),
- * and each Image those objects name literally ({ref: image}) -- a templated
- * image names none, and no values default is read. Its values files
+ * and each Image those objects use ({ref: image}) -- a templated one rendered
+ * from values.yaml (`nginx`: host-less, kept as written). Its values files
  * (values.yaml, values-*.yaml beside Chart.yaml) CONFIGURE it; a values file
  * elsewhere (ci/) does not. */
 TEST(probe_helm_chart_deploys_its_objects) {
@@ -4492,6 +4493,7 @@ TEST(probe_helm_chart_deploys_its_objects) {
                                "db -> Image:ghcr.io/acme/db (DEPLOYS image)\n"
                                "db -> Resource:StatefulSet/db (DEPLOYS)\n"
                                "web -> Image:ghcr.io/acme/sidecar (DEPLOYS image)\n"
+                               "web -> Image:nginx (DEPLOYS image)\n"
                                "web -> Resource:Deployment/web (DEPLOYS)\n"
                                "web -> Resource:Service/web (DEPLOYS)";
     if (!got || strcmp(got, want) != 0) {
@@ -4500,6 +4502,267 @@ TEST(probe_helm_chart_deploys_its_objects) {
         FAIL("Chart DEPLOYS / CONFIGURES edge set");
     }
     free(got);
+    PASS();
+}
+
+/* A chart also deploys the CRDs of its crds/ ({phase: crds}), which Helm
+ * installs before its templates. werf deploys the `.helm` dir beside its
+ * werf.yaml as a chart without Chart.yaml, named after the werf project
+ * (templated werf.yaml lines before it are skipped); a `.helm` with its own
+ * Chart.yaml stays that chart, and a werf.yaml without `.helm` makes none. */
+TEST(probe_helm_chart_crds_and_werf_chart) {
+    static const GpfFile files[] = {
+        {"charts/op/Chart.yaml", "apiVersion: v2\nname: op\nversion: 1.0.0\n"},
+        {"charts/op/crds/widget.yaml",
+         "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n"
+         "  name: widgets.acme.io\nspec:\n  group: acme.io\n  names:\n    kind: Widget\n"
+         "    plural: widgets\n  scope: Namespaced\n"},
+        {"charts/op/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: op\n"},
+        {"site/werf.yaml", "{{- $_ := set . \"Env\" (.Env | default \"prod\") }}\n\n"
+                           "project: site-web\nconfigVersion: 1\n---\nimage: web\nfrom: nginx\n"},
+        {"site/.helm/values.yaml", "replicas: 1\n"},
+        {"site/.helm/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: site\nspec:\n"
+         "  replicas: {{ .Values.replicas }}\n"},
+        {"plain/werf.yaml", "project: plain\nconfigVersion: 1\n"},
+        {"own/werf.yaml", "project: own-werf\nconfigVersion: 1\n"},
+        {"own/.helm/Chart.yaml", "apiVersion: v2\nname: own\nversion: 0.1.0\n"},
+        {"own/.helm/templates/cm.yaml",
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: own\n"}};
+    char *got = gpf_chart_edges(files, 10);
+    static const char want[] =
+        "op -> Resource:CustomResourceDefinition/widgets.acme.io (DEPLOYS crds)\n"
+        "op -> Resource:Deployment/op (DEPLOYS)\n"
+        "own -> Resource:ConfigMap/own (DEPLOYS)\n"
+        "site-web -> Resource:Deployment/site (DEPLOYS)\n"
+        "site/.helm/values.yaml -> Chart:site-web (CONFIGURES)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "chart edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("crds/ and werf chart edge set");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every edge into an Image (or out of one into an Image), one line each:
+ * `source -> Image:name TYPE image=.. [via=..] [ref=..] [default_of=..]
+ * [override_of=..] [inferred=..] [values_key=..]`, sorted. */
+static char *gpf_image_edges(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT s.label || ':' || s.name "
+            "|| ' -> Image:' || t.name || ' ' || e.type || ' image=' || "
+            "coalesce(json_extract(e.properties,'$.image'),'-') || "
+            "coalesce(' via=' || json_extract(e.properties,'$.via'), '') || "
+            "coalesce(' ref=' || json_extract(e.properties,'$.ref'), '') || "
+            "coalesce(' default_of=' || json_extract(e.properties,'$.default_of'), '') || "
+            "coalesce(' override_of=' || json_extract(e.properties,'$.override_of'), '') || "
+            "coalesce(' inferred=' || json_extract(e.properties,'$.inferred'), '') || "
+            "coalesce(' values_key=' || json_extract(e.properties,'$.values_key'), '') AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND t.label='Image' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+static bool gpf_expect_image_edges(const GpfFile *files, int n, const char *want) {
+    char *got = gpf_image_edges(files, n);
+    bool ok = got && strcmp(got, want) == 0;
+    if (!ok) {
+        fprintf(stderr, "image edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+    }
+    free(got);
+    return ok;
+}
+
+/* An image a default value names keeps its Image, its edge marked
+ * default_of with the ARGs / variables whose default supplied it (an ARG
+ * chain names each); a literal FROM is unmarked. A build's arguments (compose
+ * build.args, docker build --build-arg) make the Image it builds DEPEND_ON
+ * the base they choose {override_of}; compose's .env replacing an inline
+ * default is the effective edge's override_of, the default's image kept as
+ * {ref: image_default} -- one the service does not run. */
+TEST(probe_docker_default_images_marked_and_overrides) {
+    static const GpfFile files[] = {
+        {"src/web/Dockerfile", "ARG GO=1.22\nARG BASE=golang:${GO}\nFROM ${BASE} AS build\n"
+                               "RUN go build -o /app .\nFROM alpine:3.20\n"
+                               "COPY --from=build /app /app\n"},
+        {"src/api/Dockerfile", "ARG PY=3.12\nFROM python:${PY}-slim\n"},
+        {".env", "REG=ghcr.io/acme\nAPI_IMG=ghcr.io/acme/api-custom\n"},
+        {"compose.yaml", "services:\n  web:\n    image: ${REG}/web:${TAG:-dev}\n    build:\n"
+                         "      context: ./src/web\n      args:\n        GO: \"1.23\"\n"
+                         "  api:\n    image: ${API_IMG:-ghcr.io/acme/api}\n    build: ./src/api\n"},
+        {"scripts/build.sh", "#!/bin/sh\nIMAGE=${IMAGE:-ghcr.io/acme/api-ci}\n"
+                             "docker build --build-arg PY=3.13 -t \"$IMAGE:1\" src/api\n"}};
+    static const char want[] =
+        "Image:ghcr.io/acme/api-ci -> Image:python DEPENDS_ON image=python:3.13-slim via=from "
+        "override_of=[\"PY\"]\n"
+        "Image:ghcr.io/acme/web -> Image:golang DEPENDS_ON image=golang:1.23 via=from "
+        "default_of=[\"BASE\"] override_of=[\"GO\"]\n"
+        "Module:src/api/Dockerfile -> Image:python DEPENDS_ON image=python:3.12-slim via=from "
+        "default_of=[\"PY\"]\n"
+        "Module:src/web/Dockerfile -> Image:alpine DEPENDS_ON image=alpine:3.20 via=from\n"
+        "Module:src/web/Dockerfile -> Image:golang DEPENDS_ON image=golang:1.22 via=from "
+        "default_of=[\"GO\",\"BASE\"]\n"
+        "Resource:Service/api -> Image:ghcr.io/acme/api USAGE image=ghcr.io/acme/api "
+        "ref=image_default default_of=[\"API_IMG\"]\n"
+        "Resource:Service/api -> Image:ghcr.io/acme/api-custom USAGE image=ghcr.io/acme/api-custom "
+        "ref=image override_of=[\"API_IMG\"]\n"
+        "Resource:Service/web -> Image:ghcr.io/acme/web USAGE image=ghcr.io/acme/web:dev "
+        "ref=image default_of=[\"TAG\"]";
+    if (!gpf_expect_image_edges(files, 5, want)) {
+        FAIL("default-valued images and their in-repo overrides");
+    }
+    PASS();
+}
+
+/* The chart a Helm template renders (helm_template.c): the container image
+ * from the chart family's defaults -- an include helper (bitnami
+ * common.images.image, a dict argument, .Chart.AppVersion), a `with`
+ * binding, the taken branch of an if / else, a subchart under its alias with
+ * the parent's values and global. The object USES it {default_of: the values
+ * keys read}; the chart DEPLOYS it. A value that does not render -- a
+ * .Release field, lookup, a missing define, a field of a missing map -- names
+ * no Image. */
+TEST(probe_helm_template_images_render_with_defaults) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml",
+         "apiVersion: v2\nname: app\nversion: 1.2.3\nappVersion: \"2.0.1\"\ndependencies:\n"
+         "  - name: db\n    version: 0.1.0\n    alias: database\n"},
+        {"charts/app/values.yaml",
+         "image:\n  registry: ghcr.io\n  repository: acme/app\n  tag: \"\"\n  digest: \"\"\n"
+         "sidecar:\n  image: { repository: docker.io/library/busybox, tag: 1.36 }\nglobal: {}\n"
+         "database:\n  image:\n    tag: \"17\"\n"},
+        {"charts/app/templates/_helpers.tpl",
+         "{{- define \"common.images.image\" -}}\n"
+         "{{- $registryName := default .imageRoot.registry ((.global).imageRegistry) -}}\n"
+         "{{- $termination := .imageRoot.tag | toString -}}\n"
+         "{{- if not .imageRoot.tag }}\n  {{- if .chart }}\n"
+         "    {{- $termination = .chart.AppVersion | toString -}}\n  {{- end -}}\n{{- end -}}\n"
+         "{{- if $registryName }}\n"
+         "{{- printf \"%s/%s:%s\" $registryName .imageRoot.repository $termination -}}\n"
+         "{{- else -}}\n{{- printf \"%s:%s\" .imageRoot.repository $termination -}}\n"
+         "{{- end -}}\n{{- end -}}\n"},
+        {"charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n          image: {{ include "
+         "\"common.images.image\" (dict \"imageRoot\" .Values.image \"global\" .Values.global "
+         "\"chart\" .Chart) }}\n        - name: side\n          {{- with .Values.sidecar.image }}\n"
+         "          image: \"{{ .repository }}:{{ .tag }}\"\n          {{- end }}\n"
+         "        - name: rel\n          image: \"ghcr.io/acme/{{ .Release.Name }}:1\"\n"
+         "        - name: miss\n          image: {{ include \"nope\" . }}\n"
+         "        - name: deep\n          image: \"{{ .Values.absent.repository }}\"\n"},
+        {"charts/app/charts/db/Chart.yaml",
+         "apiVersion: v2\nname: db\nversion: 0.1.0\nappVersion: \"16.4\"\n"},
+        {"charts/app/charts/db/values.yaml",
+         "image:\n  repository: bitnami/postgresql\n  tag: \"\"\n  digest: \"\"\n"},
+        {"charts/app/charts/db/templates/sts.yaml",
+         "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: db\n          {{- if .Values.image.digest }}\n"
+         "          image: \"{{ .Values.global.imageRegistry | default \"docker.io\" }}/"
+         "{{ .Values.image.repository }}@{{ .Values.image.digest }}\"\n          {{- else }}\n"
+         "          image: \"{{ .Values.global.imageRegistry | default \"docker.io\" }}/"
+         "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}\"\n"
+         "          {{- end }}\n"}};
+    static const char want[] =
+        "Chart:app -> Image:docker.io/library/busybox DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"sidecar.image.repository\",\"sidecar.image.tag\"]\n"
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"image.registry\",\"global.imageRegistry\",\"image.tag\","
+        "\"image.repository\"]\n"
+        "Chart:db -> Image:docker.io/bitnami/postgresql DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"global.imageRegistry\",\"image.repository\",\"image.tag\"]\n"
+        "Resource:Deployment/app -> Image:docker.io/library/busybox USAGE "
+        "image=docker.io/library/busybox:1.36 ref=image "
+        "default_of=[\"sidecar.image.repository\",\"sidecar.image.tag\"]\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:2.0.1 "
+        "ref=image default_of=[\"image.registry\",\"global.imageRegistry\",\"image.tag\","
+        "\"image.repository\"]\n"
+        "Resource:StatefulSet/db -> Image:docker.io/bitnami/postgresql USAGE "
+        "image=docker.io/bitnami/postgresql:17 ref=image "
+        "default_of=[\"global.imageRegistry\",\"image.repository\",\"image.tag\"]";
+    if (!gpf_expect_image_edges(files, 7, want)) {
+        FAIL("Helm template images rendered with the chart family's defaults");
+    }
+    PASS();
+}
+
+/* A release renders its chart with its values over the defaults: of a chart
+ * in the repository each image that differs is the release's own {via,
+ * override_of} -- a Flux HelmRelease's spec.values (a Git source), a
+ * kustomize helmCharts entry's valuesFile + valuesInline (chartHome charts/),
+ * a Terraform helm_release's values + set. Of an external chart the values
+ * name images by convention -- `repository` (+ tag / registry) naming a
+ * registry host -- {inferred: values}; a host-less repository names none. */
+TEST(probe_helm_release_images) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
+        {"charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},
+        {"charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"},
+        {"flux/app.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: app\nspec:\n"
+         "  chart:\n    spec:\n      chart: ./charts/app\n      sourceRef:\n"
+         "        kind: GitRepository\n        name: repo\n  values:\n    image:\n"
+         "      tag: \"9.9\"\n---\n"
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: sonarr\n"
+         "spec:\n  chart:\n    spec:\n      chart: app-template\n      sourceRef:\n"
+         "        kind: HelmRepository\n        name: bjw-s\n  values:\n    controllers:\n"
+         "      main:\n        containers:\n          main:\n            image:\n"
+         "              repository: ghcr.io/home-operations/sonarr\n              tag: 4.0.15\n"
+         "          side:\n            image:\n              repository: busybox\n"
+         "              tag: \"1.36\"\n"},
+        {"kz/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nhelmCharts:\n"
+         "  - name: app\n    releaseName: kapp\n    valuesFile: values-prod.yaml\n"
+         "    valuesInline:\n      image:\n        tag: \"5.5\"\n"},
+        {"kz/values-prod.yaml", "image:\n  repository: quay.io/acme/app\n  tag: \"4.4\"\n"},
+        {"kz/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
+        {"kz/charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},
+        {"kz/charts/app/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: kapp\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: app\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"},
+        {"tf/main.tf", "resource \"helm_release\" \"app\" {\n  name  = \"app\"\n"
+                       "  chart = \"../charts/app\"\n  set {\n    name  = \"image.tag\"\n"
+                       "    value = \"7.7\"\n  }\n}\n"}};
+    static const char want[] =
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "
+        "default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Class:resource.helm_release.app -> Image:ghcr.io/acme/app DEPLOYS "
+        "image=ghcr.io/acme/app:7.7 via=terraform ref=image override_of=[\"image.tag\"]\n"
+        "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+        "ref=image default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Resource:Deployment/kapp -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+        "ref=image default_of=[\"image.repository\",\"image.tag\"]\n"
+        "Resource:HelmRelease/app -> Image:ghcr.io/acme/app DEPLOYS image=ghcr.io/acme/app:9.9 "
+        "via=helmrelease ref=image override_of=[\"image.tag\"]\n"
+        "Resource:HelmRelease/sonarr -> Image:ghcr.io/home-operations/sonarr DEPLOYS "
+        "image=ghcr.io/home-operations/sonarr:4.0.15 via=helmrelease ref=image inferred=values "
+        "values_key=controllers.main.containers.main.image\n"
+        "Resource:Kustomization -> Image:quay.io/acme/app DEPLOYS image=quay.io/acme/app:5.5 "
+        "via=helmcharts ref=image override_of=[\"image.repository\",\"image.tag\"]";
+    if (!gpf_expect_image_edges(files, 10, want)) {
+        FAIL("release images: local renders and the external values convention");
+    }
     PASS();
 }
 
@@ -6313,6 +6576,10 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_chart_deploys_its_objects);
+    RUN_TEST(probe_helm_chart_crds_and_werf_chart);
+    RUN_TEST(probe_docker_default_images_marked_and_overrides);
+    RUN_TEST(probe_helm_template_images_render_with_defaults);
+    RUN_TEST(probe_helm_release_images);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);
