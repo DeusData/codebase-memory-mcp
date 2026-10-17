@@ -449,8 +449,8 @@ static bool application_regular_db_exists(const char *project) {
     if (written <= 0 || (size_t)written >= sizeof(path)) {
         return false;
     }
-    struct stat status;
-    return stat(path, &status) == 0 && S_ISREG(status.st_mode);
+    cbm_path_info_t status;
+    return cbm_path_info_utf8(path, &status) == CBM_PATH_INFO_OK && status.is_regular;
 }
 
 static bool application_canonical_directory_exists(const char *path) {

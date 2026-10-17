@@ -1103,8 +1103,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     watcher_windows_image_identity_t expected_git;
     ASSERT_TRUE(watcher_windows_capture_image_identity(fake_git, &expected_git));
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? cbm_strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? cbm_strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -1238,8 +1238,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     ASSERT_TRUE(watcher_test_self_image(self));
     ASSERT_EQ(symlink(self, fake_git), 0);
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -3995,7 +3995,41 @@ TEST(watcher_null_watch_count) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+TEST(watcher_unicode_root_is_not_pruned_as_missing) {
+    char *parent = th_mktempdir("cbm_watch_utf8");
+    ASSERT_NOT_NULL(parent);
+    char root[CBM_SZ_4K];
+    snprintf(root, sizeof(root), "%s/\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E", parent);
+    ASSERT_EQ(th_mkdir_p(root), 0);
+    const char *saved = cbm_runtime_getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1);
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_store_upsert_project(store, "unicode-root", root);
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    cbm_watcher_watch(watcher, "unicode-root", root);
+    for (int i = 0; i < 8; i++) {
+        cbm_watcher_poll_once(watcher);
+    }
+    cbm_project_t info = {0};
+    bool kept = cbm_watcher_watch_count(watcher) == 1 &&
+                cbm_store_get_project(store, "unicode-root", &info) == CBM_STORE_OK;
+    cbm_project_free_fields(&info);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    if (saved_copy) {
+        cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_WATCHER_PRUNE_GRACE_S");
+    }
+    free(saved_copy);
+    ASSERT_EQ(th_rmtree(parent), 0);
+    ASSERT_TRUE(kept);
+    PASS();
+}
+
 SUITE(watcher) {
+    RUN_TEST(watcher_unicode_root_is_not_pruned_as_missing);
     /* Adaptive interval */
     RUN_TEST(poll_interval_base);
     RUN_TEST(poll_interval_scaling);
