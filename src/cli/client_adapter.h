@@ -48,11 +48,16 @@ char *cbm_client_adapter_pi(const char *binary_path);
  * other clients get through their own native hook configuration. OpenCode has
  * no such configuration; a plugin module is its only extension point.
  *
- * NOTE for maintainers: this hooks `tool.execute.after`, whose ability to
- * modify a tool's output is NOT part of OpenCode's documented plugin contract
- * (only `tool.execute.before`'s argument mutation is). If OpenCode changes it,
- * augmentation stops silently — no error, no signal. That risk is accepted
- * deliberately and recorded here so it is not rediscovered as a mystery.
+ * NOTE for maintainers: the module serves two loader generations from one
+ * default export. OpenCode 1.18.x dispatches the hooks returned by
+ * `server(ctx)`; its `tool.execute.after` ability to modify a tool's output is
+ * NOT part of the documented plugin contract (only `tool.execute.before`'s
+ * argument mutation is), so if that runtime changes, augmentation stops
+ * silently — no error, no signal. That risk is accepted deliberately for the
+ * server() path and recorded here so it is not rediscovered as a mystery.
+ * OpenCode 2 ignores `server` and calls `setup(ctx)`, which registers
+ * `execute.after`/`compaction`/`context` on the context domains and replaces
+ * `event.result` through the documented hook surface.
  *
  * Returns NULL on allocation failure or when binary_path is NULL/empty. */
 char *cbm_client_adapter_opencode(const char *binary_path);

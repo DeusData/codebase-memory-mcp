@@ -159,10 +159,10 @@ static char *agent_deep_same_name_json(size_t depth) {
 
 TEST(agent_clients_registry_is_stable_and_callback_driven) {
     static const char *expected[] = {
-        "qoder",     "kimi",        "gitlab-duo",    "rovo-dev", "amp",      "devin",
-        "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
-        "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
-        "omp",
+        "qoder",    "kimi",     "gitlab-duo",       "rovo-dev",      "amp",
+        "devin",    "tabnine",  "continue",         "visual-studio", "trae",
+        "roo-code", "amazon-q", "codebuddy",        "ibm-bob-ide",   "ibm-bob-shell",
+        "pochi",    "pi",       "sourcegraph-cody", "omp",
     };
     static const uint32_t expected_capabilities[] = {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
@@ -866,11 +866,8 @@ TEST(agent_clients_json_schemas_are_exact_and_policy_neutral) {
 
 TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries) {
     static const cbm_agent_client_id_t clients[] = {
-        CBM_AGENT_CLIENT_CODEBUDDY,
-        CBM_AGENT_CLIENT_IBM_BOB_IDE,
-        CBM_AGENT_CLIENT_IBM_BOB_SHELL,
-        CBM_AGENT_CLIENT_POCHI,
-        CBM_AGENT_CLIENT_OMP,
+        CBM_AGENT_CLIENT_CODEBUDDY, CBM_AGENT_CLIENT_IBM_BOB_IDE, CBM_AGENT_CLIENT_IBM_BOB_SHELL,
+        CBM_AGENT_CLIENT_POCHI,     CBM_AGENT_CLIENT_OMP,
     };
     for (size_t i = 0U; i < sizeof(clients) / sizeof(clients[0]); i++) {
         const char *foreign =
@@ -941,30 +938,29 @@ TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided) {
     char resolved[512];
 
     /* Default (no env) keeps the documented ~/.omp/agent path. */
-    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
-                                            sizeof(resolved)),
-              0);
+    ASSERT_EQ(
+        cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved, sizeof(resolved)),
+        0);
     ASSERT_STR_EQ(resolved, "/home/tester/.omp/agent/mcp.json");
 
     /* Named profile directory takes precedence over the home-relative default. */
     options.omp_agent_dir = "/home/tester/.omp/profiles/work/agent";
-    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
-                                            sizeof(resolved)),
-              0);
+    ASSERT_EQ(
+        cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved, sizeof(resolved)),
+        0);
     ASSERT_STR_EQ(resolved, "/home/tester/.omp/profiles/work/agent/mcp.json");
 
     /* PI_CODING_AGENT_DIR relocations also flow through the resolved option. */
     options.omp_agent_dir = "/srv/omp-shared/agent";
-    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
-                                            sizeof(resolved)),
-              0);
+    ASSERT_EQ(
+        cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved, sizeof(resolved)),
+        0);
     ASSERT_STR_EQ(resolved, "/srv/omp-shared/agent/mcp.json");
     PASS();
 }
 
 TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability) {
-    const cbm_agent_client_profile_t *profile =
-        cbm_agent_client_by_id(CBM_AGENT_CLIENT_OMP);
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_by_id(CBM_AGENT_CLIENT_OMP);
     ASSERT_NOT_NULL(profile);
     ASSERT_EQ(profile->capabilities & CBM_AGENT_CAP_INSTRUCTIONS, 0U);
     ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_MCP, 0U);
@@ -972,7 +968,6 @@ TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability)
     ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_AGENT, 0U);
     PASS();
 }
-
 
 TEST(agent_clients_remove_only_canonical_and_missing_is_noop) {
     char *dir = NULL;
@@ -1321,18 +1316,44 @@ TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
     PASS();
 }
 
-/* #2077: OpenCode's V2 loader only reads the default export and needs an
- * id plus a setup()/effect() function; the old named export had neither. */
+/* #2077/#2089/#2204: OpenCode's loaders changed shape across releases. The
+ * 1.18.x server runtime dispatches the hooks returned by default.server; the
+ * 2.x runtime ignores server and calls setup(ctx), whose context provides the
+ * tool and session hook domains, so the same augmentation is registered
+ * there. Older V2 preview loaders expose no domains; setup returns early for
+ * them instead of throwing. */
 TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
     ASSERT_NOT_NULL(strstr(js, "export default {"));
     ASSERT_NOT_NULL(strstr(js, "id: 'codebase-memory-augment'"));
-    /* Hooks live under server(), which the server runtime reads; setup()
-     * stays empty since the V2 config loader has no tool domain yet. */
-    ASSERT_NOT_NULL(strstr(js, "setup() {}"));
+    /* OpenCode 1.18.x server runtime. */
     ASSERT_NOT_NULL(strstr(js, "server: async (ctx) => {"));
-    ASSERT_NULL(strstr(js, "async setup(ctx) {"));
+    /* OpenCode 2 registers through the setup context; those domains exist on
+     * 2.x, so setup is no longer the empty placeholder #2089 pinned. */
+    ASSERT_NOT_NULL(strstr(js, "async setup(ctx) {"));
+    ASSERT_NOT_NULL(strstr(js, "ctx.tool.hook('execute.after'"));
+    ASSERT_NOT_NULL(strstr(js, "ctx.session.hook('compaction'"));
+    ASSERT_NOT_NULL(strstr(js, "ctx.session.hook('context'"));
+    ASSERT_NOT_NULL(strstr(js, "if (!ctx?.tool?.hook || !ctx?.session?.hook) return;"));
+    /* content is the surface the model reads; prefer it over output. */
+    const char *content_first = strstr(js, "if (typeof result.content === 'string') {");
+    const char *output_fallback = strstr(js, "if (typeof result.output === 'string') {");
+    ASSERT_NOT_NULL(content_first);
+    ASSERT_NOT_NULL(output_fallback);
+    ASSERT_TRUE(content_first < output_fallback);
+    ASSERT_NOT_NULL(strstr(js, "if (result.content === undefined) {"));
+    /* Reinjection is tracked per session; server() yields once setup() has
+     * registered, so a host dispatching both entries cannot append twice. */
+    ASSERT_NOT_NULL(strstr(js, "const pendingReinject = new Set();"));
+    ASSERT_NOT_NULL(strstr(js, "pendingReinject.add(event.sessionID);"));
+    ASSERT_NOT_NULL(strstr(js, "if (!pendingReinject.delete(event.sessionID)) return;"));
+    ASSERT_NOT_NULL(strstr(js, "let setupRegistered = false;"));
+    ASSERT_NOT_NULL(strstr(js, "if (setupRegistered) return;"));
+    ASSERT_NOT_NULL(strstr(js, "setupRegistered = true;"));
+    ASSERT_NOT_NULL(strstr(js, "event.result = appendResult(event.result, extra);"));
+    /* The empty setup placeholder and the old named export must both be gone. */
+    ASSERT_NULL(strstr(js, "setup() {}"));
     ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
     free(js);
     PASS();
