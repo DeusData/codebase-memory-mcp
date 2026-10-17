@@ -388,6 +388,73 @@ TEST(doc_links_md_resolve) {
     PASS();
 }
 
+/* #2587: a `path::member` reference whose member the code file does not
+ * define was an exact edge to the file, so a renamed or deleted definition
+ * looked like a valid, coarser link. It is a missing reference; a member the
+ * file defines more than once, with no owner to pick one, is ambiguous. */
+TEST(doc_links_md_member_not_defined_issue2587) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "docs/members.md"),
+                  "# Members\n"
+                  "\n"
+                  "See `src/util/rounding.py::clamp` and "
+                  "`src/util/rounding.py::no_such_function`.\n"
+                  "Areas: `src/shapes.py::Square::area`, `src/shapes.py::area`.\n"
+                  "Notes: `docs/other.md::Intro`.\n");
+    th_write_file(TH_PATH(tmp, "docs/other.md"), "# Intro\n\nText.\n");
+    th_write_file(TH_PATH(tmp, "src/util/rounding.py"), "def clamp(x, lo, hi):\n"
+                                                        "    return max(lo, min(hi, x))\n");
+    th_write_file(TH_PATH(tmp, "src/shapes.py"), "class Circle:\n"
+                                                 "    def area(self):\n"
+                                                 "        return 3\n"
+                                                 "\n"
+                                                 "\n"
+                                                 "class Square:\n"
+                                                 "    def area(self):\n"
+                                                 "        return 4\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/md.db", tmp);
+    ASSERT_EQ(dm_index(tmp, db, NULL), 0);
+    char props[512];
+    char reason[64];
+
+    /* a member the file defines, alone or through its owner */
+    ASSERT_EQ(md_edge(db, "Members", "rounding.clamp", props, sizeof(props)), 1);
+    ASSERT_EQ(md_edge(db, "Members", "Square.area", props, sizeof(props)), 1);
+    ASSERT_EQ(md_edge(db, "Members", "Circle.area", props, sizeof(props)), 0);
+
+    /* a member the file does not define: no edge to the file, a missing row */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
+                           "AND s.qualified_name LIKE '%.Members' AND t.label = 'File' "
+                           "AND t.file_path = 'src/util/rounding.py'"),
+              0);
+    dm_row(db, "docs/members.md", "src/util/rounding.py::no_such_function", reason, sizeof(reason),
+           NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+
+    /* defined twice and no owner written: ambiguous, not the file */
+    dm_row(db, "docs/members.md", "src/shapes.py::area", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "ambiguous");
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
+                           "AND s.qualified_name LIKE '%.Members' AND t.label = 'File' "
+                           "AND t.file_path = 'src/shapes.py'"),
+              0);
+
+    /* a document's headings are no definitions: the file edge stays */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
+                           "AND s.qualified_name LIKE '%.Members' AND t.label = 'File' "
+                           "AND t.file_path = 'docs/other.md'"),
+              1);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
 /* ── incremental == full ─────────────────────────────────────────── */
 
 TEST(doc_links_md_incremental) {
@@ -865,6 +932,7 @@ SUITE(doc_links_md) {
     RUN_TEST(doc_links_md_repeated_headings);
     RUN_TEST(doc_links_md_classify_span);
     RUN_TEST(doc_links_md_resolve);
+    RUN_TEST(doc_links_md_member_not_defined_issue2587);
     RUN_TEST(doc_links_md_incremental);
     RUN_TEST(doc_links_md_adr);
     RUN_TEST(doc_links_md_adr_label_choice);
