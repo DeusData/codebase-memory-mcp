@@ -2892,6 +2892,91 @@ TEST(daemon_ipc_local_participants_overlap_and_allow_modern_startup) {
     PASS();
 }
 
+TEST(daemon_ipc_windows_local_transition_release_reports_live_gate_contention) {
+#ifndef _WIN32
+    PASS();
+#else
+    static const char key[] = "6060717182829393";
+    char parent[TEST_PATH_CAP] = {0};
+    char canonical_parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char legacy_pipe[CBM_DAEMON_IPC_WINDOWS_NAME_CAP] = {0};
+    char legacy_startup[CBM_DAEMON_IPC_WINDOWS_NAME_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_local_transition_t *transition = NULL;
+    cbm_daemon_ipc_startup_lock_t *startup = NULL;
+
+    bool parent_ok = ipc_test_parent_new(parent, "local-release-busy") &&
+                     ipc_test_full_path(canonical_parent, parent);
+    bool names_ok = parent_ok && cbm_daemon_ipc_windows_legacy_names(canonical_parent, key,
+                                                                     legacy_pipe, legacy_startup);
+    if (names_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+    }
+    int acquired =
+        endpoint ? cbm_daemon_ipc_local_transition_try_acquire(endpoint, &transition) : -1;
+    int sealed = acquired == 1 ? cbm_daemon_ipc_local_transition_seal_legacy(transition) : -1;
+    int lifetime =
+        sealed == 1 ? cbm_daemon_ipc_local_transition_lifetime_probe(endpoint, transition) : -1;
+    bool begun = lifetime == 0 && cbm_daemon_ipc_local_transition_begin_work(transition);
+    int startup_acquired = begun ? cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup) : -1;
+    int blocked = cbm_daemon_ipc_local_transition_try_release(&transition);
+    bool retained_while_busy = transition != NULL;
+    bool boolean_blocked = cbm_daemon_ipc_local_transition_release(&transition);
+    /* Keep the already-validated named mutex alive after the startup owner
+     * exits. Holding just this mutex exercises the second contention path. */
+    wchar_t *legacy_name = names_ok ? cbm_utf8_to_wide(legacy_startup) : NULL;
+    HANDLE legacy_mutex = startup_acquired == 1 && legacy_name
+                              ? OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, legacy_name)
+                              : NULL;
+    free(legacy_name);
+    bool startup_released = cbm_daemon_ipc_startup_lock_release(&startup);
+    DWORD mutex_wait =
+        startup_released && legacy_mutex ? WaitForSingleObject(legacy_mutex, 0) : WAIT_FAILED;
+    bool mutex_owned = mutex_wait == WAIT_OBJECT_0 || mutex_wait == WAIT_ABANDONED;
+    int legacy_blocked =
+        mutex_owned ? cbm_daemon_ipc_local_transition_try_release(&transition) : -1;
+    bool retained_while_legacy_busy = transition != NULL;
+    bool mutex_released = mutex_owned && ReleaseMutex(legacy_mutex);
+    if (legacy_mutex) {
+        (void)CloseHandle(legacy_mutex);
+    }
+    int legacy_retained = endpoint ? cbm_daemon_ipc_legacy_generation_probe(endpoint) : -1;
+    int released = cbm_daemon_ipc_local_transition_try_release(&transition);
+    bool consumed = transition == NULL;
+    int legacy_after = endpoint ? cbm_daemon_ipc_legacy_generation_probe(endpoint) : -1;
+
+    (void)cbm_daemon_ipc_startup_lock_release(&startup);
+    (void)cbm_daemon_ipc_local_transition_release(&transition);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(names_ok);
+    ASSERT_EQ(acquired, 1);
+    ASSERT_EQ(sealed, 1);
+    ASSERT_EQ(lifetime, 0);
+    ASSERT_TRUE(begun);
+    ASSERT_EQ(startup_acquired, 1);
+    ASSERT_EQ(blocked, 0);
+    ASSERT_TRUE(retained_while_busy);
+    ASSERT_FALSE(boolean_blocked);
+    ASSERT_TRUE(startup_released);
+    ASSERT_EQ(mutex_wait, WAIT_OBJECT_0);
+    ASSERT_EQ(legacy_blocked, 0);
+    ASSERT_TRUE(retained_while_legacy_busy);
+    ASSERT_TRUE(mutex_released);
+    ASSERT_EQ(legacy_retained, 1);
+    ASSERT_EQ(released, 1);
+    ASSERT_TRUE(consumed);
+    ASSERT_EQ(legacy_after, 0);
+    PASS();
+#endif
+}
+
 TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex) {
 #ifndef _WIN32
     PASS();
@@ -2919,7 +3004,7 @@ TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex) {
     if (begun) {
         cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(1);
     }
-    bool first_release = cbm_daemon_ipc_local_transition_release(&transition);
+    int first_release = cbm_daemon_ipc_local_transition_try_release(&transition);
     bool retained_after_failure = transition != NULL;
     bool retry_release = cbm_daemon_ipc_local_transition_release(&transition);
     cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(0);
@@ -2935,7 +3020,7 @@ TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex) {
     ASSERT_EQ(sealed, 1);
     ASSERT_EQ(lifetime, 0);
     ASSERT_TRUE(begun);
-    ASSERT_FALSE(first_release);
+    ASSERT_EQ(first_release, -1);
     ASSERT_TRUE(retained_after_failure);
     ASSERT_TRUE(retry_release);
     ASSERT_NULL(transition);
@@ -5792,6 +5877,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_activation_probe_ignores_matching_startup_claim_only);
     RUN_TEST(daemon_ipc_local_transition_coexists_with_active_daemon_lifetime);
     RUN_TEST(daemon_ipc_local_participants_overlap_and_allow_modern_startup);
+    RUN_TEST(daemon_ipc_windows_local_transition_release_reports_live_gate_contention);
     RUN_TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex);
     RUN_TEST(daemon_ipc_windows_startup_release_retains_retry_authority);
     RUN_TEST(daemon_ipc_frame_timeout_poisons_connection);
