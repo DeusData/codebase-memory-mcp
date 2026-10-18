@@ -1352,6 +1352,30 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
         }
     }
     cbm_registry_add_lang(seed->registry, node->name, node->qualified_name, node->label, lang);
+    if (node->properties_json) {
+        const char *mask = strstr(node->properties_json, "\"swift_defaults\":\"");
+        const char *count = strstr(node->properties_json, "\"swift_params\":");
+        if (mask && count) {
+            mask += strlen("\"swift_defaults\":\"");
+            count += strlen("\"swift_params\":");
+            char *mask_end = NULL;
+            char *count_end = NULL;
+            unsigned long long defaults = strtoull(mask, &mask_end, CBM_HEX_BASE);
+            unsigned long params = strtoul(count, &count_end, CBM_DECIMAL_BASE);
+            if (mask_end == mask + CBM_SZ_16 && *mask_end == '"' && count_end != count &&
+                params <= UINT8_MAX) {
+                yyjson_doc *doc =
+                    yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+                if (doc) {
+                    const char *selector =
+                        yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "swift_selector"));
+                    cbm_registry_set_swift_signature(seed->registry, node->qualified_name,
+                                                     (uint64_t)defaults, (uint8_t)params, selector);
+                    yyjson_doc_free(doc);
+                }
+            }
+        }
+    }
 }
 
 /* Seed the registry from every registry symbol in the graph buffer, with
