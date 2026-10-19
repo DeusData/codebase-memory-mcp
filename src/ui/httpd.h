@@ -93,6 +93,10 @@ cbm_httpd_activity_t cbm_httpd_activity_for_test(cbm_httpd_t *d);
 void cbm_httpd_set_send_buffer_for_test(cbm_httpd_t *d, int bytes);
 void cbm_httpd_set_send_deadline_for_test(cbm_httpd_t *d, int ms);
 
+/* Large, bounded responses can opt into up to five seconds of send time.
+ * Per-connection only; the default deadline and interrupt behavior stay intact. */
+void cbm_http_conn_set_send_deadline_ms(cbm_http_conn_t *c, int ms);
+
 /* ── Connection handling ──────────────────────────────────────── */
 
 /* Wait up to timeout_ms for a client. NULL on timeout (caller re-checks

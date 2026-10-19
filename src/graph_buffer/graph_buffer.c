@@ -105,6 +105,11 @@ struct cbm_gbuf {
     bool by_id_off;
     int64_t by_id_cap;
 
+    /* Same-QN collision spans, written on export (cbm_gbuf_settle_variants).
+     * key: the surviving node's own QN string, value: gb_span_vec_t*. NULL
+     * until the first collision. */
+    CBMHashTable *variant_spans;
+
     /* Secondary node indexes */
     CBMHashTable *nodes_by_label; /* key: label, value: (node_ptr_array_t*) */
     CBMHashTable *nodes_by_name;  /* key: name, value: (node_ptr_array_t*) */
@@ -672,9 +677,15 @@ cbm_gbuf_t *cbm_gbuf_new_worker(const char *project, const char *root_path,
     return gb;
 }
 
+static void gb_free_span_vec(const char *qn, void *value, void *ud);
+
 void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
+    }
+    if (gb->variant_spans) {
+        cbm_ht_foreach(gb->variant_spans, gb_free_span_vec, NULL);
+        cbm_ht_free(gb->variant_spans);
     }
 
     /* Free each individually-allocated node */
@@ -835,7 +846,393 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
     gb->next_id = next_id;
 }
 
+void cbm_gbuf_raise_next_id(cbm_gbuf_t *gb, int64_t next_id) {
+    if (gb && next_id > gb->next_id) {
+        gb->next_id = next_id;
+    }
+}
+
+static int gb_id_cmp(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb) {
+    if (!gb || gb->edges.count < 2) {
+        return 0;
+    }
+    int n = gb->edges.count;
+    int64_t *ids = cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, (size_t)n * sizeof(*ids));
+    if (!ids) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < n; i++) {
+        ids[i] = gb->edges.items[i]->id;
+    }
+    qsort(ids, (size_t)n, sizeof(*ids), gb_id_cmp);
+    int dups = 0;
+    for (int i = 1; i < n; i++) {
+        dups += ids[i] == ids[i - SKIP_ONE];
+    }
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, ids);
+    return dups;
+}
+
+/* ── Definition variants ─────────────────────────────────────────────
+ * One name defined more than once under mutually exclusive conditions —
+ * C-family #if/#else, Rust #[cfg], build-tagged files, a definition under an
+ * `if` — is ONE identity: one QN, one node, whose edges are the union of
+ * every variant's body. The collision rule below keeps one canonical winner
+ * for name, file, lines and properties; every variant's span survives in the
+ * node's `variants` property ([{"file_path","start_line","end_line"}],
+ * sorted, unique), so a change in any variant maps to the node. Recorded only
+ * between definitions of the same label with real spans: a different kind
+ * sharing the QN (C: struct vs function) is no variant, a span on line 0 is
+ * no location (delta-route proxies), and a full tie is the same entity.
+ * C-family platform files (foo_win.c / foo_posix.c, src/unix/ vs src/win/)
+ * do not collide here: each definition keeps its path QN, and they share a
+ * `variant_key` property instead (helpers.h cbm_platform_neutral_qn), which
+ * the test-impact walk follows (store_impact.h follow_variant_keys). */
+static void *gb_yy_malloc(void *ctx, size_t size) {
+    (void)ctx;
+    return cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, size);
+}
+
+static void *gb_yy_realloc(void *ctx, void *block, size_t old_size, size_t size) {
+    (void)ctx;
+    (void)old_size;
+    return cbm_realloc(CBM_MEM_CLASS_GBUF_STRING, block, size);
+}
+
+static void gb_yy_free(void *ctx, void *block) {
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, block);
+}
+
+static const yyjson_alc gb_yy_alc = {gb_yy_malloc, gb_yy_realloc, gb_yy_free, NULL};
+
+typedef struct {
+    const char *file; /* interned in the buffer's pool */
+    int start;
+    int end;
+} gb_span_t;
+
+/* One side of a same-QN collision. */
+typedef struct {
+    const char *label;
+    const char *props;
+    const char *file;
+    int start;
+    int end;
+} gb_def_t;
+
+/* Every definition span that collapsed into one node, gathered while the
+ * buffer is built and written into the node's `variants` once, on export
+ * (cbm_gbuf_settle_variants). Rewriting a growing JSON list on every
+ * collision was quadratic in the collisions of one QN: 7,586 junit
+ * `testcase` elements in one file. */
+typedef struct {
+    gb_span_t *items;
+    size_t count;
+    size_t cap;
+} gb_span_vec_t;
+
+static bool gb_variant_label(const char *label) {
+    static const char *const labels[] = {"Function", "Method", "Class", "Interface", "Enum",
+                                         "Struct",   "Trait",  "Type",  "Macro"};
+    for (size_t i = 0; label && i < sizeof(labels) / sizeof(labels[0]); i++) {
+        if (strcmp(label, labels[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int gb_span_cmp(const void *a, const void *b) {
+    const gb_span_t *x = a;
+    const gb_span_t *y = b;
+    int c = strcmp(x->file, y->file);
+    if (c == 0) {
+        c = (x->start > y->start) - (x->start < y->start);
+    }
+    if (c == 0) {
+        c = (x->end > y->end) - (x->end < y->end);
+    }
+    return c;
+}
+
+/* The non-empty `variants` list of a properties document, or NULL. */
+static yyjson_val *gb_variants_list(yyjson_doc *doc) {
+    yyjson_val *list = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "variants") : NULL;
+    return yyjson_is_arr(list) && yyjson_arr_size(list) > 0 ? list : NULL;
+}
+
+static bool gb_props_have_variants(const char *props) {
+    return props && strstr(props, "\"variants\"") != NULL;
+}
+
+/* Does this side carry a span: a variants list, or a definition's own span? */
+static bool gb_def_has_spans(const gb_def_t *d) {
+    return gb_props_have_variants(d->props) || (gb_variant_label(d->label) && d->start > 0);
+}
+
+static void gb_span_push(gb_span_vec_t *vec, gb_span_t span) {
+    if (vec->count == vec->cap) {
+        enum { GB_SPANS_MIN = 4 };
+        size_t cap = vec->cap ? vec->cap * PAIR_LEN : GB_SPANS_MIN;
+        gb_span_t *grown = cbm_realloc(CBM_MEM_CLASS_GBUF_INDEX, vec->items, cap * sizeof(*grown));
+        if (!grown) {
+            return; /* a lost span costs precision, never data */
+        }
+        vec->items = grown;
+        vec->cap = cap;
+    }
+    vec->items[vec->count++] = span;
+}
+
+/* Append a side's spans: its `variants` list, else its own span when it is a
+ * definition. File paths are interned, so the spans outlive the props. */
+static void gb_collect_spans(cbm_gbuf_t *gb, gb_span_vec_t *vec, const gb_def_t *d) {
+    if (gb_props_have_variants(d->props)) {
+        yyjson_doc *doc = yyjson_read_opts((char *)d->props, strlen(d->props), 0, &gb_yy_alc, NULL);
+        yyjson_val *list = gb_variants_list(doc);
+        if (list) {
+            size_t i;
+            size_t max;
+            yyjson_val *v;
+            yyjson_arr_foreach(list, i, max, v) {
+                const char *f = yyjson_get_str(yyjson_obj_get(v, "file_path"));
+                int st = (int)yyjson_get_int(yyjson_obj_get(v, "start_line"));
+                int en = (int)yyjson_get_int(yyjson_obj_get(v, "end_line"));
+                if (f && st > 0) {
+                    gb_span_push(vec, (gb_span_t){gb_intern(gb, f), st, en});
+                }
+            }
+            yyjson_doc_free(doc);
+            return;
+        }
+        yyjson_doc_free(doc);
+    }
+    if (gb_variant_label(d->label) && d->start > 0) {
+        gb_span_push(vec, (gb_span_t){gb_intern(gb, d->file ? d->file : ""), d->start, d->end});
+    }
+}
+
+/* Append spans gathered in another buffer (a worker's), re-interned here. */
+static void gb_append_spans(cbm_gbuf_t *gb, gb_span_vec_t *vec, const gb_span_vec_t *from) {
+    for (size_t i = 0; i < from->count; i++) {
+        gb_span_t span = from->items[i];
+        span.file = gb_intern(gb, span.file);
+        gb_span_push(vec, span);
+    }
+}
+
+/* A same-QN collision: gather both sides' spans for the surviving node,
+ * whichever label wins and however many there are. Call it before the
+ * winner is decided, while `existing` still holds its own fields.
+ * `arrival_spans` are the arrival's spans gathered in a worker buffer (they
+ * already include its own); NULL when it brings none. */
+static void gb_note_collision(cbm_gbuf_t *gb, const cbm_gbuf_node_t *existing,
+                              const gb_def_t *arrival, const gb_span_vec_t *arrival_spans) {
+    gb_def_t prior = {existing->label, existing->properties_json, existing->file_path,
+                      existing->start_line, existing->end_line};
+    bool arrival_has = arrival_spans ? arrival_spans->count > 0 : gb_def_has_spans(arrival);
+    if (!existing->qualified_name || (!gb_def_has_spans(&prior) && !arrival_has)) {
+        return;
+    }
+    if (!gb->variant_spans) {
+        gb->variant_spans = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, 0);
+        if (!gb->variant_spans) {
+            return;
+        }
+    }
+    gb_span_vec_t *vec = cbm_ht_get(gb->variant_spans, existing->qualified_name);
+    if (!vec) {
+        vec = cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, sizeof(*vec));
+        if (!vec) {
+            return;
+        }
+        gb_collect_spans(gb, vec, &prior);
+        cbm_ht_set(gb->variant_spans, existing->qualified_name, vec);
+    }
+    if (arrival_spans) {
+        gb_append_spans(gb, vec, arrival_spans);
+    } else {
+        gb_collect_spans(gb, vec, arrival);
+    }
+}
+
+/* A worker node copied into this buffer brings the spans it gathered there. */
+static void gb_adopt_spans(cbm_gbuf_t *gb, const cbm_gbuf_node_t *node, const gb_span_vec_t *from) {
+    if (!node || !node->qualified_name || !from || from->count == 0) {
+        return;
+    }
+    if (!gb->variant_spans) {
+        gb->variant_spans = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, 0);
+        if (!gb->variant_spans) {
+            return;
+        }
+    }
+    gb_span_vec_t *vec = cbm_ht_get(gb->variant_spans, node->qualified_name);
+    if (!vec) {
+        vec = cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, sizeof(*vec));
+        if (!vec) {
+            return;
+        }
+        cbm_ht_set(gb->variant_spans, node->qualified_name, vec);
+    }
+    gb_append_spans(gb, vec, from);
+}
+
+static void gb_span_vec_free(gb_span_vec_t *vec) {
+    if (vec) {
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, vec->items);
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, vec);
+    }
+}
+
+/* A node leaves the QN index: its gathered spans go with it, so a later node
+ * of the same QN starts from its own. */
+static void gb_drop_variant_spans(cbm_gbuf_t *gb, const char *qn) {
+    if (gb->variant_spans && qn) {
+        gb_span_vec_free(cbm_ht_delete(gb->variant_spans, qn));
+    }
+}
+
+/* Write a node's gathered spans into its properties: sorted, distinct, the
+ * list left out only when it would say no more than the node's own span. */
+static void gb_write_variants(cbm_gbuf_node_t *node, gb_span_vec_t *vec) {
+    qsort(vec->items, vec->count, sizeof(vec->items[0]), gb_span_cmp);
+    size_t unique = 0;
+    for (size_t i = 0; i < vec->count; i++) {
+        if (unique == 0 || gb_span_cmp(&vec->items[unique - SKIP_ONE], &vec->items[i]) != 0) {
+            vec->items[unique++] = vec->items[i];
+        }
+    }
+    gb_span_t own = {node->file_path ? node->file_path : "", node->start_line, node->end_line};
+    bool own_is_span = gb_variant_label(node->label) && node->start_line > 0;
+    bool only_own =
+        own_is_span ? unique == SKIP_ONE && gb_span_cmp(&vec->items[0], &own) == 0 : unique == 0;
+    if (only_own && !gb_props_have_variants(node->properties_json)) {
+        return;
+    }
+    /* Numbers stay as written: a pass printed them (importance 0.000000). */
+    const char *props = node->properties_json;
+    yyjson_doc *doc = props ? yyjson_read_opts((char *)props, strlen(props),
+                                               YYJSON_READ_NUMBER_AS_RAW, &gb_yy_alc, NULL)
+                            : NULL;
+    yyjson_mut_doc *mut = yyjson_mut_doc_new(&gb_yy_alc);
+    yyjson_mut_val *root = NULL;
+    if (mut) {
+        root = doc && yyjson_is_obj(yyjson_doc_get_root(doc))
+                   ? yyjson_val_mut_copy(mut, yyjson_doc_get_root(doc))
+                   : yyjson_mut_obj(mut);
+    }
+    yyjson_mut_val *list = root && !only_own ? yyjson_mut_arr(mut) : NULL;
+    for (size_t i = 0; list && i < unique; i++) {
+        yyjson_mut_val *v = yyjson_mut_arr_add_obj(mut, list);
+        yyjson_mut_obj_add_strcpy(mut, v, "file_path", vec->items[i].file);
+        yyjson_mut_obj_add_int(mut, v, "start_line", vec->items[i].start);
+        yyjson_mut_obj_add_int(mut, v, "end_line", vec->items[i].end);
+    }
+    if (root && (only_own || list)) {
+        yyjson_mut_obj_remove_key(root, "variants");
+        if (list) {
+            yyjson_mut_obj_add_val(mut, root, "variants", list);
+        }
+        yyjson_mut_doc_set_root(mut, root);
+        char *out = yyjson_mut_write_opts(mut, 0, &gb_yy_alc, NULL, NULL);
+        if (out) {
+            cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->properties_json);
+            node->properties_json = out;
+        }
+    }
+    yyjson_mut_doc_free(mut);
+    yyjson_doc_free(doc);
+}
+
+static void gb_settle_one(const char *qn, void *value, void *ud) {
+    cbm_gbuf_t *gb = ud;
+    gb_span_vec_t *vec = value;
+    cbm_gbuf_node_t *node = gb->node_by_qn ? cbm_ht_get(gb->node_by_qn, qn) : NULL;
+    if (node && vec) {
+        gb_write_variants(node, vec);
+    }
+    gb_span_vec_free(vec);
+}
+
+static void gb_free_span_vec(const char *qn, void *value, void *ud) {
+    (void)qn;
+    (void)ud;
+    gb_span_vec_free(value);
+}
+
+void cbm_gbuf_foreach_span(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *n, cbm_gbuf_span_fn fn,
+                           void *ud) {
+    if (!gb || !n || !fn) {
+        return;
+    }
+    const gb_span_vec_t *vec = gb->variant_spans && n->qualified_name
+                                   ? cbm_ht_get(gb->variant_spans, n->qualified_name)
+                                   : NULL;
+    if (vec && vec->count > 0) {
+        for (size_t i = 0; i < vec->count; i++) {
+            fn(vec->items[i].file, vec->items[i].start, vec->items[i].end, ud);
+        }
+        return;
+    }
+    if (gb_props_have_variants(n->properties_json)) {
+        yyjson_doc *doc = yyjson_read_opts((char *)n->properties_json, strlen(n->properties_json),
+                                           0, &gb_yy_alc, NULL);
+        yyjson_val *list = gb_variants_list(doc);
+        size_t i;
+        size_t max;
+        yyjson_val *v;
+        bool any = false;
+        yyjson_arr_foreach(list, i, max, v) {
+            const char *f = yyjson_get_str(yyjson_obj_get(v, "file_path"));
+            int s = (int)yyjson_get_int(yyjson_obj_get(v, "start_line"));
+            int e = (int)yyjson_get_int(yyjson_obj_get(v, "end_line"));
+            if (f && s > 0) {
+                fn(f, s, e, ud);
+                any = true;
+            }
+        }
+        yyjson_doc_free(doc);
+        if (any) {
+            return;
+        }
+    }
+    if (n->file_path && n->start_line > 0) {
+        fn(n->file_path, n->start_line, n->end_line, ud);
+    }
+}
+
+void cbm_gbuf_settle_variants(cbm_gbuf_t *gb) {
+    if (!gb || !gb->variant_spans) {
+        return;
+    }
+    cbm_ht_foreach(gb->variant_spans, gb_settle_one, gb);
+    cbm_ht_free(gb->variant_spans);
+    gb->variant_spans = NULL;
+}
+
 /* ── Node operations ─────────────────────────────────────────────── */
+
+/* First key of the canonical same-QN collision order: how strong a claim the
+ * entity has on a qualified name. A macro is the weakest: when a "Macro" and
+ * a definition share a QN, the definition, which carries the body, the
+ * signature and every edge, owns it whichever comes first.
+ *
+ * C-preprocessor macros no longer get here: their QN carries its own
+ * namespace (`...#macro`, CBM_MACRO_QN_SUFFIX) and cannot equal a definition's.
+ * The case left is Chialisp, whose `defmacro` / `defmac` defs are labelled
+ * "Macro" under a plain QN: a macro and a `defun` of one name in one file, or
+ * in a same-stem `.clsp` / `.clib` pair (one module QN). */
+static int gb_qn_claim_rank(const char *label) {
+    return (label && strcmp(label, "Macro") == 0) ? 0 : 1;
+}
 
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
@@ -880,8 +1277,13 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * of the same entity with new content) replaces the earlier one,
          * deterministically, because intra-file arrival order is fixed. A
          * full tie is the same entity re-upserted → refresh in place.
-         * Kind-disambiguated QNs (the real cure) remain a follow-up. */
-        int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+         * Ahead of all of these, a definition beats a macro
+         * (gb_qn_claim_rank). Kind-disambiguated QNs (the real cure) remain
+         * a follow-up. */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(label);
+        if (c == 0) {
+            c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - start_line;
         }
@@ -891,9 +1293,13 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
         if (c == 0) {
             c = strcmp(existing->label ? existing->label : "", label ? label : "");
         }
+        gb_def_t arrival = {label, properties_json, file_path, start_line, end_line};
+        gb_note_collision(gb, existing, &arrival, NULL);
         if (c > 0) {
             return existing->id; /* existing entity is the canonical winner */
         }
+        /* The arrival wins: its properties; the variant spans both carry are
+         * written on export (cbm_gbuf_settle_variants). */
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
          * interned: gb_intern returns a stable pool pointer (idempotent even when
@@ -1048,6 +1454,7 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
                    intptr_to_ptr(SKIP_ONE));
 
         /* Remove from primary indexes */
+        gb_drop_variant_spans(gb, n->qualified_name);
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
@@ -1095,6 +1502,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
 
         /* Remove from primary indexes */
+        gb_drop_variant_spans(gb, n->qualified_name);
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
@@ -1125,6 +1533,113 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         cbm_log_info("gbuf.delete_by_file", "file", file_path, "scanned", s_buf, "deleted", d_buf);
     }
     return deleted_count;
+}
+
+/* Whether an edge of `types` (NULL-terminated) touches node `id`. */
+static bool gbuf_node_touched(const cbm_gbuf_t *gb, int64_t id, const char *const *types) {
+    for (int t = 0; types[t]; t++) {
+        const cbm_gbuf_edge_t **edges = NULL;
+        int count = 0;
+        if ((cbm_gbuf_find_edges_by_target_type(gb, id, types[t], &edges, &count) == 0 &&
+             count > 0) ||
+            (cbm_gbuf_find_edges_by_source_type(gb, id, types[t], &edges, &count) == 0 &&
+             count > 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Delete the `label` nodes no edge of `types` (NULL-terminated) touches --
+ * with `fileless`, only those carrying no file; returns how many. */
+static int gbuf_delete_untouched(cbm_gbuf_t *gb, const char *label, const char *const *types,
+                                 bool fileless) {
+    node_ptr_array_t *arr = cbm_ht_get(gb->nodes_by_label, label);
+    if (!arr || arr->count == 0) {
+        return 0;
+    }
+    /* The victims first: the per-node unlinking below edits `arr`. */
+    cbm_gbuf_node_t **victims =
+        cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX, (size_t)arr->count * sizeof(*victims));
+    if (!victims) {
+        return CBM_NOT_FOUND;
+    }
+    int n = 0;
+    for (int i = 0; i < arr->count; i++) {
+        const char *qn = arr->items[i]->qualified_name;
+        cbm_gbuf_node_t *node = qn ? cbm_ht_get(gb->node_by_qn, qn) : NULL;
+        if (node && !(fileless && node->file_path && node->file_path[0]) &&
+            !gbuf_node_touched(gb, node->id, types)) {
+            victims[n++] = node;
+        }
+    }
+    if (n == 0) {
+        cbm_free(CBM_MEM_CLASS_GBUF_INDEX, victims);
+        return 0;
+    }
+    CBMHashTable *deleted_set = cbm_ht_create((uint32_t)n);
+    for (int i = 0; i < n; i++) {
+        cbm_gbuf_node_t *node = victims[i];
+        if (!node->qualified_name) {
+            continue;
+        }
+        char id_buf[CBM_SZ_32];
+        make_id_key(id_buf, sizeof(id_buf), node->id);
+        cbm_ht_set(deleted_set, cbm_mem_strdup(CBM_MEM_CLASS_GBUF_INDEX, id_buf),
+                   intptr_to_ptr(SKIP_ONE));
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, node->label), node->id);
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, node->name), node->id);
+        gb_drop_variant_spans(gb, node->qualified_name);
+        cbm_ht_delete(gb->node_by_qn, node->qualified_name);
+        if (node->id >= 0 && node->id < gb->by_id_cap) {
+            gb->by_id[node->id] = NULL;
+        }
+        /* As delete_by_file: a NULL QN fails the dump's liveness check. */
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->qualified_name);
+        node->qualified_name = NULL;
+    }
+    cascade_delete_edges(gb, deleted_set);
+    cbm_ht_foreach(deleted_set, free_index_key, NULL);
+    cbm_ht_free(deleted_set);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, victims);
+    return n;
+}
+
+int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *const *edge_types) {
+    if (!gb || !label || !edge_types || !edge_types[0]) {
+        return CBM_NOT_FOUND;
+    }
+    return gbuf_delete_untouched(gb, label, edge_types, false);
+}
+
+typedef struct {
+    const char **items;
+    uint32_t count;
+} gb_type_list_t;
+
+static void collect_edge_type(const char *key, void *value, void *ud) {
+    (void)value;
+    gb_type_list_t *list = ud;
+    list->items[list->count++] = key;
+}
+
+int cbm_gbuf_delete_edgeless(cbm_gbuf_t *gb, const char *label) {
+    if (!gb || !label) {
+        return CBM_NOT_FOUND;
+    }
+    /* Edges are indexed by (node, type) only: "any edge" is an edge of any
+     * type the buffer holds (NULL-terminated by the calloc). */
+    gb_type_list_t list = {
+        cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX,
+                   ((size_t)cbm_ht_count(gb->edges_by_type) + 1) * sizeof(*list.items)),
+        0};
+    if (!list.items) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_ht_foreach(gb->edges_by_type, collect_edge_type, &list);
+    int n = gbuf_delete_untouched(gb, label, list.items, true);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, list.items);
+    return n;
 }
 
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
@@ -1415,16 +1930,15 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type) {
     return arr ? arr->count : 0;
 }
 
-int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
-    if (!gb || !type) {
-        return CBM_NOT_FOUND;
-    }
+/* Remove the edges `drop` selects from the array and the dedup index, then
+ * rebuild the secondary indexes. */
+typedef bool (*gbuf_edge_pred_t)(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud);
 
-    /* Remove edges of the given type from array and dedup index */
+static int gbuf_delete_edges_if(cbm_gbuf_t *gb, gbuf_edge_pred_t drop, const void *ud) {
     int write_idx = 0;
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
-        if (strcmp(e->type, type) == 0) {
+        if (drop(gb, e, ud)) {
             char key[EDGE_KEY_BUF];
             make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
                           e->properties_json);
@@ -1446,6 +1960,68 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
     return 0;
 }
 
+static bool gbuf_edge_is_type(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    (void)gb;
+    return strcmp(e->type, (const char *)ud) == 0;
+}
+
+int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
+    if (!gb || !type) {
+        return CBM_NOT_FOUND;
+    }
+    return gbuf_delete_edges_if(gb, gbuf_edge_is_type, type);
+}
+
+typedef struct {
+    const char *type;
+    const char *label;
+} gbuf_type_label_t;
+
+static bool gbuf_edge_from_label(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    const gbuf_type_label_t *tl = ud;
+    if (strcmp(e->type, tl->type) != 0) {
+        return false;
+    }
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(gb, e->source_id);
+    return src && src->label && strcmp(src->label, tl->label) == 0;
+}
+
+int cbm_gbuf_delete_edges_from_label(cbm_gbuf_t *gb, const char *type, const char *label) {
+    if (!gb || !type || !label) {
+        return CBM_NOT_FOUND;
+    }
+    gbuf_type_label_t tl = {type, label};
+    return gbuf_delete_edges_if(gb, gbuf_edge_from_label, &tl);
+}
+
+static int gbuf_ptr_cmp(const void *k, const void *v) {
+    uintptr_t a = (uintptr_t)*(const cbm_gbuf_edge_t *const *)k;
+    uintptr_t b = (uintptr_t)*(const cbm_gbuf_edge_t *const *)v;
+    return (a > b) - (a < b);
+}
+
+typedef struct {
+    const cbm_gbuf_edge_t **edges;
+    int n;
+} gbuf_edge_set_t;
+
+static bool gbuf_edge_in_set(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    (void)gb;
+    const gbuf_edge_set_t *s = ud;
+    return bsearch(&e, s->edges, (size_t)s->n, sizeof(*s->edges), gbuf_ptr_cmp) != NULL;
+}
+
+/* By the edges themselves, not their ids: after the parallel resolve merge,
+ * cbm_gbuf_set_next_id can hand an id out twice. */
+int cbm_gbuf_delete_edges(cbm_gbuf_t *gb, const cbm_gbuf_edge_t **edges, int n) {
+    if (!gb || !edges || n <= 0) {
+        return 0;
+    }
+    qsort((void *)edges, (size_t)n, sizeof(*edges), gbuf_ptr_cmp);
+    gbuf_edge_set_t s = {edges, n};
+    return gbuf_delete_edges_if(gb, gbuf_edge_in_set, &s);
+}
+
 /* ── Merge ───────────────────────────────────────────────────────── */
 
 /* Free remap hash table entries (key = heap string, value = heap int64_t*) */
@@ -1458,7 +2034,8 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
 /* Handle QN collision: update dst node fields (src wins), record remap if IDs differ.
  * label/file_path are re-interned into dst's pool (sn's pointers belong to src). */
 static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
-                                  const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
+                                  const cbm_gbuf_node_t *sn, const gb_span_vec_t *sn_spans,
+                                  CBMHashTable **remap) {
     /* Same guard as cbm_gbuf_upsert_node: a per-file "Module" def coming from a
      * worker-local gbuf must not touch the structural directory node ("Project"
      * root or "Folder") that shares its QN in a directory-based-module language
@@ -1480,9 +2057,13 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
          * the node set (and every downstream consumer) run to run. Winner =
          * smallest file_path, then LARGEST start_line, then largest
          * name/label — one total order, commutative, scheduling-free; a full
-         * tie is the same entity → refresh from src. */
-        int c = strcmp(sn->file_path ? sn->file_path : "",
+         * tie is the same entity → refresh from src. A definition beats a
+         * macro ahead of all of these (gb_qn_claim_rank). */
+        int c = gb_qn_claim_rank(existing->label) - gb_qn_claim_rank(sn->label);
+        if (c == 0) {
+            c = strcmp(sn->file_path ? sn->file_path : "",
                        existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - sn->start_line;
         }
@@ -1493,7 +2074,12 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             c = strcmp(existing->label ? existing->label : "", sn->label ? sn->label : "");
         }
         bool sn_wins = c <= 0;
+        gb_def_t src_def = {sn->label, sn->properties_json, sn->file_path, sn->start_line,
+                            sn->end_line};
+        gb_note_collision(dst, existing, &src_def, sn_spans);
         if (sn_wins) {
+            /* src's properties; the variant spans both carry are written on
+             * export (cbm_gbuf_settle_variants). */
             /* Keep the secondary indexes consistent when the surviving
              * label/name changes (the old code left the node listed under its
              * original label/name, so find_by_label/name mis-listed it). */
@@ -1621,11 +2207,16 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
             continue;
         }
 
+        /* The spans src gathered for this node travel with it; they are
+         * written once, when dst is exported. */
+        const gb_span_vec_t *spans =
+            src->variant_spans ? cbm_ht_get(src->variant_spans, sn->qualified_name) : NULL;
         cbm_gbuf_node_t *existing = cbm_ht_get(dst->node_by_qn, sn->qualified_name);
         if (existing) {
-            merge_update_existing(dst, existing, sn, &remap);
+            merge_update_existing(dst, existing, sn, spans, &remap);
         } else {
             merge_copy_new_node(dst, sn);
+            gb_adopt_spans(dst, cbm_ht_get(dst->node_by_qn, sn->qualified_name), spans);
         }
     }
 
@@ -1914,6 +2505,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
+    cbm_gbuf_settle_variants(gb);
 
     CBM_PROF_START(t_count);
     int live_count = count_live_nodes(gb);
@@ -2031,6 +2623,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     if (!gb || !store) {
         return CBM_NOT_FOUND;
     }
+    cbm_gbuf_settle_variants(gb);
 
     /* Upsert project */
     cbm_store_upsert_project(store, gb->project, gb->root_path);
@@ -2105,6 +2698,7 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     if (!gb || !store) {
         return CBM_NOT_FOUND;
     }
+    cbm_gbuf_settle_variants(gb);
 
     /* Begin bulk mode — no project wipe */
     cbm_store_begin(store);

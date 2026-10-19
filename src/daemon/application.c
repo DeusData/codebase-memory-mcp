@@ -11,6 +11,7 @@
 #include "foundation/log.h"
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
@@ -20,6 +21,7 @@
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
+#include "store/graph_mem.h"
 #include "ui/config.h"
 #include "watcher/watcher.h"
 
@@ -329,41 +331,88 @@ static void application_project_lock_release_fully(cbm_project_lock_lease_t **le
     }
 }
 
+typedef struct {
+    cbm_index_worker_handle_t *handle;
+    char *project;
+} application_default_worker_t;
+
+static char *application_index_project_key(const char *root_path, const char *args_json);
+static void application_worker_destroy_default(void *context,
+                                               cbm_daemon_application_worker_t opaque);
+
+/* Reuse the supervisor's bounded completed-line relay. Only actionable worker
+ * diagnostics enter the daemon journal; ordinary progress stays in worker logs. */
+static void application_worker_diagnostic(const char *line, void *context) {
+    const application_default_worker_t *worker = context;
+    if (!line || !worker) {
+        return;
+    }
+    if (!strncmp(line, "level=error ", strlen("level=error ")) ||
+        strstr(line, "\"level\":\"error\"")) {
+        cbm_log_error("index.worker", "project", worker->project ? worker->project : "", "record",
+                      line);
+    } else if (!strncmp(line, "level=warn ", strlen("level=warn ")) ||
+               strstr(line, "\"level\":\"warn\"")) {
+        cbm_log_warn("index.worker", "project", worker->project ? worker->project : "", "record",
+                     line);
+    }
+}
+
 static int application_worker_start_default(void *context, const char *args_json,
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
-    cbm_index_worker_handle_t *worker = NULL;
-    int result = cbm_index_worker_start(args_json, memory_budget_bytes, false, marker_file,
-                                        quarantine_file, &worker);
+    application_default_worker_t *worker = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*worker));
+    if (!worker) {
+        return -1;
+    }
+    yyjson_doc *args_doc = yyjson_read_opts((char *)args_json, strlen(args_json), 0,
+                                            cbm_json_writer_allocator(), NULL);
+    const char *root = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(args_doc), "repo_path"));
+    worker->project = application_index_project_key(root, args_json);
+    yyjson_doc_free(args_doc);
+    int result = cbm_index_worker_start_with_log(args_json, memory_budget_bytes, false, marker_file,
+                                                 quarantine_file, application_worker_diagnostic,
+                                                 worker, &worker->handle);
+    if (result != 0) {
+        application_worker_destroy_default(NULL, worker);
+        *worker_out = NULL;
+        return result;
+    }
     *worker_out = worker;
-    return result;
+    return 0;
 }
 
 static cbm_index_worker_poll_t application_worker_poll_default(
-    void *context, cbm_daemon_application_worker_t worker,
+    void *context, cbm_daemon_application_worker_t opaque,
     const cbm_index_worker_result_t **result_out) {
     (void)context;
-    return cbm_index_worker_poll((cbm_index_worker_handle_t *)worker, result_out);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_poll(worker->handle, result_out);
 }
 
 static bool application_worker_cancel_default(void *context,
-                                              cbm_daemon_application_worker_t worker) {
+                                              cbm_daemon_application_worker_t opaque) {
     (void)context;
-    return cbm_index_worker_request_cancel((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_request_cancel(worker->handle);
 }
 
 static const char *application_worker_log_path_default(void *context,
-                                                       cbm_daemon_application_worker_t worker) {
+                                                       cbm_daemon_application_worker_t opaque) {
     (void)context;
-    return cbm_index_worker_log_path((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_log_path(worker->handle);
 }
 
 static void application_worker_destroy_default(void *context,
-                                               cbm_daemon_application_worker_t worker) {
+                                               cbm_daemon_application_worker_t opaque) {
     (void)context;
-    cbm_index_worker_destroy((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    cbm_index_worker_destroy(worker->handle);
+    free(worker->project);
+    cbm_free(CBM_MEM_CLASS_OTHER, worker);
 }
 
 static uint32_t application_get_u32(const uint8_t *bytes) {
@@ -563,6 +612,57 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
     watch->next = application->watches;
     application->watches = watch;
     session->watch = watch;
+}
+
+static const char *application_watch_strategy_name(cbm_watcher_strategy_t strategy) {
+    switch (strategy) {
+    case CBM_WATCHER_STRATEGY_GIT:
+        return "git";
+    case CBM_WATCHER_STRATEGY_TREE:
+        return "tree";
+    case CBM_WATCHER_STRATEGY_NONE:
+        return "none";
+    default:
+        return "pending";
+    }
+}
+
+/* index_status watch visibility (#2167). The physical watcher is the truth for
+ * "watched"; the reasons explain the documented scope: only an MCP session's
+ * own project is watched, and only while that session is open. Takes the
+ * application mutex and the watcher lock one after the other, never nested. */
+static void application_watch_status(void *context, const char *project,
+                                     cbm_mcp_watch_status_t *out) {
+    cbm_daemon_application_session_t *session = context;
+    cbm_daemon_application_t *application = session ? session->application : NULL;
+    if (!application || !application->watcher) {
+        out->reason = "watcher_disabled";
+        return;
+    }
+    cbm_watcher_project_info_t info;
+    if (cbm_watcher_project_info(application->watcher, project, &info)) {
+        out->watched = true;
+        out->strategy = application_watch_strategy_name(info.strategy);
+        out->poll_interval_ms = info.poll_interval_ms;
+        out->last_scan_unix_s = info.last_scan_unix_s;
+        return;
+    }
+    const char *session_project = cbm_mcp_server_session_project(session->mcp);
+    if (!session_project || strcmp(session_project, project) != 0) {
+        out->reason = "not_session_project";
+        return;
+    }
+    if (application->config &&
+        !cbm_config_get_bool(application->config, CBM_CONFIG_AUTO_WATCH, true)) {
+        out->reason = "auto_watch_off";
+        return;
+    }
+    /* Only MCP sessions run background initialization; a one-shot CLI command
+     * never holds a watch across calls. */
+    cbm_mutex_lock(&application->mutex);
+    bool mcp_session = session->background_eligible;
+    cbm_mutex_unlock(&application->mutex);
+    out->reason = mcp_session ? "not_registered" : "cli_session";
 }
 
 static void application_refresh_watch(cbm_daemon_application_session_t *session) {
@@ -1349,6 +1449,15 @@ static char *application_job_failure_response(const cbm_index_worker_result_t *r
         (void)snprintf(message, sizeof(message),
                        "index worker containment failed (%s); inspect log: %s",
                        cbm_proc_outcome_str(result->outcome), log_path ? log_path : "unavailable");
+    } else if (result && result->response_missing) {
+        /* #1300: name the silent clean exit, where it stopped, and the log. */
+        const char *log = log_path                ? log_path
+                          : result->worker_log[0] ? result->worker_log
+                                                  : "unavailable";
+        (void)snprintf(message, sizeof(message),
+                       "index worker exited cleanly (exit 0) without writing a response; the "
+                       "index was not published; last phase reached: %s; inspect log: %s",
+                       result->last_phase[0] ? result->last_phase : "unknown", log);
     } else if (result) {
         (void)snprintf(message, sizeof(message),
                        "index worker ended with %s (exit=%d, signal=%d); inspect log: %s",
@@ -1427,6 +1536,23 @@ static void application_job_execution_cancel(application_job_execution_t *execut
     execution->unsafe_terminal = true;
 }
 
+/* A clean process exit means the response was delivered, not that indexing
+ * succeeded. The pipeline reports preserved-index aborts and publication errors
+ * as ordinary MCP tool results with isError=true. Keep that response for MCP
+ * callers, but do not publish a successful UI/background job or retry it as a
+ * crashed worker. Older successful responses may omit isError. */
+static bool application_index_response_succeeded(const char *response) {
+    yyjson_doc *document = response ? yyjson_read_opts((char *)response, strlen(response), 0,
+                                                       cbm_json_writer_allocator(), NULL)
+                                    : NULL;
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *error = yyjson_obj_get(root, "isError");
+    bool succeeded = yyjson_is_obj(root) && yyjson_is_arr(yyjson_obj_get(root, "content")) &&
+                     (!error || yyjson_is_false(error));
+    yyjson_doc_free(document);
+    return succeeded;
+}
+
 static application_attempt_decision_t application_consume_attempt(
     cbm_daemon_application_job_t *job, application_attempt_t *attempt,
     application_job_execution_t *execution, cbm_proc_outcome_t *failure_outcome) {
@@ -1437,7 +1563,7 @@ static application_attempt_decision_t application_consume_attempt(
     if (disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
         execution->response = attempt->result.response;
         attempt->result.response = NULL;
-        execution->successful = execution->response != NULL;
+        execution->successful = application_index_response_succeeded(execution->response);
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
     }
@@ -1642,6 +1768,15 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
             execution->have_last_result ? &execution->last_result : NULL,
             execution->last_log[0] ? execution->last_log : NULL);
     }
+    bool cancelled = execution->have_last_result && execution->last_result.cancellation_requested;
+    cbm_log(execution->successful ? CBM_LOG_INFO
+            : cancelled           ? CBM_LOG_WARN
+                                  : CBM_LOG_ERROR,
+            "daemon.index.result", "project", job->project_key, "path", job->root_path, "status",
+            execution->successful ? "indexed"
+            : cancelled           ? "cancelled"
+                                  : "failed",
+            NULL);
     cbm_daemon_application_t *application = job->application;
     cbm_mutex_lock(&application->mutex);
     job->response = execution->response;
@@ -1671,6 +1806,7 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
         }
     }
     application_auto_index_retry_pending_locked(application);
+    cbm_mem_class_flush_thread();
     cbm_mutex_unlock(&application->mutex);
 }
 
@@ -1737,9 +1873,11 @@ static cbm_daemon_application_job_t *application_find_active_job_locked(
 }
 
 static char *application_index_project_key(const char *root_path, const char *args_json) {
-    char *override = cbm_mcp_get_string_arg(args_json, "name");
+    yyjson_doc *doc = yyjson_read_opts((char *)args_json, strlen(args_json), 0,
+                                       cbm_json_writer_allocator(), NULL);
+    const char *override = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "name"));
     char *key = cbm_project_name_from_path(override && override[0] ? override : root_path);
-    free(override);
+    yyjson_doc_free(doc);
     return key;
 }
 
@@ -1756,7 +1894,13 @@ static size_t application_active_job_count_locked(cbm_daemon_application_t *appl
 /* Decision 2 (#1997 #832): a worker's memory slice is the aggregate budget
  * divided by the jobs active at spawn time. The job being spawned is already
  * in the table, so the divisor never drops below one; a zero aggregate means
- * "no cap" and the worker falls back to its own RAM-fraction budget. */
+ * "no cap" and the worker falls back to its own RAM-fraction budget.
+ *
+ * The daemon's resident adjacency layers (store/graph_mem.h) are part of the
+ * same aggregate, so workers split what is left after them. They are capped at
+ * a quarter of the daemon budget, which the aggregate defaults to; only a
+ * smaller configured aggregate can be exceeded, and then every job still gets
+ * at least one byte, as above — a zero slice would read as "no cap". */
 static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *application,
                                                      size_t *active_jobs_out) {
     size_t active = application_active_job_count_locked(application);
@@ -1766,7 +1910,16 @@ static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *a
     if (active_jobs_out) {
         *active_jobs_out = active;
     }
-    return application->aggregate_memory_budget_bytes / active;
+    size_t aggregate = application->aggregate_memory_budget_bytes;
+    if (aggregate == 0) {
+        return 0;
+    }
+    size_t held = cbm_graph_mem_cached_bytes();
+    size_t available = held < aggregate ? aggregate - held : 0;
+    if (available < active) {
+        available = active;
+    }
+    return available / active;
 }
 
 /* Compare the effective index request, not its JSON spelling. yyjson's deep
@@ -2182,12 +2335,16 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
     cbm_index_resource_policy_t policy;
     char error[CBM_SZ_256] = {0};
     bool loaded = cbm_config_load_index_policy(config, &policy, error, sizeof(error));
+    /* The worker reads no config: a doc_candidates setting the user set
+     * travels with the request; unset, the worker's index mode decides. */
+    bool doc_candidates_encoded =
+        !loaded || cbm_mcp_index_doc_candidates_add_to_args(document, root, config);
     cbm_config_close(owned_config);
     if (!loaded) {
         cbm_log_error("daemon.index.policy", "error", error);
         return false;
     }
-    return cbm_mcp_index_policy_add_to_args(document, root, &policy);
+    return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
 }
 
 static char *application_auto_index_args(cbm_daemon_application_t *application,
@@ -2789,6 +2946,7 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     }
     cbm_mcp_server_set_background_tasks(session->mcp, false);
     cbm_mcp_server_set_config(session->mcp, application->config);
+    cbm_mcp_server_set_watch_status_provider(session->mcp, application_watch_status, session);
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
     cbm_mcp_server_set_index_status_provider(session->mcp, application_index_status, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,

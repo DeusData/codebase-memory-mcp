@@ -17,6 +17,8 @@ npm install -g codebase-memory-mcp
 
 The runtime set for your platform is downloaded automatically at install time. There is one composition per platform and the graph UI is always included — the former `CBM_VARIANT=ui` opt-in is obsolete.
 
+For testing, `CBM_DOWNLOAD_URL` overrides the download base URL (default `https://github.com/DeusData/codebase-memory-mcp/releases/download/v<version>`): the archive and `checksums.txt` are fetched from `<CBM_DOWNLOAD_URL>/<file>`. It must be `https://`, or plain `http://` to exactly `localhost`, `127.0.0.1`, or `[::1]` (optional port; no proxy, no redirects).
+
 Then configure your coding agents:
 
 ```bash
@@ -55,8 +57,10 @@ codebase-memory-mcp install          # configure all detected coding agents
 codebase-memory-mcp --version
 codebase-memory-mcp --help
 codebase-memory-mcp update           # update to latest release
-codebase-memory-mcp uninstall        # remove agent configs
+codebase-memory-mcp uninstall        # remove agent configs; keep indexes by default
 ```
+
+Uninstall keeps project indexes with `--yes`, `--no`, or noninteractive input unless you explicitly add `--delete-indexes`. An interactive terminal without the flag asks separately and defaults to keeping them. `--delete-indexes` overrides `--no`; add `--dry-run` to preview without changing files. Kept indexes remain in the cache directory printed by uninstall.
 
 ### CLI Mode
 

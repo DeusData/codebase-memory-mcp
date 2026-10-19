@@ -334,7 +334,26 @@ TEST(gi_doublestar_backtracking_terminates) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+TEST(gi_character_classes_do_not_cross_path_separators) {
+    const char *patterns[] = {"src[!x]test.c", "src[/]test.c", "src[.-0]test.c"};
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        cbm_gitignore_t *gi = cbm_gitignore_parse(patterns[i]);
+        ASSERT_NOT_NULL(gi);
+        bool crossed = cbm_gitignore_matches(gi, "src/test.c", false);
+        cbm_gitignore_free(gi);
+        ASSERT_FALSE(crossed);
+    }
+    cbm_gitignore_t *gi = cbm_gitignore_parse("dir/src[!x]test.c\n");
+    ASSERT_NOT_NULL(gi);
+    ASSERT_TRUE(cbm_gitignore_matches(gi, "dir/srcatest.c", false));
+    ASSERT_FALSE(cbm_gitignore_matches(gi, "dir/srcxtest.c", false));
+    ASSERT_FALSE(cbm_gitignore_matches(gi, "dir/src/test.c", false));
+    cbm_gitignore_free(gi);
+    PASS();
+}
+
 SUITE(gitignore) {
+    RUN_TEST(gi_character_classes_do_not_cross_path_separators);
     RUN_TEST(gi_doublestar_backtracking_terminates);
     RUN_TEST(gi_empty_pattern);
     RUN_TEST(gi_exact_file);

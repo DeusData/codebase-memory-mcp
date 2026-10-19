@@ -440,9 +440,65 @@ TEST(githistory_ignores_inherited_repo_env) {
 #endif /* _WIN32 */
 }
 
+/* ── Branch-only resolve (list_projects) ───────────────────────────
+ * The listing prints only the branch; cbm_git_branch_resolve gets it from the
+ * two git calls cbm_git_context_resolve uses for it, so both must agree. */
+
+#ifndef _WIN32
+/* The branch resolver against the full context at `path`; NULL `want` = not git. */
+static bool branch_resolve_agrees(const char *path, const char *want) {
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(path, &ctx);
+    bool is_git = false;
+    char branch[CBM_GIT_BRANCH_MAX];
+    (void)cbm_git_branch_resolve(path, &is_git, branch, sizeof(branch));
+    bool agrees = is_git == ctx.is_git && is_git == (want != NULL) &&
+                  (want ? (ctx.branch && strcmp(branch, want) == 0 && strcmp(ctx.branch, want) == 0)
+                        : branch[0] == '\0');
+    cbm_git_context_free(&ctx);
+    return agrees;
+}
+#endif /* _WIN32 */
+
+TEST(git_branch_resolve_matches_full_context) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-based branch test not supported on Windows CI");
+#else
+    char plain[512];
+    char *tmp = th_mktempdir("cbm_gitbranch_plain");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+    snprintf(plain, sizeof(plain), "%s", tmp);
+    tmp = th_mktempdir("cbm_gitbranch");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+    if (make_git_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        th_rmtree(plain);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    char sub[600];
+    snprintf(sub, sizeof(sub), "%s/sub", tmp);
+    ASSERT_EQ(th_mkdir_p(sub), 0);
+    char missing[600];
+    snprintf(missing, sizeof(missing), "%s/missing", plain);
+
+    ASSERT_TRUE(branch_resolve_agrees(plain, NULL));
+    ASSERT_TRUE(branch_resolve_agrees(missing, NULL));
+    ASSERT_EQ(git_run(tmp, "checkout -q -b feat/x"), 0);
+    ASSERT_TRUE(branch_resolve_agrees(tmp, "feat/x"));
+    ASSERT_TRUE(branch_resolve_agrees(sub, "feat/x"));
+    ASSERT_EQ(git_run(tmp, "checkout -q --detach"), 0);
+    ASSERT_TRUE(branch_resolve_agrees(tmp, "DETACHED"));
+
+    th_rmtree(tmp);
+    th_rmtree(plain);
+    PASS();
+#endif /* _WIN32 */
+}
+
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
+    RUN_TEST(git_branch_resolve_matches_full_context);
     RUN_TEST(root_exists_non_ascii_directory);
     RUN_TEST(canonical_root_repo_root);
     RUN_TEST(canonical_root_subdir);

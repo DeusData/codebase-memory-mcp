@@ -11,6 +11,7 @@
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
+#include <stdint.h>
 #include <time.h>
 #include "macro_table.h"
 #include "result_spill.h"
@@ -18,6 +19,13 @@
 #include "iris_export_xml.h"
 #include "helpers.h"    /* cbm_count_branching (walker stack cap) */
 #include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
+
+/* Deep-nesting probes: extraction on a worker-sized stack, crash-isolated. */
+#include "pipeline/worker_pool.h"            /* CBM_WORKER_STACK_SIZE */
+#include "../src/foundation/compat_thread.h" /* cbm_thread_create */
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid */
+#endif
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -183,12 +191,13 @@ TEST(extract_ts_factory_object_methods_issue341) {
  *
  * The bound is derived, not tuned. Measured on this source, total_alloc was
  * 365984 before the scratch arena and is 87456 after, exactly that difference.
- * #1916 added two pointers to CBMDefinition (240 -> 256 bytes), so it now
- * measures 87968: 8192 is the defs item array at GROW_ARRAY's starting
- * capacity of 32 times sizeof(CBMDefinition) 256, and the other 79776 is
- * everything else this file's extraction interns; none of it is traversal
- * scratch. So the bound sits above 87968 with room and a factor of four below
- * the 365984 the scratch stacks cost.
+ * #1916 added two pointers to CBMDefinition (240 -> 256 bytes) and the C
+ * `variants` list one more (264), so it now measures 88224: 8448 is the defs
+ * item array at GROW_ARRAY's starting capacity of 32 times
+ * sizeof(CBMDefinition) 264, and the other 79776 is everything else this
+ * file's extraction interns; none of it is traversal scratch. So the bound
+ * sits above 88224 with room and a factor of four below the 365984 the
+ * scratch stacks cost.
  *
  * It is a byte budget, not a proof of lifetime; that is
  * extract_traversal_stacks_come_from_ctx_scratch_issue2010 in test_mem.c. */
@@ -581,6 +590,48 @@ TEST(java_class) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Animal"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A class field is one Field. Java, C# and Solidity list the field
+ * declaration as a variable kind too, and the class-body variable pass minted
+ * a second node: a Variable with the module's qualified name (Query.filters
+ * became `demo.query.filters`, the name of a package a documentation code
+ * span then bound). Languages whose class variables are no Field keep them. */
+TEST(class_field_is_one_field_not_also_a_variable) {
+    CBMFileResult *r = extract("package demo.query;\npublic class Query {\n"
+                               "    private Object filters;\n"
+                               "    private static final String PROP = \"v\";\n}\n",
+                               CBM_LANG_JAVA, "t", "Query.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Field", "filters"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "filters"), 0);
+    /* an initialized field is named by its declarator's name, not its text
+     * (`PROP = "v"` was the Field's name, so only the duplicate was findable) */
+    ASSERT_EQ(count_defs_named(r, "Field", "PROP"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "PROP"), 0);
+    cbm_free_result(r);
+    r = extract("namespace Demo {\n  public class Q {\n    private int count;\n  }\n}\n",
+                CBM_LANG_CSHARP, "t", "Q.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Field", "count"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "count"), 0);
+    cbm_free_result(r);
+    r = extract("pragma solidity ^0.8.0;\ncontract Q {\n    uint256 public total;\n}\n",
+                CBM_LANG_SOLIDITY, "t", "Q.sol");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Field", "total"), 1);
+    ASSERT_EQ(count_defs_named(r, "Variable", "total"), 0);
+    cbm_free_result(r);
+    /* no Field for these: their class variables stay */
+    r = extract("class Q {\n    var count: Int = 0\n}\n", CBM_LANG_SWIFT, "t", "Q.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Variable", "count"), 1);
+    cbm_free_result(r);
+    r = extract("extends Node\nclass Inner:\n    var x = 1\n", CBM_LANG_GDSCRIPT, "t", "q.gd");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Variable", "x"), 1);
     cbm_free_result(r);
     PASS();
 }
@@ -1069,6 +1120,126 @@ TEST(c_struct) {
     PASS();
 }
 
+/* `typedef struct { … } Name;` is the dominant C spelling of a type: the
+ * aggregate itself is anonymous and the typedef's declarator names it. Without
+ * that name the struct had no Class node and none of its members a Field node
+ * (37 of the 38 structs in internal/cbm/cbm.h), so a member access could only
+ * bind some OTHER struct's same-named field. */
+TEST(extract_c_anonymous_typedef_aggregate_is_named_by_its_typedef) {
+    CBMFileResult *r = extract("typedef struct {\n"
+                               "    int count;\n"
+                               "    const char *label;\n"
+                               "} Tally;\n"
+                               "\n"
+                               "typedef union {\n"
+                               "    int as_int;\n"
+                               "    float as_float;\n"
+                               "} Slot;\n"
+                               "\n"
+                               "typedef enum { SHADE_RED, SHADE_GREEN } Shade;\n"
+                               "\n"
+                               "typedef struct Named {\n"
+                               "    int id;\n"
+                               "} Named;\n"
+                               "\n"
+                               "typedef struct {\n"
+                               "    int raw;\n"
+                               "} *TallyRef;\n",
+                               CBM_LANG_C, "t", "tally.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* RED before the fix: none of the three anonymous aggregates has a def. */
+    ASSERT_TRUE(has_def(r, "Class", "Tally"));
+    ASSERT_TRUE(has_def_qn(r, "t.tally.Tally.count"));
+    ASSERT_TRUE(has_def_qn(r, "t.tally.Tally.label"));
+    ASSERT_TRUE(has_def(r, "Class", "Slot"));
+    ASSERT_TRUE(has_def_qn(r, "t.tally.Slot.as_int"));
+    ASSERT_TRUE(has_def_qn(r, "t.tally.Slot.as_float"));
+    ASSERT_TRUE(has_def_any(r, "Shade"));
+    /* A struct that names itself keeps exactly one def, under its own name. */
+    ASSERT_EQ(count_defs_named(r, "Class", "Named"), 1);
+    ASSERT_TRUE(has_def_qn(r, "t.tally.Named.id"));
+    /* A pointer typedef names a pointer type, not the aggregate: no Class. */
+    ASSERT_FALSE(has_def(r, "Class", "TallyRef"));
+    ASSERT_FALSE(has_def(r, "Field", "raw"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The anonymous aggregate of a typedef is ONE definition. extract_c_typedef names
+ * it from the type_definition; a second naming from the anonymous specifier gave
+ * Tally two Class defs under one QN, every member twice, and a variants list. */
+TEST(extract_c_anonymous_typedef_aggregate_is_one_def) {
+    CBMFileResult *r = extract("typedef struct {\n"
+                               "    int count;\n"
+                               "} Tally;\n"
+                               "typedef enum { SHADE_RED, SHADE_GREEN } Shade;\n",
+                               CBM_LANG_C, "t", "tally.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Class", "Tally"), 1);
+    ASSERT_EQ(count_defs_named(r, "Field", "count"), 1);
+    ASSERT_EQ(count_defs_named(r, "Enum", "Shade"), 1);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "Tally") == 0) {
+            ASSERT_NULL(d->variants);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A pointer-to-function member (`void (*open)(int);`, the shape of every
+ * kernel ops table) is a field of its struct. It shares the
+ * field_declaration + function_declarator shape with a C++ member FUNCTION
+ * declaration, which the field extractor rightly skips; the two differ in
+ * where the name sits: `(*open)` is a parenthesized pointer declarator. */
+TEST(extract_c_function_pointer_member_is_a_field) {
+    CBMFileResult *r = extract("struct Ops {\n"
+                               "    int flags;\n"
+                               "    void (*open)(int fd);\n"
+                               "    int (*cmp)(const void *, const void *);\n"
+                               "    char *(*name_of)(int id);\n"
+                               "    void (*handlers[4])(void);\n"
+                               "};\n",
+                               CBM_LANG_C, "t", "ops.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(has_def_qn(r, "t.ops.Ops.flags"));
+    /* RED before the fix: none of the four pointer-to-function members. */
+    ASSERT_TRUE(has_def_qn(r, "t.ops.Ops.open"));
+    ASSERT_TRUE(has_def_qn(r, "t.ops.Ops.cmp"));
+    ASSERT_TRUE(has_def_qn(r, "t.ops.Ops.name_of"));
+    ASSERT_TRUE(has_def_qn(r, "t.ops.Ops.handlers"));
+    ASSERT_EQ(count_defs_with_label(r, "Field"), 5);
+    /* Each carries a type text, which the cross-file registry needs to list
+     * it among its struct's fields. */
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Field") == 0) {
+            ASSERT_NOT_NULL(d->return_type);
+            ASSERT_TRUE(d->return_type[0] != '\0');
+        }
+    }
+    cbm_free_result(r);
+
+    /* A C++ member function DECLARATION stays out of the fields; a
+     * pointer-to-function member beside it is one. */
+    r = extract("class Widget {\n"
+                "public:\n"
+                "    void resize(int w);\n"
+                "    int (*hook)(int);\n"
+                "    int width;\n"
+                "};\n",
+                CBM_LANG_CPP, "t", "widget.hpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "Field", "hook"));
+    ASSERT_TRUE(has_def(r, "Field", "width"));
+    ASSERT_FALSE(has_def(r, "Field", "resize"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* return_type of the first definition named `name`; NULL when there is no such
  * definition or it carries no return type. */
 static const char *def_return_type(CBMFileResult *r, const char *name) {
@@ -1078,6 +1249,103 @@ static const char *def_return_type(CBMFileResult *r, const char *name) {
         }
     }
     return NULL;
+}
+
+/* A member's name is the identifier at the bottom of its declarator, and its
+ * type is everything around that identifier, in the canonical spelling of the
+ * function return types below. Taking the first declarator's first child as
+ * the name published members called `*argv` and `seen[8]`, which no member
+ * access can ever match; taking only the `type` node typed `struct Node *next`
+ * as a struct, so `list->next[i]` had no element type; and of
+ * `struct Node *next, *prev;` only `next` existed. */
+TEST(extract_c_member_declarators_name_and_type) {
+    CBMFileResult *r = extract("struct Shapes {\n"
+                               "    char **argv;\n"
+                               "    int seen[8];\n"
+                               "    struct Node *next, *prev;\n"
+                               "    int a, b;\n"
+                               "    const char *label;\n"
+                               "    unsigned flags : 3;\n"
+                               "    char *const fixed;\n"
+                               "    char *names[4];\n"
+                               "    int plain;\n"
+                               "};\n",
+                               CBM_LANG_C, "t", "shapes.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* RED before the fix: `*argv`, `seen[8]`, `*next`, `*label`, `*names[4]`
+     * as names, and no `prev` / `b` at all. */
+    ASSERT_EQ(count_defs_with_label(r, "Field"), 11);
+    ASSERT_STR_EQ(def_return_type(r, "argv"), "char **");
+    ASSERT_STR_EQ(def_return_type(r, "seen"), "int [8]");
+    ASSERT_STR_EQ(def_return_type(r, "next"), "struct Node *");
+    ASSERT_STR_EQ(def_return_type(r, "prev"), "struct Node *");
+    ASSERT_STR_EQ(def_return_type(r, "a"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "b"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "label"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "flags"), "unsigned");
+    ASSERT_STR_EQ(def_return_type(r, "fixed"), "char *const");
+    ASSERT_STR_EQ(def_return_type(r, "names"), "char *[4]");
+    ASSERT_STR_EQ(def_return_type(r, "plain"), "int");
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Field") == 0) {
+            ASSERT_NULL(strpbrk(d->name, "*[]() "));
+        }
+    }
+    cbm_free_result(r);
+
+    /* Pointer-to-function members spell their type the way C does. */
+    r = extract("struct Ops {\n"
+                "    void (*open)(int fd);\n"
+                "    char *(*name_of)(int id);\n"
+                "    void (*handlers[4])(void);\n"
+                "    int (*cmp)(const void *,\n"
+                "               const void *);\n"
+                "};\n",
+                CBM_LANG_C, "t", "ops.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(def_return_type(r, "open"), "void (*)(int fd)");
+    ASSERT_STR_EQ(def_return_type(r, "name_of"), "char *(*)(int id)");
+    ASSERT_STR_EQ(def_return_type(r, "handlers"), "void (*[4])(void)");
+    ASSERT_STR_EQ(def_return_type(r, "cmp"), "int (*)(const void *, const void *)");
+    cbm_free_result(r);
+
+    /* C++: a reference member, and member functions stay out. */
+    r = extract("class Widget {\n"
+                "public:\n"
+                "    Widget *parent, *child;\n"
+                "    const Text &title;\n"
+                "    int *ids() const;\n"
+                "    void (resize)(int w);\n"
+                "};\n",
+                CBM_LANG_CPP, "t", "widget.hpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_with_label(r, "Field"), 3);
+    ASSERT_STR_EQ(def_return_type(r, "parent"), "Widget *");
+    ASSERT_STR_EQ(def_return_type(r, "child"), "Widget *");
+    ASSERT_STR_EQ(def_return_type(r, "title"), "const Text &");
+    cbm_free_result(r);
+
+    /* A member whose type is a macro invocation (jemalloc's
+     * `ql_head(tcache_slow_t) tcache_ql;`): the member is `tcache_ql`, never
+     * the macro's argument. Both grammars: a header is parsed as C++. */
+    static const CBMLanguage macro_langs[] = {CBM_LANG_C, CBM_LANG_CPP};
+    for (size_t li = 0; li < sizeof(macro_langs) / sizeof(macro_langs[0]); li++) {
+        r = extract("struct arena_s {\n"
+                    "    ql_head(tcache_slow_t) tcache_ql;\n"
+                    "    malloc_mutex_t mtx;\n"
+                    "};\n",
+                    macro_langs[li], "t", "arena.h");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(has_def(r, "Field", "tcache_slow_t"));
+        ASSERT_FALSE(has_def(r, "Field", "(tcache_slow_t)"));
+        ASSERT_TRUE(has_def(r, "Field", "tcache_ql"));
+        ASSERT_STR_EQ(def_return_type(r, "tcache_ql"), "ql_head(tcache_slow_t)");
+        ASSERT_TRUE(has_def(r, "Field", "mtx"));
+        cbm_free_result(r);
+    }
+    PASS();
 }
 
 /* PR #1245: the C grammar splits a declared return type across the `type` node,
@@ -1182,6 +1450,138 @@ TEST(cpp_method_return_type_preserves_pointer_and_qualifier) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* --- Python --- */
+/* #1277: annotated Python instance fields reach result->field_types (the
+ * cross-file LSP's only source for them); nothing unannotated is guessed and
+ * no graph def is minted for a field. */
+static const char *py_field_type_of(const CBMFileResult *r, const char *cls_suffix,
+                                    const char *field) {
+    for (int i = 0; i < r->field_types.count; i++) {
+        const CBMFieldType *ft = &r->field_types.items[i];
+        size_t cl = strlen(ft->class_qn);
+        size_t sl = strlen(cls_suffix);
+        if (cl >= sl && strcmp(ft->class_qn + cl - sl, cls_suffix) == 0 &&
+            strcmp(ft->field_name, field) == 0) {
+            return ft->type_text;
+        }
+    }
+    return NULL;
+}
+
+TEST(python_annotated_instance_fields_exported_issue1277) {
+    const char *src = "class Trainer(Base):\n"
+                      "    engine: Contract\n"
+                      "    limit: int = 3\n"
+                      "    plain = 5\n\n"
+                      "    def __init__(self, strategies: Contract, n, opt: 'Other' = None):\n"
+                      "        self.strategies = strategies\n"
+                      "        self.typed: Contract = strategies\n"
+                      "        self.count = n\n"
+                      "        self.made = make()\n"
+                      "        self.opt = opt\n"
+                      "        if n:\n"
+                      "            self.nested: Nested = n\n"
+                      "        def inner(other: Inner):\n"
+                      "            self.hidden = other\n\n"
+                      "    def later(self, x: Later):\n"
+                      "        self.late = x\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "trainer.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "engine"), "Contract");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "limit"), "int");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "strategies"), "Contract");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "typed"), "Contract");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "opt"), "'Other'");
+    ASSERT_STR_EQ(py_field_type_of(r, ".Trainer", "nested"), "Nested");
+    /* Controls: no declared type, a nested function's binding, a non-__init__ method. */
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "plain"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "count"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "made"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "hidden"));
+    ASSERT_NULL(py_field_type_of(r, ".Trainer", "late"));
+    ASSERT_EQ(r->field_types.count, 6);
+    for (int i = 0; i < r->defs.count; i++) {
+        ASSERT_FALSE(r->defs.items[i].label && strcmp(r->defs.items[i].label, "Field") == 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1277: the import an annotated field's type comes from usually sits under
+ * `if TYPE_CHECKING:`. It is recorded, flagged annotation-only; a runtime
+ * import is not flagged; an else branch (a runtime alternative) and an
+ * ordinary `if` stay unrecorded as before. */
+static const CBMImport *py_find_import(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return &r->imports.items[i];
+    }
+    return NULL;
+}
+
+TEST(python_type_checking_imports_flagged_issue1277) {
+    const char *src = "from typing import TYPE_CHECKING\n"
+                      "import typing\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from trainer import Trainer\n"
+                      "    import contracts\n"
+                      "else:\n"
+                      "    from fallback import Runtime\n"
+                      "if typing.TYPE_CHECKING:\n"
+                      "    from engine import Engine as Eng\n"
+                      "if FLAG:\n"
+                      "    from other import Conditional\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "loop.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *tc = py_find_import(r, "TYPE_CHECKING");
+    const CBMImport *trainer = py_find_import(r, "Trainer");
+    const CBMImport *contracts = py_find_import(r, "contracts");
+    const CBMImport *eng = py_find_import(r, "Eng");
+    ASSERT_NOT_NULL(tc);
+    ASSERT_FALSE(tc->type_checking_only);
+    ASSERT_NOT_NULL(trainer);
+    ASSERT_TRUE(trainer->type_checking_only);
+    ASSERT_NOT_NULL(contracts);
+    ASSERT_TRUE(contracts->type_checking_only);
+    ASSERT_NOT_NULL(eng);
+    ASSERT_TRUE(eng->type_checking_only);
+    ASSERT_NULL(py_find_import(r, "Runtime"));
+    ASSERT_NULL(py_find_import(r, "Conditional"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A name the alternative of an `if TYPE_CHECKING:` binds again (the airflow
+ * compat shape, usually inside try/except ImportError) is bound at runtime, so
+ * its TYPE_CHECKING import is not annotation-only: it stays unrecorded, as the
+ * runtime import itself does. A star import in an alternative may bind any
+ * name, so it covers every name of the block. */
+TEST(python_type_checking_rebound_in_else_unrecorded_issue1277) {
+    const char *src = "from typing import TYPE_CHECKING\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from airflow.sdk.execution_time.secrets_masker import mask_secret\n"
+                      "    from airflow.sdk.types import OnlyTyped\n"
+                      "else:\n"
+                      "    try:\n"
+                      "        from airflow.sdk.log import mask_secret\n"
+                      "    except ImportError:\n"
+                      "        mask_secret = None\n"
+                      "if TYPE_CHECKING:\n"
+                      "    from compat.types import Starred\n"
+                      "elif SOMETHING:\n"
+                      "    from compat import *\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "hook.py");
+    ASSERT_NOT_NULL(r);
+    const CBMImport *typed = py_find_import(r, "OnlyTyped");
+    ASSERT_NOT_NULL(typed);
+    ASSERT_TRUE(typed->type_checking_only);        /* only the type checker binds it */
+    ASSERT_NULL(py_find_import(r, "mask_secret")); /* the else branch binds it at runtime */
+    ASSERT_NULL(py_find_import(r, "Starred"));     /* the elif star import may bind it */
+    ASSERT_NULL(py_find_import(r, "compat"));      /* alternatives stay unrecorded */
+    ASSERT_NOT_NULL(py_find_import(r, "TYPE_CHECKING"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_function) {
     CBMFileResult *r = extract(
         "def greet(name):\n    return f\"Hello {name}\"\n\ndef main():\n    greet(\"World\")\n",
@@ -3466,6 +3866,48 @@ TEST(python_imports) {
     PASS();
 }
 
+/* The module_path recorded for a local name, or NULL. */
+static const char *import_path_of(CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0)
+            return r->imports.items[i].module_path;
+    }
+    return NULL;
+}
+
+/* `from . import x` names the importing file's OWN package: the path is ".x",
+ * as `from .m import f` is ".m.f". Joining the all-dots module with another '.'
+ * recorded "..x" (the parent package), so the import resolved one package too
+ * high and fell to an arbitrary same-named definition (home-assistant: 7,175
+ * calls bound to another integration's function). */
+TEST(python_package_relative_import_paths) {
+    CBMFileResult *r = extract("from . import async_register\n"
+                               "from .. import shared\n"
+                               "from . import local_fn as lf\n"
+                               "from .helpers import helper_fn\n"
+                               "from pkg.db import get_row\n",
+                               CBM_LANG_PYTHON, "t", "comp/web/sub/mod.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *own = import_path_of(r, "async_register");
+    const char *parent = import_path_of(r, "shared");
+    const char *aliased = import_path_of(r, "lf");
+    const char *member = import_path_of(r, "helper_fn");
+    const char *absolute = import_path_of(r, "get_row");
+    ASSERT_NOT_NULL(own);
+    ASSERT_NOT_NULL(parent);
+    ASSERT_NOT_NULL(aliased);
+    ASSERT_NOT_NULL(member);
+    ASSERT_NOT_NULL(absolute);
+    ASSERT_STR_EQ(own, ".async_register");
+    ASSERT_STR_EQ(parent, "..shared");
+    ASSERT_STR_EQ(aliased, ".local_fn");
+    ASSERT_STR_EQ(member, ".helpers.helper_fn"); /* control: unchanged */
+    ASSERT_STR_EQ(absolute, "pkg.db.get_row");   /* control: unchanged */
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(js_imports) {
     CBMFileResult *r = extract("import React from 'react';\nimport { useState } from "
                                "'react';\nconst fs = require('fs');\n",
@@ -3503,6 +3945,32 @@ TEST(go_cgo_pseudo_import_dropped) {
     for (int i = 0; i < r->imports.count; i++) {
         ASSERT_NOT_NULL(r->imports.items[i].module_path);
         ASSERT_TRUE(strcmp(r->imports.items[i].module_path, "C") != 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A Bash script imports the files it sources and nothing else. Every top-level
+ * command used to be read as an import of its command name (`set -e` imported
+ * "set", `source x.sh` imported "source"), which the import resolver bound to
+ * any project symbol of that name; the sourced paths themselves were lost. */
+TEST(bash_imports_are_sourced_files_only) {
+    CBMFileResult *r = extract("#!/usr/bin/env bash\nset -euo pipefail\nsource ./lib/util.sh\n"
+                               ". \"$DIR/other.sh\"\ncd build\nmake all\n"
+                               "if true; then\n  source nested.sh\nfi\n",
+                               CBM_LANG_BASH, "t", "run.sh");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->imports.count, 3);
+    ASSERT(has_import(r, "lib/util.sh"));
+    ASSERT(has_import(r, "other.sh"));
+    ASSERT(has_import(r, "nested.sh"));
+    static const char *const commands[] = {"set", "source", ".", "cd", "make"};
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT_NOT_NULL(r->imports.items[i].module_path);
+        for (size_t c = 0; c < sizeof(commands) / sizeof(commands[0]); c++) {
+            ASSERT_TRUE(strcmp(r->imports.items[i].module_path, commands[c]) != 0);
+        }
     }
     cbm_free_result(r);
     PASS();
@@ -3595,6 +4063,50 @@ TEST(c_imports) {
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
     ASSERT(has_import(r, "stdio.h"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Every header keeps its includes inside its include guard, and plenty of
+ * sources include behind `#ifdef`. Reading only the top level of the file
+ * left a guarded header with no imports at all. */
+TEST(c_imports_inside_preprocessor_blocks) {
+    static const CBMLanguage langs[] = {CBM_LANG_C, CBM_LANG_CPP};
+    for (size_t li = 0; li < sizeof(langs) / sizeof(langs[0]); li++) {
+        CBMFileResult *r = extract("#ifndef GUARD_H\n"
+                                   "#define GUARD_H\n"
+                                   "#include \"first.h\"\n"
+                                   "#include <second.h>\n"
+                                   "#if defined(USE_X)\n"
+                                   "#include \"x_only.h\"\n"
+                                   "#elif defined(USE_Z)\n"
+                                   "#include \"z_only.h\"\n"
+                                   "#else\n"
+                                   "#include \"y_only.h\"\n"
+                                   "#endif\n"
+                                   "int guarded(void);\n"
+                                   "#endif\n",
+                                   langs[li], "t", "guard.h");
+        ASSERT_NOT_NULL(r);
+        ASSERT(has_import(r, "first.h"));
+        ASSERT(has_import(r, "second.h"));
+        ASSERT(has_import(r, "x_only.h"));
+        ASSERT(has_import(r, "z_only.h"));
+        ASSERT(has_import(r, "y_only.h"));
+        ASSERT_EQ(r->imports.count, 5);
+        cbm_free_result(r);
+    }
+    /* Top-level includes come out once, as before. */
+    CBMFileResult *r = extract("#include \"top.h\"\n"
+                               "#ifdef WITH_EXTRA\n"
+                               "#include \"extra.h\"\n"
+                               "#endif\n"
+                               "int f(void) { return 0; }\n",
+                               CBM_LANG_C, "t", "top.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 2);
+    ASSERT(has_import(r, "top.h"));
+    ASSERT(has_import(r, "extra.h"));
     cbm_free_result(r);
     PASS();
 }
@@ -4329,6 +4841,298 @@ TEST(python_init_nested_module_qn) {
     PASS();
 }
 
+/* ── #1548: Python defs nested in a function body ─────────────────── */
+
+/* How many defs carry exactly this QN. */
+static int pyn_def_count(const CBMFileResult *r, const char *qn) {
+    int n = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        if (q && strcmp(q, qn) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The one def with this QN, or NULL when there is none (or more than one). */
+static const CBMDefinition *pyn_def(const CBMFileResult *r, const char *qn) {
+    if (pyn_def_count(r, qn) != 1) {
+        return NULL;
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        if (q && strcmp(q, qn) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Calls of `callee` whose enclosing function is exactly `caller_qn`. */
+static int pyn_calls(const CBMFileResult *r, const char *callee, const char *caller_qn) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 && c->enclosing_func_qn &&
+            strcmp(c->enclosing_func_qn, caller_qn) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* No def QN is minted twice: a nested def must not also surface as a
+ * module-level one, and walking a def body must not re-extract anything. */
+static bool pyn_defs_unique(const CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        if (q && pyn_def_count(r, q) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The issue's reproducer: `def nested()` inside `def factory()` was never
+ * extracted. It is now a Function qualified by the def it sits in, the same
+ * QN the Python LSP gives its calls. Module-level defs, and defs in a
+ * module-level `if` block, keep their QNs. */
+TEST(extract_python_nested_def_qualified_by_enclosing_def_issue1548) {
+    CBMFileResult *r = extract("def target():\n"
+                               "    return 0\n"
+                               "\n"
+                               "\n"
+                               "def module_level():\n"
+                               "    return target()\n"
+                               "\n"
+                               "\n"
+                               "if True:\n"
+                               "    def inside_if():\n"
+                               "        return target()\n"
+                               "\n"
+                               "\n"
+                               "def factory():\n"
+                               "    def nested():\n"
+                               "        return target()\n"
+                               "    return nested\n"
+                               "\n"
+                               "\n"
+                               "def outer():\n"
+                               "    def middle():\n"
+                               "        def inner():\n"
+                               "            return target()\n"
+                               "        return inner\n"
+                               "    return middle\n",
+                               CBM_LANG_PYTHON, "t", "app.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *nested = pyn_def(r, "t.app.factory.nested");
+    ASSERT_NOT_NULL(nested);
+    ASSERT_STR_EQ(nested->label, "Function");
+    ASSERT_EQ(nested->start_line, 15);
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.outer.middle"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.outer.middle.inner"));
+    /* Never minted flat, where it would collide with a module-level name. */
+    ASSERT_EQ(pyn_def_count(r, "t.app.nested"), 0);
+    ASSERT_EQ(pyn_def_count(r, "t.app.inner"), 0);
+    /* Controls: unchanged. */
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.target"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.module_level"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.inside_if"));
+    ASSERT_NOT_NULL(pyn_def(r, "t.app.factory"));
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A call inside a nested def belongs to that def. It used to carry the flat
+ * `t.app.nested`, a QN no node has, so the edge was pinned on the file node:
+ * inbound traces of target() lost the caller. It is not the outer def's
+ * either. */
+TEST(extract_python_nested_def_calls_attributed_to_it_issue1548) {
+    CBMFileResult *r = extract("def target():\n"
+                               "    return 0\n"
+                               "\n"
+                               "def factory():\n"
+                               "    def nested():\n"
+                               "        return target()\n"
+                               "    return nested\n"
+                               "\n"
+                               "def outer():\n"
+                               "    def middle():\n"
+                               "        def inner():\n"
+                               "            return target()\n"
+                               "        return inner\n"
+                               "    return middle\n",
+                               CBM_LANG_PYTHON, "t", "app.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.factory.nested"), 1);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.outer.middle.inner"), 1);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.factory"), 0);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.nested"), 0);
+    ASSERT_EQ(pyn_calls(r, "target", "t.app.inner"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The app-factory shape: route handlers are decorated defs inside
+ * create_app. Each is extracted with its QN and carries the route its
+ * decorator declares, which is what mints the Route node and its HANDLES
+ * edge (pipeline_python_app_factory_routes_issue1548 checks the graph). */
+TEST(extract_python_decorated_nested_route_handler_issue1548) {
+    CBMFileResult *r = extract("from flask import Flask\n"
+                               "\n"
+                               "def create_app():\n"
+                               "    app = Flask(__name__)\n"
+                               "\n"
+                               "    @app.route(\"/users/<uid>\")\n"
+                               "    def show_user(uid):\n"
+                               "        return render(uid)\n"
+                               "\n"
+                               "    @app.get(\"/health\")\n"
+                               "    async def health():\n"
+                               "        return render(\"ok\")\n"
+                               "\n"
+                               "    return app\n",
+                               CBM_LANG_PYTHON, "t", "web.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *show = pyn_def(r, "t.web.create_app.show_user");
+    ASSERT_NOT_NULL(show);
+    ASSERT_STR_EQ(show->route_path, "/users/<uid>");
+    ASSERT_NOT_NULL(show->decorators);
+    const CBMDefinition *health = pyn_def(r, "t.web.create_app.health");
+    ASSERT_NOT_NULL(health);
+    ASSERT_STR_EQ(health->route_path, "/health");
+    ASSERT_STR_EQ(health->route_method, "GET");
+    ASSERT_EQ(pyn_calls(r, "render", "t.web.create_app.show_user"), 1);
+    ASSERT_EQ(pyn_calls(r, "render", "t.web.create_app.health"), 1);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A class declared in a def is qualified by the def; its methods are Methods
+ * of it, and a call in such a method is the method's. */
+TEST(extract_python_nested_class_issue1548) {
+    CBMFileResult *r = extract("def create_app():\n"
+                               "    class Settings:\n"
+                               "        debug = False\n"
+                               "\n"
+                               "        def value(self):\n"
+                               "            return load(self)\n"
+                               "\n"
+                               "    return Settings().value()\n",
+                               CBM_LANG_PYTHON, "t", "web.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *cls = pyn_def(r, "t.web.create_app.Settings");
+    ASSERT_NOT_NULL(cls);
+    ASSERT_STR_EQ(cls->label, "Class");
+    const CBMDefinition *value = pyn_def(r, "t.web.create_app.Settings.value");
+    ASSERT_NOT_NULL(value);
+    ASSERT_STR_EQ(value->label, "Method");
+    ASSERT_STR_EQ(value->parent_class, "t.web.create_app.Settings");
+    ASSERT_EQ(pyn_calls(r, "load", "t.web.create_app.Settings.value"), 1);
+    ASSERT_EQ(pyn_def_count(r, "t.web.Settings"), 0);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A def nested in a method, named like the method (django's
+ * AbstractBaseUser.check_password holds a `def setter`; Tree.visit here holds
+ * a `def visit`). It used to share the method's QN, so its calls -- its
+ * recursion included -- were the method's. It is its own Function now: the
+ * recursive call and render() are its, only visit(node) is the method's, and
+ * the recursion seed flags the nested def. */
+TEST(extract_python_nested_def_named_like_its_method_issue1548) {
+    CBMFileResult *r = extract("class Tree:\n"
+                               "    def visit(self, node):\n"
+                               "        def visit(n):\n"
+                               "            if n:\n"
+                               "                visit(n.child)\n"
+                               "                render(n)\n"
+                               "\n"
+                               "        visit(node)\n",
+                               CBM_LANG_PYTHON, "t", "m.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *method = pyn_def(r, "t.m.Tree.visit");
+    ASSERT_NOT_NULL(method);
+    ASSERT_STR_EQ(method->label, "Method");
+    const CBMDefinition *nested = pyn_def(r, "t.m.Tree.visit.visit");
+    ASSERT_NOT_NULL(nested);
+    ASSERT_STR_EQ(nested->label, "Function");
+    ASSERT_EQ(nested->start_line, 3);
+    ASSERT_EQ(pyn_calls(r, "visit", "t.m.Tree.visit.visit"), 1);
+    ASSERT_EQ(pyn_calls(r, "render", "t.m.Tree.visit.visit"), 1);
+    ASSERT_EQ(pyn_calls(r, "visit", "t.m.Tree.visit"), 1);
+    ASSERT_EQ(pyn_calls(r, "render", "t.m.Tree.visit"), 0);
+    ASSERT_TRUE(nested->is_recursive);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Controls: a lambda and the comprehensions are expressions, not defs. They
+ * mint nothing, and the calls inside them stay the enclosing def's. */
+TEST(extract_python_lambda_and_comprehension_stay_in_enclosing_def_issue1548) {
+    CBMFileResult *r = extract("def work(items):\n"
+                               "    double = lambda x: scale(x)\n"
+                               "    squares = [scale(i) for i in items]\n"
+                               "    table = {k: scale(k) for k in items}\n"
+                               "    return double(squares), table\n",
+                               CBM_LANG_PYTHON, "t", "c.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(pyn_def(r, "t.c.work"));
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *q = r->defs.items[i].qualified_name;
+        ASSERT_FALSE(q && strncmp(q, "t.c.work.", strlen("t.c.work.")) == 0);
+    }
+    ASSERT_EQ(pyn_calls(r, "scale", "t.c.work"), 3);
+    ASSERT_TRUE(pyn_defs_unique(r));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Records other than calls take their enclosing function from the same
+ * unified-walk scope frame as the calls. The nested def's env read carries its
+ * QN; the outer def's reads, before and after the nested def, keep the outer
+ * QN once its frame is popped. */
+TEST(extract_python_nested_def_env_access_attributed_to_it_issue1548) {
+    CBMFileResult *r = extract("import os\n"
+                               "\n"
+                               "def outer():\n"
+                               "    token = os.environ[\"OUTER_TOKEN\"]\n"
+                               "\n"
+                               "    def inner():\n"
+                               "        return os.environ[\"INNER_TOKEN\"]\n"
+                               "\n"
+                               "    return inner, token, os.environ[\"OUTER_AGAIN\"]\n",
+                               CBM_LANG_PYTHON, "t", "e.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int seen = 0;
+    for (int i = 0; i < r->env_accesses.count; i++) {
+        const CBMEnvAccess *ea = &r->env_accesses.items[i];
+        ASSERT_NOT_NULL(ea->enclosing_func_qn);
+        if (strcmp(ea->env_key, "INNER_TOKEN") == 0) {
+            ASSERT_STR_EQ(ea->enclosing_func_qn, "t.e.outer.inner");
+            seen++;
+        } else {
+            ASSERT_STR_EQ(ea->enclosing_func_qn, "t.e.outer");
+            seen++;
+        }
+    }
+    ASSERT_EQ(seen, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(js_index_module_qn_not_collide_with_folder) {
     /* Same bug for JS/TS index.ts files */
     CBMFileResult *r = extract("export function App() { return null; }\n", CBM_LANG_TYPESCRIPT,
@@ -4423,6 +5227,77 @@ TEST(extract_java_method_annotations_issue382) {
     ASSERT(decorators_contain(m, "GetMapping"));
     ASSERT_NOT_NULL(m->signature);
     ASSERT(m->signature[0] != '\0');
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Distilled from PR #1245 (Andrew Hundt): unittest.mock's `@patch("x")` is a
+ * bare decorator whose name collides with the HTTP verb, and its only argument
+ * is a dotted target, not a path. The "/" fallback then minted a Route handler
+ * PATCH "/" for every mocked test function. Rule: a decorator call WITH
+ * arguments but no path-shaped one is not a route. */
+TEST(extract_python_mock_patch_is_not_route) {
+    CBMFileResult *r = extract("from unittest.mock import patch\n\n"
+                               "@patch(\"subprocess.run\")\n"
+                               "def test_cmd(mock_run):\n"
+                               "    pass\n\n"
+                               "@app.patch(\"/items/{id}\")\n"
+                               "def update_item():\n"
+                               "    pass\n",
+                               CBM_LANG_PYTHON, "t", "test_routes.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *mocked = find_def_by_name(r, "test_cmd");
+    ASSERT_NOT_NULL(mocked);
+    ASSERT_NULL(mocked->route_path);
+    ASSERT_NULL(mocked->route_method);
+
+    const CBMDefinition *route = find_def_by_name(r, "update_item");
+    ASSERT_NOT_NULL(route);
+    ASSERT_STR_EQ(route->route_path, "/items/{id}");
+    ASSERT_STR_EQ(route->route_method, "PATCH");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Companion to the mock-patch case: the narrowing must not cost real routes.
+ * A receiver-less framework decorator with a path-shaped argument (Litestar /
+ * BlackSheep `@get("/x")`) stays a route, `@mock.patch("x")` (receiver, but
+ * no path) is not one, and a zero-argument `@app.route()` keeps the "/"
+ * default main emits today. */
+TEST(extract_python_bare_decorator_route_rules) {
+    CBMFileResult *r = extract("from litestar import get\n"
+                               "from unittest import mock\n\n"
+                               "@get(\"/health\")\n"
+                               "def health():\n"
+                               "    pass\n\n"
+                               "@mock.patch(\"os.getcwd\")\n"
+                               "def test_cwd(mock_cwd):\n"
+                               "    pass\n\n"
+                               "@app.route()\n"
+                               "def index():\n"
+                               "    pass\n",
+                               CBM_LANG_PYTHON, "t", "routes.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *health = find_def_by_name(r, "health");
+    ASSERT_NOT_NULL(health);
+    ASSERT_STR_EQ(health->route_path, "/health");
+    ASSERT_STR_EQ(health->route_method, "GET");
+
+    const CBMDefinition *mocked = find_def_by_name(r, "test_cwd");
+    ASSERT_NOT_NULL(mocked);
+    ASSERT_NULL(mocked->route_path);
+    ASSERT_NULL(mocked->route_method);
+
+    const CBMDefinition *index = find_def_by_name(r, "index");
+    ASSERT_NOT_NULL(index);
+    ASSERT_STR_EQ(index->route_path, "/");
+    ASSERT_STR_EQ(index->route_method, "ANY");
+
     cbm_free_result(r);
     PASS();
 }
@@ -4986,10 +5861,11 @@ TEST(swift_non_url_constructor_untouched_issue1892) {
  * the per-file constant map and resolved at the call site, for both return
  * statements and arrow expression bodies. */
 TEST(extract_ts_await_generic_call_issue2210) {
-    CBMFileResult *r = extract("function parseJsonBody<T>() { return {} as T; }\n"
-                               "async function plain() { return await parseJsonBody(); }\n"
-                               "async function generic() { return await parseJsonBody<string>(); }\n",
-                               CBM_LANG_TYPESCRIPT, "t", "await.ts");
+    CBMFileResult *r =
+        extract("function parseJsonBody<T>() { return {} as T; }\n"
+                "async function plain() { return await parseJsonBody(); }\n"
+                "async function generic() { return await parseJsonBody<string>(); }\n",
+                CBM_LANG_TYPESCRIPT, "t", "await.ts");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_EQ(count_calls_named(r, "parseJsonBody"), 2);
@@ -5332,6 +6208,439 @@ TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
     ASSERT_NOT_NULL(reg);
     ASSERT_NULL(reg->first_string_arg);
 
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #2291: the JS/TS twin of #1249. A BFF that builds its backend URL as
+ * `${process.env.BACKEND_URL}/wallet/topup` from a configurable base must
+ * index the literal path after the base, exactly as `BACKEND_URL + "/x"`
+ * already does. The flattened "{}/wallet/topup" was dropped because it
+ * neither starts with '/' nor carries a scheme, so no HTTP_CALLS edge formed
+ * and the call could never be matched to the backend's route. */
+TEST(extract_ts_template_base_url_issue2291) {
+    CBMFileResult *r = extract("const BACKEND_URL = process.env.BACKEND_URL;\n"
+                               "export async function topup(body: string) {\n"
+                               "  return fetch(`${process.env.BACKEND_URL}/wallet/topup/zibal`, {\n"
+                               "    method: 'POST', body });\n"
+                               "}\n"
+                               "export async function tickets() {\n"
+                               "  return axios.get(`${BACKEND_URL}/tickets/mine`);\n"
+                               "}\n"
+                               "export async function items(id: string) {\n"
+                               "  return got(`${BACKEND_URL}/orders/${id}/items`);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "route.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *f = find_call_by_callee(r, "fetch");
+    ASSERT_NOT_NULL(f);
+    ASSERT_NOT_NULL(f->first_string_arg);
+    ASSERT_STR_EQ(f->first_string_arg, "/wallet/topup/zibal");
+
+    const CBMCall *g = find_call_by_callee(r, "axios.get");
+    ASSERT_NOT_NULL(g);
+    ASSERT_NOT_NULL(g->first_string_arg);
+    ASSERT_STR_EQ(g->first_string_arg, "/tickets/mine");
+
+    const CBMCall *h = find_call_by_callee(r, "got");
+    ASSERT_NOT_NULL(h);
+    ASSERT_NOT_NULL(h->first_string_arg);
+    /* `got` has no service-table entry: preserve the raw first argument and
+     * carry the recovered path as an explicit candidate for HTTP detection. */
+    ASSERT_STR_EQ(h->first_string_arg, "{}/orders/{}/items");
+    ASSERT_GTE(h->arg_count, 1);
+    ASSERT_NOT_NULL(h->args[0].url_value);
+    ASSERT_STR_EQ(h->args[0].url_value, "/orders/{}/items");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue: with no literal path after the base (`${BASE}${path}`,
+ * `${BASE}/`) there is no route to recover, so none may be fabricated. */
+TEST(extract_ts_template_base_url_no_literal_path_issue2291) {
+    CBMFileResult *r = extract("export async function proxy(path: string) {\n"
+                               "  return fetch(`${process.env.BACKEND_URL}${path}`);\n"
+                               "}\n"
+                               "export async function root() {\n"
+                               "  return axios.get(`${process.env.BACKEND_URL}/`);\n"
+                               "}\n"
+                               "export function tail(tail: string) {\n"
+                               "  return axios.post(`${BASE}/${tail}`);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "proxy.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *f = find_call_by_callee(r, "fetch");
+    ASSERT_NOT_NULL(f);
+    ASSERT(f->first_string_arg == NULL || f->first_string_arg[0] != '/');
+
+    const CBMCall *g = find_call_by_callee(r, "axios.get");
+    ASSERT_NOT_NULL(g);
+    ASSERT(g->first_string_arg == NULL || g->first_string_arg[0] != '/');
+
+    const CBMCall *h = find_call_by_callee(r, "axios.post");
+    ASSERT_NOT_NULL(h);
+    ASSERT(h->first_string_arg == NULL || h->first_string_arg[0] != '/');
+    ASSERT_GTE(h->arg_count, 1);
+    ASSERT_NULL(h->args[0].url_value);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The call `callee` made inside function `func` (its enclosing QN ends in
+ * ".func"), so one file can hold several calls to the same client. */
+static const CBMCall *find_call_in_func(CBMFileResult *r, const char *callee, const char *func) {
+    size_t fl = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        const char *q = c->enclosing_func_qn;
+        if (!c->callee_name || strcmp(c->callee_name, callee) != 0 || !q) {
+            continue;
+        }
+        size_t ql = strlen(q);
+        if (ql > fl && q[ql - fl - 1] == '.' && strcmp(q + ql - fl, func) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* The URL a call hands to its client: first_string_arg, or "" when none. */
+static const char *url_in(CBMFileResult *r, const char *callee, const char *func) {
+    const CBMCall *c = find_call_in_func(r, callee, func);
+    return (c && c->first_string_arg) ? c->first_string_arg : "";
+}
+
+/* True when the URL is not presented as a path or an absolute URL. */
+static bool url_not_claimed(CBMFileResult *r, const char *callee, const char *func) {
+    const CBMCall *call = find_call_in_func(r, callee, func);
+    if (!call) {
+        return false;
+    }
+    const char *u = call->first_string_arg;
+    return !u || (u[0] != '/' && strstr(u, "://") == NULL);
+}
+
+/* Issue #706: a Python caller that centralises its endpoint URLs in module
+ * constants -- `API_URL = API_BASE_URL + "some/path"` -- lost the URL, so no
+ * HTTP_CALLS edge formed and cross-repo-intelligence reported 0 links. The
+ * concatenation must be folded: resolved parts inline, and an unresolvable
+ * base (an env var) leaves the literal path after it. */
+TEST(extract_py_concat_const_url_issue706) {
+    CBMFileResult *r = extract("import os\n"
+                               "import requests\n"
+                               "API_BASE_URL = os.environ[\"API_BASE_URL\"]\n"
+                               "HOST = \"http://provider:8000\"\n"
+                               "PREFIX = \"/v2\"\n"
+                               "API_URL = API_BASE_URL + \"some/path\"\n"
+                               "URL = API_BASE_URL + \"/foo\"\n"
+                               "ORDERS_URL = HOST + \"/orders\"\n"
+                               "REPORTS_URL = PREFIX + \"/reports\"\n"
+                               "ITEMS_URL = f\"{API_BASE_URL}/items\"\n"
+                               "DAILY_URL = REPORTS_URL + \"/daily\"\n"
+                               "def send(p):\n"
+                               "    requests.post(API_URL, json=p)\n"
+                               "def send_foo(p):\n"
+                               "    requests.post(URL, json=p)\n"
+                               "def orders():\n"
+                               "    return requests.get(ORDERS_URL)\n"
+                               "def reports():\n"
+                               "    return requests.get(REPORTS_URL)\n"
+                               "def items():\n"
+                               "    return requests.get(ITEMS_URL)\n"
+                               "def daily():\n"
+                               "    return requests.get(DAILY_URL)\n"
+                               "def direct(p):\n"
+                               "    return requests.post(API_BASE_URL + \"/direct\", json=p)\n"
+                               "def inline():\n"
+                               "    return requests.get(PREFIX + \"/inline\")\n"
+                               "def kw(p):\n"
+                               "    return requests.post(url=API_URL, json=p)\n",
+                               CBM_LANG_PYTHON, "t", "client.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.post", "send"), "/some/path");
+    ASSERT_STR_EQ(url_in(r, "requests.post", "send_foo"), "/foo");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "orders"), "http://provider:8000/orders");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "reports"), "/v2/reports");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "items"), "/items");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "daily"), "/v2/reports/daily");
+    ASSERT_STR_EQ(url_in(r, "requests.post", "direct"), "/direct");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "inline"), "/v2/inline");
+    ASSERT_STR_EQ(url_in(r, "requests.post", "kw"), "/some/path");
+
+    /* A fully resolved fold is an exact argument value; a path left behind by
+     * an unresolvable base is not, so it never reaches the exact-URL slot. */
+    const CBMCall *rep = find_call_in_func(r, "requests.get", "reports");
+    ASSERT_NOT_NULL(rep);
+    ASSERT_GTE(rep->arg_count, 1);
+    ASSERT_NOT_NULL(rep->args[0].value);
+    ASSERT_STR_EQ(rep->args[0].value, "/v2/reports");
+    const CBMCall *snd = find_call_in_func(r, "requests.post", "send");
+    ASSERT_NOT_NULL(snd);
+    ASSERT_GTE(snd->arg_count, 1);
+    ASSERT(snd->args[0].value == NULL || snd->args[0].value[0] != '/');
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a URL with nothing literal to recover -- a local
+ * computed value, a bare env-derived base, a base plus "/" or plus another
+ * variable -- must not be turned into a path or an exact URL. */
+TEST(extract_py_url_fold_no_fabrication_issue706) {
+    CBMFileResult *r = extract("import os\n"
+                               "import requests\n"
+                               "API_BASE_URL = os.environ[\"API_BASE_URL\"]\n"
+                               "EMPTY = API_BASE_URL + \"/\"\n"
+                               "def compute():\n"
+                               "    return os.environ.get(\"X\")\n"
+                               "def dyn():\n"
+                               "    u = compute()\n"
+                               "    return requests.get(u)\n"
+                               "def bare():\n"
+                               "    return requests.get(API_BASE_URL)\n"
+                               "def slash():\n"
+                               "    return requests.get(API_BASE_URL + \"/\")\n"
+                               "def empty():\n"
+                               "    return requests.get(EMPTY)\n"
+                               "def two(p):\n"
+                               "    return requests.get(API_BASE_URL + p)\n",
+                               CBM_LANG_PYTHON, "t", "ctl.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "dyn"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "bare"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "slash"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "empty"));
+    ASSERT_TRUE(url_not_claimed(r, "requests.get", "two"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #1147: a frontend that composes every endpoint from module constants
+ * -- a base constant, template literals over it, and an object-literal map of
+ * endpoints -- extracted none of its API calls. Each template / concatenation
+ * over a resolvable constant must fold to the full path, `OBJ.KEY` of an
+ * object-literal const must resolve, and a base that stays unresolvable
+ * (`${getApiBaseUrl()}`) leaves the path after it. A relative base ('api')
+ * joined to a path is a path under the client's base URL. */
+TEST(extract_ts_const_template_url_issue1147) {
+    CBMFileResult *r = extract(
+        "const BASE = '/api'\n"
+        "const REL = 'api'\n"
+        "const GAMES = '/games'\n"
+        "export const API_ENDPOINTS = {\n"
+        "  LOGIN: `${BASE}/users/login`,\n"
+        "  USER: `${REL}/users/me`,\n"
+        "  GAME_LAUNCH_URL: `${REL}/games/launch`,\n"
+        "  NESTED: { DEEP: BASE + '/deep' },\n"
+        "} as const\n"
+        "export const getApiBaseUrl = () => `${API_PROTOCOL}://${process.env.API_DOMAIN}/`\n"
+        "export async function launch() { return fetch(`${BASE}/games/launch`) }\n"
+        "export async function list() { return fetch(`${GAMES}/list`) }\n"
+        "export async function login() { return fetch(API_ENDPOINTS.LOGIN) }\n"
+        "export async function user() {\n"
+        "  return fetch(`${getApiBaseUrl()}/${API_ENDPOINTS.USER}`, { method: 'GET' })\n"
+        "}\n"
+        "export async function game(p: unknown) {\n"
+        "  return apiClient.post(API_ENDPOINTS.GAME_LAUNCH_URL, p)\n"
+        "}\n"
+        "export async function deep() { return fetch(API_ENDPOINTS.NESTED.DEEP) }\n"
+        "export async function me() { return axios.get(BASE + '/users/me') }\n",
+        CBM_LANG_TYPESCRIPT, "t", "client.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "fetch", "launch"), "/api/games/launch");
+    ASSERT_STR_EQ(url_in(r, "fetch", "list"), "/games/list");
+    ASSERT_STR_EQ(url_in(r, "fetch", "login"), "/api/users/login");
+    ASSERT_STR_EQ(url_in(r, "fetch", "user"), "/api/users/me");
+    ASSERT_STR_EQ(url_in(r, "apiClient.post", "game"), "api/games/launch");
+    ASSERT_STR_EQ(url_in(r, "fetch", "deep"), "/api/deep");
+    ASSERT_STR_EQ(url_in(r, "axios.get", "me"), "/api/users/me");
+
+    /* A wrapper client has raw string identity plus an explicit URL candidate.
+     * Only HTTP detection may select the normalized relative path. */
+    const CBMCall *g = find_call_in_func(r, "apiClient.post", "game");
+    ASSERT_NOT_NULL(g);
+    ASSERT_GTE(g->arg_count, 1);
+    ASSERT_NOT_NULL(g->args[0].value);
+    ASSERT_STR_EQ(g->args[0].value, "api/games/launch");
+    ASSERT_NOT_NULL(g->args[0].url_value);
+    ASSERT_STR_EQ(g->args[0].url_value, "/api/games/launch");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a parameter, a bare substitution, a member of an
+ * unknown object, an env-only base, and an unresolvable base followed only by
+ * an unresolvable tail carry no literal path, so none may be fabricated (the
+ * last one used to come out as "/{}"). */
+TEST(extract_ts_url_fold_no_fabrication_issue1147) {
+    CBMFileResult *r =
+        extract("const HEALTH_BASE = process.env.HEALTH_BASE\n"
+                "export async function dynamic(path: string) { return fetch(path) }\n"
+                "export async function dynTpl(x: string) { return fetch(`${x}`) }\n"
+                "export async function missing() { return fetch(API_ENDPOINTS.MISSING) }\n"
+                "export async function tail(t: string) { return fetch(`${getBase()}/${t}`) }\n"
+                "export async function envOnly() { return fetch(HEALTH_BASE) }\n",
+                CBM_LANG_TYPESCRIPT, "t", "ctl.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "dynamic"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "dynTpl"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "missing"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "tail"));
+    ASSERT_TRUE(url_not_claimed(r, "fetch", "envOnly"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Shared folding must preserve topic/string identity before service resolution. */
+TEST(extract_ts_folded_topics_keep_raw_identity) {
+    CBMFileResult *r = extract(
+        "const TENANT = 'tenant';\n"
+        "const TOPIC = `${TENANT}/events`;\n"
+        "const TOPICS = { EVENTS: `${TENANT}/events` };\n"
+        "const PREFIX = 'tenant/';\n"
+        "const DOUBLE = `${PREFIX}/events`;\n"
+        "const UNKNOWN = `${tenant}/events`;\n"
+        "const UNKNOWN_TOPICS = { EVENTS: `${tenant}/events` };\n"
+        "const PLAIN = 'tenant/events';\n"
+        "export function direct() { mqtt.publish(`${TENANT}/events`, 'payload'); }\n"
+        "export function constant() { mqtt.publish(TOPIC, 'payload'); }\n"
+        "export function member() { mqtt.publish(TOPICS.EVENTS, 'payload'); }\n"
+        "export function literal() { mqtt.publish('tenant/events', 'payload'); }\n"
+        "export function plain() { mqtt.publish(PLAIN, 'payload'); }\n"
+        "export function doubled() { mqtt.publish(`${PREFIX}/events`, 'payload'); }\n"
+        "export function doubledConstant() { mqtt.publish(DOUBLE, 'payload'); }\n"
+        "export function unknown() { mqtt.publish(`${tenant}/events`, 'payload'); }\n"
+        "export function unknownConstant() { mqtt.publish(UNKNOWN, 'payload'); }\n"
+        "export function unknownMember() { mqtt.publish(UNKNOWN_TOPICS.EVENTS, 'payload'); }\n"
+        "export function alias() { bus.publish(TOPICS.EVENTS, 'payload'); }\n",
+        CBM_LANG_TYPESCRIPT, "t", "topics.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *functions[] = {"direct", "constant", "member",         "literal",
+                               "plain",  "doubled",  "doubledConstant"};
+    for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+        const CBMCall *c = find_call_in_func(r, "mqtt.publish", functions[i]);
+        const char *expected = i < 5 ? "tenant/events" : "tenant//events";
+        ASSERT_NOT_NULL(c);
+        ASSERT_NOT_NULL(c->first_string_arg);
+        ASSERT_STR_EQ(c->first_string_arg, expected);
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT_NOT_NULL(c->args[0].value);
+        ASSERT_STR_EQ(c->args[0].value, expected);
+    }
+    const char *unknowns[] = {"unknown", "unknownConstant", "unknownMember"};
+    for (size_t i = 0; i < sizeof(unknowns) / sizeof(unknowns[0]); i++) {
+        const CBMCall *c = find_call_in_func(r, "mqtt.publish", unknowns[i]);
+        ASSERT_NOT_NULL(c);
+        ASSERT_NOT_NULL(c->first_string_arg);
+        ASSERT_STR_EQ(c->first_string_arg, "{}/events");
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT(c->args[0].value == NULL || c->args[0].value[0] != '/');
+    }
+    const CBMCall *alias = find_call_in_func(r, "bus.publish", "alias");
+    ASSERT_NOT_NULL(alias);
+    ASSERT_STR_EQ(alias->first_string_arg, "tenant/events");
+    ASSERT_GTE(alias->arg_count, 1);
+    ASSERT_STR_EQ(alias->args[0].value, "tenant/events");
+    /* Classification has not happened yet: raw and URL views stay distinct. */
+    ASSERT_NOT_NULL(alias->args[0].url_value);
+    ASSERT_STR_EQ(alias->args[0].url_value, "/tenant/events");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_py_folded_topic_keywords_keep_raw_identity) {
+    CBMFileResult *r = extract("TENANT = 'tenant'\n"
+                               "TOPIC = f'{TENANT}/events'\n"
+                               "PREFIX = 'tenant/'\n"
+                               "DOUBLE = PREFIX + '/events'\n"
+                               "UNKNOWN = f'{tenant}/events'\n"
+                               "def direct():\n    mqtt.publish(f'{TENANT}/events', 'payload')\n"
+                               "def topic():\n    mqtt.publish(topic=TOPIC, payload='x')\n"
+                               "def queue():\n    mqtt.publish(queue=TOPIC, payload='x')\n"
+                               "def channel():\n    mqtt.publish(channel=TOPIC, payload='x')\n"
+                               "def subject():\n    mqtt.publish(subject=TOPIC, payload='x')\n"
+                               "def unknown():\n    mqtt.publish(topic=UNKNOWN, payload='x')\n"
+                               "def doubled():\n    mqtt.publish(topic=DOUBLE, payload='x')\n"
+                               "def unknown_callee():\n    send(topic=TOPIC, payload='x')\n",
+                               CBM_LANG_PYTHON, "t", "topics.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *functions[] = {"direct", "topic", "queue", "channel", "subject"};
+    for (size_t i = 0; i < sizeof(functions) / sizeof(functions[0]); i++) {
+        const CBMCall *c = find_call_in_func(r, "mqtt.publish", functions[i]);
+        ASSERT_NOT_NULL(c);
+        ASSERT_STR_EQ(c->first_string_arg, "tenant/events");
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT_STR_EQ(c->args[0].value, "tenant/events");
+        if (i > 0) {
+            ASSERT_NULL(c->args[0].url_value);
+        }
+    }
+    ASSERT_STR_EQ(url_in(r, "mqtt.publish", "unknown"), "{}/events");
+    ASSERT_STR_EQ(url_in(r, "mqtt.publish", "doubled"), "tenant//events");
+    const CBMCall *c = find_call_in_func(r, "send", "unknown_callee");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR_EQ(c->first_string_arg, "tenant/events");
+    ASSERT_GTE(c->arg_count, 1);
+    ASSERT_STR_EQ(c->args[0].value, "tenant/events");
+    ASSERT_NULL(c->args[0].url_value);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2235's URL slot carries the projection separately; unknown callees stay raw. */
+TEST(extract_ts_folded_config_url_and_exclusions) {
+    CBMFileResult *r =
+        extract("const REL = 'api';\n"
+                "const API_ENDPOINTS = { USER: `${REL}/users/me` };\n"
+                "export function config() { return http({url: API_ENDPOINTS.USER}); }\n"
+                "export function format() { return axios.getUri({url: API_ENDPOINTS.USER}); }\n"
+                "export function register() { app.route({url: API_ENDPOINTS.USER, handler}); }\n"
+                "export function relative() { return fetch(`${REL}/users/me`); }\n",
+                CBM_LANG_TYPESCRIPT, "t", "config.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_in_func(r, "http", "config");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR_EQ(c->first_string_arg, "api/users/me");
+    ASSERT_GTE(c->arg_count, 1);
+    ASSERT_STR_EQ(c->args[0].value, "api/users/me");
+    ASSERT_NOT_NULL(c->args[0].url_value);
+    ASSERT_STR_EQ(c->args[0].url_value, "/api/users/me");
+    const char *callees[] = {"axios.getUri", "app.route"};
+    const char *functions[] = {"format", "register"};
+    for (size_t i = 0; i < sizeof(callees) / sizeof(callees[0]); i++) {
+        c = find_call_in_func(r, callees[i], functions[i]);
+        ASSERT_NOT_NULL(c);
+        ASSERT_NULL(c->first_string_arg);
+        ASSERT_GTE(c->arg_count, 1);
+        ASSERT_NULL(c->args[0].value);
+        ASSERT_NULL(c->args[0].url_value);
+    }
+    c = find_call_in_func(r, "fetch", "relative");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/users/me");
+    ASSERT_GTE(c->arg_count, 1);
+    ASSERT_STR_EQ(c->args[0].value, "api/users/me");
+    ASSERT_STR_EQ(c->args[0].url_value, "/api/users/me");
     cbm_free_result(r);
     PASS();
 }
@@ -6019,6 +7328,63 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
+/* The def QN of `name` and the enclosing-function QN of the call `callee` inside
+ * it, from one extraction result. */
+static void rust_def_and_scope(const CBMFileResult *r, const char *name, const char *callee,
+                               const char **def_qn, const char **scope_qn) {
+    *def_qn = NULL;
+    *scope_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->qualified_name && strcmp(d->name, name) == 0) {
+            *def_qn = d->qualified_name;
+        }
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 && c->enclosing_func_qn &&
+            strstr(c->enclosing_func_qn, name)) {
+            *scope_qn = c->enclosing_func_qn;
+        }
+    }
+}
+
+/* F-R4: a method of a generic impl (`impl<T> Gen<T>`, `impl<'a> Life<'a>`) got a
+ * call scope that kept the generic arguments ("...Gen<T>.in_generic") while the
+ * def side strips them ("...Gen.in_generic"), so no node carried the scope and
+ * every call in the body fell back to the File node (base census: 84,331 Rust
+ * CALLS sourced from a File although inside a function, 96% of all File-sourced
+ * Rust CALLS). The def QN and the call scope must agree. */
+TEST(extract_rust_generic_impl_call_scope_matches_def) {
+    CBMFileResult *r = extract("pub struct Plain;\n"
+                               "impl Plain {\n"
+                               "    pub fn in_plain(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Gen<T> { v: T }\n"
+                               "impl<T> Gen<T> {\n"
+                               "    pub fn in_generic(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub struct Life<'a> { s: &'a str }\n"
+                               "impl<'a> Life<'a> {\n"
+                               "    pub fn in_lifetime(&self) -> u32 { helper() }\n"
+                               "}\n"
+                               "pub fn helper() -> u32 { 1 }\n",
+                               CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const char *const methods[] = {"in_plain", "in_generic", "in_lifetime", NULL};
+    for (int m = 0; methods[m]; m++) {
+        const char *def_qn = NULL;
+        const char *scope_qn = NULL;
+        rust_def_and_scope(r, methods[m], "helper", &def_qn, &scope_qn);
+        ASSERT_NOT_NULL(def_qn);
+        ASSERT_NOT_NULL(scope_qn);
+        ASSERT_STR_EQ(scope_qn, def_qn);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Languages OUTSIDE the is_method flag set (only Perl and TS/JS/TSX set it) must
  * be unaffected: a Go method call never sets is_method. */
 TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
@@ -6557,6 +7923,269 @@ TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
     PASS();
 }
 
+/* True when `qn` carries the token-joined spelling of the `box<int, 2>`
+ * template-id that the preprocessed buffer used to produce. */
+static bool qn_has_token_spaced_box(const char *qn) {
+    return qn && (strstr(qn, "box <") || strstr(qn, "< int") || strstr(qn, "int ,"));
+}
+
+/* dotnet/runtime vxsort shape (src/coreclr/gc/vxsort/smallsort/
+ * bitonic_sort.*.generated.h): methods of an explicit specialization
+ * `template<> struct bitonic<int64_t, AVX2>` carry an attribute macro defined in
+ * another header (INLINE / NOINLINE), so the raw parse has ERROR regions on the
+ * method lines and the #961 rescue re-extracts them from the preprocessed
+ * buffer. That buffer used to join every token with one space, spelling the
+ * scope `box < int , 2 >` where the raw pass spells `box<int, 2>`; the QN dedup
+ * (strcmp) missed, so every method got a second node and the CALLS split across
+ * both. One definition, one spelling, on every path. */
+TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling) {
+    CBMFileResult *r = extract("#ifndef BOX_H\n"
+                               "#define BOX_H\n"
+                               "namespace ns {\n"
+                               "template <typename T, int M> struct box {\n"
+                               "    static void sort(T *p);\n"
+                               "};\n"
+                               "template<> struct box<int, 2> {\n"
+                               "    static INLINE void first(int *p) { p[0] = 0; }\n"
+                               "    static INLINE void second(int *p) { first(p); }\n"
+                               "};\n"
+                               "}\n"
+                               "#endif\n",
+                               CBM_LANG_CPP, "t", "box.h");
+    ASSERT_NOT_NULL(r);
+    int first_count = 0;
+    int second_count = 0;
+    const char *first_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (qn_has_token_spaced_box(d->qualified_name)) {
+            fprintf(stderr, "  [tmplqn] FAIL token-spaced def QN: %s\n", d->qualified_name);
+        }
+        ASSERT_FALSE(qn_has_token_spaced_box(d->qualified_name));
+        if (d->name && strcmp(d->name, "first") == 0) {
+            first_count++;
+            first_qn = d->qualified_name;
+        }
+        if (d->name && strcmp(d->name, "second") == 0) {
+            second_count++;
+        }
+    }
+    ASSERT_EQ(first_count, 1);
+    ASSERT_EQ(second_count, 1);
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_NOT_NULL(strstr(first_qn, "ns.box<int, 2>.first"));
+    /* Call scopes and LSP-resolved endpoints name the same single spelling, so
+     * no CALLS edge lands on (or starts from) a phantom second node. */
+    for (int i = 0; i < r->calls.count; i++) {
+        ASSERT_FALSE(qn_has_token_spaced_box(r->calls.items[i].enclosing_func_qn));
+    }
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        ASSERT_FALSE(qn_has_token_spaced_box(rc->caller_qn));
+        ASSERT_FALSE(qn_has_token_spaced_box(rc->callee_qn));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Defs of `r` with this label, name and start line; `*qn` gets the last one's QN. */
+static int count_defs_at(const CBMFileResult *r, const char *label, const char *name, uint32_t line,
+                         const char **qn) {
+    int n = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, label) == 0 && strcmp(d->name, name) == 0 &&
+            d->start_line == line) {
+            *qn = d->qualified_name;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* A macro-generated struct body (the kernel's lib/tests/randstruct_kunit.c:
+ * `struct s { DO_MANY_MEMBERS(m) };`, `struct t { mixed_members };`) opens a
+ * raw ERROR region in which every later struct nests inside the broken one,
+ * while the preprocessed parse gets them flat. The #961 rescue adopted the
+ * flat copies next to the mis-nested raw ones: one definition, two QNs. The
+ * flat copy replaces the raw one, and what sat under the raw QN (Fields, a
+ * real nested struct, resolved member references) moves to the flat QN. The
+ * body's `__aligned(16)` is unknown without the kernel headers, as in the
+ * real file: a local error in the expanded parse that must not block it. */
+TEST(extract_c_misnested_raw_struct_replaced_by_flat_copy) {
+    CBMFileResult *r = extract("#define DO_MEMBERS(macro) macro(a) macro(b)\n"
+                               "#define long_member(x) unsigned long x;\n"
+                               "struct plain {\n"
+                               "\tDO_MEMBERS(long_member)\n"
+                               "};\n"
+                               "\n"
+                               "#define mixed_members \\\n"
+                               "\tint a __aligned(16); \\\n"
+                               "\tunion {       \\\n"
+                               "\t\tchar c;   \\\n"
+                               "\t\tlong g;   \\\n"
+                               "\t};\n"
+                               "\n"
+                               "struct mixed_untouched {\n"
+                               "\tmixed_members\n"
+                               "};\n"
+                               "\n"
+                               "struct mixed_shuffled {\n"
+                               "\tmixed_members\n"
+                               "} __randomize_layout;\n"
+                               "\n"
+                               "struct contains_untouched {\n"
+                               "\tint before;\n"
+                               "\tstruct nested_real {\n"
+                               "\t\tint deep;\n"
+                               "\t} real;\n"
+                               "\tstruct mixed_shuffled inner;\n"
+                               "\tint after;\n"
+                               "};\n"
+                               "\n"
+                               "static int helper(int x)\n"
+                               "{\n"
+                               "\treturn x + 1;\n"
+                               "}\n"
+                               "\n"
+                               "static int check_layout(struct contains_untouched *c)\n"
+                               "{\n"
+                               "\treturn helper(c->before) + c->real.deep;\n"
+                               "}\n",
+                               CBM_LANG_C, "t", "mixed.c");
+    ASSERT_NOT_NULL(r);
+    static const struct {
+        const char *label;
+        const char *name;
+        uint32_t line;
+        const char *qn;
+    } want[] = {
+        {"Class", "mixed_shuffled", 18, "t.mixed.mixed_shuffled"},
+        {"Class", "contains_untouched", 22, "t.mixed.contains_untouched"},
+        {"Field", "before", 23, "t.mixed.contains_untouched.before"},
+        {"Field", "after", 28, "t.mixed.contains_untouched.after"},
+        /* A real nested struct keeps its real nesting. */
+        {"Class", "nested_real", 24, "t.mixed.contains_untouched.nested_real"},
+        {"Field", "deep", 25, "t.mixed.contains_untouched.nested_real.deep"},
+        {"Function", "check_layout", 36, "t.mixed.check_layout"},
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        const char *qn = NULL;
+        int n = count_defs_at(r, want[i].label, want[i].name, want[i].line, &qn);
+        if (n != 1 || !qn || strcmp(qn, want[i].qn) != 0) {
+            fprintf(stderr, "  [misnested] %s %s L%u: %d def(s), last QN %s (want one, %s)\n",
+                    want[i].label, want[i].name, want[i].line, n, qn ? qn : "(none)", want[i].qn);
+        }
+        ASSERT_EQ(n, 1);
+        ASSERT_STR_EQ(qn, want[i].qn);
+    }
+    /* Nothing is left on the mis-nested chain: no def, no call scope, no
+     * resolved caller or member target. */
+    static const char *const chain = "mixed_untouched.mixed_shuffled";
+    for (int i = 0; i < r->defs.count; i++) {
+        ASSERT_NULL(strstr(r->defs.items[i].qualified_name, chain));
+    }
+    int helper_calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        ASSERT_TRUE(!c->enclosing_func_qn || !strstr(c->enclosing_func_qn, chain));
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            ASSERT_STR_EQ(c->enclosing_func_qn, "t.mixed.check_layout");
+            helper_calls++;
+        }
+    }
+    ASSERT_TRUE(helper_calls >= 1);
+    int before_refs = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *c = &r->resolved_calls.items[i];
+        ASSERT_TRUE(!c->caller_qn || !strstr(c->caller_qn, chain));
+        ASSERT_TRUE(!c->callee_qn || !strstr(c->callee_qn, chain));
+        if (c->callee_qn && strcmp(c->callee_qn, "t.mixed.contains_untouched.before") == 0) {
+            before_refs++;
+        }
+    }
+    ASSERT_TRUE(before_refs >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The #961 rescue recovers defs the raw pass LOST. When the expanded tree scopes
+ * a def differently from the raw one, its QN differs although the raw pass
+ * already extracted the very same definition (same label, name, line). Here a
+ * namespace-opening macro defined in the file is an identifier to the raw parse
+ * and `namespace inner {` to the expanded one; rapidjson reader.h hits the same
+ * divergence on the `NumberStream<...>` specializations nested in GenericReader.
+ * Adopting the expanded copy mints a second node for one definition: the raw
+ * copy wins. */
+TEST(extract_cpp_preprocessed_rescue_skips_raw_def_on_same_line) {
+    CBMFileResult *r = extract("#define OPEN_NS namespace inner {\n"
+                               "#define CLOSE_NS }\n"
+                               "OPEN_NS\n"
+                               "template <typename T, int M> struct box {};\n"
+                               "template<> struct box<int, 2> {\n"
+                               "    static INLINE void first(int *p) { p[0] = 0; }\n"
+                               "};\n"
+                               "CLOSE_NS\n",
+                               CBM_LANG_CPP, "t", "ns.h");
+    ASSERT_NOT_NULL(r);
+    int first_count = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "first") == 0) {
+            fprintf(stderr, "  [rescue-site] def first: %s line %u\n", d->qualified_name,
+                    d->start_line);
+            first_count++;
+        }
+    }
+    ASSERT_EQ(first_count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The raw copy wins a same-site disagreement only while its QN is its own:
+ * coreclr inc/holder.h's nested `class AddressInitHolder` loses its
+ * `BaseWrapper` scope on the raw parse, and the raw parse also reads the
+ * FORCEINLINE constructor as a file-scope Function of the same QN. Keeping the
+ * raw Class there left no Class node at all (one node per QN); the correctly
+ * scoped expanded copy must survive. */
+TEST(extract_cpp_rescue_keeps_expanded_class_when_raw_qn_is_taken) {
+    /* Minimized from holder.h (delta debugging against the rule with and
+     * without this check). */
+    CBMFileResult *r = extract(
+        "class BaseWrapper : public BaseHolder<TYPE, BASE, DEFAULTVALUE, IS_NULL>\n"
+        "{\n"
+        "    class AddressInitHolder\n"
+        "    {\n"
+        "        FORCEINLINE AddressInitHolder(BaseWrapper<TYPE,BASE,DEFAULTVALUE,IS_NULL> &holder)\n"
+        "        {\n"
+        "            unknown = static_cast<IUnknown*>(m_holder.m_value);\n"
+        "        }\n"
+        "#if defined(FEATURE_COMINTEROP) && !defined(STRIKE)\n"
+        "        FORCEINLINE operator IInspectable **()\n"
+        "#endif // FEATURE_COMINTEROP\n"
+        "    {\n"
+        "    }\n"
+        "    }\n",
+        CBM_LANG_CPP, "t", "holder.h");
+    ASSERT_NOT_NULL(r);
+    bool scoped_class = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "AddressInitHolder") == 0) {
+            fprintf(stderr, "  [rescue-taken] %s %s line %u\n", d->label ? d->label : "-",
+                    d->qualified_name, d->start_line);
+            if (d->label && strcmp(d->label, "Class") == 0 && d->qualified_name &&
+                strstr(d->qualified_name, "BaseWrapper.AddressInitHolder") != NULL &&
+                strstr(d->qualified_name, "AddressInitHolder.AddressInitHolder") == NULL) {
+                scoped_class = true;
+            }
+        }
+    }
+    ASSERT_TRUE(scoped_class);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #1989: build-system export macros (UE "<MOD>_API", CMake generate_export_header
  * "<lib>_EXPORT") are empty on the real compile line but opaque to tree-sitter,
  * so `class MOD_API Foo` misparses. The preprocessed second pass predefines the
@@ -6687,6 +8316,774 @@ TEST(extract_c_export_macro_recovery_issue1989) {
     ASSERT_NOT_NULL(r);
     ASSERT_NOT_NULL(find_def(r, "sqlite3_open"));
     cbm_free_result(r);
+    PASS();
+}
+
+/* ── PR C1: C graph defects behind the C/Doxygen doc-link audit ──────── */
+
+static const CBMDefinition *c1_def(CBMFileResult *r, const char *label, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, label) == 0 && strcmp(d->name, name) == 0) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+/* Caller QN of the first raw-pass call to `callee`, or "" when there is none. */
+static const char *c1_call_scope(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, callee) == 0 &&
+            c->source_origin == CBM_SOURCE_ORIGIN_RAW) {
+            return c->enclosing_func_qn ? c->enclosing_func_qn : "";
+        }
+    }
+    return "";
+}
+
+/* Caller QN of the first C-LSP resolution whose callee QN ends in ".<leaf>". */
+static const char *c1_lsp_caller(CBMFileResult *r, const char *leaf) {
+    size_t ll = strlen(leaf);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        size_t cl = rc->callee_qn ? strlen(rc->callee_qn) : 0;
+        if (cl > ll && rc->callee_qn[cl - ll - 1] == '.' &&
+            strcmp(rc->callee_qn + cl - ll, leaf) == 0) {
+            return rc->caller_qn ? rc->caller_qn : "";
+        }
+    }
+    return "";
+}
+
+/* xxhash.h shape: `XXH_PUBLIC_API <RetT> name(...)` has one leading identifier more than
+ * the grammar admits. tree-sitter-cpp (every .h is C++) recovers it as `RetT::name` with a
+ * zero-width MISSING "::" (a Method of the return type), with a pointer return as
+ * `RetT::*name` (no name at all: the function was dropped), or keeps RetT as the name and
+ * puts the real one in an ERROR before the parameters. The implementation sits behind a
+ * guard the preprocessed pass does not take, as in xxhash.h, so only the raw parse sees
+ * it. Def QN, call-scope QN and C-LSP caller QN must all name the real function. */
+static const char *C1_MACRO_PREFIX_SRC =
+    "#if defined(XXH_IMPLEMENTATION)\n"
+    "XXH_PUBLIC_API XXH_errorcode XXH32_freeState(XXH32_state_t* statePtr)\n"
+    "{\n"
+    "    XXH_free(statePtr);\n"
+    "    return XXH_OK;\n"
+    "}\n"
+    "\n"
+    "XXH_PUBLIC_API XXH32_state_t* XXH32_createState(void)\n"
+    "{\n"
+    "    return (XXH32_state_t*)XXH_malloc(sizeof(XXH32_state_t));\n"
+    "}\n"
+    "\n"
+    "XXH_PUBLIC_API XXH32_hash_t XXH32 (const void* input, size_t len, XXH32_hash_t seed)\n"
+    "{\n"
+    "    return XXH32_endian_align(input, len, seed);\n"
+    "}\n"
+    "#endif\n";
+
+TEST(extract_cpp_macro_prefixed_function_names_c1) {
+    CBMFileResult *r = extract(C1_MACRO_PREFIX_SRC, CBM_LANG_CPP, "p", "xxhash.h");
+    ASSERT_NOT_NULL(r);
+    char want[256];
+
+    const CBMDefinition *free_state = c1_def(r, "Function", "XXH32_freeState");
+    ASSERT_NOT_NULL(free_state);
+    ASSERT_EQ(count_defs_named(r, "Method", "XXH32_freeState"), 0);
+    snprintf(want, sizeof(want), "%s.XXH32_freeState", r->module_qn);
+    ASSERT_STR_EQ(free_state->qualified_name, want);
+    ASSERT_STR_EQ(c1_call_scope(r, "XXH_free"), want);
+
+    const CBMDefinition *create = c1_def(r, "Function", "XXH32_createState");
+    ASSERT_NOT_NULL(create);
+    ASSERT_EQ((int)create->start_line, 8);
+    ASSERT_EQ((int)create->end_line, 11);
+    ASSERT_NOT_NULL(create->signature);
+
+    const CBMDefinition *xxh32 = c1_def(r, "Function", "XXH32");
+    ASSERT_NOT_NULL(xxh32);
+    ASSERT_FALSE(has_def_any(r, "XXH32_hash_t"));
+    ASSERT_STR_EQ(c1_call_scope(r, "XXH32_endian_align"), xxh32->qualified_name);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The C-LSP walks declarators on its own (c_process_function); its caller QN must
+ * name the recovered function too, or the exact-equality LSP join drops the
+ * type-aware resolution of every call inside it (the call falls back to a textual
+ * strategy). jemalloc-style prefix: not an export-macro candidate, so the
+ * preprocessed pass keeps the same misparse and cannot mask the raw one. */
+TEST(extract_cpp_macro_prefixed_lsp_caller_c1) {
+    CBMFileResult *r = extract("static int je_helper(int v) { return v; }\n"
+                               "JE_ALWAYS_INLINE je_errorcode je_reset(je_state_t *st)\n"
+                               "{\n"
+                               "    return je_helper(1);\n"
+                               "}\n"
+                               "JE_ALWAYS_INLINE je_hash_t je_hash (const void *in, size_t n)\n"
+                               "{\n"
+                               "    return je_helper(2);\n"
+                               "}\n",
+                               CBM_LANG_CPP, "p", "je.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *reset = c1_def(r, "Function", "je_reset");
+    const CBMDefinition *hash = c1_def(r, "Function", "je_hash");
+    ASSERT_NOT_NULL(reset);
+    ASSERT_NOT_NULL(hash);
+    int from_reset = 0;
+    int from_hash = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const char *caller = r->resolved_calls.items[i].caller_qn;
+        from_reset += caller && strcmp(caller, reset->qualified_name) == 0;
+        from_hash += caller && strcmp(caller, hash->qualified_name) == 0;
+    }
+    ASSERT_GT(from_reset, 0);
+    ASSERT_GT(from_hash, 0);
+    ASSERT_STR_EQ(c1_lsp_caller(r, "je_helper"), reset->qualified_name);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same recovery in the C grammar (lua's LUA_API): named after the return type
+ * before. A function-like macro invocation that only looks like a declarator
+ * (`... TEST_BEGIN (test_alignment) {`) has an untyped "parameter" no definition can
+ * have, so its macro name is never adopted as the function name. */
+TEST(extract_c_macro_prefixed_function_name_c1) {
+    CBMFileResult *r =
+        extract("#if defined(LUA_CORE)\n"
+                "LUA_API lua_CFunction lua_atpanic (lua_State *L, lua_CFunction panicf) {\n"
+                "  lua_CFunction old = G(L)->panic;\n"
+                "  return old;\n"
+                "}\n"
+                "\n"
+                "XXH_TEST_API XXH32_hash_t TEST_BEGIN (test_alignment) {\n"
+                "  helper(1);\n"
+                "}\n"
+                "#endif\n",
+                CBM_LANG_C, "p", "lapi.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(c1_def(r, "Function", "lua_atpanic"));
+    ASSERT_FALSE(has_def_any(r, "lua_CFunction"));
+    ASSERT_FALSE(has_def_any(r, "TEST_BEGIN"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `struct X` / `enum X` / `class X` without a body is a reference, not a definition:
+ * no Class/Enum def, so nothing competes with the real definition for its QN (a later
+ * or smaller-path reference used to take the node: curl 132 structs, kernel
+ * task_struct, redis redisServer) and no phantom type node appears in every file that
+ * merely mentions the type (`struct timeval`). */
+TEST(extract_c_tag_reference_is_not_a_definition_c1) {
+    CBMFileResult *r = extract("struct node {\n"
+                               "    int value;\n"
+                               "    struct node *next;\n"
+                               "};\n"
+                               "struct node *head;\n"
+                               "struct timeval tv;\n"
+                               "enum color { RED, GREEN };\n"
+                               "enum color paint(enum color c);\n"
+                               "void walk(struct node *n);\n"
+                               "struct opaque;\n",
+                               CBM_LANG_C, "p", "list.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Class", "node"), 1);
+    const CBMDefinition *node = c1_def(r, "Class", "node");
+    ASSERT_EQ((int)node->start_line, 1);
+    ASSERT_EQ((int)node->end_line, 4);
+    ASSERT_EQ(count_defs_named(r, "Enum", "color"), 1);
+    ASSERT_EQ((int)c1_def(r, "Enum", "color")->start_line, 7);
+    ASSERT_FALSE(has_def_any(r, "timeval"));
+    ASSERT_FALSE(has_def_any(r, "opaque"));
+    cbm_free_result(r);
+
+    /* .h is parsed as C++: a forward declaration before the definition. */
+    r = extract("class Widget;\n"
+                "struct Config;\n"
+                "Widget *make_widget(struct Config *cfg);\n"
+                "class Widget {\n"
+                "    int size;\n"
+                "};\n",
+                CBM_LANG_CPP, "p", "widget.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Class", "Widget"), 1);
+    ASSERT_EQ((int)c1_def(r, "Class", "Widget")->start_line, 4);
+    ASSERT_FALSE(has_def_any(r, "Config"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* tree-sitter can give up on a whole region and leave the definition head as loose
+ * ERROR tokens (kernel include/linux/sched.h: `struct task_struct {` at 826 is never a
+ * struct_specifier). Its only nodes were then the references (642 won); with
+ * references no longer minting defs the head itself must be recovered, spanning to
+ * its matching brace counted over the first branch of each #if group. */
+TEST(extract_c_struct_head_in_error_region_recovered_c1) {
+    CBMFileResult *r = extract("#ifndef SCHED_H\n"
+                               "#define SCHED_H\n"
+                               "struct task_struct;\n"
+                               "typedef struct task_struct *(*pick_f)(int cpu);\n"
+                               "\n"
+                               "/* Per-task scheduler state. */\n"
+                               "struct task_struct {\n"
+                               "\tint state;\n"
+                               "#ifdef CONFIG_SMP\n"
+                               "\tstruct {\n"
+                               "#else\n"
+                               "\tunion {\n"
+                               "#endif\n"
+                               "\t\tint on_cpu;\n"
+                               "\t};\n"
+                               "\tint prio;\n"
+                               "};\n"
+                               "#endif\n",
+                               CBM_LANG_CPP, "p", "sched.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Class", "task_struct"), 1);
+    const CBMDefinition *ts = c1_def(r, "Class", "task_struct");
+    ASSERT_EQ((int)ts->start_line, 7);
+    ASSERT_EQ((int)ts->end_line, 17);
+    ASSERT_NOT_NULL(c1_def(r, "Type", "pick_f"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A stray `;` after an if-block leaves the following `else if (...) {...}` without its
+ * `if`; inside a function the raw parse already lost (whole-file guard + split brace),
+ * error recovery reads it as a DEFINITION: type `else`, name `if`. A C keyword is never
+ * a function name (curl lib/vtls/openssl.c:4242, redis deps/tre/lib/tre-parse.c:1315). */
+TEST(extract_c_keyword_is_never_a_function_name_c1) {
+    CBMFileResult *r = extract("#ifdef USE_OPENSSL\n"
+                               "static int check(int lib, int reason)\n"
+                               "{\n"
+                               "  int result = 0;\n"
+                               "  if(lib == 1) {\n"
+                               "#ifndef HAVE_BORINGSSL_LIKE\n"
+                               "    result = 1; {\n"
+                               "#else\n"
+                               "    result = 2; {\n"
+                               "#endif\n"
+                               "  }\n"
+                               "  };\n"
+                               "  else if(reason == 2) {\n"
+                               "    result = trace_retry(reason);\n"
+                               "  }\n"
+                               "  return result;\n"
+                               "}\n"
+                               "#endif\n",
+                               CBM_LANG_C, "p", "openssl.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(has_def_any(r, "if"));
+    ASSERT_TRUE(has_call(r, "trace_retry"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Preprocessor-split code the raw parse cannot read: `#ifndef X (a)) { #else (b)) {
+ * #endif` leaves an extra `{`, the file-level ERROR swallows the function header and
+ * the function gets no node. The #961 rescue re-parses the preprocessed text, but a
+ * whole-file `#ifdef USE_OPENSSL` with no build defines leaves it nothing to parse.
+ * The first-branch projection restores it (curl ossl_connect_step2,
+ * Curl_ossl_ctx_init, mbed_configure_ssl, ...: all 11 curl misses). */
+TEST(extract_c_function_lost_to_split_branches_restored_c1) {
+    CBMFileResult *r = extract("#ifdef USE_OPENSSL\n"
+                               "static int ossl_step(int lib, int reason)\n"
+                               "{\n"
+                               "  int result = 0;\n"
+                               "  if(lib == 1) {\n"
+                               "    result = 1;\n"
+                               "  }\n"
+                               "  else if((lib == 2) &&\n"
+                               "#ifndef HAVE_BORINGSSL_LIKE\n"
+                               "          (reason == 3)) {\n"
+                               "#else\n"
+                               "          (reason == 4)) {\n"
+                               "#endif\n"
+                               "    result = trace_retry(reason);\n"
+                               "  }\n"
+                               "  return result;\n"
+                               "}\n"
+                               "\n"
+                               "int ossl_after(void)\n"
+                               "{\n"
+                               "  return ossl_step(1, 2);\n"
+                               "}\n"
+                               "#endif\n",
+                               CBM_LANG_C, "p", "openssl.c");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *step = c1_def(r, "Function", "ossl_step");
+    ASSERT_NOT_NULL(step);
+    ASSERT_EQ((int)step->start_line, 2);
+    ASSERT_EQ((int)step->end_line, 17);
+    ASSERT_EQ(count_defs_named(r, "Function", "ossl_after"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* C typedefs carry no `name` field (the alias lives in the declarators), so no typedef
+ * ever became a node and an anonymous `typedef struct {...} Name;` lost its fields and
+ * enum constants too. xxhash: `@ref XXH32_state_t` could only resolve to the namespace
+ * rename macro `#define XXH32_state_t XXH_IPREF(XXH32_state_t)`. */
+TEST(extract_c_typedef_names_are_definitions_c1) {
+    CBMFileResult *r = extract("typedef struct XXH32_state_s XXH32_state_t;\n"
+                               "typedef struct {\n"
+                               "    unsigned char digest[4];\n"
+                               "} XXH32_canonical_t;\n"
+                               "typedef enum { XXH_OK = 0, XXH_ERROR = 1 } XXH_errorcode;\n"
+                               "typedef unsigned int XXH32_hash_t;\n"
+                               "typedef int (*cmp_fn)(const void *a, const void *b);\n"
+                               "typedef struct opaque_s opaque_s;\n"
+                               "typedef struct node node;\n"
+                               "struct node { int v; };\n"
+                               "typedef struct named_s { int y; } named_t;\n"
+                               "typedef struct same { int z; } same;\n",
+                               CBM_LANG_C, "p", "xxhash.c");
+    ASSERT_NOT_NULL(r);
+    char want[256];
+    ASSERT_NOT_NULL(c1_def(r, "Type", "XXH32_state_t"));
+    const CBMDefinition *canon = c1_def(r, "Class", "XXH32_canonical_t");
+    ASSERT_NOT_NULL(canon);
+    ASSERT_EQ((int)canon->start_line, 2);
+    snprintf(want, sizeof(want), "%s.XXH32_canonical_t.digest", r->module_qn);
+    ASSERT_TRUE(has_def_qn(r, want));
+    ASSERT_NOT_NULL(c1_def(r, "Enum", "XXH_errorcode"));
+    snprintf(want, sizeof(want), "%s.XXH_OK", r->module_qn);
+    ASSERT_TRUE(has_def_qn(r, want));
+    ASSERT_NOT_NULL(c1_def(r, "Type", "XXH32_hash_t"));
+    ASSERT_NOT_NULL(c1_def(r, "Type", "cmp_fn"));
+    /* identity alias of an incomplete struct: often the only declaration of an
+     * opaque handle type */
+    ASSERT_NOT_NULL(c1_def(r, "Type", "opaque_s"));
+    /* identity alias of a struct defined in the same file: the definition owns it */
+    ASSERT_EQ(count_defs_named(r, "Class", "node"), 1);
+    ASSERT_EQ(count_defs_named(r, "Type", "node"), 0);
+    ASSERT_NOT_NULL(c1_def(r, "Class", "named_s"));
+    ASSERT_NOT_NULL(c1_def(r, "Type", "named_t"));
+    ASSERT_EQ(count_defs_named(r, "Class", "same"), 1);
+    ASSERT_EQ(count_defs_named(r, "Type", "same"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+static const CBMDefinition *c1_def_qn(CBMFileResult *r, const char *qn) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->qualified_name && strcmp(d->qualified_name, qn) == 0) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+static bool qn_ends_with(const CBMDefinition *d, const char *tail) {
+    size_t n = d && d->qualified_name ? strlen(d->qualified_name) : 0;
+    size_t t = strlen(tail);
+    return n >= t && strcmp(d->qualified_name + n - t, tail) == 0;
+}
+
+/* A field and a same-named method of one class body would share one qualified
+ * name (one node per QN): the field is fenced `<Owner>.<name>#field` and the
+ * method keeps the plain name. A field without a namesake keeps its name, and
+ * so does a nested class's field named like a method of the outer class. */
+TEST(field_named_like_method_is_fenced) {
+    CBMFileResult *r = extract("package demo;\npublic class Starter {\n"
+                               "    private String executable;\n"
+                               "    private String dir;\n"
+                               "    public Starter executable(String p) { return this; }\n"
+                               "    public void size() {}\n"
+                               "    static class Inner { int size; }\n}\n",
+                               CBM_LANG_JAVA, "t", "Starter.java");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *field = c1_def(r, "Field", "executable");
+    const CBMDefinition *method = c1_def(r, "Method", "executable");
+    ASSERT_NOT_NULL(field);
+    ASSERT_NOT_NULL(method);
+    ASSERT_TRUE(qn_ends_with(field, "Starter.executable#field"));
+    ASSERT_TRUE(qn_ends_with(method, "Starter.executable"));
+    ASSERT_TRUE(qn_ends_with(c1_def(r, "Field", "dir"), "Starter.dir"));
+    ASSERT_TRUE(qn_ends_with(c1_def(r, "Field", "size"), "Inner.size"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The def with this label and name that starts on `line`. */
+static const CBMDefinition *c1_def_at(CBMFileResult *r, const char *label, const char *name,
+                                      int line) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, label) == 0 && strcmp(d->name, name) == 0 &&
+            (int)d->start_line == line) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+/* A preprocessor macro's QN is `<module>.<NAME>#macro` (CBM_MACRO_QN_SUFFIX); name and
+ * label stay. C keeps macros apart from ordinary identifiers, so a macro and the
+ * function, type or enumerator of the same name are two entities and need two QNs: the
+ * namespace rename `#define XXH32 XXH_NAME2(XXH_NAMESPACE, XXH32)` held the QN of the
+ * function XXH32 (110 of 174 audited xxhash doc links ended on such a macro), and the
+ * #else stand-in `#define match_proxy(a) 1` replaced the function it stands in for
+ * (curl, 41 functions). Every language routed through the #define path is covered,
+ * and in each of them a macro defined twice carries `variants`: the namespace and the
+ * list follow one language predicate. */
+TEST(extract_c_macro_qn_is_fenced_c1) {
+    static const struct {
+        CBMLanguage lang;
+        const char *file;
+    } cases[] = {{CBM_LANG_C, "cfg.c"},       {CBM_LANG_CPP, "cfg.h"},
+                 {CBM_LANG_OBJC, "cfg.m"},    {CBM_LANG_CUDA, "cfg.cu"},
+                 {CBM_LANG_GLSL, "cfg.glsl"}, {CBM_LANG_ISPC, "cfg.ispc"}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract("#define MAX_LEN 10\n"
+                                   "#define SQUARE(x) ((x) * (x))\n"
+                                   "#define MAX_LEN 20\n",
+                                   cases[i].lang, "p", cases[i].file);
+        ASSERT_NOT_NULL(r);
+        char want[256];
+        const CBMDefinition *max_len = c1_def(r, "Macro", "MAX_LEN");
+        ASSERT_NOT_NULL(max_len);
+        snprintf(want, sizeof(want), "%s.MAX_LEN" CBM_MACRO_QN_SUFFIX, r->module_qn);
+        ASSERT_STR_EQ(max_len->qualified_name, want);
+        const CBMDefinition *square = c1_def(r, "Macro", "SQUARE");
+        ASSERT_NOT_NULL(square);
+        snprintf(want, sizeof(want), "%s.SQUARE#macro", r->module_qn);
+        ASSERT_STR_EQ(square->qualified_name, want);
+        /* the plain QN is free for a definition of that name */
+        snprintf(want, sizeof(want), "%s.MAX_LEN", r->module_qn);
+        ASSERT_NULL(c1_def_qn(r, want));
+        const CBMDefinition *redefined = c1_def_at(r, "Macro", "MAX_LEN", 3);
+        ASSERT_NOT_NULL(redefined);
+        ASSERT_NOT_NULL(redefined->variants);
+        cbm_free_result(r);
+    }
+
+    CBMFileResult *r = extract("#ifdef USE_PROXY\n"
+                               "int match_proxy(int a) { return a; }\n"
+                               "#else\n"
+                               "#define match_proxy(a) 1\n"
+                               "#endif\n",
+                               CBM_LANG_C, "p", "proxy.c");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *fn = c1_def(r, "Function", "match_proxy");
+    const CBMDefinition *mac = c1_def(r, "Macro", "match_proxy");
+    ASSERT_NOT_NULL(fn);
+    ASSERT_NOT_NULL(mac);
+    char want[256];
+    snprintf(want, sizeof(want), "%s.match_proxy", r->module_qn);
+    ASSERT_STR_EQ(fn->qualified_name, want);
+    snprintf(want, sizeof(want), "%s.match_proxy#macro", r->module_qn);
+    ASSERT_STR_EQ(mac->qualified_name, want);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The enumerators of a C enum live in the scope that holds the enum, so their QN is
+ * `<scope>.<CONST>`: the enum's own name is not a segment. That is how a reference
+ * spells them (`XXH_OK`, never `XXH_errorcode.XXH_OK`), and it gives the constants of
+ * an anonymous enum, which has no name to nest under, a QN at all. `parent_class`
+ * (the enum's QN) keeps the membership; an anonymous enum has no node to point at. */
+TEST(extract_c_enumerators_are_flat_c1) {
+    CBMFileResult *r = extract("enum color { RED, GREEN = 2 };\n"
+                               "enum { ANON_A, ANON_B };\n"
+                               "typedef enum { TD_A, TD_B } td_t;\n",
+                               CBM_LANG_C, "p", "e.c");
+    ASSERT_NOT_NULL(r);
+    char qn[256];
+    char parent[256];
+
+    snprintf(qn, sizeof(qn), "%s.RED", r->module_qn);
+    snprintf(parent, sizeof(parent), "%s.color", r->module_qn);
+    const CBMDefinition *red = c1_def_qn(r, qn);
+    ASSERT_NOT_NULL(red);
+    ASSERT_STR_EQ(red->label, "Variable");
+    ASSERT_NOT_NULL(red->parent_class);
+    ASSERT_STR_EQ(red->parent_class, parent);
+    snprintf(qn, sizeof(qn), "%s.GREEN", r->module_qn);
+    ASSERT_NOT_NULL(c1_def_qn(r, qn));
+    snprintf(qn, sizeof(qn), "%s.color.RED", r->module_qn);
+    ASSERT_NULL(c1_def_qn(r, qn));
+    ASSERT_NOT_NULL(c1_def_qn(r, parent)); /* the Enum itself keeps its QN */
+
+    snprintf(qn, sizeof(qn), "%s.ANON_A", r->module_qn);
+    const CBMDefinition *anon = c1_def_qn(r, qn);
+    ASSERT_NOT_NULL(anon);
+    ASSERT_STR_EQ(anon->label, "Variable");
+    ASSERT_NULL(anon->parent_class);
+    snprintf(qn, sizeof(qn), "%s.ANON_B", r->module_qn);
+    ASSERT_NOT_NULL(c1_def_qn(r, qn));
+
+    snprintf(qn, sizeof(qn), "%s.TD_A", r->module_qn);
+    snprintf(parent, sizeof(parent), "%s.td_t", r->module_qn);
+    const CBMDefinition *td = c1_def_qn(r, qn);
+    ASSERT_NOT_NULL(td);
+    ASSERT_NOT_NULL(td->parent_class);
+    ASSERT_STR_EQ(td->parent_class, parent);
+    ASSERT_EQ(count_defs_named(r, "Variable", "TD_A"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* C++: an unscoped enum's enumerators belong to the enclosing scope (module, namespace
+ * or class), whatever nesting holds the enum; `enum class` and `enum struct` are
+ * scopes of their own and keep `<Enum>.<CONST>`. */
+TEST(extract_cpp_enum_scoping_c1) {
+    CBMFileResult *r = extract("enum Color { RED, GREEN };\n"
+                               "namespace gfx {\n"
+                               "enum Blend { ADD, MULTIPLY };\n"
+                               "class Brush {\n"
+                               "public:\n"
+                               "    enum Shape { ROUND, SQUARE };\n"
+                               "};\n"
+                               "}\n"
+                               "enum class Mode { FAST, SLOW };\n"
+                               "enum struct Level { LOW, HIGH };\n",
+                               CBM_LANG_CPP, "p", "shapes.hpp");
+    ASSERT_NOT_NULL(r);
+    static const struct {
+        const char *qn_tail;
+        const char *parent_tail;
+    } want[] = {{"RED", "Color"},
+                {"GREEN", "Color"},
+                {"gfx.ADD", "gfx.Blend"},
+                {"gfx.MULTIPLY", "gfx.Blend"},
+                {"gfx.Brush.ROUND", "gfx.Brush.Shape"},
+                {"gfx.Brush.SQUARE", "gfx.Brush.Shape"},
+                {"Mode.FAST", "Mode"},
+                {"Mode.SLOW", "Mode"},
+                {"Level.LOW", "Level"},
+                {"Level.HIGH", "Level"}};
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        char qn[256];
+        char parent[256];
+        snprintf(qn, sizeof(qn), "%s.%s", r->module_qn, want[i].qn_tail);
+        snprintf(parent, sizeof(parent), "%s.%s", r->module_qn, want[i].parent_tail);
+        const CBMDefinition *d = c1_def_qn(r, qn);
+        if (!d) {
+            fprintf(stderr, "  [c1] no def with QN %s\n", qn);
+        }
+        ASSERT_NOT_NULL(d);
+        ASSERT_STR_EQ(d->label, "Variable");
+        ASSERT_NOT_NULL(d->parent_class);
+        ASSERT_STR_EQ(d->parent_class, parent);
+    }
+    char qn[256];
+    snprintf(qn, sizeof(qn), "%s.Color.RED", r->module_qn);
+    ASSERT_NULL(c1_def_qn(r, qn));
+    snprintf(qn, sizeof(qn), "%s.FAST", r->module_qn);
+    ASSERT_NULL(c1_def_qn(r, qn));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A named and an anonymous enum inside a struct, and an anonymous one inside a union:
+ * one C-looking source, read under each C-family language by the two tests below. */
+static const char *const C1_ENUM_IN_STRUCT_SRC = "struct conn {\n"
+                                                 "    enum state { ST_IDLE, ST_BUSY } st;\n"
+                                                 "    enum { KIND_A, KIND_B } kind;\n"
+                                                 "    int fd;\n"
+                                                 "};\n"
+                                                 "union box {\n"
+                                                 "    enum { BOX_A, BOX_B } tag;\n"
+                                                 "    int v;\n"
+                                                 "};\n";
+
+/* Is `<module>[.<scope>].<name>` the ONE Variable def of that name, with parent_class
+ * `<module>.<parent_tail>` (NULL: no parent_class)? */
+static bool c1_enumerator_at(CBMFileResult *r, const char *scope, const char *name,
+                             const char *parent_tail) {
+    char qn[256];
+    snprintf(qn, sizeof(qn), "%s%s%s.%s", r->module_qn, scope[0] ? "." : "", scope, name);
+    const CBMDefinition *d = c1_def_qn(r, qn);
+    if (!d || !d->label || strcmp(d->label, "Variable") != 0 ||
+        count_defs_named(r, "Variable", name) != 1) {
+        const CBMDefinition *other = c1_def(r, "Variable", name);
+        fprintf(stderr, "  [c1] want the one Variable %s, the Variable of that name is %s\n", qn,
+                other ? other->qualified_name : "(none)");
+        return false;
+    }
+    if (!parent_tail) {
+        return d->parent_class == NULL;
+    }
+    char parent[256];
+    snprintf(parent, sizeof(parent), "%s.%s", r->module_qn, parent_tail);
+    return d->parent_class && strcmp(d->parent_class, parent) == 0;
+}
+
+/* C has no struct scope for ordinary identifiers: an enum declared inside a struct or
+ * union puts its enumerators in the scope around it, and the code names them
+ * unqualified (curl lib/cf-h1-proxy.c: `ts->keepon = KEEPON_CONNECT;`). In C and
+ * Objective-C the struct is therefore no segment of a flat enumerator's QN, named
+ * enum or anonymous; `parent_class` still names a named enum. */
+TEST(extract_c_enum_inside_struct_is_file_scope_c1) {
+    static const struct {
+        CBMLanguage lang;
+        const char *file;
+    } cases[] = {{CBM_LANG_C, "link.c"}, {CBM_LANG_OBJC, "link.m"}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract(C1_ENUM_IN_STRUCT_SRC, cases[i].lang, "p", cases[i].file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_TRUE(c1_enumerator_at(r, "", "ST_IDLE", "conn.state"));
+        ASSERT_TRUE(c1_enumerator_at(r, "", "ST_BUSY", "conn.state"));
+        ASSERT_TRUE(c1_enumerator_at(r, "", "KIND_A", NULL));
+        ASSERT_TRUE(c1_enumerator_at(r, "", "KIND_B", NULL));
+        ASSERT_TRUE(c1_enumerator_at(r, "", "BOX_A", NULL));
+        ASSERT_TRUE(c1_enumerator_at(r, "", "BOX_B", NULL));
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* C++ does scope them: `conn::ST_IDLE`. The enclosing class stays the scope in C++ and
+ * CUDA -- and so in every .h, which is parsed as C++ -- for the same source. This pins
+ * the other side of the rule above: the C treatment must not reach C++. */
+TEST(extract_cpp_enum_inside_class_keeps_class_scope_c1) {
+    static const struct {
+        CBMLanguage lang;
+        const char *file;
+    } cases[] = {{CBM_LANG_CPP, "link.h"}, {CBM_LANG_CUDA, "link.cu"}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract(C1_ENUM_IN_STRUCT_SRC, cases[i].lang, "p", cases[i].file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_TRUE(c1_enumerator_at(r, "conn", "ST_IDLE", "conn.state"));
+        ASSERT_TRUE(c1_enumerator_at(r, "conn", "ST_BUSY", "conn.state"));
+        ASSERT_TRUE(c1_enumerator_at(r, "conn", "KIND_A", NULL));
+        ASSERT_TRUE(c1_enumerator_at(r, "conn", "KIND_B", NULL));
+        ASSERT_TRUE(c1_enumerator_at(r, "box", "BOX_A", NULL));
+        ASSERT_TRUE(c1_enumerator_at(r, "box", "BOX_B", NULL));
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* A macro inside an enumerator list is not enumerator grammar; the parser keeps every
+ * bare identifier it can as an `enumerator` and wraps the rest in ERROR nodes. curl.h
+ * declares its options as `CURLOPT(CURLOPT_URL, CURLOPTTYPE_STRINGPOINT, 2),`: the
+ * second argument came back as a constant 115 times and, flattened, took the plain QN
+ * of the macro `CURLOPTTYPE_LONG`. `X CURL_DEPRECATED(7.55.0, "Use Y") = BASE + 16,`
+ * turned BASE and the words of the message into constants. Only the enumerator that
+ * opens a slot is a constant; the comment above the macro call documents it. */
+TEST(extract_c_enum_macro_wrapped_list_c1) {
+    CBMFileResult *r = extract("typedef enum {\n"
+                               "  /* doc of the first option */\n"
+                               "  OPT(OPT_FIRST, TYPE_LONG, 1),\n"
+                               "  OPT(OPT_SECOND, TYPE_STRING, 2),\n"
+                               "  OPT_THIRD DEPRECATED(1.0, \"Use OPT_FIRST instead\")\n"
+                               "      = BASE_LONG + 3,\n"
+                               "  OPT_LAST\n"
+                               "} option_t;\n",
+                               CBM_LANG_C, "p", "opts.c");
+    ASSERT_NOT_NULL(r);
+    static const char *const real[] = {"OPT_FIRST", "OPT_SECOND", "OPT_THIRD", "OPT_LAST"};
+    for (size_t i = 0; i < sizeof(real) / sizeof(real[0]); i++) {
+        ASSERT_EQ(count_defs_named(r, "Variable", real[i]), 1);
+    }
+    static const char *const bogus[] = {"TYPE_LONG", "TYPE_STRING", "BASE_LONG",
+                                        "Use",       "instead",     "OPT"};
+    for (size_t i = 0; i < sizeof(bogus) / sizeof(bogus[0]); i++) {
+        ASSERT_EQ(count_defs_named(r, "Variable", bogus[i]), 0);
+    }
+    const CBMDefinition *first = c1_def(r, "Variable", "OPT_FIRST");
+    ASSERT_NOT_NULL(first->docstring);
+    ASSERT_NOT_NULL(strstr(first->docstring, "doc of the first option"));
+    ASSERT_NULL(c1_def(r, "Variable", "OPT_SECOND")->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* One file may define a QN several times under one label: both branches of an #if, a
+ * macro redefined per platform. The graph keeps one node per QN (the last by start
+ * line), and before this the other definitions left no trace (curl 123 groups, redis
+ * 87). The definition the graph keeps carries `variants`: every span of the group,
+ * the kept one included, sorted by start line. A name defined once carries nothing. */
+TEST(extract_c_variants_lists_same_file_duplicates_c1) {
+    CBMFileResult *r = extract("#if A\n"
+                               "int pick(int a) { return a; }\n"
+                               "#else\n"
+                               "int pick(int a) {\n"
+                               "    return a + 1;\n"
+                               "}\n"
+                               "#endif\n"
+                               "#ifdef B\n"
+                               "#define LIMIT 1\n"
+                               "#else\n"
+                               "#define LIMIT 2\n"
+                               "#endif\n"
+                               "int once(void) { return 0; }\n",
+                               CBM_LANG_C, "p", "v.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Function", "pick"), 2);
+    const CBMDefinition *kept = c1_def_at(r, "Function", "pick", 4);
+    const CBMDefinition *other = c1_def_at(r, "Function", "pick", 2);
+    ASSERT_NOT_NULL(kept);
+    ASSERT_NOT_NULL(other);
+    ASSERT_NOT_NULL(kept->variants);
+    ASSERT_STR_EQ(kept->variants, "[{\"file_path\":\"v.c\",\"start_line\":2,\"end_line\":2},"
+                                  "{\"file_path\":\"v.c\",\"start_line\":4,\"end_line\":6}]");
+    ASSERT_NULL(other->variants); /* one carrier per group: the node the graph keeps */
+
+    const CBMDefinition *lim_a = c1_def_at(r, "Macro", "LIMIT", 9);
+    const CBMDefinition *lim_b = c1_def_at(r, "Macro", "LIMIT", 11);
+    ASSERT_NOT_NULL(lim_a);
+    ASSERT_NOT_NULL(lim_b);
+    char want[256];
+    snprintf(want, sizeof(want),
+             "[{\"file_path\":\"v.c\",\"start_line\":%u,\"end_line\":%u},"
+             "{\"file_path\":\"v.c\",\"start_line\":%u,\"end_line\":%u}]",
+             lim_a->start_line, lim_a->end_line, lim_b->start_line, lim_b->end_line);
+    ASSERT_NOT_NULL(lim_b->variants);
+    ASSERT_STR_EQ(lim_b->variants, want);
+    ASSERT_NULL(lim_a->variants);
+
+    ASSERT_NULL(c1_def(r, "Function", "once")->variants);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `variants` describes conditional compilation, so only the C-preprocessor languages
+ * get it (cbm_is_c_preprocessor_lang, the six of the test above). A repeated QN
+ * elsewhere is another matter: a JSON file repeats one key name thousands of times
+ * (redis src/commands: 1,618 nodes, one of them with a 75-span list), a Python module
+ * may rebind a function. Both fixtures DO repeat a (QN, label) on DIFFERENT lines
+ * (two defs on one span count as one and would get no list anyway), which is asserted
+ * so the guard cannot go inert. */
+TEST(extract_variants_only_in_c_preprocessor_languages_c1) {
+    static const struct {
+        CBMLanguage lang;
+        const char *file;
+        const char *src;
+    } cases[] = {
+        {CBM_LANG_JSON, "cmd.json", "{\n  \"a\": {\"name\": 1},\n  \"b\": {\"name\": 2}\n}\n"},
+        {CBM_LANG_PYTHON, "mod.py",
+         "def pick(a):\n    return a\n\n\ndef pick(a):\n    return a + 1\n"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = extract(cases[i].src, cases[i].lang, "p", cases[i].file);
+        ASSERT_NOT_NULL(r);
+        int listed = 0;
+        bool distinct_lines = false;
+        for (int d = 0; d < r->defs.count; d++) {
+            const CBMDefinition *a = &r->defs.items[d];
+            listed += a->variants != NULL;
+            for (int e = 0; a->qualified_name && a->label && e < d; e++) {
+                const CBMDefinition *b = &r->defs.items[e];
+                distinct_lines =
+                    distinct_lines ||
+                    (b->qualified_name && b->label &&
+                     strcmp(a->qualified_name, b->qualified_name) == 0 &&
+                     strcmp(a->label, b->label) == 0 && a->start_line != b->start_line);
+            }
+        }
+        if (listed != 0 || !distinct_lines) {
+            fprintf(stderr,
+                    "  [c1-guard] %s: defs with variants=%d, repeated on distinct lines=%d\n",
+                    cases[i].file, listed, distinct_lines);
+        }
+        ASSERT_TRUE(distinct_lines);
+        ASSERT_EQ(listed, 0);
+        cbm_free_result(r);
+    }
     PASS();
 }
 
@@ -6921,6 +9318,193 @@ TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989) {
     PASS();
 }
 
+/* The call to `callee` on source line `line`, or NULL. */
+static const CBMCall *call_at_line(CBMFileResult *r, const char *callee, int line) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->start_line == line && c->callee_name && strcmp(c->callee_name, callee) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* #946: ReGameDLL_CS defines its hookable methods as
+ * `void CBasePlayer::__API_HOOK(ReloadWeapons)(...)`, a function-like macro in
+ * the declarator (`#define __API_HOOK(fname) fname`, from a header). The grammar
+ * nests that macro call as a function_declarator directly inside the definition's
+ * own function_declarator, and the declarator walk named the definition after the
+ * macro: every hook of a class collapsed into one Method `__API_HOOK`, calls in
+ * each body were sourced to whichever hook was minted last, and no caller of
+ * ReloadWeapons could reach it. The macro lives in a header here, as it does in
+ * ReGameDLL, so the preprocessed second pass cannot expand it either. */
+TEST(extract_cpp_macro_wrapped_declarator_names_def_issue946) {
+    CBMFileResult *r = extract("#include \"precompiled.h\"\n"                            /* 1 */
+                               "void helper();\n"                                        /* 2 */
+                               "class CBasePlayer {\n"                                   /* 3 */
+                               "public:\n"                                               /* 4 */
+                               "    void ReloadWeapons(int slot);\n"                     /* 5 */
+                               "    void Spawn();\n"                                     /* 6 */
+                               "};\n"                                                    /* 7 */
+                               "void CBasePlayer::__API_HOOK(ReloadWeapons)(int slot)\n" /* 8 */
+                               "{\n"                                                     /* 9 */
+                               "    helper();\n"                                         /* 10 */
+                               "}\n"                                                     /* 11 */
+                               "void EXT_FUNC CBasePlayer::__API_HOOK(Spawn)()\n"        /* 12 */
+                               "{\n"                                                     /* 13 */
+                               "    ReloadWeapons(0);\n"                                 /* 14 */
+                               "}\n"                                                     /* 15 */
+                               "void EXT_FUNC __API_HOOK(PM_Move)(int server)\n"         /* 16 */
+                               "{\n"                                                     /* 17 */
+                               "    helper();\n"                                         /* 18 */
+                               "}\n",                                                    /* 19 */
+                               CBM_LANG_CPP, "p", "player.cpp");
+    ASSERT_NOT_NULL(r);
+    /* One definition per hook, named after the macro argument. */
+    ASSERT_EQ(count_defs_named(r, "Method", "__API_HOOK"), 0);
+    ASSERT_EQ(count_defs_named(r, "Function", "__API_HOOK"), 0);
+    ASSERT_TRUE(has_def_qn(r, "p.player.CBasePlayer.ReloadWeapons"));
+    ASSERT_TRUE(has_def_qn(r, "p.player.CBasePlayer.Spawn"));
+    ASSERT_TRUE(has_def_qn(r, "p.player.PM_Move"));
+    const CBMDefinition *reload = find_def(r, "ReloadWeapons");
+    ASSERT_NOT_NULL(reload);
+    ASSERT_STR_EQ(reload->label, "Method");
+    ASSERT_EQ((int)reload->start_line, 8);
+    ASSERT_EQ((int)reload->end_line, 11);
+    /* The real parameter list, not the macro's argument list. */
+    ASSERT_EQ(reload->param_count, 1);
+    /* Each in-body call is sourced to the hook whose body contains it. */
+    const CBMCall *c10 = call_at_line(r, "helper", 10);
+    ASSERT_NOT_NULL(c10);
+    ASSERT_STR_EQ(c10->enclosing_func_qn, "p.player.CBasePlayer.ReloadWeapons");
+    const CBMCall *c14 = call_at_line(r, "ReloadWeapons", 14);
+    ASSERT_NOT_NULL(c14);
+    ASSERT_STR_EQ(c14->enclosing_func_qn, "p.player.CBasePlayer.Spawn");
+    const CBMCall *c18 = call_at_line(r, "helper", 18);
+    ASSERT_NOT_NULL(c18);
+    ASSERT_STR_EQ(c18->enclosing_func_qn, "p.player.PM_Move");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #946 precision controls: only a DEFINITION whose declarator nests a one-name
+ * macro call is renamed. Macro call statements (file scope or in a body), calls
+ * through a returned function pointer, a real function returning a function
+ * pointer, a prototype, and a multi-argument wrapper whose name is ambiguous must
+ * not mint a definition named after a macro argument. */
+TEST(extract_c_macro_wrapped_declarator_controls_issue946) {
+    CBMFileResult *r = extract("int (*get_handler(int k))(int);\n" /* 1 */
+                               "int (*pick(int k))(int)\n"         /* 2 */
+                               "{\n"                               /* 3 */
+                               "    return 0;\n"                   /* 4 */
+                               "}\n"                               /* 5 */
+                               "REGISTER(on_boot);\n"              /* 6 */
+                               "void WRAP(proto_only)(void);\n"    /* 7 */
+                               "void PAIR(alpha, beta)(void)\n"    /* 8 */
+                               "{\n"                               /* 9 */
+                               "}\n"                               /* 10 */
+                               "void run(int v)\n"                 /* 11 */
+                               "{\n"                               /* 12 */
+                               "    get_handler(v)(v);\n"          /* 13 */
+                               "    TRACE(v_trace);\n"             /* 14 */
+                               "}\n",                              /* 15 */
+                               CBM_LANG_C, "p", "controls.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "Function", "pick"));
+    ASSERT_TRUE(has_def(r, "Function", "run"));
+    ASSERT_FALSE(has_def_any(r, "on_boot"));
+    ASSERT_FALSE(has_def_any(r, "proto_only"));
+    ASSERT_FALSE(has_def_any(r, "alpha"));
+    ASSERT_FALSE(has_def_any(r, "beta"));
+    ASSERT_FALSE(has_def_any(r, "v"));
+    ASSERT_FALSE(has_def_any(r, "v_trace"));
+    const CBMCall *handler = call_at_line(r, "get_handler", 13);
+    ASSERT_NOT_NULL(handler);
+    ASSERT_STR_EQ(handler->enclosing_func_qn, "p.controls.run");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1957: the same root cause in C. `static void FNAME(first_caller)(void)` and
+ * `static void FNAME(later_function)(void)` collapsed into one Function FNAME
+ * (the later one won), and sink() inside first_caller, on line 9, was sourced
+ * to it: a call site outside its caller's range, from the textual extractor and
+ * the C LSP alike. The second file is the kernel template-header shape
+ * (arch/x86/kvm/mmu/paging_tmpl.h): FNAME token-pastes and is defined only
+ * inside #if branches, so no preprocessing can expand it. */
+TEST(extract_c_fname_macro_definitions_stay_distinct_issue1957) {
+    CBMFileResult *r = extract("#define FNAME(x) x\n"                      /* 1 */
+                               "\n"                                        /* 2 */
+                               "static void sink(void)\n"                  /* 3 */
+                               "{\n"                                       /* 4 */
+                               "}\n"                                       /* 5 */
+                               "\n"                                        /* 6 */
+                               "static void FNAME(first_caller)(void)\n"   /* 7 */
+                               "{\n"                                       /* 8 */
+                               "    sink();\n"                             /* 9 */
+                               "}\n"                                       /* 10 */
+                               "\n"                                        /* 11 */
+                               "static void FNAME(later_function)(void)\n" /* 12 */
+                               "{\n"                                       /* 13 */
+                               "}\n"                                       /* 14 */
+                               "\n"                                        /* 15 */
+                               "int main(void)\n"                          /* 16 */
+                               "{\n"                                       /* 17 */
+                               "    first_caller();\n"                     /* 18 */
+                               "    return 0;\n"                           /* 19 */
+                               "}\n",                                      /* 20 */
+                               CBM_LANG_C, "p", "repro.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_named(r, "Function", "FNAME"), 0);
+    const CBMDefinition *first = find_def(r, "first_caller");
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ((int)first->start_line, 7);
+    ASSERT_EQ((int)first->end_line, 10);
+    const CBMDefinition *later = find_def(r, "later_function");
+    ASSERT_NOT_NULL(later);
+    ASSERT_EQ((int)later->start_line, 12);
+    const CBMCall *sink = call_at_line(r, "sink", 9);
+    ASSERT_NOT_NULL(sink);
+    ASSERT_STR_EQ(sink->enclosing_func_qn, "p.repro.first_caller");
+    int lsp_sink = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->callee_qn && strcmp(rc->callee_qn, "p.repro.sink") == 0) {
+            ASSERT_STR_EQ(rc->caller_qn, "p.repro.first_caller");
+            lsp_sink++;
+        }
+    }
+    ASSERT_GTE(lsp_sink, 1);
+    cbm_free_result(r);
+
+    CBMFileResult *t = extract("#if PTTYPE == 64\n"                                /* 1 */
+                               "\t#define FNAME(name) paging##64_##name\n"         /* 2 */
+                               "#else\n"                                           /* 3 */
+                               "\t#error Invalid PTTYPE value\n"                   /* 4 */
+                               "#endif\n"                                          /* 5 */
+                               "static int FNAME(is_present)(unsigned long pte)\n" /* 6 */
+                               "{\n"                                               /* 7 */
+                               "\treturn test_bit(pte);\n"                         /* 8 */
+                               "}\n"                                               /* 9 */
+                               "static int FNAME(walk)(unsigned long pte)\n"       /* 10 */
+                               "{\n"                                               /* 11 */
+                               "\treturn check_pte(pte);\n"                        /* 12 */
+                               "}\n",                                              /* 13 */
+                               CBM_LANG_C, "p", "paging_tmpl.h");
+    ASSERT_NOT_NULL(t);
+    ASSERT_EQ(count_defs_named(t, "Function", "FNAME"), 0);
+    ASSERT_TRUE(has_def_qn(t, "p.paging_tmpl.is_present"));
+    ASSERT_TRUE(has_def_qn(t, "p.paging_tmpl.walk"));
+    const CBMCall *bit = call_at_line(t, "test_bit", 8);
+    ASSERT_NOT_NULL(bit);
+    ASSERT_STR_EQ(bit->enclosing_func_qn, "p.paging_tmpl.is_present");
+    const CBMCall *chk = call_at_line(t, "check_pte", 12);
+    ASSERT_NOT_NULL(chk);
+    ASSERT_STR_EQ(chk->enclosing_func_qn, "p.paging_tmpl.walk");
+    cbm_free_result(t);
+    PASS();
+}
+
 /* #668: walk_defs used a fixed `walk_defs_frame_t stack[4096]` — a ~160 KB
  * C-stack frame that overflowed small thread stacks (the reporter's crash was in
  * the "definitions pass" on a large SQL file), and whose `top < 4096` push guards
@@ -7096,12 +9680,12 @@ TEST(extract_python_method_test_dir_marks_is_test_issue1294) {
     PASS();
 }
 
-/* #1017: docstring truncation at MAX_COMMENT_LEN (500 bytes) can split a
+/* #1017: docstring truncation at MAX_COMMENT_LEN (500 bytes) could split a
  * multi-byte UTF-8 character, leaving an incomplete byte sequence.
  * Craft a Go comment whose 498th-500th bytes are a 3-byte CJK character
- * (U+6210 = 成 = e6 88 90).  The raw byte truncation at offset 500 lands
- * one byte past the character start, splitting it.  After the fix the
- * truncated string must end on a complete codepoint boundary. */
+ * (U+6210 = 成 = e6 88 90), where a raw byte cut at offset 500 lands one
+ * byte past the character start. Docstrings are no longer cut at all, so
+ * the whole comment is kept and still ends on a complete codepoint. */
 TEST(docstring_utf8_truncation_boundary_issue1017) {
     /* Build a comment: "// " (3 bytes) + 495 ASCII 'A' + "成成成" (9 bytes)
      * Total comment text = 3 + 495 + 9 = 507 bytes.
@@ -7142,10 +9726,10 @@ TEST(docstring_utf8_truncation_boundary_issue1017) {
     }
     ASSERT_NOT_NULL(doc);
 
-    /* Verify every byte in the truncated docstring is valid UTF-8:
-     * no trailing incomplete multi-byte sequence. */
+    /* The whole comment, and every byte of it valid UTF-8: no trailing
+     * incomplete multi-byte sequence. */
+    ASSERT_STR_EQ(doc, comment);
     size_t len = strlen(doc);
-    ASSERT_TRUE(len <= 500);
     const unsigned char *u = (const unsigned char *)doc;
     size_t i = 0;
     while (i < len) {
@@ -7167,6 +9751,356 @@ TEST(docstring_utf8_truncation_boundary_issue1017) {
         i += (size_t)seq_len;
     }
 
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Doc comments: the whole comment run above a definition, above its
+ * attributes / export / declaration wrapper, never a detached or
+ * banner-only run, and never cut at 500 bytes.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* The def with this label and name, or NULL. */
+static const CBMDefinition *doc_def(CBMFileResult *r, const char *label, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && d->name && strcmp(d->label, label) == 0 && strcmp(d->name, name) == 0) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+TEST(doc_go_comment_group_without_directives) {
+    CBMFileResult *r = extract("package knob\n\n"
+                               "// Turn rotates the knob by one step.\n"
+                               "// It is safe for concurrent use.\n"
+                               "//go:noinline\n"
+                               "func Turn() {}\n",
+                               CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "Turn");
+    ASSERT_NOT_NULL(d);
+    /* go/ast CommentGroup.Text: the whole group, the //go: directive dropped. */
+    ASSERT_STR_EQ(d->docstring, "// Turn rotates the knob by one step.\n"
+                                "// It is safe for concurrent use.");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_go_struct_field) {
+    CBMFileResult *r = extract("package knob\n\n"
+                               "// Knob is a rotary control.\n"
+                               "type Knob struct {\n"
+                               "\t// Steps counts the turns so far.\n"
+                               "\tSteps int\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *knob = doc_def(r, "Struct", "Knob");
+    ASSERT_NOT_NULL(knob);
+    ASSERT_STR_EQ(knob->docstring, "// Knob is a rotary control.");
+    const CBMDefinition *steps = doc_def(r, "Field", "Steps");
+    ASSERT_NOT_NULL(steps);
+    ASSERT_STR_EQ(steps->docstring, "// Steps counts the turns so far.");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_go_detached_comment_is_not_doc) {
+    /* go/doc: a comment group separated by a blank line documents nothing. */
+    CBMFileResult *r = extract("package knob\n\n"
+                               "// Section: helpers.\n"
+                               "\n"
+                               "func Reset() {}\n",
+                               CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "Reset");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NULL(d->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_python_comment_run_and_detached) {
+    CBMFileResult *r = extract("# Turns the knob.\n"
+                               "# One step per call.\n"
+                               "def turn():\n"
+                               "    pass\n"
+                               "\n"
+                               "# Section: helpers.\n"
+                               "\n"
+                               "def reset():\n"
+                               "    pass\n",
+                               CBM_LANG_PYTHON, "t", "knob.py");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *turn = doc_def(r, "Function", "turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "# Turns the knob.\n# One step per call.");
+    const CBMDefinition *reset = doc_def(r, "Function", "reset");
+    ASSERT_NOT_NULL(reset);
+    ASSERT_NULL(reset->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_rust_attribute_impl_method_and_inner_doc) {
+    CBMFileResult *r = extract("//! The knob crate.\n"
+                               "\n"
+                               "/// Adds two steps.\n"
+                               "/// Wraps on overflow.\n"
+                               "#[inline]\n"
+                               "pub fn add(a: u8, b: u8) -> u8 { a.wrapping_add(b) }\n"
+                               "\n"
+                               "pub struct Knob;\n"
+                               "\n"
+                               "impl Knob {\n"
+                               "    /// Turns the knob once.\n"
+                               "    pub fn turn(&self) {}\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "lib.rs");
+    ASSERT_NOT_NULL(r);
+    /* The doc sits above the attribute; a run is joined line by line. */
+    const CBMDefinition *add = doc_def(r, "Function", "add");
+    ASSERT_NOT_NULL(add);
+    ASSERT_STR_EQ(add->docstring, "/// Adds two steps.\n/// Wraps on overflow.");
+    /* impl methods get their doc too; a single comment keeps its bytes. */
+    const CBMDefinition *turn = doc_def(r, "Method", "turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "/// Turns the knob once.\n");
+    /* The //! inner doc documents the crate (the File node), not the struct. */
+    const CBMDefinition *knob = doc_def(r, "Struct", "Knob");
+    ASSERT_NOT_NULL(knob);
+    ASSERT_NULL(knob->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_ts_export_and_arrow_wrapper) {
+    CBMFileResult *r = extract("/** Exported helper. */\n"
+                               "export function helper(): number {\n"
+                               "    return 1;\n"
+                               "}\n"
+                               "\n"
+                               "/** Arrow helper. */\n"
+                               "export const arrow = (): number => 2;\n",
+                               CBM_LANG_TYPESCRIPT, "t", "knob.ts");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *helper = doc_def(r, "Function", "helper");
+    ASSERT_NOT_NULL(helper);
+    ASSERT_STR_EQ(helper->docstring, "/** Exported helper. */");
+    const CBMDefinition *arrow = doc_def(r, "Function", "arrow");
+    ASSERT_NOT_NULL(arrow);
+    ASSERT_STR_EQ(arrow->docstring, "/** Arrow helper. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_csharp_xml_doc_run_and_top_level_function) {
+    CBMFileResult *r = extract("/// Adds one.\n"
+                               "static int AddOne(int x) => x + 1;\n"
+                               "\n"
+                               "namespace Knobs {\n"
+                               "    public class Knob {\n"
+                               "        /// <summary>\n"
+                               "        /// Turns the knob.\n"
+                               "        /// </summary>\n"
+                               "        public void Turn() {}\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Knob.cs");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *turn = doc_def(r, "Method", "Turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "/// <summary>\n/// Turns the knob.\n/// </summary>");
+    const CBMDefinition *add = doc_def(r, "Function", "AddOne");
+    ASSERT_NOT_NULL(add);
+    ASSERT_STR_EQ(add->docstring, "/// Adds one.");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_java_javadoc_over_line_comment_and_field) {
+    CBMFileResult *r = extract("class Knob {\n"
+                               "    /** Turns taken so far. */\n"
+                               "    private int steps;\n"
+                               "\n"
+                               "    /** Turns the knob. */\n"
+                               "    // NOSONAR\n"
+                               "    void turn() {}\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "Knob.java");
+    ASSERT_NOT_NULL(r);
+    /* A plain comment between the Javadoc and the method does not replace it. */
+    const CBMDefinition *turn = doc_def(r, "Method", "turn");
+    ASSERT_NOT_NULL(turn);
+    ASSERT_STR_EQ(turn->docstring, "/** Turns the knob. */");
+    const CBMDefinition *steps = doc_def(r, "Field", "steps");
+    ASSERT_NOT_NULL(steps);
+    ASSERT_STR_EQ(steps->docstring, "/** Turns taken so far. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_kotlin_kdoc_folded_after_imports) {
+    /* tree-sitter-kotlin folds this KDoc into the node before the class, so it
+     * is no sibling of it. */
+    CBMFileResult *r = extract("package knobs\n"
+                               "\n"
+                               "import knobs.core.Step\n"
+                               "import knobs.core.Turn\n"
+                               "\n"
+                               "/** Base class of every knob. */\n"
+                               "abstract class BaseKnob(step: Step) : Turn(step)\n",
+                               CBM_LANG_KOTLIN, "t", "BaseKnob.kt");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Class", "BaseKnob");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "/** Base class of every knob. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_c_typedef_struct) {
+    CBMFileResult *r = extract("/* A file event. */\n"
+                               "typedef struct aeFileEvent {\n"
+                               "    int mask;\n"
+                               "} aeFileEvent;\n",
+                               CBM_LANG_C, "t", "ae.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Class", "aeFileEvent");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "/* A file event. */");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_perl_pod_section_by_sub_name) {
+    CBMFileResult *r = extract("package Knob;\n"
+                               "\n"
+                               "sub turn { return 1; }\n"
+                               "\n"
+                               "1;\n"
+                               "__END__\n"
+                               "\n"
+                               "=head1 METHODS\n"
+                               "\n"
+                               "=head2 turn\n"
+                               "\n"
+                               "Turns the knob once.\n"
+                               "\n"
+                               "=cut\n",
+                               CBM_LANG_PERL, "t", "Knob.pm");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "turn");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "=head2 turn\n\nTurns the knob once.");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A Perl file's module doc (its File node's docstring) is the POD that no
+ * sub's doc holds: each run as it stands, joined by a blank line, so that a
+ * reference is read once. */
+TEST(doc_perl_module_doc_is_the_pod_no_sub_holds) {
+    CBMFileResult *r = extract("package Knob;\n"
+                               "\n"
+                               "=head1 NAME\n"
+                               "\n"
+                               "Knob - see L<Dial>.\n"
+                               "\n"
+                               "=cut\n"
+                               "\n"
+                               "sub turn { return 1; }\n"
+                               "\n"
+                               "1;\n"
+                               "__END__\n"
+                               "\n"
+                               "=head1 METHODS\n"
+                               "\n"
+                               "The knob's methods.\n"
+                               "\n"
+                               "=head2 turn\n"
+                               "\n"
+                               "Turns the knob once.\n"
+                               "\n"
+                               "=head2 spin\n"
+                               "\n"
+                               "Not a sub here.\n"
+                               "\n"
+                               "=cut\n",
+                               CBM_LANG_PERL, "t", "Knob.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_STR_EQ(r->module_doc, "=head1 NAME\n\nKnob - see L<Dial>.\n\n=cut\n\n"
+                                 "=head1 METHODS\n\nThe knob's methods.\n\n"
+                                 "=head2 spin\n\nNot a sub here.\n\n=cut");
+    const CBMDefinition *d = doc_def(r, "Function", "turn");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, "=head2 turn\n\nTurns the knob once.");
+    cbm_free_result(r);
+
+    /* all of the POD is a sub's: no module doc */
+    r = extract("package Knob;\n"
+                "sub turn { return 1; }\n"
+                "1;\n"
+                "__END__\n"
+                "\n"
+                "=head2 turn\n"
+                "\n"
+                "Turns.\n"
+                "\n"
+                "=cut\n",
+                CBM_LANG_PERL, "t", "Knob.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(r->module_doc);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_long_comment_kept_whole) {
+    /* One 12-line block comment well past the old 500-byte cut, kept byte for
+     * byte. */
+    char src[4096];
+    char want[2048];
+    int w = snprintf(want, sizeof(want), "/*");
+    for (int i = 0; i < 12; i++) {
+        w += snprintf(want + w, sizeof(want) - (size_t)w,
+                      "\n * Line %02d of a long doc that keeps going past the cut.", i);
+    }
+    snprintf(want + w, sizeof(want) - (size_t)w, "\n */");
+    snprintf(src, sizeof(src), "package knob\n\n%s\nfunc Long() {}\n", want);
+    ASSERT_GT((int)strlen(want), 500);
+
+    CBMFileResult *r = extract(src, CBM_LANG_GO, "t", "knob.go");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = doc_def(r, "Function", "Long");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->docstring, want);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_divider_only_run_is_not_doc) {
+    CBMFileResult *r = extract("/*****************************/\n"
+                               "void knob(void) {}\n"
+                               "\n"
+                               "// \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n"
+                               "void dial(void) {}\n"
+                               "\n"
+                               "/* Resets the dial. */\n"
+                               "void reset(void) {}\n",
+                               CBM_LANG_C, "t", "knob.c");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *knob = doc_def(r, "Function", "knob");
+    ASSERT_NOT_NULL(knob);
+    ASSERT_NULL(knob->docstring);
+    const CBMDefinition *dial = doc_def(r, "Function", "dial"); /* a box-drawing banner */
+    ASSERT_NOT_NULL(dial);
+    ASSERT_NULL(dial->docstring);
+    const CBMDefinition *reset = doc_def(r, "Function", "reset");
+    ASSERT_NOT_NULL(reset);
+    ASSERT_STR_EQ(reset->docstring, "/* Resets the dial. */");
     cbm_free_result(r);
     PASS();
 }
@@ -8496,6 +11430,10 @@ TEST(non_config_language_module_has_no_promoted_description_issue519) {
 /* ── Result compaction (cbm_result_compact) ────────────────────────────── */
 
 static const char *COMPACT_PY_SRC = "import os\n"
+                                    "BASE = 'api'\n"
+                                    "URL = f'{BASE}/users/me'\n"
+                                    "def url_candidate():\n"
+                                    "    return client(URL)\n"
                                     "from typing import List\n"
                                     "\n"
                                     "@app.route(\"/items\")\n"
@@ -8563,6 +11501,16 @@ TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
     size_t cap_before = arena_capacity(&r->arena);
     cbm_result_compact(r);
 
+    const CBMCall *candidate = find_call_in_func(r, "client", "url_candidate");
+    ASSERT_NOT_NULL(candidate);
+    ASSERT_GTE(candidate->arg_count, 1);
+    ASSERT_STR_EQ(candidate->args[0].value, "api/users/me");
+    ASSERT_STR_EQ(candidate->args[0].url_value, "/api/users/me");
+    uintptr_t candidate_addr = (uintptr_t)candidate->args[0].url_value;
+    uintptr_t arena_addr = (uintptr_t)r->arena.blocks[0];
+    ASSERT(candidate_addr >= arena_addr);
+    ASSERT(candidate_addr - arena_addr < r->arena.used);
+
     /* One exact block: capacity == bytes used, no dead headroom. */
     ASSERT_EQ(r->arena.nblocks, 1);
     ASSERT_EQ(arena_capacity(&r->arena), cbm_arena_total(&r->arena));
@@ -8624,6 +11572,7 @@ TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
         for (int k = 0; k < a->arg_count; k++) {
             ASSERT(cmp_str_eq(a->args[k].expr, b->args[k].expr));
             ASSERT(cmp_str_eq(a->args[k].value, b->args[k].value));
+            ASSERT(cmp_str_eq(a->args[k].url_value, b->args[k].url_value));
             ASSERT(cmp_str_eq(a->args[k].keyword, b->args[k].keyword));
             ASSERT_EQ(a->args[k].index, b->args[k].index);
         }
@@ -8788,6 +11737,16 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     ASSERT(cmp_str_eq(back->module_qn, ref->module_qn));
     ASSERT(cmp_list_eq(back->exports, ref->exports));
 
+    const CBMCall *candidate = find_call_in_func(back, "client", "url_candidate");
+    ASSERT_NOT_NULL(candidate);
+    ASSERT_GTE(candidate->arg_count, 1);
+    ASSERT_STR_EQ(candidate->args[0].value, "api/users/me");
+    ASSERT_STR_EQ(candidate->args[0].url_value, "/api/users/me");
+    uintptr_t candidate_addr = (uintptr_t)candidate->args[0].url_value;
+    uintptr_t arena_addr = (uintptr_t)back->arena.blocks[0];
+    ASSERT(candidate_addr >= arena_addr);
+    ASSERT(candidate_addr - arena_addr < back->arena.used);
+
     /* Loading twice yields two independent copies. */
     CBMFileResult *again = cbm_result_spill_load(sp, 1);
     ASSERT_NOT_NULL(again);
@@ -8895,6 +11854,874 @@ TEST(extract_walk_truncated_when_a_node_budget_is_set) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Deep nesting: the syntax-tree walkers must not spend stack per level
+ *
+ * Extraction runs on pipeline worker threads whose stack is
+ * CBM_WORKER_STACK_SIZE (src/pipeline/worker_pool.h), not on the test runner's
+ * main thread, whose size depends on the platform and its rlimit. Each probe
+ * below therefore runs cbm_extract_file on a thread of exactly that size, so
+ * a walker that recurses once per nesting level runs out of stack at the
+ * depth it would in the pipeline. On POSIX the thread lives in a forked child
+ * and an overflow surfaces as the child's killing signal instead of taking
+ * the runner with it (the pattern of tests/test_stack_overflow.c); Windows
+ * runs it in-process, where a real overflow is a visible runner abort. A
+ * probe returns 0 when every expectation held and prints what did not.
+ *
+ * DEEP_NEST_LEVELS: a walker frame holds at least its saved frame pointer and
+ * return address plus the 32-byte TSNode it passes down (on arm64 a TSNode is
+ * passed by reference to a copy in the caller's frame), 48 bytes, so 200,000
+ * frames need 9.6 MB — past the 8 MB worker stack even at that floor;
+ * measured frames are larger and the sanitizer build adds red zones. The
+ * parser is not the limit: tree-sitter keeps the nesting on its heap parse
+ * stack and its node and cursor helpers are iterative, so the depth is the
+ * walker's problem alone. The fixtures nest parentheses, which copy no text
+ * per level (a nested call copies its argument text at every level, which is
+ * what makes the stack_overflow_b suite slow).
+ * ═══════════════════════════════════════════════════════════════════ */
+
+enum { DEEP_NEST_LEVELS = 200000 };
+
+typedef int (*deep_probe_fn)(void);
+
+typedef struct {
+    deep_probe_fn fn;
+    int rc;
+} deep_probe_job_t;
+
+static void *deep_probe_thread_main(void *arg) {
+    deep_probe_job_t *job = (deep_probe_job_t *)arg;
+    job->rc = job->fn();
+    return NULL;
+}
+
+/* 0 when the probe passed, its own code otherwise, 2 if no thread came up. */
+static int deep_probe_on_worker_stack(deep_probe_fn fn) {
+    deep_probe_job_t job = {fn, 3};
+    cbm_thread_t thread;
+    if (cbm_thread_create(&thread, CBM_WORKER_STACK_SIZE, deep_probe_thread_main, &job) != 0) {
+        return 2;
+    }
+    (void)cbm_thread_join(&thread);
+    return job.rc;
+}
+
+/* 1 when the probe passed; otherwise `why` says what happened. */
+static int deep_probe_passed(deep_probe_fn fn, char *why, size_t why_len) {
+#if defined(_WIN32)
+    int rc = deep_probe_on_worker_stack(fn);
+    if (rc != 0) {
+        snprintf(why, why_len, "probe returned %d", rc);
+    }
+    return rc == 0;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(why, why_len, "fork failed");
+        return 0;
+    }
+    if (pid == 0) {
+        int rc = deep_probe_on_worker_stack(fn);
+        fflush(NULL);
+        _exit(rc);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        snprintf(why, why_len,
+                 "extraction killed by signal %d on a worker-sized stack: a walker recursed once "
+                 "per nesting level",
+                 WTERMSIG(status));
+        return 0;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(why, why_len, "probe returned %d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 0;
+    }
+    return 1;
+#endif
+}
+
+/* head, `levels` times '(', core, `levels` times ')', tail. *core_at receives
+ * the byte offset of core. */
+static char *build_nested_source(const char *head, const char *core, const char *tail, int levels,
+                                 uint32_t *core_at) {
+    size_t head_len = strlen(head);
+    size_t core_len = strlen(core);
+    size_t tail_len = strlen(tail);
+    char *src = malloc(head_len + core_len + tail_len + 2 * (size_t)levels + 1);
+    if (!src) {
+        return NULL;
+    }
+    char *w = src;
+    memcpy(w, head, head_len);
+    w += head_len;
+    memset(w, '(', (size_t)levels);
+    w += levels;
+    *core_at = (uint32_t)(w - src);
+    memcpy(w, core, core_len);
+    w += core_len;
+    memset(w, ')', (size_t)levels);
+    w += levels;
+    memcpy(w, tail, tail_len + 1);
+    return src;
+}
+
+/* `$x = ((...((f))...))(...);` — a first-class callable whose callee sits under
+ * DEEP_NEST_LEVELS parentheses. PHP, because its first-class callable syntax
+ * is the path that hands a parenthesised callee to terminal_callee_leaf
+ * (extract_calls.c): the leaf finder steps into one named child per wrapper
+ * node that has no terminal field, while every ordinary call path first needs
+ * a textual callee name, which the field resolver only yields for identifier
+ * and member shapes whose leaf sits one or two levels down (a member chain
+ * `a.b.c()` stops at its `property`; nested calls `f(f(f()))` are arguments,
+ * visited by the explicit-stack walker). Expected: the exact occurrence the
+ * leaf finder names — one CALL_REFERENCE usage of `f` at the byte of the `f`
+ * token — in a cleanly parsed file. */
+static int deep_callee_chain_probe(void) {
+    uint32_t f_at = 0;
+    char *src = build_nested_source("<?php\n$x = ", "f", "(...);\n", DEEP_NEST_LEVELS, &f_at);
+    if (!src) {
+        return 4;
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_PHP, "t", "deep_callee.php");
+    int rc = 0;
+    if (!r || r->has_error || r->parse_incomplete) {
+        printf("    deep callee: extraction failed or the parse was not clean\n");
+        rc = 1;
+    } else {
+        int references = 0;
+        for (int i = 0; i < r->usages.count; i++) {
+            const CBMUsage *u = &r->usages.items[i];
+            if (u->kind != CBM_USAGE_CALL_REFERENCE || !u->ref_name ||
+                strcmp(u->ref_name, "f") != 0) {
+                continue;
+            }
+            references++;
+            if (u->site_start_byte != f_at || u->site_end_byte != f_at + 1) {
+                printf("    deep callee: reference site %u-%u, expected %u-%u\n",
+                       u->site_start_byte, u->site_end_byte, f_at, f_at + 1);
+                rc = 1;
+            }
+        }
+        if (references != 1) {
+            printf("    deep callee: %d CALL_REFERENCE usages of f, expected 1\n", references);
+            rc = 1;
+        }
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+    free(src);
+    return rc;
+}
+
+TEST(extract_deep_callee_chain_completes) {
+    char why[160];
+    if (!deep_probe_passed(deep_callee_chain_probe, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
+/* One invalid token at the bottom of DEEP_NEST_LEVELS parentheses. Every
+ * enclosing parenthesized_expression then carries ts_node_has_error without
+ * being an ERROR node, which is the chain cbm_collect_error_regions (cbm.c)
+ * descends: it steps into a child that contains an error and stops at the
+ * top-most ERROR or MISSING node. Nested ERROR nodes would not do — the walk
+ * never enters an ERROR subtree, so they cost it one level. Expected: one
+ * region, on the line of the nest only, with the neighbouring definition
+ * intact and the file still usable. */
+static int deep_error_regions_probe(void) {
+    uint32_t core_at = 0;
+    char *src = build_nested_source("def ok():\n    return 1\nx = ", "1 2", "\ny = ok()\n",
+                                    DEEP_NEST_LEVELS, &core_at);
+    if (!src) {
+        return 4;
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "deep_error.py");
+    int rc = 0;
+    if (!r) {
+        printf("    deep error regions: extraction failed\n");
+        rc = 1;
+    } else {
+        if (!r->parse_incomplete || r->error_region_count != 1 || !r->error_ranges ||
+            strcmp(r->error_ranges, "3-3") != 0) {
+            printf("    deep error regions: incomplete=%d count=%d ranges=%s, expected one "
+                   "region 3-3\n",
+                   r->parse_incomplete ? 1 : 0, r->error_region_count,
+                   r->error_ranges ? r->error_ranges : "(none)");
+            rc = 1;
+        }
+        if (r->parse_unusable) {
+            printf("    deep error regions: one line of five must not make the file unusable\n");
+            rc = 1;
+        }
+        if (!has_def(r, "Function", "ok")) {
+            printf("    deep error regions: the definition next to the nest was lost\n");
+            rc = 1;
+        }
+        cbm_free_result(r);
+    }
+    free(src);
+    return rc;
+}
+
+TEST(extract_deep_error_regions_complete) {
+    char why[160];
+    if (!deep_probe_passed(deep_error_regions_probe, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
+/* `f(cb=((...(obj.handler)...)))`: a labeled argument whose value is a bound
+ * method under LABELED_WRAPPERS parentheses. The usage pass classifies
+ * `handler` by climbing the wrappers (python_direct_callable_attribute_site, a
+ * loop) and then asking is_direct_argument_value, whose one recursive step
+ * moved from the value to the labeled argument holding it. The grammar never
+ * nests a labeled argument inside another's value, so that step is bounded
+ * and no stack depth is at stake; what the test pins is the answer across the
+ * conversion of that step to a loop: the usage is a callable-value candidate
+ * whose site is the outermost wrapper, and the keyword `cb` is no usage. The
+ * bare form pins the site on the attribute itself. */
+enum { LABELED_WRAPPERS = 2000 };
+
+static int handler_candidate_site(const CBMFileResult *r, uint32_t expect_start,
+                                  uint32_t expect_end, const char *form) {
+    int seen = 0;
+    int rc = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        const CBMUsage *u = &r->usages.items[i];
+        if (!u->ref_name) {
+            continue;
+        }
+        if (strcmp(u->ref_name, "cb") == 0) {
+            printf("    %s argument: the keyword label became a usage\n", form);
+            rc = 1;
+        }
+        if (strcmp(u->ref_name, "handler") != 0) {
+            continue;
+        }
+        seen++;
+        if (!u->may_be_call_reference || u->site_start_byte != expect_start ||
+            u->site_end_byte != expect_end) {
+            printf("    %s argument: handler candidate=%d site %u-%u, expected candidate site "
+                   "%u-%u\n",
+                   form, u->may_be_call_reference ? 1 : 0, u->site_start_byte, u->site_end_byte,
+                   expect_start, expect_end);
+            rc = 1;
+        }
+    }
+    if (seen != 1) {
+        printf("    %s argument: %d usages of handler, expected 1\n", form, seen);
+        rc = 1;
+    }
+    return rc;
+}
+
+static int deep_argument_nesting_probe(void) {
+    const uint32_t attribute_len = (uint32_t)strlen("obj.handler");
+    uint32_t core_at = 0;
+    char *src = build_nested_source("f(cb=", "obj.handler", ")\n", LABELED_WRAPPERS, &core_at);
+    if (!src) {
+        return 4;
+    }
+    int rc = 0;
+    CBMFileResult *wrapped = extract(src, CBM_LANG_PYTHON, "t", "deep_arg.py");
+    if (!wrapped || wrapped->has_error || wrapped->parse_incomplete) {
+        printf("    wrapped argument: extraction failed or the parse was not clean\n");
+        rc = 1;
+    } else {
+        rc |= handler_candidate_site(wrapped, core_at - LABELED_WRAPPERS,
+                                     core_at + attribute_len + LABELED_WRAPPERS, "wrapped");
+    }
+    if (wrapped) {
+        cbm_free_result(wrapped);
+    }
+    free(src);
+
+    CBMFileResult *bare = extract("f(cb=obj.handler)\n", CBM_LANG_PYTHON, "t", "bare_arg.py");
+    if (!bare || bare->has_error || bare->parse_incomplete) {
+        printf("    bare argument: extraction failed or the parse was not clean\n");
+        rc = 1;
+    } else {
+        rc |= handler_candidate_site(bare, 5, 5 + attribute_len, "bare");
+    }
+    if (bare) {
+        cbm_free_result(bare);
+    }
+    return rc;
+}
+
+TEST(extract_deep_argument_nesting_completes) {
+    char why[160];
+    if (!deep_probe_passed(deep_argument_nesting_probe, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
+/* #1527: the call-context metrics find each call's innermost enclosing
+ * Function/Method with a line sweep instead of scanning every def per call.
+ * The sweep must give the scan's exact answer -- smallest span, ties to the
+ * lowest def index -- on nested, overlapping, same-line, malformed
+ * (end < start) and unnamed/non-callable ranges. Fixed-seed generator:
+ * deterministic, many shapes. */
+static uint32_t enc_rand(uint32_t *state) {
+    *state = (*state * 1103515245u) + 12345u;
+    return (*state >> 16) & 0x7fffu;
+}
+
+TEST(extract_enclosing_sweep_matches_scan_issue1527) {
+    static const char *const labels[] = {"Function", "Method", "Class", "Variable"};
+    uint32_t seed = 1527;
+    for (int round = 0; round < 40; round++) {
+        CBMArena a;
+        cbm_arena_init(&a);
+        CBMFileResult r;
+        memset(&r, 0, sizeof(r));
+        int ndefs = round == 0 ? 0 : (int)(enc_rand(&seed) % 300);
+        int ncalls = (int)(enc_rand(&seed) % 1500) + 1;
+        int max_line = (int)(enc_rand(&seed) % 400) + 5;
+        for (int i = 0; i < ndefs; i++) {
+            CBMDefinition d;
+            memset(&d, 0, sizeof(d));
+            d.name = (enc_rand(&seed) % 10) == 0 ? NULL : "f";
+            d.label = labels[enc_rand(&seed) % 4];
+            d.start_line = 1 + (enc_rand(&seed) % (uint32_t)max_line);
+            int len = (int)(enc_rand(&seed) % 60) - 3; /* a few malformed end < start */
+            d.end_line = (uint32_t)((int)d.start_line + len > 0 ? (int)d.start_line + len : 0);
+            cbm_defs_push(&r.defs, &a, d);
+        }
+        for (int i = 0; i < ncalls; i++) {
+            CBMCall c;
+            memset(&c, 0, sizeof(c));
+            c.callee_name = "g";
+            c.start_line = (int)(enc_rand(&seed) % (uint32_t)(max_line + 10)) - 2;
+            cbm_calls_push(&r.calls, &a, c);
+        }
+        ASSERT_EQ(cbm_test_enclosing_sweep_mismatches(&r), 0);
+        cbm_arena_destroy(&a);
+    }
+    PASS();
+}
+
+/* Python namespace facts: provenance is ordered, content-only and independently
+ * owned. These tests do not enable any reexport resolution. */
+static bool py_facts_equal(const CBMPyNamespaceFacts *a, const CBMPyNamespaceFacts *b) {
+    if (!cbm_py_namespace_facts_valid(a) || !cbm_py_namespace_facts_valid(b) ||
+        a->version != b->version || a->language != b->language || a->status != b->status ||
+        a->failure != b->failure || a->count != b->count)
+        return false;
+    for (int i = 0; i < a->count; i++) {
+        const CBMPyNamespaceFact *x = &a->items[i], *y = &b->items[i];
+        if (x->kind != y->kind || x->def_kind != y->def_kind ||
+            x->sequence_kind != y->sequence_kind || x->reason != y->reason ||
+            x->flags != y->flags || x->relative_level != y->relative_level ||
+            x->name_count != y->name_count || !cmp_str_eq(x->local_name, y->local_name) ||
+            !cmp_str_eq(x->module_name, y->module_name) ||
+            !cmp_str_eq(x->member_name, y->member_name))
+            return false;
+        for (int j = 0; j < x->name_count; j++) {
+            if (!cmp_str_eq(x->names[j], y->names[j]))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool py_facts_owned_range(const CBMArena *arena, const void *ptr, size_t bytes) {
+    if (!ptr)
+        return bytes == 0;
+    uintptr_t address = (uintptr_t)ptr;
+    for (int i = 0; i < arena->nblocks; i++) {
+        uintptr_t start = (uintptr_t)arena->blocks[i];
+        size_t size = arena->block_sizes[i];
+        if (address >= start && bytes <= size && address - start <= size - bytes)
+            return true;
+    }
+    return false;
+}
+
+static bool py_facts_owned_string(const CBMArena *arena, const char *str) {
+    return !str || (py_facts_owned_range(arena, str, 1) &&
+                    py_facts_owned_range(arena, str, strlen(str) + 1));
+}
+
+static bool py_facts_owned(const CBMArena *arena, const CBMPyNamespaceFacts *facts) {
+    if (!py_facts_owned_range(arena, facts->items, (size_t)facts->count * sizeof(*facts->items)))
+        return false;
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *f = &facts->items[i];
+        if (!py_facts_owned_string(arena, f->local_name) ||
+            !py_facts_owned_string(arena, f->module_name) ||
+            !py_facts_owned_string(arena, f->member_name) ||
+            !py_facts_owned_range(arena, f->names, (size_t)f->name_count * sizeof(*f->names)))
+            return false;
+        for (int j = 0; j < f->name_count; j++) {
+            if (!py_facts_owned_string(arena, f->names[j]))
+                return false;
+        }
+    }
+    return true;
+}
+
+static const char PY_FACTS_ORDERED[] = "def item():\n    return 1\n"
+                                       "from first import item\n"
+                                       "from second import item as item\n"
+                                       "item = unknown\n"
+                                       "del item\n"
+                                       "import pkg.mod\n"
+                                       "import pkg.mod as alias\n"
+                                       "from . import child as local\n"
+                                       "from ..outer import member\n"
+                                       "from one.shared import *\n"
+                                       "from two.shared import *\n"
+                                       "class Local:\n    pass\n";
+
+TEST(python_namespace_facts_preserve_order_and_import_provenance) {
+    CBMFileResult *r = extract(PY_FACTS_ORDERED, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+    bool ok = r && !r->has_error && !r->parse_incomplete &&
+              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 12 &&
+              cbm_py_namespace_facts_valid(&r->py_namespace) && has_def(r, "Function", "item") &&
+              has_def(r, "Class", "Local") && r->module_qn &&
+              strcmp(r->module_qn, "t.pkg.__init__") == 0;
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        ok = f[0].kind == CBM_PY_NS_OWN_DEF && f[0].def_kind == CBM_PY_NS_DEF_FUNCTION &&
+             strcmp(f[0].local_name, "item") == 0 && f[1].kind == CBM_PY_NS_IMPORT_NAME &&
+             strcmp(f[1].module_name, "first") == 0 && strcmp(f[1].member_name, "item") == 0 &&
+             strcmp(f[1].local_name, "item") == 0 && f[2].kind == CBM_PY_NS_IMPORT_NAME &&
+             strcmp(f[2].module_name, "second") == 0 && strcmp(f[2].local_name, "item") == 0 &&
+             f[3].kind == CBM_PY_NS_SHADOW && strcmp(f[3].local_name, "item") == 0 &&
+             f[4].kind == CBM_PY_NS_DELETE && strcmp(f[4].local_name, "item") == 0 &&
+             f[5].kind == CBM_PY_NS_IMPORT_MODULE && strcmp(f[5].module_name, "pkg.mod") == 0 &&
+             strcmp(f[5].local_name, "pkg") == 0 && f[5].flags == CBM_PY_NS_IMPORT_BINDS_ROOT &&
+             f[6].kind == CBM_PY_NS_IMPORT_MODULE && strcmp(f[6].module_name, "pkg.mod") == 0 &&
+             strcmp(f[6].local_name, "alias") == 0 && f[6].flags == 0 && f[7].relative_level == 1 &&
+             strcmp(f[7].module_name, "") == 0 && strcmp(f[7].member_name, "child") == 0 &&
+             strcmp(f[7].local_name, "local") == 0 && f[8].relative_level == 2 &&
+             strcmp(f[8].module_name, "outer") == 0 && strcmp(f[8].member_name, "member") == 0 &&
+             f[9].kind == CBM_PY_NS_IMPORT_STAR && strcmp(f[9].module_name, "one.shared") == 0 &&
+             f[10].kind == CBM_PY_NS_IMPORT_STAR && strcmp(f[10].module_name, "two.shared") == 0 &&
+             f[11].kind == CBM_PY_NS_OWN_DEF && f[11].def_kind == CBM_PY_NS_DEF_CLASS &&
+             strcmp(f[11].local_name, "Local") == 0 && py_facts_owned(&r->arena, &r->py_namespace);
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* The type checker view of `if TYPE_CHECKING:` publishes its consequence (a
+ * lazy-module package: the else branch only installs the module). A name an
+ * elif/else import binds again is withdrawn by a SHADOW: its runtime source is
+ * the alternative. Both streams stay COMPLETE and valid. */
+TEST(python_namespace_facts_type_checking_alternatives) {
+    CBMFileResult *lazy = extract("from typing import TYPE_CHECKING\n"
+                                  "if TYPE_CHECKING:\n    from .lazy_mod import Lazy\n"
+                                  "else:\n    import sys\n",
+                                  CBM_LANG_PYTHON, "t", "lz/__init__.py");
+    CBMFileResult *compat = extract("from typing import TYPE_CHECKING\n"
+                                    "if TYPE_CHECKING:\n    from .types_only import Shim\n"
+                                    "else:\n    try:\n        from .runtime_impl import Shim\n"
+                                    "    except ImportError:\n        Shim = None\n",
+                                    CBM_LANG_PYTHON, "t", "cmp/__init__.py");
+    bool ok = lazy && compat && lazy->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              compat->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              cbm_py_namespace_facts_valid(&lazy->py_namespace) &&
+              cbm_py_namespace_facts_valid(&compat->py_namespace) &&
+              lazy->py_namespace.count == 3 && compat->py_namespace.count == 3;
+    if (ok) {
+        const CBMPyNamespaceFact *l = lazy->py_namespace.items;
+        const CBMPyNamespaceFact *c = compat->py_namespace.items;
+        ok = l[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(l[1].local_name, "Lazy") == 0 &&
+             l[2].kind == CBM_PY_NS_SHADOW && strcmp(l[2].local_name, "sys") == 0 &&
+             c[1].kind == CBM_PY_NS_IMPORT_NAME && strcmp(c[1].local_name, "Shim") == 0 &&
+             c[2].kind == CBM_PY_NS_SHADOW && strcmp(c[2].local_name, "Shim") == 0;
+    }
+    if (lazy)
+        cbm_free_result(lazy);
+    if (compat)
+        cbm_free_result(compat);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(python_namespace_facts_distinguish_all_operations_and_unknowns) {
+    static const char source[] = "__all__ = ['old']; __all__ = []\n"
+                                 "__all__ = dynamic\n"
+                                 "__all__ = ('new', '_private', 'a,b', '')\n"
+                                 "__all__ += ('new',)\n"
+                                 "__all__ -= []\n"
+                                 "del __all__\n";
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "main.py");
+    CBMFileResult *empty = extract("# no bindings\n", CBM_LANG_PYTHON, "t", "empty.py");
+    bool ok = r && empty && !r->has_error && !r->parse_incomplete && !empty->has_error &&
+              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 7 &&
+              empty->py_namespace.status == CBM_PY_NS_COMPLETE && empty->py_namespace.count == 0 &&
+              cbm_py_namespace_facts_valid(&r->py_namespace);
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        ok = f[0].kind == CBM_PY_NS_ALL_SET && f[0].name_count == 1 &&
+             strcmp(f[0].names[0], "old") == 0 && f[1].kind == CBM_PY_NS_ALL_SET &&
+             f[1].name_count == 0 && f[1].names == NULL &&
+             f[1].sequence_kind == CBM_PY_NS_SEQUENCE_LIST && f[2].kind == CBM_PY_NS_ALL_UNKNOWN &&
+             f[3].kind == CBM_PY_NS_ALL_SET && f[3].sequence_kind == CBM_PY_NS_SEQUENCE_TUPLE &&
+             f[3].name_count == 4 && strcmp(f[3].names[0], "new") == 0 &&
+             strcmp(f[3].names[1], "_private") == 0 && strcmp(f[3].names[2], "a,b") == 0 &&
+             strcmp(f[3].names[3], "") == 0 && f[4].kind == CBM_PY_NS_ALL_APPEND &&
+             f[4].name_count == 1 && strcmp(f[4].names[0], "new") == 0 &&
+             f[5].kind == CBM_PY_NS_ALL_UNKNOWN && f[6].kind == CBM_PY_NS_ALL_DELETE;
+    }
+    if (r)
+        cbm_free_result(r);
+    if (empty)
+        cbm_free_result(empty);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(python_namespace_facts_unknown_effects_and_body_stability) {
+    static const char one[] = "from pkg import Item\ndef f():\n    return 1\n";
+    static const char two[] =
+        "from pkg import Item\ndef f():\n    from elsewhere import Other\n    return Other()\n";
+    CBMFileResult *a = extract(one, CBM_LANG_PYTHON, "t", "main.py");
+    CBMFileResult *b = extract(two, CBM_LANG_PYTHON, "t", "main.py");
+    bool ok = a && b && !a->has_error && !b->has_error && !a->parse_incomplete &&
+              !b->parse_incomplete && a->py_namespace.count == 2 &&
+              py_facts_equal(&a->py_namespace, &b->py_namespace);
+    if (a)
+        cbm_free_result(a);
+    if (b)
+        cbm_free_result(b);
+    static const char unknown[] = "from pkg import Item\n"
+                                  "if enabled:\n    from other import Item\n"
+                                  "@deco\ndef wrapped():\n    pass\n"
+                                  "class Derived(Base):\n    pass\n"
+                                  "Item = factory()\n";
+    a = extract(unknown, CBM_LANG_PYTHON, "t", "main.py");
+    ok = a && !a->has_error && !a->parse_incomplete && a->py_namespace.count == 8 && ok;
+    if (a && a->py_namespace.count == 8) {
+        const CBMPyNamespaceFact *f = a->py_namespace.items;
+        ok = f[0].kind == CBM_PY_NS_IMPORT_NAME && f[1].kind == CBM_PY_NS_UNKNOWN &&
+             f[1].reason == CBM_PY_NS_REASON_COMPOUND && f[2].kind == CBM_PY_NS_UNKNOWN &&
+             f[3].kind == CBM_PY_NS_SHADOW && f[3].reason == CBM_PY_NS_REASON_DECORATED &&
+             strcmp(f[3].local_name, "wrapped") == 0 && f[4].kind == CBM_PY_NS_UNKNOWN &&
+             f[5].kind == CBM_PY_NS_SHADOW && f[5].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS &&
+             f[6].kind == CBM_PY_NS_UNKNOWN && f[7].kind == CBM_PY_NS_SHADOW && ok;
+    }
+    if (a)
+        cbm_free_result(a);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(python_namespace_facts_parse_errors_are_complete_unknown) {
+    const char *source = "from pkg import Before\ndef broken(:\n";
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "main.py");
+    bool ok = r && r->parse_incomplete && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              r->py_namespace.count == 1 && r->py_namespace.items[0].kind == CBM_PY_NS_UNKNOWN &&
+              r->py_namespace.items[0].reason == CBM_PY_NS_REASON_PARSE &&
+              cbm_py_namespace_facts_valid(&r->py_namespace);
+    if (r)
+        cbm_free_result(r);
+    CBMFileResult fallback = {0};
+    cbm_arena_init(&fallback.arena);
+    CBMExtractCtx ctx = {.arena = &fallback.arena,
+                         .result = &fallback,
+                         .source = "",
+                         .source_len = 0,
+                         .language = CBM_LANG_PYTHON};
+    ok = cbm_extract_python_namespace_facts(&ctx) == CBM_PY_NS_COMPLETE &&
+         fallback.py_namespace.count == 1 &&
+         fallback.py_namespace.items[0].reason == CBM_PY_NS_REASON_PARSE && ok;
+    cbm_arena_destroy(&fallback.arena);
+    r = extract("const x = 1;\n", CBM_LANG_JAVASCRIPT, "t", "__init__.js");
+    ok = r && !r->has_error && r->py_namespace.status == CBM_PY_NS_NOT_APPLICABLE &&
+         r->py_namespace.language == CBM_LANG_JAVASCRIPT && r->py_namespace.count == 0 && ok;
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(python_namespace_facts_capture_and_copy_fail_atomically) {
+    static const char source[] = "from .pkg import Item as Local\n__all__ = ['Local', '']\n";
+    bool ok = true, capture_complete = false, copy_complete = false;
+    int capture_failures = 0, copy_failures = 0;
+    for (int limit = 0; limit < 64 && !capture_complete; limit++) {
+        cbm_py_namespace_test_capture_fail_after(limit);
+        CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+        cbm_py_namespace_test_capture_fail_after(-1);
+        if (!r) {
+            ok = false;
+            break;
+        }
+        const CBMPyNamespaceFacts *f = &r->py_namespace;
+        capture_complete = f->status == CBM_PY_NS_COMPLETE;
+        if (capture_complete) {
+            ok = f->count == 2 && cbm_py_namespace_facts_valid(f) && ok;
+        } else {
+            capture_failures++;
+            ok = f->status == CBM_PY_NS_INCOMPLETE && f->failure == CBM_PY_NS_FAILURE_ALLOCATION &&
+                 !f->items && f->count == 0 && f->cap == 0 && cbm_py_namespace_facts_valid(f) && ok;
+        }
+        cbm_free_result(r);
+    }
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+    CBMArena reference_arena;
+    cbm_arena_init(&reference_arena);
+    CBMPyNamespaceFacts original = {0};
+    ok = r && cbm_py_namespace_facts_copy(&reference_arena, &r->py_namespace, &original) && ok;
+    for (int limit = 0; r && limit < 64 && !copy_complete; limit++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMPyNamespaceFacts copy = {0};
+        cbm_py_namespace_test_copy_fail_after(limit);
+        copy_complete = cbm_py_namespace_facts_copy(&arena, &r->py_namespace, &copy);
+        cbm_py_namespace_test_copy_fail_after(-1);
+        if (copy_complete) {
+            ok = py_facts_equal(&copy, &r->py_namespace) && py_facts_owned(&arena, &copy) && ok;
+        } else {
+            copy_failures++;
+            ok = copy.status == CBM_PY_NS_INCOMPLETE &&
+                 copy.failure == CBM_PY_NS_FAILURE_ALLOCATION && !copy.items && copy.count == 0 &&
+                 copy.cap == 0 && ok;
+        }
+        ok = py_facts_equal(&r->py_namespace, &original) && ok;
+        cbm_arena_destroy(&arena);
+    }
+    /* Rebuilding into an existing result must replace old complete facts on
+     * failure; do not leave a stale successful manifest attached. */
+    if (r) {
+        CBMExtractCtx ctx = {.arena = &r->arena,
+                             .result = r,
+                             .source = source,
+                             .source_len = (int)strlen(source),
+                             .language = CBM_LANG_PYTHON};
+        cbm_py_namespace_test_capture_fail_after(0);
+        CBMPyNamespaceStatus status = cbm_extract_python_namespace_facts(&ctx);
+        cbm_py_namespace_test_capture_fail_after(-1);
+        ok = status == CBM_PY_NS_INCOMPLETE && !r->py_namespace.items &&
+             r->py_namespace.count == 0 && ok;
+        cbm_free_result(r);
+    }
+    cbm_arena_destroy(&reference_arena);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(capture_complete);
+    ASSERT_TRUE(copy_complete);
+    ASSERT_GT(capture_failures, 2);
+    ASSERT_GT(copy_failures, 2);
+    PASS();
+}
+
+TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema) {
+    CBMPyNamespaceFacts zero = {0};
+    bool ok = cbm_py_namespace_facts_valid(&zero) && zero.status == CBM_PY_NS_NOT_CAPTURED;
+    CBMPyNamespaceFact event = {.kind = CBM_PY_NS_ALL_SET,
+                                .sequence_kind = CBM_PY_NS_SEQUENCE_LIST};
+    CBMPyNamespaceFacts facts = {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                 .language = CBM_LANG_PYTHON,
+                                 .status = CBM_PY_NS_COMPLETE,
+                                 .items = &event,
+                                 .count = 1,
+                                 .cap = 1};
+    ok = cbm_py_namespace_facts_valid(&facts) && ok;
+    for (int variant = 0; variant < 8; variant++) {
+        CBMPyNamespaceFact bad_event = event;
+        CBMPyNamespaceFacts bad = facts;
+        bad.items = &bad_event;
+        if (variant == 0)
+            bad.version++;
+        if (variant == 1)
+            bad.cap = 0;
+        if (variant == 2)
+            bad.count = -1;
+        if (variant == 3)
+            bad_event.kind = (CBMPyNamespaceFactKind)999;
+        if (variant == 4)
+            bad_event.name_count = 1;
+        if (variant == 5)
+            bad_event.flags = UINT32_MAX;
+        if (variant == 6)
+            bad.language = CBM_LANG_JAVA;
+        if (variant == 7)
+            bad.status = CBM_PY_NS_INCOMPLETE;
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMPyNamespaceFacts copy = {0};
+        ok = !cbm_py_namespace_facts_valid(&bad) &&
+             !cbm_py_namespace_facts_copy(&arena, &bad, &copy) &&
+             copy.status == CBM_PY_NS_INCOMPLETE && copy.count == 0 && !copy.items && ok;
+        cbm_arena_destroy(&arena);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload) {
+    char source[] = "from . import Thing as Local\n"
+                    "__all__ = ['Local', '', 'a,b', '_private']\n"
+                    "if enabled:\n    Local = dynamic\n"
+                    "__all__ = []\n";
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+    CBMArena retained;
+    cbm_arena_init(&retained);
+    CBMPyNamespaceFacts expected = {0};
+    bool ok = r && !r->has_error && !r->parse_incomplete && r->py_namespace.count == 4 &&
+              cbm_py_namespace_facts_copy(&retained, &r->py_namespace, &expected);
+    memset(source, 'x', strlen(source)); /* facts cannot borrow the caller's input */
+    char dir[512];
+    int n = snprintf(dir, sizeof(dir), "%s/cbm_py_facts_XXXXXX", cbm_tmpdir());
+    bool made = n > 0 && (size_t)n < sizeof(dir) && cbm_mkdtemp(dir);
+    size_t saved = cbm_result_spill_pin_free_bytes_for_tests(SIZE_MAX);
+    cbm_result_spill_t *spill = made ? cbm_result_spill_open(dir, 1, 1) : NULL;
+    cbm_result_spill_pin_free_bytes_for_tests(saved);
+    ok = spill && ok;
+    if (r && spill && ok) {
+        cbm_result_compact(r);
+        cbm_result_compact(r);
+        ok = r->arena.nblocks == 1 && r->py_namespace.cap == r->py_namespace.count &&
+             py_facts_equal(&r->py_namespace, &expected) &&
+             py_facts_owned(&r->arena, &r->py_namespace);
+        if (ok && cbm_result_spill_park(spill, 0, 0, r)) {
+            r = NULL;
+            CBMFileResult header = {0};
+            ok = cbm_result_spill_peek_header(spill, 0, &header) &&
+                 header.py_namespace.status == CBM_PY_NS_COMPLETE && header.py_namespace.count == 4;
+            for (int round = 0; round < 2; round++) {
+                CBMFileResult *loaded = cbm_result_spill_load(spill, 0);
+                ok = loaded && loaded->cached_tree == NULL &&
+                     py_facts_owned(&loaded->arena, &loaded->py_namespace) &&
+                     py_facts_equal(&loaded->py_namespace, &expected) && ok;
+                if (loaded)
+                    cbm_free_result(loaded);
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if (r)
+        cbm_free_result(r);
+    cbm_result_spill_close(spill);
+    if (made) {
+        char subdir[1024];
+        snprintf(subdir, sizeof(subdir), "%s/spill", dir);
+        cbm_rmdir(subdir);
+        cbm_rmdir(dir);
+    }
+    /* Original result/source tree and both reloads are gone; the independent
+     * copied payload still owns the relative empty module and literal strings. */
+    ok = py_facts_owned(&retained, &expected) && cbm_py_namespace_facts_valid(&expected) &&
+         expected.count == 4 && expected.items[0].relative_level == 1 &&
+         strcmp(expected.items[0].module_name, "") == 0 && expected.items[1].name_count == 4 &&
+         strcmp(expected.items[1].names[2], "a,b") == 0 && ok;
+    cbm_arena_destroy(&retained);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(python_namespace_facts_unavailable_and_empty_survive_spill) {
+    CBMPyNamespaceFacts states[] = {
+        {0},
+        {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+         .language = CBM_LANG_PYTHON,
+         .status = CBM_PY_NS_COMPLETE},
+        {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+         .language = CBM_LANG_PYTHON,
+         .status = CBM_PY_NS_INCOMPLETE,
+         .failure = CBM_PY_NS_FAILURE_ALLOCATION},
+        {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+         .language = CBM_LANG_JAVASCRIPT,
+         .status = CBM_PY_NS_NOT_APPLICABLE},
+    };
+    char dir[512];
+    int n = snprintf(dir, sizeof(dir), "%s/cbm_py_fact_states_XXXXXX", cbm_tmpdir());
+    bool made = n > 0 && (size_t)n < sizeof(dir) && cbm_mkdtemp(dir);
+    size_t saved = cbm_result_spill_pin_free_bytes_for_tests(SIZE_MAX);
+    cbm_result_spill_t *spill = made ? cbm_result_spill_open(dir, 1, 4) : NULL;
+    cbm_result_spill_pin_free_bytes_for_tests(saved);
+    bool ok = spill != NULL;
+    for (int i = 0; spill && i < 4; i++) {
+        CBMFileResult *r = cbm_result_alloc();
+        if (!r) {
+            ok = false;
+            break;
+        }
+        cbm_arena_init(&r->arena);
+        r->module_qn = cbm_arena_strdup(&r->arena, "t.metadata");
+        r->py_namespace = states[i];
+        cbm_result_compact(r);
+        cbm_result_compact(r);
+        bool ready =
+            r->module_qn && r->arena.nblocks == 1 && py_facts_equal(&r->py_namespace, &states[i]);
+        if (!ready || !cbm_result_spill_park(spill, 0, i, r)) {
+            ok = false;
+            cbm_free_result(r);
+            continue;
+        }
+        CBMFileResult header = {0};
+        ok = cbm_result_spill_peek_header(spill, i, &header) &&
+             header.py_namespace.status == states[i].status && header.py_namespace.count == 0 && ok;
+        for (int round = 0; round < 2; round++) {
+            CBMFileResult *loaded = cbm_result_spill_load(spill, i);
+            ok = loaded && py_facts_equal(&loaded->py_namespace, &states[i]) &&
+                 py_facts_owned(&loaded->arena, &loaded->py_namespace) && ok;
+            if (loaded)
+                cbm_free_result(loaded);
+        }
+    }
+    cbm_result_spill_close(spill);
+    if (made) {
+        char subdir[1024];
+        snprintf(subdir, sizeof(subdir), "%s/spill", dir);
+        cbm_rmdir(subdir);
+        cbm_rmdir(dir);
+    }
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
+    static const char source[] = "import alpha, beta.mod as Beta\n"
+                                 "from pkg import (One, Two as Local)\n"
+                                 "from pkg import later\n"
+                                 "def later():\n    pass\n"
+                                 "from pkg import __all__\n"
+                                 "def __all__():\n    pass\n"
+                                 "values = {obj: 1}\n"
+                                 "class HasDescriptor:\n    field = descriptor\n"
+                                 "__all__ = ['escaped\\n']\n";
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "main.py");
+    bool ok = r && !r->has_error && !r->parse_incomplete &&
+              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 14 &&
+              cbm_py_namespace_facts_valid(&r->py_namespace) && has_def(r, "Function", "later") &&
+              has_def(r, "Class", "HasDescriptor");
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        ok = f[0].kind == CBM_PY_NS_IMPORT_MODULE && strcmp(f[0].local_name, "alpha") == 0 &&
+             f[1].kind == CBM_PY_NS_IMPORT_MODULE && strcmp(f[1].local_name, "Beta") == 0 &&
+             strcmp(f[1].module_name, "beta.mod") == 0 && f[2].kind == CBM_PY_NS_IMPORT_NAME &&
+             strcmp(f[2].member_name, "One") == 0 && f[3].kind == CBM_PY_NS_IMPORT_NAME &&
+             strcmp(f[3].member_name, "Two") == 0 && strcmp(f[3].local_name, "Local") == 0 &&
+             f[4].kind == CBM_PY_NS_IMPORT_NAME && f[5].kind == CBM_PY_NS_OWN_DEF &&
+             strcmp(f[5].local_name, "later") == 0 && f[6].kind == CBM_PY_NS_IMPORT_NAME &&
+             strcmp(f[6].local_name, "__all__") == 0 && f[7].kind == CBM_PY_NS_OWN_DEF &&
+             strcmp(f[7].local_name, "__all__") == 0 && f[8].kind == CBM_PY_NS_UNKNOWN &&
+             f[9].kind == CBM_PY_NS_SHADOW && strcmp(f[9].local_name, "values") == 0 &&
+             f[10].kind == CBM_PY_NS_UNKNOWN && f[11].kind == CBM_PY_NS_SHADOW &&
+             f[11].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS && f[12].kind == CBM_PY_NS_UNKNOWN &&
+             f[13].kind == CBM_PY_NS_ALL_UNKNOWN;
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
@@ -8904,6 +12731,17 @@ SUITE(extraction) {
     RUN_TEST(extract_walk_truncated_when_a_node_budget_is_set);
     /* Initialize extraction library */
     cbm_init();
+
+    RUN_TEST(python_namespace_facts_preserve_order_and_import_provenance);
+    RUN_TEST(python_namespace_facts_distinguish_all_operations_and_unknowns);
+    RUN_TEST(python_namespace_facts_unknown_effects_and_body_stability);
+    RUN_TEST(python_namespace_facts_parse_errors_are_complete_unknown);
+    RUN_TEST(python_namespace_facts_type_checking_alternatives);
+    RUN_TEST(python_namespace_facts_capture_and_copy_fail_atomically);
+    RUN_TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema);
+    RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);
+    RUN_TEST(python_namespace_facts_unavailable_and_empty_survive_spill);
+    RUN_TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects);
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
@@ -8917,6 +12755,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_config_string_not_a_callee);
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
+    RUN_TEST(extract_rust_generic_impl_call_scope_matches_def);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
@@ -8985,6 +12824,8 @@ SUITE(extraction) {
     /* OOP */
     RUN_TEST(java_class);
     RUN_TEST(java_method);
+    RUN_TEST(class_field_is_one_field_not_also_a_variable);
+    RUN_TEST(field_named_like_method_is_fenced);
     RUN_TEST(java_interface);
     RUN_TEST(java_interface_no_duplicate_function_issue1234);
     RUN_TEST(java_enum_dedup_preserves_calls_issue1234);
@@ -9018,12 +12859,19 @@ SUITE(extraction) {
     RUN_TEST(c_function_return_type_preserves_pointer_and_qualifier);
     RUN_TEST(c_function_return_type_plain_unchanged);
     RUN_TEST(c_struct);
+    RUN_TEST(extract_c_anonymous_typedef_aggregate_is_named_by_its_typedef);
+    RUN_TEST(extract_c_anonymous_typedef_aggregate_is_one_def);
+    RUN_TEST(extract_c_function_pointer_member_is_a_field);
+    RUN_TEST(extract_c_member_declarators_name_and_type);
     RUN_TEST(cpp_class);
     RUN_TEST(cpp_method_return_type_preserves_pointer_and_qualifier);
 
     /* Scripting */
     RUN_TEST(python_function);
     RUN_TEST(python_class);
+    RUN_TEST(python_annotated_instance_fields_exported_issue1277);
+    RUN_TEST(python_type_checking_imports_flagged_issue1277);
+    RUN_TEST(python_type_checking_rebound_in_else_unrecorded_issue1277);
     RUN_TEST(js_function);
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
@@ -9188,13 +13036,16 @@ SUITE(extraction) {
     RUN_TEST(python_iris_invokeClassMethod);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
+    RUN_TEST(python_package_relative_import_paths);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
     RUN_TEST(go_cgo_pseudo_import_dropped);
+    RUN_TEST(bash_imports_are_sourced_files_only);
     RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);
     RUN_TEST(c_imports);
+    RUN_TEST(c_imports_inside_preprocessor_blocks);
     RUN_TEST(ruby_imports);
     RUN_TEST(lua_imports);
     RUN_TEST(import_stress_go);
@@ -9240,9 +13091,18 @@ SUITE(extraction) {
     /* __init__.py / index.ts Module QN collision regression */
     RUN_TEST(python_init_module_qn_not_collide_with_folder);
     RUN_TEST(python_init_nested_module_qn);
+    RUN_TEST(extract_python_nested_def_qualified_by_enclosing_def_issue1548);
+    RUN_TEST(extract_python_nested_def_calls_attributed_to_it_issue1548);
+    RUN_TEST(extract_python_decorated_nested_route_handler_issue1548);
+    RUN_TEST(extract_python_nested_class_issue1548);
+    RUN_TEST(extract_python_nested_def_named_like_its_method_issue1548);
+    RUN_TEST(extract_python_lambda_and_comprehension_stay_in_enclosing_def_issue1548);
+    RUN_TEST(extract_python_nested_def_env_access_attributed_to_it_issue1548);
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
+    RUN_TEST(extract_python_mock_patch_is_not_route);
+    RUN_TEST(extract_python_bare_decorator_route_rules);
     RUN_TEST(arkts_component_struct);
     RUN_TEST(arkts_exported_struct_decorators);
     RUN_TEST(arkts_member_decorators);
@@ -9263,6 +13123,15 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
+    RUN_TEST(extract_ts_template_base_url_issue2291);
+    RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
+    RUN_TEST(extract_py_concat_const_url_issue706);
+    RUN_TEST(extract_py_url_fold_no_fabrication_issue706);
+    RUN_TEST(extract_ts_const_template_url_issue1147);
+    RUN_TEST(extract_ts_url_fold_no_fabrication_issue1147);
+    RUN_TEST(extract_ts_folded_topics_keep_raw_identity);
+    RUN_TEST(extract_py_folded_topic_keywords_keep_raw_identity);
+    RUN_TEST(extract_ts_folded_config_url_and_exclusions);
     RUN_TEST(extract_ts_url_builder_issue1009);
     RUN_TEST(extract_ts_await_generic_call_issue2210);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
@@ -9300,6 +13169,10 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
+    RUN_TEST(extract_cpp_template_specialization_preprocessed_qn_single_spelling);
+    RUN_TEST(extract_c_misnested_raw_struct_replaced_by_flat_copy);
+    RUN_TEST(extract_cpp_preprocessed_rescue_skips_raw_def_on_same_line);
+    RUN_TEST(extract_cpp_rescue_keeps_expanded_class_when_raw_qn_is_taken);
     RUN_TEST(extract_cpp_export_macro_class_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_struct_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_enum_recovery_issue1989);
@@ -9307,6 +13180,22 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_export_macro_inline_method_recovery_issue1989);
     RUN_TEST(extract_cpp_export_macro_negative_control_ordinary_caps_issue1989);
     RUN_TEST(extract_c_export_macro_recovery_issue1989);
+    RUN_TEST(extract_cpp_macro_prefixed_function_names_c1);
+    RUN_TEST(extract_cpp_macro_prefixed_lsp_caller_c1);
+    RUN_TEST(extract_c_macro_prefixed_function_name_c1);
+    RUN_TEST(extract_c_tag_reference_is_not_a_definition_c1);
+    RUN_TEST(extract_c_struct_head_in_error_region_recovered_c1);
+    RUN_TEST(extract_c_keyword_is_never_a_function_name_c1);
+    RUN_TEST(extract_c_function_lost_to_split_branches_restored_c1);
+    RUN_TEST(extract_c_typedef_names_are_definitions_c1);
+    RUN_TEST(extract_c_macro_qn_is_fenced_c1);
+    RUN_TEST(extract_c_enumerators_are_flat_c1);
+    RUN_TEST(extract_cpp_enum_scoping_c1);
+    RUN_TEST(extract_c_enum_inside_struct_is_file_scope_c1);
+    RUN_TEST(extract_cpp_enum_inside_class_keeps_class_scope_c1);
+    RUN_TEST(extract_c_enum_macro_wrapped_list_c1);
+    RUN_TEST(extract_c_variants_lists_same_file_duplicates_c1);
+    RUN_TEST(extract_variants_only_in_c_preprocessor_languages_c1);
     RUN_TEST(extract_cpp_export_macro_overlong_candidate_safe_issue1989);
     RUN_TEST(extract_cpp_export_macro_comment_string_budget_issue1989);
     RUN_TEST(extract_cpp_export_macro_candidate_cap_issue1989);
@@ -9319,11 +13208,28 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989);
     RUN_TEST(extract_cpp_export_macro_suffix_variants_issue1989);
     RUN_TEST(extract_cpp_export_macro_explicit_define_priority_issue1989);
+    RUN_TEST(extract_cpp_macro_wrapped_declarator_names_def_issue946);
+    RUN_TEST(extract_c_macro_wrapped_declarator_controls_issue946);
+    RUN_TEST(extract_c_fname_macro_definitions_stay_distinct_issue1957);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
     RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
+    RUN_TEST(doc_go_comment_group_without_directives);
+    RUN_TEST(doc_go_struct_field);
+    RUN_TEST(doc_go_detached_comment_is_not_doc);
+    RUN_TEST(doc_python_comment_run_and_detached);
+    RUN_TEST(doc_rust_attribute_impl_method_and_inner_doc);
+    RUN_TEST(doc_ts_export_and_arrow_wrapper);
+    RUN_TEST(doc_csharp_xml_doc_run_and_top_level_function);
+    RUN_TEST(doc_java_javadoc_over_line_comment_and_field);
+    RUN_TEST(doc_kotlin_kdoc_folded_after_imports);
+    RUN_TEST(doc_c_typedef_struct);
+    RUN_TEST(doc_perl_pod_section_by_sub_name);
+    RUN_TEST(doc_perl_module_doc_is_the_pod_no_sub_holds);
+    RUN_TEST(doc_long_comment_kept_whole);
+    RUN_TEST(doc_divider_only_run_is_not_doc);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
 
     /* #518/#519 — prose carried into docstring so nodes_fts can index it */
@@ -9337,6 +13243,12 @@ SUITE(extraction) {
     RUN_TEST(json_toplevel_description_promoted_to_module_issue519);
     RUN_TEST(config_description_only_at_top_level_issue519);
     RUN_TEST(non_config_language_module_has_no_promoted_description_issue519);
+    RUN_TEST(extract_enclosing_sweep_matches_scan_issue1527);
+
+    /* Syntax-tree walkers spend no stack per nesting level */
+    RUN_TEST(extract_deep_callee_chain_completes);
+    RUN_TEST(extract_deep_error_regions_complete);
+    RUN_TEST(extract_deep_argument_nesting_completes);
 
     cbm_shutdown();
 }
