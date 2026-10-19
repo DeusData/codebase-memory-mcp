@@ -198,6 +198,10 @@ TEST(parse_rejects_declarations_and_truncated_documents) {
     PASS();
 }
 
+/* No entry here needs its content read, so the candidate list stays empty:
+ * this also guards against sorting a NULL array. That guard binds only on the
+ * trapping UBSan leg (-fno-sanitize-recover=undefined); macOS and recovering
+ * UBSan pass without it. */
 TEST(parse_clean_props_and_externals_are_not_local_changes) {
     wc_fixture_t fixture;
     ASSERT_TRUE(wc_fixture_init(&fixture, "cbm_svn_clean"));

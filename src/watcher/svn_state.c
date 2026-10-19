@@ -1173,8 +1173,12 @@ static int walk_candidates(svn_walk_t *walk, candidate_list_t *candidates) {
 }
 
 static int fingerprint_candidates(parser_t *parser, cbm_svn_observation_t *observation) {
-    qsort(parser->candidates.paths, parser->candidates.count, sizeof(*parser->candidates.paths),
-          candidate_compare);
+    /* With no candidates the array is NULL, and glibc declares qsort's base
+     * nonnull even for a zero count. */
+    if (parser->candidates.count > 1) {
+        qsort(parser->candidates.paths, parser->candidates.count, sizeof(*parser->candidates.paths),
+              candidate_compare);
+    }
     svn_walk_t walk = {0};
     walk.root = parser->root;
     int result = 0;
