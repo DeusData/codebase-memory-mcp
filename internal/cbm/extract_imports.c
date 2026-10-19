@@ -612,6 +612,37 @@ static bool py_ns_plain_string(PyNamespaceBuilder *b, TSNode node, const char **
     return true;
 }
 
+/* One string of a literal: any quoting or prefix (r, b, u, rb), unless it is an
+ * f-string with a replacement field, whose __format__ / __str__ may run code. */
+static bool py_ns_string_without_field(TSNode node) {
+    if (strcmp(ts_node_type(node), "string") != 0)
+        return false;
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (strcmp(ts_node_type(ts_node_named_child(node, i)), "interpolation") == 0)
+            return false;
+    }
+    return true;
+}
+
+/* A string literal, implicit concatenations included, evaluates nothing: a
+ * docstring (module, class or attribute) is no namespace effect. */
+static bool py_ns_literal_string(TSNode node) {
+    if (strcmp(ts_node_type(node), "concatenated_string") != 0)
+        return py_ns_string_without_field(node);
+    uint32_t count = ts_node_named_child_count(node);
+    bool parts = false;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode part = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(part), "comment") == 0)
+            continue;
+        if (!py_ns_string_without_field(part))
+            return false;
+        parts = true;
+    }
+    return parts;
+}
+
 /* Bounded syntactic proof only. Unsupported or deep expressions become an
  * unknown-effect barrier; no evaluator or source execution is involved. */
 static bool py_ns_safe_expr(PyNamespaceBuilder *b, TSNode node, int depth) {
@@ -624,11 +655,8 @@ static bool py_ns_safe_expr(PyNamespaceBuilder *b, TSNode node, int depth) {
         strcmp(kind, "float") == 0 || strcmp(kind, "true") == 0 || strcmp(kind, "false") == 0 ||
         strcmp(kind, "none") == 0 || strcmp(kind, "comment") == 0)
         return true;
-    if (strcmp(kind, "string") == 0) {
-        const char *text = NULL;
-        size_t len = 0;
-        return py_ns_plain_string(b, node, &text, &len);
-    }
+    if (strcmp(kind, "string") == 0 || strcmp(kind, "concatenated_string") == 0)
+        return py_ns_literal_string(node);
     bool container =
         strcmp(kind, "tuple") == 0 || strcmp(kind, "list") == 0 ||
         strcmp(kind, "parenthesized_expression") == 0 || strcmp(kind, "parameters") == 0 ||
@@ -677,8 +705,7 @@ static bool py_ns_class_safe(PyNamespaceBuilder *b, TSNode node) {
                 continue;
             if (strcmp(kind, "expression_statement") == 0 &&
                 ts_node_named_child_count(child) == 1) {
-                TSNode expr = ts_node_named_child(child, 0);
-                if (strcmp(ts_node_type(expr), "string") == 0 && py_ns_safe_expr(b, expr, 0))
+                if (py_ns_literal_string(ts_node_named_child(child, 0)))
                     continue;
                 /* Even an identifier assignment can install a descriptor whose
                  * __set_name__ hook executes during class creation. */
@@ -968,6 +995,35 @@ static bool py_ns_type_checking_block(PyNamespaceBuilder *b, TSNode node) {
     return !b->failure;
 }
 
+/* `from __future__ import x [as y]` is its own node type, without a module
+ * field: a compiler directive that also binds x (or y) to the feature object,
+ * like a from-import of module `__future__`. */
+static bool py_ns_future_import(PyNamespaceBuilder *b, TSNode node) {
+    const char *module_name = py_ns_copy(b, "__future__", strlen("__future__"));
+    if (!module_name)
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool ok = true;
+    int emitted = 0;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            const char *field = ts_tree_cursor_current_field_name(&cursor);
+            if (!field || strcmp(field, "name") != 0)
+                continue;
+            CBMPyNamespaceFact f;
+            if (!py_ns_import_fact(b, ts_tree_cursor_current_node(&cursor), true, module_name, 0,
+                                   &f) ||
+                !py_ns_push(b, f)) {
+                ok = false;
+                break;
+            }
+            emitted++;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok && emitted > 0;
+}
+
 static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "comment") == 0 || strcmp(kind, "pass_statement") == 0)
@@ -976,6 +1032,8 @@ static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
         return py_ns_import(b, node, false);
     if (strcmp(kind, "import_from_statement") == 0)
         return py_ns_import(b, node, true);
+    if (strcmp(kind, "future_import_statement") == 0)
+        return py_ns_future_import(b, node);
     bool decorated = strcmp(kind, "decorated_definition") == 0;
     TSNode def = decorated ? ts_node_child_by_field_name(node, TS_FIELD("definition")) : node;
     if (!ts_node_is_null(def)) {

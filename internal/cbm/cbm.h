@@ -412,8 +412,12 @@ static inline bool cbm_import_binds_runtime_name(const CBMImport *imp) {
     return imp && !imp->type_checking_only;
 }
 
-/* Content-only ordered Python namespace facts; no resolved target identities. */
-#define CBM_PY_NAMESPACE_FACTS_VERSION 1u
+/* Content-only ordered Python namespace facts; no resolved target identities.
+ * The version travels in the lsp_surface "py" payload, and a stored payload of
+ * another version does not decode: an incremental run then re-extracts in full,
+ * so stored facts of an older extraction never mix with fresh ones.
+ * 2: string-literal statements are no effect; `from __future__` imports bind. */
+#define CBM_PY_NAMESPACE_FACTS_VERSION 2u
 
 typedef enum {
     CBM_PY_NS_NOT_CAPTURED = 0,

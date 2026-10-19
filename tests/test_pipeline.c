@@ -14624,6 +14624,7 @@ static const char *const py_reexport_calls[][2] = {
     {"ctl_from_cls", "direct.impl.Direct"},
     {"ctl_from_fn", "direct.impl.direct_fn"},
     {"lazy_tc", "lz.lazy_mod.Lazy"},
+    {"doc_reexport", "docp.impl.Doc"},
 };
 enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_calls[0]) };
 
@@ -14633,7 +14634,7 @@ enum { PY_REEXPORT_N_CALLS = sizeof(py_reexport_calls) / sizeof(py_reexport_call
 static const char *const py_reexport_excluded[][2] = {
     {"excl_unlisted", "pkg.all_mod.Unlisted"}, {"excl_private", "pkg.star_mod._private_fn"},
     {"excl_shadowed", "shad.impl.Gone"},       {"excl_barrier", "barr.impl.Before"},
-    {"excl_compat", "cmp.types_only.Shim"},
+    {"excl_compat", "cmp.types_only.Shim"},    {"excl_fstring", "fsp.impl.Kept"},
 };
 enum { PY_REEXPORT_N_EXCLUDED = sizeof(py_reexport_excluded) / sizeof(py_reexport_excluded[0]) };
 
@@ -14693,6 +14694,19 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "    except ImportError:\n        Shim = None\n");
     write_temp_file(tmp, "app/cmp/types_only.py", "class Shim:\n    pass\n");
     write_temp_file(tmp, "app/cmp/runtime_impl.py", "class Shim:\n    pass\n");
+    /* The sql/expression.py shape of sqlalchemy: docstrings and a __future__
+     * import around the re-exports; an f-string with a field stays a barrier. */
+    write_temp_file(tmp, "app/docp/__init__.py",
+                    "\"\"\"Package docstring.\"\"\"\n"
+                    "from __future__ import annotations\n"
+                    "from .impl import Doc\n"
+                    "alias = Doc\n"
+                    "\"\"\"Attribute docstring.\"\"\"\n");
+    write_temp_file(tmp, "app/docp/impl.py", "class Doc:\n    pass\n");
+    write_temp_file(tmp, "app/fsp/__init__.py",
+                    "from .impl import Kept\n"
+                    "f\"{Kept}\"\n");
+    write_temp_file(tmp, "app/fsp/impl.py", "class Kept:\n    pass\n");
     write_temp_file(tmp, "app/main.py",
                     "from app import pkg\n"
                     "from app import cyc\n"
@@ -14700,6 +14714,8 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "from app import barr\n"
                     "from app import lz\n"
                     "from app import cmp\n"
+                    "from app import docp\n"
+                    "from app import fsp\n"
                     "from app.db import models\n"
                     "from app.pkg import Explicit, Listed, Deep, star_fn, Renamed\n"
                     "from app.direct.impl import Direct, direct_fn\n\n\n"
@@ -14725,6 +14741,8 @@ static int py_reexport_run(bool parallel, bool incremental, bool *lsp, bool *exc
                     "def excl_barrier():\n    barr.Before()\n\n\n"
                     "def excl_compat():\n    cmp.Shim()\n\n\n"
                     "def lazy_tc():\n    lz.Lazy()\n\n\n"
+                    "def doc_reexport():\n    docp.Doc()\n\n\n"
+                    "def excl_fstring():\n    fsp.Kept()\n\n\n"
                     "def ctl_from_cls():\n    Direct()\n\n\n"
                     "def ctl_from_fn():\n    direct_fn()\n");
     for (int i = 0; parallel && i < 52; i++) {
@@ -23459,26 +23477,32 @@ TEST(pipeline_python_namespace_codec_owns_ordered_facts) {
 }
 
 TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
-    /* Numeric values below are the frozen version-1 namespace wire values.
-     * Even an empty LSP array must validate its namespace envelope. */
+    /* Numeric values below are the frozen namespace wire values (version 2
+     * changed which statements extraction proves harmless, not the wire
+     * shape). Even an empty LSP array must validate its namespace envelope,
+     * and a payload of an older facts version is no authority: its facts
+     * were extracted under other rules, so the incremental run that reads
+     * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
         "{\"v\":3,\"lang\":1,\"lsp\":[]}",
         "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":null}",
         "{\"v\":3,\"lang\":1.0,\"lsp\":[],\"py\":null}",
         "{\"v\":3,\"v\":3,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
         "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -23498,7 +23522,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":3,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -23511,6 +23535,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
                     facts.facts.items[0].kind == CBM_PY_NS_UNKNOWN &&
                     facts.facts.items[0].reason == CBM_PY_NS_REASON_PARSE;
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(CBM_PY_NAMESPACE_FACTS_VERSION, 2u); /* the rows above spell it */
     ASSERT_TRUE(rejected);
     ASSERT_EQ(unknown_rc, 1);
     ASSERT_EQ(equal_rc, 0);

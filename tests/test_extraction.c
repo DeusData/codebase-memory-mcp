@@ -12318,6 +12318,96 @@ TEST(python_namespace_facts_type_checking_alternatives) {
     PASS();
 }
 
+/* A string-literal statement (a module, class or attribute docstring) has no
+ * effect, and `from __future__ import x` binds x like any from-import. Neither
+ * may withdraw the names bound before it: sqlalchemy's sql/expression.py lost
+ * its 149 re-exports to `nullsfirst = nulls_first` followed by a triple-quoted
+ * docstring. An f-string with a replacement field can run code
+ * (__format__ / __str__) and stays an effect. */
+static bool py_facts_any_unknown(const CBMFileResult *r, CBMPyNamespaceUnknownReason reason) {
+    for (int i = 0; r && i < r->py_namespace.count; i++) {
+        if (r->py_namespace.items[i].kind == CBM_PY_NS_UNKNOWN &&
+            r->py_namespace.items[i].reason == reason)
+            return true;
+    }
+    return false;
+}
+
+TEST(python_namespace_facts_string_statements_and_future_imports) {
+    static const char source[] = "\"\"\"Module docstring.\"\"\"\n"
+                                 "from __future__ import annotations\n"
+                                 "from __future__ import (division as div, generator_stop)\n"
+                                 "from .impl import a\n"
+                                 "\"\"\"A triple-quoted string after an import.\"\"\"\n"
+                                 "'''Single-quoted triple.'''\n"
+                                 "r\"raw \\d\"\n"
+                                 "b\"bytes\"\n"
+                                 "rb'raw bytes'\n"
+                                 "u\"unicode\"\n"
+                                 "\"implicit\" 'concatenation'\n"
+                                 "f\"no replacement field {{escaped}}\"\n"
+                                 "from .impl import b\n"
+                                 "class Documented:\n"
+                                 "    \"\"\"Class docstring.\"\"\"\n"
+                                 "    def method(self):\n"
+                                 "        pass\n"
+                                 "x = a\n"
+                                 "\"\"\"Attribute docstring.\"\"\"\n";
+    CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+    bool ok = r && !r->has_error && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+              cbm_py_namespace_facts_valid(&r->py_namespace) && r->py_namespace.count == 7;
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        ok = f[0].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[0].module_name, "__future__") == 0 &&
+             f[0].relative_level == 0 && strcmp(f[0].member_name, "annotations") == 0 &&
+             strcmp(f[0].local_name, "annotations") == 0 && f[1].kind == CBM_PY_NS_IMPORT_NAME &&
+             strcmp(f[1].member_name, "division") == 0 && strcmp(f[1].local_name, "div") == 0 &&
+             f[2].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[2].local_name, "generator_stop") == 0 &&
+             f[3].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[3].local_name, "a") == 0 &&
+             f[4].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[4].local_name, "b") == 0 &&
+             f[5].kind == CBM_PY_NS_OWN_DEF && f[5].def_kind == CBM_PY_NS_DEF_CLASS &&
+             strcmp(f[5].local_name, "Documented") == 0 && f[6].kind == CBM_PY_NS_SHADOW &&
+             strcmp(f[6].local_name, "x") == 0;
+    }
+    if (!ok && r) {
+        for (int i = 0; i < r->py_namespace.count; i++) {
+            const CBMPyNamespaceFact *f = &r->py_namespace.items[i];
+            printf("  string/future fact %d: kind %d reason %d name %s\n", i, (int)f->kind,
+                   (int)f->reason, f->local_name ? f->local_name : "-");
+        }
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok); /* RED while a docstring is an effect and __future__ is unsupported */
+
+    /* Controls: each stays a namespace barrier. */
+    static const struct {
+        const char *name;
+        const char *source;
+        CBMPyNamespaceUnknownReason reason;
+    } barriers[] = {
+        {"f-string field", "from .impl import a\nf\"{a}\"\n", CBM_PY_NS_REASON_EFFECT},
+        {"concatenated f-string field", "from .impl import a\n\"x\" f\"{a!r}\"\n",
+         CBM_PY_NS_REASON_EFFECT},
+        {"call", "from .impl import a\nprint(a)\n", CBM_PY_NS_REASON_EFFECT},
+        /* Python rejects it, and so does the grammar: the whole file is unknown */
+        {"star from __future__", "from .impl import a\nfrom __future__ import *\n",
+         CBM_PY_NS_REASON_PARSE},
+    };
+    for (size_t i = 0; i < sizeof(barriers) / sizeof(barriers[0]); i++) {
+        r = extract(barriers[i].source, CBM_LANG_PYTHON, "t", "pkg/__init__.py");
+        ok = r && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+             cbm_py_namespace_facts_valid(&r->py_namespace) &&
+             py_facts_any_unknown(r, barriers[i].reason);
+        if (!ok)
+            printf("  control '%s' is no namespace barrier\n", barriers[i].name);
+        if (r)
+            cbm_free_result(r);
+        ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
 TEST(python_namespace_facts_distinguish_all_operations_and_unknowns) {
     static const char source[] = "__all__ = ['old']; __all__ = []\n"
                                  "__all__ = dynamic\n"
@@ -12665,7 +12755,7 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
                                  "__all__ = ['escaped\\n']\n";
     CBMFileResult *r = extract(source, CBM_LANG_PYTHON, "t", "main.py");
     bool ok = r && !r->has_error && !r->parse_incomplete &&
-              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 14 &&
+              r->py_namespace.status == CBM_PY_NS_COMPLETE && r->py_namespace.count == 13 &&
               cbm_py_namespace_facts_valid(&r->py_namespace) && has_def(r, "Function", "later") &&
               has_def(r, "Class", "HasDescriptor");
     if (ok) {
@@ -12681,8 +12771,10 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
              strcmp(f[7].local_name, "__all__") == 0 && f[8].kind == CBM_PY_NS_UNKNOWN &&
              f[9].kind == CBM_PY_NS_SHADOW && strcmp(f[9].local_name, "values") == 0 &&
              f[10].kind == CBM_PY_NS_UNKNOWN && f[11].kind == CBM_PY_NS_SHADOW &&
-             f[11].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS && f[12].kind == CBM_PY_NS_UNKNOWN &&
-             f[13].kind == CBM_PY_NS_ALL_UNKNOWN;
+             f[11].reason == CBM_PY_NS_REASON_UNPROVEN_CLASS &&
+             /* a string with an escape evaluates nothing: no effect, but no
+              * literal export name either */
+             f[12].kind == CBM_PY_NS_ALL_UNKNOWN;
     }
     if (r)
         cbm_free_result(r);
@@ -12705,6 +12797,7 @@ SUITE(extraction) {
     RUN_TEST(python_namespace_facts_unknown_effects_and_body_stability);
     RUN_TEST(python_namespace_facts_parse_errors_are_complete_unknown);
     RUN_TEST(python_namespace_facts_type_checking_alternatives);
+    RUN_TEST(python_namespace_facts_string_statements_and_future_imports);
     RUN_TEST(python_namespace_facts_capture_and_copy_fail_atomically);
     RUN_TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema);
     RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);
