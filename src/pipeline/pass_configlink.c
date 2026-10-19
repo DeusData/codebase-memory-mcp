@@ -116,15 +116,18 @@ static const cbm_gbuf_node_t **canonical_node_copy(const cbm_gbuf_node_t *const 
     return sorted;
 }
 
-/* Infrastructure files: YAML, JSON and HCL (Terraform, OpenTofu, tfvars). A
- * key_symbol pair with either side in one links by exact name and only inside
- * the config file's component (user decision 2026-10-10): in 17 infra
- * repositories 4 of 40 sampled key_symbol edges were right, all of them exact
- * and within one directory tree; the rest were substring and cross-component
- * coincidences. Other config formats keep exact + substring matching. */
+/* Files whose key_symbol pairs link by exact name and only inside the config
+ * file's component: infrastructure files -- YAML, JSON, HCL (Terraform,
+ * OpenTofu, tfvars) -- (user decision 2026-10-10: in 17 infra repositories 4
+ * of 40 sampled key_symbol edges were right, all of them exact and within one
+ * directory tree; the rest were substring and cross-component coincidences),
+ * and TOML and INI files (user decision 2026-10-14: all 72 of their substring
+ * or cross-component edges in those repositories were coincidences, such as
+ * `.gitleaks.toml useDefault` <- TestConfig_UseDefault). Other config formats
+ * (.env, .properties) keep exact + substring matching. */
 static bool cl_is_infra_path(const char *path) {
-    static const char *const exts[] = {".yaml", ".yml",  ".json",   ".tf",
-                                       ".hcl",  ".tofu", ".tfvars", NULL};
+    static const char *const exts[] = {".yaml",   ".yml",  ".json", ".tf",  ".hcl",  ".tofu",
+                                       ".tfvars", ".toml", ".ini",  ".cfg", ".conf", NULL};
     const char *dot = path ? strrchr(path, '.') : NULL;
     const char *slash = path ? strrchr(path, '/') : NULL;
     if (!dot || (slash && dot < slash)) {

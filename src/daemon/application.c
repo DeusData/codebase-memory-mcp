@@ -21,6 +21,7 @@
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
+#include "store/graph_mem.h"
 #include "ui/config.h"
 #include "watcher/watcher.h"
 
@@ -1893,7 +1894,13 @@ static size_t application_active_job_count_locked(cbm_daemon_application_t *appl
 /* Decision 2 (#1997 #832): a worker's memory slice is the aggregate budget
  * divided by the jobs active at spawn time. The job being spawned is already
  * in the table, so the divisor never drops below one; a zero aggregate means
- * "no cap" and the worker falls back to its own RAM-fraction budget. */
+ * "no cap" and the worker falls back to its own RAM-fraction budget.
+ *
+ * The daemon's resident adjacency layers (store/graph_mem.h) are part of the
+ * same aggregate, so workers split what is left after them. They are capped at
+ * a quarter of the daemon budget, which the aggregate defaults to; only a
+ * smaller configured aggregate can be exceeded, and then every job still gets
+ * at least one byte, as above — a zero slice would read as "no cap". */
 static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *application,
                                                      size_t *active_jobs_out) {
     size_t active = application_active_job_count_locked(application);
@@ -1903,7 +1910,16 @@ static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *a
     if (active_jobs_out) {
         *active_jobs_out = active;
     }
-    return application->aggregate_memory_budget_bytes / active;
+    size_t aggregate = application->aggregate_memory_budget_bytes;
+    if (aggregate == 0) {
+        return 0;
+    }
+    size_t held = cbm_graph_mem_cached_bytes();
+    size_t available = held < aggregate ? aggregate - held : 0;
+    if (available < active) {
+        available = active;
+    }
+    return available / active;
 }
 
 /* Compare the effective index request, not its JSON spelling. yyjson's deep

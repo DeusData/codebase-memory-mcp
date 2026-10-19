@@ -19,7 +19,9 @@
 
 #include "php_lsp.h"
 #include "lsp_node_iter.h"
+#include "lsp_work.h"
 #include "../helpers.h"
+#include "../../../src/foundation/hash_table.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3745,6 +3747,126 @@ static void apply_phpdoc_class_tags(PHPLSPContext *ctx, CBMTypeRegistry *reg, co
  *   - handle `as` aliasing: register method under the alias name too
  *   - skip insteadof (rare in practice; full support deferred)
  */
+/* The registry indices of each receiver's methods, in registration order.
+ * Flattening a trait used to visit EVERY registered function to find the
+ * trait's own, so a file whose classes use traits paid O(uses x functions),
+ * and the functions grow with every class flattened before: quadratic in the
+ * trait-using classes of one file (#1265). The registry is append-only, so
+ * the index catches up incrementally (indexed_upto) and never misses a
+ * function registered between two flattens. */
+typedef struct {
+    int *items;
+    int count;
+    int cap;
+} php_func_ids_t;
+
+struct php_trait_index {
+    CBMHashTable *by_receiver; /* receiver_type (borrowed) -> php_func_ids_t* */
+    int indexed_upto;          /* reg->funcs[0, indexed_upto) are indexed */
+    bool failed;               /* allocation failed: callers use the full scan */
+};
+
+static bool php_func_ids_push(CBMArena *arena, php_func_ids_t *ids, int func_index) {
+    if (ids->count == ids->cap) {
+        int cap = ids->cap ? ids->cap * 2 : 4;
+        int *items = (int *)cbm_arena_alloc(arena, (size_t)cap * sizeof(*items));
+        if (!items) {
+            return false;
+        }
+        if (ids->count > 0) {
+            memcpy(items, ids->items, (size_t)ids->count * sizeof(*items));
+        }
+        ids->items = items;
+        ids->cap = cap;
+    }
+    ids->items[ids->count++] = func_index;
+    return true;
+}
+
+/* Index every function registered since the last call. Returns false (and
+ * marks the index failed for good) on an allocation failure. */
+static bool php_trait_index_sync(PHPLSPContext *ctx, struct php_trait_index *ix,
+                                 const CBMTypeRegistry *reg) {
+    if (ix->failed) {
+        return false;
+    }
+    if (!ix->by_receiver) {
+        ix->by_receiver = cbm_ht_create(0);
+        if (!ix->by_receiver) {
+            ix->failed = true;
+            return false;
+        }
+    }
+    for (; ix->indexed_upto < reg->func_count; ix->indexed_upto++) {
+        CBM_LSP_WORK(1);
+        const char *receiver = reg->funcs[ix->indexed_upto].receiver_type;
+        if (!receiver) {
+            continue;
+        }
+        php_func_ids_t *ids = (php_func_ids_t *)cbm_ht_get(ix->by_receiver, receiver);
+        if (!ids) {
+            ids = (php_func_ids_t *)cbm_arena_alloc(ctx->arena, sizeof(*ids));
+            if (!ids) {
+                ix->failed = true;
+                return false;
+            }
+            memset(ids, 0, sizeof(*ids));
+            cbm_ht_set(ix->by_receiver, receiver, ids);
+        }
+        if (!php_func_ids_push(ctx->arena, ids, ix->indexed_upto)) {
+            ix->failed = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+static void php_trait_index_free(struct php_trait_index *ix) {
+    if (ix->by_receiver) {
+        cbm_ht_free(ix->by_receiver);
+        ix->by_receiver = NULL;
+    }
+}
+
+/* Copy one method `src` of the trait into class_qn (see
+ * flatten_trait_into_class). Reads src before registering, because
+ * cbm_registry_add_func may move reg->funcs. */
+static void flatten_trait_method(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
+                                 const char *canonical_trait_qn, const CBMRegisteredFunc *src,
+                                 const char *alias_for_method, const char *only_method_name) {
+    if (only_method_name && src->short_name && strcmp(src->short_name, only_method_name) != 0) {
+        return;
+    }
+    const char *new_short = alias_for_method ? alias_for_method : src->short_name;
+    if (!new_short)
+        return;
+    CBMRegisteredFunc rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, new_short);
+    rf.short_name = cbm_arena_strdup(ctx->arena, new_short);
+    rf.receiver_type = class_qn;
+    rf.min_params = src->min_params;
+
+    /* Self-substitute the return type: any NAMED(trait_qn) in the
+     * signature's return becomes NAMED(class_qn). */
+    const CBMType *new_sig = src->signature;
+    if (src->signature && src->signature->kind == CBM_TYPE_FUNC &&
+        src->signature->data.func.return_types) {
+        const CBMType *ret0 = src->signature->data.func.return_types[0];
+        if (ret0 && ret0->kind == CBM_TYPE_NAMED && ret0->data.named.qualified_name &&
+            strcmp(ret0->data.named.qualified_name, canonical_trait_qn) == 0) {
+            const CBMType **rets = (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*rets));
+            if (rets) {
+                rets[0] = cbm_type_named(ctx->arena, class_qn);
+                rets[1] = NULL;
+                new_sig = cbm_type_func_replace_returns(ctx->arena, src->signature, rets);
+            }
+        }
+    }
+    rf.signature = new_sig;
+    cbm_registry_add_func(reg, rf);
+}
+
 static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
                                      const char *trait_qn, const char *alias_for_method,
                                      const char *only_method_name) {
@@ -3780,43 +3902,36 @@ static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, c
      * appends to reg->funcs, so the loop must never visit entries it adds
      * during iteration (a mutate-while-iterating hazard). */
     const int func_count_before = reg->func_count;
+    struct php_trait_index *ix = ctx->trait_index;
+    if (ix && php_trait_index_sync(ctx, ix, reg)) {
+        /* Only the trait's own methods, in registration order; the ids are
+         * ascending, so the snapshot bound ends the walk. No sync runs inside
+         * the loop, so the list cannot change under it. */
+        const php_func_ids_t *ids =
+            (const php_func_ids_t *)cbm_ht_get(ix->by_receiver, canonical_trait_qn);
+        for (int j = 0; ids && j < ids->count && ids->items[j] < func_count_before; j++) {
+            CBM_LSP_WORK(1);
+            if (CBM_LSP_WORK_CEILING_HIT()) {
+                break; /* test seam only (#765, #1265): see lsp_work.h */
+            }
+            flatten_trait_method(ctx, reg, class_qn, canonical_trait_qn, &reg->funcs[ids->items[j]],
+                                 alias_for_method, only_method_name);
+        }
+        return;
+    }
+    /* No index (no owning pass, or it could not allocate): the full scan,
+     * which yields the same methods in the same order. */
     for (int i = 0; i < func_count_before; i++) {
+        CBM_LSP_WORK(1);
+        if (CBM_LSP_WORK_CEILING_HIT()) {
+            break; /* test seam only (#765, #1265): see lsp_work.h */
+        }
         const CBMRegisteredFunc *src = &reg->funcs[i];
         if (!src->receiver_type || strcmp(src->receiver_type, canonical_trait_qn) != 0) {
             continue;
         }
-        if (only_method_name && src->short_name && strcmp(src->short_name, only_method_name) != 0) {
-            continue;
-        }
-        const char *new_short = alias_for_method ? alias_for_method : src->short_name;
-        if (!new_short)
-            continue;
-        CBMRegisteredFunc rf;
-        memset(&rf, 0, sizeof(rf));
-        rf.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, new_short);
-        rf.short_name = cbm_arena_strdup(ctx->arena, new_short);
-        rf.receiver_type = class_qn;
-        rf.min_params = src->min_params;
-
-        /* Self-substitute the return type: any NAMED(trait_qn) in the
-         * signature's return becomes NAMED(class_qn). */
-        const CBMType *new_sig = src->signature;
-        if (src->signature && src->signature->kind == CBM_TYPE_FUNC &&
-            src->signature->data.func.return_types) {
-            const CBMType *ret0 = src->signature->data.func.return_types[0];
-            if (ret0 && ret0->kind == CBM_TYPE_NAMED && ret0->data.named.qualified_name &&
-                strcmp(ret0->data.named.qualified_name, canonical_trait_qn) == 0) {
-                const CBMType **rets =
-                    (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*rets));
-                if (rets) {
-                    rets[0] = cbm_type_named(ctx->arena, class_qn);
-                    rets[1] = NULL;
-                    new_sig = cbm_type_func_replace_returns(ctx->arena, src->signature, rets);
-                }
-            }
-        }
-        rf.signature = new_sig;
-        cbm_registry_add_func(reg, rf);
+        flatten_trait_method(ctx, reg, class_qn, canonical_trait_qn, src, alias_for_method,
+                             only_method_name);
     }
 }
 
@@ -4217,6 +4332,16 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
      * Pass 2: classes and enums (which may `use Trait;` and need the
      * trait's signatures already patched).
      */
+    /* The index lives in the call's arena, not on this stack frame: ctx keeps
+     * a pointer to it for the duration of the pass. On an allocation failure
+     * it stays NULL and flatten_trait_into_class runs the full scan. */
+    struct php_trait_index *trait_index =
+        (struct php_trait_index *)cbm_arena_alloc(ctx->arena, sizeof(*trait_index));
+    if (trait_index) {
+        memset(trait_index, 0, sizeof(*trait_index));
+    }
+    struct php_trait_index *outer_index = ctx->trait_index;
+    ctx->trait_index = trait_index;
     for (int pass = 0; pass < 2; pass++) {
         TSNode stack[256];
         int top = 0;
@@ -4241,6 +4366,10 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
             }
         }
     }
+    if (trait_index) {
+        php_trait_index_free(trait_index);
+    }
+    ctx->trait_index = outer_index;
 }
 
 void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root) {
@@ -4372,6 +4501,17 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         }
     }
 
+    /* Index the registry (F12). Unindexed, every lookup below was a linear
+     * scan over the stdlib plus every definition of the file: O(lookups x
+     * definitions), quadratic in the size of one file. First-registered
+     * answers keep the result of that scan (the first registration of a
+     * duplicate QN wins), so the output does not change. Index memory goes to
+     * a scratch arena that dies with this call, as in cbm_run_php_lsp_cross. */
+    reg.index_first_registered = true;
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     /* Phase C: run the resolver. */
     PHPLSPContext ctx;
     php_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
@@ -4401,6 +4541,11 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         ctx.use_count = 0;
     }
 
+    /* Trait flattening registered methods after the index was built; lookups
+     * would tail-scan them. Re-index once, first-registered as above, so the
+     * answers equal those of the indexed part followed by the tail scan. */
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     php_lsp_process_file(&ctx, root);
 
     if (ctx.debug) {
@@ -4414,6 +4559,7 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
                     rc->confidence);
         }
     }
+    cbm_arena_destroy(&idx_arena);
 }
 
 /* ── Cross-file + batch ───────────────────────────────────────── */

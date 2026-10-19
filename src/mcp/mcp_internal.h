@@ -39,6 +39,13 @@ void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint
  * scratch count cannot see other processes' entries in the shared temp dir.
  * The server borrows dir until it is reset or the server is freed. */
 void cbm_mcp_server_set_search_scratch_dir_for_test(cbm_mcp_server_t *srv, const char *dir);
+/* search_code's in-process scan of `filelist_path` (records separated as the
+ * scoped list is written: NUL on POSIX, newline on Windows) into `out_path`.
+ * Returns the scan cause in mcp_scan_cause_t order: 0 success, 1 command
+ * failure, 3 output limit, 4 deadline, 5 cancelled. */
+int cbm_mcp_search_scan_for_test(cbm_mcp_server_t *srv, const char *filelist_path,
+                                 const char *pattern, bool use_regex, const char *out_path,
+                                 size_t output_limit, uint64_t deadline_ms);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use

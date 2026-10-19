@@ -643,12 +643,18 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             if (cbm_pipeline_php_vendor_bound(php_vendor, def->base_classes[b])) {
                 continue;
             }
-            const char *base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn,
-                                                   imp_keys, imp_vals, imp_count, lang);
-            if (!base_qn || cbm_python_external_base_contradicts(
-                                fi->language, &result->imports, def->base_classes[b], base_qn,
-                                ctx->gbuf, ctx->project_name, fi->rel_path)) {
-                continue; /* unresolved, or an external base (`unittest.TestCase`) */
+            /* An earlier sibling of the class body shadows every module or
+             * imported name, so it needs no external-base gate. */
+            const char *base_qn = cbm_registry_resolve_python_class_body_base(
+                ctx->registry, ctx->gbuf, def->qualified_name, def->base_classes[b], lang);
+            if (!base_qn) {
+                base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn, imp_keys,
+                                           imp_vals, imp_count, lang);
+                if (!base_qn || cbm_python_external_base_contradicts(
+                                    fi->language, &result->imports, def->base_classes[b], base_qn,
+                                    ctx->gbuf, ctx->project_name, fi->rel_path)) {
+                    continue; /* unresolved, or an external base (`unittest.TestCase`) */
+                }
             }
             const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
             if (base_node && node->id != base_node->id) {

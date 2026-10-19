@@ -19,6 +19,7 @@
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
+#include "store/graph_mem.h"
 #include "store/store.h"
 #include "ui/config.h"
 #include "watcher/watcher.h"
@@ -5889,6 +5890,32 @@ TEST(daemon_application_worker_slice_is_aggregate_over_active_jobs) {
     PASS();
 }
 
+/* The daemon's resident adjacency layers are its own memory: a worker's slice
+ * is the aggregate minus them, and never "no cap" (0) when they exceed it. The
+ * held bytes come through the graph_mem seam, so no layer has to be built. */
+TEST(daemon_application_worker_slice_leaves_room_for_graph_cache) {
+    const size_t mib = (size_t)1024U * 1024U;
+    const size_t aggregate = 1000U * mib;
+    cbm_daemon_application_config_t config = {.aggregate_memory_budget_bytes = aggregate};
+    cbm_graph_mem_drop_idle();
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    size_t without_layers = cbm_daemon_application_worker_memory_budget_bytes(application);
+    cbm_graph_mem_set_cached_bytes_for_testing(200U * mib);
+    size_t with_layers = cbm_daemon_application_worker_memory_budget_bytes(application);
+    cbm_graph_mem_set_cached_bytes_for_testing(aggregate + 5U);
+    size_t layers_over_aggregate = cbm_daemon_application_worker_memory_budget_bytes(application);
+    cbm_graph_mem_set_cached_bytes_for_testing(0);
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+
+    ASSERT_NOT_NULL(application);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(without_layers, aggregate);
+    ASSERT_EQ(with_layers, aggregate - 200U * mib);
+    ASSERT_EQ(layers_over_aggregate, 1);
+    PASS();
+}
+
 /* Decision A (#1997 #832): the over-budget verdict travels as a CLEAN worker
  * exit carrying an error response. The daemon passes that response through
  * verbatim on the first attempt — no crash/hang recovery loop, no quarantine
@@ -6960,6 +6987,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
     RUN_TEST(daemon_application_worker_slice_is_aggregate_over_active_jobs);
+    RUN_TEST(daemon_application_worker_slice_leaves_room_for_graph_cache);
     RUN_TEST(daemon_application_over_budget_response_passes_through_without_recovery);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_tool_error_is_failed_job_even_after_clean_worker_exit);

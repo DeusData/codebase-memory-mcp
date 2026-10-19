@@ -260,6 +260,24 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
                                                 CBMLanguage lang);
+/* The registry step of BOTH call resolvers once the LSP has not answered:
+ * for Python, the def or class `callee_name` binds in the nearest def enclosing
+ * `scope_qn` (cbm_registry_resolve_lexical, "lexical_scope"); otherwise, or
+ * when there is no such local, cbm_registry_resolve_call_lang. */
+cbm_resolution_t cbm_registry_resolve_call_scoped(const cbm_registry_t *r, const char *callee_name,
+                                                  const char *module_qn,
+                                                  const char **import_map_keys,
+                                                  const char **import_map_vals,
+                                                  int import_map_count, CBMLanguage lang,
+                                                  const char *scope_qn);
+/* Python: the bare base `base` of the class `class_qn` nested in a class body
+ * binds the sibling class of that body (`<enclosing class>.<base>`) when the
+ * sibling is defined earlier in the same file (Python evaluates the bases in
+ * the class body). Exact lookups only; the registry-owned sibling QN, or NULL
+ * to resolve the base as before. Every base-class resolver asks this first. */
+const char *cbm_registry_resolve_python_class_body_base(const cbm_registry_t *r,
+                                                        const cbm_gbuf_t *gb, const char *class_qn,
+                                                        const char *base, CBMLanguage lang);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
 #endif
@@ -283,6 +301,15 @@ void cbm_pxc_test_import_probe_fail_after(int successful_allocations);
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
 
 /* cbm_route_canon_path: cbm.h (route_path.c). */
+
+/* A definition's decorator route (def->route_path, e.g. an ASP.NET [HttpGet("x")]
+ * action): upsert its Route node and the definition -> Route HANDLES edge. Both
+ * resolvers call it per DEFINITION at node creation (pass_parallel.c,
+ * pass_definitions.c), so overloads sharing one QN -- a GET form action and its
+ * POST submit -- each keep their route; the merged node properties hold only one
+ * of them. Defined in pass_route_nodes.c. */
+void cbm_pipeline_emit_def_route(cbm_gbuf_t *gb, int64_t func_id, const CBMDefinition *def,
+                                 const char *rel);
 
 /* A file and the directory beside it share a stem (`pkg/foo.sh` beside
  * `pkg/foo/`): the file's Module QN equals the directory's Folder QN, and the
@@ -349,6 +376,37 @@ typedef struct {
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 
+/* The env join's inputs held by the unchanged files of an incremental
+ * repair (pass_envjoin.c), read from the store before the K8s pass; ids are
+ * the stored rows, i.e. the repair buffer's proxies. */
+typedef struct {
+    int64_t node;      /* a Dockerfile Module */
+    const char *path;  /* its file */
+    const char *props; /* its properties (image_files, image_ignore) */
+} cbm_envjoin_set_row_t;
+
+typedef struct {
+    int64_t owner; /* USAGE {ref:image} source */
+    int64_t image; /* its Image */
+    const char *props;
+} cbm_envjoin_img_row_t;
+
+typedef struct {
+    int64_t reader; /* CONFIGURES {strategy:env_access} source */
+    const char *file;
+    const char *key; /* the global EnvVar's name */
+} cbm_envjoin_reader_row_t;
+
+typedef struct {
+    CBMArena arena; /* owns every string and array */
+    cbm_envjoin_set_row_t *sets;
+    int set_count;
+    cbm_envjoin_img_row_t *imgs;
+    int img_count;
+    cbm_envjoin_reader_row_t *readers;
+    int reader_count;
+} cbm_envjoin_base_t;
+
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {
@@ -397,6 +455,10 @@ typedef struct {
     /* Stem collisions of the discovered files: which Module definitions take
      * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
     const cbm_stem_marks_t *stem_marks;
+
+    /* An incremental repair: the env join's inputs held by the unchanged
+     * files (pass_envjoin.c). Borrowed; NULL in a full run. */
+    const cbm_envjoin_base_t *envjoin_base;
 
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW
@@ -1022,6 +1084,9 @@ int cbm_parse_compile_commands(const char *json_data, const char *repo_path, cha
 /* File identification helpers */
 bool cbm_is_kustomize_file(const char *name);
 bool cbm_is_k8s_manifest(const char *name, const char *content);
+/* A Helm values file name: values.yaml / .yml, values-<x>.yaml / .yml
+ * (pass_k8s.c; beside Chart.yaml it CONFIGURES the chart). */
+bool cbm_helm_values_name(const char *base);
 
 /* Secret detection */
 bool cbm_is_secret_binding(const char *key, const char *value);
@@ -1230,7 +1295,8 @@ typedef void (*cbm_build_site_fn)(const cbm_build_site_t *site, void *ud);
  * (repository path; NULL: no build, or unknown), the service names its
  * depends_on and links list, and the names of the environment variables its
  * environment sets (map keys / list items' names -- never a value), with
- * their 1-based lines. */
+ * their 1-based lines and the service name each value addresses (a bare
+ * name, `name:port`, a URL's host; NULL: none -- cbm_env_address). */
 typedef struct {
     const char *name;
     const char *image;
@@ -1239,6 +1305,7 @@ typedef struct {
     int ndeps;
     const char **env;
     const int *env_lines;
+    const char **env_hosts;
     int nenv;
     int line;
     int end_line;
@@ -1261,15 +1328,69 @@ bool cbm_build_path(const char *rel);
 void cbm_build_sites(CBMArena *a, const char *rel, const char *src, size_t len, const char *dotenv,
                      cbm_build_site_fn fn, void *ud);
 
-/* Terraform / OpenTofu modules (pass_terraform.c): a helm_release DEPLOYS its
- * chart. Run at the end of the K8s pass, over the same files. */
+/* Terraform / OpenTofu / Terragrunt (pass_terraform.c): references, module
+ * calls, tfvars, Terragrunt units; a helm_release DEPLOYS its chart. Run at
+ * the end of the K8s pass, over the same files. */
 void cbm_pipeline_pass_terraform(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                  int file_count);
 
-/* The Image node of image reference `ref` (its normalised repository:
- * docker.io for no registry host, library/ for an official image; tag and
- * digest dropped), made when new; 0 for scratch or no image. */
+/* Kubernetes objects Terraform declares (pass_terraform.c): a
+ * kubernetes_<type> resource with a literal name is a Resource of the K8s
+ * identity scheme, ecosystem terraform. Run by the K8s pass before its joins. */
+void cbm_pipeline_tf_k8s_objects(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int file_count);
+
+/* A Resource's properties from its identity QN (pass_k8s.c,
+ * k8s_resource_props); `ecosystem` NULL for a manifest's. Caller frees. */
+char *cbm_k8s_resource_props(const char *qn, const char *effective_ns, const char *version,
+                             const char *labels, const char *ecosystem);
+
+/* Ansible (pass_ansible.c): a playbook or task file IMPORTS the playbooks,
+ * task files and roles its directives name; its tasks and handlers are
+ * Functions, a notify CALLS the handlers it names, a kube / k8s task
+ * DEPLOYS the template it applies. Run at the end of the K8s pass, over the
+ * same files. */
+void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                               int file_count);
+
+/* Does a YAML text's first content line start a sequence item (pass_ansible.c)?
+ * The incremental planner's test for Ansible content. */
+bool cbm_ansible_is_sequence(const char *src);
+
+/* `v` (a path; "./" and "../" allowed) from repository directory `dir`, as a
+ * repository path into out; false past the root or when it does not fit
+ * (pass_terraform.c). */
+bool cbm_repo_rel_join(const char *dir, const char *v, char *out, size_t sz);
+
+/* The Image node of image reference `ref` (its repository as written, tag
+ * and digest dropped; Docker Hub's host spellings as docker.io with library/
+ * for an official image; registry "unknown" when the reference names no
+ * host -- none is invented), made when new; 0 for scratch or no image. */
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref);
+
+/* A chart repository URL as an identity (pass_k8s.c): `url` trimmed, its
+ * scheme and host lower-cased, trailing `/` and `.git` dropped. False for no
+ * URL: no scheme or host, a file:// directory, credentials in the authority,
+ * a query or fragment (`?`, `#`: a token may ride there), or a byte no
+ * stated URL holds (whitespace, quote, template, `$`). A
+ * repository URL is never cut: oci://host/x with chart x is oci://host/x/x. */
+bool cbm_chart_repo_url(const char *url, char *out, size_t sz);
+
+/* The repository of chart reference `ref` (a Flux OCIRepository url, a
+ * Terraform `chart = "oci://..."`): all before its last segment, the chart.
+ * False when none is left. */
+bool cbm_chart_ref_repo(const char *ref, char *out, size_t sz);
+
+/* The external Chart node of chart `name` from repository `url` (pass_k8s.c),
+ * made when new and owned by `file`: `__chart__<url>/<name>` {source,
+ * external, repository} -- one QN in every project -- when `url` resolves
+ * (cbm_chart_repo_url), else `<project>.__helm_dep__.<name>`. */
+int64_t cbm_pipeline_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, const char *url,
+                                    const char *file);
+
+/* Is Chart node `node` an external chart (either identity) rather than one
+ * a Chart.yaml of this repository declares? */
+bool cbm_pipeline_chart_is_external(const cbm_gbuf_node_t *node);
 
 /* Environment variable `key` that `owner` sets (pass_docker.c): a K8s or
  * compose Resource for its container `container`, a Dockerfile Module for
@@ -1288,6 +1409,16 @@ int64_t cbm_pipeline_env_setter(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *
  * builds on (FROM, COPY --from). Run at the end of the K8s pass. */
 void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                               int file_count);
+
+/* The env join (pass_envjoin.c): a container's EnvVar CONFIGURES {strategy:
+ * env_read} each reader of its name inside the files the container's image
+ * is built from. Recomputes every such edge; after the Docker pass. Returns
+ * how many. */
+int cbm_pipeline_env_join(cbm_pipeline_ctx_t *ctx);
+
+/* Whether a Dockerfile Module's properties (image_files) copy `path` into
+ * the image, ignore patterns aside. */
+bool cbm_envjoin_props_hold(const char *props, const char *path);
 
 /* Pre-dump pass: markdown → file REFERENCES_FILE linking. */
 int cbm_pipeline_pass_doclinks(cbm_pipeline_ctx_t *ctx);
@@ -1382,6 +1513,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
                                  int baseline_count, bool force_full_on_mismatch);
 
+/* The exact no-op test cbm_pipeline_run_incremental routes by, read-only on
+ * an already opened generation: true when that generation is current for the
+ * pipeline's mode and records exactly the baseline manifest. */
+bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *store,
+                                               const cbm_file_hash_t *baseline_manifest,
+                                               int baseline_count);
+
 /* Exact semantic inputs for no-op/forced-full routing. The manifest contains
  * every discovered source plus repository controls actually consumed by
  * discovery, package mapping, path aliases, and extension overrides. */
@@ -1439,8 +1577,43 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      spelled `proj.pkg.foo/`, or, where the directory is a Java/Go package,
  *      the file's Module is `proj.pkg.foo#sh`. The Module the Folder used to
  *      swallow is a node again. An index built before holds neither, so it
- *      rebuilds once on upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 8 };
+ *      rebuilds once on upgrade.
+ *   9: a container's variable reaches its program: the EnvVar a container
+ *      sets CONFIGURES {strategy:env_read} the readers of its name inside the
+ *      files the container's image is built from (pass_envjoin.c); a K8s
+ *      image reference says its container (USAGE {ref:image, container}) and
+ *      a Dockerfile's Module its image's files (image_context, image_files,
+ *      image_ignore). A workload or compose service CONNECTS_TO the Service
+ *      its environment addresses (extract_k8s.c, pass_docker.c). A script's
+ *      curl / wget HTTP_CALLS the Route of the URL it states (pass_shell.c).
+ *      A kustomize patch OVERRIDEs the objects of its build it changes, its
+ *      file an IMPORTS of the kustomization; a Resource keeps the version of
+ *      its apiVersion and its labels; a kustomization DEPLOYS the charts it inflates
+ *      (helmCharts); an object a namePrefix / nameSuffix renames has a
+ *      variant Resource {ecosystem:kustomize} with its deployed name, which
+ *      OVERRIDEs {via:namePrefix|nameSuffix} it (extract_k8s.c,
+ *      pass_k8s.c). A Terraform reference
+ *      USAGEs {ref, via:terraform}, from its block, the block of its module
+ *      (directory) declaring it (one in depends_on: DEPENDS_ON), instead of
+ *      the generic name matcher's USAGE / CALLS; a bare block label names
+ *      its block like a quoted one; a module call with a local source
+ *      IMPORTS its directory's Folder (the root: the Project) and module.X.Y
+ *      USAGEs {ref:output} the output there; a .tfvars assignment OVERRIDEs
+ *      {via:tfvars} the variable block of its own directory (or, inferred,
+ *      of the nearest ancestor module declaring its names); a Terragrunt
+ *      unit's include / read_terragrunt_config IMPORTS {via:terragrunt} the
+ *      file it names, a dependency DEPENDS_ON the other unit; a
+ *      kubernetes_* resource with a literal name is a Resource
+ *      {ecosystem:terraform} its block DEPLOYS
+ *      (pass_terraform.c, extract_unified.c, extract_defs.c); an Ansible
+ *      playbook / task file IMPORTS {via:ansible} the playbooks, task files
+ *      and roles its directives name, its tasks and handlers are Functions
+ *      {source:ansible}, a notify CALLS {via:notify} the handlers it names,
+ *      a kube / k8s task DEPLOYS {via:ansible} the template it applies
+ *      (pass_ansible.c). An external Chart is keyed by its publisher URL.
+ *      An index built before holds none of them, so it rebuilds once on
+ *      upgrade. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1536,6 +1709,10 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
  * on failure. */
 int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
                                 const char *const *edge_types);
+/* Delete the project's `label` nodes that carry no file and that no edge of
+ * any type touches (a Route whose last caller and handler were purged);
+ * returns how many, or -1 on failure. */
+int cbm_delta_drop_edgeless(cbm_store_t *store, const char *project, const char *label);
 /* An Image's build edges (Image -DEPENDS_ON {via:build}-> Dockerfile,
  * pass_docker.c) belong to the build configuration declaring them, not to
  * either end: every run recomputes them whole from all build files, the
@@ -1543,6 +1720,22 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
  * between pre-existing nodes. */
 #define CBM_BUILD_EDGE_TYPE "DEPENDS_ON"
 #define CBM_BUILD_EDGE_SOURCE "Image"
+/* The env join's edges (EnvVar -CONFIGURES {strategy:env_read}-> reader,
+ * pass_envjoin.c) likewise: no other producer draws CONFIGURES from an
+ * EnvVar, every run recomputes them whole. */
+#define CBM_ENVJOIN_EDGE_TYPE "CONFIGURES"
+#define CBM_ENVJOIN_EDGE_SOURCE "EnvVar"
+
+/* The env join's inputs the store holds (the unchanged files of a closure
+ * repair, read after the purge), into `out` (its arena owns them); 0, or -1
+ * on failure. cbm_envjoin_base_free releases it. */
+int cbm_delta_envjoin_base(cbm_store_t *store, const char *project, cbm_envjoin_base_t *out);
+void cbm_envjoin_base_free(cbm_envjoin_base_t *b);
+/* 1 when a stored image copies one of `paths` (a deletion then changes
+ * which context the Dockerfile's sources resolve in), 0 when none, -1 on
+ * failure. */
+int cbm_delta_image_holds_any(cbm_store_t *store, const char *project, const char *const *paths,
+                              int path_count);
 
 /* The files whose File node the shell pass marked as running a container
  * build ({"declares_build":true}), into arena `a`; returns how many, or -1

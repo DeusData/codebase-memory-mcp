@@ -3996,6 +3996,18 @@ else
   echo "SKIP Phase 13: no install script available for this platform"
 fi
 
+# ── Phase 13w: package-wrapper install E2E ──
+# The npm, PyPI and Go wrappers install the same release archive as above,
+# from this checkout, the way a user's package manager runs them (#2657: a
+# wrapper cap refused every shipped binary). SMOKE_REQUIRE_WRAPPERS=1 (CI)
+# makes a missing node/python/go toolchain a failure, not a skip.
+echo ""
+echo "--- Phase 13w: package-wrapper install E2E ---"
+if ! bash "$REPO_ROOT/scripts/smoke-wrappers.sh" "$SMOKE_DOWNLOAD_URL"; then
+  echo "FAIL 13w: a package wrapper could not install the release binary"
+  exit 1
+fi
+
 else
   echo ""
   echo "=== Phase 12-13: SKIPPED (SMOKE_DOWNLOAD_URL not set) ==="

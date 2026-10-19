@@ -260,6 +260,15 @@ struct cbm_pipeline {
      * "invalid_existing_db" (#1864). */
     bool final_existed;
     bool existing_generation;
+    /* The copy into the stage is deferred until routing needs it: an
+     * unchanged repository is proven current on the live generation
+     * (live_db_path, read-only) and never copies, seals or renames a
+     * database. backup_succeeded records the copy once it ran; live_noop
+     * marks a run that ended on the live proof with nothing staged. */
+    bool stage_backup_pending;
+    bool backup_succeeded;
+    bool live_noop;
+    const char *live_db_path; /* borrowed from cbm_pipeline_run */
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -848,7 +857,10 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->repo_path = strdup(repo_path);
     p->db_path = db_path ? strdup(db_path) : NULL;
     p->project_name = cbm_project_name_from_path(repo_path);
-    (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
+    /* The Git context is resolved once, when the run starts
+     * (pipeline_refresh_git_context): a context resolved here was always
+     * replaced before any use, at the cost of seven git subprocesses per
+     * index call. Until then the branch QN names the working tree. */
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->requested_mode = mode;
     p->mode = mode;
@@ -2738,12 +2750,69 @@ static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
     return 0;
 }
 
+static int remove_stage_files(const char *stage_path);
+
+/* Copy the live generation into this run's stage: every route except the
+ * live no-op works on that copy. A failed copy behaves as the eager copy it
+ * replaces did: the stage files go (the name and its lock stay this run's,
+ * the rebuilt generation is renamed over it later) and the run has no
+ * previous generation, so it rebuilds in full. */
+static void materialize_stage_backup(cbm_pipeline_t *p) {
+    p->stage_backup_pending = false;
+    p->backup_succeeded = cbm_store_backup_path(p->live_db_path, p->db_path) == CBM_STORE_OK;
+    if (!p->backup_succeeded) {
+        cbm_log_warn("pipeline.stage", "action", "backup_failed_full_rebuild", "path",
+                     p->live_db_path);
+        (void)remove_stage_files(p->db_path);
+    }
+    p->existing_generation = p->backup_succeeded;
+}
+
+/* The live generation is provably current: read-only, it passes the shallow
+ * integrity and format checks the staged route applies to its copy, and the
+ * exact semantic-manifest test the staged route would answer no-op with. A
+ * copy of it would route to that no-op and publish the same database again,
+ * so the run ends here with nothing copied, sealed or renamed. Any doubt
+ * answers false and the run copies and routes exactly as before. */
+static bool live_generation_current(cbm_pipeline_t *p, const cbm_file_hash_t *baseline_manifest,
+                                    int baseline_count) {
+    struct stat db_st;
+    if (!p->live_db_path || stat(p->live_db_path, &db_st) != 0) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(p->live_db_path);
+    if (!store) {
+        return false;
+    }
+    int fmt = 0;
+    bool current = cbm_store_check_integrity(store);
+    if (current) {
+        cbm_store_get_format_version(store, &fmt);
+        current =
+            fmt == CBM_INDEX_FORMAT_VERSION &&
+            cbm_pipeline_incremental_generation_exact(p, store, baseline_manifest, baseline_count);
+    }
+    cbm_store_close(store);
+    return current;
+}
+
 /* Route an existing generation. Full rebuilds never delete the live DB here:
  * publication owns the eventual atomic replacement after every pass and
  * metadata write has succeeded. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         const cbm_file_hash_t *baseline_manifest,
                                         int baseline_count, bool force_full_on_mismatch) {
+    if (p->stage_backup_pending) {
+        if (live_generation_current(p, baseline_manifest, baseline_count)) {
+            p->stage_backup_pending = false;
+            p->live_noop = true;
+            cbm_log_info("pipeline.route", "path", "incremental_manifest", "generation", "live");
+            cbm_log_info("incremental.noop", "reason", "semantic_manifest_equal", "generation",
+                         "live");
+            return 0;
+        }
+        materialize_stage_backup(p);
+    }
     if (!p->existing_generation) {
         /* Nothing to be incremental against: a first index, or a
          * destination that could not be copied (already reported as
@@ -2846,12 +2915,15 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
     if (!p || !p->project_name) {
         return false;
     }
-    char *db_path = resolve_db_path(p);
+    /* Until routing copies it, the stage is an empty placeholder: the
+     * coverage the copy would carry is read from the live generation. */
+    char *resolved = p->stage_backup_pending ? NULL : resolve_db_path(p);
+    const char *db_path = p->stage_backup_pending ? p->live_db_path : resolved;
     if (!db_path) {
         return false;
     }
     cbm_store_t *store = cbm_store_open_path_query(db_path);
-    free(db_path);
+    free(resolved);
     if (!store) {
         return false;
     }
@@ -4542,6 +4614,29 @@ static void sweep_orphan_stages(const char *final_path) {
     free(dir_path);
 }
 
+/* End a run whose exact no-op was proven on the live generation. Nothing was
+ * staged, so nothing is sealed or renamed and the live database stays the
+ * current generation. The checks publication makes on the run's sources and
+ * destination still decide success, and the artifact is refreshed from the
+ * live database exactly as it would be from a republished one. */
+static int finish_live_noop(cbm_pipeline_t *p, const char *final_path) {
+    cbm_userconfig_t *fresh_config = cbm_userconfig_load_with_source(p->repo_path);
+    bool source_matches = cbm_pipeline_project_source_matches(p, fresh_config);
+    cbm_userconfig_free(fresh_config);
+    struct stat final_st;
+    int rc = 0;
+    if (!source_matches) {
+        cbm_log_error("pipeline.err", "phase", "test_declarations_source_changed");
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    } else if (stat(final_path, &final_st) != 0) {
+        /* The destination vanished during the run: someone else owns it. */
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    } else {
+        rc = export_after_publish(p, final_path);
+    }
+    return rc;
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     /* Per-index attribution: peaks and phase totals are about THIS index, not
      * the process history, so they start clean here. The first mark opens
@@ -4571,21 +4666,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_NOT_FOUND;
     }
 
-    bool backup_succeeded = false;
-    if (final_existed) {
-        backup_succeeded = cbm_store_backup_path(final_path, staging_path) == CBM_STORE_OK;
-        if (!backup_succeeded) {
-            cbm_log_warn("pipeline.stage", "action", "backup_failed_full_rebuild", "path",
-                         final_path);
-            /* The copy is gone but the NAME stays ours: the rebuilt
-             * generation is renamed over it by the inner finalize and then
-             * published from it below, so its lock is held to the end. */
-            remove_stage_files(staging_path);
-        }
-    }
-
+    /* The existing generation is copied into the stage only when routing
+     * needs a copy (materialize_stage_backup): an exact no-op is proven on
+     * the live generation and copies nothing -- on a kernel-scale index the
+     * copy alone was a 19 GB write per unchanged re-index. */
     p->final_existed = final_existed;
-    p->existing_generation = final_existed && backup_succeeded;
+    p->existing_generation = final_existed;
     char *configured_db_path = p->db_path;
     p->db_path = strdup(staging_path);
     if (!p->db_path) {
@@ -4595,10 +4681,19 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
+    p->stage_backup_pending = final_existed;
+    p->backup_succeeded = false;
+    p->live_noop = false;
+    p->live_db_path = final_path;
     cbm_log_debug("pipeline.setup", "step", "staged");
     int rc = cbm_pipeline_run_staged(p);
     free(p->db_path);
     p->db_path = configured_db_path;
+    bool backup_succeeded = p->backup_succeeded;
+    bool live_noop = p->live_noop;
+    p->stage_backup_pending = false;
+    p->live_noop = false;
+    p->live_db_path = NULL;
 
     /* Report WHY the run stopped. Everything below happens before the final
      * rename, so the live database is still the previous generation and an
@@ -4612,12 +4707,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         pipeline_release_test_config(p);
         return rc;
     }
-    if (check_cancel(p)) {
+    /* A cancelled run and a live no-op both end here without publishing:
+     * the stage placeholder is discarded, and only the no-op goes on to
+     * finish on the live generation. */
+    bool cancelled = check_cancel(p);
+    if (cancelled || live_noop) {
         cleanup_staging_db(staging_path);
         free(staging_path);
+        rc = cancelled ? CBM_PIPELINE_ABORT_PRESERVE_DB : finish_live_noop(p, final_path);
         free(final_path);
         pipeline_release_test_config(p);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return rc;
     }
     if (seal_staging_db(staging_path) != 0) {
         cleanup_staging_db(staging_path);

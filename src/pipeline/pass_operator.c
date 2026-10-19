@@ -1640,7 +1640,7 @@ static CBMHashTable *gc_chart_index(const cbm_gbuf_t *gb) {
         const char *qn = nodes[i]->qualified_name;
         const char *slash = fp ? strrchr(fp, '/') : NULL;
         const char *base = slash ? slash + SKIP_ONE : fp;
-        if (!fp || !qn || strstr(qn, ".__helm_dep__.") ||
+        if (!fp || !qn || cbm_pipeline_chart_is_external(nodes[i]) ||
             (strcmp(base, "Chart.yaml") != 0 && strcmp(base, "Chart.yml") != 0) || !slash) {
             continue;
         }

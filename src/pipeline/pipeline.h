@@ -200,6 +200,12 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 /* Module QN: project.dir.parts (no name). Caller must free(). */
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
 
+/* Length of the prefix cbm_pipeline_fqn_compute(project, rel_path, name) puts
+ * before a symbol `name` (the joining dot excluded): the QN prefix every
+ * definition of that file carries, __init__ / index already dropped. Computed
+ * without allocating; 0 when unavailable. */
+size_t cbm_pipeline_fqn_symbol_prefix_len(const char *project, const char *rel_path);
+
 /* Language-aware module QN. When `module_is_dir` is true (Java/Go package
  * semantics) the module is derived from the CONTAINING DIRECTORY (the filename
  * stem is dropped), so it agrees with the extraction-side def QNs; when false
@@ -253,9 +259,23 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
 /* As cbm_registry_add, recording `lang`: the DETECTED language of the file
  * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
- * veto (cbm_registry_name_guess_vetoed) checks against the caller. */
+ * veto (cbm_registry_name_guess_vetoed) checks against the caller. Detects no
+ * function-local symbols: that needs the defining file's module QN, see
+ * cbm_registry_add_lang_in_module. */
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
                            const char *label, CBMLanguage lang);
+
+/* As cbm_registry_add_lang. A Python symbol declared inside a function body of
+ * its own file (cbm_registry_qn_is_function_local, bounded by
+ * `module_prefix_len`: cbm_pipeline_fqn_symbol_prefix_len of the defining file)
+ * is registered for exact lookups only, never offered to the short-name
+ * strategies. The three graph
+ * registration sites (pass_definitions.c, pass_parallel.c,
+ * pipeline_incremental.c) all register through this, so full and incremental
+ * indexes agree. 0 = no local detection. */
+void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
+                                     const char *qualified_name, const char *label,
+                                     CBMLanguage lang, size_t module_prefix_len);
 
 /* True when code in `caller` can call a symbol defined in `target` by bare
  * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
@@ -267,6 +287,20 @@ bool cbm_lang_resolution_compatible(CBMLanguage caller, CBMLanguage target);
  * layer ("<python-builtins>" -> Python, "<kotlin-builtins>" -> Kotlin);
  * CBM_LANG_COUNT for anything else. */
 CBMLanguage cbm_registry_synthetic_path_language(const char *file_path);
+
+/* True when a proper prefix of `qualified_name` longer than
+ * `module_prefix_len` (cbm_pipeline_fqn_symbol_prefix_len of the defining file)
+ * is a registered Function or Method, i.e. the symbol was declared inside a
+ * function body of its own file. False when module_prefix_len is 0. */
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name,
+                                       size_t module_prefix_len);
+
+/* Python bare-name lexical lookup: the def or class named `callee_name` bound
+ * in the nearest function scope enclosing `scope_qn` (the caller's QN),
+ * skipping class bodies, stopping at the caller's module (`module_qn`).
+ * Strategy "lexical_scope"; qualified_name is NULL when no such local exists. */
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn, const char *module_qn);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.

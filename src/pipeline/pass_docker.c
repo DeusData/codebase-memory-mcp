@@ -11,9 +11,10 @@
  * ENV); a reference without a value leaves the image unknown, and an unknown
  * image is no edge.
  *
- * Image identity is the normalised repository: docker.io for an image
- * without a registry host, library/ for an official one-segment image;
- * tag and digest stay on the edge.
+ * Image identity is the repository as written, tag and digest dropped (they
+ * stay on the edge). Its registry is the host the reference names -- Docker
+ * Hub's spellings as docker.io, with library/ for an official one-segment
+ * image -- else "unknown": no host is invented for a reference naming none.
  *
  * PHASE 4 P4.1b: what the container runs. The last stage's ENTRYPOINT (else
  * CMD) SPAWNS -- from the Dockerfile's Module {api:dockerfile}:
@@ -52,6 +53,7 @@
 #include "cbm.h"
 #include "helpers.h"
 #include "lang_specs.h"
+#include "yyjson/yyjson.h"
 
 #include <ctype.h>
 #include <stdatomic.h>
@@ -103,6 +105,7 @@ typedef struct {
 typedef struct {
     CBMHashTable *files;  /* repo path -> File node */
     CBMHashTable *gomain; /* repo dir -> the `main` Function of its package */
+    CBMHashTable *dirs;   /* every directory holding a file (not the root) */
 } dk_index_t;
 
 typedef struct dk_var {
@@ -266,7 +269,6 @@ static const char *dk_expand(dk_t *d, const dk_var_t *vars, const char *text) {
     return out;
 }
 
-/* The repository identity of image reference `ref` into out. */
 /* Only characters an image reference can hold (name, :tag, @digest) -- a
  * template's placeholder (`<.Values.image>`, `<tpl>`) or an expression is
  * no image. */
@@ -279,7 +281,15 @@ static bool dk_ref_chars(const char *ref) {
     return ref[0] != '\0';
 }
 
-static bool dk_normalize(const char *ref, char *out, size_t sz) {
+/* The registry of a reference that names no host. */
+static const char DK_REGISTRY_UNKNOWN[] = "unknown";
+
+/* The repository identity of image reference `ref` into out, the registry
+ * its host names into reg. A reference without a host is the repository as
+ * written, its registry unknown: docker.io is only Docker's default -- a
+ * short-name search list (Podman, CRI-O) or a local-only build tag resolves
+ * elsewhere or nowhere. */
+static bool dk_normalize(const char *ref, char *out, size_t sz, char *reg, size_t reg_sz) {
     if (!dk_ref_chars(ref)) {
         return false;
     }
@@ -298,15 +308,12 @@ static bool dk_normalize(const char *ref, char *out, size_t sz) {
         return false;
     }
     char *first_end = strchr(r, '/');
-    if (!first_end) {
-        snprintf(out, sz, "docker.io/library/%s", r);
-        return true;
-    }
-    size_t fl = (size_t)(first_end - r);
-    bool host = memchr(r, '.', fl) || memchr(r, ':', fl) ||
-                (fl == strlen("localhost") && strncmp(r, "localhost", fl) == 0);
+    size_t fl = first_end ? (size_t)(first_end - r) : 0;
+    bool host = first_end && (memchr(r, '.', fl) || memchr(r, ':', fl) ||
+                              (fl == strlen("localhost") && strncmp(r, "localhost", fl) == 0));
     if (!host) {
-        snprintf(out, sz, "docker.io/%s", r);
+        snprintf(out, sz, "%s", r);
+        snprintf(reg, reg_sz, "%s", DK_REGISTRY_UNKNOWN);
         return true;
     }
     const char *rest = first_end + SKIP_ONE;
@@ -316,8 +323,10 @@ static bool dk_normalize(const char *ref, char *out, size_t sz) {
         (fl == strlen("registry-1.docker.io") && strncmp(r, "registry-1.docker.io", fl) == 0);
     if (hub) {
         snprintf(out, sz, "docker.io/%s%s", strchr(rest, '/') ? "" : "library/", rest);
+        snprintf(reg, reg_sz, "docker.io");
     } else {
         snprintf(out, sz, "%.*s/%s", (int)fl, r, rest);
+        snprintf(reg, reg_sz, "%.*s", (int)fl, r);
     }
     return true;
 }
@@ -363,15 +372,20 @@ static int dk_stage_of(const dk_t *d, const char *ref) {
 
 int64_t cbm_pipeline_image_node(cbm_pipeline_ctx_t *ctx, const char *ref) {
     char repo[CBM_SZ_512];
-    if (!ref || dk_ieq(ref, "scratch") || !dk_normalize(ref, repo, sizeof(repo))) {
+    char reg[CBM_SZ_512];
+    if (!ref || dk_ieq(ref, "scratch") ||
+        !dk_normalize(ref, repo, sizeof(repo), reg, sizeof(reg))) {
         return 0;
     }
     char qn[CBM_SZ_1K];
     snprintf(qn, sizeof(qn), "__image__%s", repo);
     char esc_repo[CBM_SZ_1K];
+    char esc_reg[CBM_SZ_1K];
     cbm_json_escape(esc_repo, (int)sizeof(esc_repo), repo);
+    cbm_json_escape(esc_reg, (int)sizeof(esc_reg), reg);
     char node_props[CBM_SZ_2K];
-    snprintf(node_props, sizeof(node_props), "{\"repository\":\"%s\"}", esc_repo);
+    snprintf(node_props, sizeof(node_props), "{\"repository\":\"%s\",\"registry\":\"%s\"}",
+             esc_repo, esc_reg);
     return cbm_gbuf_upsert_node(ctx->gbuf, "Image", repo, qn, "", 0, 0, node_props);
 }
 
@@ -549,46 +563,100 @@ static int dk_json_array(dk_t *d, TSNode arr, const char **out, int max) {
     return n;
 }
 
+/* The logical line at byte `at` of the source, as Docker joins it: a line
+ * ending in `\` (blanks after it aside) goes on in the next one;
+ * dk_uncomment already made comment lines inside a continuation bare
+ * continuations. */
+static char *dk_logical_line(dk_t *d, size_t at) {
+    const char *s = d->src + at;
+    char *out = cbm_arena_alloc(d->a, strlen(s) + SKIP_ONE);
+    size_t n = 0;
+    while (out && *s) {
+        const char *e = strchr(s, '\n');
+        size_t l = e ? (size_t)(e - s) : strlen(s);
+        size_t t = l;
+        while (t > 0 &&
+               (s[t - SKIP_ONE] == ' ' || s[t - SKIP_ONE] == '\t' || s[t - SKIP_ONE] == '\r')) {
+            t--;
+        }
+        bool more = e && t > 0 && s[t - SKIP_ONE] == '\\';
+        size_t keep = more ? t - SKIP_ONE : t;
+        memcpy(out + n, s, keep);
+        n += keep;
+        if (!more) {
+            break;
+        }
+        out[n++] = ' ';
+        s = e + SKIP_ONE;
+    }
+    if (out) {
+        out[n] = '\0';
+    }
+    return out;
+}
+
+/* A COPY / ADD in JSON form: its strings, expanded. */
+static int dk_copy_json(dk_t *d, const char *p, const char **out, int max) {
+    yyjson_doc *doc = yyjson_read(p, strlen(p), YYJSON_READ_STOP_WHEN_DONE);
+    yyjson_val *arr = doc ? yyjson_doc_get_root(doc) : NULL;
+    int n = 0;
+    yyjson_arr_iter it;
+    yyjson_val *v;
+    if (yyjson_is_arr(arr)) {
+        for (yyjson_arr_iter_init(arr, &it); n < max && (v = yyjson_arr_iter_next(&it));) {
+            const char *s = yyjson_get_str(v);
+            out[n++] = s ? dk_expand(d, d->local, cbm_arena_strdup(d->a, s)) : NULL;
+        }
+    }
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return n;
+}
+
+/* COPY / ADD as Docker reads it, from the instruction's own text: flags
+ * first, then the JSON form or whitespace-separated words (a heredoc
+ * source is unknown). The grammar loses a JSON form opening with `/`
+ * (otel accounting) and, after a word with trailing blanks, takes the
+ * instructions that follow for more words (awesome-compose wasmedge). */
 static void dk_copy(dk_t *d, TSNode ins) {
     static const char FROM[] = "--from=";
     const char *words[DK_MAX_WORDS];
     int nw = 0;
     dk_copy_t *c = cbm_arena_alloc(d->a, sizeof(*c));
-    if (c) {
-        *c = (dk_copy_t){.workdir = d->workdir};
+    char *p = dk_logical_line(d, ts_node_start_byte(ins));
+    if (!c || !p) {
+        return;
     }
-    for (uint32_t i = 0; i < ts_node_named_child_count(ins); i++) {
-        TSNode p = ts_node_named_child(ins, i);
-        if (dk_type(p, "path") && nw < DK_MAX_WORDS) {
-            const char *t = dk_text(d, p);
-            words[nw++] = t ? dk_expand(d, d->local, t) : NULL;
-            continue;
+    *c = (dk_copy_t){.workdir = d->workdir};
+    p += strcspn(p, " \t"); /* the keyword */
+    for (;;) {
+        p += strspn(p, " \t");
+        if (strncmp(p, "--", PAIR_LEN) != 0) {
+            break;
         }
-        if (dk_type(p, "json_string_array")) {
-            const char *raw[DK_MAX_WORDS];
-            int n = dk_json_array(d, p, raw, DK_MAX_WORDS - nw);
-            for (int k = 0; k < n; k++) {
-                words[nw++] = raw[k] ? dk_expand(d, d->local, raw[k]) : NULL;
-            }
-            continue;
-        }
-        if (!dk_type(p, "param")) {
-            continue;
-        }
-        const char *t = dk_text(d, p);
-        if (!t || strncmp(t, FROM, sizeof(FROM) - SKIP_ONE) != 0) {
-            continue;
-        }
-        const char *ref = dk_expand(d, d->local, t + sizeof(FROM) - SKIP_ONE);
-        if (c) {
+        size_t l = strcspn(p, " \t");
+        if (l > sizeof(FROM) - SKIP_ONE && strncmp(p, FROM, sizeof(FROM) - SKIP_ONE) == 0) {
+            const char *v =
+                cbm_arena_strndup(d->a, p + sizeof(FROM) - SKIP_ONE, l - (sizeof(FROM) - SKIP_ONE));
+            const char *ref = v ? dk_expand(d, d->local, v) : NULL;
             c->has_from = true;
             c->from = ref;
+            if (ref && ref[0] && !dk_is_stage(d, ref)) {
+                dk_link(d, ref, "copy-from", dk_line(ins));
+            }
         }
-        if (ref && ref[0] && !dk_is_stage(d, ref)) {
-            dk_link(d, ref, "copy-from", dk_line(ins));
-        }
+        p += l;
     }
-    if (!c || nw < PAIR_LEN || d->stage >= DK_MAX_STAGES) {
+    bool json = *p == '[' && (nw = dk_copy_json(d, p, words, DK_MAX_WORDS)) > 0;
+    while (!json && *p && nw < DK_MAX_WORDS) {
+        size_t l = strcspn(p, " \t");
+        const char *w = cbm_arena_strndup(d->a, p, l);
+        words[nw++] = w && strncmp(w, "<<", PAIR_LEN) != 0 ? dk_expand(d, d->local, w) : NULL;
+        p += l;
+        p += strspn(p, " \t");
+    }
+    if (nw < PAIR_LEN || d->stage >= DK_MAX_STAGES) {
         return;
     }
     c->srcs = cbm_arena_alloc(d->a, (size_t)(nw - SKIP_ONE) * sizeof(*c->srcs));
@@ -1148,6 +1216,199 @@ static void dk_envs(dk_t *d) {
     cbm_ht_free(seen);
 }
 
+/* ── The image's files (F1: the env join) ───────────────────────────── */
+
+static char *dk_read(const char *path, size_t *len);
+
+enum { DK_SET_CANDS = 2 };
+
+static bool dk_glob(const char *s) {
+    return strpbrk(s, "*?[") != NULL;
+}
+
+/* Context source `src` as a repository path under `ctx`; NULL when it climbs
+ * out of the repository. */
+static const char *dk_in_ctx(dk_t *d, const char *ctx, const char *src) {
+    while (*src == '/') {
+        src++;
+    }
+    const char *p = dk_norm(d, dk_join(d, ctx, src));
+    return p && strncmp(p, "..", PAIR_LEN) != 0 ? p : NULL;
+}
+
+static bool dk_exists(const dk_t *d, const char *p) {
+    return !p[0] || cbm_ht_get(d->ix->files, p) || (d->ix->dirs && cbm_ht_get(d->ix->dirs, p));
+}
+
+/* The stages the image is made of: the last, the stages each is built FROM
+ * and the stages each COPYs --from, transitively. */
+static void dk_image_stages(const dk_t *d, bool *in) {
+    in[d->stage] = true;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (int s = 0; s <= d->stage; s++) {
+            if (!in[s]) {
+                continue;
+            }
+            int p = d->st[s].parent;
+            if (p >= 0 && p < DK_MAX_STAGES && !in[p]) {
+                in[p] = grew = true;
+            }
+            for (const dk_copy_t *c = d->st[s].copies; c; c = c->next) {
+                int f = c->has_from ? dk_stage_of(d, c->from) : -1;
+                if (f >= 0 && f < DK_MAX_STAGES && !in[f]) {
+                    in[f] = grew = true;
+                }
+            }
+        }
+    }
+}
+
+/* Calls fn(d, src, ud) for each context source (no --from, no URL) the
+ * image's stages COPY / ADD. */
+static void dk_image_sources(dk_t *d, const bool *in, void (*fn)(dk_t *, const char *, void *),
+                             void *ud) {
+    for (int s = 0; s <= d->stage; s++) {
+        for (const dk_copy_t *c = in[s] ? d->st[s].copies : NULL; c; c = c->next) {
+            for (int k = 0; !c->has_from && k < c->nsrc; k++) {
+                if (c->srcs[k] && !strstr(c->srcs[k], "://")) {
+                    fn(d, c->srcs[k], ud);
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    const char *cands[DK_SET_CANDS];
+    int ncand;
+    int hits[DK_SET_CANDS];
+} dk_ctx_vote_t;
+
+/* A literal source that names something below the context votes for each
+ * candidate context it exists under. */
+static void dk_ctx_vote(dk_t *d, const char *src, void *ud) {
+    dk_ctx_vote_t *v = ud;
+    const char *n = dk_glob(src) ? NULL : dk_in_ctx(d, "", src);
+    for (int i = 0; n && n[0] && i < v->ncand; i++) {
+        const char *p = dk_in_ctx(d, v->cands[i], src);
+        v->hits[i] += p && dk_exists(d, p);
+    }
+}
+
+typedef struct {
+    const char *ctx;
+    const char *json; /* the array so far, without its closing ']' */
+    CBMHashTable *seen;
+} dk_json_list_t;
+
+static void dk_json_add(dk_t *d, dk_json_list_t *l, const char *item) {
+    if (!item || !l->json || cbm_ht_get(l->seen, item)) {
+        return;
+    }
+    cbm_ht_set(l->seen, item, (void *)item);
+    size_t cap = strlen(item) * PAIR_LEN + PAIR_LEN;
+    char *esc = cbm_arena_alloc(d->a, cap);
+    if (!esc) {
+        l->json = NULL;
+        return;
+    }
+    cbm_json_escape(esc, (int)cap, item);
+    l->json = cbm_arena_sprintf(d->a, "%s%s\"%s\"", l->json, l->json[SKIP_ONE] ? "," : "", esc);
+}
+
+static void dk_file_add(dk_t *d, const char *src, void *ud) {
+    dk_json_list_t *l = ud;
+    dk_json_add(d, l, dk_in_ctx(d, l->ctx, src));
+}
+
+/* The context's ignore file, as repository-path patterns ("!" kept):
+ * <Dockerfile>.dockerignore beside the Dockerfile first, else
+ * <context>/.dockerignore. */
+static void dk_ignore_add(dk_t *d, dk_json_list_t *l) {
+    const char *root = d->ctx->repo_path;
+    if (!root) {
+        return;
+    }
+    char path[CBM_SZ_4K];
+    size_t len = 0;
+    snprintf(path, sizeof(path), "%s/%s.dockerignore", root, d->file);
+    char *src = dk_read(path, &len);
+    if (!src) {
+        snprintf(path, sizeof(path), "%s/%s%s.dockerignore", root, l->ctx, l->ctx[0] ? "/" : "");
+        src = dk_read(path, &len);
+    }
+    for (char *line = src; line && *line;) {
+        char *end = strchr(line, '\n');
+        char *next = end ? end + SKIP_ONE : line + strlen(line);
+        if (end) {
+            *end = '\0';
+        }
+        char *s = line;
+        while (*s == ' ' || *s == '\t') {
+            s++;
+        }
+        size_t sl = strlen(s);
+        while (sl > 0 &&
+               (s[sl - SKIP_ONE] == ' ' || s[sl - SKIP_ONE] == '\t' || s[sl - SKIP_ONE] == '\r')) {
+            s[--sl] = '\0';
+        }
+        bool neg = s[0] == '!';
+        const char *pat = neg ? s + SKIP_ONE : s;
+        const char *p = s[0] && s[0] != '#' ? dk_in_ctx(d, l->ctx, pat) : NULL;
+        if (p && strcmp(p, l->ctx) != 0) {
+            dk_json_add(d, l, neg ? cbm_arena_sprintf(d->a, "!%s", p) : p);
+        }
+        line = next;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, src);
+}
+
+/* F1: the files the image is made of -- the context sources its stages COPY
+ * / ADD, resolved in the build context: the Dockerfile's directory or the
+ * repository root, the one more of the literal sources exist under (a tie:
+ * the directory) -- and the context's ignore patterns, kept on the
+ * Dockerfile's Module (image_context, image_files, image_ignore) for the env
+ * join, which reads them back in an incremental run. */
+static void dk_image_set(dk_t *d) {
+    cbm_gbuf_node_t *mod = (cbm_gbuf_node_t *)cbm_gbuf_find_by_id(d->ctx->gbuf, d->module);
+    if (!mod || d->stage < 0 || d->stage >= DK_MAX_STAGES) {
+        return;
+    }
+    bool in[DK_MAX_STAGES] = {false};
+    dk_image_stages(d, in);
+    dk_ctx_vote_t v = {.cands = {d->dir, ""}, .ncand = d->dir[0] ? DK_SET_CANDS : SKIP_ONE};
+    dk_image_sources(d, in, dk_ctx_vote, &v);
+    const char *ctx = v.ncand > SKIP_ONE && v.hits[SKIP_ONE] > v.hits[0] ? "" : d->dir;
+    dk_json_list_t files = {.ctx = ctx, .json = "[", .seen = cbm_ht_create(0)};
+    dk_json_list_t ignore = {.ctx = ctx, .json = "[", .seen = cbm_ht_create(0)};
+    if (files.seen && ignore.seen) {
+        dk_image_sources(d, in, dk_file_add, &files);
+        dk_ignore_add(d, &ignore);
+    }
+    const char *props =
+        mod->properties_json && mod->properties_json[0] ? mod->properties_json : "{}";
+    size_t pl = strlen(props);
+    if (files.seen && ignore.seen && files.json && files.json[SKIP_ONE] && ignore.json &&
+        pl >= PAIR_LEN && props[pl - SKIP_ONE] == '}') {
+        char cesc[CBM_SZ_4K];
+        cbm_json_escape(cesc, (int)sizeof(cesc), ctx);
+        bool empty = strspn(props + SKIP_ONE, " \t\r\n") == pl - PAIR_LEN;
+        const char *out = cbm_arena_sprintf(
+            d->a, "%.*s%s\"image_context\":\"%s\",\"image_files\":%s],\"image_ignore\":%s]}",
+            (int)(pl - SKIP_ONE), props, empty ? "" : ",", cesc, files.json, ignore.json);
+        if (out) {
+            (void)cbm_gbuf_node_set_properties_json(mod, out);
+        }
+    }
+    if (files.seen) {
+        cbm_ht_free(files.seen);
+    }
+    if (ignore.seen) {
+        cbm_ht_free(ignore.seen);
+    }
+}
+
 static void dk_file(dk_t *d, TSNode root) {
     for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
         TSNode ins = ts_node_named_child(root, i);
@@ -1172,6 +1433,7 @@ static void dk_file(dk_t *d, TSNode root) {
     }
     dk_spawn(d);
     dk_envs(d);
+    dk_image_set(d);
 }
 
 static char *dk_read(const char *path, size_t *len) {
@@ -1313,9 +1575,30 @@ static void dk_compose_edge(dk_compose_t *c, int64_t src, int64_t tgt, const cha
     }
 }
 
+/* The services of the same file a service's environment addresses:
+ * CONNECTS_TO {via:env, key, container} -- the variable, never its value. */
+static void dk_compose_connects(dk_compose_t *c, const cbm_compose_service_t *s, int64_t self) {
+    for (int i = 0; s->env_hosts && i < s->nenv; i++) {
+        const char *hq = s->env_hosts[i] ? dk_compose_qn(c, s->env_hosts[i]) : NULL;
+        const cbm_gbuf_node_t *to = hq ? cbm_gbuf_find_by_qn(c->ctx->gbuf, hq) : NULL;
+        if (!to) {
+            continue;
+        }
+        char kesc[CBM_SZ_256];
+        char sesc[CBM_SZ_256];
+        cbm_json_escape(kesc, (int)sizeof(kesc), s->env[i]);
+        cbm_json_escape(sesc, (int)sizeof(sesc), s->name);
+        char props[CBM_SZ_1K];
+        snprintf(props, sizeof(props), "{\"via\":\"env\",\"key\":\"%s\",\"container\":\"%s\"}",
+                 kesc, sesc);
+        dk_compose_edge(c, self, to->id, "CONNECTS_TO", props);
+    }
+}
+
 /* A compose service: a Resource {ecosystem:compose, kind:Service} the file
  * DEFINES; it DEPENDS_ON the services it depends on / links, USAGE
- * {ref:image} its image and DEPENDS_ON {via:build} the Dockerfile it builds. */
+ * {ref:image} its image, DEPENDS_ON {via:build} the Dockerfile it builds and
+ * CONNECTS_TO the services its environment addresses. */
 static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
     dk_compose_t *c = ud;
     const char *qn = dk_compose_qn(c, s->name);
@@ -1350,6 +1633,7 @@ static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
         const cbm_gbuf_node_t *dep = dq ? cbm_gbuf_find_by_qn(c->ctx->gbuf, dq) : NULL;
         dk_compose_edge(c, self->id, dep ? dep->id : 0, "DEPENDS_ON", "{\"via\":\"depends_on\"}");
     }
+    dk_compose_connects(c, s, self->id);
     if (s->image) {
         char esc[CBM_SZ_1K];
         cbm_json_escape(esc, (int)sizeof(esc), s->image);
@@ -1427,17 +1711,32 @@ static bool dk_node_before(const cbm_gbuf_node_t *a, const cbm_gbuf_node_t *b) {
     return c < 0 || (c == 0 && a->start_line < b->start_line);
 }
 
-/* The repository's File nodes by path, and the `main` of each Go main
- * package by directory (the first by file and line). */
+/* Every directory above repository path `p` into `dirs`. */
+static void dk_index_dirs(CBMArena *a, CBMHashTable *dirs, const char *p) {
+    for (const char *s = strchr(p, '/'); s; s = strchr(s + SKIP_ONE, '/')) {
+        char *dir = cbm_arena_strndup(a, p, (size_t)(s - p));
+        if (!dir || cbm_ht_get(dirs, dir)) {
+            continue;
+        }
+        cbm_ht_set(dirs, dir, dir);
+    }
+}
+
+/* The repository's File nodes by path, its directories, and the `main` of
+ * each Go main package by directory (the first by file and line). */
 static void dk_index_build(cbm_pipeline_ctx_t *ctx, CBMArena *a, dk_index_t *ix) {
     ix->files = cbm_ht_create(0);
     ix->gomain = cbm_ht_create(0);
+    ix->dirs = cbm_ht_create(0);
     const cbm_gbuf_node_t **nodes = NULL;
     int n = 0;
     if (ix->files && cbm_gbuf_find_by_label(ctx->gbuf, "File", &nodes, &n) == 0) {
         for (int i = 0; i < n; i++) {
             if (nodes[i]->file_path) {
                 cbm_ht_set(ix->files, nodes[i]->file_path, (void *)nodes[i]);
+                if (ix->dirs) {
+                    dk_index_dirs(a, ix->dirs, nodes[i]->file_path);
+                }
             }
         }
     }
@@ -1767,7 +2066,7 @@ static int dk_hub_match(const char *tag, const char *const *comps, int nc) {
 }
 
 /* The Image of a component: `<repo>:<pattern>` (`*-frontend`: the
- * prefix's version masked) {repository, component, tag_pattern}. */
+ * prefix's version masked) {repository, registry, component, tag_pattern}. */
 static int64_t dk_hub_image(cbm_pipeline_ctx_t *ctx, const char *repo, const char *comp,
                             char pre_sep, char suf_sep) {
     char head[PAIR_LEN + SKIP_ONE] = {0};
@@ -1786,16 +2085,24 @@ static int64_t dk_hub_image(cbm_pipeline_ctx_t *ctx, const char *repo, const cha
     snprintf(pattern, sizeof(pattern), "%s%s%s", head, comp, tail);
     snprintf(name, sizeof(name), "%s:%s", repo, pattern);
     snprintf(qn, sizeof(qn), "__image__%s", name);
+    char same[CBM_SZ_1K];
+    char reg[CBM_SZ_512];
+    if (!dk_normalize(repo, same, sizeof(same), reg, sizeof(reg))) {
+        snprintf(reg, sizeof(reg), "%s", DK_REGISTRY_UNKNOWN);
+    }
     char esc_r[CBM_SZ_1K];
+    char esc_g[CBM_SZ_1K];
     char esc_c[CBM_SZ_1K];
     char esc_p[CBM_SZ_1K];
     cbm_json_escape(esc_r, (int)sizeof(esc_r), repo);
+    cbm_json_escape(esc_g, (int)sizeof(esc_g), reg);
     cbm_json_escape(esc_c, (int)sizeof(esc_c), comp);
     cbm_json_escape(esc_p, (int)sizeof(esc_p), pattern);
     char props[CBM_SZ_4K];
     snprintf(props, sizeof(props),
-             "{\"repository\":\"%s\",\"component\":\"%s\",\"tag_pattern\":\"%s\"}", esc_r, esc_c,
-             esc_p);
+             "{\"repository\":\"%s\",\"registry\":\"%s\",\"component\":\"%s\","
+             "\"tag_pattern\":\"%s\"}",
+             esc_r, esc_g, esc_c, esc_p);
     return cbm_gbuf_upsert_node(ctx->gbuf, "Image", name, qn, "", 0, 0, props);
 }
 
@@ -1962,6 +2269,9 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
     }
     if (ix.gomain) {
         cbm_ht_free(ix.gomain);
+    }
+    if (ix.dirs) {
+        cbm_ht_free(ix.dirs);
     }
     edges += dk_link_builds(ctx, &arena);
     edges += dk_image_hubs(ctx, &arena);

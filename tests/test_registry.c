@@ -1965,6 +1965,172 @@ TEST(registry_python_scope_qualified_terminal_bucket_uncapped) {
     PASS();
 }
 
+/* #1548: a Python def or class declared in a function body is a local of it.
+ * It is registered for exact lookups but kept out of the short-name index, so
+ * no weak strategy offers it to a caller elsewhere. A class nested in a class
+ * (proj.m.Outer.Inner) is an attribute, not a local, and stays nameable; so
+ * does the same QN shape from another language. */
+TEST(registry_python_function_local_is_exact_only_issue1548) {
+    cbm_registry_t *r = cbm_registry_new();
+    const size_t web = strlen("proj.web"); /* symbol prefix of web.py */
+    static const char *const defs[][3] = {
+        {"create_app", "proj.web.create_app", "Function"},
+        {"index", "proj.web.create_app.index", "Function"},
+        {"Settings", "proj.web.create_app.Settings", "Class"},
+        {"value", "proj.web.create_app.Settings.value", "Method"},
+        {"Outer", "proj.web.Outer", "Class"},
+        {"Inner", "proj.web.Outer.Inner", "Class"},
+    };
+    for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
+        cbm_registry_add_lang_in_module(r, defs[i][0], defs[i][1], defs[i][2], CBM_LANG_PYTHON,
+                                        web);
+    }
+    cbm_registry_add_lang_in_module(r, "f", "proj.ts.f", "Function", CBM_LANG_TYPESCRIPT,
+                                    strlen("proj.ts"));
+    cbm_registry_add_lang_in_module(r, "g", "proj.ts.f.g", "Function", CBM_LANG_TYPESCRIPT,
+                                    strlen("proj.ts"));
+
+    static const char *const local[] = {"proj.web.create_app.index", "proj.web.create_app.Settings",
+                                        "proj.web.create_app.Settings.value"};
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(cbm_registry_exists(r, local[i]));
+        ASSERT_TRUE(cbm_registry_qn_is_function_local(r, local[i], web));
+        const char *simple = strrchr(local[i], '.') + 1;
+        const char **out = NULL;
+        int count = -1;
+        cbm_registry_find_by_name(r, simple, &out, &count);
+        ASSERT_EQ(count, 0);
+    }
+    static const char *const nameable[][2] = {{"create_app", "proj.web.create_app"},
+                                              {"Inner", "proj.web.Outer.Inner"},
+                                              {"g", "proj.ts.f.g"}};
+    for (int i = 0; i < 3; i++) {
+        const char **out = NULL;
+        int count = 0;
+        cbm_registry_find_by_name(r, nameable[i][0], &out, &count);
+        ASSERT_EQ(count, 1);
+        ASSERT_STR_EQ(out[0], nameable[i][1]);
+    }
+    ASSERT_FALSE(cbm_registry_qn_is_function_local(r, "proj.web.Outer.Inner", web));
+    /* No module prefix: no local detection. */
+    ASSERT_FALSE(cbm_registry_qn_is_function_local(r, "proj.web.create_app.index", 0));
+    /* A weak strategy cannot reach the local; before, index() anywhere in
+     * the project resolved to it by unique_name. */
+    cbm_resolution_t res = cbm_registry_resolve(r, "index", "proj.other", NULL, NULL, 0);
+    ASSERT_NULL(res.qualified_name);
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Python LEGB for bare names: the caller's own def first, then each enclosing
+ * def outward; a class body is not a scope its methods see; the module is left
+ * to the other strategies. A dotted callee is not a bare name. */
+TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548) {
+    cbm_registry_t *r = cbm_registry_new();
+    static const char *const defs[][3] = {
+        {"Tree", "proj.m.Tree", "Class"},
+        {"visit", "proj.m.Tree.visit", "Method"},
+        {"visit", "proj.m.Tree.visit.visit", "Function"},
+        {"helper", "proj.m.Tree.helper", "Method"},
+        {"factory", "proj.m.factory", "Function"},
+        {"helper", "proj.m.factory.helper", "Function"},
+        {"Local", "proj.m.factory.Local", "Class"},
+        {"run", "proj.m.factory.Local.run", "Method"},
+        {"top", "proj.m.top", "Function"},
+    };
+    for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
+        cbm_registry_add_lang_in_module(r, defs[i][0], defs[i][1], defs[i][2], CBM_LANG_PYTHON,
+                                        strlen("proj.m"));
+    }
+
+    /* In method Tree.visit, `visit` is its nested def; so it is inside that
+     * nested def (its own recursion). */
+    cbm_resolution_t res = cbm_registry_resolve_lexical(r, "visit", "proj.m.Tree.visit", "proj.m");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.Tree.visit.visit");
+    ASSERT_STR_EQ(res.strategy, "lexical_scope");
+    res = cbm_registry_resolve_lexical(r, "visit", "proj.m.Tree.visit.visit", "proj.m");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.Tree.visit.visit");
+    /* The class body is skipped: Tree.helper is not a bare name in a method. */
+    res = cbm_registry_resolve_lexical(r, "helper", "proj.m.Tree.visit.visit", "proj.m");
+    ASSERT_NULL(res.qualified_name);
+    /* A method of a local class sees the def enclosing its class. */
+    res = cbm_registry_resolve_lexical(r, "helper", "proj.m.factory.Local.run", "proj.m");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.factory.helper");
+    res = cbm_registry_resolve_lexical(r, "Local", "proj.m.factory", "proj.m");
+    ASSERT_STR_EQ(res.qualified_name, "proj.m.factory.Local");
+    /* Module-level names and dotted callees are not this strategy's. */
+    res = cbm_registry_resolve_lexical(r, "top", "proj.m.factory", "proj.m");
+    ASSERT_NULL(res.qualified_name);
+    res = cbm_registry_resolve_lexical(r, "self.helper", "proj.m.factory", "proj.m");
+    ASSERT_NULL(res.qualified_name);
+    res = cbm_registry_resolve_lexical(r, "helper", "proj.m", "proj.m");
+    ASSERT_NULL(res.qualified_name);
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* A package __init__.py function can share a submodule's QN: poetry's
+ * layouts/__init__.py `def layout` is proj.pkg.layout, the QN prefix of every
+ * symbol in layouts/layout.py. Bounded at its own file, class Layout and its
+ * methods are no locals of that function, in either registration order (full
+ * index: discovery order; incremental: node-id order), and the lexical walk of
+ * a caller in layout.py never enters the __init__ function. */
+TEST(registry_python_local_bound_at_own_file_issue1548) {
+    const size_t init_prefix = strlen("proj.pkg");      /* pkg/__init__.py */
+    const size_t mod_prefix = strlen("proj.pkg.layout"); /* pkg/layout.py */
+    for (int order = 0; order < 2; order++) {
+        cbm_registry_t *r = cbm_registry_new();
+        if (order == 0) {
+            cbm_registry_add_lang_in_module(r, "layout", "proj.pkg.layout", "Function",
+                                            CBM_LANG_PYTHON, init_prefix);
+        }
+        cbm_registry_add_lang_in_module(r, "Layout", "proj.pkg.layout.Layout", "Class",
+                                        CBM_LANG_PYTHON, mod_prefix);
+        cbm_registry_add_lang_in_module(r, "create", "proj.pkg.layout.Layout.create", "Method",
+                                        CBM_LANG_PYTHON, mod_prefix);
+        cbm_registry_add_lang_in_module(r, "make", "proj.pkg.layout.make", "Function",
+                                        CBM_LANG_PYTHON, mod_prefix);
+        if (order == 1) {
+            cbm_registry_add_lang_in_module(r, "layout", "proj.pkg.layout", "Function",
+                                            CBM_LANG_PYTHON, init_prefix);
+        }
+        static const char *const nameable[][2] = {{"Layout", "proj.pkg.layout.Layout"},
+                                                  {"create", "proj.pkg.layout.Layout.create"},
+                                                  {"make", "proj.pkg.layout.make"}};
+        for (size_t i = 0; i < sizeof(nameable) / sizeof(nameable[0]); i++) {
+            const char **out = NULL;
+            int count = 0;
+            cbm_registry_find_by_name(r, nameable[i][0], &out, &count);
+            ASSERT_EQ(count, 1);
+            ASSERT_STR_EQ(out[0], nameable[i][1]);
+            ASSERT_FALSE(cbm_registry_qn_is_function_local(r, nameable[i][1], mod_prefix));
+        }
+        /* `Layout()` in layout.py's make(): no lexical local; module strategies own it. */
+        cbm_resolution_t res =
+            cbm_registry_resolve_lexical(r, "Layout", "proj.pkg.layout.make", "proj.pkg.layout");
+        ASSERT_NULL(res.qualified_name);
+        cbm_registry_free(r);
+    }
+    PASS();
+}
+
+/* The prefix every def of a file carries, without allocating; the same as
+ * cbm_pipeline_fqn_compute(project, path, name) minus ".name". */
+TEST(fqn_symbol_prefix_len_matches_fqn_compute) {
+    static const char *const paths[] = {"pkg/layout.py", "pkg/__init__.py", "a.py",
+                                        "deep/x/y/mod.py", "web/index.py", "noext"};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        char *qn = cbm_pipeline_fqn_compute("proj", paths[i], "sym");
+        ASSERT_NOT_NULL(qn);
+        size_t want = strlen(qn) - strlen(".sym");
+        free(qn);
+        ASSERT_EQ(cbm_pipeline_fqn_symbol_prefix_len("proj", paths[i]), want);
+    }
+    ASSERT_EQ(cbm_pipeline_fqn_symbol_prefix_len("proj", "pkg/__init__.py"), strlen("proj.pkg"));
+    ASSERT_EQ(cbm_pipeline_fqn_symbol_prefix_len(NULL, "a.py"), 0);
+    PASS();
+}
+
 SUITE(registry) {
     RUN_TEST(python_symbol_scope_len_preserves_file_identity);
     RUN_TEST(registry_python_package_scope_is_explicit);
@@ -2069,4 +2235,8 @@ SUITE(registry) {
     RUN_TEST(python_import_binding_contradicts_only_foreign_chains);
     RUN_TEST(python_external_base_contradicts_django_shapes);
     RUN_TEST(weak_call_guards_share_one_drop_list);
+    RUN_TEST(registry_python_function_local_is_exact_only_issue1548);
+    RUN_TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548);
+    RUN_TEST(registry_python_local_bound_at_own_file_issue1548);
+    RUN_TEST(fqn_symbol_prefix_len_matches_fqn_compute);
 }

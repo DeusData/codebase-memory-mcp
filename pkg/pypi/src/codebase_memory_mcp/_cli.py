@@ -1,6 +1,5 @@
 """Downloads codebase-memory-mcp on first run, then runs its native entry point."""
 
-import collections
 import errno
 import hashlib
 import json
@@ -39,26 +38,19 @@ _WINDOWS_ARCHIVE_NAMES = (
 # file://, ftp://, and custom schemes — a redirect or tainted URL source
 # could otherwise turn a download into an arbitrary-local-file read.
 _ALLOWED_SCHEMES = frozenset({"https"})
+# install.sh's loopback pattern: plain HTTP only to an exact loopback
+# authority, for local smoke tests (CBM_DOWNLOAD_URL).
+_LOOPBACK_HTTP_URL = re.compile(
+    r"http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?([/?#].*)?"
+)
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 _MAX_REDIRECTS = 5
 _NETWORK_TIMEOUT_SECONDS = 120
 _CANDIDATE_TIMEOUT_SECONDS = 15
-_MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024
-# Release archive resource limits. Keep in sync with the Go wrapper
-# (pkg/go/cmd/codebase-memory-mcp/main.go) and the npm wrapper (install.js).
-_MAX_RELEASE_ARCHIVE_BYTES = 256 * 1024 * 1024
+# Entry-count guard for the archive namespace check. Keep in sync with the
+# Go wrapper (pkg/go/cmd/codebase-memory-mcp/main.go) and the npm wrapper.
 _MAX_ARCHIVE_MEMBERS = 64
-_MAX_ARCHIVE_MEMBER_BYTES = 256 * 1024 * 1024
-_MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024
 _ARCHIVE_COPY_CHUNK_BYTES = 64 * 1024
-_ArchiveLimits = collections.namedtuple(
-    "_ArchiveLimits", "compressed_bytes members member_bytes expanded_bytes"
-)
-_DEFAULT_ARCHIVE_LIMITS = _ArchiveLimits(
-    compressed_bytes=_MAX_RELEASE_ARCHIVE_BYTES,
-    members=_MAX_ARCHIVE_MEMBERS,
-    member_bytes=_MAX_ARCHIVE_MEMBER_BYTES,
-    expanded_bytes=_MAX_ARCHIVE_EXPANDED_BYTES,
-)
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 _RUNTIME_LOCK_NAME = ".codebase-memory-mcp-runtime.lock"
 _RUNTIME_LOCK_WAIT_SECONDS = 45
@@ -79,13 +71,50 @@ _runtime_lock_claim_observer = None
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Expose redirects to _download_https for explicit per-hop validation."""
+    """Expose redirects to _download_file for explicit per-hop validation."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
 _HTTPS_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+# A loopback fetch never goes through a proxy.
+_LOOPBACK_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+)
+
+
+def _download_base(version: str, environ=None):
+    """Return (base, loopback) for release downloads.
+
+    CBM_DOWNLOAD_URL replaces the release download base (for testing), with
+    install.sh's policy: HTTPS, or plain HTTP to an exact loopback authority.
+    """
+    env = os.environ if environ is None else environ
+    override = env.get("CBM_DOWNLOAD_URL")
+    if not override:
+        return f"https://github.com/{REPO}/releases/download/v{version}", False
+    if override.startswith("https://"):
+        return override, False
+    if _LOOPBACK_HTTP_URL.fullmatch(override):
+        return override, True
+    sys.exit(
+        f"codebase-memory-mcp: refusing non-HTTPS download URL "
+        f"(CBM_DOWNLOAD_URL): {override}"
+    )
+
+
+def _validate_loopback_url(url: str) -> None:
+    """Reject anything but plain HTTP to an exact loopback authority."""
+    parsed = urllib.parse.urlparse(url)
+    if (
+        not _LOOPBACK_HTTP_URL.fullmatch(url)
+        or parsed.scheme != "http"
+        or parsed.hostname not in _LOOPBACK_HOSTNAMES
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        sys.exit(f"codebase-memory-mcp: refusing non-loopback HTTP URL: {url}")
 
 
 def _validate_url_scheme(url: str) -> None:
@@ -103,23 +132,33 @@ def _validate_url_scheme(url: str) -> None:
         )
 
 
-def _download_https(url: str, dest: str, max_bytes: int = 0) -> None:
-    """Download through a bounded HTTPS-only opener into dest."""
+def _validate_download_url(url: str, loopback: bool) -> None:
+    if loopback:
+        _validate_loopback_url(url)
+    else:
+        _validate_url_scheme(url)
+
+
+def _download_file(url: str, dest: str, loopback: bool = False) -> None:
+    """Download into dest: HTTPS with checked redirects, or one loopback hop."""
+    opener = _LOOPBACK_OPENER if loopback else _HTTPS_OPENER
     current_url = url
     for redirect_count in range(_MAX_REDIRECTS + 1):
-        _validate_url_scheme(current_url)
+        _validate_download_url(current_url, loopback)
         request = urllib.request.Request(
             current_url, headers={"User-Agent": "codebase-memory-mcp-installer"}
         )
         try:
-            response = _HTTPS_OPENER.open(
-                request, timeout=_NETWORK_TIMEOUT_SECONDS
-            )
+            response = opener.open(request, timeout=_NETWORK_TIMEOUT_SECONDS)
         except urllib.error.HTTPError as exc:
             if exc.code not in _REDIRECT_CODES:
                 raise
             location = exc.headers.get("Location")
             exc.close()
+            if loopback:
+                raise RuntimeError(
+                    f"refusing redirect from loopback download: {current_url}"
+                )
             if not location:
                 raise RuntimeError(f"redirect has no Location: {current_url}")
             if redirect_count == _MAX_REDIRECTS:
@@ -129,18 +168,8 @@ def _download_https(url: str, dest: str, max_bytes: int = 0) -> None:
             continue
 
         with response:
-            _validate_url_scheme(response.geturl())
-            declared = (response.headers.get("Content-Length") or "").strip()
-            # Only plain ASCII digits are a length (str.isdigit also accepts
-            # characters that int() rejects); anything else is left to the
-            # byte counter below.
-            if max_bytes and re.fullmatch(r"[0-9]+", declared):
-                if int(declared) > max_bytes:
-                    raise RuntimeError(
-                        f"download exceeds the {max_bytes}-byte safety limit"
-                    )
+            _validate_download_url(response.geturl(), loopback)
             deadline = time.monotonic() + _NETWORK_TIMEOUT_SECONDS
-            total = 0
             try:
                 with open(dest, "wb") as out:
                     while True:
@@ -151,12 +180,6 @@ def _download_https(url: str, dest: str, max_bytes: int = 0) -> None:
                         chunk = response.read(65536)
                         if not chunk:
                             return
-                        total += len(chunk)
-                        if max_bytes and total > max_bytes:
-                            raise RuntimeError(
-                                f"download exceeds the {max_bytes}-byte "
-                                f"safety limit"
-                            )
                         out.write(chunk)
             except BaseException:
                 # Never leave a partial download behind for a later step to
@@ -236,106 +259,51 @@ def _validate_archive_names(names, archive_names, casefold: bool = False):
         )
 
 
-def _validate_archive_limits(limits) -> None:
-    if (
-        limits.compressed_bytes <= 0
-        or limits.members <= 0
-        or limits.member_bytes <= 0
-        or limits.expanded_bytes <= 0
-    ):
-        sys.exit("codebase-memory-mcp: invalid archive resource safety limits")
-
-
-def _require_compressed_archive_within_limit(archive_path: str, limits) -> None:
-    status = os.stat(archive_path)
-    if not stat.S_ISREG(status.st_mode):
+def _require_regular_archive(archive_path: str) -> None:
+    if not stat.S_ISREG(os.stat(archive_path).st_mode):
         sys.exit("codebase-memory-mcp: release archive is not a regular file")
-    if status.st_size > limits.compressed_bytes:
-        sys.exit(
-            f"codebase-memory-mcp: release archive exceeds the "
-            f"{limits.compressed_bytes}-byte compressed safety limit"
-        )
 
 
-def _require_member_count_within_limit(count: int, limits) -> None:
-    if count > limits.members:
+def _require_member_count_within_limit(count: int, max_members: int) -> None:
+    if count > max_members:
         sys.exit(
-            f"codebase-memory-mcp: archive exceeds the {limits.members}-member "
+            f"codebase-memory-mcp: archive exceeds the {max_members}-member "
             f"safety limit"
         )
 
 
-def _account_declared_archive_member(
-    name: str, size: int, declared_expanded: int, limits
-) -> int:
-    """Check one member's declared size; return the new declared total."""
+def _require_declared_size(name: str, size: int) -> None:
     if size < 0:
         sys.exit(
             f"codebase-memory-mcp: archive member has a negative declared "
             f"size: {name!r}"
         )
-    if size > limits.member_bytes:
-        sys.exit(
-            f"codebase-memory-mcp: archive member {name!r} exceeds the "
-            f"{limits.member_bytes}-byte expanded safety limit"
-        )
-    if declared_expanded > limits.expanded_bytes - size:
-        sys.exit(
-            f"codebase-memory-mcp: archive exceeds the {limits.expanded_bytes}-byte "
-            f"aggregate expanded safety limit"
-        )
-    return declared_expanded + size
 
 
-def _copy_archive_member_within_limits(
-    source, output, name: str, declared_size: int, actual_expanded: int, limits
-) -> int:
-    """Copy a member while counting bytes; return the new actual total.
+def _copy_archive_member(source, output, name: str, declared_size: int) -> int:
+    """Copy a member, then require the declared size; return the bytes copied.
 
-    Reads stop one byte past the smaller of the member and remaining aggregate
-    limits, so a member that yields more than it declares can never fill the
-    disk. The caller removes the target on failure.
+    The caller removes the target on failure.
     """
-    remaining = limits.expanded_bytes - actual_expanded
-    copy_limit = min(limits.member_bytes, remaining)
     copied = 0
     while True:
-        wanted = min(_ARCHIVE_COPY_CHUNK_BYTES, copy_limit + 1 - copied)
-        if wanted <= 0:
-            break
-        chunk = source.read(wanted)
+        chunk = source.read(_ARCHIVE_COPY_CHUNK_BYTES)
         if not chunk:
             break
         copied += len(chunk)
-        if copied > copy_limit:
-            break
         output.write(chunk)
-    if copied > limits.member_bytes:
-        sys.exit(
-            f"codebase-memory-mcp: archive member {name!r} exceeds the "
-            f"{limits.member_bytes}-byte actual expanded safety limit"
-        )
-    if copied > remaining:
-        sys.exit(
-            f"codebase-memory-mcp: archive exceeds the {limits.expanded_bytes}-byte "
-            f"aggregate actual expanded safety limit"
-        )
     if copied != declared_size:
         sys.exit(
             f"codebase-memory-mcp: archive member {name!r} actual size {copied} "
             f"does not match declared size {declared_size}"
         )
-    return actual_expanded + copied
+    return copied
 
 
-def _write_archive_member_within_limits(
-    source, target: str, name: str, declared_size: int, actual_expanded: int, limits
-) -> int:
+def _write_archive_member(source, target: str, name: str, declared_size: int) -> int:
     try:
         with open(target, "xb") as output:
-            return _copy_archive_member_within_limits(
-                source, output, name, declared_size, actual_expanded, limits
-            )
+            return _copy_archive_member(source, output, name, declared_size)
     except BaseException:
         _remove_quietly(target)
         raise
@@ -347,36 +315,29 @@ def _safe_extract_tar(
     archive_names=(),
     extract_names=(),
     ui: bool = False,
-    limits=_DEFAULT_ARCHIVE_LIMITS,
+    max_members: int = _MAX_ARCHIVE_MEMBERS,
 ):
     """Validate a tar namespace, then extract only its authenticated runtime set."""
-    _validate_archive_limits(limits)
     members = tf.getmembers()
-    _require_member_count_within_limit(len(members), limits)
-    declared_expanded = 0
+    _require_member_count_within_limit(len(members), max_members)
     for member in members:
         if not member.isfile():
             sys.exit(
                 f"codebase-memory-mcp: refusing unsafe tar entry "
                 f"(not a regular root file: {member.name!r})"
             )
-        declared_expanded = _account_declared_archive_member(
-            member.name, member.size, declared_expanded, limits
-        )
+        _require_declared_size(member.name, member.size)
     _validate_archive_names([member.name for member in members], archive_names)
     runtime_names = list(extract_names)
     by_name = {member.name: member for member in members}
     dest_abs = os.path.abspath(dest)
-    actual_expanded = 0
     for name in runtime_names:
         source = tf.extractfile(by_name[name])
         if source is None:
             sys.exit(f"codebase-memory-mcp: could not read archive member: {name}")
         target = os.path.join(dest_abs, name)
         with source:
-            actual_expanded = _write_archive_member_within_limits(
-                source, target, name, by_name[name].size, actual_expanded, limits
-            )
+            _write_archive_member(source, target, name, by_name[name].size)
     return tuple(runtime_names)
 
 
@@ -386,7 +347,7 @@ def _safe_extract_zip(
     archive_names=(),
     extract_names=(),
     ui: bool = False,
-    limits=_DEFAULT_ARCHIVE_LIMITS,
+    max_members: int = _MAX_ARCHIVE_MEMBERS,
 ):
     """Extract a zipfile after validating its Windows-style namespace.
 
@@ -394,16 +355,12 @@ def _safe_extract_zip(
     members before extraction prevents archive order from selecting the binary
     that a portable package-manager shim eventually executes.
     """
-    _validate_archive_limits(limits)
     dest_abs = os.path.abspath(dest)
     names = []
     infos = zf.infolist()
-    _require_member_count_within_limit(len(infos), limits)
-    declared_expanded = 0
+    _require_member_count_within_limit(len(infos), max_members)
     for info in infos:
-        declared_expanded = _account_declared_archive_member(
-            info.filename, info.file_size, declared_expanded, limits
-        )
+        _require_declared_size(info.filename, info.file_size)
         raw_name = info.filename
         name = raw_name.replace("\\", "/")
         segments_name = name[:-1] if name.endswith("/") else name
@@ -437,30 +394,24 @@ def _safe_extract_zip(
     # Extract only the validated runtime files. This avoids relying on
     # platform-specific zip path rewriting and always creates regular files.
     runtime_names = list(extract_names)
-    actual_expanded = 0
     for name in runtime_names:
         target = os.path.join(dest_abs, name)
         with zf.open(name) as source:
-            actual_expanded = _write_archive_member_within_limits(
-                source,
-                target,
-                name,
-                zf.getinfo(name).file_size,
-                actual_expanded,
-                limits,
-            )
+            _write_archive_member(source, target, name, zf.getinfo(name).file_size)
     return tuple(runtime_names)
 
 
-def _verify_checksum(archive_path: str, archive_name: str, version: str) -> None:
-    """Verify SHA256 checksum against checksums.txt from the release."""
-    url = f"https://github.com/{REPO}/releases/download/v{version}/checksums.txt"
+def _verify_checksum(
+    archive_path: str, archive_name: str, base: str, loopback: bool = False
+) -> None:
+    """Verify SHA256 checksum against checksums.txt from the same base."""
+    url = f"{base}/checksums.txt"
     tmp_path = None
     try:
-        _validate_url_scheme(url)
+        _validate_download_url(url, loopback)
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
             tmp_path = tmp.name
-        _download_https(url, tmp_path, _MAX_CHECKSUM_MANIFEST_BYTES)
+        _download_file(url, tmp_path, loopback)
         expected = None
         with open(tmp_path, encoding="utf-8") as f:
             for line in f:
@@ -517,7 +468,7 @@ def _version() -> str:
         from importlib.metadata import version
         return version("codebase-memory-mcp")
     except Exception:
-        return "0.11.0"
+        return "0.12.1"
 
 
 def _os_name() -> str:
@@ -1344,8 +1295,9 @@ def _download(version: str) -> Path:
     # have no such variant. Keep in sync with install.sh / install.js / cli.c.
     portable = "-portable" if os_name == "linux" else ""
     archive = f"codebase-memory-mcp-{os_name}-{arch}{portable}.{ext}"
-    url = f"https://github.com/{REPO}/releases/download/v{version}/{archive}"
-    _validate_url_scheme(url)
+    base, loopback = _download_base(version)
+    url = f"{base}/{archive}"
+    _validate_download_url(url, loopback)
 
     dest = _bin_path(version)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1358,7 +1310,7 @@ def _download(version: str) -> Path:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_archive = os.path.join(tmp, f"cbm.{ext}")
         try:
-            _download_https(url, tmp_archive, _MAX_RELEASE_ARCHIVE_BYTES)
+            _download_file(url, tmp_archive, loopback)
         except (OSError, RuntimeError, urllib.error.URLError) as e:
             sys.exit(
                 f"codebase-memory-mcp: download failed ({e})\n"
@@ -1366,10 +1318,8 @@ def _download(version: str) -> Path:
                 f"See https://github.com/{REPO}/releases for available versions."
             )
 
-        _verify_checksum(tmp_archive, archive, version)
-        _require_compressed_archive_within_limit(
-            tmp_archive, _DEFAULT_ARCHIVE_LIMITS
-        )
+        _verify_checksum(tmp_archive, archive, base, loopback)
+        _require_regular_archive(tmp_archive)
 
         bin_name = (
             _WINDOWS_BINARY_NAME if os_name == "windows" else "codebase-memory-mcp"

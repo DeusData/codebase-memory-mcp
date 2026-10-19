@@ -847,6 +847,91 @@ TEST(parallel_args_json_no_overflow) {
     PASS();
 }
 
+/* F14: a definition's properties buffer was sized for its docstring and variants
+ * only. A wide signature (50 annotated parameters) filled the rest of the 2 KB, and
+ * the MinHash fingerprint "fp", structural profile "sp" and body tokens "bt"
+ * appended behind it were dropped whole: no SIMILAR_TO edge and fewer
+ * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
+ * ImageController actions, 2026-10-18). `small` has the same body and is the
+ * control that the fixture produces all three at all. Both resolvers. */
+static const char f14_body[] =
+    "    total = 0\n"
+    "    for item in range(10):\n"
+    "        if item % 3 == 0:\n"
+    "            total += item * 2\n"
+    "        elif item % 5 == 1:\n"
+    "            total -= len(str(item))\n"
+    "        else:\n"
+    "            total ^= hash((item, total))\n"
+    "    values = [x * x for x in range(total % 7 + 3)]\n"
+    "    mapping = {str(k): v for k, v in enumerate(values)}\n"
+    "    while total > 100:\n"
+    "        total //= 3\n"
+    "    try:\n"
+    "        result = sorted(mapping.items(), key=lambda kv: kv[1])\n"
+    "    except ValueError as err:\n"
+    "        result = [(\"error\", str(err))]\n"
+    "    return result, total, mapping\n";
+
+static bool f14_props_have(const cbm_gbuf_t *gb, const char *project, const char *name,
+                           const char *venue) {
+    char *qn = cbm_pipeline_fqn_compute(project, "pkg/wide.py", name);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(gb, qn) : NULL;
+    free(qn);
+    const char *p = n && n->properties_json ? n->properties_json : "";
+    bool fp = strstr(p, "\"fp\":\"") != NULL;
+    bool sp = strstr(p, "\"sp\":\"") != NULL;
+    bool bt = strstr(p, "\"bt\":\"") != NULL;
+    bool sig = strstr(p, "\"signature\":\"") != NULL;
+    printf("  f14 %s %s: found=%d len=%zu fp=%d sp=%d bt=%d signature=%d\n", venue, name, n != NULL,
+           strlen(p), fp, sp, bt, sig);
+    return n && fp && sp && bt && sig;
+}
+
+TEST(parallel_wide_definition_keeps_fp_sp_bt_f14) {
+    char params[CBM_SZ_4K];
+    size_t pos = 0;
+    for (int i = 0; i < 50; i++) {
+        pos += (size_t)snprintf(params + pos, sizeof(params) - pos, "%sp%02d: Dict[str, int] = None",
+                                i ? ", " : "", i);
+    }
+    char src[CBM_SZ_8K];
+    snprintf(src, sizeof(src), "def small(a, b):\n%s\n\ndef wide(%s):\n%s", f14_body, params,
+             f14_body);
+    const char *project = "cbm_f14";
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_f14_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/pkg/wide.py", tmpdir);
+    if (th_write_file(path, src) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("failed to write the F14 fixture");
+    }
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"pkg/wide.py";
+    files[0].language = CBM_LANG_PYTHON;
+    cbm_gbuf_t *graphs[2] = {run_sequential(project, tmpdir, files, 1),
+                             run_parallel(project, tmpdir, files, 1, 2)};
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        const char *venue = g == 0 ? "sequential" : "parallel";
+        bool control = f14_props_have(graphs[g], project, "small", venue);
+        bool wide = f14_props_have(graphs[g], project, "wide", venue);
+        all = all && control && wide;
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
+}
+
 /* ── Graph buffer merge tests ─────────────────────────────────────── */
 
 TEST(gbuf_shared_ids_unique) {
@@ -5148,6 +5233,173 @@ TEST(parallel_php_vendor_types_never_bind_by_name_issue1186) {
     PASS();
 }
 
+/* ── PHP LSP types receivers of imported project classes (#1186) ─── */
+
+/* Foo.php calls methods on receivers typed with classes imported from OTHER
+ * project files: a promoted property (`$this->svc->go()`) and an aliased
+ * import (`R $r` -> `$r->find()`). The import map handed to the PHP LSP held
+ * the IMPORTS edge target -- the imported file's File node QN
+ * (`...Svc.php.__file__`) -- as the class, so no receiver ever typed and the
+ * calls fell to name-only strategies (the #1186 "useful calls at 0.38"). The
+ * decoy App\Other\Svc shares the short name and the method, so a name-only
+ * match cannot tell the two apart. Controls: the vendor-typed receiver
+ * (`Client $c`) must stay unresolved, and the same-file calls keep their LSP
+ * strategies. */
+static const struct {
+    const char *rel;
+    const char *src;
+} k_php_xfile_files[] = {
+    {"lib/Services/Svc.php", "<?php\nnamespace App\\Services;\n\nclass Svc {\n"
+                             "    public function go() { return 1; }\n}\n"},
+    {"lib/Other/Svc.php", "<?php\nnamespace App\\Other;\n\nclass Svc {\n"
+                          "    public function go() { return 2; }\n}\n"},
+    {"lib/Repo/Repo.php", "<?php\nnamespace App\\Repo;\n\nclass Repo {\n"
+                          "    public function find() { return 3; }\n}\n"},
+    {"lib/Http/Foo.php",
+     "<?php\nnamespace App\\Http;\n\n"
+     "use App\\Services\\Svc;\nuse App\\Repo\\Repo as R;\nuse Vendor\\Pkg\\Client;\n\n"
+     "class Foo {\n"
+     "    public function __construct(private Svc $svc) {}\n"
+     "    public function run(R $r, Client $c) {\n"
+     "        $this->svc->go();\n"
+     "        $r->find();\n"
+     "        $c->go();\n"
+     "        $this->local();\n"
+     "        (new Local())->ping();\n"
+     "    }\n"
+     "    private function local() { return 4; }\n}\n\n"
+     "class Local {\n"
+     "    public function ping() { return 5; }\n}\n"},
+};
+enum { PHP_XFILE_FILE_COUNT = (int)(sizeof(k_php_xfile_files) / sizeof(k_php_xfile_files[0])) };
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *src_rel;
+    const char *tgt_rel;
+    const char *tgt_suffix;
+    const char *strategy_prefix;
+    int total;
+    int with_strategy;
+} php_xfile_edge_count_t;
+
+static void php_xfile_count_edge(const cbm_gbuf_edge_t *edge, void *ud) {
+    php_xfile_edge_count_t *c = ud;
+    if (!edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    const cbm_gbuf_node_t *s = cbm_gbuf_find_by_id(c->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(c->gbuf, edge->target_id);
+    if (!s || !t || !s->file_path || !t->file_path || !t->qualified_name ||
+        strcmp(s->file_path, c->src_rel) != 0 || strcmp(t->file_path, c->tgt_rel) != 0) {
+        return;
+    }
+    size_t qlen = strlen(t->qualified_name);
+    size_t slen = strlen(c->tgt_suffix);
+    if (qlen < slen || strcmp(t->qualified_name + qlen - slen, c->tgt_suffix) != 0) {
+        return;
+    }
+    c->total++;
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"strategy\":\"%s", c->strategy_prefix);
+    if (edge->properties_json && strstr(edge->properties_json, needle)) {
+        c->with_strategy++;
+    }
+}
+
+/* 1 when every cross-file receiver resolved through the PHP LSP, the decoy and
+ * the vendor receiver drew nothing, and the same-file controls held. */
+static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
+    static const char *const foo = "lib/Http/Foo.php";
+    struct {
+        const char *tgt;
+        const char *suffix;
+        int want_total;
+        int want_lsp;
+    } checks[] = {
+        {"lib/Services/Svc.php", ".Svc.go", 1, 1}, /* $this->svc->go(), not $c->go() */
+        {"lib/Other/Svc.php", ".Svc.go", 0, 0},    /* decoy: same short name + method */
+        {"lib/Repo/Repo.php", ".Repo.find", 1, 1}, /* aliased import */
+        {foo, ".Foo.local", 1, 1},                 /* same-file control */
+        {foo, ".Local.ping", 1, 1},                /* same-file control */
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        php_xfile_edge_count_t c = {gbuf, foo, checks[i].tgt, checks[i].suffix, "php_", 0, 0};
+        cbm_gbuf_foreach_edge(gbuf, php_xfile_count_edge, &c);
+        if (c.total != checks[i].want_total || c.with_strategy != checks[i].want_lsp) {
+            printf("  [%s] CALLS Foo.php -> %s%s: %d edge(s), %d via php_*; want %d, %d\n", driver,
+                   checks[i].tgt, checks[i].suffix, c.total, c.with_strategy, checks[i].want_total,
+                   checks[i].want_lsp);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+/* Run the fixture on both venues. extra_use (nullable) is one more `use` line
+ * added to Foo.php. Returns 1 when both graphs pass, 0 when not, -1 on setup
+ * failure. */
+static int php_xfile_run(const char *extra_use) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_phpxfile_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        return -1;
+    }
+    char paths[PHP_XFILE_FILE_COUNT][512];
+    cbm_file_info_t files[PHP_XFILE_FILE_COUNT];
+    memset(files, 0, sizeof(files));
+    static const char foo_use[] = "use Vendor\\Pkg\\Client;\n";
+    for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, k_php_xfile_files[i].rel);
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", paths[i]);
+        *strrchr(dir, '/') = '\0';
+        cbm_mkdir_p(dir, 0755);
+        char src[2048];
+        const char *s = k_php_xfile_files[i].src;
+        const char *at = extra_use ? strstr(s, foo_use) : NULL;
+        if (at) {
+            size_t head = (size_t)(at - s) + sizeof(foo_use) - 1;
+            snprintf(src, sizeof(src), "%.*s%s%s", (int)head, s, extra_use, s + head);
+            s = src;
+        }
+        if (th_write_file(paths[i], s) != 0) {
+            th_rmtree(tmpdir);
+            return -1;
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)k_php_xfile_files[i].rel;
+        files[i].language = CBM_LANG_PHP;
+    }
+
+    cbm_gbuf_t *seq = run_sequential_with_lsp_cross_and_mutator(
+        "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, NULL, NULL, true);
+    cbm_gbuf_t *par = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, 2, NULL, NULL, NULL, true);
+    int seq_ok = seq ? php_xfile_graph_ok(seq, "sequential") : 0;
+    int par_ok = par ? php_xfile_graph_ok(par, "parallel") : 0;
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    th_rmtree(tmpdir);
+    return seq_ok && par_ok;
+}
+
+TEST(parallel_php_lsp_types_imported_project_receivers_issue1186) {
+    ASSERT_EQ(php_xfile_run(NULL), 1);
+    PASS();
+}
+
+/* The same file with one more import that no file in the project declares,
+ * the global class `use Exception;` written in most namespaced PHP files.
+ * The typed import evidence leaves such a file "unknown" as a whole (#2520),
+ * so the class-valued import mapping must not depend on that evidence. */
+TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue1186) {
+    ASSERT_EQ(php_xfile_run("use Exception;\n"), 1);
+    PASS();
+}
+
+
 /* A fresh PHP external row replaces stale evidence for its exact occurrence,
  * including an older external row, without clearing a real project invocation
  * of the same method at the next occurrence. Test both old-row orders. */
@@ -5261,6 +5513,8 @@ TEST(parallel_php_external_row_replaces_only_its_exact_occurrence) {
 SUITE(parallel) {
     RUN_TEST(parallel_php_external_row_replaces_only_its_exact_occurrence);
     RUN_TEST(parallel_php_vendor_types_never_bind_by_name_issue1186);
+    RUN_TEST(parallel_php_lsp_types_imported_project_receivers_issue1186);
+    RUN_TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue1186);
     RUN_TEST(usage_semantic_reference_candidate_trusts_marked_producer);
     RUN_TEST(lsp_bare_segment_skips_preprocessor_spacing);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
@@ -5346,6 +5600,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_post_extract_projection_spills_before_resolve);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
+    RUN_TEST(parallel_wide_definition_keeps_fp_sp_bt_f14);
 
     /* Cleanup shared state */
     parity_teardown();

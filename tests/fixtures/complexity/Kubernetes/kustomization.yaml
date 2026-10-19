@@ -6,3 +6,19 @@ resources:
   - crd.yaml
   - ocirepository.yaml
   - helmrelease.yaml
+patches:
+  - path: patch.yaml
+  - path: patch-more.yaml
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: web
+      spec:
+        type: NodePort
+  - patch: |-
+      - op: add
+        path: /metadata/labels/tier
+        value: front
+    target:
+      kind: Deployment

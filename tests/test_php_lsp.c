@@ -19,6 +19,9 @@
 #include "cbm.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/php_lsp.h"
+#include "lsp/lsp_work.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -622,6 +625,198 @@ TEST(phplsp_class_aliased_trait_name_collision_terminates) {
     CBMFileResult *r = extract_php(src);
     ASSERT(r);
     cbm_free_result(r);
+    PASS();
+}
+
+/* ── 23e. #765 / #1265: trait flattening work is counted, bounded, linear ──
+ *
+ * The guards above prove only that extraction returns; a regression would hang
+ * the runner instead of failing it. These tests count the LSP work
+ * (CBM_LSP_WORK, which flatten_trait_into_class adds to once per registry
+ * function it visits) under a test-only ceiling (lsp_work.h): if a flatten
+ * bound is reverted, the runaway loop stops at the ceiling and the test is RED
+ * deterministically. No clock is read (O9). */
+enum { PHPLSP_FLATTEN_CEILING = 50000000 };
+
+static uint64_t phplsp_counted_work(const char *src, int *ceiling_hit, CBMFileResult **out) {
+    (void)cbm_lsp_work_take();
+    cbm_lsp_work_ceiling = PHPLSP_FLATTEN_CEILING;
+    CBMFileResult *r = extract_php(src);
+    uint64_t work = cbm_lsp_work_take();
+    cbm_lsp_work_ceiling = 0;
+    *ceiling_hit = work > PHPLSP_FLATTEN_CEILING;
+    if (out) {
+        *out = r;
+    } else if (r) {
+        cbm_free_result(r);
+    }
+    return work;
+}
+
+/* Every reported collision shape, in one file: #765's aliased import that
+ * shares the trait's name, the v0.9.0 variant where the alias TARGET's short
+ * name equals the local trait (owen-it/laravel-auditing wrapper), #951's
+ * class named like its aliased trait, a self-using trait and a mutual pair. A
+ * model using the wrapper trait still sees the flattened method. */
+TEST(phplsp_trait_collision_shapes_bounded_work_issue765) {
+    const char *src = "<?php\n"
+                      "namespace App\\Models\\Traits;\n"
+                      "\n"
+                      "use OwenIt\\Auditing\\Auditable as AuditableBase;\n"
+                      "use App\\Functions\\Delivery as Delivery_Trait;\n"
+                      "\n"
+                      "trait Auditable {\n"
+                      "    use AuditableBase;\n"
+                      "    public function auditTag(): string { $x = 'a'; return $x; }\n"
+                      "}\n"
+                      "trait Selfish {\n"
+                      "    use Selfish;\n"
+                      "    public function me(): int { return 1; }\n"
+                      "}\n"
+                      "trait Ping {\n"
+                      "    use Pong;\n"
+                      "    public function ping(): int { return 1; }\n"
+                      "}\n"
+                      "trait Pong {\n"
+                      "    use Ping;\n"
+                      "    public function pong(): int { return 2; }\n"
+                      "}\n"
+                      "class Delivery {\n"
+                      "    use Delivery_Trait;\n"
+                      "    public function run(): void { }\n"
+                      "}\n"
+                      "class User {\n"
+                      "    use Auditable, Ping;\n"
+                      "    public function label(): string { return $this->auditTag(); }\n"
+                      "    public function both(): int { return $this->ping() + $this->pong(); }\n"
+                      "}\n";
+    int hit = 0;
+    CBMFileResult *r = NULL;
+    uint64_t work = phplsp_counted_work(src, &hit, &r);
+    printf("    collision shapes: work=%llu\n", (unsigned long long)work);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(hit);
+    /* The flattened trait method is still found through the using class. */
+    ASSERT(find_resolved(r, "label", "auditTag") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* n classes in one file, each composing the same two traits, and one probe
+ * class calling a flattened method through $this. */
+static char *phplsp_trait_users_source(int n) {
+    size_t sz = (size_t)n * 256 + 1024;
+    char *src = malloc(sz);
+    if (!src) {
+        return NULL;
+    }
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "<?php\nnamespace App\\Bulk;\n\n"
+                                  "trait Stamps {\n"
+                                  "    public function stamp(): int { return 1; }\n"
+                                  "    public function touch(): int { return 2; }\n"
+                                  "    public function fresh(): int { return 3; }\n"
+                                  "}\n"
+                                  "trait Flags {\n"
+                                  "    use Stamps;\n"
+                                  "    public function flag(): int { return 4; }\n"
+                                  "}\n");
+    for (int i = 0; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, sz - pos,
+                                "class M%d {\n"
+                                "    use Flags;\n"
+                                "    public function own%d(): int { return %d; }\n"
+                                "}\n",
+                                i, i, i);
+    }
+    /* One call through a flattened method, so the lookup cost stays constant
+     * and the gate measures flattening (F12: the single-file registry is not
+     * finalized, so every lookup is a linear scan; that is its own defect). */
+    snprintf(src + pos, sz - pos,
+             "class Probe {\n"
+             "    use Flags;\n"
+             "    public function probe(): int { return $this->stamp(); }\n"
+             "}\n");
+    return src;
+}
+
+/* Deterministic complexity gate: twice the trait-using classes must cost about
+ * twice the counted work. Each flatten visits the registry; if that visit grows
+ * with the classes already flattened, the ratio drifts toward 4 (main before the
+ * per-trait method index: 3.22 at 150 -> 300). Both sizes stay below the 256
+ * top-level declarations the class-field walk visits (#2388), so every class
+ * is flattened. */
+TEST(phplsp_trait_flatten_work_is_linear_issue1265) {
+    enum { N1 = 100, N2 = 200 };
+    char *s1 = phplsp_trait_users_source(N1);
+    char *s2 = phplsp_trait_users_source(N2);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_NOT_NULL(s2);
+    int hit1 = 0;
+    int hit2 = 0;
+    CBMFileResult *r2 = NULL;
+    uint64_t w1 = phplsp_counted_work(s1, &hit1, NULL);
+    uint64_t w2 = phplsp_counted_work(s2, &hit2, &r2);
+    free(s1);
+    free(s2);
+    printf("    trait users %d -> %d: work %llu -> %llu (ratio %.2f)\n", N1, N2,
+           (unsigned long long)w1, (unsigned long long)w2, w1 ? (double)w2 / (double)w1 : 0.0);
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(hit1);
+    ASSERT_FALSE(hit2);
+    ASSERT(w1 > 0);
+    /* The flattened method still resolves through the probe class. */
+    ASSERT(find_resolved(r2, "Probe.probe", "stamp") >= 0);
+    cbm_free_result(r2);
+    ASSERT(w2 * 10 <= w1 * 25); /* ratio <= 2.5 */
+    PASS();
+}
+
+/* F12: the single-file PHP LSP (cbm_run_php_lsp) never indexed its registry,
+ * so every type and method lookup was a linear scan over the stdlib plus every
+ * definition of the file. Each class here looks up the previous class and its
+ * method once: twice the classes must cost about twice the counted work; the
+ * linear scans drift toward four. */
+static char *phplsp_chain_classes_source(int n) {
+    size_t sz = (size_t)n * 96 + 256;
+    char *src = malloc(sz);
+    if (!src) {
+        return NULL;
+    }
+    size_t pos = (size_t)snprintf(src, sz,
+                                  "<?php\nnamespace App\\Chain;\n\n"
+                                  "class C0 { public function m(): int { return 0; } }\n");
+    for (int i = 1; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, sz - pos,
+                                "class C%d { public function m(): int { return (new C%d())->m(); } }\n",
+                                i, i - 1);
+    }
+    return src;
+}
+
+TEST(phplsp_single_file_lookup_work_is_linear_f12) {
+    enum { N1 = 1000, N2 = 2000 };
+    char *s1 = phplsp_chain_classes_source(N1);
+    char *s2 = phplsp_chain_classes_source(N2);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_NOT_NULL(s2);
+    int hit1 = 0;
+    int hit2 = 0;
+    CBMFileResult *r2 = NULL;
+    uint64_t w1 = phplsp_counted_work(s1, &hit1, NULL);
+    uint64_t w2 = phplsp_counted_work(s2, &hit2, &r2);
+    free(s1);
+    free(s2);
+    printf("    chained classes %d -> %d: work %llu -> %llu (ratio %.2f)\n", N1, N2,
+           (unsigned long long)w1, (unsigned long long)w2, w1 ? (double)w2 / (double)w1 : 0.0);
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(hit1);
+    ASSERT_FALSE(hit2);
+    ASSERT(w1 > 0);
+    /* The last class's call still resolves to the previous class's method. */
+    ASSERT(find_resolved(r2, "C1999.m", "C1998.m") >= 0);
+    cbm_free_result(r2);
+    ASSERT(w2 * 10 <= w1 * 25); /* ratio <= 2.5 */
     PASS();
 }
 
@@ -5671,6 +5866,9 @@ SUITE(php_lsp) {
     RUN_TEST(phplsp_trait_self_use_terminates);
     RUN_TEST(phplsp_trait_aliased_import_name_collision_terminates);
     RUN_TEST(phplsp_class_aliased_trait_name_collision_terminates);
+    RUN_TEST(phplsp_trait_collision_shapes_bounded_work_issue765);
+    RUN_TEST(phplsp_trait_flatten_work_is_linear_issue1265);
+    RUN_TEST(phplsp_single_file_lookup_work_is_linear_f12);
     RUN_TEST(phplsp_match_result_type);
     RUN_TEST(phplsp_ternary_result_type);
     RUN_TEST(phplsp_method_chain_depth_three);

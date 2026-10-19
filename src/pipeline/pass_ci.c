@@ -27,6 +27,7 @@
 #include "foundation/compat.h"
 #include "pipeline/pipeline_internal.h"
 #include "cbm.h"
+#include "helpers.h" /* cbm_env_address */
 #include "lang_specs.h"
 
 #include <ctype.h>
@@ -718,8 +719,13 @@ static const char *ci_unquote(const char *v, size_t *len) {
     return v;
 }
 
+static const char *ci_interp(CBMArena *a, const char *s, const ci_env_t *env);
+
 /* One .env line s[0, n): KEY=VALUE (an `export ` prefix, quotes around the
- * value removed) appended to env; a comment, a blank or another line: none. */
+ * value removed) appended to env, its ${X} references expanded from the lines
+ * before it as compose does (`CART_ADDR=cart:${CART_PORT}`; a single-quoted
+ * value stays literal, an unknown variable leaves it as written); a comment,
+ * a blank or another line: none. */
 static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) {
     static const char EXPORT[] = "export ";
     size_t b = 0;
@@ -743,9 +749,12 @@ static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) 
         v++;
     }
     size_t vl = n - v;
+    bool literal = v < n && s[v] == '\'';
     const char *val = ci_unquote(s + v, &vl);
+    const char *raw = cbm_arena_strndup(a, val, vl);
+    const char *expanded = raw && !literal ? ci_interp(a, raw, env) : NULL;
     env->kv[PAIR_LEN * env->n] = cbm_arena_strndup(a, s + b, kl);
-    env->kv[PAIR_LEN * env->n + SKIP_ONE] = cbm_arena_strndup(a, val, vl);
+    env->kv[PAIR_LEN * env->n + SKIP_ONE] = expanded ? expanded : raw;
     env->n++;
 }
 
@@ -988,35 +997,60 @@ static int ci_compose_deps(const ci_t *c, TSNode svc, const char ***out) {
     return n;
 }
 
+/* The compose service a variable's value addresses (its .env interpolated):
+ * a bare service name only -- the value itself is never kept. NULL: none. */
+static const char *ci_env_host(const ci_t *c, const char *name, const char *raw,
+                               const ci_env_t *env) {
+    enum { CI_DNS_LABEL = 64 };
+    const char *value = raw ? ci_interp(c->a, raw, env) : NULL;
+    char svc[CI_DNS_LABEL];
+    char ns[CI_DNS_LABEL];
+    return value && cbm_env_address(name, value, svc, sizeof(svc), ns, sizeof(ns)) == SKIP_ONE
+               ? cbm_arena_strdup(c->a, svc)
+               : NULL;
+}
+
 /* The variable names a service's environment sets: a mapping's keys, a
  * list's "NAME=value" / "NAME" items (the name only -- a value is never
- * kept), with their 1-based lines. */
-static int ci_compose_env(const ci_t *c, TSNode svc, const char ***out, const int **lines) {
+ * kept), with their 1-based lines and the service each value addresses. */
+static int ci_compose_env(const ci_t *c, TSNode svc, const ci_env_t *dotenv, const char ***out,
+                          const int **lines, const char ***hosts) {
     int n = 0;
     TSNode env = ci_get(c, svc, "environment");
     TSNode *items = ci_items(c, env, &n);
     ci_pair_t *pairs = items ? NULL : ci_pairs(c, env, &n);
     const char **names = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*names));
     int *rows = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*rows));
+    const char **to = cbm_arena_alloc(c->a, (size_t)(n + SKIP_ONE) * sizeof(*to));
     int k = 0;
-    for (int i = 0; names && rows && i < n; i++) {
+    for (int i = 0; names && rows && to && i < n; i++) {
         int row = 0;
         const char *name = NULL;
+        const char *raw = NULL;
         if (items) {
             const char *s = ci_scalar(c, items[i], &row);
             const char *eq = s ? strchr(s, '=') : NULL;
             name = eq ? cbm_arena_strndup(c->a, s, (size_t)(eq - s)) : s;
+            raw = eq ? eq + SKIP_ONE : NULL;
         } else {
+            int vrow = 0;
             name = pairs[i].key;
             row = pairs[i].row;
+            raw = ts_node_is_null(pairs[i].value) ? NULL : ci_scalar(c, pairs[i].value, &vrow);
+        }
+        if (name && name[0] && !raw) {
+            /* a name without a value takes the project environment's (.env) */
+            raw = cbm_arena_sprintf(c->a, "${%s}", name);
         }
         if (name && name[0]) {
             names[k] = name;
+            to[k] = ci_env_host(c, name, raw, dotenv);
             rows[k++] = row + SKIP_ONE;
         }
     }
     *out = names;
     *lines = rows;
+    *hosts = to;
     return k;
 }
 
@@ -1044,7 +1078,7 @@ static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env
                                        .line = (int)ts_node_start_point(svc).row,
                                        .end_line = (int)ts_node_end_point(svc).row + SKIP_ONE};
             s.ndeps = ci_compose_deps(c, svc, &s.deps);
-            s.nenv = ci_compose_env(c, svc, &s.env, &s.env_lines);
+            s.nenv = ci_compose_env(c, svc, env, &s.env, &s.env_lines, &s.env_hosts);
             c->service_fn(&s, c->ud);
         }
     }

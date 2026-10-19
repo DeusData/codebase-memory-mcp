@@ -213,6 +213,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         const cbm_gbuf_node_t *tgt = NULL;
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
+        bool property_read = false;
         if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
@@ -225,6 +226,13 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (semantic_reference) {
                 tgt = cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
                                                    semantic_reference->callee_qn, allow_tail);
+                if (!cbm_pipeline_reference_target_admissible(semantic_reference, tgt)) {
+                    /* a property read: the name fallback below may still bind the
+                     * property's own node, never a callable */
+                    tgt = NULL;
+                    semantic_reference = NULL;
+                    property_read = true;
+                }
                 precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
             }
         }
@@ -283,6 +291,9 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
+                continue;
+            }
+            if (property_read && cbm_pipeline_node_is_callable_target(tgt)) {
                 continue;
             }
         }

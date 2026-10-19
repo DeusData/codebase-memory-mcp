@@ -25,7 +25,7 @@ on:
         type: string
         default: all
       test_selection:
-        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the test-unix and test-windows legs run only its tests. Empty = every test (dry run, release, and any PR the selection does not narrow)'
+        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the Linux x86_64 test-unix leg runs only its tests, the arm64, macOS and Windows legs run every test. Empty = every test (dry run, release, and any PR the selection does not narrow)'
         type: string
         default: ''
 
@@ -222,7 +222,11 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.cc }}-
 
       - name: Fetch the test selection
-        if: ${{ inputs.test_selection != '' }}
+        # Only the Linux x86_64 leg narrows (user decision 2026-10-16): the
+        # coverage that justifies an omission comes from the Linux x86_64
+        # producer, so arm64, macOS and Windows code under #ifdef has static
+        # evidence only and those legs run every test.
+        if: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ inputs.test_selection }}
@@ -234,7 +238,7 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.cc }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
-          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && format('{0}/test-selection', runner.temp) || '' }}
+          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' && format('{0}/test-selection', runner.temp) || '' }}
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -617,13 +621,6 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-
 
-      - name: Fetch the test selection
-        if: ${{ inputs.test_selection != '' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ${{ inputs.test_selection }}
-          path: ${{ runner.temp }}/test-selection
-
       - name: Test
         shell: msys2 {0}
         # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
@@ -651,7 +648,8 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
-          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && format('{0}/test-selection', runner.temp) || '' }}
+          # Windows legs run every test: see the Linux x86_64-only fetch in test-unix.
+          CBM_TEST_SELECTION_DIR: ''
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 

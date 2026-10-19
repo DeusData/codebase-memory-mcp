@@ -29,8 +29,11 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *   1  #1108: File-node QNs keep the file extension.
  *   2  Kubernetes objects: one Resource per YAML document, QN
  *      <file>::<group>/<Kind>/<declared namespace or ->/<name>; a
- *      Dockerfile.<variant> keeps its suffix in its QNs. */
-#define CBM_INDEX_FORMAT_VERSION 2
+ *      Dockerfile.<variant> keeps its suffix in its QNs.
+ *   3  Image identity invents no registry: a reference without a host is
+ *      __image__<repository as written>, registry "unknown" -- no longer
+ *      __image__docker.io/[library/]<repository>. */
+#define CBM_INDEX_FORMAT_VERSION 3
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
@@ -478,6 +481,16 @@ int cbm_store_commit(cbm_store_t *s);
 /* Rollback the current transaction. */
 int cbm_store_rollback(cbm_store_t *s);
 
+/* Read batch: run the reads that follow in one deferred read transaction,
+ * renewed every 100 ms so a writer is never held back longer, instead of one
+ * lock round trip per statement. Begin returns false (and does nothing) when
+ * a transaction is already open. For read-only work only; end it before any
+ * write, transaction or read scope on the same store. Close ends it. */
+bool cbm_store_read_batch_begin(cbm_store_t *s);
+void cbm_store_read_batch_end(cbm_store_t *s);
+/* Test seam: make an open read batch due for renewal at its next statement. */
+void cbm_store_read_batch_expire_for_test(cbm_store_t *s);
+
 /* Stable request read scope. Borrows an exclusively owned, single-thread
  * store and callback context. Refuses a transaction, busy statement or owned
  * progress handler; idle cached statements are allowed. Saves query_only and
@@ -614,6 +627,29 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 /* Find nodes by file path. */
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
+
+/* Streamed node scan: the rows of cbm_store_find_nodes (label NULL) or
+ * cbm_store_find_nodes_by_label, in the same order, a batch at a time. Pages
+ * are keyset queries along the eager query's index, and no read lock is held
+ * between calls. open returns NULL on error. next fills out[0..max) and sets
+ * *count; a count of 0 means the scan is exhausted. The caller frees each
+ * returned node with cbm_node_free_fields. A failed read returns
+ * CBM_STORE_ERR with no rows from that call and ends the scan;
+ * cbm_store_error() names the failure. paged is false when the eager query's
+ * plan is not the one the pages reproduce: the scan then hands out the eager
+ * scan's rows (same order, no memory saving). Close the scan before closing
+ * the store. */
+typedef struct cbm_store_node_scan cbm_store_node_scan_t;
+cbm_store_node_scan_t *cbm_store_node_scan_open(cbm_store_t *s, const char *project,
+                                                const char *label);
+int cbm_store_node_scan_next(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *count);
+bool cbm_store_node_scan_paged(const cbm_store_node_scan_t *scan);
+void cbm_store_node_scan_close(cbm_store_node_scan_t *scan);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* One-shot fault: after this many successful pages (of any scan), the next
+ * page fails like a SQLite step error; -1 disables the seam. */
+void cbm_store_node_scan_test_fail_page_after(int successful_pages);
+#endif
 
 /* Return a stable, paginated outline for one exact repository-relative file.
  * File/folder/container nodes are excluded. labels may be NULL when
@@ -1209,6 +1245,13 @@ char *cbm_glob_to_like(const char *pattern);
  * Bails on alternation (|). Returns count of hints written to out[].
  * Each out[i] is malloc'd — caller must free each string. */
 int cbm_extract_like_hints(const char *pattern, char **out, int max_out);
+
+/* Literal prefix every match of an anchored POSIX ERE must begin with: the
+ * plain printable-ASCII run after a leading '^', minus its last character when
+ * a quantifier or escape follows it. Returns its length (written NUL-terminated
+ * to out); 0 when the pattern is not anchored, contains '|', or starts with an
+ * operator. Case is kept as written. */
+int cbm_regex_anchored_prefix(const char *pattern, char *out, int out_sz);
 
 /* Prepend (?i) to a regex pattern if not already present.
  * Returns a static buffer — do NOT free. */

@@ -14,6 +14,7 @@
 #include "cli/config_toml_edit.h"
 #include "ui/config.h"
 #include "cli/config_yaml_edit.h"
+#include "cli/runtime_settings.h"
 #include "daemon/bootstrap.h"
 #include "daemon/ipc.h"
 #include "daemon/runtime.h"
@@ -1568,7 +1569,9 @@ static const char skill_content[] =
     "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, REFERENCES_FILE,\n"
     "MENTIONS (doc comment -> referenced code), FILE_CHANGES_WITH, SIMILAR_TO,\n"
     "SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"
-    "INFRA_MAPS (K8s Service -> selected workloads), DEPENDS_ON (chart / manifest -> dependency)\n"
+    "INFRA_MAPS (K8s Service -> selected workloads), DEPENDS_ON (chart / manifest -> dependency),\n"
+    "DEPLOYS (what puts manifests / charts on a cluster -> what it puts there),\n"
+    "CONNECTS_TO (workload / compose service -> the Service its environment addresses)\n"
     "\n"
     "## Cypher Examples (for query_graph)\n"
     "```\n"
@@ -7407,6 +7410,9 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         }
         return NULL;
     }
+    /* Another process mid-commit is waited out; failing here failed every
+     * settings write behind it, the daemon's UI save included. */
+    cbm_runtime_settings_wait_for_writers(db);
 
     /* Create table if not exists */
     const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)";

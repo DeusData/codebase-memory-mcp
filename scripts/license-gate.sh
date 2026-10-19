@@ -13,7 +13,8 @@ set -euo pipefail
 # the ScanCode pass for runtime; their per-directory license files ARE
 # scanned, and layer 1 guarantees each grammar carries one.
 #
-# Requires: scancode (pipx install scancode-toolkit), python3.
+# Requires: scancode (PIP_CONSTRAINT=.github/scancode-constraints.txt
+# pipx install scancode-toolkit==32.5.0, as CI does), python3.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -79,7 +80,7 @@ echo "OK: every vendored source directory is covered by a license file"
 
 echo "=== License gate 2/2: ScanCode detection ==="
 if ! command -v scancode &>/dev/null; then
-    echo "FAIL: scancode not installed (pipx install scancode-toolkit)"
+    echo "FAIL: scancode not installed (PIP_CONSTRAINT=.github/scancode-constraints.txt pipx install scancode-toolkit==32.5.0)"
     exit 1
 fi
 

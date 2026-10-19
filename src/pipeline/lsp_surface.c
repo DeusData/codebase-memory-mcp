@@ -33,7 +33,9 @@
 #include "pipeline/worker_pool.h"
 #include "yyjson/yyjson.h"
 
-enum { SURFACE_CODEC_VERSION = 2 };
+/* 3: Go defs carry their parsed result list `|`-joined in "ret" (F-G8 D1);
+ * a version-2 surface holds the raw result text and must be re-extracted. */
+enum { SURFACE_CODEC_VERSION = 3 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still

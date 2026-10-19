@@ -398,8 +398,19 @@ typedef struct {
     const char *member;      // ES named import: the exported name the local binds (`get` in
                              // `import { get as navigate } from "axios"`); NULL otherwise
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
+    bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
+                             // binds the name for annotations, never at runtime (#1277)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
+
+/* True when an import binds its local name at runtime. A Python import under
+ * `if TYPE_CHECKING:` exists for annotations only: a call through that name
+ * cannot happen, so no CALLS import map may bind it (an import_map edge
+ * through it would be fabricated by construction). THE one rule every CALLS
+ * import-map builder applies. */
+static inline bool cbm_import_binds_runtime_name(const CBMImport *imp) {
+    return imp && !imp->type_checking_only;
+}
 
 /* Content-only ordered Python namespace facts; no resolved target identities. */
 #define CBM_PY_NAMESPACE_FACTS_VERSION 1u
@@ -701,23 +712,35 @@ typedef struct {
 /* A fact a Kubernetes manifest states about other objects (extract_k8s.c),
  * resolved by the K8s pass against the objects of the source's bundle.
  *   CBM_K8S_FACT_REF: object def_index names a kind/ns/name object at a
- *     reference path (via), drawn as edge (USAGE, INFRA_MAPS or DEPENDS_ON);
- *     ns NULL = the source's own namespace.
+ *     reference path (via), drawn as edge (USAGE, INFRA_MAPS, DEPENDS_ON or
+ *     CONNECTS_TO); ns NULL = the source's own namespace. A CONNECTS_TO
+ *     reference (via "env") is the Service the value of environment variable
+ *     `key` of container `container` addresses -- the value is not kept.
  *   CBM_K8S_FACT_CRD: the CRD def_index declares kind `kind` in group `name`.
  *   CBM_K8S_FACT_DEPLOY: object def_index (a Flux Kustomization, an Argo
  *     Application) deploys the repository directory `name` into namespace
- *     `ns` (NULL: the objects' own); via "flux" / "argo".
+ *     `ns` (NULL: the objects' own); via "flux" / "argo". via "kustomize"
+ *     (def_index -1: the kustomization itself): a `helmCharts` entry
+ *     inflates chart `name` of repository `url` at `version` as release
+ *     `release` into namespace `ns`, with values file `path`.
  *   CBM_K8S_FACT_ROUTE: object def_index (an Ingress, an HTTPRoute) exposes
  *     `route` ("<host or *><path>") and sends it to the kind/ns/name backend
  *     (name NULL: none); via "ingress" / "httproute".
  *   CBM_K8S_FACT_SOURCE: object def_index (a Flux OCIRepository) fetches
  *     from the URL `name`; a HelmRelease whose chartRef names it deploys the
  *     chart there.
- *   CBM_K8S_FACT_IMAGE: object def_index runs a container of image `name`
- *     (a literal reference); via "container".
+ *   CBM_K8S_FACT_IMAGE: object def_index runs its container `container`
+ *     (NULL: unnamed) from image `name` (a literal reference); via "container".
  *   CBM_K8S_FACT_ENV: object def_index sets environment variable `name` in
  *     its container `container` (NULL: unnamed) at `line`; via = where the
- *     value comes from ("value", or the valueFrom kind) -- never the value. */
+ *     value comes from ("value", or the valueFrom kind) -- never the value.
+ *   CBM_K8S_FACT_PATCH: a kustomization's `patches` entry at `line` patches
+ *     the objects of its build named by kind / group / version / name / ns
+ *     (any NULL: any) -- its `target`, else an inline patch document's own
+ *     kind / group / name / ns; `path` is
+ *     the patch file (as written, relative to the kustomization), NULL for an
+ *     inline patch. kind and name both NULL: the patch file's documents name
+ *     them. def_index -1: the kustomization itself is the source. */
 typedef enum {
     CBM_K8S_FACT_REF = 0,
     CBM_K8S_FACT_CRD,
@@ -725,7 +748,8 @@ typedef enum {
     CBM_K8S_FACT_ROUTE,
     CBM_K8S_FACT_SOURCE,
     CBM_K8S_FACT_IMAGE,
-    CBM_K8S_FACT_ENV
+    CBM_K8S_FACT_ENV,
+    CBM_K8S_FACT_PATCH
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
@@ -737,6 +761,13 @@ typedef struct {
     const char *edge;
     const char *route;
     const char *container;
+    const char *key;      /* CONNECTS_TO: the environment variable addressing it */
+    const char *group;    /* PATCH: the API group named ("core"), NULL: any */
+    const char *version;  /* PATCH: the API version named, NULL: any */
+    const char *path;     /* PATCH: the patch file, NULL: inline */
+    const char *selector; /* PATCH: the target's labelSelector, NULL: none */
+    const char *url;      /* DEPLOY (kustomize): the chart repository */
+    const char *release;  /* DEPLOY (kustomize): the release name */
     int line;
 } CBMK8sFact;
 
@@ -1286,6 +1317,14 @@ void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
 void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
+/* True unless every import of `imports` that binds `local_name` is
+ * annotation-only (cbm_import_binds_runtime_name), so also true when no import
+ * names it: the rule for the builders that key IMPORTS edges by local name. */
+bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name);
+/* The same for the `len` bytes at `name` (not NUL-terminated): lets a caller
+ * decide before it copies the name. */
+bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
+                                               size_t len);
 void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
 void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
 void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);

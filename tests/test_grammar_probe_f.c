@@ -1704,7 +1704,7 @@ TEST(probe_mcp_trace_run) {
     ASSERT_NOT_NULL(r);
     /* qualified names are grouped by prefix, split at a dot */
     ASSERT_NOT_NULL(strstr(r, "Deployment/-/server"));
-    ASSERT_NOT_NULL(strstr(r, "\"__image__docker\",\"rows\":[[\"io/acme/server\""));
+    ASSERT_NOT_NULL(strstr(r, "[\"__image__acme/server\"")); /* dotless: the whole QN */
     ASSERT_NOT_NULL(strstr(r, ".svc\",\"rows\":[[\"Dockerfile\""));   /* its Module */
     ASSERT_NOT_NULL(strstr(r, ".cmd.server\",\"rows\":[[\"main\"")); /* what it starts */
     ASSERT_NOT_NULL(strstr(r, "Deployment/-/server#env/server/LISTEN_PORT"));
@@ -1812,7 +1812,7 @@ static char *gpf_deploys(const GpfFile *files, int nfiles) {
             "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT "
             "CASE WHEN s.label IN ('Module','File') THEN '@' || s.file_path ELSE s.name END "
             "|| ' -> ' || CASE WHEN t.label='Chart' THEN 'chart:' || t.name || "
-            "CASE WHEN instr(t.qualified_name,'__helm_dep__') THEN '(ext)' ELSE '' END "
+            "CASE WHEN json_extract(t.properties,'$.external') THEN '(ext)' ELSE '' END "
             "ELSE t.label || ':' || t.file_path END "
             "|| ' (' || json_extract(e.properties,'$.via') || ')' AS x "
             "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
@@ -1961,8 +1961,8 @@ static char *gpf_images(const GpfFile *files, int nfiles) {
     } while (0)
 
 /* A Dockerfile DEPENDS_ON each image it builds on: FROM and COPY --from,
- * with ARG defaults expanded, under the image's repository (docker.io and
- * library/ filled in, a registry host kept, tag and digest dropped). A stage
+ * with ARG defaults expanded, under the image's repository (as written: a
+ * registry host kept, none invented; tag and digest dropped). A stage
  * (by name or index), scratch and an ARG without a value are no image. */
 TEST(probe_dockerfile_bases_are_images) {
     static const GpfFile files[] = {
@@ -1979,9 +1979,69 @@ TEST(probe_dockerfile_bases_are_images) {
                            "COPY --from=registry.example.com:5000/team/tools:2 /bin/x /x\n"}};
     GPF_ASSERT_IMAGES(files, 1,
                       "@svc/Dockerfile -> docker.io/bitnami/kubectl (copy-from)\n"
-                      "@svc/Dockerfile -> docker.io/library/golang (from)\n"
                       "@svc/Dockerfile -> gcr.io/distroless/static (from)\n"
+                      "@svc/Dockerfile -> golang (from)\n"
                       "@svc/Dockerfile -> registry.example.com:5000/team/tools (copy-from)");
+    PASS();
+}
+
+/* Every Image node as "<name> [<registry>]", sorted, one per line. */
+static char *gpf_image_nodes(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT name || ' [' "
+                          "|| coalesce(json_extract(properties,'$.registry'), '-') || ']' AS x "
+                          "FROM nodes WHERE project=?1 AND label='Image' ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An image reference that names no registry host keeps it unknown: the Image
+ * is the repository as written, registry "unknown" -- never docker.io, which
+ * is only Docker's default (a short-name search list or a local-only build
+ * tag resolves elsewhere or nowhere). A stated host is kept, its Docker Hub
+ * spellings as docker.io with library/ for an official one-segment name.
+ * Every source alike: FROM, a K8s container, a compose service, a build tag. */
+TEST(probe_image_without_registry_host_stays_unknown) {
+    static const GpfFile files[] = {
+        {"svc/Dockerfile", "FROM nginx:1.27\nFROM acme/base:2 AS b\nFROM docker.io/redis:7 AS c\n"
+                           "FROM index.docker.io/acme/tool AS d\n"
+                           "FROM ghcr.io/acme/app@sha256:0123 AS e\n"
+                           "FROM localhost:5000/team/x AS f\n"},
+        {"app.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+                     "  template:\n    spec:\n      containers:\n        - name: web\n"
+                     "          image: busybox:1.36\n        - name: side\n"
+                     "          image: quay.io/acme/sidecar:1\n"},
+        {"compose.yaml", "services:\n  web:\n    image: acme/web:1\n"},
+        {"build.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t myapp:dev svc\n"}};
+    char *got = gpf_image_nodes(files, 4);
+    static const char want[] = "acme/base [unknown]\n"
+                               "acme/web [unknown]\n"
+                               "busybox [unknown]\n"
+                               "docker.io/acme/tool [docker.io]\n"
+                               "docker.io/library/redis [docker.io]\n"
+                               "ghcr.io/acme/app [ghcr.io]\n"
+                               "localhost:5000/team/x [localhost:5000]\n"
+                               "myapp [unknown]\n"
+                               "nginx [unknown]\n"
+                               "quay.io/acme/sidecar [quay.io]";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "image nodes got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("Image nodes and registries");
+    }
+    free(got);
     PASS();
 }
 
@@ -2000,10 +2060,10 @@ TEST(probe_dockerfile_variants_are_dockerfiles) {
         {"tools/Dockerfile.j2", "FROM {{ base_image }}\n"}};
     GPF_ASSERT_IMAGES(files, 7,
                       "@Containerfile -> quay.io/podman/stable (from)\n"
-                      "@svc/Dockerfile -> docker.io/library/alpine (from)\n"
-                      "@svc/Dockerfile-test -> docker.io/library/ubuntu (from)\n"
-                      "@svc/Dockerfile.debug -> docker.io/library/debian (from)\n"
-                      "@tools/pipeline.Dockerfile -> docker.io/library/node (from)");
+                      "@svc/Dockerfile -> alpine (from)\n"
+                      "@svc/Dockerfile-test -> ubuntu (from)\n"
+                      "@svc/Dockerfile.debug -> debian (from)\n"
+                      "@tools/pipeline.Dockerfile -> node (from)");
     PASS();
 }
 
@@ -2083,8 +2143,8 @@ TEST(probe_k8s_container_images_are_images) {
          "          image: <image-built-from-dockerfile>\n"}};
     char *got = gpf_image_users(files, 1);
     static const char want[] = "CronJob/nightly -> ghcr.io/acme/job\n"
-                               "Deployment/web -> docker.io/library/busybox\n"
-                               "Deployment/web -> docker.io/library/nginx\n"
+                               "Deployment/web -> busybox\n"
+                               "Deployment/web -> nginx\n"
                                "Widget/w -> quay.io/acme/widget";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "image users got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
@@ -2145,10 +2205,10 @@ TEST(probe_build_configs_build_images_from_dockerfiles) {
                          "  missing:\n    image: acme/missing\n    build: ./nope\n"
                          "  unknown:\n    image: ${NOPE}/x\n    build: ./src/web\n"}};
     char *got = gpf_builds(files, 5);
-    static const char want[] = "docker.io/library/api -> src/api/Dockerfile.prod (skaffold)\n"
-                               "docker.io/library/dev-web -> src/web/Dockerfile (skaffold)\n"
-                               "docker.io/library/web -> src/web/Dockerfile (skaffold)\n"
-                               "ghcr.io/acme/frontend -> src/web/Dockerfile (compose)";
+    static const char want[] = "api -> src/api/Dockerfile.prod (skaffold)\n"
+                               "dev-web -> src/web/Dockerfile (skaffold)\n"
+                               "ghcr.io/acme/frontend -> src/web/Dockerfile (compose)\n"
+                               "web -> src/web/Dockerfile (skaffold)";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "builds got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
@@ -2203,10 +2263,10 @@ TEST(probe_compose_services_are_resources) {
          "  worker:\n    build:\n      context: .\n      dockerfile: worker/Dockerfile\n"}};
     char *got = gpf_compose(files, 3);
     static const char want[] =
-        "Service/cache -> Image:docker.io/library/redis (USAGE image)\n"
+        "Service/cache -> Image:redis (USAGE image)\n"
         "Service/cache -> Service/db (DEPENDS_ON depends_on)\n"
-        "Service/db -> Image:docker.io/library/postgres (USAGE image)\n"
-        "Service/web -> Image:docker.io/acme/web (USAGE image)\n"
+        "Service/db -> Image:postgres (USAGE image)\n"
+        "Service/web -> Image:acme/web (USAGE image)\n"
         "Service/web -> Module:web/Dockerfile (DEPENDS_ON build)\n"
         "Service/web -> Service/cache (DEPENDS_ON depends_on)\n"
         "Service/web -> Service/db (DEPENDS_ON depends_on)\n"
@@ -2314,17 +2374,17 @@ TEST(probe_image_hub_splits_by_component) {
          "          image: acme/solo:2\n"}};
     enum { NF = sizeof(files) / sizeof(files[0]) };
     char *got = gpf_builds(files, NF);
-    static const char want_builds[] = "docker.io/acme/demo:*-a -> svc/a/Dockerfile (compose)\n"
-                                      "docker.io/acme/demo:*-b -> svc/b/Dockerfile (compose)\n"
-                                      "docker.io/acme/demo:*-c -> svc/c/Dockerfile (compose)\n"
-                                      "docker.io/acme/solo -> solo/Dockerfile (compose)\n"
-                                      "docker.io/acme/tool -> tool/Dockerfile (compose)\n"
-                                      "docker.io/acme/tool:test -> tool/Dockerfile.test (compose)\n"
-                                      "docker.io/acme/x -> w1/Dockerfile (compose)\n"
-                                      "docker.io/acme/x -> w2/Dockerfile.alt (compose)\n"
-                                      "docker.io/acme/x:*-v -> v/Dockerfile (compose)\n"
-                                      "docker.io/acme/y:*-p -> p/Dockerfile (compose)\n"
-                                      "docker.io/acme/y:*-q -> q/Dockerfile (compose)";
+    static const char want_builds[] = "acme/demo:*-a -> svc/a/Dockerfile (compose)\n"
+                                      "acme/demo:*-b -> svc/b/Dockerfile (compose)\n"
+                                      "acme/demo:*-c -> svc/c/Dockerfile (compose)\n"
+                                      "acme/solo -> solo/Dockerfile (compose)\n"
+                                      "acme/tool -> tool/Dockerfile (compose)\n"
+                                      "acme/tool:test -> tool/Dockerfile.test (compose)\n"
+                                      "acme/x -> w1/Dockerfile (compose)\n"
+                                      "acme/x -> w2/Dockerfile.alt (compose)\n"
+                                      "acme/x:*-v -> v/Dockerfile (compose)\n"
+                                      "acme/y:*-p -> p/Dockerfile (compose)\n"
+                                      "acme/y:*-q -> q/Dockerfile (compose)";
     if (!got || strcmp(got, want_builds) != 0) {
         fprintf(stderr, "builds got:\n%s\nwant:\n%s\n", got ? got : "(null)", want_builds);
         free(got);
@@ -2332,20 +2392,20 @@ TEST(probe_image_hub_splits_by_component) {
     }
     free(got);
     got = gpf_image_users(files, NF);
-    static const char want_users[] = "Deployment/b -> docker.io/acme/demo:*-b\n"
-                                     "Deployment/s -> docker.io/acme/solo\n"
-                                     "Deployment/z -> docker.io/acme/demo\n"
-                                     "Service/a -> docker.io/acme/demo:*-a\n"
-                                     "Service/b -> docker.io/acme/demo:*-b\n"
-                                     "Service/c -> docker.io/acme/demo:*-c\n"
-                                     "Service/p -> docker.io/acme/y:*-p\n"
-                                     "Service/q -> docker.io/acme/y:*-q\n"
-                                     "Service/solo -> docker.io/acme/solo\n"
-                                     "Service/tool -> docker.io/acme/tool\n"
-                                     "Service/tooltest -> docker.io/acme/tool:test\n"
-                                     "Service/v -> docker.io/acme/x:*-v\n"
-                                     "Service/w1 -> docker.io/acme/x\n"
-                                     "Service/w2 -> docker.io/acme/x";
+    static const char want_users[] = "Deployment/b -> acme/demo:*-b\n"
+                                     "Deployment/s -> acme/solo\n"
+                                     "Deployment/z -> acme/demo\n"
+                                     "Service/a -> acme/demo:*-a\n"
+                                     "Service/b -> acme/demo:*-b\n"
+                                     "Service/c -> acme/demo:*-c\n"
+                                     "Service/p -> acme/y:*-p\n"
+                                     "Service/q -> acme/y:*-q\n"
+                                     "Service/solo -> acme/solo\n"
+                                     "Service/tool -> acme/tool\n"
+                                     "Service/tooltest -> acme/tool:test\n"
+                                     "Service/v -> acme/x:*-v\n"
+                                     "Service/w1 -> acme/x\n"
+                                     "Service/w2 -> acme/x";
     if (!got || strcmp(got, want_users) != 0) {
         fprintf(stderr, "image users got:\n%s\nwant:\n%s\n", got ? got : "(null)", want_users);
         free(got);
@@ -2458,6 +2518,1300 @@ TEST(probe_container_env_sets_scoped_envvars) {
             FAIL("an env value reached the graph");
         }
     }
+    PASS();
+}
+
+/* Every env join edge (CONFIGURES {strategy:env_read}) as
+ * "<setter file> <container>/<name> -> <reader file>", then the containers
+ * the image references name: "#image_containers=...". */
+static char *gpf_env_joins(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT DISTINCT s.file_path "
+            "|| ' ' || substr(s.qualified_name, instr(s.qualified_name, '#env/') + 5) || ' -> ' "
+            "|| t.file_path AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='CONFIGURES' AND "
+            "json_extract(e.properties,'$.strategy')='env_read' ORDER BY x)), '') || char(10) || "
+            "'#image_containers=' || coalesce((SELECT group_concat(c, ',') FROM (SELECT "
+            "json_extract(e.properties,'$.container') AS c FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id WHERE e.project=?1 AND e.type='USAGE' AND s.file_path='k8s/shop.yaml' "
+            "AND json_extract(e.properties,'$.ref')='image' ORDER BY c)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* Every CONNECTS_TO edge as "<source file> <source> -> <target> (<key>)". */
+static char *gpf_connects(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' -> ' || t.name || ' (' || json_extract(e.properties,'$.key') || ')' AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+            "e.project=?1 AND e.type='CONNECTS_TO' ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A service address in a container's environment CONNECTS_TO the Service it
+ * names: `svc:port`, a URL's host, `<svc>.<ns>.svc...`, a bare name on an
+ * address key -- a K8s Service of the bundle in the named (else the
+ * object's own) namespace, a compose service of the same file, its .env
+ * interpolated (a name without a value takes the .env's, which may itself
+ * name others). Never: another domain's host, a templated value, localhost,
+ * a bare name on any other key, a namespace without that Service, a service
+ * addressing itself -- and never a value in the graph. */
+TEST(probe_env_address_connects_to_its_service) {
+    static const GpfFile files[] = {
+        {"k8s/app.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\n"
+         "spec:\n  template:\n    spec:\n      containers:\n        - name: web\n"
+         "          image: acme/web\n          env:\n"
+         "            - name: CATALOG_ADDR\n              value: \"catalog:3550\"\n"
+         "            - name: AUTH_URL\n"
+         "              value: \"http://auth.auth.svc.cluster.local:8080/login\"\n"
+         "            - name: CACHE_HOST\n              value: cache\n"
+         "            - name: DB_HOST\n              value: db.example.com\n"
+         "            - name: TEMPLATED_ADDR\n              value: \"{{ .Values.addr }}\"\n"
+         "            - name: LOCAL_ADDR\n              value: \"localhost:9000\"\n"
+         "            - name: GREETING\n              value: catalog\n"
+         "            - name: PRICES_ADDR\n              value: \"catalog.other:3550\"\n"
+         "            - name: MAIL_URL\n              value: \"smtp://mail.shop.example.com:25\"\n"},
+        {"k8s/svc.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: catalog\n"
+                         "  namespace: shop\n---\napiVersion: v1\nkind: Service\nmetadata:\n"
+                         "  name: cache\n  namespace: shop\n---\napiVersion: v1\nkind: Service\n"
+                         "metadata:\n  name: auth\n  namespace: auth\n---\napiVersion: v1\n"
+                         "kind: Service\nmetadata:\n  name: db\n  namespace: shop\n---\n"
+                         "apiVersion: v1\nkind: Service\nmetadata:\n  name: mail\n"
+                         "  namespace: shop\n"},
+        {"compose.yaml",
+         "services:\n  web:\n    image: acme/web\n    environment:\n      DB_HOST: db\n"
+         "      CACHE_URL: redis://cache:6379\n      API_KEY: s3cr3t-value\n"
+         "      WEB_ADDR: web\n  worker:\n    image: acme/worker\n    environment:\n"
+         "      - QUEUE_ADDR\n      - OTHER_URL=http://${QUEUE_HOST}:80\n"
+         "  db:\n    image: postgres\n  cache:\n    image: redis\n  queue:\n"
+         "    image: rabbitmq\n"},
+        {".env", "QUEUE_PORT=5672\nQUEUE_HOST=queue\nQUEUE_ADDR=queue:${QUEUE_PORT}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_connects(files, n);
+    static const char want[] = "compose.yaml Service/web -> Service/cache (CACHE_URL)\n"
+                               "compose.yaml Service/web -> Service/db (DB_HOST)\n"
+                               "compose.yaml Service/worker -> Service/queue (QUEUE_ADDR)\n"
+                               "k8s/app.yaml Deployment/web -> Service/auth (AUTH_URL)\n"
+                               "k8s/app.yaml Deployment/web -> Service/cache (CACHE_HOST)\n"
+                               "k8s/app.yaml Deployment/web -> Service/catalog (CATALOG_ADDR)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "connects got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("CONNECTS_TO edge set");
+    }
+    free(got);
+    static const char *const values[] = {"catalog:3550", "s3cr3t-value", "redis://cache:6379",
+                                         "queue:5672", "/login"};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        int hits = gpf_graph_mentions(files, n, values[i]);
+        if (hits != 0) {
+            fprintf(stderr, "value %s: %d graph mentions\n", values[i], hits);
+            FAIL("an env value reached the graph");
+        }
+    }
+    PASS();
+}
+
+/* Every kustomize patch edge as "<source file> <source label> -> <target>
+ * @<target file>", then "patch imports <n>" (IMPORTS of patch files), "maps
+ * into patches <n>" (INFRA_MAPS into a patch file's documents) and "version
+ * <v>" (base/deploy.yaml's Resource), "odd version <v>" (other/odd.yaml's:
+ * none without one, missing without the Resource), "labels <l>"
+ * (base/deploy.yaml's). */
+static char *gpf_patches(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.label || ' -> ' || t.name || ' @' || t.file_path AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='OVERRIDE' AND json_extract(e.properties,'$.via')='patch' ORDER BY x)), '') "
+            "|| char(10) || 'patch imports ' || (SELECT COUNT(*) FROM edges e WHERE e.project=?1 "
+            "AND e.type='IMPORTS' AND json_extract(e.properties,'$.local_name')='patches') || "
+            "char(10) || 'maps into patches ' || (SELECT COUNT(*) FROM edges e JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='INFRA_MAPS' AND t.file_path LIKE "
+            "'overlays/%') || char(10) || 'version ' || coalesce((SELECT "
+            "json_extract(properties,'$.version') FROM nodes WHERE project=?1 AND "
+            "label='Resource' AND file_path='base/deploy.yaml'), '-') || char(10) || "
+            "'odd version ' || coalesce((SELECT coalesce(json_extract(properties,'$.version'), "
+            "'none') FROM nodes WHERE project=?1 AND label='Resource' AND "
+            "file_path='other/odd.yaml'), 'missing') || char(10) || 'labels ' || "
+            "coalesce((SELECT json_extract(properties,'$.labels') FROM nodes WHERE project=?1 "
+            "AND label='Resource' AND file_path='base/deploy.yaml'), '-')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kustomization's patches OVERRIDE the objects of its build they change,
+ * child -> base: a patch file's documents the objects of the same kind and
+ * name; an inline patch (from the kustomization) the object its document
+ * names (a `${VAR}` name as written); a JSON6902 operation file (from the
+ * file) the objects its target selects -- group and version included; a
+ * component's the objects of the build including it; a kind alone every
+ * object of that kind. Never: an object outside the build, one the patch
+ * does not name (another name, group, version or namespace), a component
+ * nothing includes. A label selector meets the objects whose metadata.labels
+ * carry its terms (`k=v`, `k`, `k!=v`; a Resource keeps them sorted). A
+ * patch file is an import of
+ * the kustomization, never a member of its build (a Service selects no patch
+ * document). A Resource keeps the version of its apiVersion; a bare group
+ * (`apiVersion: example.io`) has none. */
+TEST(probe_kustomize_patches_override_their_base) {
+    static const GpfFile files[] = {
+        {"base/kustomization.yaml", "resources:\n- deploy.yaml\n- svc.yaml\n- cm.yaml\n"},
+        {"base/cm.yaml",
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${APP}-config\n  namespace: app\n"},
+        {"base/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\n"
+         "  labels:\n    tier: front\n    app: web\n    note: a=b\nspec:\n"
+         "  template:\n    metadata:\n      labels:\n        app: web\n"},
+        {"base/svc.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: app\n"
+                          "spec:\n  selector:\n    app: web\n"},
+        {"overlays/prod/kustomization.yaml",
+         "namespace: app\nresources:\n- ../../base\ncomponents:\n- ../../components/extra\n"
+         "patches:\n"
+         "- path: patch-deploy.yaml\n"
+         "- path: ns-patch.yaml\n"
+         "- path: all.yaml\n  target:\n    kind: Service\n"
+         "- patch: |-\n    apiVersion: v1\n    kind: Service\n    metadata:\n      name: web\n"
+         "    spec:\n      type: NodePort\n"
+         "- path: ops.yaml\n  target:\n    kind: Deployment\n    name: web\n"
+         "- path: ops-v2.yaml\n  target:\n    group: apps\n    version: v2\n    kind: Deployment\n"
+         "- path: ops-batch.yaml\n  target:\n    group: batch\n    kind: Deployment\n"
+         "- path: sel.yaml\n  target:\n    kind: Deployment\n    labelSelector: tier=none\n"
+         "- path: lab.yaml\n  target:\n    kind: Deployment\n    labelSelector: app=web,tier\n"
+         "- path: neq.yaml\n  target:\n    kind: Deployment\n    labelSelector: app!=web\n"
+         "- path: sel-only.yaml\n  target:\n    labelSelector: tier=front\n"
+         "- path: ann.yaml\n  target:\n    kind: Deployment\n    annotationSelector: x=y\n"
+         "- path: cm-patch.yaml\n"
+         "- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n"
+         "      name: missing\n"},
+        {"overlays/prod/ops-batch.yaml", "- op: replace\n  path: /spec/replicas\n  value: 5\n"},
+        {"overlays/prod/ns-patch.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: elsewhere\n"},
+        {"overlays/prod/all.yaml", "- op: add\n  path: /metadata/labels/tier\n  value: front\n"},
+        {"overlays/prod/sel.yaml", "- op: replace\n  path: /spec/replicas\n  value: 6\n"},
+        {"overlays/prod/lab.yaml", "- op: replace\n  path: /spec/replicas\n  value: 7\n"},
+        {"overlays/prod/neq.yaml", "- op: replace\n  path: /spec/replicas\n  value: 8\n"},
+        {"overlays/prod/sel-only.yaml", "- op: replace\n  path: /spec/replicas\n  value: 9\n"},
+        {"overlays/prod/ann.yaml", "- op: replace\n  path: /spec/replicas\n  value: 1\n"},
+        {"overlays/prod/cm-patch.yaml",
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${APP}-config\n  namespace: app\n"
+         "data:\n  k: v\n"},
+        {"overlays/prod/patch-deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\nspec:\n"
+         "  template:\n    metadata:\n      labels:\n        app: web\n"},
+        {"overlays/prod/ops.yaml", "- op: replace\n  path: /spec/replicas\n  value: 3\n"},
+        {"overlays/prod/ops-v2.yaml", "- op: replace\n  path: /spec/replicas\n  value: 4\n"},
+        {"components/extra/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\npatches:\n"
+         "- patch: |-\n    apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n"
+         "      name: web\n      namespace: app\n"},
+        {"components/unused/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1alpha1\nkind: Component\npatches:\n"
+         "- patch: |-\n    apiVersion: v1\n    kind: Service\n    metadata:\n      name: web\n"},
+        {"other/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\n"},
+        {"other/odd.yaml", "apiVersion: example.io\nkind: Thing\nmetadata:\n  name: odd\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_patches(files, n);
+    static const char want[] =
+        "components/extra/kustomization.yaml File -> Deployment/web @base/deploy.yaml\n"
+        "overlays/prod/all.yaml File -> Service/web @base/svc.yaml\n"
+        "overlays/prod/cm-patch.yaml Resource -> ConfigMap/${APP}-config @base/cm.yaml\n"
+        "overlays/prod/kustomization.yaml File -> Service/web @base/svc.yaml\n"
+        "overlays/prod/lab.yaml File -> Deployment/web @base/deploy.yaml\n"
+        "overlays/prod/ops.yaml File -> Deployment/web @base/deploy.yaml\n"
+        "overlays/prod/patch-deploy.yaml Resource -> Deployment/web @base/deploy.yaml\n"
+        "overlays/prod/sel-only.yaml File -> Deployment/web @base/deploy.yaml\n"
+        "patch imports 12\n"
+        "maps into patches 0\n"
+        "version v1\n"
+        "odd version none\n"
+        "labels app=web,tier=front";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "patches got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize patch edges");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every kustomize chart deploy as "<source file> <source label> -> <target
+ * label>/<target name> <properties less line>", then "values imports <n>". */
+static char *gpf_kcharts(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.label || ' -> ' || t.label || '/' || t.name || ' ' || json_remove(e.properties, "
+            "'$.line') AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='DEPLOYS' AND "
+            "json_extract(e.properties,'$.via')='helmcharts' ORDER BY x)), '') || char(10) || "
+            "'values imports ' || (SELECT COUNT(*) FROM edges e WHERE e.project=?1 AND "
+            "e.type='IMPORTS' AND json_extract(e.properties,'$.local_name')='valuesFile')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A chart a kustomization inflates (`helmCharts`) DEPLOYS from that
+ * kustomization -- its Kustomization Resource, else (no `kind:` line) its
+ * File -- to the shared external Chart of the name, keeping repository,
+ * version, release, namespace and values file; two kustomizations of one
+ * chart share it. A chart name with a path names nothing; a values file
+ * outside the repository is not kept; one inside is an import. */
+TEST(probe_kustomize_helm_charts_deploy_their_chart) {
+    static const GpfFile files[] = {
+        {"obs/kustomization.yaml",
+         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nhelmCharts:\n"
+         "- name: loki\n  repo: https://grafana.github.io/helm-charts\n  version: 6.46.0\n"
+         "  releaseName: logs\n  namespace: obs\n  valuesFile: values.yaml\n"
+         "- name: org/thing\n  repo: https://example.com/charts\n"},
+        {"obs/values.yaml", "loki:\n  auth_enabled: false\n"},
+        {"plain/kustomization.yaml",
+         "helmCharts:\n- name: loki\n  repo: oci://registry.example.com/charts\n"
+         "  valuesFile: ../../../../outside.yaml\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_kcharts(files, n);
+    static const char want[] =
+        "obs/kustomization.yaml Resource -> Chart/loki {\"via\":\"helmcharts\",\"external\":true,"
+        "\"chart\":\"loki\",\"url\":\"https://grafana.github.io/helm-charts\",\"version\":\"6.46.0\","
+        "\"release\":\"logs\",\"namespace\":\"obs\",\"values\":\"obs/values.yaml\"}\n"
+        "plain/kustomization.yaml File -> Chart/loki {\"via\":\"helmcharts\",\"external\":true,"
+        "\"chart\":\"loki\",\"url\":\"oci://registry.example.com/charts\"}\n"
+        "values imports 1";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "kustomize charts got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize chart deploys");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every Terraform reference edge as
+ * "<file> <block> -> <file> <block> <type> <ref>:<line>", then a line
+ * "other tf edges <n>": USAGE / CALLS edges leaving a .tf file that the
+ * module resolver did not make. */
+static char *gpf_tf_refs(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' -> ' || t.file_path || ' ' || t.name || ' ' || e.type || ' ' || "
+            "json_extract(e.properties,'$.ref') || ':' || json_extract(e.properties,'$.line') AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND e.type IN ('USAGE','DEPENDS_ON') AND "
+            "json_extract(e.properties,'$.via')='terraform' ORDER BY x)), '') || char(10) || "
+            "'other tf edges ' || (SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+            "WHERE e.project=?1 AND e.type IN ('USAGE','CALLS') AND s.file_path LIKE '%.tf' AND "
+            "coalesce(json_extract(e.properties,'$.via'),'') != 'terraform')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A Terraform reference (var.X, local.X, module.X, data.T.N, T.N) USAGEs,
+ * from the top-level block holding it, the block declaring it in the same
+ * directory -- the module, all its .tf files -- with the reference kind and
+ * line; an entry of the block's depends_on list is a DEPENDS_ON (beside a
+ * USAGE where the block also uses the object). A bare label (`variable prefix {}`) names its block like a quoted
+ * one. A name mentioned in string text, a `/ *` glob inside an
+ * interpolation, a reference to the block holding it, and a directory
+ * declaring nothing of the name make no edge; the generic name matcher
+ * makes none at all for a .tf file. */
+TEST(probe_terraform_refs_resolve_in_their_module) {
+    static const GpfFile files[] = {
+        {"infra/variables.tf",
+         "variable \"region\" {}\nvariable prefix {\n  default = \"x\"\n}\n"
+         "variable \"unused\" {\n  description = \"see var.region\"\n}\n"},
+        {"infra/main.tf",
+         "locals {\n  name = \"${var.prefix}-svc\"\n  full = \"${local.name}-${var.region}\"\n}\n"
+         "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = local.full\n}\n"
+         "resource \"aws_s3_bucket_policy\" \"logs\" {\n  bucket = aws_s3_bucket.logs.id\n"
+         "  policy = data.aws_iam_policy_document.p.json\n"
+         "  depends_on = [aws_s3_bucket.logs]\n}\n"
+         "data \"aws_iam_policy_document\" \"p\" {\n  statement {\n"
+         "    resources = [\"${aws_s3_bucket.logs.arn}/*\"]\n  }\n}\n"
+         "module \"net\" {\n  source = \"./net\"\n  region = var.region\n"
+         "  depends_on = [\n    aws_s3_bucket_policy.logs,\n  ]\n}\n"
+         "output \"net\" {\n  value = module.net.id\n}\n"},
+        {"infra/net/main.tf",
+         "variable \"region\" {}\nresource \"aws_vpc\" \"v\" {\n  tags = { r = var.region }\n}\n"},
+        {"other/x.tf", "resource \"null_resource\" \"n\" {\n  triggers = { r = var.region }\n}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_refs(files, n);
+    static const char want[] =
+        "infra/main.tf data.aws_iam_policy_document.p -> infra/main.tf resource.aws_s3_bucket.logs "
+        "USAGE resource:15\n"
+        "infra/main.tf locals -> infra/variables.tf variable.prefix USAGE var:2\n"
+        "infra/main.tf locals -> infra/variables.tf variable.region USAGE var:3\n"
+        "infra/main.tf module.net -> infra/main.tf resource.aws_s3_bucket_policy.logs "
+        "DEPENDS_ON resource:22\n"
+        "infra/main.tf module.net -> infra/variables.tf variable.region USAGE var:20\n"
+        "infra/main.tf output.net -> infra/main.tf module.net USAGE module:26\n"
+        "infra/main.tf resource.aws_s3_bucket.logs -> infra/main.tf locals USAGE local:6\n"
+        "infra/main.tf resource.aws_s3_bucket_policy.logs -> infra/main.tf "
+        "data.aws_iam_policy_document.p USAGE data:10\n"
+        "infra/main.tf resource.aws_s3_bucket_policy.logs -> infra/main.tf "
+        "resource.aws_s3_bucket.logs DEPENDS_ON resource:11\n"
+        "infra/main.tf resource.aws_s3_bucket_policy.logs -> infra/main.tf "
+        "resource.aws_s3_bucket.logs USAGE resource:9\n"
+        "infra/net/main.tf resource.aws_vpc.v -> infra/net/main.tf variable.region USAGE var:3\n"
+        "other tf edges 0";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform refs got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform refs");
+    }
+    free(got);
+    PASS();
+}
+
+/* A Terraform / OpenTofu module file (.tf, .tofu) extracts its blocks but no
+ * generic calls or usages -- its references are the module resolver's -- while
+ * any other HCL file (Packer, Nomad, Terragrunt .hcl) keeps them. */
+TEST(probe_terraform_module_files_extract_no_generic_refs) {
+    static const char src[] = "locals {\n  watched = [1]\n  result = length(watched)\n}\n";
+    static const char *const names[] = {"main.tf", "main.tofu", "main.hcl"};
+    int calls[3];
+    int usages[3];
+    int defs[3];
+    for (int i = 0; i < 3; i++) {
+        CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_HCL, "probe", names[i],
+                                            0, NULL, NULL);
+        ASSERT_NOT_NULL(r);
+        calls[i] = r->calls.count;
+        usages[i] = r->usages.count;
+        defs[i] = r->defs.count;
+        cbm_free_result(r);
+    }
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(calls[i], 0);
+        ASSERT_EQ(usages[i], 0);
+        ASSERT_GT(defs[i], 0);
+    }
+    ASSERT_GT(calls[2], 0);
+    ASSERT_GT(usages[2], 0);
+    PASS();
+}
+
+/* Every Terraform module IMPORTS and output-read edge as
+ * "<file> <block> <type> <target> <local_name|ref>:<line>", the target a
+ * Folder's path, the Project, or "<file> <block>". */
+static char *gpf_tf_modules(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' ' || e.type || ' ' || CASE t.label WHEN 'Folder' THEN 'Folder:' || "
+            "t.file_path WHEN 'Project' THEN 'Project' ELSE t.file_path || ' ' || t.name END || "
+            "' ' || coalesce(json_extract(e.properties,'$.local_name'), "
+            "json_extract(e.properties,'$.ref')) || ':' || json_extract(e.properties,'$.line') AS x "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.project=?1 AND json_extract(e.properties,'$.via')='terraform' AND "
+            "(e.type='IMPORTS' OR json_extract(e.properties,'$.ref')='output') ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A module call with a local source IMPORTS {local_name} the Folder of that
+ * directory (the root directory: the Project), and module.X.Y -- also through
+ * an index or a splat -- USAGEs {ref: output} the `output "Y"` there. A
+ * registry source (also `modules/net`: a local path starts with ./ or ../), a
+ * directory that does not exist, holds no .tf file or lies past the
+ * repository root, and an output the module does not declare make none. */
+TEST(probe_terraform_module_calls_import_their_source) {
+    static const GpfFile files[] = {
+        {"main.tf",
+         "module \"net\" {\n  source = \"./modules/net\"\n}\n"
+         "module \"cnt\" {\n  source = \"./modules/net\"\n  count  = 2\n}\n"
+         "module \"reg\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n"
+         "  version = \"5.0.0\"\n}\n"
+         "module \"gone\" {\n  source = \"./modules/missing\"\n}\n"
+         "module \"out\" {\n  source = \"../outside\"\n}\n"
+         "output \"a\" {\n  value = module.net.id\n}\n"
+         "output \"b\" {\n  value = module.cnt[0].id\n}\n"
+         "output \"c\" {\n  value = module.cnt[*].name\n}\n"
+         "output \"d\" {\n  value = module.net.nope\n}\n"
+         "output \"e\" {\n  value = module.reg.vpc_id\n}\n"
+         "module \"bare\" {\n  source = \"modules/net\"\n}\n"
+         "module \"docs\" {\n  source = \"./docs\"\n}\n"},
+        {"docs/README.md", "# docs\n"},
+        {"modules/net/main.tf",
+         "output \"id\" {\n  value = \"x\"\n}\noutput \"name\" {\n  value = \"n\"\n}\n"},
+        {"examples/basic/main.tf",
+         "module \"root\" {\n  source = \"../..\"\n}\noutput \"r\" {\n  value = module.root.a\n}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_modules(files, n);
+    static const char want[] =
+        "examples/basic/main.tf module.root IMPORTS Project root:1\n"
+        "examples/basic/main.tf output.r USAGE main.tf output.a output:5\n"
+        "main.tf module.cnt IMPORTS Folder:modules/net cnt:4\n"
+        "main.tf module.net IMPORTS Folder:modules/net net:1\n"
+        "main.tf output.a USAGE modules/net/main.tf output.id output:19\n"
+        "main.tf output.b USAGE modules/net/main.tf output.id output:22\n"
+        "main.tf output.c USAGE modules/net/main.tf output.name output:25";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform modules got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform modules");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every tfvars OVERRIDE edge as "<file> <name> -> <file> <block> <line>",
+ * " inferred" appended when the edge says so. */
+static char *gpf_tf_tfvars(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' -> ' || t.file_path || ' ' || t.name || ' ' || "
+            "json_extract(e.properties,'$.line') || CASE WHEN "
+            "json_extract(e.properties,'$.inferred') THEN ' inferred' ELSE '' END AS x FROM edges e "
+            "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 "
+            "AND e.type='OVERRIDE' AND json_extract(e.properties,'$.via')='tfvars' ORDER BY x)), "
+            "'')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A .tfvars file's assignment to a variable the module of its own directory
+ * declares OVERRIDEs {via: tfvars, line} that `variable` block, from the
+ * file's Variable of the name. A file whose directory declares none of its
+ * names -- no Terraform there, or a module that does not declare them --
+ * sets the nearest ancestor module's that does (applied by a -var-file the
+ * repository does not state: `inferred`). An undeclared name, and a file
+ * with no declaring module above it, make none. */
+TEST(probe_terraform_tfvars_override_their_variables) {
+    static const GpfFile files[] = {
+        {"stack/variables.tf", "variable \"region\" {}\nvariable \"size\" {\n  default = 1\n}\n"},
+        {"stack/terraform.tfvars", "region  = \"eu\"\nsize    = 3\nunknown = \"x\"\n"},
+        {"stack/prod/prod.tfvars", "region = \"us\"\n"},
+        {"stack/sub/main.tf", "resource \"null_resource\" \"x\" {}\n"},
+        {"stack/sub/sub.tfvars", "size = 9\n"},
+        {"other.tfvars", "region = \"ap\"\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_tfvars(files, n);
+    static const char want[] =
+        "stack/prod/prod.tfvars region -> stack/variables.tf variable.region 1 inferred\n"
+        "stack/sub/sub.tfvars size -> stack/variables.tf variable.size 1 inferred\n"
+        "stack/terraform.tfvars region -> stack/variables.tf variable.region 1\n"
+        "stack/terraform.tfvars size -> stack/variables.tf variable.size 2";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform tfvars got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform tfvars");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every Terragrunt edge as "<file> <block> <type> <target> <local_name |
+ * read=<file> | ->:<line>", a Folder target as "Folder:<path>". */
+static char *gpf_tg_edges(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "s.name || ' ' || e.type || ' ' || CASE t.label WHEN 'Folder' THEN 'Folder:' || "
+            "t.file_path ELSE t.file_path END || ' ' || coalesce(json_extract(e.properties,"
+            "'$.local_name'), 'read=' || json_extract(e.properties,'$.read'), '-') || ':' || "
+            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "json_extract(e.properties,'$.via')='terragrunt' ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A Terragrunt unit (terragrunt.hcl), evaluated in its own context: an
+ * include IMPORTS {local_name} the file its path names; a
+ * read_terragrunt_config IMPORTS {read} the file it names -- from the block
+ * holding the call, or, for a call in an included file (evaluated for the
+ * including unit: find_in_parent_folders searches from the UNIT), from the
+ * include block bringing that file in; a dependency DEPENDS_ON the other
+ * unit; a local terraform source IMPORTS its Folder. A path built from an
+ * unknown function (get_env) makes none. */
+TEST(probe_terragrunt_units_compose_their_files) {
+    static const GpfFile files[] = {
+        {"root.hcl",
+         "locals {\n  acct = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n"},
+        {"live/account.hcl", "locals {\n  id = \"1\"\n}\n"},
+        {"live/app/terragrunt.hcl",
+         "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n"
+         "include \"common\" {\n"
+         "  path = \"${dirname(find_in_parent_folders(\"root.hcl\"))}/_common/app.hcl\"\n}\n"
+         "dependency \"db\" {\n  config_path = \"../db\"\n}\n"
+         "terraform {\n  source = \"../../modules/app\"\n}\n"
+         "locals {\n  env = read_terragrunt_config(\"env.hcl\")\n"
+         "  bad = read_terragrunt_config(get_env(\"X\"))\n}\n"},
+        {"live/app/env.hcl", "locals {\n  name = \"app\"\n}\n"},
+        {"_common/app.hcl",
+         "locals {\n  acct = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n"},
+        {"live/db/terragrunt.hcl", "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n"},
+        {"modules/app/main.tf", "variable \"x\" {}\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tg_edges(files, n);
+    static const char want[] =
+        "live/app/terragrunt.hcl dependency.db DEPENDS_ON live/db/terragrunt.hcl db:7\n"
+        "live/app/terragrunt.hcl include.common IMPORTS _common/app.hcl common:4\n"
+        "live/app/terragrunt.hcl include.common IMPORTS live/account.hcl read=_common/app.hcl:2\n"
+        "live/app/terragrunt.hcl include.root IMPORTS live/account.hcl read=root.hcl:2\n"
+        "live/app/terragrunt.hcl include.root IMPORTS root.hcl root:1\n"
+        "live/app/terragrunt.hcl locals IMPORTS live/app/env.hcl read=live/app/terragrunt.hcl:14\n"
+        "live/app/terragrunt.hcl terraform IMPORTS Folder:modules/app -:10\n"
+        "live/db/terragrunt.hcl include.root IMPORTS live/account.hcl read=root.hcl:2\n"
+        "live/db/terragrunt.hcl include.root IMPORTS root.hcl root:1";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terragrunt got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terragrunt");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every Ansible IMPORTS edge as "<file> <type> <label>:<target> <local_name>:<line>". */
+static char *gpf_ansible(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "e.type || ' ' || t.label || ':' || t.file_path || ' ' || "
+            "json_extract(e.properties,'$.local_name') || ':' || "
+            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "json_extract(e.properties,'$.via')='ansible' ORDER BY x)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A playbook or task file (a YAML file whose top level is a sequence)
+ * IMPORTS {local_name: <directive>} what its directives name: import_playbook
+ * a playbook from its directory; include_tasks / import_tasks a task file
+ * from its directory, else from its role's tasks/ (also inside a block:);
+ * roles: items and include_role / import_role a role's Folder, roles/<name>
+ * at or above its directory. A templated target, an empty directive, and a
+ * mapping-topped file (values, CI) with the same keys, make none. */
+TEST(probe_ansible_files_import_what_they_name) {
+    static const GpfFile files[] = {
+        {"site.yml", "- name: Install\n  import_playbook: playbooks/cluster.yml\n"},
+        {"playbooks/cluster.yml",
+         "- hosts: all\n  roles:\n    - common\n    - role: web\n      when: false\n"
+         "    - \"{{ dyn }}\"\n  tasks:\n    - name: a\n      include_tasks: tasks/extra.yml\n"
+         "    - name: b\n      ansible.builtin.import_role:\n        name: db\n"},
+        {"playbooks/tasks/extra.yml", "- name: x\n  debug:\n    msg: hi\n"},
+        {"roles/common/tasks/main.yml",
+         "- name: setup\n  include_tasks: setup.yml\n- name: nested\n  block:\n"
+         "    - name: inner\n      import_tasks: other.yml\n"},
+        {"roles/common/tasks/setup.yml", "- name: s\n  debug:\n    msg: s\n"},
+        {"roles/common/tasks/other.yml", "- name: o\n  debug:\n    msg: o\n"},
+        {"roles/common/handlers/main.yml", "- name: h\n  include_tasks: setup.yml\n"},
+        {"roles/web/tasks/main.yml",
+         "- name: w\n  debug:\n    msg: w\n- name: empty\n  include_tasks:\n"},
+        {"roles/db/tasks/main.yml", "- name: d\n  debug:\n    msg: d\n"},
+        {"values.yaml", "include: playbooks/tasks/extra.yml\n"
+                        "users:\n  - name: ops\n    roles:\n      - common\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_ansible(files, n);
+    static const char want[] =
+        "playbooks/cluster.yml IMPORTS Folder:roles/common roles:3\n"
+        "playbooks/cluster.yml IMPORTS Folder:roles/db import_role:11\n"
+        "playbooks/cluster.yml IMPORTS Folder:roles/web roles:4\n"
+        "playbooks/cluster.yml IMPORTS Module:playbooks/tasks/extra.yml include_tasks:9\n"
+        "roles/common/handlers/main.yml IMPORTS Module:roles/common/tasks/setup.yml "
+        "include_tasks:2\n"
+        "roles/common/tasks/main.yml IMPORTS Module:roles/common/tasks/other.yml import_tasks:6\n"
+        "roles/common/tasks/main.yml IMPORTS Module:roles/common/tasks/setup.yml include_tasks:2\n"
+        "site.yml IMPORTS Module:playbooks/cluster.yml import_playbook:2";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "ansible got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("ansible");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every Resource a Terraform block DEPLOYS as "<block> DEPLOYS <name>
+ * <obj_key> v=<version>", then "terraform resources <n>": the Resources
+ * marked ecosystem terraform, then each INFRA_MAPS edge into one of them as
+ * "<label>:<name> INFRA_MAPS <name>". */
+static char *gpf_tf_k8s(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.name || ' DEPLOYS ' || "
+            "t.name || ' ' || json_extract(t.properties,'$.obj_key') || ' v=' || "
+            "coalesce(json_extract(t.properties,'$.version'), '-') AS x FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='DEPLOYS' AND t.label='Resource' AND "
+            "json_extract(e.properties,'$.via')='terraform' ORDER BY x)), '') || char(10) || "
+            "'terraform resources ' || (SELECT COUNT(*) FROM nodes WHERE project=?1 AND "
+            "label='Resource' AND json_extract(properties,'$.ecosystem')='terraform') || "
+            "coalesce((SELECT group_concat(y, '') FROM (SELECT char(10) || s.label || ':' || s.name "
+            "|| ' INFRA_MAPS ' || t.name AS y FROM edges e JOIN nodes s ON s.id=e.source_id JOIN "
+            "nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='INFRA_MAPS' AND "
+            "json_extract(t.properties,'$.ecosystem')='terraform' ORDER BY y)), '')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kubernetes_<type> resource (also _vN) with a literal metadata name is a
+ * Resource of the K8s identity scheme, ecosystem terraform, its block
+ * DEPLOYS it: the kind its type names, or a kubernetes_manifest's own
+ * apiVersion / kind. The name and namespace come from the object's own
+ * metadata only (never spec's), a default service account's is `default`;
+ * a cluster-scoped kind's obj_key says `_`. A
+ * computed name, and a type acting on an object declared elsewhere
+ * (kubernetes_annotations), make none. A manifest of the same bundle
+ * references it like a manifest's object: the Ingress maps to the Service. */
+TEST(probe_terraform_kubernetes_objects_are_resources) {
+    static const GpfFile files[] = {
+        {"k8s/main.tf",
+         "resource \"kubernetes_namespace_v1\" \"apps\" {\n  metadata {\n    name = \"apps\"\n  }\n}\n"
+         "resource \"kubernetes_deployment\" \"web\" {\n  metadata {\n    name      = \"web\"\n"
+         "    namespace = \"apps\"\n  }\n  spec {\n    template {\n      metadata {\n"
+         "        name = \"inner\"\n      }\n    }\n  }\n}\n"
+         "resource \"kubernetes_manifest\" \"cert\" {\n  manifest = {\n"
+         "    \"apiVersion\" = \"cert-manager.io/v1\"\n    \"kind\"       = \"Certificate\"\n"
+         "    \"metadata\" = {\n      \"name\"      = \"tls\"\n      \"namespace\" = \"apps\"\n"
+         "    }\n  }\n}\n"
+         "resource \"kubernetes_service\" \"computed\" {\n  metadata {\n    name = var.name\n  }\n}\n"
+         "resource \"kubernetes_api_service\" \"metrics\" {\n  metadata {\n"
+         "    name = \"v1beta1.metrics.k8s.io\"\n  }\n  spec {\n    service {\n"
+         "      name      = \"metrics-server\"\n      namespace = \"kube-system\"\n    }\n  }\n}\n"
+         "resource \"kubernetes_annotations\" \"patch\" {\n  api_version = \"v1\"\n"
+         "  kind        = \"ConfigMap\"\n  metadata {\n    name = \"cm\"\n  }\n}\n"
+         "resource \"kubernetes_default_service_account\" \"sa\" {\n  metadata {\n"
+         "    namespace = \"apps\"\n  }\n}\n"
+         "resource \"kubernetes_service_v1\" \"web\" {\n  metadata {\n    name      = \"web\"\n"
+         "    namespace = \"apps\"\n  }\n}\n"
+         "variable \"name\" {}\n"},
+        {"k8s/ingress.yaml",
+         "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: web\n"
+         "  namespace: apps\nspec:\n  rules:\n    - http:\n        paths:\n          - path: /\n"
+         "            pathType: Prefix\n            backend:\n              service:\n"
+         "                name: web\n                port:\n                  number: 80\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_tf_k8s(files, n);
+    static const char want[] =
+        "resource.kubernetes_api_service.metrics DEPLOYS APIService/v1beta1.metrics.k8s.io "
+        "apiregistration.k8s.io/APIService/_/v1beta1.metrics.k8s.io v=-\n"
+        "resource.kubernetes_default_service_account.sa DEPLOYS ServiceAccount/default "
+        "core/ServiceAccount/apps/default v=-\n"
+        "resource.kubernetes_deployment.web DEPLOYS Deployment/web apps/Deployment/apps/web v=-\n"
+        "resource.kubernetes_manifest.cert DEPLOYS Certificate/tls "
+        "cert-manager.io/Certificate/apps/tls v=v1\n"
+        "resource.kubernetes_namespace_v1.apps DEPLOYS Namespace/apps core/Namespace/_/apps v=-\n"
+        "resource.kubernetes_service_v1.web DEPLOYS Service/web core/Service/apps/web v=-\n"
+        "terraform resources 6\n"
+        "Resource:Ingress/web INFRA_MAPS Service/web\n"
+        "Route:*/ INFRA_MAPS Service/web";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "terraform k8s got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("terraform k8s");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every kustomize variant as "<variant> <QN key> <- <base file>:<base>
+ * via=<via> kust=<kustomization>:<line>", then "variants <n> defined <m>":
+ * the Resources marked ecosystem kustomize, and the DEFINES edges into
+ * them. */
+static char *gpf_kust_variants(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT v.name || ' ' || "
+            "substr(v.qualified_name, instr(v.qualified_name, '::') + 2) || ' <- ' || "
+            "b.file_path || ':' || b.name || ' via=' || json_extract(e.properties,'$.via') || "
+            "' kust=' || json_extract(e.properties,'$.kustomization') || ':' || "
+            "json_extract(e.properties,'$.line') AS x FROM edges e JOIN nodes v ON "
+            "v.id=e.source_id JOIN nodes b ON b.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='OVERRIDE' AND json_extract(v.properties,'$.ecosystem')='kustomize' ORDER BY "
+            "x)), '') || char(10) || 'variants ' || (SELECT COUNT(*) FROM nodes WHERE project=?1 "
+            "AND label='Resource' AND json_extract(properties,'$.ecosystem')='kustomize') || "
+            "' defined ' || (SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN "
+            "nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='DEFINES' AND "
+            "s.label='File' AND json_extract(t.properties,'$.ecosystem')='kustomize')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kustomization's namePrefix / nameSuffix deploys its objects under other
+ * names: each renamed object gets a variant Resource with the deployed name
+ * (ecosystem kustomize), which the kustomization's File DEFINES and which
+ * OVERRIDEs {via: namePrefix | nameSuffix, kustomization, line} the object.
+ * Prefixes compose down the build (outer first), as do suffixes (inner
+ * first); the outermost namespace wins; a cluster-scoped kind keeps its
+ * own (none); CRDs, Namespaces and apiregistration APIServices keep their
+ * names (kustomize's skip list) and get none; a prefix with a `/` is no
+ * name part and renames nothing. */
+TEST(probe_kustomize_name_prefix_makes_variants) {
+    static const GpfFile files[] = {
+        {"base/kustomization.yaml",
+         "namespace: system\nnamePrefix: b-\nresources:\n- app.yaml\n- crd.yaml\n- ns.yaml\n"
+         "- apisvc.yaml\n- role.yaml\n"},
+        {"base/app.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: system\n"
+         "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: system\n"},
+        {"base/crd.yaml",
+         "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n"
+         "  name: widgets.example.com\n"},
+        {"base/ns.yaml", "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: system\n"},
+        {"base/apisvc.yaml",
+         "apiVersion: apiregistration.k8s.io/v1\nkind: APIService\nmetadata:\n"
+         "  name: v1.example.com\n"},
+        {"base/role.yaml",
+         "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n"
+         "  name: reader\n"},
+        {"overlay/kustomization.yaml",
+         "namespace: prod\nnamePrefix: p-\nnameSuffix: -x\nresources:\n- ../base\n"},
+        {"suffixed/kustomization.yaml", "nameSuffix: -s\nresources:\n- ../base\n"},
+        {"slashed/kustomization.yaml", "namePrefix: x/\nresources:\n- ../base\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_kust_variants(files, n);
+    static const char want[] =
+        "ClusterRole/b-reader rbac.authorization.k8s.io/ClusterRole/-/b-reader <- "
+        "base/role.yaml:ClusterRole/reader via=namePrefix kust=base/kustomization.yaml:2\n"
+        "ClusterRole/b-reader-s rbac.authorization.k8s.io/ClusterRole/-/b-reader-s <- "
+        "base/role.yaml:ClusterRole/reader via=nameSuffix kust=suffixed/kustomization.yaml:1\n"
+        "ClusterRole/p-b-reader-x rbac.authorization.k8s.io/ClusterRole/-/p-b-reader-x <- "
+        "base/role.yaml:ClusterRole/reader via=namePrefix kust=overlay/kustomization.yaml:2\n"
+        "Deployment/b-web apps/Deployment/system/b-web <- base/app.yaml:Deployment/web "
+        "via=namePrefix kust=base/kustomization.yaml:2\n"
+        "Deployment/b-web-s apps/Deployment/system/b-web-s <- base/app.yaml:Deployment/web "
+        "via=nameSuffix kust=suffixed/kustomization.yaml:1\n"
+        "Deployment/p-b-web-x apps/Deployment/prod/p-b-web-x <- base/app.yaml:Deployment/web "
+        "via=namePrefix kust=overlay/kustomization.yaml:2\n"
+        "Service/b-web core/Service/system/b-web <- base/app.yaml:Service/web via=namePrefix "
+        "kust=base/kustomization.yaml:2\n"
+        "Service/b-web-s core/Service/system/b-web-s <- base/app.yaml:Service/web "
+        "via=nameSuffix kust=suffixed/kustomization.yaml:1\n"
+        "Service/p-b-web-x core/Service/prod/p-b-web-x <- base/app.yaml:Service/web "
+        "via=namePrefix kust=overlay/kustomization.yaml:2\n"
+        "variants 9 defined 9";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "kustomize variants got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("kustomize variants");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every Ansible task / handler as "<file>:<line> <kind> <name> [<module>]",
+ * then every notify as "<task> -> <handler file>:<handler> @<line>", then
+ * "functions <n> defined <m>". */
+static char *gpf_ansible_tasks(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT file_path || ':' || "
+            "start_line || ' ' || json_extract(properties,'$.kind') || ' ' || name || ' [' || "
+            "json_extract(properties,'$.module') || ']' AS x FROM nodes WHERE project=?1 AND "
+            "label='Function' AND json_extract(properties,'$.source')='ansible' ORDER BY "
+            "file_path, start_line)), '') || char(10) || coalesce((SELECT group_concat(y, "
+            "char(10)) FROM (SELECT s.name || ' -> ' || t.file_path || ':' || t.name || ' @' || "
+            "json_extract(e.properties,'$.line') AS y FROM edges e JOIN nodes s ON "
+            "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+            "e.type='CALLS' AND json_extract(e.properties,'$.via')='notify' ORDER BY y)), '') || "
+            "char(10) || 'functions ' || (SELECT COUNT(*) FROM nodes WHERE project=?1 AND "
+            "label='Function' AND json_extract(properties,'$.source')='ansible') || ' defined ' "
+            "|| (SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='DEFINES' AND s.label='File' AND "
+            "json_extract(t.properties,'$.source')='ansible')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An Ansible task (or handler) is a Function, named by its `name:` (else its
+ * module), {source: ansible, kind, module}, which its file DEFINES:
+ * a playbook's pre_tasks / tasks / post_tasks / handlers, a role's tasks/
+ * and handlers/ files, and files an Ansible file includes; a block's tasks
+ * (block, rescue, always), never the block itself. A notify CALLS {via:
+ * notify, line} each handler of that name or listen topic in the task's own
+ * role (a nested role is the directory before its tasks/), else in its file.
+ * A YAML list that is no Ansible (a JSON patch) holds none. */
+TEST(probe_ansible_tasks_are_functions) {
+    static const GpfFile files[] = {
+        {"site.yml",
+         "- hosts: all\n  pre_tasks:\n    - name: Prep\n      command: /bin/true\n"
+         "  roles:\n    - web\n  handlers:\n    - name: reload all\n"
+         "      service: name=x state=reloaded\n  tasks:\n    - name: Ping\n      ping:\n"
+         "      notify: reload all\n- import_playbook: other.yml\n"},
+        {"other.yml",
+         "- hosts: db\n  tasks:\n    - debug: msg=hi\n    - include_tasks: tasks/common.yml\n"},
+        {"tasks/common.yml",
+         "- name: Common\n  shell: echo c\n- name: \"Say \\\"hi\\\"\"\n  debug:\n    msg: x\n"
+         "- name: 'it''s'\n  debug:\n    msg: y\n- name: Act\n  action: shell echo a\n"},
+        {"roles/web/tasks/main.yml",
+         "- name: Install web\n  package:\n    name: nginx\n  notify:\n    - restart web\n"
+         "    - web changed\n- block:\n    - name: Inside block\n      template:\n"
+         "        src: a.j2\n        dest: /etc/a\n      notify: restart web\n  rescue:\n"
+         "    - name: Rescue it\n      debug:\n        msg: failed\n  always:\n"
+         "    - name: Always it\n      ansible.builtin.file:\n        path: /tmp/x\n"
+         "        state: absent\n- include_tasks: extra.yml\n"},
+        {"roles/web/tasks/extra.yml", "- name: Extra\n  command: echo hi\n"},
+        {"roles/web/handlers/main.yml",
+         "- name: restart web\n  service:\n    name: nginx\n    state: restarted\n"
+         "- name: log change\n  debug:\n    msg: changed\n  listen: web changed\n"},
+        {"roles/apps/csi/tasks/main.yml", "- name: Csi\n  command: x\n  notify: restart csi\n"},
+        {"roles/apps/csi/handlers/main.yml", "- name: restart csi\n  command: y\n"},
+        {"roles/apps/lb/handlers/main.yml", "- name: restart csi\n  command: w\n"},
+        {"roles/other/handlers/main.yml", "- name: restart csi\n  command: z\n"},
+        {"patches/ops.yaml", "- op: add\n  path: /x\n  value: 1\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_ansible_tasks(files, n);
+    static const char want[] =
+        "other.yml:3 task debug [debug]\n"
+        "other.yml:4 task include_tasks [include_tasks]\n"
+        "roles/apps/csi/handlers/main.yml:1 handler restart csi [command]\n"
+        "roles/apps/csi/tasks/main.yml:1 task Csi [command]\n"
+        "roles/apps/lb/handlers/main.yml:1 handler restart csi [command]\n"
+        "roles/other/handlers/main.yml:1 handler restart csi [command]\n"
+        "roles/web/handlers/main.yml:1 handler restart web [service]\n"
+        "roles/web/handlers/main.yml:5 handler log change [debug]\n"
+        "roles/web/tasks/extra.yml:1 task Extra [command]\n"
+        "roles/web/tasks/main.yml:1 task Install web [package]\n"
+        "roles/web/tasks/main.yml:8 task Inside block [template]\n"
+        "roles/web/tasks/main.yml:14 task Rescue it [debug]\n"
+        "roles/web/tasks/main.yml:18 task Always it [file]\n"
+        "roles/web/tasks/main.yml:22 task include_tasks [include_tasks]\n"
+        "site.yml:3 task Prep [command]\n"
+        "site.yml:8 handler reload all [service]\n"
+        "site.yml:11 task Ping [ping]\n"
+        "tasks/common.yml:1 task Common [shell]\n"
+        "tasks/common.yml:3 task Say \"hi\" [debug]\n"
+        "tasks/common.yml:6 task it's [debug]\n"
+        "tasks/common.yml:9 task Act [shell]\n"
+        "Csi -> roles/apps/csi/handlers/main.yml:restart csi @3\n"
+        "Inside block -> roles/web/handlers/main.yml:restart web @12\n"
+        "Install web -> roles/web/handlers/main.yml:log change @4\n"
+        "Install web -> roles/web/handlers/main.yml:restart web @4\n"
+        "Ping -> site.yml:reload all @13\n"
+        "functions 21 defined 21";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "ansible tasks got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("ansible tasks");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every DEPLOYS an Ansible task draws, as "<task> DEPLOYS <file> [<module>]",
+ * then "deploys <n>". */
+static char *gpf_ansible_deploys(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.name || ' DEPLOYS ' "
+            "|| t.file_path || ' [' || json_extract(e.properties,'$.module') || ']' AS x FROM "
+            "edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE "
+            "e.project=?1 AND e.type='DEPLOYS' AND json_extract(e.properties,'$.via')='ansible' "
+            "ORDER BY x)), '') || char(10) || 'deploys ' || (SELECT COUNT(*) FROM edges WHERE "
+            "project=?1 AND type='DEPLOYS' AND json_extract(properties,'$.via')='ansible')";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A kube / k8s task DEPLOYS {via: ansible, module, line} the repository file
+ * it applies, traced to the template (or copied file) its play rendered it
+ * from: a renderer whose dest is the very filename; {{ item.item.K }} over
+ * "{{ R.results }}" -> each item of the renderer registering R (its list
+ * literal, a set_fact's or the role defaults'); {{ item.K }} -> each of the
+ * task's own items through the renderer of that dest; a literal filename a
+ * looped renderer renders to; a k8s template: argument. A template is found
+ * before a copy to the same dest. A remote copy (even of a name the role's
+ * files/ holds), a delete by name, apply nothing in the repository. */
+TEST(probe_ansible_kube_tasks_deploy_their_templates) {
+    static const GpfFile files[] = {
+        {"roles/app/tasks/main.yml",
+         "- name: Render manifests\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/{{ item.file }}\"\n  with_items:\n    - {name: a, file: a.yml}\n"
+         "    - {name: b, file: b.yml}\n  register: app_manifests\n"
+         "- name: Apply manifests\n  kube:\n    filename: \"{{ conf }}/{{ item.item.file }}\"\n"
+         "  with_items:\n    - \"{{ app_manifests.results }}\"\n"
+         "- name: Render single\n  template:\n    src: single.yml.j2\n"
+         "    dest: \"{{ conf }}/single.yml\"\n"
+         "- name: Apply single\n  kube:\n    filename: \"{{ conf }}/single.yml\"\n"
+         "- name: Copy static\n  copy:\n    src: static.yml\n    dest: \"{{ conf }}/static.yml\"\n"
+         "- name: Apply static\n  kube:\n    filename: \"{{ conf }}/static.yml\"\n"
+         "- name: Render from defaults\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/x/{{ item.file }}\"\n  loop: \"{{ app_extra }}\"\n"
+         "  register: extra_out\n"
+         "- name: Apply from defaults\n  kube:\n    filename: \"{{ conf }}/x/{{ item.item.file }}\"\n"
+         "  loop: \"{{ extra_out.results }}\"\n"
+         "- name: Facts\n  set_fact:\n    sf_list:\n      - {file: e.yml}\n"
+         "- name: Render from facts\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/f/{{ item.file }}\"\n  with_items: \"{{ sf_list }}\"\n"
+         "  register: sf_out\n"
+         "- name: Apply set_fact\n  kube:\n    filename: \"{{ conf }}/f/{{ item.item.file }}\"\n"
+         "  with_items: \"{{ sf_out.results }}\"\n"
+         "- name: Pairs\n  template:\n    src: \"{{ item.name }}/{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n  with_items:\n"
+         "    - {name: c, file: c.yml}\n"
+         "- name: Apply pairs\n  kube:\n    filename: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n"
+         "  loop:\n    - {name: c, file: c.yml}\n"
+         "- name: Rendered literal\n  template:\n    src: \"{{ item.file }}.j2\"\n"
+         "    dest: \"{{ conf }}/r/{{ item.file }}\"\n  with_items:\n    - {file: ipam.yml}\n"
+         "- name: Apply literal\n  kube:\n    filename: \"{{ conf }}/r/ipam.yml\"\n"
+         "- name: Copy first\n  copy:\n    src: first.yml\n    dest: \"{{ conf }}/dup.yml\"\n"
+         "- name: Render dup\n  template:\n    src: dup.yml.j2\n    dest: \"{{ conf }}/dup.yml\"\n"
+         "- name: Apply dup\n  kube:\n    filename: \"{{ conf }}/dup.yml\"\n"
+         "- name: Remote copy\n  copy:\n    src: static.yml\n    dest: \"{{ conf }}/remote.yml\"\n"
+         "    remote_src: true\n"
+         "- name: Apply remote\n  kube:\n    filename: \"{{ conf }}/remote.yml\"\n"
+         "- name: Delete by name\n  kube:\n    name: old\n    resource: deploy\n    state: absent\n"
+         "- name: k8s template\n  kubernetes.core.k8s:\n    template: tpl.yml.j2\n"},
+        {"roles/app/defaults/main.yml", "app_extra:\n  - file: d.yml\nother: 1\n"},
+        {"roles/app/templates/a.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/b.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/c/c.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/d.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/e.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/ipam.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/single.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/tpl.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/templates/dup.yml.j2", "kind: ConfigMap\n"},
+        {"roles/app/files/first.yml", "kind: ConfigMap\n"},
+        {"roles/app/files/static.yml", "kind: ConfigMap\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_ansible_deploys(files, n);
+    static const char want[] =
+        "Apply dup DEPLOYS roles/app/templates/dup.yml.j2 [kube]\n"
+        "Apply from defaults DEPLOYS roles/app/templates/d.yml.j2 [kube]\n"
+        "Apply literal DEPLOYS roles/app/templates/ipam.yml.j2 [kube]\n"
+        "Apply manifests DEPLOYS roles/app/templates/a.yml.j2 [kube]\n"
+        "Apply manifests DEPLOYS roles/app/templates/b.yml.j2 [kube]\n"
+        "Apply pairs DEPLOYS roles/app/templates/c/c.yml.j2 [kube]\n"
+        "Apply set_fact DEPLOYS roles/app/templates/e.yml.j2 [kube]\n"
+        "Apply single DEPLOYS roles/app/templates/single.yml.j2 [kube]\n"
+        "Apply static DEPLOYS roles/app/files/static.yml [kube]\n"
+        "k8s template DEPLOYS roles/app/templates/tpl.yml.j2 [kubernetes.core.k8s]\n"
+        "deploys 10";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "ansible deploys got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("ansible deploys");
+    }
+    free(got);
+    PASS();
+}
+
+/* Every script HTTP_CALLS edge as "<source file> <route QN>", then a line
+ * "edgeless routes <n>": the Route nodes no edge touches. */
+static char *gpf_script_http(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
+            "t.qualified_name AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND e.type='HTTP_CALLS' AND "
+            "json_extract(e.properties,'$.via') IN ('curl','wget') ORDER BY x)), '') || char(10) "
+            "|| 'edgeless routes ' || (SELECT COUNT(*) FROM nodes r WHERE r.project=?1 AND "
+            "r.label='Route' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id=r.id OR "
+            "e.source_id=r.id))";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A script's curl / wget of a URL it states HTTP_CALLS the Route of it, with
+ * the method its flags give (-X, a body POST, -T PUT, -I HEAD, -G GET,
+ * wget --post-data POST): a Kubernetes Service of the repository by the path
+ * alone (`api`, `api.default.svc.cluster.local`), where that service's
+ * handler meets it; any other host -- a download, a domain under the
+ * service's name, localhost even beside a Service named so -- with the host
+ * kept, and no path-only Route made for it. Constant words resolve
+ * (`v${VER}`), unknown parts are `{}`, also in an unquoted word the grammar
+ * splits; never a proxy's or referer's URL, and never the user info or the
+ * query (a token) in the graph. */
+TEST(probe_script_http_request_calls_its_route) {
+    static const GpfFile files[] = {
+        {"k8s/api.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\n"},
+        {"k8s/localhost.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: localhost\n"},
+        {"dl.sh",
+         "#!/bin/bash\nVER=1.2.3\n"
+         "curl -fsSL https://github.com/x/y/releases/download/v1/tool.tgz -o tool.tgz\n"
+         "curl -X POST -d '{}' \"http://api:8080/v1/items?token=s3cr3t-token\"\n"
+         "wget --post-data=x https://user:pw-secret@dl.example.com/a/b\n"
+         "curl -I https://example.com/head\n"
+         "curl -x http://proxy.local:3128 https://example.org/target\n"
+         "curl -LO \"https://dl.example.com/v${VER}/x-${VER}.tgz\"\n"
+         "curl \"https://dl.example.com/r/${UNKNOWN}/y.tgz\"\n"
+         "curl http://localhost:9090/metrics\n"
+         "curl -G -d q=1 https://example.com/search\n"
+         "curl --request DELETE https://example.com/item/1\n"
+         "curl -fsSLO https://dl.example.com/u/$OS-$ARCH.tgz\n"
+         "curl -LO https://dl.example.com/j/`uname`.tgz\n"
+         "curl -LO https://dl.example.com/q/${VER}$OS.tgz\n"
+         "curl https://api.example.com/v1/ping\n"
+         "curl http://api.default.svc.cluster.local:8080/health\n"
+         "curl \"https://${HOST}/api/x\"\n"},
+        {"Makefile", "TOOL_VERSION=0.1.1\nARCH=amd64\n"
+                     "install:\n\tcurl -sSL https://get.example.com/install.sh | sh\n"
+                     "bin/tool:\n\tcurl -sLo \"bin/tool\" https://dl.example.com/t/v$(TOOL_VERSION)/"
+                     "tool_v$(TOOL_VERSION)_$(OS)_$(ARCH)\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_script_http(files, n);
+    static const char want[] =
+        "Makefile __route__GET__https://dl.example.com/t/v0.1.1/tool_v0.1.1_{}_amd64\n"
+        "Makefile __route__GET__https://get.example.com/install.sh\n"
+        "dl.sh __route__DELETE__https://example.com/item/1\n"
+        "dl.sh __route__GET__/health\n"
+        "dl.sh __route__GET__http://localhost:9090/metrics\n"
+        "dl.sh __route__GET__https://api.example.com/v1/ping\n"
+        "dl.sh __route__GET__https://dl.example.com/j/{}.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/q/{}{}.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/r/{}/y.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/u/{}-{}.tgz\n"
+        "dl.sh __route__GET__https://dl.example.com/v1.2.3/x-1.2.3.tgz\n"
+        "dl.sh __route__GET__https://example.com/search\n"
+        "dl.sh __route__GET__https://example.org/target\n"
+        "dl.sh __route__GET__https://github.com/x/y/releases/download/v1/tool.tgz\n"
+        "dl.sh __route__HEAD__https://example.com/head\n"
+        "dl.sh __route__POST__/v1/items\n"
+        "dl.sh __route__POST__https://dl.example.com/a/b\n"
+        "edgeless routes 0";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "script http got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("script HTTP_CALLS edge set");
+    }
+    free(got);
+    static const char *const values[] = {"s3cr3t-token", "pw-secret", "proxy.local"};
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        int hits = gpf_graph_mentions(files, n, values[i]);
+        if (hits != 0) {
+            fprintf(stderr, "value %s: %d graph mentions\n", values[i], hits);
+            FAIL("a credential, token or proxy reached the graph");
+        }
+    }
+    PASS();
+}
+
+/* A variable a container sets joins the readers of its name inside the files
+ * its own image is built from: the K8s container's image (two containers,
+ * two images), built by compose from a Dockerfile; the stages the last one
+ * copies from; a JSON-form COPY opening with `/` and a COPY with a trailing
+ * blank before a comment (both lost by the grammar); a context the sources
+ * exist under (the repository root for side/, web/ for web/). Never: the same
+ * name in another container's image, a file the context's .dockerignore
+ * drops, a test file, or a reader in no image. */
+TEST(probe_container_env_joins_its_own_image_readers) {
+    static const GpfFile files[] = {
+        {"k8s/shop.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: shop\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: web\n          image: acme/web:1\n"
+         "          env:\n            - name: PORT\n              value: \"8080\"\n"
+         "            - name: MODE\n              value: prod\n"
+         "        - name: side\n          image: acme/side:2\n          env:\n"
+         "            - name: PORT\n              value: \"9090\"\n"},
+        {"compose.yaml", "services:\n  web:\n    image: acme/web:1\n    build: ./web\n"
+                         "    environment:\n      API_KEY: k\n"
+                         "  side:\n    image: acme/side:2\n    build:\n      context: .\n"
+                         "      dockerfile: side/Dockerfile\n"},
+        {"web/Dockerfile", "FROM node:20 AS build\nCOPY src ./src \n# a comment after a blank\n"
+                           "RUN npm ci\nFROM node:20-slim\nCOPY --from=build /src /app/src\n"
+                           "COPY [\"/lib/\", \"/app/lib/\"]\nCOPY gen ./gen\n"
+                           "CMD [\"node\", \"src/server.js\"]\n"},
+        {"web/.dockerignore", "gen/skip.js\n"},
+        {"web/src/server.js", "const port = process.env.PORT;\nconst mode = process.env.MODE;\n"
+                              "const key = process.env.API_KEY;\n"},
+        {"web/src/server.test.js", "const p = process.env.PORT;\n"},
+        {"web/lib/conf.js", "module.exports = process.env.MODE;\n"},
+        {"web/gen/a.js", "exports.m = process.env.MODE;\n"},
+        {"web/gen/skip.js", "exports.m = process.env.MODE;\n"},
+        {"side/Dockerfile", "FROM golang:1.22 AS build\nCOPY side/main.go shared/util.go /src/\n"
+                            "RUN go build -o /app /src\nFROM alpine:3.20\n"
+                            "COPY --from=build /app /app\nENTRYPOINT [\"/app\"]\n"},
+        {"side/main.go", "package main\n\nimport \"os\"\n\nfunc main() { _ = os.Getenv(\"PORT\") }\n"},
+        {"shared/util.go", "package shared\n\nimport \"os\"\n\n"
+                           "func Port() string { return os.Getenv(\"PORT\") }\n"},
+        {"other/main.go", "package main\n\nimport \"os\"\n\n"
+                          "func main() { _ = os.Getenv(\"PORT\"); _ = os.Getenv(\"MODE\") }\n"}};
+    char *got = gpf_env_joins(files, (int)(sizeof(files) / sizeof(files[0])));
+    static const char want[] = "compose.yaml web/API_KEY -> web/src/server.js\n"
+                               "k8s/shop.yaml side/PORT -> shared/util.go\n"
+                               "k8s/shop.yaml side/PORT -> side/main.go\n"
+                               "k8s/shop.yaml web/MODE -> web/gen/a.js\n"
+                               "k8s/shop.yaml web/MODE -> web/lib/conf.js\n"
+                               "k8s/shop.yaml web/MODE -> web/src/server.js\n"
+                               "k8s/shop.yaml web/PORT -> web/src/server.js\n"
+                               "#image_containers=side,web";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "env joins got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("env_read edge set");
+    }
+    free(got);
     PASS();
 }
 
@@ -3078,6 +4432,77 @@ TEST(probe_helm_templated_objects_are_resources) {
     PASS();
 }
 
+/* Every DEPLOYS edge out of a Chart and CONFIGURES edge into one, as
+ * "<source> -> <label>:<target> (<type>[ <ref>])", a File by its path,
+ * sorted, one per line. */
+static char *gpf_chart_edges(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT CASE WHEN "
+            "s.label='File' THEN s.file_path ELSE s.name END || ' -> ' || t.label || ':' || "
+            "t.name || ' (' || e.type || coalesce(' ' || json_extract(e.properties,'$.ref'), '') "
+            "|| ')' AS x FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
+            "t.id=e.target_id WHERE e.project=?1 AND ((s.label='Chart' AND e.type='DEPLOYS') OR "
+            "(t.label='Chart' AND e.type='CONFIGURES')) ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* A chart deploys what its templates render: Chart -DEPLOYS {via: chart}->
+ * each object of its templates/ (a subchart's objects are the subchart's),
+ * and each Image those objects name literally ({ref: image}) -- a templated
+ * image names none, and no values default is read. Its values files
+ * (values.yaml, values-*.yaml beside Chart.yaml) CONFIGURE it; a values file
+ * elsewhere (ci/) does not. */
+TEST(probe_helm_chart_deploys_its_objects) {
+    static const GpfFile files[] = {
+        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 1.0.0\n"},
+        {"charts/web/values.yaml", "image:\n  repository: nginx\n  tag: \"1.27\"\nreplicas: 1\n"},
+        {"charts/web/values-prod.yaml", "replicas: 3\n"},
+        {"charts/web/ci/test-values.yaml", "replicas: 2\n"},
+        {"charts/web/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+         "  replicas: {{ .Values.replicas }}\n  template:\n    spec:\n      containers:\n"
+         "        - name: web\n"
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"
+         "        - name: side\n          image: ghcr.io/acme/sidecar:1\n"},
+        {"charts/web/templates/svc.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  selector:\n"
+         "    app: web\n"},
+        {"charts/web/charts/db/Chart.yaml", "apiVersion: v2\nname: db\nversion: 0.1.0\n"},
+        {"charts/web/charts/db/templates/sts.yaml",
+         "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  template:\n"
+         "    spec:\n      containers:\n        - name: db\n"
+         "          image: ghcr.io/acme/db:16\n"}};
+    char *got = gpf_chart_edges(files, 8);
+    static const char want[] = "charts/web/values-prod.yaml -> Chart:web (CONFIGURES)\n"
+                               "charts/web/values.yaml -> Chart:web (CONFIGURES)\n"
+                               "db -> Image:ghcr.io/acme/db (DEPLOYS image)\n"
+                               "db -> Resource:StatefulSet/db (DEPLOYS)\n"
+                               "web -> Image:ghcr.io/acme/sidecar (DEPLOYS image)\n"
+                               "web -> Resource:Deployment/web (DEPLOYS)\n"
+                               "web -> Resource:Service/web (DEPLOYS)";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "chart edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("Chart DEPLOYS / CONFIGURES edge set");
+    }
+    free(got);
+    PASS();
+}
+
 /* A template's `include "name"` calls the define of that name in its chart
  * family -- the chart and its subcharts share one template namespace -- never
  * a same-named define of an unrelated chart; a define may also be written in
@@ -3466,6 +4891,128 @@ TEST(probe_helm_unresolved_file_dependency_stays_external) {
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.charts, 2);
     ASSERT_EQ(m.depends_on, 1);
+    PASS();
+}
+
+/* Every external Chart as "<name> <QN, the project as <p>> <repository or ->
+ * in=<edges into it>", sorted, one per line. NULL on failure; the caller
+ * frees. */
+static char *gpf_external_charts(const GpfFile *files, int nfiles) {
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
+    char *out = NULL;
+    if (store) {
+        sqlite3_stmt *st = NULL;
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT n.name || ' ' || "
+            "replace(n.qualified_name, ?1, '<p>') || ' ' || "
+            "coalesce(json_extract(n.properties,'$.repository'), '-') || ' in=' || "
+            "(SELECT count(*) FROM edges e WHERE e.target_id=n.id) AS x FROM nodes n "
+            "WHERE n.project=?1 AND n.label='Chart' AND json_extract(n.properties,'$.external') "
+            "ORDER BY x)";
+        if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                out = strdup((const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    gpf_cleanup(&lp, store);
+    return out;
+}
+
+/* An external Chart is keyed by its publisher, __chart__<repository>/<name>,
+ * the repository's scheme and host lower-cased, a trailing slash and `.git`
+ * dropped: a Chart.yaml dependency, a kustomization, a Flux chartRef and a
+ * Terraform oci:// reference naming one published chart meet in one node,
+ * the same QN in every project. An oci:// repository is never cut, even when
+ * it ends in the chart's name (karpenter); a chart reference is cut to its
+ * repository. A repository that is no URL (an @alias, no scheme, file://,
+ * credentials in the authority, a query or fragment a token may ride in, an
+ * unexpanded ${...}) or that the pass does not read (a
+ * Terraform `repository =`) keeps the per-project
+ * <project>.__helm_dep__.<name>. The external charts a Chart.yaml depends on
+ * carry its path, yet a helm_release, a helm command and a Go loader naming
+ * that chart directory deploy the chart the directory declares. */
+TEST(probe_external_chart_identity_is_its_publisher) {
+    static const GpfFile files[] = {
+        {"charts/app/Chart.yaml",
+         "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
+         "  - name: redis\n    repository: https://Charts.Example.com/stable/\n"
+         "    version: 1.x\n"
+         "  - name: common\n    repository: \"@stable\"\n    version: 1.x\n"
+         "  - name: nats\n    repository: oci://registry.example.com/charts\n"
+         "    version: 1.x\n"
+         "  - name: vault\n    repository: https://user@charts.example.com/private\n"
+         "    version: 1.x\n"},
+        {"main.tf", "resource \"helm_release\" \"app\" {\n"
+                    "  name  = \"app\"\n  chart = \"./charts/app\"\n}\n\n"
+                    "resource \"helm_release\" \"queue\" {\n"
+                    "  name  = \"queue\"\n"
+                    "  chart = \"oci://registry.example.com/charts/nats\"\n}\n\n"
+                    "resource \"helm_release\" \"cache\" {\n"
+                    "  name       = \"cache\"\n"
+                    "  repository = \"https://charts.example.com/stable\"\n"
+                    "  chart      = \"redis\"\n}\n"},
+        {"deploy.sh", "#!/bin/sh\ndeploy_app() {\n  helm upgrade --install app ./charts/app\n}\n"},
+        {"go.mod", "module example.com/app\n\ngo 1.22\n"},
+        {"install.go", "package main\n\n"
+                       "import \"helm.sh/helm/v3/pkg/chart/loader\"\n\n"
+                       "func installApp() {\n\t_, _ = loader.Load(\"charts/app\")\n}\n"},
+        {"obs/kustomization.yaml",
+         GPF_KUST "helmCharts:\n- name: redis\n  repo: https://charts.example.com/stable.git\n"
+                  "- name: karpenter\n  repo: oci://registry.example.com/karpenter\n"
+                  "- name: templated\n  repo: https://charts.example.com/${ENV}\n"
+                  "- name: local\n  repo: file://../charts\n"
+                  "- name: bare\n  repo: charts.example.com/stable\n"
+                  "- name: tokened\n  repo: https://charts.example.com/stable?token=x\n"
+                  "- name: fragment\n  repo: https://charts.example.com/stable#x\n"},
+        {"apps/web/kustomization.yaml",
+         GPF_KUST "namespace: web\nresources:\n  - ocirepository.yaml\n  - helmrelease.yaml\n"},
+        {"apps/web/ocirepository.yaml",
+         "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\nmetadata:\n"
+         "  name: web-chart\nspec:\n  url: oci://registry.example.com/charts/nats\n"},
+        {"apps/web/helmrelease.yaml",
+         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\nmetadata:\n  name: web\n"
+         "spec:\n  chartRef:\n    kind: OCIRepository\n    name: web-chart\n"}};
+    int n = (int)(sizeof(files) / sizeof(files[0]));
+    char *got = gpf_external_charts(files, n);
+    static const char want[] =
+        "bare <p>.__helm_dep__.bare - in=1\n"
+        "common <p>.__helm_dep__.common - in=1\n"
+        "fragment <p>.__helm_dep__.fragment - in=1\n"
+        "karpenter __chart__oci://registry.example.com/karpenter/karpenter "
+        "oci://registry.example.com/karpenter in=1\n"
+        "local <p>.__helm_dep__.local - in=1\n"
+        "nats __chart__oci://registry.example.com/charts/nats oci://registry.example.com/charts "
+        "in=3\n"
+        "redis <p>.__helm_dep__.redis - in=1\n"
+        "redis __chart__https://charts.example.com/stable/redis https://charts.example.com/stable "
+        "in=2\n"
+        "templated <p>.__helm_dep__.templated - in=1\n"
+        "tokened <p>.__helm_dep__.tokened - in=1\n"
+        "vault <p>.__helm_dep__.vault - in=1";
+    if (!got || strcmp(got, want) != 0) {
+        fprintf(stderr, "external charts got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
+        free(got);
+        FAIL("external chart identity");
+    }
+    free(got);
+    GPF_ASSERT_DEPLOYS(files, n,
+                       "HelmRelease/web -> chart:nats(ext) (helmrelease)\n"
+                       "Kustomization -> chart:bare(ext) (helmcharts)\n"
+                       "Kustomization -> chart:fragment(ext) (helmcharts)\n"
+                       "Kustomization -> chart:karpenter(ext) (helmcharts)\n"
+                       "Kustomization -> chart:local(ext) (helmcharts)\n"
+                       "Kustomization -> chart:redis(ext) (helmcharts)\n"
+                       "Kustomization -> chart:templated(ext) (helmcharts)\n"
+                       "Kustomization -> chart:tokened(ext) (helmcharts)\n"
+                       "deploy_app -> chart:app (helm)\n"
+                       "installApp -> chart:app (helm-sdk)\n"
+                       "resource.helm_release.app -> chart:app (terraform)\n"
+                       "resource.helm_release.cache -> chart:redis(ext) (terraform)\n"
+                       "resource.helm_release.queue -> chart:nats(ext) (terraform)");
     PASS();
 }
 
@@ -4686,6 +6233,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_k8s_manifest_mints_no_envelope_variables);
     RUN_TEST(probe_yaml_config_keeps_variables);
     RUN_TEST(probe_helm_unresolved_file_dependency_stays_external);
+    RUN_TEST(probe_external_chart_identity_is_its_publisher);
     RUN_TEST(probe_kustomize_nested_sibling_entries);
     RUN_TEST(probe_kustomize_single_module);
     RUN_TEST(probe_kustomize_entries_after_commented_out_entry);
@@ -4726,6 +6274,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_mcp_trace_run);
     RUN_TEST(probe_mcp_trace_deploy);
     RUN_TEST(probe_dockerfile_bases_are_images);
+    RUN_TEST(probe_image_without_registry_host_stays_unknown);
     RUN_TEST(probe_dockerfile_variants_are_dockerfiles);
     RUN_TEST(probe_dockerfile_entrypoint_runs);
     RUN_TEST(probe_k8s_container_images_are_images);
@@ -4733,6 +6282,21 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_compose_services_are_resources);
     RUN_TEST(probe_shell_docker_builds_build_images);
     RUN_TEST(probe_container_env_sets_scoped_envvars);
+    RUN_TEST(probe_container_env_joins_its_own_image_readers);
+    RUN_TEST(probe_env_address_connects_to_its_service);
+    RUN_TEST(probe_script_http_request_calls_its_route);
+    RUN_TEST(probe_kustomize_patches_override_their_base);
+    RUN_TEST(probe_kustomize_helm_charts_deploy_their_chart);
+    RUN_TEST(probe_terraform_refs_resolve_in_their_module);
+    RUN_TEST(probe_terraform_module_files_extract_no_generic_refs);
+    RUN_TEST(probe_terraform_module_calls_import_their_source);
+    RUN_TEST(probe_terraform_tfvars_override_their_variables);
+    RUN_TEST(probe_terragrunt_units_compose_their_files);
+    RUN_TEST(probe_ansible_files_import_what_they_name);
+    RUN_TEST(probe_terraform_kubernetes_objects_are_resources);
+    RUN_TEST(probe_kustomize_name_prefix_makes_variants);
+    RUN_TEST(probe_ansible_tasks_are_functions);
+    RUN_TEST(probe_ansible_kube_tasks_deploy_their_templates);
     RUN_TEST(probe_image_hub_splits_by_component);
     RUN_TEST(probe_gitops_objects_deploy_their_units);
     RUN_TEST(probe_shell_kubectl_deploys_what_it_applies);
@@ -4748,6 +6312,7 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);
+    RUN_TEST(probe_helm_chart_deploys_its_objects);
     RUN_TEST(probe_helm_include_resolves_in_the_chart_family);
     RUN_TEST(probe_k8s_selector_stays_in_its_directory);
     RUN_TEST(probe_k8s_selector_within_kustomize_build);

@@ -161,7 +161,7 @@ if rc != 2 or "Please consult --help." not in err:
 #    the cap, or a list that reaches the cap selects FULL (file_list_truncated);
 #    the tier still classifies what was listed. A complete list decides as usual
 #    (renames add their old path, so a complete list may exceed the count).
-DOCS = ["README.md", "docs/a.md", "docs/b.md"]
+DOCS = ["CONTRIBUTING.md", "docs/a.md", "docs/b.md"]
 CAP_LIST = [f"docs/page{i:04d}.md" for i in range(3000)]
 
 

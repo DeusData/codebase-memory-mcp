@@ -539,8 +539,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
     size_t pos = (size_t)n;
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
-    /* Right after the docstring: the buffer is sized for exactly these three
-     * uncapped fields (pp_props_buf), so none can be squeezed out. */
+    /* The buffer is sized for every field below (pp_props_buf), so none can be
+     * squeezed out. */
     append_json_raw(buf, bufsize, &pos, "variants", def->variants);
     append_json_string(buf, bufsize, &pos, "variant_key", def->variant_key);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
@@ -731,24 +731,71 @@ typedef struct {
  * to the response/logfile — this only throttles the stderr noise). */
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
-/* A def's properties buffer: CBM_SZ_2K for every other field plus the whole
- * serialized docstring, variants and variant_key fields, which have no length
- * cap (a field that does not fit is dropped whole). Returns `stack` for a def
- * with none of them, or when the larger buffer cannot be allocated. Twin of
- * pass_definitions.c -- keep both in sync. */
-static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
-    size_t need = *size;
-    if (def->docstring && def->docstring[0]) {
-        need += strlen("docstring") + pp_json_escaped_len(def->docstring) + PP_JSON_FIELD_OVERHEAD;
+/* Upper bound of build_def_props' fixed prefix: the Function/Method metrics
+ * literal (about 330 B) with nine ints and seven true/false/test_role strings at
+ * their widest stays under 600 B. */
+enum { PP_PROPS_PREFIX_MAX = CBM_SZ_1K };
+
+/* Serialized size of one optional field as append_json_string emits it
+ * (0 when the field is absent). */
+static size_t pp_str_field_len(const char *key, const char *val) {
+    return val && val[0] ? strlen(key) + pp_json_escaped_len(val) + PP_JSON_FIELD_OVERHEAD : 0;
+}
+
+/* Serialized size of a string array as append_json_str_array emits it. */
+static size_t pp_arr_field_len(const char *key, const char **arr) {
+    if (!arr || !arr[0]) {
+        return 0;
     }
+    size_t n = strlen(key) + PP_JSON_FIELD_OVERHEAD;
+    for (int i = 0; arr[i]; i++) {
+        n += pp_json_escaped_len(arr[i]) + PP_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
+    }
+    return n;
+}
+
+/* A def's properties buffer, sized so EVERY field build_def_props appends fits:
+ * the fixed metrics prefix (PP_PROPS_PREFIX_MAX) plus each optional field's
+ * whole serialized form. A field that does not fit is dropped whole, so a buffer
+ * sized for only some of them let a long signature, decorator list or parameter
+ * list squeeze out the MinHash fingerprint ("fp"), structural profile ("sp") and
+ * body tokens ("bt") behind them: no SIMILAR_TO edge and fewer
+ * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
+ * ImageController actions, 2026-10-18). fp/sp/bt are appended behind their own
+ * room checks, so both the check's reserve and the field are counted. Returns
+ * `stack` when everything fits it, or when the larger buffer cannot be
+ * allocated. Twin of pass_definitions.c -- keep both in sync. */
+static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
+    size_t need = PP_PROPS_PREFIX_MAX + pp_str_field_len("docstring", def->docstring);
     if (def->variants && def->variants[0]) {
         need += strlen("variants") + strlen(def->variants) + PP_JSON_FIELD_OVERHEAD;
     }
-    if (def->variant_key && def->variant_key[0]) {
-        need +=
-            strlen("variant_key") + pp_json_escaped_len(def->variant_key) + PP_JSON_FIELD_OVERHEAD;
+    need += pp_str_field_len("variant_key", def->variant_key) +
+            pp_str_field_len("signature", def->signature) +
+            pp_str_field_len("return_type", def->return_type) +
+            pp_str_field_len("parent_class", def->parent_class) +
+            pp_arr_field_len("decorators", def->decorators) +
+            pp_arr_field_len("base_classes", def->base_classes) +
+            pp_arr_field_len("param_names", def->param_names) +
+            pp_arr_field_len("param_types", def->param_types) +
+            pp_str_field_len("route_path", def->route_path) +
+            pp_str_field_len("route_method", def->route_method) +
+            pp_str_field_len("http_client", def->http_client) +
+            pp_str_field_len("http_base_url", def->http_base_url);
+    for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        need += pp_str_field_len(kv[0], kv[SKIP_ONE]);
     }
-    if (need == *size) {
+    if (def->fingerprint && def->fingerprint_k > 0) {
+        need += CBM_MINHASH_HEX_LEN + CBM_MINHASH_JSON_OVERHEAD + SKIP_ONE;
+    }
+    if (def->structural_profile) {
+        need += CBM_AST_PROFILE_BUF + pp_str_field_len("sp", def->structural_profile) + SKIP_ONE;
+    }
+    if (def->body_tokens) {
+        need += CBM_SZ_512 + pp_str_field_len("bt", def->body_tokens) + SKIP_ONE;
+    }
+    need += PP_ESC_SPACE; /* the closing '}' + NUL */
+    if (need <= *size) {
         return stack;
     }
     char *buf = cbm_alloc(CBM_MEM_CLASS_GBUF_STRING, need);
@@ -779,23 +826,7 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_stem_mark
         cbm_free(CBM_MEM_CLASS_GBUF_STRING, props);
     }
     ws->nodes_created++;
-    if (def->route_path && def->route_path[0] != '\0') {
-        const char *rm = def->route_method ? def->route_method : "ANY";
-        char route_qn[CBM_ROUTE_QN_SIZE];
-        char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", rm,
-                 cbm_route_canon_path(def->route_path, cpath, sizeof(cpath)));
-        char rprops[CBM_SZ_256];
-        snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", rm);
-        int64_t route_id =
-            cbm_gbuf_upsert_node(ws->local_gbuf, "Route", def->route_path, route_qn,
-                                 def->file_path ? def->file_path : fi->rel_path, 0, 0, rprops);
-        char hprops[CBM_SZ_512];
-        char esc_h[CBM_SZ_512];
-        cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
-        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
-        cbm_gbuf_insert_edge(ws->local_gbuf, func_id, route_id, "HANDLES", hprops);
-    }
+    cbm_pipeline_emit_def_route(ws->local_gbuf, func_id, def, fi->rel_path);
 }
 
 static void log_extract_fail(int pos, uint64_t ms, const char *path) {
@@ -1773,7 +1804,8 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
  * once per file by the caller: computing the file QN and finding its node for
  * every definition was 700 k allocations and lookups on the Go corpus. */
 static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
-                                 int64_t file_node_id, CBMLanguage lang, int *reg_entries) {
+                                 int64_t file_node_id, CBMLanguage lang, size_t module_prefix_len,
+                                 int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
@@ -1781,7 +1813,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c) — see pass_definitions.c for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add_lang(ctx->registry, def->name, def->qualified_name, def->label, lang);
+        cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
+                                        lang, module_prefix_len);
         (*reg_entries)++;
     }
     char marked[CBM_SZ_4K];
@@ -1988,9 +2021,14 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             int64_t file_node_id = file_node ? file_node->id : 0;
             free(file_qn);
             pp_add_file_doc(file_node, result->module_doc);
+            /* Bounds the function-local detection to this file (pass_definitions.c). */
+            size_t py_prefix_len = files[i].language == CBM_LANG_PYTHON
+                                       ? cbm_pipeline_fqn_symbol_prefix_len(ctx->project_name, rel)
+                                       : 0;
             for (int d = 0; d < result->defs.count; d++) {
-                defines_edges += register_and_link_def(ctx, &result->defs.items[d], file_node_id,
-                                                       files[i].language, &reg_entries);
+                defines_edges +=
+                    register_and_link_def(ctx, &result->defs.items[d], file_node_id,
+                                          files[i].language, py_prefix_len, &reg_entries);
             }
         }
 
@@ -2410,8 +2448,18 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
     if (handler_ref && handler_ref[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik,
-                                                             iv, ic, main_gbuf, lang);
+        /* Python: a handler an app factory registers is usually its local def
+         * (`app.add_url_rule("/", "index", index)` inside create_app); only the
+         * lexical lookup sees a function's locals. MUST match pass_calls.c. */
+        cbm_resolution_t hres = {0};
+        if (lang == CBM_LANG_PYTHON) {
+            hres = cbm_registry_resolve_lexical(registry, handler_ref, call->enclosing_func_qn,
+                                                module_qn);
+        }
+        if (!hres.qualified_name) {
+            hres = cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik, iv, ic,
+                                                main_gbuf, lang);
+        }
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
@@ -3267,8 +3315,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call) {
-            res = cbm_registry_resolve_call_lang(rc->registry, call->callee_name, module_qn,
-                                                 imp_keys, imp_vals, imp_count, lang);
+            /* Python LEGB fallback first (MUST match pass_calls.c). */
+            res = cbm_registry_resolve_call_scoped(rc->registry, call->callee_name, module_qn,
+                                                   imp_keys, imp_vals, imp_count, lang,
+                                                   call->enclosing_func_qn);
         }
         /* `p->open(fd)`: the registry does not split a callee on the arrow.
          * The object's type decides, as for the dot call handled further
@@ -3616,6 +3666,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         const cbm_gbuf_node_t *tgt = NULL;
         bool precise_call_reference = false;
         const CBMResolvedCall *semantic_reference = NULL;
+        bool property_read = false;
         if (cbm_pipeline_usage_semantic_reference_candidate(usage)) {
             bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
             semantic_reference = cbm_pipeline_find_lsp_reference_indexed_in_graph(
@@ -3628,6 +3679,13 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (semantic_reference) {
                 tgt = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
                                                    semantic_reference->callee_qn, allow_tail);
+                if (!cbm_pipeline_reference_target_admissible(semantic_reference, tgt)) {
+                    /* a property read: the name fallback below may still bind the
+                     * property's own node, never a callable */
+                    tgt = NULL;
+                    semantic_reference = NULL;
+                    property_read = true;
+                }
                 precise_call_reference = cbm_pipeline_node_is_callable_target(tgt);
             }
         }
@@ -3681,6 +3739,9 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
+                continue;
+            }
+            if (property_read && cbm_pipeline_node_is_callable_target(tgt)) {
                 continue;
             }
         }
@@ -3833,13 +3894,17 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (cbm_pipeline_php_vendor_bound(php_vendor, def->base_classes[b])) {
             continue;
         }
-        const char *bqn =
-            resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
-        /* Same external-base gate as the sequential semantic pass. */
-        if (!bqn ||
-            cbm_python_external_base_contradicts(fs->lang, fs->imports, def->base_classes[b], bqn,
-                                                 rc->main_gbuf, rc->project_name, fs->rel)) {
-            continue;
+        /* Same order as the sequential semantic pass: an earlier sibling of
+         * the class body first (no external-base gate), then the registry. */
+        const char *bqn = cbm_registry_resolve_python_class_body_base(
+            rc->registry, rc->main_gbuf, def->qualified_name, def->base_classes[b], fs->lang);
+        if (!bqn) {
+            bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
+            if (!bqn || cbm_python_external_base_contradicts(
+                            fs->lang, fs->imports, def->base_classes[b], bqn, rc->main_gbuf,
+                            rc->project_name, fs->rel)) {
+                continue;
+            }
         }
         const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
         if (bn && node->id != bn->id) {
@@ -4293,10 +4358,27 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
                 bool had_error = result->has_error;
+                /* The LSP map also binds annotation-only imports (#1277);
+                 * only a file that records one needs its own map, every
+                 * other file passes the CALLS map unchanged. MUST match the
+                 * sequential dispatch in pass_lsp_cross.c. */
+                const char **lsp_keys = NULL;
+                const char **lsp_vals = NULL;
+                int lsp_count = 0;
+                bool own_lsp_map = cbm_pxc_result_has_type_only_import(result);
+                if (own_lsp_map) {
+                    cbm_pxc_build_import_map_ex(rc->main_gbuf, rc->project_name, rel, lang, result,
+                                                true, &lsp_keys, &lsp_vals, &lsp_count);
+                }
                 cbm_pxc_dispatch_file_with_php_bindings(
                     lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
-                    rc->module_def_index, rc->all_defs, rc->def_count, imp_keys, imp_vals,
-                    imp_count, pp_rust_shared_registry_get, rc, &php_vendor);
+                    rc->module_def_index, rc->all_defs, rc->def_count,
+                    own_lsp_map ? lsp_keys : imp_keys, own_lsp_map ? lsp_vals : imp_vals,
+                    own_lsp_map ? lsp_count : imp_count, pp_rust_shared_registry_get, rc,
+                    &php_vendor);
+                if (own_lsp_map) {
+                    cbm_pxc_free_import_map(lsp_keys, lsp_vals, lsp_count);
+                }
                 cbm_index_mark_done(rel);
                 if (!had_error && result->has_error && result->error_msg &&
                     (strcmp(result->error_msg, CBM_C_LSP_MEMO_ERROR) == 0 ||

@@ -1550,10 +1550,10 @@ static bool gbuf_node_touched(const cbm_gbuf_t *gb, int64_t id, const char *cons
     return false;
 }
 
-int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *const *edge_types) {
-    if (!gb || !label || !edge_types || !edge_types[0]) {
-        return CBM_NOT_FOUND;
-    }
+/* Delete the `label` nodes no edge of `types` (NULL-terminated) touches --
+ * with `fileless`, only those carrying no file; returns how many. */
+static int gbuf_delete_untouched(cbm_gbuf_t *gb, const char *label, const char *const *types,
+                                 bool fileless) {
     node_ptr_array_t *arr = cbm_ht_get(gb->nodes_by_label, label);
     if (!arr || arr->count == 0) {
         return 0;
@@ -1568,7 +1568,8 @@ int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i]->qualified_name;
         cbm_gbuf_node_t *node = qn ? cbm_ht_get(gb->node_by_qn, qn) : NULL;
-        if (node && !gbuf_node_touched(gb, node->id, edge_types)) {
+        if (node && !(fileless && node->file_path && node->file_path[0]) &&
+            !gbuf_node_touched(gb, node->id, types)) {
             victims[n++] = node;
         }
     }
@@ -1601,6 +1602,43 @@ int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *
     cbm_ht_foreach(deleted_set, free_index_key, NULL);
     cbm_ht_free(deleted_set);
     cbm_free(CBM_MEM_CLASS_GBUF_INDEX, victims);
+    return n;
+}
+
+int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *const *edge_types) {
+    if (!gb || !label || !edge_types || !edge_types[0]) {
+        return CBM_NOT_FOUND;
+    }
+    return gbuf_delete_untouched(gb, label, edge_types, false);
+}
+
+typedef struct {
+    const char **items;
+    uint32_t count;
+} gb_type_list_t;
+
+static void collect_edge_type(const char *key, void *value, void *ud) {
+    (void)value;
+    gb_type_list_t *list = ud;
+    list->items[list->count++] = key;
+}
+
+int cbm_gbuf_delete_edgeless(cbm_gbuf_t *gb, const char *label) {
+    if (!gb || !label) {
+        return CBM_NOT_FOUND;
+    }
+    /* Edges are indexed by (node, type) only: "any edge" is an edge of any
+     * type the buffer holds (NULL-terminated by the calloc). */
+    gb_type_list_t list = {
+        cbm_calloc(CBM_MEM_CLASS_GBUF_INDEX,
+                   ((size_t)cbm_ht_count(gb->edges_by_type) + 1) * sizeof(*list.items)),
+        0};
+    if (!list.items) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_ht_foreach(gb->edges_by_type, collect_edge_type, &list);
+    int n = gbuf_delete_untouched(gb, label, list.items, true);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, list.items);
     return n;
 }
 

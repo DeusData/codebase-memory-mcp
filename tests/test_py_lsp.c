@@ -3629,12 +3629,16 @@ TEST(pylsp_nested_and_local_classbody_calls_join_extracted_caller) {
         {"field(35)", "test.main.Controller.build", "test.main.field"},
     };
     CBMFileResult *r = extract_py(source);
-    bool correct = pylsp_class_sites(r, source, sites, 7) &&
-                   !pylsp_module_has_def(r, "test.main.build.Local") &&
-                   !pylsp_module_has_def(r, "test.main.Controller.build.Local");
+    /* #1548: a class declared in a function body is extracted, as a local of
+     * that function; its class-body calls still join the enclosing function
+     * (the sites above), never the local class. */
+    bool sites_ok = pylsp_class_sites(r, source, sites, 7);
+    bool locals_extracted = r && pylsp_module_has_def(r, "test.main.build.Local") &&
+                            pylsp_module_has_def(r, "test.main.Controller.build.Local");
     if (r)
         cbm_free_result(r);
-    ASSERT_TRUE(correct);
+    ASSERT_TRUE(sites_ok);
+    ASSERT_TRUE(locals_extracted);
     PASS();
 }
 

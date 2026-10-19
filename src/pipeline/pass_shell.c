@@ -11,8 +11,8 @@
  *   kubectl ... -k D                      the Kustomization of D
  *   kustomize build D | ... | kubectl apply -f -   (also kubectl kustomize D)
  *   helm install|upgrade [NAME] CHART     the Chart of a chart dir, else the
- *                                         shared external Chart (repo/name,
- *                                         oci://.../name)
+ *                                         external Chart of that name
+ *                                         (repo/name, oci://.../name)
  *   helm template [NAME] CHART | ... | kubectl apply -f -
  *   find D -name G -exec kubectl apply -f {} \;    D's manifests matching G
  *
@@ -60,6 +60,7 @@
 #include "cbm.h"
 #include "lang_specs.h"
 
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -215,7 +216,7 @@ static bool sh_index_build(sh_index_t *ix, cbm_pipeline_ctx_t *ctx) {
             const char *base = fp ? sh_basename(fp) : "";
             const char *qn = nodes[i]->qualified_name;
             if ((strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0) && qn &&
-                !strstr(qn, ".__helm_dep__.")) {
+                !cbm_pipeline_chart_is_external(nodes[i])) {
                 cbm_ht_set(ix->charts, fp, (void *)(intptr_t)nodes[i]->id);
             }
         }
@@ -378,6 +379,7 @@ typedef struct {
     bool spawn; /* SPAWNS the script `tgt` / the Process `ext`, not DEPLOYS */
     bool make;  /* SPAWNS the rule of target `ext` that makefile `path` reads */
     bool build; /* the image `ext` is built from the Dockerfile `path` */
+    bool http;  /* HTTP_CALLS the URL `ext` (scheme://host/path) with method `path` */
 } sh_hit_t;
 
 typedef struct {
@@ -2040,6 +2042,187 @@ static void sh_spawn(sh_t *s, TSNode cmd, const sh_argv_t *a) {
     sh_hit_push(s, cmd, (sh_hit_t){.via = s->exec ? "exec" : "shell", .ext = name, .spawn = true});
 }
 
+/* ── HTTP requests (F3) ─────────────────────────────────────────────── */
+
+/* `url` (http / https) as scheme://host[:port]/path -- the user info, the
+ * query and the fragment dropped, so no credential or token reaches the
+ * graph; NULL when it is not one, or its host is unknown. */
+static const char *sh_url_norm(CBMArena *a, const char *url) {
+    const char *scheme_end = strstr(url, "://");
+    if (!scheme_end || (strncmp(url, "http://", strlen("http://")) != 0 &&
+                        strncmp(url, "https://", strlen("https://")) != 0)) {
+        return NULL;
+    }
+    const char *auth = scheme_end + strlen("://");
+    size_t al = strcspn(auth, "/?#");
+    const char *at = NULL;
+    for (size_t i = 0; i < al; i++) {
+        if (auth[i] == '@') {
+            at = auth + i;
+        }
+    }
+    const char *host = at ? at + SKIP_ONE : auth;
+    size_t hl = (size_t)(auth + al - host);
+    const char *h = hl ? cbm_arena_strndup(a, host, hl) : NULL;
+    if (!h || strpbrk(h, "$`{}\"' \t\\")) {
+        return NULL;
+    }
+    const char *path = auth + al;
+    size_t pl = strcspn(path, "?#");
+    return cbm_arena_sprintf(a, "%.*s%.*s%.*s", (int)(auth - url), url, (int)hl, host,
+                             pl ? (int)pl : SKIP_ONE, pl ? path : "/");
+}
+
+/* Skip one expansion at p (`${...}`, `$(...)`, `$NAME`, a backquoted
+ * command); returns the byte after it. */
+static const char *sh_url_skip_expansion(const char *p) {
+    if (*p == '`') {
+        const char *e = strchr(p + SKIP_ONE, '`');
+        return e ? e + SKIP_ONE : p + strlen(p);
+    }
+    char open = p[SKIP_ONE];
+    if (open == '{' || open == '(') {
+        char close = open == '{' ? '}' : ')';
+        int depth = 0;
+        for (const char *q = p + SKIP_ONE; *q; q++) {
+            depth += *q == open;
+            depth -= *q == close;
+            if (depth == 0) {
+                return q + SKIP_ONE;
+            }
+        }
+        return p + strlen(p);
+    }
+    const char *q = p + SKIP_ONE;
+    while (isalnum((unsigned char)*q) || *q == '_') {
+        q++;
+    }
+    return q;
+}
+
+/* An http(s) URL word the script states with a literal host but variable
+ * parts after it ("https://host/releases/download/${VER}/x.tgz"),
+ * from its source text as the shell reads the word -- up to an unquoted
+ * blank or operator, as tree-sitter-bash may split an unquoted word with
+ * expansions into several arguments: quotes dropped, each expansion of the
+ * path a `{}` as in a Route path; then sh_url_norm. NULL when the host is
+ * not literal. */
+static const char *sh_url_template(sh_t *s, const sh_argv_t *a, int i) {
+    sh_str_t out = {0};
+    char quote = 0;
+    for (const char *p = s->src + a->span[PAIR_LEN * i]; *p;) {
+        if (!quote && (strchr(" \t\r\n|;&<>)", *p) || (*p == '\\' && p[SKIP_ONE] == '\n'))) {
+            break;
+        }
+        if ((*p == '"' || *p == '\'') && (!quote || quote == *p)) {
+            quote = quote ? 0 : *p;
+            p++;
+        } else if ((*p == '$' || *p == '`') && quote != '\'') {
+            sh_str_add(s->a, &out, "{}", PAIR_LEN);
+            p = sh_url_skip_expansion(p);
+        } else {
+            sh_str_add(s->a, &out, p, SKIP_ONE);
+            p++;
+        }
+    }
+    const char *raw = sh_str_done(&out);
+    return raw ? sh_url_norm(s->a, raw) : NULL; /* a `{}` host is no literal one */
+}
+
+static bool sh_ieq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
+
+/* Options whose value is a URL that is not the request: a proxy, a referer. */
+static bool sh_http_url_option(const char *o) {
+    static const char *const OPTS[] = {"-x",        "--proxy",   "--preproxy", "-e",
+                                       "--referer", "--doh-url", "--proxy1.0", NULL};
+    return sh_in(o, OPTS);
+}
+
+/* The method curl / wget sends: -X / --request / --method; a body (-d, -F,
+ * --data*, --json, --form*, --post-data / --post-file) POST, -T PUT, -I HEAD,
+ * -G back to GET; default GET. */
+static const char *sh_http_method(const sh_argv_t *a, int from) {
+    static const char *const METHODS[] = {"GET",    "POST", "PUT",     "PATCH",
+                                          "DELETE", "HEAD", "OPTIONS", NULL};
+    const char *method = "GET";
+    bool get = false;
+    for (int i = from; i < a->n; i++) {
+        const char *w = a->v[i];
+        if (!w) {
+            continue;
+        }
+        const char *named = NULL;
+        if (sh_eq(w, "-X") || sh_eq(w, "--request") || sh_eq(w, "--method")) {
+            named = i + SKIP_ONE < a->n ? a->v[i + SKIP_ONE] : NULL;
+        } else if (sh_starts(w, "-X") && w[PAIR_LEN]) {
+            named = w + PAIR_LEN;
+        } else if (sh_starts(w, "--request=") || sh_starts(w, "--method=")) {
+            named = strchr(w, '=') + SKIP_ONE;
+        }
+        for (int m = 0; named && METHODS[m]; m++) {
+            if (sh_ieq(named, METHODS[m])) {
+                return METHODS[m];
+            }
+        }
+        if (sh_eq(w, "-G") || sh_eq(w, "--get")) {
+            get = true;
+        } else if (sh_eq(w, "-I") || sh_eq(w, "--head")) {
+            method = "HEAD";
+        } else if (sh_eq(w, "-T") || sh_starts(w, "--upload-file")) {
+            method = "PUT";
+        } else if (sh_eq(w, "-d") || sh_eq(w, "-F") || sh_starts(w, "--data") ||
+                   sh_starts(w, "--json") || sh_starts(w, "--form") ||
+                   sh_starts(w, "--post-data") || sh_starts(w, "--post-file")) {
+            method = strcmp(method, "GET") == 0 ? "POST" : method;
+        }
+    }
+    return get && strcmp(method, "POST") == 0 ? "GET" : method;
+}
+
+/* curl / wget with a URL the script states (constant words): an HTTP
+ * request to it, from the command's function. */
+static void sh_http(sh_t *s, TSNode cmd, const sh_argv_t *a) {
+    int p = sh_program(s, a);
+    const char *prog = p >= 0 && a->v[p] ? sh_basename(a->v[p]) : NULL;
+    if (!prog || (strcmp(prog, "curl") != 0 && strcmp(prog, "wget") != 0)) {
+        return;
+    }
+    const char *via = strcmp(prog, "curl") == 0 ? "curl" : "wget";
+    const char *method = sh_http_method(a, p + SKIP_ONE);
+    for (int i = p + SKIP_ONE; i < a->n; i++) {
+        /* arguments that touch in the source are one shell word, which
+         * tree-sitter-bash may split around an expansion */
+        int j = i;
+        while (j + SKIP_ONE < a->n &&
+               a->span[PAIR_LEN * (j + SKIP_ONE)] == a->span[PAIR_LEN * j + SKIP_ONE]) {
+            j++;
+        }
+        bool url_option =
+            i > p + SKIP_ONE && a->v[i - SKIP_ONE] && sh_http_url_option(a->v[i - SKIP_ONE]);
+        sh_str_t word = {0};
+        for (int k = i; k <= j; k++) {
+            sh_str_add(s->a, &word, a->v[k], a->v[k] ? strlen(a->v[k]) : 0);
+        }
+        const char *w = sh_str_done(&word);
+        /* a `$` left in an evaluated word is an expansion the grammar took
+         * for text (`$OS-$ARCH.tgz`): no value, so the template */
+        const char *url = url_option               ? NULL
+                          : w && !strpbrk(w, "$`") ? sh_url_norm(s->a, w)
+                                                   : sh_url_template(s, a, i);
+        if (url) {
+            sh_hit_push(s, cmd, (sh_hit_t){.via = via, .ext = url, .path = method, .http = true});
+        }
+        i = j;
+    }
+}
+
 /* ── Statements ────────────────────────────────────────────────────── */
 
 static void sh_walk(sh_t *s, TSNode n);
@@ -2344,6 +2527,7 @@ static void sh_command(sh_t *s, TSNode cmd) {
         sh_deploy_command(s, cmd, &a, NULL, &out);
         sh_spawn(s, cmd, &a);
         sh_build(s, cmd, &a);
+        sh_http(s, cmd, &a);
     }
     sh_argv_free(&a);
 }
@@ -2392,6 +2576,7 @@ static void sh_pipe_run(sh_t *s, TSNode n, sh_src_t *src) {
         }
         sh_spawn(s, cmd, &a);
         sh_build(s, cmd, &a);
+        sh_http(s, cmd, &a);
         sh_argv_free(&a);
         sh_redirects(s, el);
     }
@@ -3384,16 +3569,11 @@ static int64_t sh_source(cbm_pipeline_ctx_t *ctx, const sh_span_t *spans, int n,
     return fn ? fn->id : 0;
 }
 
-/* The shared external Chart of `name` (the one chart dependencies use). */
+/* The external Chart of `name` a helm command names: the hit keeps no
+ * repository URL (a `repo/name` alias, an oci:// reference's last segment),
+ * so the per-project one. */
 static int64_t sh_external_chart(cbm_pipeline_ctx_t *ctx, const char *name, const char *file) {
-    char qn[CBM_SZ_512];
-    snprintf(qn, sizeof(qn), "%s.__helm_dep__.%s", ctx->project_name, name);
-    const cbm_gbuf_node_t *known = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
-    if (known) {
-        return known->id;
-    }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Chart", name, qn, file, SKIP_ONE, 0,
-                                "{\"source\":\"helm\",\"external\":true}");
+    return cbm_pipeline_external_chart(ctx, name, NULL, file);
 }
 
 /* A hit's CI context as JSON members (`,"ci":..,"job":..`); "" for none. */
@@ -3479,10 +3659,105 @@ static int sh_link_build(cbm_pipeline_ctx_t *ctx, const sh_hit_t *x, CBMHashTabl
     return SKIP_ONE;
 }
 
+/* A host that is a service of the repository: one DNS label or a
+ * `<svc>.<ns>.svc...` name whose first label names a Kubernetes Service of
+ * it. Its Route is the path alone, where that service's handler of the path
+ * meets it, as code clients do; any other host -- a download, a
+ * port-forwarded localhost -- stays in the Route, so it never meets a
+ * handler it does not reach. (Not a compose service: the Docker pass makes
+ * those after this one in a full run, while a repair holds them already;
+ * the QN tells them apart, as a repair's proxies carry no properties.) */
+static bool sh_http_service(cbm_pipeline_ctx_t *ctx, const char *host) {
+    const char *first_dot = strchr(host, '.');
+    const char *svc = first_dot ? strchr(first_dot + SKIP_ONE, '.') : NULL;
+    bool dns_form = !first_dot || (svc && sh_starts(svc, ".svc") &&
+                                   (svc[strlen(".svc")] == '\0' || svc[strlen(".svc")] == '.'));
+    if (!dns_form || strcmp(host, "localhost") == 0) {
+        return false;
+    }
+    char name[CBM_SZ_256];
+    snprintf(name, sizeof(name), "Service/%.*s",
+             (int)(first_dot ? (size_t)(first_dot - host) : strlen(host)), host);
+    const cbm_gbuf_node_t **nodes = NULL;
+    int n = 0;
+    if (cbm_gbuf_find_by_name(ctx->gbuf, name, &nodes, &n) != 0) {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        if (nodes[i]->label && strcmp(nodes[i]->label, "Resource") == 0 &&
+            nodes[i]->qualified_name && !strstr(nodes[i]->qualified_name, "::compose/")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An HTTP request a script makes: HTTP_CALLS {via: curl | wget, method,
+ * url_path, host} to its Route (sh_http_service). */
+static int sh_link_http(cbm_pipeline_ctx_t *ctx, int64_t src, const sh_hit_t *x) {
+    const char *auth = strstr(x->ext, "://");
+    if (!auth || src <= 0) {
+        return 0;
+    }
+    auth += strlen("://");
+    size_t al = strcspn(auth, "/");
+    char host[CBM_SZ_256];
+    size_t hl = auth[0] == '[' ? strcspn(auth, "]") + SKIP_ONE : strcspn(auth, ":/");
+    if (hl == 0 || hl > al || hl >= sizeof(host)) {
+        return 0;
+    }
+    for (size_t i = 0; i < hl; i++) {
+        host[i] = (char)tolower((unsigned char)auth[i]);
+    }
+    host[hl] = '\0';
+    const char *path = auth + al;
+    char cpath[CBM_SZ_2K];
+    cbm_route_canon_path(path, cpath, sizeof(cpath));
+    bool local = sh_http_service(ctx, host);
+    char qn[CBM_ROUTE_QN_SIZE];
+    snprintf(qn, sizeof(qn), "__route__%s__%.*s%s", x->path, local ? 0 : (int)(auth + al - x->ext),
+             x->ext, cpath);
+    char authority[CBM_SZ_256]; /* the host with its port */
+    if (al >= sizeof(authority)) {
+        return 0;
+    }
+    for (size_t i = 0; i < al; i++) {
+        authority[i] = (char)tolower((unsigned char)auth[i]);
+    }
+    authority[al] = '\0';
+    char ehost[CBM_SZ_512];
+    char epath[CBM_SZ_4K];
+    cbm_json_escape(ehost, (int)sizeof(ehost), authority);
+    cbm_json_escape(epath, (int)sizeof(epath), path);
+    char rprops[CBM_SZ_1K];
+    if (local) {
+        snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\"}", x->path);
+    } else {
+        snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"host\":\"%s\",\"external\":true}",
+                 x->path, ehost);
+    }
+    int64_t route =
+        cbm_gbuf_upsert_node(ctx->gbuf, "Route", local ? path : x->ext, qn, "", 0, 0, rprops);
+    if (route <= 0 || route == src) {
+        return 0;
+    }
+    char ci[CBM_SZ_1K];
+    sh_ci_props(x, ci, sizeof(ci));
+    char props[CBM_SZ_4K + CBM_SZ_1K];
+    snprintf(props, sizeof(props),
+             "{\"via\":\"%s\",\"method\":\"%s\",\"url_path\":\"%s\",\"host\":\"%s\"%s,\"line\":%d}",
+             x->via, x->path, epath, ehost, ci, x->line);
+    cbm_gbuf_insert_edge(ctx->gbuf, src, route, "HTTP_CALLS", props);
+    return SKIP_ONE;
+}
+
 static int sh_link_hit(cbm_pipeline_ctx_t *ctx, const sh_hit_t *x, int64_t src,
                        CBMHashTable *modules) {
     if (x->spawn) {
         return src > 0 ? sh_link_spawn(ctx, src, x, modules) : 0;
+    }
+    if (x->http) {
+        return sh_link_http(ctx, src, x);
     }
     int64_t tgt = x->tgt > 0 ? x->tgt : sh_external_chart(ctx, x->ext, x->file);
     if (src <= 0 || tgt <= 0 || src == tgt) {

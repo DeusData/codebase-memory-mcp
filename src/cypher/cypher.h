@@ -359,6 +359,9 @@ void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
 /* Override only the deadline clock on this thread; NULL restores real time. */
 typedef uint64_t (*cbm_cypher_test_clock_fn)(void);
 void cbm_cypher_test_set_deadline_clock(cbm_cypher_test_clock_fn clock_fn);
+/* Start nodes per streamed execution chunk on this thread; 0 restores the
+ * default. INT_MAX runs the whole start set as one chunk (a single pass). */
+void cbm_cypher_test_set_stream_chunk(int start_nodes);
 #endif
 
 /* Worst-case binding slot count for a node cross-join. Computes the count in

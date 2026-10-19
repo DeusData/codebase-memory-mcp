@@ -24,7 +24,7 @@ src/cli/config_text_edit.c	72
 src/cli/config_toml_edit.c	73
 src/cli/config_yaml_edit.c	117
 src/cli/hook_augment.c	31
-src/cypher/cypher.c	132
+src/cypher/cypher.c	125
 src/daemon/application.c	107
 src/daemon/bootstrap.c	13
 src/daemon/daemon.c	31

@@ -2483,7 +2483,7 @@ static void main_daemon_ctl_open_browser(int port) {
  * not a state a test can ask for; it is COMPILED OUT of ordinary builds (see
  * TEST_SEAMS in Makefile.cbm). */
 static bool main_daemon_ctl_apply_ui_config(cbm_daemon_runtime_client_t *client,
-                                            uint8_t update_mask, int port) {
+                                            uint8_t update_mask, int port, uint32_t timeout_ms) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     char forced[8];
     if (cbm_safe_getenv("CBM_TEST_DAEMON_UI_CONFIG_REFUSED", forced, sizeof(forced), NULL) &&
@@ -2491,9 +2491,8 @@ static bool main_daemon_ctl_apply_ui_config(cbm_daemon_runtime_client_t *client,
         return false;
     }
 #endif
-    return cbm_daemon_application_client_set_ui_config(client, update_mask, true, port,
-                                                       MAIN_CONNECT_TIMEOUT_MS) ==
-           CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    return cbm_daemon_application_client_set_ui_config(
+               client, update_mask, true, port, timeout_ms) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
 static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_io, int port,
@@ -2712,7 +2711,13 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
 
     /* The committed control connection satisfied the daemon's no-client
-     * startup window; configure the UI before departing. */
+     * startup window; configure the UI before departing.
+     *
+     * Both requests wait for the daemon's reply within the startup budget. The
+     * connection is up, so the reply is an event that comes unless the daemon
+     * dies; the old 1 s bound (MAIN_CONNECT_TIMEOUT_MS, a probe budget) decided
+     * the command whenever saving the UI configuration (journaled commits to
+     * _config.db) ran long on a loaded runner. */
     int ui_port = 0;
     bool ui_configured = false;
     if ((CBM_EMBEDDED_FILE_COUNT > 0)) {
@@ -2722,13 +2727,14 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         uint8_t update_mask = 0x03U; /* enabled + port */
         bool context_set =
             main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL,
-                                    MAIN_CONNECT_TIMEOUT_MS);
+                                    MAIN_DAEMON_CTL_START_TIMEOUT_MS);
         ui_configured = context_set &&
-                        main_daemon_ctl_apply_ui_config(start_result.client, update_mask, ui_port);
+                        main_daemon_ctl_apply_ui_config(start_result.client, update_mask, ui_port,
+                                                        MAIN_DAEMON_CTL_START_TIMEOUT_MS);
         if (!ui_configured) {
             /* Reaching here means the daemon is up: the control connection above
              * already satisfied its startup window. Only the UI handshake — two
-             * requests bounded by MAIN_CONNECT_TIMEOUT_MS — came back short.
+             * requests bounded by the startup budget — came back short.
              *
              * Whether that is fatal depends on what was asked for. `--port`/`--open`
              * make the UI the point of the command, so failing to configure it is a
@@ -3371,9 +3377,13 @@ int main(int argc, char **argv) {
 
     g_daemon_client = bootstrap_result.client;
 
+    /* Startup requests on the connected client wait within the startup budget,
+     * like the bootstrap before them: a 1 s bound on the reply (a probe budget)
+     * ended the server whenever the daemon's UI save ran long, which the smoke's
+     * `--ui=true --port` run saw as a binary without UI assets. */
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
         !main_set_client_context(g_daemon_client, NULL, tool_profile, NULL, NULL,
-                                 MAIN_CONNECT_TIMEOUT_MS)) {
+                                 bootstrap_config.startup_timeout_ms)) {
         (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
         g_daemon_client = NULL;
@@ -3391,9 +3401,10 @@ int main(int argc, char **argv) {
         bool explicitly_enabled = false;
         uint8_t update_mask =
             parse_ui_flags(argc, argv, &ui_enabled, &ui_port, &explicitly_enabled);
-        if (update_mask != 0 && cbm_daemon_application_client_set_ui_config(
-                                    g_daemon_client, update_mask, ui_enabled, ui_port,
-                                    MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+        if (update_mask != 0 &&
+            cbm_daemon_application_client_set_ui_config(
+                g_daemon_client, update_mask, ui_enabled, ui_port,
+                bootstrap_config.startup_timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
             (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;

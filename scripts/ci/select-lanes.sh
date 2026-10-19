@@ -123,20 +123,53 @@ BUILD = {"Makefile.cbm", "scripts/test.sh", "scripts/run-tests-parallel.sh",
          "scripts/env.sh", "scripts/build.sh", "scripts/clean.sh",
          "scripts/path-safety.sh", "scripts/test-runtime.sh", "scripts/msan.sh",
          "scripts/lint.sh", ".clang-format", ".clang-tidy",
-         "scripts/vendored-checksums.txt"}
+         "scripts/vendored-checksums.txt", "scripts/run-test-wave.py",
+         "scripts/embed-frontend.sh"}
 SMOKE = {"scripts/smoke-test.sh", "scripts/smoke-local.sh",
          "scripts/smoke-fixture-server.py", "scripts/smoke-invariants.sh",
          "test-infrastructure/vm/vm-smoke.sh",
          "test-infrastructure/vm/windows-user-path-guard.ps1",
-         "scripts/test-windows.ps1"}
+         "scripts/test-windows.ps1", "scripts/smoke-wrappers.sh",
+         "scripts/security-fuzz.sh", "scripts/security-fuzz-random.sh",
+         "scripts/security-install.sh", "scripts/security-network.sh",
+         "scripts/security-strings.sh", "scripts/test_mcp_interactive.py"}
 LINT_CONFIG = {"scripts/memory-core-baseline.txt", "scripts/lint-memory-core.py",
-               "scripts/hooks/pre-commit"}
+               "scripts/hooks/pre-commit", ".cppcheck", "scripts/check-no-test-skips.sh",
+               "scripts/check-nolint-whitelist.sh", "scripts/lint-mem-gate.py",
+               "scripts/lint-mem-whitelist.txt", "scripts/lint-tidy-diff.sh"}
+# Local tools and release-only jobs: no PR lane runs them.
 NON_GATING = {"scripts/package-release.sh", "scripts/benchmark-index.sh",
               "scripts/benchmark-search-graph.sh", "scripts/benchmark-streaming.py",
-              "scripts/soak-test.sh", ".cbmignore", ".node-version", "flake.nix"}
-PKG_FILES = {"install.sh", "install.ps1", "server.json", "package.json", "manifest.json"}
+              "scripts/soak-test.sh", ".cbmignore", ".node-version", "flake.nix",
+              "flake.lock", "scripts/soak-legs.sh", "scripts/repro.sh",
+              "scripts/audit-grammar-security.sh", "scripts/check-dco.sh",
+              "scripts/check-lsp-originality.sh", "scripts/clone-bench-repos.sh",
+              "scripts/extract_nomic_vectors.py", "scripts/gen-pdf-unicode.py",
+              "scripts/gen-py-stdlib.py", "scripts/generate-lang-code.py",
+              "scripts/new-languages.json", "scripts/git-hooks/commit-msg",
+              "scripts/install-git-hooks.sh", "scripts/sanitizer-coverage-map.py",
+              "scripts/sanitizer-map.json", "scripts/test_mcp_rapid_init.py",
+              "scripts/vendor-grammar.sh"}
+# The license-gate lane runs these (and only that lane).
+LICENSE_TOOLS = {"scripts/license-gate.sh", "scripts/license-gate-check.py",
+                 "scripts/license-gate-check-npm.py", "scripts/license-policy.json",
+                 "scripts/ui_browser_licenses.py"}
+# security-static runs these; it runs on every PR (ALWAYS).
+SECURITY_TOOLS = {"scripts/security-audit.sh", "scripts/security-allowlist.txt",
+                  "scripts/security-network-source-audit.py", "scripts/security-ui.sh"}
+# Repository files C tests read: the test legs run (a docs-only tier runs no C
+# suite, so test_cli's README/site contract would never see a README change).
+READ_BY_TESTS = {"scripts/security-vendored.sh", ".codebase-memory.json", "README.md",
+                 "docs/index.html", "docs/llms.txt", "pkg/npm/README.md"}
+# The test legs' failure report (tests/test_failure_report_contract.sh).
+TEST_REPORT = {"scripts/suite-failure-report.sh"}
+# The release notices ship inside every archive.
+PKG_SCRIPTS = {"scripts/gen-third-party-notices.sh", "scripts/gen-ui-licenses.py"}
+PKG_FILES = {"install.sh", "install.ps1", "server.json", "package.json", "manifest.json",
+             "Formula"}
 DOC_SUFFIXES = (".md", ".png", ".svg", ".jpg", ".gif", ".txt")
-DOC_FILES = {"LICENSE", "CODEOWNERS", ".gitignore", ".gitattributes"}
+DOC_FILES = {"LICENSE", "CODEOWNERS", ".gitignore", ".gitattributes", "DCO",
+             ".gitleaksignore", "glama.json"}
 
 
 def category(path):
@@ -169,6 +202,18 @@ def category(path):
         return "build"
     if path in SMOKE:
         return "smoke"
+    if path in LICENSE_TOOLS:
+        return "license-tools"
+    if path in SECURITY_TOOLS:
+        return "security-tools"
+    if path in READ_BY_TESTS:
+        return "test"
+    if path in TEST_REPORT:
+        return "test-contract"
+    if path in PKG_SCRIPTS:
+        return "pkg"
+    if path.startswith("scripts/") and path.endswith(".md"):
+        return "docs"
     if path.startswith("tests/fixtures/"):
         return "test"
     if path.startswith("tests/windows/"):
@@ -213,7 +258,8 @@ MID = {"pipeline", "mcp", "store", "cypher", "discover", "git", "graph_buffer",
 PLATFORM = {"daemon", "cli", "watcher", "ui", "foundation", "smoke", "pkg", "test-win"}
 CORE = {"mem-core", "build", "vendored", "ci-gate", "other", "scripts-other"}
 LOWER = {"test", "test-contract", "fuzz", "ui-frontend", "ci-other",
-         "local-infra", "docs", "lint-cfg", "memwaste-tools"}
+         "local-infra", "docs", "lint-cfg", "memwaste-tools", "license-tools",
+         "security-tools"}
 
 
 def normalized(cat):
@@ -240,7 +286,8 @@ def tier_of(cats):
         return "T2-extract"
     if cats & {"test", "test-contract", "fuzz"}:
         return "T1-tests"
-    if cats & {"ui-frontend", "ci-other", "local-infra", "lint-cfg", "memwaste-tools"}:
+    if cats & {"ui-frontend", "ci-other", "local-infra", "lint-cfg", "memwaste-tools",
+               "license-tools", "security-tools"}:
         return "T0b-nonproduct"
     return "T0a-docs"
 
@@ -270,7 +317,7 @@ R1 = {
 # because a pkg path is never docs-only (it lifts the tier to T4).
 ADD_ONS = [
     ({"pkg"}, {"pkg-wrappers", "smoke-ubuntu", "smoke-mac", "smoke-win"}),
-    ({"vendored", "pkg", "ci-gate", "build"}, {"license-gate"}),
+    ({"vendored", "pkg", "ci-gate", "build", "license-tools"}, {"license-gate"}),
     ({"ui-frontend"}, {"windows-guards", "smoke-ubuntu"}),
     ({"memwaste-tools", "mem-core"}, {"memwaste"}),
     ({"test-win"}, {"windows", "windows-guards"}),

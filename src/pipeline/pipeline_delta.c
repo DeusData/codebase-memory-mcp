@@ -151,7 +151,12 @@ int cbm_delta_snapshot_inbound(cbm_store_t *store, const char *project, const ch
         int step_rc;
         while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             const char *type = (const char *)sqlite3_column_text(stmt, 2);
-            if (delta_edge_type_is_recomputed(type)) {
+            const char *eprops = (const char *)sqlite3_column_text(stmt, 3);
+            /* the env join's edges come from file-owned EnvVars, but every
+             * run recomputes them whole (pass_envjoin.c) */
+            bool joined = type && strcmp(type, CBM_ENVJOIN_EDGE_TYPE) == 0 && eprops &&
+                          strstr(eprops, "\"strategy\":\"env_read\"");
+            if (delta_edge_type_is_recomputed(type) || joined) {
                 continue;
             }
             if (count >= cap) {
@@ -247,6 +252,38 @@ int cbm_delta_purge(cbm_store_t *store, const char *project, const char *const *
     return 0;
 }
 
+/* Run a node DELETE binding ?1 = project, ?2 = label, ?3.. = the first
+ * `type_count` of `types`; the number of nodes deleted, or -1. */
+static int delta_delete_nodes(sqlite3 *db, const char *sql, const char *project, const char *label,
+                              const char *const *types, int type_count) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, label, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    for (int i = 0; i < type_count; i++) {
+        sqlite3_bind_text(stmt, i + 3, types[i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
+}
+
+int cbm_delta_drop_edgeless(cbm_store_t *store, const char *project, const char *label) {
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return CBM_NOT_FOUND;
+    }
+    /* Each NOT EXISTS is served by an (id, type) index's id prefix. */
+    static const char SQL[] =
+        "DELETE FROM nodes WHERE project = ?1 AND label = ?2"
+        " AND (file_path IS NULL OR file_path = '')"
+        " AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = nodes.id)"
+        " AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = nodes.id)";
+    return delta_delete_nodes(db, SQL, project, label, NULL, 0);
+}
+
 int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const char *label,
                                 const char *const *edge_types) {
     sqlite3 *db = cbm_store_get_db(store);
@@ -269,18 +306,7 @@ int cbm_delta_drop_unreferenced(cbm_store_t *store, const char *project, const c
     if (t == 0 || len <= 0 || (size_t)len >= sizeof(sql)) {
         return CBM_NOT_FOUND;
     }
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        return CBM_NOT_FOUND;
-    }
-    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, label, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    for (int i = 0; i < t; i++) {
-        sqlite3_bind_text(stmt, i + 3, edge_types[i], CBM_NOT_FOUND, SQLITE_TRANSIENT);
-    }
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE ? sqlite3_changes(db) : CBM_NOT_FOUND;
+    return delta_delete_nodes(db, sql, project, label, edge_types, t);
 }
 
 /* The first column of `sql` (?1 = the project) as arena strings in *out. */
@@ -338,6 +364,157 @@ int cbm_delta_image_components(cbm_store_t *store, const char *project, CBMArena
                                " label = 'Image' AND json_extract(properties, '$.component')"
                                " IS NOT NULL ORDER BY qualified_name",
                                a, out);
+}
+
+/* Calls fn for each row of `sql` (?1 = project); the row count, or -1. */
+static int delta_each_row(cbm_store_t *store, const char *project, const char *sql,
+                          void (*fn)(sqlite3_stmt *, void *), void *ud) {
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    if (!db || sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+    int n = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        fn(stmt, ud);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? n : CBM_NOT_FOUND;
+}
+
+/* Room for one more of `size` bytes in arena array *items (count n). */
+static bool delta_room(CBMArena *a, void **items, int n, int *cap, size_t size) {
+    if (n < *cap) {
+        return true;
+    }
+    int ncap = *cap ? *cap * PAIR_LEN : CBM_SZ_64;
+    void *grown = cbm_arena_alloc(a, (size_t)ncap * size);
+    if (!grown) {
+        return false;
+    }
+    if (n) {
+        memcpy(grown, *items, (size_t)n * size);
+    }
+    *items = grown;
+    *cap = ncap;
+    return true;
+}
+
+typedef struct {
+    cbm_envjoin_base_t *b;
+    int cap;
+    bool failed;
+} delta_ej_t;
+
+static const char *delta_col(CBMArena *a, sqlite3_stmt *st, int i) {
+    const char *s = (const char *)sqlite3_column_text(st, i);
+    return cbm_arena_strdup(a, s ? s : "");
+}
+
+static void delta_ej_set(sqlite3_stmt *st, void *ud) {
+    delta_ej_t *e = ud;
+    cbm_envjoin_base_t *b = e->b;
+    if (!delta_room(&b->arena, (void **)&b->sets, b->set_count, &e->cap, sizeof(*b->sets))) {
+        e->failed = true;
+        return;
+    }
+    b->sets[b->set_count++] =
+        (cbm_envjoin_set_row_t){sqlite3_column_int64(st, 0), delta_col(&b->arena, st, SKIP_ONE),
+                                delta_col(&b->arena, st, PAIR_LEN)};
+}
+
+static void delta_ej_img(sqlite3_stmt *st, void *ud) {
+    delta_ej_t *e = ud;
+    cbm_envjoin_base_t *b = e->b;
+    if (!delta_room(&b->arena, (void **)&b->imgs, b->img_count, &e->cap, sizeof(*b->imgs))) {
+        e->failed = true;
+        return;
+    }
+    b->imgs[b->img_count++] =
+        (cbm_envjoin_img_row_t){sqlite3_column_int64(st, 0), sqlite3_column_int64(st, SKIP_ONE),
+                                delta_col(&b->arena, st, PAIR_LEN)};
+}
+
+static void delta_ej_reader(sqlite3_stmt *st, void *ud) {
+    delta_ej_t *e = ud;
+    cbm_envjoin_base_t *b = e->b;
+    if (!delta_room(&b->arena, (void **)&b->readers, b->reader_count, &e->cap,
+                    sizeof(*b->readers))) {
+        e->failed = true;
+        return;
+    }
+    b->readers[b->reader_count++] =
+        (cbm_envjoin_reader_row_t){sqlite3_column_int64(st, 0), delta_col(&b->arena, st, SKIP_ONE),
+                                   delta_col(&b->arena, st, PAIR_LEN)};
+}
+
+int cbm_delta_envjoin_base(cbm_store_t *store, const char *project, cbm_envjoin_base_t *out) {
+    *out = (cbm_envjoin_base_t){0};
+    cbm_arena_init_lazy(&out->arena, CBM_SZ_4K);
+    delta_ej_t sets = {.b = out};
+    delta_ej_t imgs = {.b = out};
+    delta_ej_t readers = {.b = out};
+    if (delta_each_row(store, project,
+                       "SELECT id, file_path, properties FROM nodes WHERE project = ?1"
+                       " AND label = 'Module' AND instr(properties, '\"image_files\"') > 0"
+                       " ORDER BY id",
+                       delta_ej_set, &sets) < 0 ||
+        delta_each_row(store, project,
+                       "SELECT source_id, target_id, properties FROM edges WHERE project = ?1"
+                       " AND type = 'USAGE' AND instr(properties, '\"ref\":\"image\"') > 0"
+                       " ORDER BY id",
+                       delta_ej_img, &imgs) < 0 ||
+        delta_each_row(store, project,
+                       "SELECT e.source_id, s.file_path, t.name FROM edges e"
+                       " JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id"
+                       " WHERE e.project = ?1 AND e.type = 'CONFIGURES'"
+                       " AND instr(e.properties, '\"strategy\":\"env_access\"') > 0"
+                       " ORDER BY e.id",
+                       delta_ej_reader, &readers) < 0 ||
+        sets.failed || imgs.failed || readers.failed) {
+        cbm_envjoin_base_free(out);
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+typedef struct {
+    const char *const *paths;
+    int path_count;
+    bool hit;
+} delta_holds_t;
+
+static void delta_holds_row(sqlite3_stmt *st, void *ud) {
+    delta_holds_t *h = ud;
+    const char *props = (const char *)sqlite3_column_text(st, 0);
+    for (int i = 0; props && !h->hit && i < h->path_count; i++) {
+        h->hit = cbm_envjoin_props_hold(props, h->paths[i]);
+    }
+}
+
+int cbm_delta_image_holds_any(cbm_store_t *store, const char *project, const char *const *paths,
+                              int path_count) {
+    delta_holds_t h = {paths, path_count, false};
+    if (path_count <= 0) {
+        return 0;
+    }
+    if (delta_each_row(store, project,
+                       "SELECT properties FROM nodes WHERE project = ?1 AND label = 'Module'"
+                       " AND instr(properties, '\"image_files\"') > 0",
+                       delta_holds_row, &h) < 0) {
+        return CBM_NOT_FOUND;
+    }
+    return h.hit ? SKIP_ONE : 0;
+}
+
+void cbm_envjoin_base_free(cbm_envjoin_base_t *b) {
+    if (b) {
+        cbm_arena_destroy(&b->arena);
+        *b = (cbm_envjoin_base_t){0};
+    }
 }
 
 int cbm_delta_drop_edges_from_label(cbm_store_t *store, const char *project, const char *type,
@@ -640,15 +817,18 @@ static void delta_patch_node(const cbm_gbuf_node_t *node, void *userdata) {
     ctx->nodes++;
 }
 
-/* An edge of the class recomputed wholesale on every run (an Image's build
- * edges): the staging graph dropped its old set, so it is written even
- * between pre-existing nodes. */
+/* An edge of a class recomputed wholesale on every run (an Image's build
+ * edges, the env join's edges): the staging graph dropped its old set, so it
+ * is written even between pre-existing nodes. */
 static bool delta_edge_recomputed(const delta_patch_ctx_t *ctx, const cbm_gbuf_edge_t *edge) {
-    if (!ctx->gbuf || strcmp(edge->type, CBM_BUILD_EDGE_TYPE) != 0) {
+    const char *want = strcmp(edge->type, CBM_BUILD_EDGE_TYPE) == 0     ? CBM_BUILD_EDGE_SOURCE
+                       : strcmp(edge->type, CBM_ENVJOIN_EDGE_TYPE) == 0 ? CBM_ENVJOIN_EDGE_SOURCE
+                                                                        : NULL;
+    if (!ctx->gbuf || !want) {
         return false;
     }
     const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, edge->source_id);
-    return src && src->label && strcmp(src->label, CBM_BUILD_EDGE_SOURCE) == 0;
+    return src && src->label && strcmp(src->label, want) == 0;
 }
 
 static void delta_patch_edge(const cbm_gbuf_edge_t *edge, void *userdata) {

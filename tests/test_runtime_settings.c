@@ -4,6 +4,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
+#include "foundation/log.h"
 #include "cli/cli.h"
 #include "cli/runtime_settings.h"
 #include "ui/config.h"
@@ -397,7 +398,240 @@ TEST(runtime_settings_response_memory_returns_to_caller_baseline) {
     PASS();
 }
 
+/* A second connection holds _config.db's lock, as another process mid-commit
+ * would. The sink commits the holder the moment the waiter logs
+ * config_db.busy_wait, so the wait is observed as an event, single-threaded and
+ * without a duration. A call that fails on the lock instead never logs, so the
+ * holder stays held through it and the call reports the failure. Results are
+ * captured before any ASSERT so a failure never leaks the lock or the sink. */
+static sqlite3 *g_lock_holder;
+static int g_lock_waits;
+static CBMLogLevel g_lock_saved_level;
+
+static void release_holder_on_wait(const char *line) {
+    if (!g_lock_holder || !strstr(line, "config_db.busy_wait"))
+        return;
+    g_lock_waits++;
+    (void)sqlite3_exec(g_lock_holder, "COMMIT", NULL, NULL, NULL);
+}
+
+static bool hold_config_lock(const char *cache, const char *lock_sql) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/_config.db", cache);
+    g_lock_waits = 0;
+    if (sqlite3_open(path, &g_lock_holder) != SQLITE_OK ||
+        sqlite3_exec(g_lock_holder, lock_sql, NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_close(g_lock_holder);
+        g_lock_holder = NULL;
+        return false;
+    }
+    g_lock_saved_level = cbm_log_get_level();
+    if (g_lock_saved_level > CBM_LOG_WARN)
+        cbm_log_set_level(CBM_LOG_WARN);
+    cbm_log_set_sink(release_holder_on_wait);
+    return true;
+}
+
+static void release_config_lock(void) {
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(g_lock_saved_level);
+    if (g_lock_holder) {
+        if (!sqlite3_get_autocommit(g_lock_holder))
+            (void)sqlite3_exec(g_lock_holder, "COMMIT", NULL, NULL, NULL);
+        sqlite3_close(g_lock_holder);
+        g_lock_holder = NULL;
+    }
+}
+
+static long long settings_revision(const char *cache) {
+    yyjson_doc *snapshot = read_snapshot(cache);
+    const char *text =
+        snapshot ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(snapshot), "revision")) : NULL;
+    long long revision = text ? strtoll(text, NULL, 10) : -1;
+    yyjson_doc_free(snapshot);
+    return revision;
+}
+
+/* A test that fails between init and fixture_close leaves the settings bound
+ * to its own cache; the lock tests reset first so each one fails on its own
+ * defect, never on a predecessor's leftover state. */
+static bool fresh_fixture_open(settings_fixture_t *fixture) {
+    cbm_runtime_settings_reset_for_tests();
+    return fixture_open(fixture);
+}
+
+/* CI churn: a daemon committing _config.db made an unrelated CLI start exit
+ * with "could not load saved runtime settings" (50 ms window). */
+TEST(runtime_settings_startup_waits_out_a_committing_writer) {
+    settings_fixture_t fixture;
+    ASSERT_TRUE(fresh_fixture_open(&fixture));
+    int status = 0;
+    char *result = apply(fixture.path, "{\"CBM_WORKERS\":\"4\"}", &status);
+    ASSERT_EQ(status, 200);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    ASSERT_TRUE(hold_config_lock(fixture.path, "BEGIN EXCLUSIVE"));
+    bool initialized = cbm_runtime_settings_init(fixture.path);
+    int waits = g_lock_waits;
+    release_config_lock();
+    ASSERT_TRUE(initialized);
+    ASSERT_EQ(waits, 1);
+    ASSERT_STR_EQ(cbm_runtime_getenv("CBM_WORKERS"), "4");
+    fixture_close(&fixture);
+    PASS();
+}
+
+/* The daemon's set_ui_config handler: a concurrent commit failed the save at
+ * once (cbm_config_open had no wait) and made the load silently return the
+ * legacy defaults instead of the saved port. */
+TEST(runtime_settings_ui_save_and_load_wait_out_a_committing_writer) {
+    settings_fixture_t fixture;
+    ASSERT_TRUE(fresh_fixture_open(&fixture));
+    ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
+    cbm_ui_config_t config = {.ui_enabled = true, .ui_port = 8222};
+    ASSERT_TRUE(cbm_ui_config_save(&config));
+
+    ASSERT_TRUE(hold_config_lock(fixture.path, "BEGIN EXCLUSIVE"));
+    config.ui_port = 8333;
+    bool saved = cbm_ui_config_save(&config);
+    int save_waits = g_lock_waits;
+    release_config_lock();
+    ASSERT_TRUE(saved);
+    ASSERT_TRUE(save_waits >= 1);
+
+    ASSERT_TRUE(hold_config_lock(fixture.path, "BEGIN EXCLUSIVE"));
+    cbm_ui_config_t loaded = {0};
+    cbm_ui_config_load(&loaded);
+    int load_waits = g_lock_waits;
+    release_config_lock();
+    ASSERT_EQ(load_waits, 1);
+    ASSERT_TRUE(loaded.ui_enabled);
+    ASSERT_EQ(loaded.ui_port, 8333);
+    fixture_close(&fixture);
+    PASS();
+}
+
+/* Every `daemon start` on a UI build saved the same two values; the upsert
+ * still updated the rows, fired the revision trigger and committed. */
+TEST(runtime_settings_unchanged_ui_save_does_not_rewrite) {
+    settings_fixture_t fixture;
+    ASSERT_TRUE(fresh_fixture_open(&fixture));
+    ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
+    cbm_ui_config_t config = {.ui_enabled = true, .ui_port = 8222};
+    ASSERT_TRUE(cbm_ui_config_save(&config));
+    long long first = settings_revision(fixture.path);
+    ASSERT_TRUE(first > 0);
+    ASSERT_TRUE(cbm_ui_config_save(&config));
+    ASSERT_TRUE(cbm_ui_config_save(&config));
+    ASSERT_EQ(settings_revision(fixture.path), first);
+    config.ui_port = 8223;
+    ASSERT_TRUE(cbm_ui_config_save(&config));
+    ASSERT_EQ(settings_revision(fixture.path), first + 1);
+    fixture_close(&fixture);
+    PASS();
+}
+
+/* A process killed mid-write (crash, taskkill /F, power loss) leaves _config.db
+ * with a hot rollback journal. Made portably and deterministically: snapshot the
+ * database and its journal while a spilled write transaction is open, roll the
+ * transaction back, then put the snapshot back. The journal is checked to be
+ * hot (SQLite's magic and a nonzero record count) before the code under test
+ * runs, so these tests cannot pass on a journal that was never hot. */
+static bool copy_file(const char *from, const char *to) {
+    FILE *in = cbm_fopen(from, "rb");
+    FILE *out = in ? cbm_fopen(to, "wb") : NULL;
+    bool ok = in && out;
+    char buffer[8192];
+    size_t got = 0;
+    while (ok && (got = fread(buffer, 1, sizeof(buffer), in)) > 0)
+        ok = fwrite(buffer, 1, got, out) == got;
+    if (in)
+        fclose(in);
+    if (out && fclose(out) != 0)
+        ok = false;
+    return ok;
+}
+
+static bool journal_is_hot(const char *path) {
+    static const unsigned char magic[8] = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
+    unsigned char header[12] = {0};
+    FILE *file = cbm_fopen(path, "rb");
+    bool read = file && fread(header, 1, sizeof(header), file) == sizeof(header);
+    if (file)
+        fclose(file);
+    unsigned records = ((unsigned)header[8] << 24) | ((unsigned)header[9] << 16) |
+                       ((unsigned)header[10] << 8) | (unsigned)header[11];
+    return read && memcmp(header, magic, sizeof(magic)) == 0 && records > 0;
+}
+
+static bool leave_hot_journal(const char *cache, const char *update_sql) {
+    char db_path[512], journal_path[512], db_copy[512], journal_copy[512];
+    snprintf(db_path, sizeof(db_path), "%s/_config.db", cache);
+    snprintf(journal_path, sizeof(journal_path), "%s/_config.db-journal", cache);
+    snprintf(db_copy, sizeof(db_copy), "%s/snapshot.db", cache);
+    snprintf(journal_copy, sizeof(journal_copy), "%s/snapshot.journal", cache);
+    sqlite3 *writer = NULL;
+    bool ok = sqlite3_open(db_path, &writer) == SQLITE_OK &&
+              sqlite3_exec(writer, "PRAGMA cache_size=1; BEGIN IMMEDIATE; CREATE TABLE spill(x BLOB)",
+                           NULL, NULL, NULL) == SQLITE_OK &&
+              sqlite3_exec(writer, update_sql, NULL, NULL, NULL) == SQLITE_OK;
+    for (int i = 0; ok && i < 64; i++)
+        ok = sqlite3_exec(writer, "INSERT INTO spill VALUES(randomblob(8192))", NULL, NULL, NULL) ==
+             SQLITE_OK;
+    ok = ok && copy_file(db_path, db_copy) && copy_file(journal_path, journal_copy);
+    if (writer) {
+        (void)sqlite3_exec(writer, "ROLLBACK", NULL, NULL, NULL);
+        sqlite3_close(writer);
+    }
+    ok = ok && journal_is_hot(journal_copy) && copy_file(db_copy, db_path) &&
+         copy_file(journal_copy, journal_path);
+    remove(db_copy);
+    remove(journal_copy);
+    return ok;
+}
+
+/* The hot journal made every later start fail with "could not load saved
+ * runtime settings", permanently: a read-only connection cannot roll it back. */
+TEST(runtime_settings_startup_recovers_a_hot_journal) {
+    settings_fixture_t fixture;
+    ASSERT_TRUE(fresh_fixture_open(&fixture));
+    int status = 0;
+    char *result = apply(fixture.path, "{\"CBM_WORKERS\":\"4\"}", &status);
+    ASSERT_EQ(status, 200);
+    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    ASSERT_TRUE(leave_hot_journal(fixture.path,
+                                  "UPDATE runtime_settings SET value='9' WHERE key='CBM_WORKERS'"));
+    ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
+    ASSERT_STR_EQ(cbm_runtime_getenv("CBM_WORKERS"), "4");
+    char journal[512];
+    snprintf(journal, sizeof(journal), "%s/_config.db-journal", fixture.path);
+    ASSERT_FALSE(cbm_file_exists(journal));
+    fixture_close(&fixture);
+    PASS();
+}
+
+/* The same journal made the UI load silently fall back to the legacy defaults. */
+TEST(runtime_settings_ui_load_recovers_a_hot_journal) {
+    settings_fixture_t fixture;
+    ASSERT_TRUE(fresh_fixture_open(&fixture));
+    ASSERT_TRUE(cbm_runtime_settings_init(fixture.path));
+    cbm_ui_config_t config = {.ui_enabled = true, .ui_port = 8222};
+    ASSERT_TRUE(cbm_ui_config_save(&config));
+    ASSERT_TRUE(leave_hot_journal(fixture.path,
+                                  "UPDATE runtime_settings SET value='9999' WHERE key='ui_port'"));
+    cbm_ui_config_t loaded = {0};
+    cbm_ui_config_load(&loaded);
+    ASSERT_TRUE(loaded.ui_enabled);
+    ASSERT_EQ(loaded.ui_port, 8222);
+    fixture_close(&fixture);
+    PASS();
+}
+
 SUITE(runtime_settings) {
+    RUN_TEST(runtime_settings_startup_recovers_a_hot_journal);
+    RUN_TEST(runtime_settings_ui_load_recovers_a_hot_journal);
+    RUN_TEST(runtime_settings_startup_waits_out_a_committing_writer);
+    RUN_TEST(runtime_settings_ui_save_and_load_wait_out_a_committing_writer);
+    RUN_TEST(runtime_settings_unchanged_ui_save_does_not_rewrite);
     RUN_TEST(runtime_settings_response_memory_returns_to_caller_baseline);
     RUN_TEST(runtime_settings_preserves_unknown_inherited_values_and_reset);
     RUN_TEST(runtime_settings_canonical_alias_and_actual_listener);

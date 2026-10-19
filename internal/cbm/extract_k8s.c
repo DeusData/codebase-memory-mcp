@@ -15,6 +15,7 @@
 #include "helpers.h"
 #include "tree_sitter/api.h"
 #include "foundation/constants.h"
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 /* Local constants. */
 enum {
     K8S_BUF_SIZE = 256,
+    K8S_PROPS_KV = 5, /* extra_props: version, labels (key + value each), NULL */
 };
 
 // ---------------------------------------------------------------------------
@@ -217,6 +219,302 @@ static TSNode unwrap_pair_value(TSNode pair) {
     return val_node;
 }
 
+// ---------------------------------------------------------------------------
+// Kustomize patches
+// ---------------------------------------------------------------------------
+
+// One `patches` entry of a kustomization (the kustomize v5 mapping form). The
+// patch file of `path` is an import (local name "patches"); what the entry
+// patches is a PATCH fact the K8s pass resolves in the kustomization's build:
+// its `target`, else each document of an inline `patch`; a path patch
+// without a target names the objects of its own documents, which the pass
+// reads from the patch file's Resources. A target the pass cannot evaluate
+// (a label or annotation selector) names nothing.
+
+typedef struct {
+    const char *kind;
+    const char *group;
+    const char *version;
+    const char *name;
+    const char *ns;
+    const char *selector; /* labelSelector */
+    bool unsupported;     /* annotationSelector: not evaluated */
+} kust_target_t;
+
+static void kust_target(CBMExtractCtx *ctx, TSNode map, kust_target_t *t) {
+    CBMArena *a = ctx->arena;
+    k8s_kids_t pairs = k8s_kids(map);
+    TSNode pair;
+    while (k8s_kid(&pairs, false, &pair)) {
+        if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+            continue;
+        }
+        const char *key = get_scalar_text(a, ts_node_named_child(pair, 0), ctx->source);
+        TSNode v = unwrap_pair_value(pair);
+        const char *val = key && !ts_node_is_null(v) ? get_scalar_text(a, v, ctx->source) : NULL;
+        if (!val || !val[0]) {
+            continue;
+        }
+        if (strcmp(key, "kind") == 0) {
+            t->kind = val;
+        } else if (strcmp(key, "group") == 0) {
+            t->group = val;
+        } else if (strcmp(key, "version") == 0) {
+            t->version = val;
+        } else if (strcmp(key, "name") == 0) {
+            t->name = val;
+        } else if (strcmp(key, "namespace") == 0) {
+            t->ns = val;
+        } else if (strcmp(key, "labelSelector") == 0) {
+            t->selector = val;
+        } else if (strcmp(key, "annotationSelector") == 0) {
+            t->unsupported = true;
+        }
+    }
+}
+
+// The block mapping a sequence item holds, null when it holds none (a
+// string entry, which emit_kustomize_sequence imports).
+static TSNode kust_item_mapping(TSNode item) {
+    TSNode v = first_content_child(item);
+    if (!ts_node_is_null(v) && strcmp(ts_node_type(v), "block_node") == 0) {
+        v = first_content_child(v);
+    }
+    if (ts_node_is_null(v) || strcmp(ts_node_type(v), "block_mapping") != 0) {
+        TSNode null_node = {0};
+        return null_node;
+    }
+    return v;
+}
+
+// The text of an inline patch: a block scalar's lines after its header line
+// (`|`, `|-`, `|2`...), or a one-line scalar.
+static const char *kust_inline_text(CBMExtractCtx *ctx, TSNode v) {
+    if (strcmp(ts_node_type(v), "block_scalar") == 0) {
+        const char *raw = cbm_node_text(ctx->arena, v, ctx->source);
+        const char *nl = raw ? strchr(raw, '\n') : NULL;
+        return nl ? nl + SKIP_ONE : NULL;
+    }
+    return get_scalar_text(ctx->arena, v, ctx->source);
+}
+
+// One line of an inline patch: its indent and `key: value` (the value
+// unquoted, a trailing comment dropped); false for a blank or comment line.
+static bool kust_line(const char *p, size_t len, int *indent, char *key, size_t ksz, char *val,
+                      size_t vsz) {
+    size_t i = 0;
+    while (i < len && p[i] == ' ') {
+        i++;
+    }
+    if (i == len || p[i] == '#') {
+        return false;
+    }
+    *indent = (int)i;
+    size_t k = i;
+    while (k < len && p[k] != ':') {
+        k++;
+    }
+    snprintf(key, ksz, "%.*s", (int)(k - i), p + i);
+    val[0] = '\0';
+    size_t s = k < len ? k + SKIP_ONE : len;
+    while (s < len && p[s] == ' ') {
+        s++;
+    }
+    size_t e = s;
+    while (e < len && !(p[e] == '#' && p[e - SKIP_ONE] == ' ')) {
+        e++;
+    }
+    while (e > s && (p[e - SKIP_ONE] == ' ' || p[e - SKIP_ONE] == '\r')) {
+        e--;
+    }
+    if (e - s >= PAIR_LEN && (p[s] == '"' || p[s] == '\'') && p[e - SKIP_ONE] == p[s]) {
+        s++;
+        e--;
+    }
+    snprintf(val, vsz, "%.*s", (int)(e - s), p + s);
+    return true;
+}
+
+// Each document of an inline patch with a kind and a metadata.name: a PATCH
+// fact naming that object -- its kind, the group of its apiVersion ("core"
+// for the core group, as on a Resource), its name and namespace. A JSON6902
+// operation list names nothing.
+static const char KUST_DOC_END[] = "---";
+
+static void kust_inline_facts(CBMExtractCtx *ctx, const char *text, CBMK8sFact base) {
+    CBMArena *a = ctx->arena;
+    CBMK8sFact f = base;
+    int top = -1;  /* indent of the document's keys */
+    int meta = -1; /* indent of metadata's keys, -1: not inside metadata */
+    bool in_meta = false;
+    for (const char *p = text; p;) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        size_t b = strspn(p, " ");
+        bool doc_end = b + strlen(KUST_DOC_END) <= len &&
+                       strncmp(p + b, KUST_DOC_END, strlen(KUST_DOC_END)) == 0;
+        int ind = 0;
+        char key[K8S_BUF_SIZE];
+        char val[K8S_BUF_SIZE];
+        if (!doc_end && kust_line(p, len, &ind, key, sizeof(key), val, sizeof(val))) {
+            if (top < 0) {
+                top = ind;
+            }
+            if (ind == top) {
+                in_meta = strcmp(key, "metadata") == 0 && !val[0];
+                meta = -1;
+                if (strcmp(key, "kind") == 0 && val[0]) {
+                    f.kind = cbm_arena_strdup(a, val);
+                } else if (strcmp(key, "apiVersion") == 0 && val[0]) {
+                    const char *slash = strchr(val, '/');
+                    f.group = slash ? cbm_arena_strndup(a, val, (size_t)(slash - val)) : "core";
+                }
+            } else if (in_meta && ind > top) {
+                meta = meta < 0 ? ind : meta;
+                if (ind == meta && strcmp(key, "name") == 0 && val[0]) {
+                    f.name = cbm_arena_strdup(a, val);
+                } else if (ind == meta && strcmp(key, "namespace") == 0 && val[0]) {
+                    f.ns = cbm_arena_strdup(a, val);
+                }
+            }
+        }
+        if (doc_end || !eol) {
+            if (f.kind && f.name) {
+                cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
+            }
+            f = base;
+            top = -1;
+            in_meta = false;
+        }
+        p = eol ? eol + SKIP_ONE : NULL;
+    }
+}
+
+// The mapping entries of a kustomization's `patches` list.
+static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
+    CBMArena *a = ctx->arena;
+    k8s_kids_t items = k8s_kids(seq);
+    TSNode item;
+    while (k8s_kid(&items, false, &item)) {
+        TSNode map = strcmp(ts_node_type(item), "block_sequence_item") == 0
+                         ? kust_item_mapping(item)
+                         : (TSNode){0};
+        if (ts_node_is_null(map)) {
+            continue;
+        }
+        const char *path = NULL;
+        const char *inline_text = NULL;
+        kust_target_t t = {0};
+        bool has_target = false;
+        k8s_kids_t pairs = k8s_kids(map);
+        TSNode pair;
+        while (k8s_kid(&pairs, false, &pair)) {
+            if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+                continue;
+            }
+            const char *key = get_scalar_text(a, ts_node_named_child(pair, 0), ctx->source);
+            TSNode v = unwrap_pair_value(pair);
+            if (!key || ts_node_is_null(v)) {
+                continue;
+            }
+            if (strcmp(key, "path") == 0) {
+                path = get_scalar_text(a, v, ctx->source);
+            } else if (strcmp(key, "patch") == 0) {
+                inline_text = kust_inline_text(ctx, v);
+            } else if (strcmp(key, "target") == 0 &&
+                       strcmp(ts_node_type(v), "block_mapping") == 0) {
+                kust_target(ctx, v, &t);
+                has_target = true;
+            }
+        }
+        if (path && path[0]) {
+            CBMImport imp = {.local_name = cbm_arena_strdup(a, "patches"),
+                             .module_path = cbm_arena_strdup(a, path)};
+            cbm_imports_push(&ctx->result->imports, a, imp);
+        }
+        CBMK8sFact base = {.fact = CBM_K8S_FACT_PATCH,
+                           .def_index = -1,
+                           .via = "patch",
+                           .edge = "OVERRIDE",
+                           .path = path && path[0] ? path : NULL,
+                           .line = (int)ts_node_start_point(item).row + TS_LINE_OFFSET};
+        if (has_target) {
+            if (!t.unsupported && (t.kind || t.name || t.selector)) {
+                CBMK8sFact f = base;
+                f.kind = t.kind;
+                f.group = t.group;
+                f.version = t.version;
+                f.name = t.name;
+                f.ns = t.ns;
+                f.selector = t.selector;
+                cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
+            }
+        } else if (inline_text) {
+            kust_inline_facts(ctx, inline_text, base);
+        } else if (base.path) {
+            cbm_k8sfact_push(&ctx->result->k8s_facts, a, base);
+        }
+    }
+}
+
+// The `helmCharts` list of a kustomization: each chart it inflates into its
+// build is a DEPLOY fact (via "kustomize") the K8s pass draws to that chart;
+// its values file an import (local name "valuesFile").
+static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
+    CBMArena *a = ctx->arena;
+    k8s_kids_t items = k8s_kids(seq);
+    TSNode item;
+    while (k8s_kid(&items, false, &item)) {
+        TSNode map = strcmp(ts_node_type(item), "block_sequence_item") == 0
+                         ? kust_item_mapping(item)
+                         : (TSNode){0};
+        if (ts_node_is_null(map)) {
+            continue;
+        }
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_DEPLOY,
+                        .def_index = -1,
+                        .via = "kustomize",
+                        .edge = "DEPLOYS",
+                        .line = (int)ts_node_start_point(item).row + TS_LINE_OFFSET};
+        k8s_kids_t pairs = k8s_kids(map);
+        TSNode pair;
+        while (k8s_kid(&pairs, false, &pair)) {
+            if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+                continue;
+            }
+            const char *key = get_scalar_text(a, ts_node_named_child(pair, 0), ctx->source);
+            TSNode v = unwrap_pair_value(pair);
+            const char *val =
+                key && !ts_node_is_null(v) ? get_scalar_text(a, v, ctx->source) : NULL;
+            if (!val || !val[0]) {
+                continue;
+            }
+            if (strcmp(key, "name") == 0) {
+                f.name = val;
+            } else if (strcmp(key, "repo") == 0) {
+                f.url = val;
+            } else if (strcmp(key, "version") == 0) {
+                f.version = val;
+            } else if (strcmp(key, "releaseName") == 0) {
+                f.release = val;
+            } else if (strcmp(key, "namespace") == 0) {
+                f.ns = val;
+            } else if (strcmp(key, "valuesFile") == 0) {
+                f.path = val;
+            }
+        }
+        if (!f.name) {
+            continue;
+        }
+        if (f.path) {
+            CBMImport imp = {.local_name = cbm_arena_strdup(a, "valuesFile"),
+                             .module_path = cbm_arena_strdup(a, f.path)};
+            cbm_imports_push(&ctx->result->imports, a, imp);
+        }
+        cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
+    }
+}
+
 // Process a single block_mapping_pair for kustomize list keys.
 static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
     if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
@@ -227,15 +525,24 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
         return;
     }
     const char *key_text = get_scalar_text(ctx->arena, key_node, ctx->source);
-    if (!key_text || !is_kustomize_list_key(key_text)) {
+    if (!key_text) {
         return;
     }
-
     TSNode val_node = unwrap_pair_value(pair);
     if (ts_node_is_null(val_node) || strcmp(ts_node_type(val_node), "block_sequence") != 0) {
         return;
     }
+    if (strcmp(key_text, "helmCharts") == 0) {
+        emit_kustomize_charts(ctx, val_node);
+        return;
+    }
+    if (!is_kustomize_list_key(key_text)) {
+        return;
+    }
     emit_kustomize_sequence(ctx, val_node, key_text);
+    if (strcmp(key_text, "patches") == 0) {
+        emit_kustomize_patches(ctx, val_node);
+    }
 }
 
 // Emit a "Class" def named after the document's `kind` scalar. A kustomization
@@ -310,7 +617,71 @@ typedef struct {
     char kind[K8S_BUF_SIZE];
     char name[K8S_BUF_SIZE];
     char ns[K8S_BUF_SIZE];
+    const char *labels; // metadata.labels as "k=v,k2=v2" (text order), NULL: none
 } k8s_doc_id_t;
+
+// A label a selector term can name: no templated part (a skeleton's `<...>`,
+// `{{`), no `,` or `=` (the separators of the list), nothing JSON escapes
+// (`"`, `\`, control characters -- none in a valid label).
+static bool k8s_label_plain(const char *s) {
+    if (s[0] == '<' || strstr(s, "{{") || strpbrk(s, ",=\"\\")) {
+        return false;
+    }
+    for (const char *p = s; *p; p++) {
+        if ((unsigned char)*p < ' ') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int k8s_cmp_label(const void *x, const void *y) {
+    return strcmp(*(const char *const *)x, *(const char *const *)y);
+}
+
+// metadata.labels as "k=v,k2=v2" in text order (the arena's), NULL when it
+// has none a selector can name.
+static const char *k8s_labels(CBMArena *a, TSNode map, const char *source) {
+    if (strcmp(ts_node_type(map), "block_mapping") != 0) {
+        return NULL;
+    }
+    int cap = (int)ts_node_named_child_count(map);
+    const char **items = cap > 0 ? cbm_arena_alloc(a, (size_t)cap * sizeof(*items)) : NULL;
+    int n = 0;
+    size_t len = 0;
+    k8s_kids_t pairs = k8s_kids(map);
+    TSNode p;
+    while (items && n < cap && k8s_kid(&pairs, false, &p)) {
+        if (strcmp(ts_node_type(p), "block_mapping_pair") != 0) {
+            continue;
+        }
+        const char *k = get_scalar_text(a, ts_node_named_child(p, 0), source);
+        TSNode vn = unwrap_pair_value(p);
+        const char *v = ts_node_is_null(vn) ? NULL : get_scalar_text(a, vn, source);
+        if (k && k[0] && v && k8s_label_plain(k) && k8s_label_plain(v)) {
+            items[n] = cbm_arena_sprintf(a, "%s=%s", k, v);
+            len += items[n] ? strlen(items[n]) + SKIP_ONE : 0;
+            n += items[n] ? SKIP_ONE : 0;
+        }
+    }
+    k8s_kids_done(&pairs);
+    if (n == 0) {
+        return NULL;
+    }
+    qsort((void *)items, (size_t)n, sizeof(*items), k8s_cmp_label);
+    char *out = cbm_arena_alloc(a, len);
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    for (int i = 0; i < n; i++) {
+        size_t l = strlen(items[i]);
+        memcpy(out + w, items[i], l);
+        w += l;
+        out[w++] = i + SKIP_ONE < n ? ',' : '\0';
+    }
+    return out;
+}
 
 // Read metadata.name and metadata.namespace from a metadata block_mapping.
 static void extract_metadata(CBMArena *a, TSNode meta_mapping, const char *source,
@@ -331,10 +702,14 @@ static void extract_metadata(CBMArena *a, TSNode meta_mapping, const char *sourc
         const char *mkey_text = get_scalar_text(a, mkey, source);
         bool is_name = mkey_text && strcmp(mkey_text, "name") == 0;
         bool is_ns = mkey_text && strcmp(mkey_text, "namespace") == 0;
+        TSNode mval = unwrap_pair_value(mpair);
+        if (mkey_text && strcmp(mkey_text, "labels") == 0 && !ts_node_is_null(mval)) {
+            id->labels = k8s_labels(a, mval, source);
+            continue;
+        }
         if (!is_name && !is_ns) {
             continue;
         }
-        TSNode mval = unwrap_pair_value(mpair);
         const char *text = ts_node_is_null(mval) ? NULL : get_scalar_text(a, mval, source);
         if (text) {
             snprintf(is_name ? id->name : id->ns, K8S_BUF_SIZE, "%s", text);
@@ -773,35 +1148,13 @@ static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const 
     cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
 }
 
-// A container's literal image: `path` ends in containers[].image,
-// initContainers[].image or ephemeralContainers[].image at any depth (pod
-// templates, CronJobs, the pod templates of custom resources).
-static bool k8s_image_leaf(const char *path, const char *value) {
-    static const char *const LEAVES[] = {"containers[].image", "initContainers[].image",
-                                         "ephemeralContainers[].image"};
-    if (!value[0] || strchr(value, '$') || strchr(value, ' ') || strstr(value, "{{")) {
-        return false;
-    }
-    size_t pl = strlen(path);
-    for (size_t i = 0; i < sizeof(LEAVES) / sizeof(LEAVES[0]); i++) {
-        size_t ll = strlen(LEAVES[i]);
-        if (pl >= ll && strcmp(path + pl - ll, LEAVES[i]) == 0 &&
-            (pl == ll || path[pl - ll - SKIP_ONE] == '.')) {
-            return true;
-        }
-    }
-    return false;
+// A literal image reference: no variable, no template, no blank.
+static bool k8s_image_literal(const char *value) {
+    return value && value[0] && !strchr(value, '$') && !strchr(value, ' ') && !strstr(value, "{{");
 }
 
 // A scalar at `path`: a leaf reference, or a CRD's group / kind.
 static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
-    if (k8s_image_leaf(path, value)) {
-        CBMK8sFact f = {.fact = CBM_K8S_FACT_IMAGE,
-                        .def_index = w->def_index,
-                        .name = cbm_arena_strdup(w->ctx->arena, value),
-                        .via = "container"};
-        cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
-    }
     const char *pod = k8s_pod_prefix(w->kind);
     size_t pl = strlen(pod);
     if (pl && strncmp(path, pod, pl) == 0 && path[pl] == '.') {
@@ -1086,10 +1439,39 @@ static const char *k8s_env_source(k8s_walk_t *w, TSNode item) {
     return "value";
 }
 
-// The environment variables a container (`path` ends in containers[],
-// initContainers[] or ephemeralContainers[], any depth) sets: each env[]
-// name, with where its value comes from -- never the value.
-static void k8s_container_env(k8s_walk_t *w, const char *path, TSNode container) {
+// The Service a container's literal env value addresses (`host:port`, a URL,
+// `<svc>.<ns>.svc...`, a bare name on an address key): a CONNECTS_TO
+// reference, resolved in the bundle like every other. Only the service's
+// name and namespace are kept -- never the value.
+static void k8s_env_address(k8s_walk_t *w, TSNode item, const char *key, const char *cname) {
+    enum { K8S_DNS_LABEL = 64 };
+    const char *value = k8s_text(w, item, "value");
+    char svc[K8S_DNS_LABEL];
+    char ns[K8S_DNS_LABEL];
+    if (!value || cbm_env_address(key, value, svc, sizeof(svc), ns, sizeof(ns)) == 0) {
+        return;
+    }
+    CBMArena *a = w->ctx->arena;
+    CBMK8sFact f = {.fact = CBM_K8S_FACT_REF,
+                    .def_index = w->def_index,
+                    .kind = "Service",
+                    .ns = ns[0] ? cbm_arena_strdup(a, ns) : NULL,
+                    .name = cbm_arena_strdup(a, svc),
+                    .via = "env",
+                    .edge = "CONNECTS_TO",
+                    .container = cname,
+                    .key = key,
+                    .line = (int)ts_node_start_point(item).row + SKIP_ONE};
+    cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
+}
+
+// A container (`path` ends in containers[], initContainers[] or
+// ephemeralContainers[], any depth: pod templates, CronJobs, the pod
+// templates of custom resources): its literal image, and the environment
+// variables it sets -- each env[] name, with where its value comes from,
+// never the value. Both carry the container's name, so a variable joins the
+// program of its own container's image.
+static void k8s_container(k8s_walk_t *w, const char *path, TSNode container) {
     static const char *const ITEMS[] = {"containers[]", "initContainers[]",
                                         "ephemeralContainers[]"};
     size_t pl = strlen(path);
@@ -1104,6 +1486,15 @@ static void k8s_container_env(k8s_walk_t *w, const char *path, TSNode container)
     }
     const char *cname = k8s_text(w, container, "name");
     cname = cname && cname[0] && !strstr(cname, "{{") ? cname : NULL;
+    const char *image = k8s_text(w, container, "image");
+    if (k8s_image_literal(image)) {
+        CBMK8sFact f = {.fact = CBM_K8S_FACT_IMAGE,
+                        .def_index = w->def_index,
+                        .name = image,
+                        .container = cname,
+                        .via = "container"};
+        cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+    }
     k8s_iter_t env = k8s_iter(k8s_child(w, container, "env"));
     TSNode item;
     while (k8s_next(&env, &item)) {
@@ -1118,12 +1509,13 @@ static void k8s_container_env(k8s_walk_t *w, const char *path, TSNode container)
                         .via = k8s_env_source(w, item),
                         .line = (int)ts_node_start_point(item).row + SKIP_ONE};
         cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
+        k8s_env_address(w, item, key, cname);
     }
 }
 
 // A mapping at `path` that holds a reference in its kind/name/namespace.
 static void k8s_mapping(k8s_walk_t *w, const char *path, TSNode mapping) {
-    k8s_container_env(w, path, mapping);
+    k8s_container(w, path, mapping);
     for (size_t i = 0; i < sizeof(k8s_mapping_refs) / sizeof(k8s_mapping_refs[0]); i++) {
         const k8s_mapping_ref_t *r = &k8s_mapping_refs[i];
         if (k8s_kind_in(r->kinds, w->kind) && strcmp(path, r->path) == 0) {
@@ -1332,6 +1724,26 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
+        // The version of its apiVersion (`v1beta2` of cluster.x-k8s.io/v1beta2,
+        // `v1` of v1), which the QN leaves out (one object across versions); a
+        // bare group without one (`apiVersion: example.io`) has none.
+        const char *slash = strchr(id.api_version, '/');
+        const char *version = slash ? slash + SKIP_ONE : id.api_version;
+        bool versioned = slash || (version[0] == 'v' && isdigit((unsigned char)version[1]));
+        const char **kv = (const char **)cbm_arena_alloc(a, K8S_PROPS_KV * sizeof(char *));
+        int kn = 0;
+        if (kv && version[0] && versioned && id.api_version[0] != '<') {
+            kv[kn++] = "version";
+            kv[kn++] = cbm_arena_strdup(a, version);
+        }
+        if (kv && id.labels) {
+            kv[kn++] = "labels";
+            kv[kn++] = id.labels;
+        }
+        if (kv && kn > 0) {
+            kv[kn] = NULL;
+            def.extra_props = kv;
+        }
         cbm_defs_push(&ctx->result->defs, a, def);
         k8s_emit_facts(ctx, mapping, group, id.kind, ctx->result->defs.count - SKIP_ONE);
     }

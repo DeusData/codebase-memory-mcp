@@ -86,6 +86,16 @@ jobs:
           path: ${{ runner.temp }}/test-selection
           if-no-files-found: error
           overwrite: true
+      # The selection a veto discarded (written only when one did): evidence
+      # for the vetoes, never read by a test leg.
+      - name: Upload the vetoed selection
+        if: ${{ !cancelled() && steps.select.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-selection-vetoed
+          path: ${{ runner.temp }}/test-impact/selection-vetoed.json
+          if-no-files-found: ignore
+          overwrite: true
 
   test:
     needs: [changes, lint, select-tests]
@@ -190,6 +200,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # SMOKE_REQUIRE_WRAPPERS=1 needs a Go toolchain for the Go wrapper; the
+      # macOS runner images have none on PATH.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: pkg/go/go.mod
+          cache: false
+
       - name: Install deps (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
@@ -232,6 +249,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
       - name: Build prod + smoke (macOS)
         if: matrix.os == 'macos-14'
@@ -242,6 +260,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
       - name: Build prod + smoke (Windows)
         if: matrix.os == 'windows-latest'
@@ -252,6 +271,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+          SMOKE_REQUIRE_WRAPPERS: "1"
 
   # ── Waste sanitizer, REPORT-ONLY: memory + CPU waste on this repository and
   #    the per-function scaling lane (Linux). Deliberately NOT in ci-ok's needs:

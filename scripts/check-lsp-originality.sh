@@ -82,8 +82,8 @@ REFS=(
 
 # Infrastructure hybrid LSP sources outside internal/cbm/lsp/ (scanned too).
 INFRA_SRC=(internal/cbm/extract_k8s.c src/pipeline/pass_k8s.c src/pipeline/pass_operator.c
-           src/pipeline/pass_shell.c src/pipeline/pass_terraform.c
-           src/pipeline/pass_ci.c src/pipeline/pass_docker.c)
+           src/pipeline/pass_shell.c src/pipeline/pass_terraform.c src/pipeline/pass_ansible.c
+           src/pipeline/pass_ci.c src/pipeline/pass_docker.c src/pipeline/pass_envjoin.c)
 
 ONLY_LANG=""; REFRESH=0; LIST_ONLY=0
 while [ $# -gt 0 ]; do

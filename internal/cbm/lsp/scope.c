@@ -5,6 +5,7 @@
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 _Thread_local uint64_t cbm_lsp_work_steps = 0;
+_Thread_local uint64_t cbm_lsp_work_ceiling = 0;
 uint64_t cbm_lsp_work_take(void) {
     uint64_t v = cbm_lsp_work_steps;
     cbm_lsp_work_steps = 0;

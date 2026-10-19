@@ -1,5 +1,20 @@
 #include "mcp/test_impact_result_internal.h"
 
+/* The ids of the matched run_all rules, in policy order: which rule made a
+ * RULE_RUN_ALL answer run everything. Outside the decision hash. */
+static tir_json *tir_run_all_rules(tir_context *c) {
+    tir_json *array = tir_node(c, TIR_ARRAY);
+    for (size_t i = 0; i < c->rule_count; i++) {
+        if (!tir_step(c, 0, 1))
+            return NULL;
+        const tir_rule *rule = &c->rules[i];
+        if (rule->matched && rule->source->action == CBM_TEST_RULE_RUN_ALL &&
+            !tir_add(c, array, NULL, tir_string(c, rule->id)))
+            return NULL;
+    }
+    return array;
+}
+
 static tir_json *tir_result_object(tir_context *c, cbm_test_result_t *result) {
     const char *decision = c->global ? "run_all" : (c->runnable ? "selected" : "nothing");
     tir_json *o = tir_node(c, TIR_OBJECT);
@@ -7,6 +22,7 @@ static tir_json *tir_result_object(tir_context *c, cbm_test_result_t *result) {
     tir_add(c, o, "experimental", tir_bool(c, true));
     tir_add(c, o, "decision", tir_text(c, decision));
     tir_add(c, o, "run_all_reasons", c->global_json);
+    tir_add(c, o, "run_all_rules", tir_run_all_rules(c));
     tir_add(c, o, "lanes", c->lane_json);
     tir_add(c, o, "warnings", tir_warnings_json(c));
     tir_add(c, o, "totals", tir_totals_json(c));

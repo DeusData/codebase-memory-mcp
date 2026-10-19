@@ -449,7 +449,7 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
+STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
@@ -540,7 +540,9 @@ PIPELINE_SRCS = \
     src/pipeline/pass_operator.c \
     src/pipeline/pass_shell.c \
     src/pipeline/pass_terraform.c \
+    src/pipeline/pass_ansible.c \
     src/pipeline/pass_docker.c \
+    src/pipeline/pass_envjoin.c \
     src/pipeline/pass_ci.c \
     src/pipeline/pass_similarity.c \
     src/pipeline/pass_semantic_edges.c \
@@ -744,6 +746,7 @@ TEST_STORE_SRCS = \
     tests/test_store_impact.c \
     tests/test_store_scope.c \
     tests/test_store_graph_digest.c \
+    tests/test_graph_mem.c \
     tests/test_store_search.c \
     tests/test_store_arch.c \
     tests/test_architecture_projection.c \
@@ -843,7 +846,7 @@ TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
 
 TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
 TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
-TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c
+TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
 TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c tests/test_conditional_variants.c tests/test_spawns.c

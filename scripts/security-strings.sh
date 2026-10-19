@@ -246,6 +246,7 @@ DANGEROUS_CMDS='wget|netcat|ncat|/dev/tcp|telnet'
 # evaluation. Document the source so reviewers can verify the false positive.
 ALLOWED_DANGEROUS=(
     '^telnet$'  # rst tree-sitter grammar: valid_schemas[] in vendored/grammars/rst/tree_sitter_rst/chars.c
+    '^wget$'    # src/pipeline/pass_shell.c: the program name a script's curl / wget HTTP_CALLS compares and records as `via`
 )
 if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null && [ -s "$SEC_CMDS" ]; then
     for allow in "${ALLOWED_DANGEROUS[@]}"; do

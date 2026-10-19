@@ -203,6 +203,32 @@ void cbm_runtime_settings_note_http_port(int port) {
     atomic_store_explicit(&active_http_port, port, memory_order_relaxed);
 }
 
+/* A commit holds _config.db's lock for milliseconds, so its release is an event
+ * that always comes; waiting for it is not a race. Failing on the lock instead
+ * (SQLite's default, or startup's former 50 ms window) let one process's routine
+ * commit fail another: a daemon saving its UI configuration made unrelated CLI
+ * starts exit with "could not load saved runtime settings", and a concurrent
+ * commit made the daemon's own UI save fail. The bound only catches a wedged
+ * holder. Each busy wait is logged once (SQLite restarts the attempt count for
+ * every lock attempt), so a test that holds the lock can observe the waiter
+ * instead of guessing a duration. */
+enum { SETTINGS_BUSY_TIMEOUT_MS = 3000, SETTINGS_BUSY_STEP_MS = 10 };
+
+static int settings_busy_wait(void *context, int attempts) {
+    (void)context;
+    if (attempts == 0)
+        cbm_log_warn("config_db.busy_wait", "action", "waiting for a settings writer");
+    if ((long long)attempts * SETTINGS_BUSY_STEP_MS >= SETTINGS_BUSY_TIMEOUT_MS)
+        return 0;
+    sqlite3_sleep(SETTINGS_BUSY_STEP_MS);
+    return 1;
+}
+
+void cbm_runtime_settings_wait_for_writers(sqlite3 *db) {
+    if (db)
+        sqlite3_busy_handler(db, settings_busy_wait, NULL);
+}
+
 static bool canonical_cache_path(const char *cache, char out[SETTINGS_PATH_CAP], bool create) {
     if (!cache || !cache[0])
         return false;
@@ -234,7 +260,7 @@ static sqlite3 *settings_open(const char *cache) {
             sqlite3_close(db);
         return NULL;
     }
-    sqlite3_busy_timeout(db, 3000);
+    cbm_runtime_settings_wait_for_writers(db);
     const char *schema =
         "BEGIN IMMEDIATE;"
         "CREATE TABLE IF NOT EXISTS runtime_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
@@ -442,6 +468,65 @@ void cbm_runtime_settings_reset_for_tests(void) {
 }
 #endif
 
+/* A process killed mid-write leaves a hot rollback journal, and a read-only
+ * connection cannot roll it back (SQLITE_READONLY_ROLLBACK): every later start
+ * failed with "could not load saved runtime settings" until something opened
+ * the database read-write, and nothing did. One read-write open that reads the
+ * schema makes SQLite roll the interrupted write back. A journal is hot only
+ * while no live writer holds its lock, so this never undoes a write in
+ * progress; a live writer takes the busy path instead. */
+static bool settings_recover_hot_journal(const char *path) {
+    sqlite3 *db = NULL;
+    bool recovered = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK;
+    if (recovered) {
+        cbm_runtime_settings_wait_for_writers(db);
+        recovered =
+            sqlite3_exec(db, "SELECT count(*) FROM sqlite_master", NULL, NULL, NULL) == SQLITE_OK;
+    }
+    if (db)
+        sqlite3_close(db);
+    char journal[SETTINGS_PATH_CAP + 16];
+    (void)snprintf(journal, sizeof(journal), "%s-journal", path);
+    if (recovered)
+        cbm_log_warn("config_db.hot_journal_recovered", "journal", journal, "action",
+                     "rolled back an interrupted settings write");
+    else
+        /* Still fatal for the caller: without the rollback the saved settings
+         * cannot be read consistently, and guessing them is worse. */
+        cbm_log_error("config_db.hot_journal_unrecovered", "journal", journal, "hint",
+                      "an interrupted settings write could not be rolled back; make the "
+                      "settings directory writable and retry");
+    return recovered;
+}
+
+/* Read-only connection holding one read snapshot (BEGIN + a schema read), or
+ * NULL. A writer mid-commit is waited out; a database still locked after the
+ * bound is an error, not an absent override. */
+static sqlite3 *settings_open_snapshot(const char *path, bool *hot_journal) {
+    *hot_journal = false;
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db)
+            sqlite3_close(db);
+        return NULL;
+    }
+    cbm_runtime_settings_wait_for_writers(db);
+    if (sqlite3_exec(db, "BEGIN; SELECT count(*) FROM sqlite_master", NULL, NULL, NULL) ==
+        SQLITE_OK)
+        return db;
+    *hot_journal = sqlite3_extended_errcode(db) == SQLITE_READONLY_ROLLBACK;
+    sqlite3_close(db);
+    return NULL;
+}
+
+static sqlite3 *settings_read_snapshot(const char *path) {
+    bool hot_journal = false;
+    sqlite3 *db = settings_open_snapshot(path, &hot_journal);
+    if (!db && hot_journal && settings_recover_hot_journal(path))
+        db = settings_open_snapshot(path, &hot_journal);
+    return db;
+}
+
 bool cbm_runtime_settings_init(const char *cache) {
     char canonical[SETTINGS_PATH_CAP];
     if (!canonical_cache_path(cache, canonical, true))
@@ -453,20 +538,12 @@ bool cbm_runtime_settings_init(const char *cache) {
         return false;
     sqlite3 *db = NULL;
     if (cbm_file_exists(path)) {
-        if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-            if (db)
-                sqlite3_close(db);
+        /* The snapshot read happens before individual optional tables are
+         * queried; failing here exits the whole process. Hook clients skip
+         * this init. */
+        db = settings_read_snapshot(path);
+        if (!db)
             return false;
-        }
-        /* Startup, especially hook clients, must never wait on a schema writer.
-         * This read forces the shared snapshot before individual optional tables
-         * are queried; a busy database is an error, not an absent override. */
-        sqlite3_busy_timeout(db, 50);
-        if (sqlite3_exec(db, "BEGIN; SELECT count(*) FROM sqlite_master", NULL, NULL, NULL) !=
-            SQLITE_OK) {
-            sqlite3_close(db);
-            return false;
-        }
     }
     for (size_t i = 0; i < SETTINGS_COUNT; i++) {
         bool saved = false;
@@ -640,15 +717,18 @@ static char *error_json(const char *message, int code, int *status) {
     return json;
 }
 
+/* An unchanged value is not rewritten: the UPDATE would still fire the revision
+ * trigger, so every `daemon start` on a UI build committed (journal + fsync) and
+ * locked out concurrent readers although nothing changed. */
 static bool write_value(sqlite3 *db, const setting_t *setting, const char *value) {
     const char *sql;
     if (setting->storage == SET_CONFIG)
         sql = value ? "INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET "
-                      "value=excluded.value"
+                      "value=excluded.value WHERE value IS NOT excluded.value"
                     : "DELETE FROM config WHERE key=?";
     else
         sql = value ? "INSERT INTO runtime_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO "
-                      "UPDATE SET value=excluded.value"
+                      "UPDATE SET value=excluded.value WHERE value IS NOT excluded.value"
                     : "DELETE FROM runtime_settings WHERE key=?";
     sqlite3_stmt *statement = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &statement, NULL) != SQLITE_OK)
@@ -759,13 +839,12 @@ void cbm_runtime_settings_load_ui(bool *enabled, int *port) {
     char path[SETTINGS_PATH_CAP];
     if (snprintf(path, sizeof(path), "%s/_config.db", canonical) >= (int)sizeof(path))
         return;
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        if (db)
-            sqlite3_close(db);
+    /* Without the wait and the hot-journal recovery, a concurrent commit or an
+     * interrupted write made every read fail and the caller silently kept its
+     * defaults. */
+    sqlite3 *db = settings_read_snapshot(path);
+    if (!db)
         return;
-    }
-    sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
     for (size_t i = 0; i < SETTINGS_COUNT; i++)
         if (settings[i].storage == SET_UI) {
             char value[SETTINGS_VALUE_CAP];

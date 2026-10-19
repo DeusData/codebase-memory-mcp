@@ -170,6 +170,12 @@ done
 # content, not all tokenizer arrays or all boolean password assignments.
 make_fixture "$TMP/lookalike.bin" 'const keywords=["wget","telnet"];'
 assert_audit 1 "$COMMAND_BLOCKED" 'unreviewed command keyword array is blocked' "$TMP/lookalike.bin"
+# pass_shell.c compares a script's program name with the bare string "wget" (its
+# curl / wget HTTP_CALLS). Only that whole line is exempt; a command is not.
+make_fixture "$TMP/token.bin" 'wget'
+assert_audit 0 "$AUDIT_PASSED" 'bare wget token (pass_shell.c program name) is allowed' "$TMP/token.bin"
+make_fixture "$TMP/token.bin" 'wget -O /tmp/payload'
+assert_audit 1 "$COMMAND_BLOCKED" 'a wget command line remains blocked' "$TMP/token.bin"
 make_fixture "$TMP/lookalike.bin" 'this.password=!1;'
 assert_audit 1 "$CREDENTIAL_BLOCKED" 'unreviewed boolean password assignment is blocked' "$TMP/lookalike.bin"
 

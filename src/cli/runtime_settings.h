@@ -25,6 +25,11 @@ bool cbm_runtime_settings_save_ui(bool enabled, int port);
 /* The HTTP handler supplies its actual bound port for truthful listener state. */
 void cbm_runtime_settings_note_http_port(int port);
 
+/* Every connection to _config.db waits for a committing writer instead of
+ * failing on its lock. Logs config_db.busy_wait once per busy wait. */
+struct sqlite3;
+void cbm_runtime_settings_wait_for_writers(struct sqlite3 *db);
+
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Single-threaded test teardown only; never exposed in production builds. */
 void cbm_runtime_settings_reset_for_tests(void);

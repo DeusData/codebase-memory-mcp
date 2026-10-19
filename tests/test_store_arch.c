@@ -298,6 +298,45 @@ TEST(arch_path_scoping) {
     PASS();
 }
 
+/* packages: count DESC, tied counts in name (BINARY) order. The aggregation
+ * runs off the label index now; a sorted GROUP BY follows the ORDER BY
+ * direction, which reversed the ties until the name tie-break was explicit. */
+TEST(arch_packages_tied_counts_in_name_order) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    static const char *const pkg_names[] = {"gamma", "alpha", "Zeta", "beta",
+                                            "Alpha", "gamma", "beta"};
+    enum { PKG_NODES = 7, PKG_GROUPS = 5 };
+    for (int i = 0; i < PKG_NODES; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "test.pkg%d.%s", i, pkg_names[i]);
+        cbm_node_t n = {.project = "test",
+                        .label = "Package",
+                        .name = pkg_names[i],
+                        .qualified_name = qn,
+                        .file_path = "pkg/manifest.toml"};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    }
+    static const char *const want_names[] = {"beta", "gamma", "Alpha", "Zeta", "alpha"};
+    static const int want_counts[] = {2, 2, 1, 1, 1};
+    const char *aspects[] = {"packages"};
+    const char *paths[] = {NULL, "pkg"}; /* unscoped and path-scoped SQL */
+    for (int p = 0; p < 2; p++) {
+        cbm_architecture_info_t info;
+        ASSERT_EQ(cbm_store_get_architecture(s, "test", paths[p], aspects, 1, &info),
+                  CBM_STORE_OK);
+        ASSERT_EQ(info.package_count, PKG_GROUPS);
+        for (int i = 0; i < PKG_GROUPS; i++) {
+            ASSERT_STR_EQ(info.packages[i].name, want_names[i]);
+            ASSERT_EQ(info.packages[i].node_count, want_counts[i]);
+        }
+        cbm_store_architecture_free(&info);
+    }
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_empty_project) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -1859,6 +1898,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
     RUN_TEST(arch_path_scoping);
+    RUN_TEST(arch_packages_tied_counts_in_name_order);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
     RUN_TEST(arch_routes);

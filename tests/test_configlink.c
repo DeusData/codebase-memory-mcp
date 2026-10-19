@@ -85,7 +85,8 @@ static void rm_rf(const char *path) {
 /* ── Strategy 1: Config Key → Code Symbol ───────────────────────── */
 
 /* Go: TestConfigKeySymbol_ExactMatch
- * config.toml has max_connections, main.go has getMaxConnections() */
+ * config.toml has max_connections, main.go has maxConnections(). (A TOML key
+ * links by exact name only, see configlink_key_symbol_toml_ini_exact_scoped.) */
 TEST(configlink_key_symbol_exact_match) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
 
@@ -94,9 +95,9 @@ TEST(configlink_key_symbol_exact_match) {
                                           "test.config.max_connections", "config.toml", 0, 0, NULL);
     ASSERT_GT(cfg_id, 0);
 
-    /* Code Function node: getMaxConnections from main.go */
-    int64_t func_id = cbm_gbuf_upsert_node(gb, "Function", "getMaxConnections",
-                                           "test.main.getMaxConnections", "main.go", 0, 0, NULL);
+    /* Code Function node: maxConnections from main.go */
+    int64_t func_id = cbm_gbuf_upsert_node(gb, "Function", "maxConnections",
+                                           "test.main.maxConnections", "main.go", 0, 0, NULL);
     ASSERT_GT(func_id, 0);
 
     /* Run configlink */
@@ -113,12 +114,14 @@ TEST(configlink_key_symbol_exact_match) {
 }
 
 /* Go: TestConfigKeySymbol_SubstringMatch
- * config.toml has request_timeout, main.go has getRequestTimeoutSeconds() */
+ * app.properties has request_timeout, main.go has getRequestTimeoutSeconds().
+ * (Formats outside the exact + component rule -- .properties, .env -- keep
+ * substring matching.) */
 TEST(configlink_key_symbol_substring_match) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
 
-    cbm_gbuf_upsert_node(gb, "Variable", "request_timeout", "test.config.request_timeout",
-                         "config.toml", 0, 0, NULL);
+    cbm_gbuf_upsert_node(gb, "Variable", "request_timeout", "test.app.request_timeout",
+                         "app.properties", 0, 0, NULL);
 
     cbm_gbuf_upsert_node(gb, "Function", "getRequestTimeoutSeconds",
                          "test.main.getRequestTimeoutSeconds", "main.go", 0, 0, NULL);
@@ -277,6 +280,48 @@ TEST(configlink_key_symbol_terraform_variable) {
     ASSERT_EQ(count, 1);
     ASSERT_EQ(edges[0]->source_id, var);
     ASSERT_EQ(edges[0]->target_id, cfg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* TOML and INI keys (.toml, .ini, .cfg, .conf) link like infrastructure keys:
+ * by exact name and only inside the config file's component. In 17 infra
+ * repositories all 72 TOML/INI key_symbol edges were substring or
+ * cross-component coincidences (`.gitleaks.toml useDefault` <-
+ * TestConfig_UseDefault, `grafana.ini admin_user` <- GenAdminUser). Each
+ * format's key below reaches only svc-a's exact `requestTimeout`: not svc-a's
+ * substring `getRequestTimeoutSeconds`, not svc-b's exact `requestTimeout`. */
+TEST(configlink_key_symbol_toml_ini_exact_scoped) {
+    static const char *const files[] = {"svc-a/config.toml", "svc-a/settings.ini",
+                                        "svc-a/setup.cfg", "svc-a/app.conf"};
+    enum { FILES = 4 };
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    int64_t cfg[FILES];
+    for (int i = 0; i < FILES; i++) {
+        char qn[CBM_SZ_128];
+        snprintf(qn, sizeof(qn), "test.cfg%d.request_timeout", i);
+        cfg[i] = cbm_gbuf_upsert_node(gb, "Variable", "request_timeout", qn, files[i], 0, 0, NULL);
+    }
+    int64_t inside = cbm_gbuf_upsert_node(gb, "Function", "requestTimeout",
+                                          "test.svc_a.main.requestTimeout", "svc-a/main.go", 0, 0,
+                                          NULL);
+    cbm_gbuf_upsert_node(gb, "Function", "getRequestTimeoutSeconds",
+                         "test.svc_a.client.getRequestTimeoutSeconds", "svc-a/client.go", 0, 0,
+                         NULL);
+    cbm_gbuf_upsert_node(gb, "Function", "requestTimeout", "test.svc_b.main.requestTimeout",
+                         "svc-b/main.go", 0, 0, NULL);
+    run_configlink(gb, "test", NULL);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count);
+    ASSERT_EQ(count, FILES);
+    for (int i = 0; i < FILES; i++) {
+        bool found = false;
+        for (int e = 0; e < count; e++) {
+            found = found || (edges[e]->source_id == inside && edges[e]->target_id == cfg[i]);
+        }
+        ASSERT_TRUE(found);
+    }
     cbm_gbuf_free(gb);
     PASS();
 }
@@ -469,9 +514,11 @@ enum { CL_DET_CANDIDATES = 9000 }; /* > the 8192 code-entry cap */
 static cbm_gbuf_t *build_oversized_corpus(bool reverse) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
 
-    /* One config key every candidate can match on: "max_connections". */
-    cbm_gbuf_upsert_node(gb, "Variable", "max_connections", "test.config.max_connections",
-                         "config.toml", 0, 0, NULL);
+    /* One config key every candidate can match on by substring:
+     * "max_connections", in a format that keeps substring matching (TOML and
+     * INI keys link by exact name only). */
+    cbm_gbuf_upsert_node(gb, "Variable", "max_connections", "test.app.max_connections",
+                         "app.properties", 0, 0, NULL);
 
     for (int k = 0; k < CL_DET_CANDIDATES; k++) {
         int i = reverse ? (CL_DET_CANDIDATES - 1 - k) : k;
@@ -529,6 +576,7 @@ SUITE(configlink) {
     RUN_TEST(configlink_key_symbol_config_dir_component);
     RUN_TEST(configlink_key_symbol_no_config_cap);
     RUN_TEST(configlink_key_symbol_terraform_variable);
+    RUN_TEST(configlink_key_symbol_toml_ini_exact_scoped);
 
     /* Strategy 2: Dependency → Import */
     RUN_TEST(configlink_dep_import_package_json);

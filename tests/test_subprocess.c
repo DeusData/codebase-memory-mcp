@@ -1784,18 +1784,23 @@ static void sp_stdout_payload(unsigned char bytes[SP_STDOUT_BYTES]) {
     bytes[SP_STDOUT_BYTES - 1] = 'Z'; /* final byte has no newline */
 }
 
-/* Called before normal harness setup. Normal entry remembers argv[0], whose
- * storage lasts through main; the private exact argv grammar never runs suites. */
+/* Normal entry (test_main.c) remembers the runner image, whose storage lasts
+ * through main. */
+void tf_subprocess_set_binary(const char *path);
+void tf_subprocess_set_binary(const char *path) {
+    sp_stdout_test_binary = path;
+}
+
+/* Runner roles (test_main.c's role table), before normal harness setup; the
+ * private exact argv grammar never runs suites. */
 static int sp_stdin_probe(int argc, char **argv);
-const char *tf_runner_image(int argc, char **argv); /* test_main.c */
-int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv);
-int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv) {
-    if (argc >= 2 && argv && strcmp(argv[1], "__cbm_subprocess_stdin_probe") == 0)
-        return sp_stdin_probe(argc, argv);
-    if (argc < 2 || !argv || strcmp(argv[1], "__cbm_subprocess_stdout_probe") != 0) {
-        sp_stdout_test_binary = tf_runner_image(argc, argv);
-        return -1;
-    }
+int tf_role_subprocess_stdin_probe(int argc, char **argv);
+int tf_role_subprocess_stdin_probe(int argc, char **argv) {
+    return sp_stdin_probe(argc, argv);
+}
+
+int tf_role_subprocess_stdout_probe(int argc, char **argv);
+int tf_role_subprocess_stdout_probe(int argc, char **argv) {
     if (argc != 4 || (strcmp(argv[2], "binary") != 0 && strcmp(argv[2], "text") != 0 &&
                       strcmp(argv[2], "empty") != 0))
         return 91;

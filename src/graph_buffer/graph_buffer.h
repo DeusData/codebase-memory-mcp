@@ -124,6 +124,13 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
  * is gone, as a full index never makes them. */
 int cbm_gbuf_delete_unreferenced(cbm_gbuf_t *gb, const char *label, const char *const *edge_types);
 
+/* Delete every `label` node that carries no file and that no edge of any
+ * type touches; returns how many. For a label made by edges of many kinds
+ * (Route: HTTP_CALLS, ASYNC_CALLS, HANDLES, ...): incremental indexing drops
+ * the file-less one whose last edge went with its files, as a full index
+ * never makes it. */
+int cbm_gbuf_delete_edgeless(cbm_gbuf_t *gb, const char *label);
+
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project);

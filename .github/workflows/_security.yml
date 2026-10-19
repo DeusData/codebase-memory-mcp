@@ -38,7 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install ScanCode Toolkit
-        run: pipx install scancode-toolkit
+        # Pinned: an unpinned install picked up pluggy 1.7.0, which breaks
+        # scancode at import (see .github/scancode-constraints.txt).
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/.github/scancode-constraints.txt
+        run: pipx install scancode-toolkit==32.5.0
       - name: "Gate self-test (a planted violation must be detected)"
         run: scripts/license-gate.sh --selftest
       - name: "License compliance gate (one finding fails)"

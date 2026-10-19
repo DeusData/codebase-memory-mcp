@@ -13,6 +13,7 @@
 #include "py_lsp.h"
 #include "../cbm.h"
 #include "../helpers.h"
+#include "../../../src/foundation/hash_table.h" /* module-scope suffix index (re-exports) */
 #include "lsp_node_iter.h"
 #include "tree_sitter/api.h"
 #include <ctype.h>
@@ -246,6 +247,20 @@ static void py_register_lambda(PyLSPContext *ctx, const char *name, TSNode lambd
 static void py_register_dict_literal(PyLSPContext *ctx, const char *name, TSNode dict_node);
 static TSNode py_lookup_lambda(PyLSPContext *ctx, const char *name);
 static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, const char *key);
+static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char *container_qn);
+static void py_process_class(PyLSPContext *ctx, TSNode class_node);
+static void py_process_class_in(PyLSPContext *ctx, TSNode class_node, const char *container_qn);
+typedef enum { PY_LOCAL_DEFS_BIND, PY_LOCAL_DEFS_PROCESS } PyLocalDefsMode;
+static void py_visit_local_defs(PyLSPContext *ctx, TSNode block, PyLocalDefsMode mode, int depth);
+
+/* A name looked up in a module namespace: the module's own function or
+ * class, or the definition the module re-exports under that name. At most
+ * one of func/type is set. */
+typedef struct {
+    const CBMRegisteredFunc *func;
+    const CBMRegisteredType *type;
+} PyModuleMember;
+static PyModuleMember py_module_member(PyLSPContext *ctx, const char *module_qn, const char *name);
 
 /* ── Scope mutation wrappers ─────────────────────────────────────────────
  *
@@ -734,6 +749,38 @@ static void py_classify_imports_for_root(PyLSPContext *ctx, TSNode root) {
     }
 }
 
+/* `from X import Y` names X.Y, which need not be a definition:
+ *  - X re-exports Y (`from .fields import *` in X/__init__.py): bind the
+ *    definition Y resolves to, and record that canonical QN for the import
+ *    so every later consumer of the import metadata agrees;
+ *  - Y is a submodule (`from django.db import models`): bind the MODULE, so
+ *    `models.CharField` is a module-namespace lookup, not a class attribute.
+ * A registered X.Y (the ordinary case) keeps its NAMED binding. */
+static const CBMType *py_canonical_named_import(PyLSPContext *ctx, int index, const char **qn_io,
+                                                const CBMType *named) {
+    const char *qn = *qn_io;
+    const CBMTypeRegistry *reg = ctx->registry;
+    if (!reg || cbm_registry_lookup_type(reg, qn) || cbm_registry_lookup_func(reg, qn))
+        return named;
+    const char *dot = strrchr(qn, '.');
+    if (dot && dot > qn) {
+        /* the export table is keyed by symbol scope: a package import value
+         * may still carry the package file identity (P.pkg.__init__.Y) */
+        char *module = cbm_arena_strndup(ctx->arena, qn, (size_t)(dot - qn));
+        if (module)
+            module[cbm_fqn_symbol_scope_len(module)] = '\0';
+        const char *target = module ? cbm_registry_lookup_export(reg, module, dot + 1) : NULL;
+        if (target) {
+            *qn_io = target;
+            ctx->import_module_qns[index] = target;
+            return cbm_type_named(ctx->arena, target);
+        }
+    }
+    if (cbm_registry_is_module(reg, qn))
+        return cbm_type_module(ctx->arena, qn);
+    return named;
+}
+
 static void py_bind_import_index(PyLSPContext *ctx, int index, bool synthetic_fallback) {
     if (!ctx || !ctx->current_scope || index < 0 || index >= ctx->import_count)
         return;
@@ -772,6 +819,8 @@ static void py_bind_import_index(PyLSPContext *ctx, int index, bool synthetic_fa
         // `import X` / `import X as Y` (single segment) — MODULE(X).
         t = cbm_type_module(ctx->arena, qn);
     }
+    if (t->kind == CBM_TYPE_NAMED)
+        t = py_canonical_named_import(ctx, index, &qn, t);
     const CBMRegisteredFunc *imported =
         from_style && ctx->registry ? cbm_registry_lookup_func(ctx->registry, qn) : NULL;
     if (py_func_is_exact_callable_value(imported)) {
@@ -1127,7 +1176,7 @@ static const char *py_exact_callable_target_ex(PyLSPContext *ctx, TSNode node,
         receiver = cbm_type_resolve_alias(receiver);
         if (receiver->kind == CBM_TYPE_MODULE) {
             const CBMRegisteredFunc *f =
-                cbm_registry_lookup_symbol(ctx->registry, receiver->data.module.module_qn, member);
+                py_module_member(ctx, receiver->data.module.module_qn, member).func;
             return py_func_is_exact_callable_value(f) ? f->qualified_name : NULL;
         }
         if (receiver->kind == CBM_TYPE_NAMED) {
@@ -1219,9 +1268,310 @@ static const CBMRegisteredFunc *py_lookup_attribute_depth(PyLSPContext *ctx, con
     return NULL;
 }
 
+static PyModuleMember py_module_member_exact(PyLSPContext *ctx, const char *module_qn,
+                                             const char *name) {
+    PyModuleMember m = {0};
+    m.func = cbm_registry_lookup_symbol(ctx->registry, module_qn, name);
+    if (m.func)
+        return m;
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", module_qn, name);
+    m.type = qn ? cbm_registry_lookup_type(ctx->registry, qn) : NULL;
+    if (m.type)
+        return m;
+    /* Re-export: `module.name` is bound by the module's imports (the export
+     * table the cross registry materialized once, before its seal), keyed by
+     * the module symbol scope (a package without its `.__init__`). */
+    size_t scope_len = cbm_fqn_symbol_scope_len(module_qn);
+    const char *scope =
+        module_qn[scope_len] ? cbm_arena_strndup(ctx->arena, module_qn, scope_len) : module_qn;
+    const char *target = scope ? cbm_registry_lookup_export(ctx->registry, scope, name) : NULL;
+    if (target) {
+        m.func = cbm_registry_lookup_func(ctx->registry, target);
+        if (!m.func)
+            m.type = cbm_registry_lookup_type(ctx->registry, target);
+    }
+    return m;
+}
+
+/* `prefix.module_qn`, or NULL when module_qn already starts with prefix. */
+static const char *py_qualify_module(PyLSPContext *ctx, const char *prefix, size_t prefix_len,
+                                     const char *module_qn) {
+    if (prefix_len == 0 ||
+        (strncmp(module_qn, prefix, prefix_len) == 0 && module_qn[prefix_len] == '.'))
+        return NULL;
+    return cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)prefix_len, prefix, module_qn);
+}
+
+/* An in-project `import sibling` / `import pkg` binds the module by its
+ * source spelling ("pkg"), while its defs are registered project-qualified.
+ * Try the spelling as written, then qualified by the importing file's
+ * package, then by the project root (the file module's first segment). */
+static PyModuleMember py_module_member(PyLSPContext *ctx, const char *module_qn, const char *name) {
+    PyModuleMember none = {0};
+    if (!ctx || !ctx->registry || !module_qn || !name)
+        return none;
+    PyModuleMember m = py_module_member_exact(ctx, module_qn, name);
+    if (m.func || m.type || !ctx->file_module_qn)
+        return m;
+    const char *file_mod = ctx->file_module_qn;
+    const char *last_dot = strrchr(file_mod, '.');
+    const char *first_dot = strchr(file_mod, '.');
+    if (last_dot && last_dot > file_mod) {
+        const char *qual =
+            py_qualify_module(ctx, file_mod, (size_t)(last_dot - file_mod), module_qn);
+        m = qual ? py_module_member_exact(ctx, qual, name) : none;
+        if (m.func || m.type)
+            return m;
+    }
+    if (first_dot && first_dot != last_dot) {
+        const char *qual =
+            py_qualify_module(ctx, file_mod, (size_t)(first_dot - file_mod), module_qn);
+        m = qual ? py_module_member_exact(ctx, qual, name) : none;
+    }
+    return m;
+}
+
+/* Emit a call resolved through a module namespace. A re-export may bind the
+ * definition under another name (`from .x import Orig as Renamed`): that is
+ * an import alias, whose join reads the written name from `reason`. */
+static void py_emit_module_member_call(PyLSPContext *ctx, const char *callee_qn,
+                                       const char *strategy, float confidence,
+                                       const char *written_name, TSNode site) {
+    const char *dot = strrchr(callee_qn, '.');
+    const char *short_name = dot ? dot + 1 : callee_qn;
+    if (strcmp(short_name, written_name) != 0) {
+        py_emit_resolved_call_reason(ctx, callee_qn, "lsp_import_alias", confidence, written_name,
+                                     site);
+    } else {
+        py_emit_resolved_call(ctx, callee_qn, strategy, confidence, site);
+    }
+}
+
+/* ── The C3 method resolution order ──────────────────────────────── */
+
+/* Longest linearization followed. A longer one (or more bases than this) keeps
+ * the depth-first walk above. */
+#define PY_C3_MAX 64
+
+enum { PY_MRO_CACHE_INITIAL_CAP = 64 };  /* power of two (index masking) */
+enum { PY_MRO_CACHE_MAX_CAP = 1 << 20 }; /* hard stop for adversarial files */
+
+static uint32_t py_mro_hash(const char *qn) {
+    uint32_t h = 2166136261u; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)qn; *p; p++) {
+        h = (h ^ *p) * 16777619u;
+    }
+    return h;
+}
+
+static const CBMPyMroCacheEntry *py_mro_cache_find(const PyLSPContext *ctx, const char *qn,
+                                                   uint32_t h) {
+    if (!ctx->mro_cache || ctx->mro_cache_cap == 0)
+        return NULL;
+    uint32_t mask = (uint32_t)ctx->mro_cache_cap - 1;
+    uint32_t idx = h & mask;
+    for (int probed = 0; probed < ctx->mro_cache_cap; probed++) {
+        const CBMPyMroCacheEntry *e = &ctx->mro_cache[idx];
+        if (!e->qn)
+            return NULL;
+        if (e->hash == h && strcmp(e->qn, qn) == 0)
+            return e;
+        idx = (idx + 1) & mask;
+    }
+    return NULL;
+}
+
+/* Doubles the table (arena allocation: the old table is freed with the
+ * per-file arena). */
+static bool py_mro_cache_grow(PyLSPContext *ctx) {
+    if (ctx->mro_cache_cap >= PY_MRO_CACHE_MAX_CAP)
+        return false;
+    int new_cap = ctx->mro_cache_cap ? ctx->mro_cache_cap * 2 : PY_MRO_CACHE_INITIAL_CAP;
+    CBMPyMroCacheEntry *entries = (CBMPyMroCacheEntry *)cbm_arena_alloc(
+        ctx->arena, (size_t)new_cap * sizeof(CBMPyMroCacheEntry));
+    if (!entries)
+        return false;
+    memset(entries, 0, (size_t)new_cap * sizeof(CBMPyMroCacheEntry));
+    uint32_t mask = (uint32_t)new_cap - 1;
+    for (int i = 0; i < ctx->mro_cache_cap; i++) {
+        const CBMPyMroCacheEntry *e = &ctx->mro_cache[i];
+        if (!e->qn)
+            continue;
+        uint32_t idx = e->hash & mask;
+        while (entries[idx].qn)
+            idx = (idx + 1) & mask;
+        entries[idx] = *e;
+    }
+    ctx->mro_cache = entries;
+    ctx->mro_cache_cap = new_cap;
+    return true;
+}
+
+/* Records the order of `qn` (len -1: none). A table that cannot grow only
+ * costs a recomputation later. */
+static void py_mro_cache_put(PyLSPContext *ctx, const char *qn, uint32_t h, const char **mro,
+                             int len) {
+    if ((ctx->mro_cache_count + 1) * 4 > ctx->mro_cache_cap * 3 && !py_mro_cache_grow(ctx))
+        return;
+    const char *key = cbm_arena_strdup(ctx->arena, qn);
+    if (!key)
+        return;
+    uint32_t mask = (uint32_t)ctx->mro_cache_cap - 1;
+    uint32_t idx = h & mask;
+    while (ctx->mro_cache[idx].qn)
+        idx = (idx + 1) & mask;
+    ctx->mro_cache[idx].qn = key;
+    ctx->mro_cache[idx].hash = h;
+    ctx->mro_cache[idx].len = len;
+    ctx->mro_cache[idx].mro = mro;
+    ctx->mro_cache_count++;
+}
+
+static bool py_c3_in_tail(const char *qn, const char *const *seq, int head, int len) {
+    for (int k = head + 1; k < len; k++) {
+        if (strcmp(seq[k], qn) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* The C3 head to take next: the first sequence head that is in no sequence's
+ * tail. NULL when every head is blocked (Python rejects such a class). */
+static const char *py_c3_pick(const char **const *seqs, const int *lens, const int *heads,
+                              int nseq) {
+    for (int s = 0; s < nseq; s++) {
+        if (heads[s] >= lens[s])
+            continue;
+        const char *cand = seqs[s][heads[s]];
+        bool blocked = false;
+        for (int t = 0; t < nseq && !blocked; t++) {
+            blocked = heads[t] < lens[t] && py_c3_in_tail(cand, seqs[t], heads[t], lens[t]);
+        }
+        if (!blocked)
+            return cand;
+    }
+    return NULL;
+}
+
+/* The C3 merge of `nseq` sequences into mro[1..]: returns the order's length,
+ * or -1 when there is none or it is longer than PY_C3_MAX. */
+static int py_c3_merge(const char **const *seqs, const int *lens, int *heads, int nseq,
+                       const char **mro) {
+    int n = 1;
+    for (;;) {
+        bool pending = false;
+        for (int s = 0; s < nseq && !pending; s++) {
+            pending = heads[s] < lens[s];
+        }
+        if (!pending)
+            return n;
+        const char *pick = py_c3_pick(seqs, lens, heads, nseq);
+        if (!pick || n >= PY_C3_MAX)
+            return -1;
+        mro[n++] = pick;
+        for (int s = 0; s < nseq; s++) {
+            if (heads[s] < lens[s] && strcmp(seqs[s][heads[s]], pick) == 0)
+                heads[s]++;
+        }
+    }
+}
+
+/* Python's method resolution order of `type_qn`: the class, then the C3 merge
+ * of its bases' linearizations and of the base list. A common base therefore
+ * follows every class deriving from it. Computed once per class and file
+ * (ctx->mro_cache). Sets *out to an arena array and returns its length, or -1
+ * when there is no C3 order, the hierarchy is deeper than
+ * CBM_LSP_MAX_LOOKUP_DEPTH, or the order is longer than PY_C3_MAX. A base the
+ * registry does not know (external, unresolved) linearizes to itself. Only an
+ * order computed from the top (depth 0) is cached as missing: below it, the
+ * depth cap may have cut a hierarchy that is fine on its own. */
+static int py_c3_linearize(PyLSPContext *ctx, const char *type_qn, const char ***out, int depth) {
+    uint32_t h = py_mro_hash(type_qn);
+    const CBMPyMroCacheEntry *hit = py_mro_cache_find(ctx, type_qn, h);
+    if (hit) {
+        *out = hit->mro;
+        return hit->len;
+    }
+    int n = -1;
+    const char **mro = NULL;
+    const CBMRegisteredType *rt =
+        depth <= CBM_LSP_MAX_LOOKUP_DEPTH ? cbm_registry_lookup_type(ctx->registry, type_qn) : NULL;
+    const char **bases = rt ? rt->embedded_types : NULL;
+    int nb = 0;
+    while (bases && bases[nb])
+        nb++;
+    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH || nb >= PY_C3_MAX) {
+        n = -1;
+    } else if (rt && rt->alias_of) {
+        n = py_c3_linearize(ctx, rt->alias_of, &mro, depth + 1);
+    } else {
+        const char ***seqs =
+            (const char ***)cbm_arena_alloc(ctx->arena, (size_t)(nb + 1) * sizeof(const char **));
+        int *lens = (int *)cbm_arena_alloc(ctx->arena, (size_t)(nb + 1) * 2 * sizeof(int));
+        mro = (const char **)cbm_arena_alloc(ctx->arena, PY_C3_MAX * sizeof(const char *));
+        bool ok = seqs && lens && mro;
+        int *heads = lens ? lens + nb + 1 : NULL;
+        for (int b = 0; ok && b < nb; b++) {
+            lens[b] = py_c3_linearize(ctx, bases[b], &seqs[b], depth + 1);
+            heads[b] = 0;
+            ok = lens[b] >= 0;
+        }
+        if (ok) {
+            seqs[nb] = bases;
+            lens[nb] = nb;
+            heads[nb] = 0;
+            mro[0] = cbm_arena_strdup(ctx->arena, type_qn);
+            n = mro[0] ? py_c3_merge((const char **const *)seqs, lens, heads, nb + 1, mro) : -1;
+        }
+    }
+    if (n >= 0 || depth == 0)
+        py_mro_cache_put(ctx, type_qn, h, n >= 0 ? mro : NULL, n);
+    *out = n >= 0 ? mro : NULL;
+    return n;
+}
+
+/* Attribute lookup along the class's C3 order: the class itself, then each
+ * class of its order that declares the member. A hierarchy without a C3 order
+ * keeps the depth-first walk. */
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name) {
-    return py_lookup_attribute_depth(ctx, type_qn, member_name, 0);
+    if (!ctx || !type_qn || !member_name)
+        return NULL;
+    const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, type_qn, member_name);
+    if (f)
+        return f;
+    const char **mro = NULL;
+    int n = py_c3_linearize(ctx, type_qn, &mro, 0);
+    if (n < 0)
+        return py_lookup_attribute_depth(ctx, type_qn, member_name, 0);
+    /* mro[0] is the class itself, already asked, or an alias's target. */
+    for (int i = strcmp(mro[0], type_qn) == 0 ? 1 : 0; i < n; i++) {
+        f = cbm_registry_lookup_method(ctx->registry, mro[i], member_name);
+        if (f)
+            return f;
+    }
+    return NULL;
+}
+
+/* The method super() reaches from inside `class_qn`: the first class AFTER it in
+ * its C3 order that declares `member` itself. *have_mro is false when the
+ * hierarchy has no C3 order; the caller then keeps its base-by-base walk. */
+static const CBMRegisteredFunc *py_lookup_super_attribute(PyLSPContext *ctx, const char *class_qn,
+                                                          const char *member, bool *have_mro) {
+    *have_mro = false;
+    if (!ctx || !class_qn || !member)
+        return NULL;
+    const char **mro = NULL;
+    int n = py_c3_linearize(ctx, class_qn, &mro, 0);
+    if (n < 0)
+        return NULL;
+    *have_mro = true;
+    for (int i = 1; i < n; i++) {
+        const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, mro[i], member);
+        if (f)
+            return f;
+    }
+    return NULL;
 }
 
 /* Per-file field overlay: look up a (class_qn, field_name) recorded during resolve
@@ -1712,16 +2062,17 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
             return cbm_type_unknown();
 
         if (obj_type->kind == CBM_TYPE_MODULE) {
-            // module.attr — return type of the registered symbol if known.
+            // module.attr — its own function or class, or what it re-exports
+            // under the name.
             const char *mod = obj_type->data.module.module_qn;
-            const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, mod, attr_name);
-            if (f)
-                return py_func_return_type(ctx, f->qualified_name);
-            // Could also be a class — return NAMED("mod.attr")
+            PyModuleMember mm = py_module_member(ctx, mod, attr_name);
+            if (mm.func)
+                return py_func_return_type(ctx, mm.func->qualified_name);
+            if (mm.type)
+                return cbm_type_named(ctx->arena, mm.type->qualified_name);
             const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mod, attr_name);
-            const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
-            if (rt)
-                return cbm_type_named(ctx->arena, qn);
+            if (qn && cbm_registry_is_module(ctx->registry, qn))
+                return cbm_type_module(ctx->arena, qn);
             if (py_names_submodule(ctx, qn))
                 return cbm_type_module(ctx->arena, qn);
             return cbm_type_unknown();
@@ -2002,10 +2353,11 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
 
             if (obj_type->kind == CBM_TYPE_MODULE) {
                 const char *mod = obj_type->data.module.module_qn;
-                const CBMRegisteredFunc *f =
-                    cbm_registry_lookup_symbol(ctx->registry, mod, attr_name);
-                if (f)
-                    return py_func_return_type(ctx, f->qualified_name);
+                PyModuleMember mm = py_module_member(ctx, mod, attr_name);
+                if (mm.func)
+                    return py_func_return_type(ctx, mm.func->qualified_name);
+                if (mm.type) // `mod.Class()` constructs an instance
+                    return cbm_type_named(ctx->arena, mm.type->qualified_name);
             }
             if (obj_type->kind == CBM_TYPE_NAMED) {
                 const CBMRegisteredFunc *f =
@@ -2959,6 +3311,22 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     const CBMRegisteredType *enclosing =
                         cbm_registry_lookup_type(ctx->registry, ctx->enclosing_class_qn);
                     if (enclosing && enclosing->embedded_types) {
+                        // The proxy walks the enclosing class's C3 order, in which a
+                        // diamond's shared base follows every class deriving from it:
+                        // RadarrCalendarEntity(RadarrEntity, CalendarEntity) reaches
+                        // CalendarEntity before Entity, which the first base reaches
+                        // through its own ancestry. The base-by-base walk below stays for
+                        // a hierarchy without a C3 order and for an undeclared __init__.
+                        bool have_mro = false;
+                        const CBMRegisteredFunc *sf = py_lookup_super_attribute(
+                            ctx, ctx->enclosing_class_qn, attr_name, &have_mro);
+                        if (sf) {
+                            bool is_init = strcmp(attr_name, "__init__") == 0;
+                            py_emit_resolved_call(ctx, sf->qualified_name,
+                                                  is_init ? "lsp_super_init" : "lsp_super",
+                                                  is_init ? 0.90f : 0.88f, call_node);
+                            return;
+                        }
                         for (int i = 0; enclosing->embedded_types[i]; i++) {
                             // super().__init__() is a constructor delegation:
                             // lsp_super_init is the MORE SPECIFIC, more accurate
@@ -3003,46 +3371,21 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
 
         if (obj_type->kind == CBM_TYPE_MODULE) {
             const char *mod = obj_type->data.module.module_qn;
-            const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, mod, attr_name);
-            if (f) {
-                py_emit_resolved_call(ctx, f->qualified_name, "lsp_module_attr", 0.92f, call_node);
+            // py_module_member also retries an in-project module written in its
+            // short source form ("helpers") project-qualified; a genuinely
+            // external module (requests, os) has no project def, so it stays
+            // lsp_module_attr_unresolved below. It also answers a name the
+            // module re-exports (`models.CharField`).
+            PyModuleMember mm = py_module_member(ctx, mod, attr_name);
+            if (mm.func) {
+                py_emit_module_member_call(ctx, mm.func->qualified_name, "lsp_module_attr", 0.92f,
+                                           attr_name, call_node);
                 return;
             }
-            // An `import sibling` of an IN-PROJECT module records the module's QN
-            // in its short, source-written form ("helpers"), but the sibling's
-            // defs are registered project-qualified ("<root>.helpers.do_work").
-            // So the lookup above misses for in-project modules even though the
-            // target IS resolvable, and the call used to drop to
-            // lsp_module_attr_unresolved @0.55 (below the join's 0.6 floor) — no
-            // edge. Retry against the project-qualified module: derive the
-            // project root from the current file's module_qn (strip its last
-            // segment) and look up "<root>.<mod>". A genuinely-external module
-            // (requests, os) has no such project def, so it correctly stays
-            // lsp_module_attr_unresolved.
-            if (mod && ctx->file_module_qn) {
-                const char *last_dot = strrchr(ctx->file_module_qn, '.');
-                if (last_dot && last_dot > ctx->file_module_qn) {
-                    size_t root_len = (size_t)(last_dot - ctx->file_module_qn);
-                    // Skip if mod is already rooted under the project to avoid
-                    // "<root>.<root>.mod".
-                    if (!(strncmp(mod, ctx->file_module_qn, root_len) == 0 &&
-                          mod[root_len] == '.')) {
-                        char *qual_mod =
-                            (char *)cbm_arena_alloc(ctx->arena, root_len + 1 + strlen(mod) + 1);
-                        if (qual_mod) {
-                            memcpy(qual_mod, ctx->file_module_qn, root_len);
-                            qual_mod[root_len] = '.';
-                            strcpy(qual_mod + root_len + 1, mod);
-                            const CBMRegisteredFunc *qf =
-                                cbm_registry_lookup_symbol(ctx->registry, qual_mod, attr_name);
-                            if (qf) {
-                                py_emit_resolved_call(ctx, qf->qualified_name, "lsp_module_attr",
-                                                      0.92f, call_node);
-                                return;
-                            }
-                        }
-                    }
-                }
+            if (mm.type) {
+                py_emit_module_member_call(ctx, mm.type->qualified_name, "lsp_constructor", 0.88f,
+                                           attr_name, call_node);
+                return;
             }
             // Best-effort: emit "module.attr" QN — Phase 9 cross-file may fix up.
             const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mod, attr_name);
@@ -4273,6 +4616,11 @@ static const CBMType *py_resolve_annotation(PyLSPContext *ctx, const char *ann) 
     const CBMType *t = cbm_scope_lookup(ctx->current_scope, ann);
     if (!cbm_type_is_unknown(t))
         return t;
+    if (ctx->annotation_scope) {
+        t = cbm_scope_lookup(ctx->annotation_scope, ann);
+        if (!cbm_type_is_unknown(t))
+            return t;
+    }
     if (ctx->module_qn) {
         const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, ann);
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, qn);
@@ -4362,6 +4710,101 @@ static void py_bind_parameters(PyLSPContext *ctx, TSNode params) {
     }
 }
 
+/* Bind a def or class statement of the current function body as a local of
+ * that function (#1548): its graph QN extends the function's
+ * (enclosing_func_qn.name), the QN extraction gives it. An undecorated def
+ * registered with that QN becomes an exact callable alias; anything else
+ * (decorated, overloaded, not registered) is a hard local shadow, so no call
+ * falls through to a same-named module symbol. A class is bound by its type
+ * when registered, else shadowed. A parameter of the same name is already a
+ * local and keeps its own binding. */
+static void py_bind_local_def(PyLSPContext *ctx, TSNode def, bool is_class) {
+    TSNode name_node = ts_node_child_by_field_name(def, "name", 4);
+    char *name = ts_node_is_null(name_node) ? NULL : py_node_text(ctx, name_node);
+    if (!name || !name[0] || !ctx->enclosing_func_qn) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    if (cbm_scope_lookup_local(ctx->current_scope, name))
+        return;
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_func_qn, name);
+    if (!qn) {
+        py_disable_callable_value_proof(ctx);
+        py_scope_bind(ctx, name, cbm_type_unknown());
+        return;
+    }
+    if (is_class) {
+        py_scope_bind(ctx, name,
+                      cbm_registry_lookup_type(ctx->registry, qn) ? cbm_type_named(ctx->arena, qn)
+                                                                  : cbm_type_unknown());
+        return;
+    }
+    const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
+    if (py_func_is_exact_callable_value(func)) {
+        py_scope_bind_callable(ctx, name, cbm_type_unknown(), func->qualified_name);
+    } else {
+        py_scope_bind(ctx, name, cbm_type_unknown());
+    }
+}
+
+/* Statements a function body nests further statements in. A def inside any of
+ * them is still a local of the function; a nested def, class or lambda body
+ * is a scope of its own and is never entered. */
+static bool py_is_statement_block(const char *kind) {
+    static const char *const kinds[] = {"block",
+                                        "if_statement",
+                                        "elif_clause",
+                                        "else_clause",
+                                        "for_statement",
+                                        "while_statement",
+                                        "try_statement",
+                                        "except_clause",
+                                        "except_group_clause",
+                                        "finally_clause",
+                                        "with_statement",
+                                        "match_statement",
+                                        "case_clause",
+                                        NULL};
+    for (int i = 0; kinds[i]; i++) {
+        if (strcmp(kind, kinds[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Visit the def/class statements of a function body, including those inside
+ * its compound statements: BIND binds each as a local (py_bind_local_def),
+ * PROCESS walks each nested def's own body (py_process_function). */
+static void py_visit_local_defs(PyLSPContext *ctx, TSNode block, PyLocalDefsMode mode, int depth) {
+    if (!ctx || ctx->eval_failure || ts_node_is_null(block) || depth >= cbm_lsp_max_walk_depth())
+        return;
+    PyKids kids = py_kids(ctx->arena, block);
+    for (uint32_t i = 0; i < kids.n && !ctx->eval_failure; i++) {
+        TSNode c = py_kid(&kids, i);
+        const char *ck = ts_node_type(c);
+        TSNode def = c;
+        if (strcmp(ck, "decorated_definition") == 0) {
+            def = ts_node_child_by_field_name(c, "definition", 10);
+            if (ts_node_is_null(def))
+                continue;
+            ck = ts_node_type(def);
+        }
+        if (strcmp(ck, "function_definition") == 0) {
+            if (mode == PY_LOCAL_DEFS_BIND)
+                py_bind_local_def(ctx, def, false);
+            else
+                py_process_function(ctx, def, ctx->enclosing_func_qn);
+        } else if (strcmp(ck, "class_definition") == 0) {
+            if (mode == PY_LOCAL_DEFS_BIND)
+                py_bind_local_def(ctx, def, true);
+            else
+                py_process_class_in(ctx, def, ctx->enclosing_func_qn);
+        } else if (py_is_statement_block(ck)) {
+            py_visit_local_defs(ctx, c, mode, depth + 1);
+        }
+    }
+}
+
 static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char *container_qn) {
     if (!ctx || ctx->eval_failure)
         return;
@@ -4391,22 +4834,13 @@ static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char 
 
     TSNode body = ts_node_child_by_field_name(func_node, "body", 4);
     if (!ts_node_is_null(body)) {
+        /* Python resolves a bare name in the function's own scope first: every
+         * def/class statement of the body binds a local for the whole body
+         * (LEGB), whatever a module-level symbol of the same spelling says. */
+        py_visit_local_defs(ctx, body, PY_LOCAL_DEFS_BIND, 0);
         py_resolve_calls_in(ctx, body);
-        // Also descend into nested function/class definitions in the body.
-        PyKids bk = py_kids(ctx->arena, body);
-        for (uint32_t i = 0; i < bk.n; i++) {
-            TSNode c = py_kid(&bk, i);
-            const char *ck = ts_node_type(c);
-            if (strcmp(ck, "function_definition") == 0) {
-                py_process_function(ctx, c, ctx->enclosing_func_qn);
-            } else if (strcmp(ck, "decorated_definition") == 0) {
-                TSNode def = ts_node_child_by_field_name(c, "definition", 10);
-                if (!ts_node_is_null(def) &&
-                    strcmp(ts_node_type(def), "function_definition") == 0) {
-                    py_process_function(ctx, def, ctx->enclosing_func_qn);
-                }
-            }
-        }
+        // Also descend into nested function definitions in the body.
+        py_visit_local_defs(ctx, body, PY_LOCAL_DEFS_PROCESS, 0);
     }
 
     py_scope_restore(ctx, saved);
@@ -4536,7 +4970,10 @@ static void py_exec_class_definition(PyLSPContext *ctx, TSNode class_node) {
     py_scope_restore(ctx, saved_scope);
 }
 
-static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
+/* Walk a class's methods with the class qualified under `container_qn`: the
+ * module for a module-level class, the enclosing def for a class declared in
+ * a function body (#1548: extraction gives it the def's QN as prefix). */
+static void py_process_class_in(PyLSPContext *ctx, TSNode class_node, const char *container_qn) {
     if (!ctx || ctx->eval_failure)
         return;
     TSNode name_node = ts_node_child_by_field_name(class_node, "name", 4);
@@ -4547,7 +4984,8 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
         return;
 
     const char *prev_class = ctx->enclosing_class_qn;
-    ctx->enclosing_class_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+    ctx->enclosing_class_qn =
+        cbm_arena_sprintf(ctx->arena, "%s.%s", container_qn ? container_qn : ctx->module_qn, cname);
 
     TSNode body = ts_node_child_by_field_name(class_node, "body", 4);
     if (!ts_node_is_null(body)) {
@@ -4611,14 +5049,24 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
                     strcmp(ts_node_type(def), "function_definition") == 0 &&
                     !py_is_init_method(ctx, def)) {
                     py_process_function(ctx, def, ctx->enclosing_class_qn);
+                } else if (!ts_node_is_null(def) &&
+                           strcmp(ts_node_type(def), "class_definition") == 0) {
+                    py_process_class_in(ctx, def, ctx->enclosing_class_qn);
                 }
             } else if (strcmp(ck, "class_definition") == 0) {
-                py_process_class(ctx, c);
+                /* A class nested in a class is qualified by its outer class
+                 * (proj.m.Outer.Inner), the QN extraction gives it; under the
+                 * module its methods' calls never joined their callers. */
+                py_process_class_in(ctx, c, ctx->enclosing_class_qn);
             }
         }
     }
 
     ctx->enclosing_class_qn = prev_class;
+}
+
+static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
+    py_process_class_in(ctx, class_node, NULL);
 }
 
 /* Module bindings are replayed in source order before deferred function bodies
@@ -4687,6 +5135,28 @@ static char *py_module_prefix(CBMArena *scratch, const char *module_qn, size_t l
     return prefix;
 }
 
+/* A class declared inside a def -- django's per-test `class MyModelAdmin`, an
+ * app factory's local class, and anything nested in one -- is a local of that
+ * def, not a global of the module: bound here by its short name, every
+ * same-named local class of the file collapsed onto whichever registered last.
+ * Its QN extends a registered function's (proj.mod.Tests.test_x.MyModelAdmin),
+ * which tells it apart from a class nested in a class (proj.mod.Outer.Inner).
+ * Only prefixes longer than the module are probed. */
+static bool py_type_is_function_local(const PyLSPContext *ctx, const char *qn, size_t module_len) {
+    char scope[512];
+    size_t len = strlen(qn);
+    if (len >= sizeof(scope))
+        return false;
+    memcpy(scope, qn, len + 1);
+    for (char *dot = strrchr(scope, '.'); dot && (size_t)(dot - scope) > module_len;
+         dot = strrchr(scope, '.')) {
+        *dot = '\0';
+        if (cbm_registry_lookup_func(ctx->registry, scope))
+            return true;
+    }
+    return false;
+}
+
 /* A project registry can contain another file's class in the same logical
  * Python module. Keep those cross-file globals available, but do not prebind
  * classes declared by this source: their binding epoch belongs in the ordered
@@ -4734,6 +5204,8 @@ static void py_bind_external_module_classes(PyLSPContext *ctx, const PyKids *rk)
                 continue;
             if (package_scope && strchr(qn + prefix_len + 1, '.'))
                 continue; /* submodule/nested classes are not package globals */
+            if (py_type_is_function_local(ctx, qn, prefix_len))
+                continue; /* a def-local class is no module global (#1548) */
             py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
         }
         if (prefix)
@@ -5237,6 +5709,27 @@ static void py_replay_import_statement(PyLSPContext *ctx, TSNode stmt, unsigned 
     }
 }
 
+/* The consequence block of a module-level `if TYPE_CHECKING:` /
+ * `if <module>.TYPE_CHECKING:` statement, else a null node. Mirrors the
+ * extraction's py_is_type_checking_condition (extract_imports.c). */
+static TSNode py_type_checking_body(PyLSPContext *ctx, TSNode stmt) {
+    TSNode none = {0};
+    if (strcmp(ts_node_type(stmt), "if_statement") != 0)
+        return none;
+    TSNode cond = ts_node_child_by_field_name(stmt, "condition", 9);
+    if (ts_node_is_null(cond))
+        return none;
+    TSNode name = cond;
+    if (strcmp(ts_node_type(cond), "attribute") == 0)
+        name = ts_node_child_by_field_name(cond, "attribute", 9);
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0)
+        return none;
+    char *text = py_node_text(ctx, name);
+    if (!text || strcmp(text, "TYPE_CHECKING") != 0)
+        return none;
+    return ts_node_child_by_field_name(stmt, "consequence", 11);
+}
+
 static bool py_expression_is_annotation_only_assignment(TSNode statement) {
     if (ts_node_named_child_count(statement) != 1)
         return false;
@@ -5321,6 +5814,29 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
              * Invalidate only syntactic binding targets at the control-flow
              * join; a later unconditional statement may restore exact proof. */
             py_invalidate_possible_bindings(ctx, c, 0);
+            /* `if TYPE_CHECKING:` holds the imports annotations are written
+             * against (#1277). Bind them into the annotation-only frame: an
+             * annotation resolves through them, a runtime call never does (the
+             * interpreter never runs the block). Extraction recorded them
+             * flagged type_checking_only, so they reach this walk through the
+             * LSP import map only, never a CALLS import map. */
+            TSNode tc_body = py_type_checking_body(ctx, c);
+            if (!ts_node_is_null(tc_body)) {
+                if (!ctx->annotation_scope)
+                    ctx->annotation_scope = cbm_scope_push(ctx->arena, NULL);
+                CBMScope *runtime_scope = ctx->current_scope;
+                PyKids tk = py_kids(ctx->arena, tc_body);
+                for (uint32_t t = 0; ctx->annotation_scope && t < tk.n && !ctx->eval_failure; t++) {
+                    TSNode stmt = py_kid(&tk, t);
+                    const char *sk = ts_node_type(stmt);
+                    if (strcmp(sk, "import_statement") == 0 ||
+                        strcmp(sk, "import_from_statement") == 0) {
+                        ctx->current_scope = ctx->annotation_scope;
+                        py_replay_import_statement(ctx, stmt, consumed_imports);
+                        ctx->current_scope = runtime_scope;
+                    }
+                }
+            }
         }
     }
     // Pass 2: top-level calls (rare) and nested definitions.
@@ -5755,6 +6271,453 @@ bool cbm_py_lsp_test_register_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSP
 }
 #endif
 
+/* ── Module namespaces: package re-exports ────────────────────────────────
+ *
+ * cbm_pxc_collect_all_defs carries each Python module's namespace records
+ * (PyReexport / PyStarImport / PyAll, built from its ordered namespace facts)
+ * next to its definitions. py_build_module_namespaces folds them into the
+ * registry's export table ONCE, after the func/type indexes are finalized
+ * (every probe below is a hashed lookup or a binary search) and before the
+ * seal. Per module it computes the namespace its imports bind: a re-export
+ * resolves its target through further re-exports (chains); a star copies the
+ * source module's namespace, restricted to its literal `__all__` when it has
+ * one and otherwise to names without a leading `_`; the module's own
+ * definitions are never replaced. Modules are visited in sorted order and
+ * records in source order; a module reached again while its own namespace is
+ * being computed (an import cycle) contributes what it has so far, so every
+ * cycle ends with the same answer on every run. PY_NS_MAX_DEPTH bounds only
+ * the native recursion (no project re-exports through 64 modules in a row). */
+enum { PY_NS_MAX_DEPTH = 64, PY_NS_MAP_MIN_CAP = 8 };
+
+typedef struct {
+    const char *name;   /* short name (borrowed); NULL = empty slot */
+    const char *target; /* definition QN, registry-owned */
+    bool own;           /* the module's own definition: imports never replace it */
+} PyNsSlot;
+
+typedef struct {
+    PyNsSlot *slots;
+    int cap; /* power of two */
+    int count;
+} PyNsMap;
+
+typedef struct {
+    const char *scope;
+    int *records; /* def indices of PyReexport / PyStarImport, source order */
+    int record_count;
+    const char **all_names; /* NULL-terminated when has_all */
+    bool has_all;
+    bool star_source;
+    int state; /* 0 = pending, 1 = computing, 2 = done */
+    PyNsMap ns;
+} PyNsModule;
+
+typedef struct {
+    CBMArena *scratch;
+    const CBMTypeRegistry *reg;
+    const CBMLSPDef *defs;
+    PyNsModule *mods;
+    const char **scopes; /* sorted, parallel to mods */
+    int mod_count;
+    CBMHashTable *by_suffix; /* dot-boundary scope tail -> module index + 1, or PY_NS_AMBIGUOUS */
+} PyNsBuild;
+
+#define PY_NS_AMBIGUOUS ((void *)(uintptr_t)UINTPTR_MAX)
+
+static bool py_ns_is_record(const CBMLSPDef *d) {
+    return strcmp(d->label, "PyReexport") == 0 || strcmp(d->label, "PyStarImport") == 0 ||
+           strcmp(d->label, "PyAll") == 0;
+}
+
+static uint32_t py_ns_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+
+static PyNsSlot *py_ns_find(const PyNsMap *map, const char *name) {
+    if (!map->slots)
+        return NULL;
+    uint32_t mask = (uint32_t)map->cap - 1;
+    for (uint32_t i = py_ns_hash(name) & mask;; i = (i + 1) & mask) {
+        PyNsSlot *s = &map->slots[i];
+        if (!s->name || strcmp(s->name, name) == 0)
+            return s;
+    }
+}
+
+static bool py_ns_grow(CBMArena *scratch, PyNsMap *map) {
+    int cap = map->cap ? map->cap * 2 : PY_NS_MAP_MIN_CAP;
+    PyNsSlot *slots = (PyNsSlot *)cbm_arena_alloc(scratch, (size_t)cap * sizeof(PyNsSlot));
+    if (!slots)
+        return false;
+    memset(slots, 0, (size_t)cap * sizeof(PyNsSlot));
+    PyNsMap grown = {slots, cap, 0};
+    for (int i = 0; i < map->cap; i++) {
+        if (map->slots[i].name) {
+            *py_ns_find(&grown, map->slots[i].name) = map->slots[i];
+            grown.count++;
+        }
+    }
+    *map = grown;
+    return true;
+}
+
+/* Bind name -> target. A later import rebinds an earlier one (Python's
+ * semantics); nothing rebinds the module's own definition. */
+static void py_ns_put(CBMArena *scratch, PyNsMap *map, const char *name, const char *target,
+                      bool own) {
+    if ((map->count + 1) * 2 > map->cap && !py_ns_grow(scratch, map))
+        return;
+    PyNsSlot *s = py_ns_find(map, name);
+    if (s->name && s->own)
+        return;
+    if (!s->name)
+        map->count++;
+    s->name = name;
+    s->target = target;
+    s->own = own;
+}
+
+static int py_ns_module_index(const PyNsBuild *b, const char *scope) {
+    int lo = 0;
+    int hi = b->mod_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(b->scopes[mid], scope);
+        if (cmp == 0)
+            return mid;
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return -1;
+}
+
+static void py_ns_compute(PyNsBuild *b, int m, int depth);
+
+/* The definition `qn` names: itself when registered, else the name its
+ * module's namespace binds (a chained re-export), else NULL. */
+static const char *py_ns_resolve(PyNsBuild *b, const char *qn, int depth) {
+    const CBMRegisteredFunc *f = cbm_registry_lookup_func(b->reg, qn);
+    if (f)
+        return f->qualified_name;
+    const CBMRegisteredType *t = cbm_registry_lookup_type(b->reg, qn);
+    if (t)
+        return t->qualified_name;
+    const char *dot = strrchr(qn, '.');
+    if (!dot || dot == qn || depth > PY_NS_MAX_DEPTH)
+        return NULL;
+    char *scope = cbm_arena_strndup(b->scratch, qn, (size_t)(dot - qn));
+    int m = scope ? py_ns_module_index(b, scope) : -1;
+    if (m < 0)
+        return NULL;
+    py_ns_compute(b, m, depth + 1);
+    const PyNsSlot *s = py_ns_find(&b->mods[m].ns, dot + 1);
+    return s && s->name ? s->target : NULL; /* NULL target = tombstone */
+}
+
+/* The parent of a dotted scope ("a.b.c" -> "a.b"), or NULL at the root. */
+static char *py_ns_parent(CBMArena *scratch, const char *scope) {
+    const char *dot = strrchr(scope, '.');
+    return dot && dot > scope ? cbm_arena_strndup(scratch, scope, (size_t)(dot - scope)) : NULL;
+}
+
+/* Module index a record raw module spec names, seen from the module that
+ * wrote it (importer_qn: its raw module QN, `.__init__` kept), or -1.
+ * Relative (`..pkg.mod`): the importer package -- the importer itself for a
+ * package `__init__`, else its parent -- ascended once per further dot, then
+ * the dotted rest; exact. Absolute (`app.db.models`): the one project module
+ * scope whose dot-boundary tail spells it; none or several = unknown (a
+ * vendored copy, an external module), never a guess between candidates. */
+static int py_ns_resolve_spec(PyNsBuild *b, const char *spec, const char *importer_qn) {
+    if (!spec || !importer_qn)
+        return -1;
+    size_t level = 0;
+    while (spec[level] == '.')
+        level++;
+    const char *rest = spec + level;
+    if (level == 0) {
+        void *v = b->by_suffix ? cbm_ht_get(b->by_suffix, rest) : NULL;
+        if (!v || v == PY_NS_AMBIGUOUS)
+            return -1;
+        return (int)((uintptr_t)v - 1);
+    }
+    size_t scope_len = cbm_fqn_symbol_scope_len(importer_qn);
+    char *pkg = cbm_arena_strndup(b->scratch, importer_qn, scope_len);
+    bool is_package = importer_qn[scope_len] != '\0';
+    if (pkg && !is_package)
+        pkg = py_ns_parent(b->scratch, pkg);
+    for (size_t up = 1; pkg && up < level; up++)
+        pkg = py_ns_parent(b->scratch, pkg);
+    if (!pkg)
+        return -1;
+    const char *module = rest[0] ? cbm_arena_sprintf(b->scratch, "%s.%s", pkg, rest) : pkg;
+    return module ? py_ns_module_index(b, module) : -1;
+}
+
+/* Index every dot-boundary tail of every module scope ("p.app.db" -> "app.db",
+ * "db"); a tail two modules share is ambiguous. */
+static bool py_ns_build_suffix_index(PyNsBuild *b) {
+    b->by_suffix = cbm_ht_create((uint32_t)(b->mod_count * 4 + 16));
+    if (!b->by_suffix)
+        return false;
+    for (int m = 0; m < b->mod_count; m++) {
+        const char *s = b->scopes[m];
+        for (const char *tail = s; tail; tail = strchr(tail, '.') ? strchr(tail, '.') + 1 : NULL) {
+            void *prev = cbm_ht_get(b->by_suffix, tail);
+            cbm_ht_set(b->by_suffix, tail, prev ? PY_NS_AMBIGUOUS : (void *)(uintptr_t)(m + 1));
+        }
+    }
+    return true;
+}
+
+/* An unresolvable star is a whole-namespace barrier: every name the
+ * module's imports bound so far becomes unknown (a tombstone, so the
+ * open-addressing chains stay intact); own definitions stay. */
+static void py_ns_barrier(PyNsModule *mod) {
+    for (int i = 0; i < mod->ns.cap; i++) {
+        if (mod->ns.slots[i].name && !mod->ns.slots[i].own)
+            mod->ns.slots[i].target = NULL;
+    }
+}
+
+/* `from src import *` into dst. */
+static void py_ns_star_merge(PyNsBuild *b, PyNsModule *dst, const PyNsModule *src) {
+    if (src->has_all) {
+        for (int i = 0; src->all_names && src->all_names[i]; i++) {
+            const PyNsSlot *s = py_ns_find(&src->ns, src->all_names[i]);
+            if (s && s->name && s->target)
+                py_ns_put(b->scratch, &dst->ns, s->name, s->target, false);
+        }
+        return;
+    }
+    for (int i = 0; i < src->ns.cap; i++) {
+        const PyNsSlot *s = &src->ns.slots[i];
+        if (s->name && s->target && s->name[0] != '_')
+            py_ns_put(b->scratch, &dst->ns, s->name, s->target, false);
+    }
+}
+
+static void py_ns_compute(PyNsBuild *b, int m, int depth) {
+    PyNsModule *mod = &b->mods[m];
+    if (mod->state != 0 || depth > PY_NS_MAX_DEPTH)
+        return;
+    mod->state = 1;
+    for (int r = 0; r < mod->record_count; r++) {
+        const CBMLSPDef *d = &b->defs[mod->records[r]];
+        if (!d->receiver_type)
+            continue;
+        int src = py_ns_resolve_spec(b, d->receiver_type, d->def_module_qn);
+        if (strcmp(d->label, "PyReexport") == 0) {
+            const char *qn =
+                src >= 0 && d->method_names_str
+                    ? cbm_arena_sprintf(b->scratch, "%s.%s", b->scopes[src], d->method_names_str)
+                    : NULL;
+            const char *target = qn ? py_ns_resolve(b, qn, depth + 1) : NULL;
+            /* unresolved: the name is still rebound, to something unknown */
+            py_ns_put(b->scratch, &mod->ns, d->short_name, target, false);
+            continue;
+        }
+        if (src < 0) {
+            py_ns_barrier(mod);
+            continue;
+        }
+        if (src == m)
+            continue;
+        py_ns_compute(b, src, depth + 1);
+        py_ns_star_merge(b, mod, &b->mods[src]);
+    }
+    mod->state = 2;
+}
+
+static int py_ns_cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+typedef struct {
+    const char *key;
+    const char *target;
+} PyNsExport;
+
+static int py_ns_cmp_export(const void *a, const void *b) {
+    return strcmp(((const PyNsExport *)a)->key, ((const PyNsExport *)b)->key);
+}
+
+/* The symbol scope of a module QN (a package's `.__init__` dropped). */
+static const char *py_ns_scope(CBMArena *scratch, const char *module_qn) {
+    return cbm_arena_strndup(scratch, module_qn, cbm_fqn_symbol_scope_len(module_qn));
+}
+
+/* Sorted, de-duplicated module scopes of every Python def and record (and
+ * every star source). Returns the count; def_scope[i] is def i's scope
+ * (NULL when def i is skipped). */
+static int py_ns_collect_scopes(PyNsBuild *b, int def_count, bool check_lang,
+                                const char **def_scope) {
+    const char **all =
+        (const char **)cbm_arena_alloc(b->scratch, (size_t)(def_count * 2 + 1) * sizeof(char *));
+    if (!all)
+        return -1;
+    int n = 0;
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &b->defs[i];
+        def_scope[i] = NULL;
+        if ((check_lang && d->lang != CBM_LANG_PYTHON) || !d->label || !d->qualified_name ||
+            !d->def_module_qn)
+            continue;
+        def_scope[i] = py_ns_scope(b->scratch, d->def_module_qn);
+        if (!def_scope[i])
+            continue;
+        all[n++] = def_scope[i];
+    }
+    qsort(all, (size_t)n, sizeof(char *), py_ns_cmp_str);
+    int u = 0;
+    for (int i = 0; i < n; i++) {
+        if (u == 0 || strcmp(all[u - 1], all[i]) != 0)
+            all[u++] = all[i];
+    }
+    b->scopes = all;
+    return u;
+}
+
+/* Attach records, __all__ lists and (for star sources) own top-level
+ * definitions to their modules. */
+static bool py_ns_attach(PyNsBuild *b, int def_count, const char **def_scope) {
+    int *def_mod = (int *)cbm_arena_alloc(b->scratch, (size_t)(def_count + 1) * sizeof(int));
+    if (!def_mod)
+        return false;
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &b->defs[i];
+        def_mod[i] = def_scope[i] ? py_ns_module_index(b, def_scope[i]) : -1;
+        if (def_mod[i] < 0 || !py_ns_is_record(d))
+            continue;
+        PyNsModule *mod = &b->mods[def_mod[i]];
+        if (strcmp(d->label, "PyAll") == 0) {
+            mod->has_all = true;
+            mod->all_names = py_split_pipe(b->scratch, d->method_names_str);
+            continue;
+        }
+        mod->record_count++;
+        if (strcmp(d->label, "PyStarImport") == 0 && d->receiver_type) {
+            int src = py_ns_resolve_spec(b, d->receiver_type, d->def_module_qn);
+            if (src >= 0)
+                b->mods[src].star_source = true;
+        }
+    }
+    for (int m = 0; m < b->mod_count; m++) {
+        PyNsModule *mod = &b->mods[m];
+        if (mod->record_count > 0) {
+            mod->records =
+                (int *)cbm_arena_alloc(b->scratch, (size_t)mod->record_count * sizeof(int));
+            if (!mod->records)
+                return false;
+            mod->record_count = 0;
+        }
+    }
+    for (int i = 0; i < def_count; i++) {
+        if (def_mod[i] < 0)
+            continue;
+        const CBMLSPDef *d = &b->defs[i];
+        PyNsModule *mod = &b->mods[def_mod[i]];
+        if (py_ns_is_record(d)) {
+            if (strcmp(d->label, "PyAll") != 0)
+                mod->records[mod->record_count++] = i;
+            continue;
+        }
+        /* A star source exports its own top-level classes and functions
+         * (direct children of the module scope, never methods). */
+        size_t scope_len = strlen(def_scope[i]);
+        if (!mod->star_source || !d->short_name || d->receiver_type ||
+            strncmp(d->qualified_name, def_scope[i], scope_len) != 0 ||
+            d->qualified_name[scope_len] != '.' ||
+            strcmp(d->qualified_name + scope_len + 1, d->short_name) != 0)
+            continue;
+        const CBMRegisteredFunc *f = cbm_registry_lookup_func(b->reg, d->qualified_name);
+        const CBMRegisteredType *t = f ? NULL : cbm_registry_lookup_type(b->reg, d->qualified_name);
+        const char *target = f ? f->qualified_name : t ? t->qualified_name : NULL;
+        if (target)
+            py_ns_put(b->scratch, &mod->ns, d->short_name, target, true);
+    }
+    return true;
+}
+
+/* Copy the computed namespaces (import-bound names only) and the module set
+ * into the registry's arena, sorted for binary search. */
+static void py_ns_publish(PyNsBuild *b, CBMTypeRegistry *reg) {
+    int total = 0;
+    for (int m = 0; m < b->mod_count; m++) {
+        for (int i = 0; i < b->mods[m].ns.cap; i++)
+            total += b->mods[m].ns.slots[i].name && !b->mods[m].ns.slots[i].own &&
+                     b->mods[m].ns.slots[i].target;
+    }
+    const char **module_qns =
+        (const char **)cbm_arena_alloc(reg->arena, (size_t)(b->mod_count + 1) * sizeof(char *));
+    PyNsExport *exports =
+        (PyNsExport *)cbm_arena_alloc(b->scratch, (size_t)(total + 1) * sizeof(PyNsExport));
+    const char **keys =
+        (const char **)cbm_arena_alloc(reg->arena, (size_t)(total + 1) * sizeof(char *));
+    const char **targets =
+        (const char **)cbm_arena_alloc(reg->arena, (size_t)(total + 1) * sizeof(char *));
+    if (!module_qns || !exports || !keys || !targets)
+        return;
+    int n = 0;
+    for (int m = 0; m < b->mod_count; m++) {
+        module_qns[m] = cbm_arena_strdup(reg->arena, b->scopes[m]);
+        const PyNsMap *ns = &b->mods[m].ns;
+        for (int i = 0; i < ns->cap; i++) {
+            const PyNsSlot *s = &ns->slots[i];
+            if (!s->name || s->own || !s->target)
+                continue;
+            exports[n].key = cbm_arena_sprintf(reg->arena, "%s.%s", b->scopes[m], s->name);
+            exports[n].target = s->target;
+            if (exports[n].key)
+                n++;
+        }
+    }
+    qsort(exports, (size_t)n, sizeof(PyNsExport), py_ns_cmp_export);
+    for (int i = 0; i < n; i++) {
+        keys[i] = exports[i].key;
+        targets[i] = exports[i].target;
+    }
+    reg->module_qns = module_qns;
+    reg->module_count = b->mod_count;
+    reg->export_keys = keys;
+    reg->export_targets = targets;
+    reg->export_count = n;
+}
+
+/* Build reg's module set and export table from defs[]. reg must be
+ * finalized and not yet sealed. check_lang: defs[] is mixed-language. */
+static void py_build_module_namespaces(CBMTypeRegistry *reg, CBMLSPDef *defs, int def_count,
+                                       bool check_lang) {
+    if (!reg || !defs || def_count <= 0 || reg->read_only)
+        return;
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    PyNsBuild b = {.scratch = &scratch, .reg = reg, .defs = defs};
+    const char **def_scope =
+        (const char **)cbm_arena_alloc(&scratch, (size_t)def_count * sizeof(char *));
+    int mod_count = def_scope ? py_ns_collect_scopes(&b, def_count, check_lang, def_scope) : -1;
+    if (mod_count > 0) {
+        b.mod_count = mod_count;
+        b.mods = (PyNsModule *)cbm_arena_alloc(&scratch, (size_t)mod_count * sizeof(PyNsModule));
+    }
+    if (b.mods) {
+        memset(b.mods, 0, (size_t)mod_count * sizeof(PyNsModule));
+        for (int m = 0; m < mod_count; m++)
+            b.mods[m].scope = b.scopes[m];
+        if (py_ns_build_suffix_index(&b) && py_ns_attach(&b, def_count, def_scope)) {
+            for (int m = 0; m < mod_count; m++)
+                py_ns_compute(&b, m, 0);
+            py_ns_publish(&b, reg);
+        }
+    }
+    cbm_ht_free(b.by_suffix);
+    cbm_arena_destroy(&scratch);
+}
+
 bool cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           const char *module_qn, CBMLSPDef *defs, int def_count,
                           const char **import_names, const char **import_qns, int import_count,
@@ -5810,6 +6773,7 @@ CBMLSPStatus cbm_run_py_lsp_cross_status(CBMArena *arena, const char *source, in
     /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
      * comment for the rationale. */
     cbm_registry_finalize_into(&reg, &idx_arena);
+    py_build_module_namespaces(&reg, defs, def_count, false);
 
     ctx.syn_calls = synthetic_calls;
     for (int i = 0; i < import_count; i++) {
@@ -5852,6 +6816,8 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     py_mark_ambiguous_callable_bindings(reg, arena);
     cbm_registry_build_type_qn_order(reg, arena);
     cbm_registry_finalize(reg);
+    /* Export table: after finalize (hashed probes), before the seal. */
+    py_build_module_namespaces(reg, defs, def_count, true);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }

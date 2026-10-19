@@ -123,6 +123,19 @@ static const char *python_import_root(CBMArena *a, const char *path) {
     return dot ? cbm_arena_strndup(a, path, (size_t)(dot - path)) : path;
 }
 
+/* Spell `from <module> import <name>` as one dotted path. A package-relative
+ * module (`from . import x`, `from .. import x`) is nothing but dots, which
+ * already end in the separator: joining with another '.' would add a level and
+ * name the PARENT package ("..x"), so the import resolved one package too high
+ * and fell to a same-named definition anywhere in the project. */
+static const char *python_join_from_import(CBMArena *a, const char *module, const char *name) {
+    size_t len = strlen(module);
+    if (len > 0 && module[len - SKIP_ONE] == '.') {
+        return cbm_arena_sprintf(a, "%s%s", module, name);
+    }
+    return cbm_arena_sprintf(a, "%s.%s", module, name);
+}
+
 // --- Go imports ---
 // import_declaration -> import_spec_list -> import_spec -> (name, path)
 
@@ -209,7 +222,7 @@ static void emit_py_aliased_import(CBMExtractCtx *ctx, TSNode child, const char 
     }
     const char *local = !ts_node_is_null(alias_node) ? cbm_node_text(a, alias_node, ctx->source)
                                                      : path_last(a, name);
-    const char *full = mod_prefix ? cbm_arena_sprintf(a, "%s.%s", mod_prefix, name) : name;
+    const char *full = mod_prefix ? python_join_from_import(a, mod_prefix, name) : name;
     CBMImport imp = {.local_name = local, .module_path = full};
     cbm_imports_push(&ctx->result->imports, a, imp);
 }
@@ -267,7 +280,7 @@ static void emit_py_import_from_name(CBMExtractCtx *ctx, TSNode child, const cha
     CBMArena *a = ctx->arena;
     char *name = cbm_node_text(a, child, ctx->source);
     if (name && name[0]) {
-        const char *full = mod_path ? cbm_arena_sprintf(a, "%s.%s", mod_path, name) : name;
+        const char *full = mod_path ? python_join_from_import(a, mod_path, name) : name;
         CBMImport imp = {.local_name = name, .module_path = full};
         cbm_imports_push(&ctx->result->imports, a, imp);
     }
@@ -321,6 +334,139 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
+/* `TYPE_CHECKING` or `<module>.TYPE_CHECKING` (typing.TYPE_CHECKING, t.TYPE_CHECKING). */
+static bool py_is_type_checking_condition(CBMExtractCtx *ctx, TSNode cond) {
+    if (ts_node_is_null(cond)) {
+        return false;
+    }
+    TSNode name = cond;
+    if (strcmp(ts_node_type(cond), "attribute") == 0) {
+        name = ts_node_child_by_field_name(cond, TS_FIELD("attribute"));
+    }
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0) {
+        return false;
+    }
+    const char *text = cbm_node_text(ctx->arena, name, ctx->source);
+    return text && strcmp(text, "TYPE_CHECKING") == 0;
+}
+
+/* One import statement; `type_only` flags every import it records. */
+static void process_py_import_node(CBMExtractCtx *ctx, TSNode node, bool type_only) {
+    const char *kind = ts_node_type(node);
+    int before = ctx->result->imports.count;
+    if (strcmp(kind, "import_statement") == 0) {
+        process_py_import_stmt(ctx, node);
+    } else if (strcmp(kind, "import_from_statement") == 0 ||
+               strcmp(kind, "future_import_statement") == 0) {
+        // `from __future__ import annotations` is a distinct node type in
+        // tree-sitter-python but has the same shape (module + name list).
+        process_py_import_from(ctx, node);
+    }
+    for (int i = before; type_only && i < ctx->result->imports.count; i++) {
+        ctx->result->imports.items[i].type_checking_only = true;
+    }
+}
+
+static bool py_is_import_node(TSNode node) {
+    const char *kind = ts_node_type(node);
+    return strcmp(kind, "import_statement") == 0 || strcmp(kind, "import_from_statement") == 0 ||
+           strcmp(kind, "future_import_statement") == 0;
+}
+
+static bool py_import_is_wildcard(TSNode import_node) {
+    uint32_t n = ts_node_child_count(import_node);
+    for (uint32_t i = 0; i < n; i++) {
+        if (strcmp(ts_node_type(ts_node_child(import_node, i)), "wildcard_import") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Records, unflagged, every import statement anywhere under `root` (the
+ * runtime alternative of a TYPE_CHECKING block usually nests them in
+ * try/except ImportError). An iterative pre-order walk: adversarially deep
+ * nesting must not exhaust the stack. Returns true when one of them is a star
+ * import. */
+static bool py_record_subtree_imports(CBMExtractCtx *ctx, TSNode root) {
+    bool star = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool is_import = py_is_import_node(node);
+        if (is_import) {
+            process_py_import_node(ctx, node, false);
+            star = star || py_import_is_wildcard(node);
+        }
+        if (!is_import && ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                return star;
+            }
+        }
+    }
+}
+
+/* Drops the imports [first, mark) whose local name an import at [mark, count)
+ * binds as well (every one when `star`), then the imports [mark, count). */
+static void py_drop_rebound_imports(CBMImportArray *imports, int first, int mark, bool star) {
+    int keep = first;
+    for (int i = first; i < mark; i++) {
+        const CBMImport *imp = &imports->items[i];
+        bool rebound = star;
+        for (int j = mark; !rebound && j < imports->count; j++) {
+            rebound = imp->local_name && imports->items[j].local_name &&
+                      strcmp(imp->local_name, imports->items[j].local_name) == 0;
+        }
+        if (!rebound) {
+            imports->items[keep++] = *imp;
+        }
+    }
+    imports->count = keep;
+}
+
+/* A module-level `if TYPE_CHECKING:` holds imports a type checker sees and
+ * the interpreter never runs (#1277: an annotated field's type is usually
+ * imported exactly there, to avoid an import cycle). Record the imports of
+ * its consequence block, flagged type_checking_only. Its elif/else branches
+ * are runtime alternatives and stay unrecorded, as every other compound
+ * statement's imports do; a name they bind again (the compat shape: the same
+ * name imported in `else:` under try/except ImportError) is bound at runtime,
+ * so its TYPE_CHECKING import is no annotation-only import and is dropped as
+ * well, and a star import there may bind any name. */
+static void process_py_type_checking_block(CBMExtractCtx *ctx, TSNode if_node) {
+    if (!py_is_type_checking_condition(
+            ctx, ts_node_child_by_field_name(if_node, TS_FIELD("condition")))) {
+        return;
+    }
+    TSNode body = ts_node_child_by_field_name(if_node, TS_FIELD("consequence"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    int first = ctx->result->imports.count;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            process_py_import_node(ctx, ts_tree_cursor_current_node(&cursor), true);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    int mark = ctx->result->imports.count;
+    bool star = false;
+    uint32_t n = ts_node_child_count(if_node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode alt = ts_node_child(if_node, i);
+        const char *kind = ts_node_type(alt);
+        if (strcmp(kind, "elif_clause") == 0 || strcmp(kind, "else_clause") == 0) {
+            star = py_record_subtree_imports(ctx, alt) || star;
+        }
+    }
+    py_drop_rebound_imports(&ctx->result->imports, first, mark, star);
+}
+
 static void parse_python_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
@@ -329,15 +475,10 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
     }
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char *kind = ts_node_type(node);
-
-        if (strcmp(kind, "import_statement") == 0) {
-            process_py_import_stmt(ctx, node);
-        } else if (strcmp(kind, "import_from_statement") == 0 ||
-                   strcmp(kind, "future_import_statement") == 0) {
-            // `from __future__ import annotations` is a distinct node type in
-            // tree-sitter-python but has the same shape (module + name list).
-            process_py_import_from(ctx, node);
+        if (strcmp(ts_node_type(node), "if_statement") == 0) {
+            process_py_type_checking_block(ctx, node);
+        } else {
+            process_py_import_node(ctx, node, false);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -736,6 +877,97 @@ static bool py_ns_delete(PyNamespaceBuilder *b, TSNode node, int depth) {
     return ok;
 }
 
+static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node);
+
+/* `if TYPE_CHECKING:` / `if <module>.TYPE_CHECKING:` */
+static bool py_ns_is_type_checking_if(PyNamespaceBuilder *b, TSNode node) {
+    TSNode cond = ts_node_child_by_field_name(node, TS_FIELD("condition"));
+    if (ts_node_is_null(cond))
+        return false;
+    TSNode name = cond;
+    if (strcmp(ts_node_type(cond), "attribute") == 0)
+        name = ts_node_child_by_field_name(cond, TS_FIELD("attribute"));
+    const char *text = NULL;
+    size_t len = 0;
+    return !ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0 &&
+           py_ns_slice(b, name, &text, &len) && len == strlen("TYPE_CHECKING") &&
+           memcmp(text, "TYPE_CHECKING", len) == 0;
+}
+
+/* An import in an elif/else branch of a TYPE_CHECKING block rebinds its names
+ * at runtime from wherever that branch says (the compat shape: `else: try:
+ * from runtime.place import name`). A static reader cannot tell which source
+ * the module ends up exporting, so every name such an import binds becomes a
+ * SHADOW (reason UNSUPPORTED: the re-export is withdrawn, as for a later
+ * assignment); a star import, or an import form the builder does not read,
+ * may bind any name, so the whole namespace becomes unknown. An iterative
+ * walk of the branch: deep nesting must not exhaust the stack. */
+static bool py_ns_alternative_imports(PyNamespaceBuilder *b, TSNode root) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool done = false;
+    while (!done && !b->failure) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool from = strcmp(kind, "import_from_statement") == 0;
+        bool is_import = from || strcmp(kind, "import_statement") == 0;
+        if (is_import) {
+            int start = b->facts.count;
+            bool star = !py_ns_import(b, node, from);
+            for (int i = start; !star && i < b->facts.count; i++) {
+                star = b->facts.items[i].kind == CBM_PY_NS_IMPORT_STAR;
+                b->facts.items[i] = (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
+                                                         .local_name = b->facts.items[i].local_name,
+                                                         .reason = CBM_PY_NS_REASON_UNSUPPORTED};
+            }
+            if (star && !b->failure) {
+                b->facts.count = start;
+                py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND);
+            }
+        }
+        if (!is_import && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return !b->failure;
+}
+
+/* The type checker view of a module-level `if TYPE_CHECKING:`: its
+ * consequence runs, its elif/else branches never do. Packages that load
+ * their public names lazily at runtime (`else: sys.modules[...] =
+ * _LazyModule(...)`) publish them exactly there, so a static reader of the
+ * namespace must take this branch to see them; every other compound
+ * statement stays a whole-namespace unknown. A name an elif/else branch
+ * imports again is withdrawn (py_ns_alternative_imports). */
+static bool py_ns_type_checking_block(PyNamespaceBuilder *b, TSNode node) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("consequence"));
+    if (ts_node_is_null(body))
+        return py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND);
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count && !b->failure; i++) {
+        TSNode stmt = ts_node_named_child(body, i);
+        int start = b->facts.count;
+        if (!py_ns_statement(b, stmt) && !b->failure) {
+            b->facts.count = start;
+            if (!py_ns_unknown(b, CBM_PY_NS_REASON_UNSUPPORTED))
+                return false;
+        }
+    }
+    uint32_t children = ts_node_child_count(node);
+    for (uint32_t i = 0; i < children && !b->failure; i++) {
+        TSNode alt = ts_node_child(node, i);
+        const char *kind = ts_node_type(alt);
+        if (strcmp(kind, "elif_clause") == 0 || strcmp(kind, "else_clause") == 0)
+            py_ns_alternative_imports(b, alt);
+    }
+    return !b->failure;
+}
+
 static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "comment") == 0 || strcmp(kind, "pass_statement") == 0)
@@ -781,6 +1013,8 @@ static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
             return py_ns_assignment(b, expr);
         return py_ns_safe_expr(b, expr, 0) || py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT);
     }
+    if (strcmp(kind, "if_statement") == 0 && py_ns_is_type_checking_if(b, node))
+        return py_ns_type_checking_block(b, node);
     if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "try_statement") == 0 ||
         strcmp(kind, "for_statement") == 0 || strcmp(kind, "while_statement") == 0 ||
         strcmp(kind, "with_statement") == 0 || strcmp(kind, "match_statement") == 0)

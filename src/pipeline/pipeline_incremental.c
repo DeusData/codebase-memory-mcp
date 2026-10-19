@@ -32,6 +32,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
+#include "foundation/limits.h" /* cbm_max_file_bytes */
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
 
@@ -404,8 +405,15 @@ static int semantic_manifest_control_entry(semantic_manifest_builder_t *builder,
     }
     bool root_control = (!rel_dir || !rel_dir[0]) && (strcmp(name, ".cbmignore") == 0 ||
                                                       strcmp(name, ".codebase-memory.json") == 0);
-    bool control =
-        strcmp(name, ".gitignore") == 0 || root_control || semantic_manifest_package_control(name);
+    /* A build context's ignore file (or BuildKit's <Dockerfile>.dockerignore)
+     * shapes which files an image holds (pass_docker.c image_ignore), and
+     * discovery indexes neither. */
+    static const char DOCKERIGNORE[] = ".dockerignore";
+    size_t nl = strlen(name);
+    bool dockerignore = nl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
+                        strcmp(name + nl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0;
+    bool control = strcmp(name, ".gitignore") == 0 || root_control ||
+                   semantic_manifest_package_control(name) || dockerignore;
     return info.is_regular && control ? semantic_manifest_add(builder, project, rel_path, abs_path)
                                       : 0;
 }
@@ -1319,7 +1327,10 @@ static bool incr_label_is_registry_symbol(const char *label) {
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing
  * project's definition symbols so the resolver can match cross-file symbols
  * during incremental. Mirrors the full-index registry contents exactly so an
- * incremental re-resolve picks the same nodes a full reindex would. */
+ * incremental re-resolve picks the same nodes a full reindex would -- including
+ * a Python function's locals, which cbm_registry_add_lang keeps out of the
+ * short-name index there too (nodes load ORDER BY id and a file's defs are
+ * inserted parent first, so the enclosing function is seeded before its locals). */
 /* Each symbol is seeded with its file's DETECTED language, exactly what the
  * full index recorded (pass_definitions.c / pass_parallel.c), so the cross-
  * language veto judges an incremental re-resolve the same way. Stored nodes carry no
@@ -1329,6 +1340,7 @@ static bool incr_label_is_registry_symbol(const char *label) {
 typedef struct {
     cbm_registry_t *registry;
     CBMHashTable *lang_by_path; /* rel_path -> (CBMLanguage + 1); keys borrowed */
+    const char *project;        /* bounds Python function-local detection per file */
 } registry_seed_t;
 
 static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
@@ -1343,14 +1355,20 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
             lang = (CBMLanguage)((uintptr_t)v - SKIP_ONE);
         }
     }
-    cbm_registry_add_lang(seed->registry, node->name, node->qualified_name, node->label, lang);
+    /* Same per-file bound as the full index (pass_definitions.c). */
+    size_t prefix_len = lang == CBM_LANG_PYTHON
+                            ? cbm_pipeline_fqn_symbol_prefix_len(seed->project, node->file_path)
+                            : 0;
+    cbm_registry_add_lang_in_module(seed->registry, node->name, node->qualified_name, node->label,
+                                    lang, prefix_len);
 }
 
 /* Seed the registry from every registry symbol in the graph buffer, with
  * languages taken from the discovered files (see registry_visitor). */
 static void registry_seed_from_gbuf(cbm_registry_t *registry, const cbm_gbuf_t *gbuf,
-                                    const cbm_file_info_t *files, int file_count) {
-    registry_seed_t seed = {.registry = registry, .lang_by_path = NULL};
+                                    const char *project, const cbm_file_info_t *files,
+                                    int file_count) {
+    registry_seed_t seed = {.registry = registry, .lang_by_path = NULL, .project = project};
     if (files && file_count > 0) {
         seed.lang_by_path = cbm_ht_create((size_t)file_count * PAIR_LEN);
     }
@@ -2448,6 +2466,32 @@ static bool closure_dir_has_compose(const char *repo_path, const char *rel, cons
     return found;
 }
 
+/* The nearest directory at or above `rel`'s that holds a Chart.yaml, into out
+ * ("" for the repository root); false when none does. */
+static bool closure_chart_dir_of(const char *repo_path, const char *rel, char *out, size_t sz) {
+    snprintf(out, sz, "%s", rel);
+    char *cut = strrchr(out, '/');
+    for (;;) {
+        if (cut) {
+            *cut = '\0';
+        } else {
+            out[0] = '\0';
+        }
+        static const char *const names[] = {"Chart.yaml", "Chart.yml"};
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            char path[CBM_SZ_4K];
+            snprintf(path, sizeof(path), "%s/%s%s%s", repo_path, out, out[0] ? "/" : "", names[i]);
+            if (cbm_file_exists(path)) {
+                return true;
+            }
+        }
+        if (!out[0]) {
+            return false;
+        }
+        cut = strrchr(out, '/');
+    }
+}
+
 /* Kubernetes inputs reach past their own file (pass_k8s.c): a kustomization
  * decides which manifests deploy together and in which namespace, a
  * Chart.yaml links other charts, and a manifest's Services select workloads
@@ -2466,6 +2510,20 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
         }
         if (strcmp(base, "Chart.yaml") == 0 || strcmp(base, "Chart.yml") == 0) {
             return "helm_chart_changed";
+        }
+        /* A chart's values file CONFIGURES it and its templates/ are what it
+         * DEPLOYS: edges the K8s pass draws from the chart directory, which a
+         * repair of this file alone does not hold. */
+        char chart[CBM_SZ_4K];
+        if (closure_chart_dir_of(repo_path, rel, chart, sizeof(chart))) {
+            size_t cl = strlen(chart);
+            const char *in_chart = rel + (cl ? cl + SKIP_ONE : 0);
+            if (cbm_helm_values_name(in_chart)) {
+                return "helm_values_changed";
+            }
+            if (strncmp(in_chart, "templates/", strlen("templates/")) == 0) {
+                return "helm_template_changed";
+            }
         }
         if (strcmp(base, ".env") == 0 && closure_dir_has_compose(repo_path, rel, base)) {
             return "compose_env_changed";
@@ -2507,6 +2565,157 @@ static const char *closure_k8s_decline(cbm_store_t *store, const char *project,
         }
     }
     return NULL;
+}
+
+/* Terraform / OpenTofu / Terragrunt inputs reach past their own file
+ * (pass_terraform.c): the files of a module directory resolve each other's
+ * references, a module call's source decides which outputs another file of
+ * the directory reads, a .tfvars file sets the variables beside it, and a
+ * Terragrunt unit includes and reads other .hcl files. The repair recomputes
+ * the changed files' edges only, so a delta touching any of them -- an edge
+ * held by two unchanged files may hang on it -- declines to the full
+ * rebuild. Returns the reason, or NULL. */
+static const char *closure_terraform_decline(char **paths, int n) {
+    static const char *const exts[] = {".tf", ".tofu", ".tfvars", ".hcl"};
+    for (int i = 0; i < n; i++) {
+        const char *slash = strrchr(paths[i], '/');
+        const char *dot = strrchr(slash ? slash + SKIP_ONE : paths[i], '.');
+        for (size_t k = 0; dot && k < sizeof(exts) / sizeof(exts[0]); k++) {
+            if (strcmp(dot, exts[k]) == 0) {
+                return "terraform_input_changed";
+            }
+        }
+    }
+    return NULL;
+}
+
+/* A role's defaults/ or vars/ main.yml (.yaml): the lists a kube task's loop
+ * reads (pass_ansible.c, an_role_list) -- a roles/<name> component before. */
+static bool closure_ansible_role_vars(const char *rel) {
+    static const char *const TAILS[] = {"/defaults/main.yml", "/defaults/main.yaml",
+                                        "/vars/main.yml", "/vars/main.yaml"};
+    static const char ROLES[] = "roles/";
+    size_t n = strlen(rel);
+    for (size_t k = 0; k < sizeof(TAILS) / sizeof(TAILS[0]); k++) {
+        size_t tl = strlen(TAILS[k]);
+        if (n <= tl || strcmp(rel + n - tl, TAILS[k]) != 0) {
+            continue;
+        }
+        const char *end = rel + n - tl; /* the role directory: rel up to end */
+        for (const char *p = rel; (p = strstr(p, ROLES)) != NULL && p < end; p++) {
+            if ((p == rel || p[-SKIP_ONE] == '/') && p + sizeof(ROLES) - SKIP_ONE < end) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Does `rel` hold Ansible tasks (a Function {source: ansible})? -1 on a
+ * lookup error. */
+static int closure_holds_ansible_tasks(cbm_store_t *store, const char *project, const char *rel) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_file(store, project, rel, &nodes, &count) != CBM_STORE_OK) {
+        return -SKIP_ONE;
+    }
+    int held = 0;
+    for (int j = 0; j < count && !held; j++) {
+        held = nodes[j].label && strcmp(nodes[j].label, "Function") == 0 &&
+               nodes[j].properties_json &&
+               strstr(nodes[j].properties_json, "\"source\":\"ansible\"") != NULL;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return held;
+}
+
+/* Ansible (pass_ansible.c): a task's notify CALLS the handlers of its role
+ * in another file, whether a file is Ansible at all can hang on another
+ * file's include, and what a kube task DEPLOYS on the lists of its role's
+ * defaults / vars. The repair recomputes the changed files only, so a
+ * changed or deleted file that held Ansible tasks, a changed YAML file whose
+ * top level is a sequence (it may be Ansible now), or a changed or deleted
+ * role defaults / vars main file declines to the full rebuild. Returns the
+ * reason, or NULL. */
+static const char *closure_ansible_decline(cbm_store_t *store, const char *project,
+                                           const char *repo_path, char **paths, int n_changed,
+                                           int n_deleted) {
+    for (int i = 0; i < n_changed + n_deleted; i++) {
+        const char *rel = paths[i];
+        if (closure_ansible_role_vars(rel)) {
+            return "ansible_role_vars_changed";
+        }
+        int held = closure_holds_ansible_tasks(store, project, rel);
+        if (held != 0) {
+            return held < 0 ? "ansible_lookup_failed" : "ansible_tasks_changed";
+        }
+        const char *dot = strrchr(rel, '.');
+        if (i >= n_changed || !dot || (strcmp(dot, ".yaml") != 0 && strcmp(dot, ".yml") != 0)) {
+            continue;
+        }
+        char path[CBM_SZ_4K];
+        snprintf(path, sizeof(path), "%s/%s", repo_path, rel);
+        FILE *f = cbm_fopen(path, "rb");
+        if (!f) {
+            continue;
+        }
+        (void)fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        (void)fseek(f, 0, SEEK_SET);
+        char *text = size > 0 && size <= cbm_max_file_bytes()
+                         ? cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + SKIP_ONE)
+                         : NULL;
+        size_t got = text ? fread(text, SKIP_ONE, (size_t)size, f) : 0;
+        (void)fclose(f);
+        if (text) {
+            text[got] = '\0';
+        }
+        bool sequence = text && cbm_ansible_is_sequence(text);
+        cbm_free(CBM_MEM_CLASS_OTHER, text);
+        if (sequence) {
+            return "ansible_content_changed";
+        }
+    }
+    return NULL;
+}
+
+/* A file holding Ansible tasks that the repair would re-walk as a dependent
+ * (an edge of it reaches a changed or deleted file: a deleted template its
+ * task DEPLOYS) is walked without the files its edges are drawn from --
+ * its role's defaults / vars, handlers, included task files -- which are
+ * outside the closure: it would lose those edges, or keep a dropped one's
+ * fallback undrawn. Declines to the full rebuild. Returns the reason, or
+ * NULL. */
+static const char *closure_ansible_dependent_decline(cbm_store_t *store, const char *project,
+                                                     char **dependents, int count) {
+    for (int i = 0; i < count; i++) {
+        int held = closure_holds_ansible_tasks(store, project, dependents[i]);
+        if (held != 0) {
+            return held < 0 ? "ansible_lookup_failed" : "ansible_dependent";
+        }
+    }
+    return NULL;
+}
+
+/* The env join (pass_envjoin.c) reads each image's files from its
+ * Dockerfile's Module, stored with the ignore patterns of its context: an
+ * ignore file changing, or a deletion of a file an image copies (which
+ * context a Dockerfile's sources resolve in can follow it), declines to the
+ * full rebuild. Adding a file declines already. Returns the reason, or NULL. */
+static const char *closure_envjoin_decline(cbm_store_t *store, const char *project, char **paths,
+                                           int n_changed, int n_deleted) {
+    for (int i = 0; i < n_changed + n_deleted; i++) {
+        const char *slash = strrchr(paths[i], '/');
+        const char *base = slash ? slash + SKIP_ONE : paths[i];
+        size_t bl = strlen(base);
+        size_t sl = strlen(".dockerignore");
+        if (bl >= sl && strcmp(base + bl - sl, ".dockerignore") == 0) {
+            return "dockerignore_changed";
+        }
+    }
+    int held = cbm_delta_image_holds_any(store, project, (const char *const *)paths + n_changed,
+                                         n_deleted);
+    return held > 0 ? "image_file_deleted" : held < 0 ? "image_lookup_failed" : NULL;
 }
 
 /* rel's directory prefix of len bytes as the plain Folder QN, in the arena. */
@@ -2709,8 +2918,21 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     if (decline) {
         goto done;
     }
+    decline = closure_terraform_decline(changed_paths, n_changed + n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_ansible_decline(store, project, cbm_pipeline_repo_path(p), changed_paths,
+                                      n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
     decline =
         closure_stem_mark_decline(project, files, file_count, changed_paths + n_changed, n_deleted);
+    if (decline) {
+        goto done;
+    }
+    decline = closure_envjoin_decline(store, project, changed_paths, n_changed, n_deleted);
     if (decline) {
         goto done;
     }
@@ -2872,6 +3094,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         decline = "doc_scope_changed";
         goto done;
     }
+    decline = closure_ansible_dependent_decline(store, project, dependents, dependent_count);
+    if (decline) {
+        goto done;
+    }
 
     /* Closure = changed ∪ dependents. Every member must be in the current
      * discovery (a dependent outside it cannot be re-resolved). */
@@ -3014,6 +3240,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
      * collisions of the whole discovered set, as in a full run. */
     cbm_stem_marks_t stem_marks;
     cbm_stem_marks_init(&stem_marks, project, files, file_count);
+    /* The env join's inputs in the files the repair leaves alone. */
+    cbm_envjoin_base_t envjoin_base = {0};
+    cbm_arena_init_lazy(&envjoin_base.arena, CBM_SZ_4K);
     cbm_doclink_scope_t *doc_base = NULL;
     int doc_base_count = 0;
     cbm_doc_link_row_t *doc_fresh = NULL;
@@ -3076,14 +3305,14 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         goto out;
     }
     int64_t max_db_id = cbm_delta_preseed(staging, project, gbuf);
-    if (max_db_id < 0) {
+    if (max_db_id < 0 || cbm_delta_envjoin_base(staging, project, &envjoin_base) != 0) {
         goto out;
     }
     registry = cbm_registry_new();
     if (!registry) {
         goto out;
     }
-    registry_seed_from_gbuf(registry, gbuf, files, file_count);
+    registry_seed_from_gbuf(registry, gbuf, project, files, file_count);
     cbm_log_info("delta.preseed_done", "registry", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
@@ -3231,6 +3460,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .build_decl_files = decl_files,
         .build_decl_count = decl_count,
         .stem_marks = &stem_marks,
+        .envjoin_base = &envjoin_base,
     };
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
@@ -3300,9 +3530,12 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
      * the skaffold / compose file declaring them, not to either end: the K8s
      * pass just recomputed them from every build file, so they replace the
-     * staging set wholesale. */
+     * staging set wholesale. So do the env join's edges (pass_envjoin.c),
+     * recomputed from this repair's files and the stored rest. */
     if (cbm_delta_drop_edges_from_label(staging, project, CBM_BUILD_EDGE_TYPE,
-                                        CBM_BUILD_EDGE_SOURCE) < 0) {
+                                        CBM_BUILD_EDGE_SOURCE) < 0 ||
+        cbm_delta_drop_edges_from_label(staging, project, CBM_ENVJOIN_EDGE_TYPE,
+                                        CBM_ENVJOIN_EDGE_SOURCE) < 0) {
         goto out;
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -3312,9 +3545,11 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     cbm_log_info("delta.patch_done", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     /* The proxy buffer holds no edges, so only the patched staging graph can
      * tell a Process node no SPAWNS reaches any more (its last spawner was
-     * purged), or an Image nothing builds on, builds or runs. */
+     * purged), an Image nothing builds on, builds or runs, or a file-less
+     * Route no caller or handler is left on. */
     if (cbm_delta_drop_unreferenced(staging, project, "Process", SH_PROCESS_EDGES) < 0 ||
-        cbm_delta_drop_unreferenced(staging, project, "Image", DK_IMAGE_EDGES) < 0) {
+        cbm_delta_drop_unreferenced(staging, project, "Image", DK_IMAGE_EDGES) < 0 ||
+        cbm_delta_drop_edgeless(staging, project, "Route") < 0) {
         goto out;
     }
 
@@ -3497,6 +3732,7 @@ out:
     cbm_delta_free_snapshot(snapshot, snapshot_count);
     cbm_arena_destroy(&decl_arena);
     cbm_stem_marks_free(&stem_marks);
+    cbm_envjoin_base_free(&envjoin_base);
     surface_name_set_free(stale_surface_set);
     cbm_doclinks_free_scopes(doc_base, doc_base_count);
     cbm_doclinks_free_rows(doc_fresh, doc_fresh_count);
@@ -3557,6 +3793,62 @@ static bool incr_doc_links_current(cbm_store_t *store, const char *project) {
     return current;
 }
 
+/* The exact no-op test: the stored generation's metadata is current for this
+ * mode, its doc-link layer is usable, and its recorded semantic manifest
+ * equals the baseline byte for byte. Read-only. The two out flags report the
+ * halves the staged route also needs for its own routing. */
+static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
+                                  const cbm_file_hash_t *stored, int stored_count,
+                                  const cbm_file_hash_t *baseline_manifest, int baseline_count,
+                                  bool *metadata_current_out, bool *doc_links_current_out) {
+    cbm_coverage_meta_t meta = {0};
+    int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
+    const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
+    bool metadata_current =
+        meta_rc == CBM_STORE_OK && meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
+        meta.hash_records_complete && meta.index_mode && strcmp(meta.index_mode, mode_name) == 0;
+    /* A generation whose doc-link layer is missing or failed is not
+     * current even with identical inputs: index_status tells the user to
+     * re-run, and the re-run has to rebuild. */
+    bool doc_links_current = metadata_current && incr_doc_links_current(store, project);
+    bool exact = doc_links_current && cbm_pipeline_semantic_manifests_equal(
+                                          stored, stored_count, baseline_manifest, baseline_count);
+    cbm_store_coverage_meta_clear(&meta);
+    *metadata_current_out = metadata_current;
+    *doc_links_current_out = doc_links_current;
+    return exact;
+}
+
+bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *store,
+                                               const cbm_file_hash_t *baseline_manifest,
+                                               int baseline_count) {
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    /* A forced legacy-partial run must reach the staged route that takes
+     * the one-shot flag; answering here would consume the run without it. */
+    if (atomic_load(&g_incr_test_force_legacy_partial)) {
+        return false;
+    }
+#endif
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_file_hash_t *stored = NULL;
+    int stored_count = 0;
+    if (!store ||
+        cbm_store_get_file_hashes(store, project, &stored, &stored_count) != CBM_STORE_OK) {
+        return false;
+    }
+    bool metadata_current = false;
+    bool doc_links_current = false;
+    bool exact = incr_generation_exact(p, store, project, stored, stored_count, baseline_manifest,
+                                       baseline_count, &metadata_current, &doc_links_current);
+    cbm_store_free_file_hashes(stored, stored_count);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (exact) {
+        incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_NOOP);
+    }
+#endif
+    return exact;
+}
+
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
                                  int baseline_count, bool force_full_on_mismatch) {
@@ -3602,21 +3894,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * rebuilds the complete graph. This avoids partial LSP/package/config
      * convergence gaps while retaining the common unchanged-repo fast path. */
     if (!force_legacy_partial) {
-        cbm_coverage_meta_t meta = {0};
-        int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
-        const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
-        bool metadata_current = meta_rc == CBM_STORE_OK &&
-                                meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
-                                meta.hash_records_complete && meta.index_mode &&
-                                strcmp(meta.index_mode, mode_name) == 0;
-        /* A generation whose doc-link layer is missing or failed is not
-         * current even with identical inputs: index_status tells the user to
-         * re-run, and the re-run has to rebuild. */
-        bool doc_links_current = metadata_current && incr_doc_links_current(store, project);
-        bool exact = doc_links_current &&
-                     cbm_pipeline_semantic_manifests_equal(stored, stored_count, baseline_manifest,
-                                                           baseline_count);
-        cbm_store_coverage_meta_clear(&meta);
+        bool metadata_current = false;
+        bool doc_links_current = false;
+        bool exact =
+            incr_generation_exact(p, store, project, stored, stored_count, baseline_manifest,
+                                  baseline_count, &metadata_current, &doc_links_current);
         if (exact) {
             cbm_store_free_file_hashes(stored, stored_count);
             cbm_store_close(store);
@@ -3831,12 +4113,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* An Image's build edges (Image -> Dockerfile, pass_docker.c) belong to
      * the skaffold / compose file declaring them, not to either end: the K8s
      * pass recomputes them all from every build file, so none is kept (nor
-     * captured below). */
+     * captured below). Neither is an env join edge (pass_envjoin.c): the
+     * join recomputes them all over the whole loaded graph. */
     CBMArena decl_arena; /* the files that declared image builds before */
     cbm_arena_init_lazy(&decl_arena, CBM_SZ_4K);
     const char **decl_files = NULL;
     int decl_count = incr_build_decl_files(existing, &decl_arena, &decl_files);
     (void)cbm_gbuf_delete_edges_from_label(existing, CBM_BUILD_EDGE_TYPE, CBM_BUILD_EDGE_SOURCE);
+    (void)cbm_gbuf_delete_edges_from_label(existing, CBM_ENVJOIN_EDGE_TYPE,
+                                           CBM_ENVJOIN_EDGE_SOURCE);
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in
@@ -3877,7 +4162,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Step 3-5: Registry + extract + resolve */
     cbm_registry_t *registry = cbm_registry_new();
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    registry_seed_from_gbuf(registry, existing, files, file_count);
+    registry_seed_from_gbuf(registry, existing, project, files, file_count);
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
@@ -3943,9 +4228,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
          * pass_shell.c), an Image only through its DEPENDS_ON / USAGE edges
          * (pass_docker.c); neither carries a file: when the last file naming
          * one is gone, nothing else removes it -- a full index never makes
-         * it. This buffer holds the whole graph. */
+         * it. Nor a file-less Route (a call site's, pass_calls.c,
+         * pass_shell.c) without its last caller and handler. This buffer
+         * holds the whole graph. */
         (void)cbm_gbuf_delete_unreferenced(existing, "Process", SH_PROCESS_EDGES);
         (void)cbm_gbuf_delete_unreferenced(existing, "Image", DK_IMAGE_EDGES);
+        (void)cbm_gbuf_delete_edgeless(existing, "Route");
         phase_rc = run_postpasses(&ctx, changed_files, ci, project, true);
     }
 
