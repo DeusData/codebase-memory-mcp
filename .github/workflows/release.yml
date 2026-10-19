@@ -236,8 +236,20 @@ jobs:
       - name: Generate SBOM
         run: python3 scripts/ci/generate-sbom.py "${{ inputs.version }}"
 
+      # actions/attest-sbom is deprecated. What it does now is emit
+      # "::warning::actions/attest-sbom has been deprecated" and forward to
+      # actions/attest with NODE_OPTIONS set, passing sbom-path straight
+      # through. Calling attest directly produces the same attestation without
+      # the wrapper, and sbom-path is a first-class input there (verified
+      # against the action definition at this exact SHA, which is tag v4.1.0).
+      #
+      # This step deliberately carries no continue-on-error: a release must
+      # fail if its SBOM cannot be attested. An unattested SBOM is worse than
+      # an absent one, because the artifact still ships looking complete.
       - name: Attest SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        env:
+          NODE_OPTIONS: '--max-http-header-size=32768'
         with:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'
@@ -271,9 +283,15 @@ jobs:
         # move the release tag. (A floating HEAD also broke the 0.8.0 release:
         # HEAD had become a commit touching .github/workflows/, and the App
         # token may not create refs pointing at workflow-modifying commits.)
+        # The Go wrapper is a nested module: `go install
+        # .../pkg/go/cmd/codebase-memory-mcp@vX.Y.Z` and @latest resolve its
+        # versions from pkg/go/v* tags only (without one, Go fetches the whole
+        # repository, which is over its 500 MB module limit).
         run: |
           git tag -f "$VERSION" "$GITHUB_SHA"
           git push origin "$VERSION" --force
+          git tag -f "pkg/go/$VERSION" "$GITHUB_SHA"
+          git push origin "pkg/go/$VERSION" --force
 
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
@@ -497,6 +515,12 @@ jobs:
             npm publish --access public --provenance --tag next
           else
             npm publish --access public --provenance
+          fi
+          # `next` is "the newest you can opt into": once a stable release
+          # exists, an older RC must not stay behind it (0.9.1-rc.1 did until
+          # v0.12.1). Re-runnable: dist-tag add is idempotent.
+          if [[ "$RELEASE_VERSION" != *-* ]]; then
+            npm dist-tag add "codebase-memory-mcp@$V" next
           fi
 
       # ── PyPI ─────────────────────────────────────────────────

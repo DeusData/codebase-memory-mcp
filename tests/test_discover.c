@@ -891,6 +891,76 @@ TEST(discover_gitignore_dir_excluded_issue234) {
     PASS();
 }
 
+static int disc_git(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=master %s",
+             dir, args);
+    return system(cmd);
+}
+
+static bool disc_has(const cbm_file_info_t *files, int count, const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A .gitignore never hides a file git tracks: git applies ignore rules to
+ * untracked paths only. cluster-api's nested `.gitignore` line `manager`,
+ * meant for a built binary, hid its tracked config/manager/ kustomization.
+ * Untracked ignored files stay out, also inside a directory that is entered
+ * only for its tracked content. */
+TEST(discover_gitignore_never_hides_tracked_files) {
+    char *base = th_mktempdir("cbm_disc_tracked");
+    ASSERT(base != NULL);
+    if (disc_git(base, "init -q") != 0) {
+        th_cleanup(base);
+        FAIL("git init failed");
+    }
+    th_write_file(TH_PATH(base, ".gitignore"), "manager\n*.gen.go\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n\nfunc main() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/manager.go"), "package manager\n\nfunc Run() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/scratch.go"), "package manager\n\nfunc S() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/sub/deep.go"), "package sub\n\nfunc Deep() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/tmp/build.go"), "package tmp\n\nfunc B() {}\n");
+    th_write_file(TH_PATH(base, "api/types.gen.go"), "package api\n\nfunc Gen() {}\n");
+    th_write_file(TH_PATH(base, "api/other.gen.go"), "package api\n\nfunc Other() {}\n");
+    int add_rc = disc_git(base, "add .gitignore main.go");
+    int force_rc = disc_git(base, "add -f config/manager/manager.go config/manager/sub/deep.go "
+                                  "api/types.gen.go");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    bool main_found = rc == 0 && disc_has(files, count, "main.go");
+    bool manager_found = rc == 0 && disc_has(files, count, "config/manager/manager.go");
+    bool deep_found = rc == 0 && disc_has(files, count, "config/manager/sub/deep.go");
+    bool gen_found = rc == 0 && disc_has(files, count, "api/types.gen.go");
+    bool scratch_found = rc == 0 && disc_has(files, count, "config/manager/scratch.go");
+    bool build_found = rc == 0 && disc_has(files, count, "config/manager/tmp/build.go");
+    bool other_found = rc == 0 && disc_has(files, count, "api/other.gen.go");
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_EQ(force_rc, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(main_found);
+    /* Tracked: kept although .gitignore matches them or a directory above. */
+    ASSERT_TRUE(manager_found);
+    ASSERT_TRUE(deep_found);
+    ASSERT_TRUE(gen_found);
+    /* Untracked and ignored: still out, also below the entered directory. */
+    ASSERT_FALSE(scratch_found);
+    ASSERT_FALSE(build_found);
+    ASSERT_FALSE(other_found);
+    PASS();
+}
+
 TEST(discover_max_file_size) {
     char *base = th_mktempdir("cbm_disc_size");
     ASSERT(base != NULL);
@@ -1253,6 +1323,82 @@ TEST(discover_cbmignore_negates_always_skip_dir) {
     ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "obj"));
 
     cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* ── Laravel compiled Blade view cache (issue #1735) ─────────────── */
+
+/* storage/framework/views/ holds Laravel's compiled Blade templates: generated
+ * PHP with no source value that the php_only grammar flags as parse damage.
+ * It is skipped by default even when Laravel's stock .gitignore in that folder
+ * is missing. The match is on the path suffix, component-aligned, so ordinary
+ * views/ dirs (resources/views, app/views, app/framework/views) and look-alike
+ * prefixes (mystorage/...) stay indexed. */
+TEST(discover_skips_laravel_compiled_views_issue1735) {
+    char *base = th_mktempdir("cbm_disc_laravel_views");
+    ASSERT(base != NULL);
+
+    /* No .gitignore anywhere: the skip must come from the built-in rule. */
+    th_write_file(TH_PATH(base, "storage/framework/views/abc123.php"),
+                  "<?php $__env->startSection('title'); ?>\n"
+                  "<?php echo e($title); ?>\n"
+                  "<?php $__env->stopSection(); ?>\n");
+    th_write_file(TH_PATH(base, "backend/storage/framework/views/def456.php"),
+                  "<?php echo e($x); ?>\n");
+    th_write_file(TH_PATH(base, "resources/views/welcome.blade.php"), "<h1>{{ $title }}</h1>\n");
+    th_write_file(TH_PATH(base, "app/views/x.php"), "<?php function x() { return 1; }\n");
+    th_write_file(TH_PATH(base, "app/framework/views/y.php"), "<?php function y() {}\n");
+    th_write_file(TH_PATH(base, "mystorage/framework/views/z.php"), "<?php function z() {}\n");
+    th_write_file(TH_PATH(base, "storage/framework/views_old/w.php"), "<?php function w() {}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/framework/views/abc123.php"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "backend/storage/framework/views/def456.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "resources/views/welcome.blade.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/views/x.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/framework/views/y.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "mystorage/framework/views/z.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/framework/views_old/w.php"));
+    ASSERT_EQ(count, 5);
+    /* Reported as an excluded subtree (#411), like every built-in skip dir. */
+    ASSERT_TRUE(discover_excluded_contains(excluded, excluded_count, "storage/framework/views"));
+    ASSERT_TRUE(
+        discover_excluded_contains(excluded, excluded_count, "backend/storage/framework/views"));
+    ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "app/views"));
+    ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "resources/views"));
+
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Like the other ordinary built-in skip dirs (#500), a .cbmignore negation
+ * un-skips the compiled-view cache for a user who really wants it indexed. */
+TEST(discover_cbmignore_negates_laravel_compiled_views_issue1735) {
+    char *base = th_mktempdir("cbm_disc_laravel_views_neg");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "!storage/framework/views/\n");
+    th_write_file(TH_PATH(base, "storage/framework/views/abc123.php"), "<?php echo 1; ?>\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/framework/views/abc123.php"));
+
     cbm_discover_free(files, count);
     th_cleanup(base);
     PASS();
@@ -2306,6 +2452,7 @@ SUITE(discover) {
     RUN_TEST(discover_missing_global_excludes_is_noop);
     RUN_TEST(discover_cbmignore_negates_global_ignore);
     RUN_TEST(discover_gitignore_dir_excluded_issue234);
+    RUN_TEST(discover_gitignore_never_hides_tracked_files);
     RUN_TEST(discover_max_file_size);
     RUN_TEST(discover_null_path);
     RUN_TEST(discover_nonexistent_path);
@@ -2329,6 +2476,10 @@ SUITE(discover) {
     RUN_TEST(discover_cbmignore_negates_fast_skip_dir);
     RUN_TEST(discover_cbmignore_negation_last_match_wins);
     RUN_TEST(discover_cbmignore_negation_cannot_unskip_safety_core);
+
+    /* Laravel compiled Blade view cache (issue #1735) */
+    RUN_TEST(discover_skips_laravel_compiled_views_issue1735);
+    RUN_TEST(discover_cbmignore_negates_laravel_compiled_views_issue1735);
 
     /* .git/info/exclude support (issue #489) */
     RUN_TEST(discover_git_info_exclude);

@@ -45,6 +45,17 @@ bool cbm_daemon_process_role_requires_client(cbm_daemon_process_role_t role);
  * ABI values must never create parallel daemon namespaces. */
 cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime_parent);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Test runners only; no product binary arms it. Once armed, an endpoint
+ * request that names no runtime parent while CBM_RUNTIME_DIR is unset (one
+ * that would resolve to the account-wide default rendezvous, where the
+ * developer's live daemon listens) is refused with a diagnostic on stderr. */
+void cbm_daemon_bootstrap_forbid_default_runtime_for_test(bool forbid);
+/* The same decision cbm_daemon_bootstrap_endpoint_new makes, without
+ * resolving anything: true when that call would be refused. */
+bool cbm_daemon_bootstrap_default_runtime_refused_for_test(const char *runtime_parent);
+#endif
+
 /* Cross-platform launch policy for the daemon child. The child is invoked
  * directly (never through a shell), with exactly argv[0] plus the one hidden
  * internal argument. It is detached from the launching client's lifetime and
