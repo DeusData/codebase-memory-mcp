@@ -9415,20 +9415,27 @@ static void install_generated_client_extension(const char *label, const char *pa
      * through to the write, which reports it through the usual error path. */
     bool foreign =
         cbm_text_managed_block_status(path, CBM_ADAPTER_MARKER_START, CBM_ADAPTER_MARKER_END) == 1;
-    if (g_install_plan) {
-        plan_record(label, "extension", path);
-        if (foreign) {
+    if (foreign) {
+        /* The --plan receipt (#388) lists only writes the run will make, and
+         * its stdout carries the receipt JSON, so plan mode records nothing
+         * and prints nothing here. The dry run names the skip instead. */
+        if (g_install_plan) {
+            return;
+        }
+        if (dry_run) {
             printf("  extension: %s would be skipped — the file there is not ours (no "
                    "codebase-memory-mcp markers), so it is left untouched; delete it or add the "
                    "markers to let the installer manage it\n",
                    path);
+        } else {
+            printf("  extension: %s left untouched — the file there is not ours (no "
+                   "codebase-memory-mcp markers)\n",
+                   path);
         }
         return;
     }
-    if (foreign) {
-        printf("  extension: %s left untouched — the file there is not ours (no "
-               "codebase-memory-mcp markers)\n",
-               path);
+    if (g_install_plan) {
+        plan_record(label, "extension", path);
         return;
     }
     char *content = generate(binary_path);
