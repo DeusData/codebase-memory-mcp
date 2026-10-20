@@ -1943,6 +1943,9 @@ static bool application_index_args_normalize_defaults(yyjson_mut_val *root) {
     if (name && (!yyjson_mut_is_str(name) || yyjson_mut_get_len(name) == 0)) {
         (void)yyjson_mut_obj_remove_key(root, "name");
     }
+    /* Automatic jobs carry _cbm_background, which picks the worker count and
+     * never what is indexed, so an explicit request joins them. */
+    (void)yyjson_mut_obj_remove_key(root, "_cbm_background");
     return true;
 }
 
