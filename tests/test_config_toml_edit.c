@@ -57,7 +57,8 @@ static int cte_codex_edit_commands_detailed(const char *path, const char *comman
                                             cbm_toml_codex_hook_action_t action, int check_only,
                                             cbm_toml_codex_hook_failure_t *failure) {
     return cbm_toml_reconcile_codex_hooks_detailed(path, CTE_CODEX_BEGIN, CTE_CODEX_END, command,
-                                                   command_windows, action, check_only, failure);
+                                                   command_windows, action, check_only, failure,
+                                                   NULL);
 }
 
 static int cte_codex_edit_detailed(const char *path, cbm_toml_codex_hook_action_t action,

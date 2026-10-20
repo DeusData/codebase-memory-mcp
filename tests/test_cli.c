@@ -12197,6 +12197,89 @@ TEST(cli_codex_session_hook_issue330) {
     PASS();
 }
 
+/* The block installs up to v0.12 wrote: the lifecycle pair only, inside the
+ * markers. Upgrades and uninstalls must still recognize it as ours. */
+static const char test_codex_previous_hook_block[] =
+    "# >>> codebase-memory-mcp SessionStart >>>\n"
+    "[[hooks.SessionStart]]\n"
+    "matcher = \"startup|resume|clear|compact\"\n\n"
+    "[[hooks.SessionStart.hooks]]\n"
+    "type = \"command\"\ncommand = \"codebase-memory-mcp hook-augment\"\n"
+    "command_windows = \"codebase-memory-mcp hook-augment\"\ntimeout = 5\n\n"
+    "[[hooks.SubagentStart]]\nmatcher = \"*\"\n\n"
+    "[[hooks.SubagentStart.hooks]]\n"
+    "type = \"command\"\ncommand = \"codebase-memory-mcp hook-augment\"\n"
+    "command_windows = \"codebase-memory-mcp hook-augment\"\ntimeout = 5\n"
+    "# <<< codebase-memory-mcp SessionStart <<<\n";
+
+/* Codex shell searches get graph context in flow: the managed block adds a
+ * PreToolUse Bash hook, upgrades the previous block in place, removes either
+ * generation, keeps a user's own inline hooks.PreToolUse (TOML cannot mix an
+ * inline array with array-of-tables entries for one key), and replaces the
+ * inline form Codex may normalize ours to. */
+TEST(cli_codex_pretooluse_hook_lifecycle) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexpre-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+
+    /* fresh install: one PreToolUse Bash hook running hook-augment, idempotent */
+    write_test_file(cfg, "[mcp_servers.other]\ncommand = \"x\"\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]\nmatcher = \"Bash\""), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse.hooks]]"), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+    ASSERT_EQ(cbm_remove_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "hooks.PreToolUse"));
+    ASSERT_NOT_NULL(strstr(d, "[mcp_servers.other]"));
+
+    /* upgrade: the previous block is replaced, never refused as ambiguous */
+    char previous[2048];
+    snprintf(previous, sizeof(previous), "[mcp_servers.other]\ncommand = \"x\"\n\n%s",
+             test_codex_previous_hook_block);
+    write_test_file(cfg, previous);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]"), 1U);
+
+    /* uninstall of the previous generation */
+    write_test_file(cfg, previous);
+    ASSERT_EQ(cbm_remove_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "hooks.SessionStart"));
+    ASSERT_NULL(strstr(d, "hook-augment"));
+
+    /* a user's own inline PreToolUse stays, and our block leaves PreToolUse out */
+    const char *foreign = "[hooks]\nPreToolUse = [{ matcher = \"Bash\", hooks = [{ type = "
+                          "\"command\", command = \"/usr/local/bin/audit-shell\" }] }]\n";
+    write_test_file(cfg, foreign);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(strstr(d, "audit-shell"));
+    ASSERT_NULL(strstr(d, "[[hooks.PreToolUse]]"));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+
+    /* Codex's inline form of our own PreToolUse is replaced, not duplicated */
+    write_test_file(cfg, "[hooks]\nPreToolUse = [{ matcher = \"Bash\", hooks = [{ type = "
+                         "\"command\", command = \"codebase-memory-mcp hook-augment\", "
+                         "command_windows = \"codebase-memory-mcp hook-augment\", "
+                         "timeout = 5 }] }]\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "PreToolUse = ["));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]"), 1U);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* Gemini/Antigravity SessionStart reminder parity (settings.json JSON path). */
 TEST(cli_gemini_session_hook_parity) {
     char tmpdir[256];
@@ -13221,7 +13304,8 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     bool lifecycle_ok = first_rc == 0 && repeat_rc == 0 && dry_rc == 0 && first && repeated &&
                         after_dry && strcmp(first, repeated) == 0 && strcmp(first, after_dry) == 0;
     bool migrated = migration_rc == 0 && toml && !strstr(toml, "SessionStart") && hooks &&
-                    strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart");
+                    strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart") &&
+                    strstr(hooks, "PreToolUse");
     free(first);
     free(repeated);
     free(after_dry);
@@ -13577,6 +13661,47 @@ TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter) {
 
     if (!reached)
         FAIL("PreToolUse Bash must reach graph search augmentation");
+    PASS();
+}
+
+/* Codex sends PreToolUse for its shell tool as tool_name "Bash" with a string
+ * tool_input.command, plus its own fields (turn_id, model, permission_mode,
+ * tool_use_id, a null transcript_path). The default dialect must augment it. */
+TEST(cli_hook_augment_codex_pretooluse_payload) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    const char *input = "{\"session_id\":\"0199a1b2-codex\",\"turn_id\":\"turn-1\","
+                        "\"transcript_path\":null,\"cwd\":\"/tmp/hookproj\","
+                        "\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.6\","
+                        "\"permission_mode\":\"default\",\"tool_name\":\"Bash\","
+                        "\"tool_input\":{\"command\":\"rg -n someIndexedSymbol .\"},"
+                        "\"tool_use_id\":\"call_1\"}";
+    char *output = cbm_hook_augment_process(srv, input);
+    bool reached = output && strstr(output, "\"hookEventName\":\"PreToolUse\"") &&
+                   strstr(output, "additionalContext") && strstr(output, "someIndexedSymbol");
+    free(output);
+    cbm_mcp_server_free(srv);
+    free(project);
+
+    if (!reached)
+        FAIL("a Codex-shaped PreToolUse Bash payload must reach graph search augmentation");
     PASS();
 }
 
@@ -18500,6 +18625,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_metadata_rejects_truncated_utf8_without_oob);
     RUN_TEST(cli_aider_config_loads_installed_conventions);
     RUN_TEST(cli_codex_session_hook_issue330);
+    RUN_TEST(cli_codex_pretooluse_hook_lifecycle);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_claude_subagent_hook);
     RUN_TEST(cli_claude_hook_mutation_converges_mixed_owned_duplicates);
@@ -18525,6 +18651,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
     RUN_TEST(cli_hook_augment_context_names_graph_follow_ups);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
+    RUN_TEST(cli_hook_augment_codex_pretooluse_payload);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
