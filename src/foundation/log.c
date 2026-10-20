@@ -3,6 +3,7 @@
  */
 #include "log.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -53,9 +54,8 @@ bool cbm_log_crash_durable(void) {
 
 /* CBM_LOG_LEVEL support — distilled from #414 (closes #413, thanks @santanusinha). */
 void cbm_log_init_from_env(void) {
-    /* getenv() is safe here: this runs at startup before any thread is created,
-     * so there is no concurrent setenv() to race against. */
-    const char *raw = getenv("CBM_LOG_LEVEL");
+    /* Resolve the immutable startup override before the inherited environment. */
+    const char *raw = cbm_runtime_getenv("CBM_LOG_LEVEL");
     if (raw && raw[0] != '\0') {
         /* Textual form, case-insensitive. Index of each name == its enum value. */
         static const char *const names[] = {"debug", "info", "warn", "error", "none"};
@@ -85,7 +85,7 @@ void cbm_log_init_from_env(void) {
     /* Unrecognised value: leave the level unchanged (fail-open). */
 
 parse_format:;
-    const char *fmt = getenv("CBM_LOG_FORMAT");
+    const char *fmt = cbm_runtime_getenv("CBM_LOG_FORMAT");
     if (fmt && fmt[0] != '\0') {
         char lower_fmt[8];
         size_t i = 0;
@@ -104,6 +104,14 @@ parse_format:;
     /* Format is intentionally explicit-only. Logs stay local to stderr and the
      * optional in-process sink; deployment environment variables must not
      * silently change the operator-selected output shape. */
+}
+
+void cbm_log_init_for_process(bool quiet_by_default, bool require_info_liveness) {
+    cbm_log_set_level(quiet_by_default ? CBM_LOG_WARN : CBM_LOG_INFO);
+    cbm_log_init_from_env();
+    if (require_info_liveness && cbm_log_get_level() > CBM_LOG_INFO) {
+        cbm_log_set_level(CBM_LOG_INFO);
+    }
 }
 
 void cbm_log_set_sink(cbm_log_sink_fn fn) {

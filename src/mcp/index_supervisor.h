@@ -76,6 +76,16 @@ void cbm_index_worker_log_begin(const char *args_json, const char *repo_path);
 bool cbm_index_supervisor_capture_build_fingerprint(void);
 const char *cbm_index_supervisor_build_fingerprint(void);
 
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Test-only: the runner captures a synthetic stub (see the capture seam) so
+ * spawned workers start instantly, but a daemon runtime service can only carry
+ * the REAL image hash. A fixture that runs a real daemon and drives the
+ * production activation guard against it aligns the captured value with that
+ * hash for its duration and restores the previous value afterwards. Invalid
+ * input is ignored. Never compiled into production. */
+void cbm_index_supervisor_set_build_fingerprint_for_test(const char *fingerprint);
+#endif
+
 typedef struct {
     const char *expected_build_fingerprint;
     const char *args_json;
@@ -137,6 +147,14 @@ typedef struct {
     bool forced;
     bool tree_quiesced;
     bool supervision_failed;
+    /* #1300: the worker exited CLEAN but wrote no response (an empty or
+     * unreadable response file). A contained failure, never a success: the
+     * response stays NULL, the worker log is retained and named, and
+     * last_phase is the last structured event that log recorded ("unknown"
+     * when it holds none), so the report says where the run stopped. */
+    bool response_missing;
+    char last_phase[128];
+    char worker_log[4096];
     bool response_rejected; /* clean worker exceeded the bounded response protocol */
     char *response;         /* worker result only after a contained, uncancelled CLEAN exit;
                              * borrowed for async polls, caller-owned from the sync wrapper */
@@ -150,6 +168,10 @@ typedef enum {
     CBM_INDEX_WORKER_POLL_RUNNING = 0,
     CBM_INDEX_WORKER_POLL_TERMINAL = 1,
 } cbm_index_worker_poll_t;
+
+/* Pure Windows backstop policy, available on all platforms for regression tests.
+ * Small/zero budgets disable the OS cap, not the cooperative budget or containment. */
+size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes);
 
 /* Start returns after process creation. All string arguments are copied by the
  * contained subprocess layer. Recovery values are encoded only as hidden argv

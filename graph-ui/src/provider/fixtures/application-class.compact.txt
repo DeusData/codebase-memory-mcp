@@ -1,0 +1,18 @@
+rows_refs: 2  (cols: id prefix)
+  0 cbm-pr2068.src.daemon.application.
+  1 src/daemon/application.c
+rows_ref_rule: @N+suffix=prefix+suffix
+rows: 8  (cols: n.name n.qualified_name n.file_path n.start_line n.end_line n.is_test)
+  cbm_daemon_application @0+cbm_daemon_application @1+ "171" "200" "false"
+  cbm_daemon_application_watch @0+cbm_daemon_application_watch @1+ "98" "103" "false"
+  cbm_daemon_application_session @0+cbm_daemon_application_session @1+ "105" "131" "false"
+  cbm_daemon_application_job @0+cbm_daemon_application_job @1+ "133" "151" "false"
+  cbm_daemon_application_mutation @0+cbm_daemon_application_mutation @1+ "164" "169" "false"
+  cbm_daemon_application_watch_job_subscription @0+cbm_daemon_application_watch_job_subscription @1+ "158" "162" "false"
+  cbm_config @0+cbm_daemon_application.cbm_config @1+ "174" "174" "false"
+  cbm_watcher @0+cbm_daemon_application.cbm_watcher @1+ "173" "173" "false"
+returned: 8
+total: 8
+total_relation: eq
+has_more: false
+truncated: false

@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <aclapi.h>
+#include <ntsecapi.h>
 #include <sddl.h>
 #include <windows.h>
 #else
@@ -136,6 +137,16 @@ void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
     if (predicate && predicate[0]) {
         activation_note_refusal(predicate, os_error);
     }
+}
+
+/* Test seam: the next `count` staging writes fail with errno = os_error, so a
+ * caller's report of a full disk is testable without filling one. */
+static unsigned int activation_write_failures_for_testing;
+static int activation_write_failure_errno_for_testing;
+
+void cbm_activation_transaction_write_failures_set_for_testing(unsigned int count, int os_error) {
+    activation_write_failures_for_testing = count;
+    activation_write_failure_errno_for_testing = os_error;
 }
 #endif
 
@@ -424,6 +435,102 @@ static void activation_windows_security_destroy(activation_windows_security_t *s
     memset(security, 0, sizeof(*security));
 }
 
+/* #1705: THIS machine's built-in Administrator ACCOUNT (RID 500 under the local
+ * machine account-domain SID, S-1-5-21-<machine>-500) is a trusted owner/grantee,
+ * mirroring the daemon's win_sid_trusted (src/daemon/ipc.c). It is resolved via
+ * LSA (the local machine account-domain SID) plus CreateWellKnownSid and compared
+ * with EqualSid. It is deliberately NOT IsWellKnownSid(WinAccountAdministratorSid)
+ * and NOT a trailing-RID-500 test: both accept a FOREIGN S-1-5-21-*-500 (a domain
+ * admin, or another machine's built-in Administrator), opening a cross-machine
+ * bypass. Resolved once and cached for the process; any LSA or synthesis failure
+ * caches "none" and grants NO tolerance (fail closed). advapi32 is already loaded
+ * (this file calls GetSecurityInfo etc.), so the functions are resolved from its
+ * module handle with no new import. CLI activation is single-threaded by
+ * contract, so the cache needs no lock. */
+typedef NTSTATUS(NTAPI *activation_lsa_open_policy_fn)(PLSA_UNICODE_STRING, PLSA_OBJECT_ATTRIBUTES,
+                                                       ACCESS_MASK, PLSA_HANDLE);
+typedef NTSTATUS(NTAPI *activation_lsa_query_information_policy_fn)(LSA_HANDLE,
+                                                                    POLICY_INFORMATION_CLASS,
+                                                                    PVOID *);
+typedef NTSTATUS(NTAPI *activation_lsa_free_memory_fn)(PVOID);
+typedef NTSTATUS(NTAPI *activation_lsa_close_fn)(LSA_HANDLE);
+typedef BOOL(WINAPI *activation_create_well_known_sid_fn)(WELL_KNOWN_SID_TYPE, PSID, PSID, DWORD *);
+
+static PSID activation_windows_local_admin_sid(void) {
+    static bool resolved = false;
+    static PSID cached = NULL;
+    if (resolved) {
+        return cached;
+    }
+    resolved = true;
+    HMODULE advapi = GetModuleHandleW(L"advapi32.dll");
+    if (!advapi) {
+        return NULL;
+    }
+    activation_lsa_open_policy_fn lsa_open =
+        (activation_lsa_open_policy_fn)(void (*)(void))GetProcAddress(advapi, "LsaOpenPolicy");
+    activation_lsa_query_information_policy_fn lsa_query =
+        (activation_lsa_query_information_policy_fn)(void (*)(void))GetProcAddress(
+            advapi, "LsaQueryInformationPolicy");
+    activation_lsa_free_memory_fn lsa_free =
+        (activation_lsa_free_memory_fn)(void (*)(void))GetProcAddress(advapi, "LsaFreeMemory");
+    activation_lsa_close_fn lsa_close =
+        (activation_lsa_close_fn)(void (*)(void))GetProcAddress(advapi, "LsaClose");
+    activation_create_well_known_sid_fn create_sid =
+        (activation_create_well_known_sid_fn)(void (*)(void))GetProcAddress(advapi,
+                                                                            "CreateWellKnownSid");
+    if (!lsa_open || !lsa_query || !lsa_free || !lsa_close || !create_sid) {
+        return NULL;
+    }
+    LSA_OBJECT_ATTRIBUTES attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    LSA_HANDLE policy = NULL;
+    /* STATUS_SUCCESS is 0; any other status is treated as failure (fail closed). */
+    if (lsa_open(NULL, &attributes, POLICY_VIEW_LOCAL_INFORMATION, &policy) != 0 || !policy) {
+        return NULL;
+    }
+    POLICY_ACCOUNT_DOMAIN_INFO *domain = NULL;
+    if (lsa_query(policy, PolicyAccountDomainInformation, (PVOID *)&domain) == 0 && domain &&
+        domain->DomainSid && IsValidSid(domain->DomainSid)) {
+        DWORD needed = 0;
+        (void)create_sid(WinAccountAdministratorSid, domain->DomainSid, NULL, &needed);
+        if (needed > 0U) {
+            PSID admin = malloc(needed);
+            if (admin &&
+                create_sid(WinAccountAdministratorSid, domain->DomainSid, admin, &needed) &&
+                IsValidSid(admin)) {
+                cached = admin;
+            } else {
+                free(admin);
+            }
+        }
+    }
+    if (domain) {
+        (void)lsa_free(domain);
+    }
+    (void)lsa_close(policy);
+    return cached;
+}
+
+/* #2023/#1686: an owner refusal must name WHICH owner, not just "status -3, os 0".
+ * The path is already carried by g_activation_refusal_object; this appends the
+ * offending owner's SID string, mirroring the daemon's ACL/owner diagnostics, so
+ * the operator sees the exact identity to remove or the directory to move. */
+static void activation_windows_note_untrusted_owner(const char *predicate, PSID owner,
+                                                    DWORD os_error) {
+    char label[192];
+    LPSTR owner_text = NULL;
+    (void)snprintf(
+        label, sizeof(label), "%s; owner=%s", predicate,
+        (owner && IsValidSid(owner) && ConvertSidToStringSidA(owner, &owner_text) && owner_text)
+            ? owner_text
+            : "unresolved-sid");
+    if (owner_text) {
+        (void)LocalFree(owner_text);
+    }
+    activation_note_refusal(label, os_error);
+}
+
 /* Trusted-owner acceptance for SOURCE-side objects: a downloaded release
  * bundle is owned by whatever the machine's default-owner policy dictates
  * (Administrators on GitHub-runner-class images). Its integrity is enforced
@@ -440,11 +547,13 @@ static bool activation_windows_owner_is_trusted(HANDLE handle) {
     PSECURITY_DESCRIPTOR descriptor = NULL;
     DWORD result = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL,
                                    NULL, NULL, &descriptor);
+    PSID local_admin = activation_windows_local_admin_sid();
     bool trusted = result == ERROR_SUCCESS && owner && IsValidSid(owner) &&
                    (EqualSid(owner, user_sid) || IsWellKnownSid(owner, WinLocalSystemSid) ||
-                    IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
+                    IsWellKnownSid(owner, WinBuiltinAdministratorsSid) ||
+                    (local_admin && EqualSid(owner, local_admin)));
     if (!trusted) {
-        activation_note_refusal("owner-not-trusted", result);
+        activation_windows_note_untrusted_owner("owner-not-trusted", owner, result);
     }
     if (descriptor) {
         (void)LocalFree(descriptor);
@@ -522,7 +631,7 @@ static bool activation_windows_owner_is_current(HANDLE handle) {
         }
     }
     if (!same) {
-        activation_note_refusal("owner-not-current-user", result);
+        activation_windows_note_untrusted_owner("owner-not-current-user", owner, result);
     }
     if (descriptor) {
         (void)LocalFree(descriptor);
@@ -596,10 +705,15 @@ static bool activation_windows_acl_check(HANDLE handle, DWORD tolerated_untruste
         PSID sid = (PSID)&ace->SidStart;
         size_t sid_capacity = (size_t)header->AceSize - sid_offset;
         DWORD sid_length = GetSidLengthRequired(((SID *)sid)->SubAuthorityCount);
+        PSID local_admin = activation_windows_local_admin_sid();
         bool trusted = sid_length <= sid_capacity && IsValidSid(sid) &&
                        GetLengthSid(sid) == sid_length &&
                        (EqualSid(sid, user_sid) || IsWellKnownSid(sid, WinLocalSystemSid) ||
                         IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+                        /* #1705: THIS machine's built-in Administrator (RID-500),
+                         * resolved via LSA — never a foreign S-1-5-21-*-500; same
+                         * tolerance as the daemon's win_sid_trusted. */
+                        (local_admin && EqualSid(sid, local_admin)) ||
                         /* OWNER RIGHTS modulates whoever owns the object; the
                          * owner is separately validated in every chain that
                          * reaches here (same tolerance as the daemon IPC and
@@ -608,9 +722,17 @@ static bool activation_windows_acl_check(HANDLE handle, DWORD tolerated_untruste
         if (!trusted) {
             char label[128];
             LPSTR sid_text = NULL;
-            (void)snprintf(label, sizeof(label), "acl-grants-cross-account-mutation to %s",
+            /* #1856: say whether the grant is INHERITED. The remedy differs and
+             * the wrong one silently does nothing: `icacls <dir> /remove:g <sid>`
+             * cannot remove an inherited ACE -- that needs `/inheritance:r` --
+             * and the stock `C:\` ACE for Authenticated Users reaches every new
+             * child directory exactly this way. A reporter following the
+             * generic advice sees the command succeed and the refusal persist. */
+            bool inherited = (header->AceFlags & INHERITED_ACE) != 0;
+            (void)snprintf(label, sizeof(label), "acl-grants-cross-account-mutation to %s%s",
                            ConvertSidToStringSidA(sid, &sid_text) && sid_text ? sid_text
-                                                                              : "unparsable-sid");
+                                                                              : "unparsable-sid",
+                           inherited ? " (inherited from a parent directory)" : "");
             if (sid_text) {
                 (void)LocalFree(sid_text);
             }
@@ -778,8 +900,16 @@ static bool activation_posix_acl_empty(int descriptor) {
 }
 
 static char *activation_posix_walk_path(const char *directory) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
+    /* macOS and immutable Linux layouts can expose writable trees through
+     * root-owned aliases (for example /tmp and /home on Atomic systems).
+     * Resolve only these trusted system aliases; arbitrary user symlinks must
+     * still fail the O_NOFOLLOW walk below. */
+#ifdef __linux__
+    static const char *const aliases[] = {"/tmp", "/var", "/home"};
+#else
     static const char *const aliases[] = {"/tmp", "/var"};
+#endif
     for (size_t index = 0; index < sizeof(aliases) / sizeof(aliases[0]); index++) {
         const char *alias = aliases[index];
         size_t alias_length = strlen(alias);
@@ -789,8 +919,13 @@ static char *activation_posix_walk_path(const char *directory) {
         }
         struct stat alias_status;
         char resolved[4096];
-        if (lstat(alias, &alias_status) != 0 || !S_ISLNK(alias_status.st_mode) ||
-            alias_status.st_uid != 0 || !realpath(alias, resolved)) {
+        if (lstat(alias, &alias_status) != 0) {
+            continue;
+        }
+        if (!S_ISLNK(alias_status.st_mode)) {
+            continue;
+        }
+        if (alias_status.st_uid != 0 || !realpath(alias, resolved)) {
             return NULL;
         }
         struct stat resolved_status;
@@ -1009,6 +1144,13 @@ static bool activation_native_sync(activation_native_file_t file) {
 
 static bool activation_native_write_all(activation_native_file_t file, const void *data,
                                         size_t length) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (activation_write_failures_for_testing > 0) {
+        activation_write_failures_for_testing--;
+        errno = activation_write_failure_errno_for_testing;
+        return false;
+    }
+#endif
     const unsigned char *cursor = data;
     while (length > 0) {
 #ifdef _WIN32
@@ -1493,6 +1635,16 @@ static void activation_failed_stage_cleanup(cbm_activation_transaction_t *transa
     }
 }
 
+/* A failed stage write reports IO with errno restored, after the cleanup, to
+ * the error of the call that failed (0 when none applies), so the caller can
+ * name it. */
+static cbm_activation_transaction_status_t activation_stage_io_failure(
+    cbm_activation_transaction_t *transaction, int os_error) {
+    activation_failed_stage_cleanup(transaction);
+    errno = os_error;
+    return CBM_ACTIVATION_TRANSACTION_IO;
+}
+
 cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
     const char *target_path, const void *candidate, size_t candidate_size,
     cbm_activation_transaction_t **transaction_out) {
@@ -1518,11 +1670,20 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
     }
     transaction->staged_exists = true;
     bool written = activation_native_write_all(staged, candidate, candidate_size);
+    int os_error = written ? 0 : errno;
     bool durable = written && activation_native_sync(staged);
+    if (written && !durable) {
+        os_error = errno;
+    }
     bool closed = activation_native_close(staged);
-    if (!written || !durable || !closed || !activation_sync_directory(transaction)) {
-        activation_failed_stage_cleanup(transaction);
-        return CBM_ACTIVATION_TRANSACTION_IO;
+    if (!closed && os_error == 0) {
+        os_error = errno;
+    }
+    if (!written || !durable || !closed) {
+        return activation_stage_io_failure(transaction, os_error);
+    }
+    if (!activation_sync_directory(transaction)) {
+        return activation_stage_io_failure(transaction, errno);
     }
     *transaction_out = transaction;
     return CBM_ACTIVATION_TRANSACTION_OK;
@@ -1672,28 +1833,45 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_file(
     unsigned char buffer[64U * 1024U];
     size_t total = 0;
     bool copied = true;
+    int os_error = 0;
     for (;;) {
         size_t amount = 0;
         if (!activation_native_read(source, buffer, sizeof(buffer), &amount)) {
             copied = false;
+            os_error = errno;
             break;
         }
         if (amount == 0) {
             break;
         }
-        if (SIZE_MAX - total < amount || !activation_native_write_all(staged, buffer, amount)) {
+        if (SIZE_MAX - total < amount) {
             copied = false;
+            break;
+        }
+        if (!activation_native_write_all(staged, buffer, amount)) {
+            copied = false;
+            os_error = errno;
             break;
         }
         total += amount;
     }
     bool durable = copied && total > 0 && activation_native_sync(staged);
+    if (copied && total > 0 && !durable) {
+        os_error = errno;
+    }
     bool source_closed = activation_native_close(source);
+    if (!source_closed && os_error == 0) {
+        os_error = errno;
+    }
     bool staged_closed = activation_native_close(staged);
-    if (!copied || total == 0 || !durable || !source_closed || !staged_closed ||
-        !activation_sync_directory(transaction)) {
-        activation_failed_stage_cleanup(transaction);
-        return CBM_ACTIVATION_TRANSACTION_IO;
+    if (!staged_closed && os_error == 0) {
+        os_error = errno;
+    }
+    if (!copied || total == 0 || !durable || !source_closed || !staged_closed) {
+        return activation_stage_io_failure(transaction, os_error);
+    }
+    if (!activation_sync_directory(transaction)) {
+        return activation_stage_io_failure(transaction, errno);
     }
     *transaction_out = transaction;
     return CBM_ACTIVATION_TRANSACTION_OK;

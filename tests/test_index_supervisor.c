@@ -6,9 +6,12 @@
 #include "daemon/bootstrap.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/profile.h"
+#include "foundation/constants.h"
 #include "mcp/index_supervisor.h"
+#include "mcp/mcp.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -560,7 +563,8 @@ static bool index_supervisor_test_run_probe(const char *mode, bool profiling,
     (void)snprintf(args, sizeof(args), "{\"__cbm_test_worker\":\"%s\"}", mode);
     cbm_profile_active = profiling;
     cbm_index_worker_handle_t *handle = NULL;
-    if (cbm_index_worker_start(args, 0, false, NULL, NULL, &handle) != 0 || !handle) {
+    const size_t budget = (size_t)1024U * 1024U * 1024U;
+    if (cbm_index_worker_start(args, budget, false, NULL, NULL, &handle) != 0 || !handle) {
         return false;
     }
     char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP];
@@ -588,6 +592,17 @@ static bool index_supervisor_test_run_probe(const char *mode, bool profiling,
     return terminal;
 }
 
+static char g_index_supervisor_memory_log[1024];
+static int g_index_supervisor_memory_log_count;
+
+static void index_supervisor_test_memory_log_sink(const char *line) {
+    if (strstr(line, "index.supervisor.worker_memory")) {
+        g_index_supervisor_memory_log_count++;
+        (void)snprintf(g_index_supervisor_memory_log, sizeof(g_index_supervisor_memory_log), "%s",
+                       line);
+    }
+}
+
 TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-index-logs-XXXXXX", cbm_tmpdir());
@@ -596,6 +611,14 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool saved_profile = cbm_profile_active;
     (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    g_index_supervisor_memory_log[0] = '\0';
+    g_index_supervisor_memory_log_count = 0;
+    cbm_log_set_sink_ex(index_supervisor_test_memory_log_sink, CBM_LOG_SINK_TEE);
 
     cbm_proc_outcome_t clean_outcome = CBM_PROC_SPAWN_FAILED;
     cbm_proc_outcome_t profile_outcome = CBM_PROC_SPAWN_FAILED;
@@ -621,6 +644,9 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     bool crash_classified_failure = crash_outcome == CBM_PROC_CRASH;
 #endif
 
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_log_set_format(saved_format);
     cbm_profile_active = saved_profile;
     index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
     (void)th_rmtree(cache);
@@ -640,6 +666,58 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     ASSERT_FALSE(crash_response);
     ASSERT_TRUE(crash_log);
     ASSERT_FALSE(crash_response_file);
+#ifdef _WIN32
+    ASSERT_EQ(g_index_supervisor_memory_log_count, 1); /* crash only, never clean */
+    ASSERT_TRUE(strstr(g_index_supervisor_memory_log, "job_limit_bytes=1610612736") != NULL);
+    ASSERT_TRUE(strstr(g_index_supervisor_memory_log, "peak_job_memory_bytes=") != NULL);
+    ASSERT_TRUE(strstr(g_index_supervisor_memory_log, "unavailable") == NULL);
+#else
+    ASSERT_EQ(g_index_supervisor_memory_log_count, 0);
+#endif
+    PASS();
+}
+
+TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-heartbeat-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_log_level = getenv("CBM_LOG_LEVEL");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char *saved_log_level = old_log_level ? cbm_strdup(old_log_level) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    (void)cbm_unsetenv("CBM_LOG_LEVEL");
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"heartbeat\"}", 0, false,
+                                          NULL, NULL, &handle);
+    char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
+    if (handle) {
+        (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
+    }
+    bool ready = log_path[0] && index_supervisor_test_wait_file_text(
+                                    log_path, "async worker heartbeat probe ready",
+                                    INDEX_SUPERVISOR_TEST_READY_MS);
+    bool heartbeat = ready && index_supervisor_test_wait_file_text(
+                                  log_path, "msg=pipeline.discover", 1000);
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool clean = terminal && result && result->outcome == CBM_PROC_CLEAN && result->response;
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_dump("heartbeat worker log", log_path);
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    index_supervisor_test_restore_env("CBM_LOG_LEVEL", saved_log_level);
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(heartbeat);
+    ASSERT_TRUE(clean);
     PASS();
 }
 
@@ -762,6 +840,82 @@ TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained) {
     PASS();
 }
 
+static char g_index_supervisor_no_response_log[CBM_SZ_2K];
+
+static void index_supervisor_test_no_response_sink(const char *line) {
+    if (strstr(line, "index.supervisor.no_response")) {
+        (void)snprintf(g_index_supervisor_no_response_log,
+                       sizeof(g_index_supervisor_no_response_log), "%s", line);
+    }
+}
+
+/* #1300: a worker that exits 0 without writing its response. The supervisor
+ * pre-creates the response file, so the old read returned "" and the run was
+ * a SUCCESS with an empty response; the clean-exit branch then deleted the
+ * worker log, the only record of where the run stopped. It must instead be a
+ * named failure: no response, the log retained, and the last phase the log
+ * recorded (incremental.edge_snapshot, not the plain stderr line after it). */
+TEST(index_supervisor_clean_exit_without_response_is_named_failure_issue1300) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-silent-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    g_index_supervisor_no_response_log[0] = '\0';
+    cbm_log_set_sink_ex(index_supervisor_test_no_response_sink, CBM_LOG_SINK_TEE);
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"silent-exit\"}", 0, false, NULL,
+                                          NULL, &handle);
+    char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
+    if (handle) {
+        (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
+    }
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool clean_exit = terminal && result && result->outcome == CBM_PROC_CLEAN &&
+                      result->exit_code == 0 && result->tree_quiesced;
+    bool no_response = terminal && result && result->response == NULL;
+    bool named = terminal && result && result->response_missing &&
+                 strcmp(result->last_phase, "incremental.edge_snapshot") == 0 &&
+                 strcmp(result->worker_log, log_path) == 0;
+    bool not_success =
+        terminal && result &&
+        cbm_mcp_supervised_result_disposition(0, result) != CBM_MCP_SUPERVISED_RESULT_SUCCESS;
+    bool log_retained = log_path[0] && cbm_file_size(log_path) > 0;
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_dump("silent-exit worker log", log_path);
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_log_set_format(saved_format);
+    bool event_named = strstr(g_index_supervisor_no_response_log,
+                              "last_phase=incremental.edge_snapshot") != NULL &&
+                       log_path[0] && strstr(g_index_supervisor_no_response_log, log_path) != NULL;
+    (void)cbm_unlink(log_path);
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(clean_exit);
+    ASSERT_TRUE(no_response);
+    ASSERT_TRUE(not_success);
+    ASSERT_TRUE(named);
+    ASSERT_TRUE(log_retained);
+    ASSERT_TRUE(event_named);
+    PASS();
+}
+
 /* #1070, #1130, #1132, #1133, #1145, #1450: six reports of an indexing worker
  * that died leaving "the worker log file is completely empty (0 KB)". Nothing
  * was ever flushed, so not one of them is reproducible or attributable — the
@@ -849,12 +1003,31 @@ TEST(index_supervisor_killed_worker_log_is_never_empty_and_names_the_run) {
     PASS();
 }
 
+TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow) {
+    const size_t mib = (size_t)1024U * 1024U;
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(0) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(4096) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(8192) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(512U * mib - 1) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(512U * mib) == 768U * mib);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(512U * mib + 1) == 768U * mib + 1);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(1024U * mib) == 1536U * mib);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(SIZE_MAX / 2) ==
+                SIZE_MAX / 2 + (SIZE_MAX / 2) / 2);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(SIZE_MAX - 1) == SIZE_MAX);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(SIZE_MAX) == SIZE_MAX);
+    PASS();
+}
+
 SUITE(index_supervisor) {
+    RUN_TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow);
     RUN_TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar);
     RUN_TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached);
     RUN_TEST(index_supervisor_sync_wrapper_forwards_cancel_and_drains_tree);
     RUN_TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling);
+    RUN_TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat);
     RUN_TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback);
     RUN_TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained);
+    RUN_TEST(index_supervisor_clean_exit_without_response_is_named_failure_issue1300);
     RUN_TEST(index_supervisor_killed_worker_log_is_never_empty_and_names_the_run);
 }

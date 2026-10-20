@@ -1,0 +1,16 @@
+{
+  "name": "tree-sitter-arkts",
+  "version": "0.1.0",
+  "description": "ArkTS (HarmonyOS .ets) grammar for tree-sitter — fork of tree-sitter-typescript",
+  "keywords": ["tree-sitter", "arkts", "ets", "harmonyos", "openharmony", "arkui"],
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.arkts",
+      "file-types": ["ets"]
+    }
+  ]
+}

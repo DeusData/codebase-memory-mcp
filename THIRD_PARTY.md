@@ -37,7 +37,7 @@ The core runtime headers in `internal/cbm/vendored/common/tree_sitter/`
 
 ## Tree-sitter Grammars
 
-159 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
+160 pre-generated parsers are vendored in `internal/cbm/vendored/grammars/<lang>/`
 (generated `parser.c` plus `scanner.c` where applicable, compiled statically).
 Each grammar is the work of its upstream authors and each grammar directory
 contains the upstream `LICENSE` file.
@@ -52,12 +52,49 @@ License summary:
 - `clojure` ([sogaiu/tree-sitter-clojure](https://github.com/sogaiu/tree-sitter-clojure)) is **CC0-1.0**;
   `fennel` is **CC0-1.0**; `jinja2` and `just` are **Apache-2.0**;
   `pine` is **ISC** (declared by its upstream).
-- The grammars authored in-house for this project (`cobol`, `form`, `janet`,
-  `magma`, `protobuf`, `wolfram`) are **MIT** under the project's own license,
-  (c) DeusData. Six further grammars (`assembly`, `cfml`, `cfscript`,
-  `dotenv`, `pine`, `qml`) are self-maintained forks that retain their
-  original upstream authors' licenses — see the manifest for per-grammar
-  provenance.
+- The grammars authored in-house for this project (`chialisp`, `cobol`, `form`,
+  `janet`, `magma`, `protobuf`, `wolfram`) are **MIT** under the project's own
+  license, (c) DeusData. Each ships the repository's own LICENSE, byte-identical
+  to the root copy; they carry no third-party copyright because there is no
+  third party. `chialisp` is a generic s-expression grammar for the Chia
+  smart-coin language, written for this project because no usable public
+  grammar exists; its source and corpus tests live in
+  `tools/tree-sitter-chialisp/`.
+- Ten further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `javascript`, `pascal`, `pine`, `qml`, `tsx`) are
+  self-maintained forks that retain their original upstream authors' licenses —
+  see the manifest for per-grammar provenance. `arkts` is a first-party derivative of
+  [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
+  (MIT, (c) 2017 Max Brunsfeld; on the
+  [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
+  base, MIT, (c) 2014 Max Brunsfeld) with (c) 2026 DeusData ArkTS additions;
+  its grammar source lives in `tools/tree-sitter-arkts/`. `javascript`
+  ([tree-sitter/tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript),
+  MIT, (c) 2014 Max Brunsfeld) and `tsx`
+  ([tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)'s
+  `tsx` dialect, MIT, (c) 2017 Max Brunsfeld, on the same javascript base) are
+  the upstream grammars with one (c) 2026 DeusData patch that lets a lone `&`
+  appear in JSX strings and text; their grammar sources live in
+  `tools/tree-sitter-javascript/` and `tools/tree-sitter-tsx/`. `pascal`
+  ([Isopod/tree-sitter-pascal](https://github.com/Isopod/tree-sitter-pascal),
+  MIT, (c) 2018 Benjamin Gray) is the upstream grammar with one (c) 2026
+  DeusData patch that accepts non-ASCII letters in identifiers; its grammar
+  source lives in `tools/tree-sitter-pascal/`.
+
+### tree-sitter-plsql
+
+- **Project:** [AndreasMaierDe/tree-sitter-plsql](https://github.com/AndreasMaierDe/tree-sitter-plsql)
+- **License:** MIT
+- **Copyright:** (c) 2022 AndreasMaierDe
+- **Vendored at:** `internal/cbm/vendored/grammars/plsql/`
+- **Pinned commit:** `28aebef209be`
+- **Notes:** Community-maintained grammar for Oracle PL/SQL; not in the
+  nvim-treesitter or Helix registries (`community-niche` in the manifest). No
+  external scanner. One local patch: `parser.c`'s
+  `#include <tree_sitter/parser.h>` is changed to the quoted form used by every
+  other vendored grammar, as documented in
+  `internal/cbm/vendored/grammars/MANIFEST.md`. PL/SQL support was originally
+  contributed in PR #1033 by Oğuz (@ouzsrcm).
 
 ### tree-sitter-objectscript (UDL + routine)
 
@@ -104,6 +141,109 @@ Semantic vector search uses static token embeddings derived from the
 
 See `vendored/nomic/NOTICE` for the exact derivation procedure
 (per-token inference + int8 quantization via `scripts/extract_nomic_vectors.py`).
+
+## Embedded Character Data (PDF text layer)
+
+The PDF text-layer extractor (`internal/cbm/pdf/`) carries static tables
+derived from the following sources. No upstream source code is included.
+
+- **Adobe Glyph List** — the glyph-name subset in `internal/cbm/pdf/pdf_tables.c`
+  (the names of the standard Latin encodings and common symbols, mapped to
+  Unicode) follows [adobe-type-tools/agl-aglfn](https://github.com/adobe-type-tools/agl-aglfn)
+  `glyphlist.txt`.
+  - **License:** BSD-3-Clause
+  - **Copyright:** Copyright 2002-2019 Adobe (http://www.adobe.com/).
+- **Adobe core-14 font metrics** — the advance widths of the printable ASCII
+  range of Helvetica and Times-Roman in `pdf_tables.c` (used only for a
+  standard-14 font that omits its `/Widths`) are the values of Adobe's
+  core-14 AFM files. The AFM files themselves are not distributed.
+  - **Copyright:** Copyright (c) 1985, 1987, 1989, 1990, 1997 Adobe Systems
+    Incorporated. All Rights Reserved.
+- **Unicode Character Database** — `internal/cbm/pdf/pdf_unicode.c` (NFKC of
+  each code point, canonical compositions, character classes) is generated
+  by `scripts/gen-pdf-unicode.py` from CPython's `unicodedata` (Unicode
+  16.0.0).
+  - **License:** Unicode License v3 (text below)
+  - **Copyright:** Copyright © 1991-2026 Unicode, Inc.
+- The base encodings (Standard, WinAnsi, MacRoman, Symbol) are those of
+  ISO 32000-1, Annex D.
+
+Adobe Glyph List license (BSD-3-Clause):
+
+```
+Copyright 2002-2019 Adobe (http://www.adobe.com/).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors may be
+used to endorse or promote products derived from this software without
+specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+Unicode License v3:
+
+```
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2026 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+```
 
 ## Hybrid LSP — Reference Language Servers
 

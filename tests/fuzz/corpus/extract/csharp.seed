@@ -1,0 +1,6 @@
+Program.cs
+using System;
+namespace App {
+  public interface IRepo { string Get(int id); }
+  public class Repo : IRepo { public string Get(int id) => id.ToString(); }
+}

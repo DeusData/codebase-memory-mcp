@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define CBM_DAEMON_SEMVER_SIZE 12U
+
 /* Detailed post-admission operation ABI. It is deliberately absent from the
  * stable endpoint HELLO: an exact executable fingerprint already selects this
  * layout, while conflicting generations must remain able to diagnose each
@@ -212,6 +214,12 @@ typedef struct {
     cbm_daemon_client_id_t client_id;
     /* Kernel-authenticated PID of this client as observed by the daemon. */
     uint64_t authenticated_process_id;
+    /* Nonzero only when the transport connect succeeded but no valid response
+     * arrived in time: the kernel-reported PID of the process that holds the
+     * endpoint. A held-but-mute endpoint is a live process whose runtime is
+     * wedged (2026-08-29 zombie incident) — callers must report this PID
+     * rather than fold the failure into plain absence. */
+    uint64_t muted_endpoint_holder_pid;
     cbm_daemon_conflict_t conflict;
     char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
 } cbm_daemon_runtime_connect_result_t;
@@ -262,7 +270,12 @@ typedef struct {
     uint8_t client_count; /* entries in client_pids, capped at the wire limit */
     uint32_t client_pids[CBM_DAEMON_CONTROL_CLIENT_CAP];
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    char semantic_version[12];
+    char semantic_version[CBM_DAEMON_SEMVER_SIZE];
+    /* Meaningful even when the status request itself FAILED: nonzero when the
+     * endpoint accepted the transport connect but answered nothing — the
+     * kernel-reported PID of the mute holder. `daemon status` uses this to
+     * name a zombie generation instead of reporting bare "not running". */
+    uint64_t muted_endpoint_holder_pid;
 } cbm_daemon_runtime_status_t;
 
 typedef struct {
@@ -287,6 +300,17 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
                                      const cbm_daemon_build_identity_t *identity,
                                      uint32_t timeout_ms,
                                      cbm_daemon_runtime_stop_result_t *result_out);
+
+/* #2277: the actionable half of a version/build conflict refusal. The
+ * conflict text itself (cbm_daemon_conflict_format) is wire-validated
+ * byte-for-byte across generations and must not change, so the remedy is a
+ * separate, client-side sentence built from the cross-build STATUS probe:
+ * which daemon holds the endpoint (pid, version, lifetime), which CBM
+ * sessions keep it alive, and how to clear it. active may be NULL when the
+ * status probe did not answer. Returns false (out empty) on truncation. */
+#define CBM_DAEMON_CONFLICT_REMEDY_SIZE 640U
+bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active, char *out,
+                                       size_t out_size);
 
 /* Performs the complete guarded first-participant handoff, starts listening
  * synchronously, then owns both that participant claim and its
@@ -316,6 +340,13 @@ uint64_t cbm_daemon_runtime_service_clients_admitted_total(cbm_daemon_runtime_se
 /* Includes accepted connections still waiting for HELLO. Never exceeds the
  * configured max_clients; over-cap peers receive REJECTED before close. */
 size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_t *service);
+
+/* Re-evaluate an ephemeral generation that is lingering after its last committed
+ * client disconnected (the bounded cold-storm debounce). Retires it once the
+ * linger window elapses with no new client committing; the bound also rules out
+ * an unbounded idle hang. The host lifetime loop calls this every tick; it is a
+ * no-op unless a last-committed-client linger is armed. */
+void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service);
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,
                                                   const char *project_key);
 uint64_t cbm_daemon_runtime_service_client_process_id(cbm_daemon_runtime_service_t *service,
@@ -419,6 +450,48 @@ void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force);
  * i.e. the tamper case that must still be rejected after unverifiable images
  * became admissible. */
 void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force);
+/* #1955 test seam: make the peer look like a different file with identical
+ * bytes (second install path, package-manager copy) so the fingerprint
+ * fallback runs; the counter reports how many full-image fingerprints the
+ * HELLO path has computed in this process. */
+void cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(bool force);
+uint64_t cbm_daemon_runtime_peer_image_hashes_for_testing(void);
+/* Abandoned-request containment seams (2026-08-29 zombie incident). The
+ * timeout override shrinks the join ceiling to test scale; zero restores the
+ * production constant. The hook replaces the terminal containment stop with a
+ * recordable callback so an in-process harness survives the trigger; NULL
+ * restores process termination. */
+typedef void (*cbm_daemon_runtime_containment_hook_t)(const char *component);
+void cbm_daemon_runtime_set_abandoned_request_join_timeout_for_testing(uint32_t timeout_ms);
+void cbm_daemon_runtime_set_containment_hook_for_testing(
+    cbm_daemon_runtime_containment_hook_t hook);
+/* Cold-storm ephemeral-linger seam (2026-09). Overrides the bounded linger
+ * window the last-committed-client retirement grants while cohort participants
+ * are mid-bootstrap, so a test drives both the linger and its expiry backstop
+ * in test time. UINT32_MAX restores the production constant; any other value
+ * (0 = expire immediately) overrides. Process-global; reset it after use. */
+void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms);
+/* Connection-cap seams (flaky-ledger item 12). While held, the two bounded
+ * waits on a peer in the connection-cap path end only on that peer: a
+ * connection that has not sent its first frame keeps its worker slot until it
+ * closes (or the service stops) instead of until the request deadline, and an
+ * inline rejection's drain (Windows; a no-op on POSIX) lasts until the peer
+ * closes instead of 250 ms. A "slow hello" becomes a state the test releases,
+ * not a window it races. Process-global; reset it after use. */
+void cbm_daemon_runtime_hold_peer_waits_for_testing(bool hold);
+/* The four points that order a HELLO against an inline accept-loop rejection.
+ * The hook runs on the client thread for the CLIENT_* points and on the accept
+ * thread for the DAEMON_* points (never under the service mutex), so a test can
+ * pin either order: daemon answers after the HELLO is on the wire, or the
+ * daemon has answered and closed before the HELLO is sent. NULL removes it. */
+typedef enum {
+    CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_CONNECTED = 0, /* transport up, HELLO not sent */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_SENT,          /* HELLO send attempted */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTING,     /* inline rejection not yet written */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTED,      /* inline rejection written + closed */
+} cbm_daemon_runtime_hello_point_t;
+typedef void (*cbm_daemon_runtime_hello_hook_t)(cbm_daemon_runtime_hello_point_t point);
+void cbm_daemon_runtime_set_hello_hook_for_testing(cbm_daemon_runtime_hello_hook_t hook);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */

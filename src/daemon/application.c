@@ -10,14 +10,18 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/mem.h"
+#include "foundation/mem_core.h"
+#include "foundation/json_writer.h"
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
 #include "foundation/subprocess.h"
+#include "foundation/workspace.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
+#include "store/graph_mem.h"
 #include "ui/config.h"
 #include "watcher/watcher.h"
 
@@ -31,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -126,6 +131,9 @@ struct cbm_daemon_application_session {
     bool update_notice_delivered;
     bool pending_background_initialize;
     bool pending_update_notice;
+    /* #2144: the current request arrived on the one-shot tool channel (the
+     * `cli` command path), whose client closes right after the reply. */
+    bool one_shot_request;
     cbm_daemon_application_session_t *next;
 };
 
@@ -146,7 +154,30 @@ struct cbm_daemon_application_job {
     bool cancelled;
     bool cancel_requested;
     bool supervision_failed;
+    /* #2144: an async index_repository holds one subscriber reference on
+     * the application's behalf, released only at terminal publish, so the
+     * job outlives the request and session that started it. */
+    bool async_owned;
+    bool worker_started;
     cbm_daemon_application_job_t *next;
+};
+
+/* #2144: the last known index outcome per project, kept after the terminal
+ * job itself is reaped so index_repository(status: true) can answer after
+ * completion. sync_cut_short records that a synchronous caller gave up (client
+ * cancel, deadline, disconnect) before its index finished; the next
+ * index_repository or status call for that project carries the async advice.
+ * This is job bookkeeping, not graph freshness (index_status owns that). */
+typedef struct cbm_daemon_application_index_record cbm_daemon_application_index_record_t;
+struct cbm_daemon_application_index_record {
+    char *project_key;
+    const char *state; /* static string: queued/succeeded/failed/cancelled */
+    bool async;
+    bool sync_cut_short;
+    char started_at[32];
+    char finished_at[32];
+    char *error;
+    cbm_daemon_application_index_record_t *next;
 };
 
 /* A watcher-triggered physical job is owned by the exact live sessions that
@@ -176,11 +207,12 @@ struct cbm_daemon_application {
     cbm_daemon_application_job_t *jobs;
     cbm_daemon_application_watch_job_subscription_t *watch_job_subscriptions;
     cbm_daemon_application_mutation_t *mutations;
+    cbm_daemon_application_index_record_t *index_records;
     cbm_daemon_application_worker_ops_t worker_ops;
     cbm_daemon_application_update_ops_t update_ops;
     cbm_project_lock_manager_t *project_locks;
     size_t physical_job_limit;
-    size_t worker_memory_budget_bytes;
+    size_t aggregate_memory_budget_bytes;
     size_t active_mutations;
     size_t update_owners;
     cbm_daemon_application_update_worker_t update_worker;
@@ -207,7 +239,8 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
 static bool application_update_reap(cbm_daemon_application_t *application, bool wait,
                                     uint32_t timeout_ms);
 static void *application_job_thread(void *opaque);
-static char *application_auto_index_args(const char *root_path);
+static char *application_auto_index_args(cbm_daemon_application_t *application,
+                                         const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
     const char *args_json, application_job_subscribe_status_t *status_out);
@@ -298,41 +331,88 @@ static void application_project_lock_release_fully(cbm_project_lock_lease_t **le
     }
 }
 
+typedef struct {
+    cbm_index_worker_handle_t *handle;
+    char *project;
+} application_default_worker_t;
+
+static char *application_index_project_key(const char *root_path, const char *args_json);
+static void application_worker_destroy_default(void *context,
+                                               cbm_daemon_application_worker_t opaque);
+
+/* Reuse the supervisor's bounded completed-line relay. Only actionable worker
+ * diagnostics enter the daemon journal; ordinary progress stays in worker logs. */
+static void application_worker_diagnostic(const char *line, void *context) {
+    const application_default_worker_t *worker = context;
+    if (!line || !worker) {
+        return;
+    }
+    if (!strncmp(line, "level=error ", strlen("level=error ")) ||
+        strstr(line, "\"level\":\"error\"")) {
+        cbm_log_error("index.worker", "project", worker->project ? worker->project : "", "record",
+                      line);
+    } else if (!strncmp(line, "level=warn ", strlen("level=warn ")) ||
+               strstr(line, "\"level\":\"warn\"")) {
+        cbm_log_warn("index.worker", "project", worker->project ? worker->project : "", "record",
+                     line);
+    }
+}
+
 static int application_worker_start_default(void *context, const char *args_json,
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
-    cbm_index_worker_handle_t *worker = NULL;
-    int result = cbm_index_worker_start(args_json, memory_budget_bytes, false, marker_file,
-                                        quarantine_file, &worker);
+    application_default_worker_t *worker = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*worker));
+    if (!worker) {
+        return -1;
+    }
+    yyjson_doc *args_doc = yyjson_read_opts((char *)args_json, strlen(args_json), 0,
+                                            cbm_json_writer_allocator(), NULL);
+    const char *root = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(args_doc), "repo_path"));
+    worker->project = application_index_project_key(root, args_json);
+    yyjson_doc_free(args_doc);
+    int result = cbm_index_worker_start_with_log(args_json, memory_budget_bytes, false, marker_file,
+                                                 quarantine_file, application_worker_diagnostic,
+                                                 worker, &worker->handle);
+    if (result != 0) {
+        application_worker_destroy_default(NULL, worker);
+        *worker_out = NULL;
+        return result;
+    }
     *worker_out = worker;
-    return result;
+    return 0;
 }
 
 static cbm_index_worker_poll_t application_worker_poll_default(
-    void *context, cbm_daemon_application_worker_t worker,
+    void *context, cbm_daemon_application_worker_t opaque,
     const cbm_index_worker_result_t **result_out) {
     (void)context;
-    return cbm_index_worker_poll((cbm_index_worker_handle_t *)worker, result_out);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_poll(worker->handle, result_out);
 }
 
 static bool application_worker_cancel_default(void *context,
-                                              cbm_daemon_application_worker_t worker) {
+                                              cbm_daemon_application_worker_t opaque) {
     (void)context;
-    return cbm_index_worker_request_cancel((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_request_cancel(worker->handle);
 }
 
 static const char *application_worker_log_path_default(void *context,
-                                                       cbm_daemon_application_worker_t worker) {
+                                                       cbm_daemon_application_worker_t opaque) {
     (void)context;
-    return cbm_index_worker_log_path((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_log_path(worker->handle);
 }
 
 static void application_worker_destroy_default(void *context,
-                                               cbm_daemon_application_worker_t worker) {
+                                               cbm_daemon_application_worker_t opaque) {
     (void)context;
-    cbm_index_worker_destroy((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    cbm_index_worker_destroy(worker->handle);
+    free(worker->project);
+    cbm_free(CBM_MEM_CLASS_OTHER, worker);
 }
 
 static uint32_t application_get_u32(const uint8_t *bytes) {
@@ -371,6 +451,11 @@ static bool application_regular_db_exists(const char *project) {
     }
     struct stat status;
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
+}
+
+static bool application_canonical_directory_exists(const char *path) {
+    cbm_path_info_t info = {0};
+    return cbm_path_info_utf8(path, &info) == 0 && info.is_directory;
 }
 
 static cbm_daemon_application_watch_t *application_find_watch_locked(
@@ -429,6 +514,22 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
     }
 }
 
+static bool application_session_workspace_allowed(const cbm_daemon_application_session_t *session,
+                                                  const char *operation) {
+    const char *root = session ? cbm_mcp_server_session_root(session->mcp) : NULL;
+    char boundary_error[CBM_SZ_1K];
+    bool allowed =
+        root && root[0] &&
+        cbm_workspace_root_allowed(root, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
+                                   cbm_mcp_server_allowed_root(session->mcp), boundary_error,
+                                   sizeof(boundary_error));
+    if (!allowed) {
+        cbm_log_warn("daemon.workspace.skipped", "operation", operation, "detail",
+                     root && root[0] ? boundary_error : "session root is unavailable");
+    }
+    return allowed;
+}
+
 /* Caller holds application->mutex. */
 static void application_refresh_watch_locked(cbm_daemon_application_session_t *session) {
     cbm_daemon_application_t *application = session->application;
@@ -440,6 +541,10 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
     const char *project = cbm_mcp_server_session_project(session->mcp);
     const char *root = cbm_mcp_server_session_root(session->mcp);
     if (!project || !project[0] || !root || !root[0]) {
+        return;
+    }
+    if (!application_session_workspace_allowed(session, "watch")) {
+        application_release_session_watch_locked(session);
         return;
     }
     bool enabled = !application->config ||
@@ -509,6 +614,57 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
     session->watch = watch;
 }
 
+static const char *application_watch_strategy_name(cbm_watcher_strategy_t strategy) {
+    switch (strategy) {
+    case CBM_WATCHER_STRATEGY_GIT:
+        return "git";
+    case CBM_WATCHER_STRATEGY_TREE:
+        return "tree";
+    case CBM_WATCHER_STRATEGY_NONE:
+        return "none";
+    default:
+        return "pending";
+    }
+}
+
+/* index_status watch visibility (#2167). The physical watcher is the truth for
+ * "watched"; the reasons explain the documented scope: only an MCP session's
+ * own project is watched, and only while that session is open. Takes the
+ * application mutex and the watcher lock one after the other, never nested. */
+static void application_watch_status(void *context, const char *project,
+                                     cbm_mcp_watch_status_t *out) {
+    cbm_daemon_application_session_t *session = context;
+    cbm_daemon_application_t *application = session ? session->application : NULL;
+    if (!application || !application->watcher) {
+        out->reason = "watcher_disabled";
+        return;
+    }
+    cbm_watcher_project_info_t info;
+    if (cbm_watcher_project_info(application->watcher, project, &info)) {
+        out->watched = true;
+        out->strategy = application_watch_strategy_name(info.strategy);
+        out->poll_interval_ms = info.poll_interval_ms;
+        out->last_scan_unix_s = info.last_scan_unix_s;
+        return;
+    }
+    const char *session_project = cbm_mcp_server_session_project(session->mcp);
+    if (!session_project || strcmp(session_project, project) != 0) {
+        out->reason = "not_session_project";
+        return;
+    }
+    if (application->config &&
+        !cbm_config_get_bool(application->config, CBM_CONFIG_AUTO_WATCH, true)) {
+        out->reason = "auto_watch_off";
+        return;
+    }
+    /* Only MCP sessions run background initialization; a one-shot CLI command
+     * never holds a watch across calls. */
+    cbm_mutex_lock(&application->mutex);
+    bool mcp_session = session->background_eligible;
+    cbm_mutex_unlock(&application->mutex);
+    out->reason = mcp_session ? "not_registered" : "cli_session";
+}
+
 static void application_refresh_watch(cbm_daemon_application_session_t *session) {
     if (!session || !session->application) {
         return;
@@ -527,6 +683,131 @@ static void application_job_free(cbm_daemon_application_job_t *job) {
     free(job->args_json);
     free(job->response);
     free(job);
+}
+
+enum { APPLICATION_RECORD_ERROR_CAP = 512 };
+
+static void application_utc_now(char out[32]) {
+    time_t now = time(NULL);
+    struct tm parts;
+    out[0] = '\0';
+    if (cbm_gmtime_r(&now, &parts)) {
+        (void)strftime(out, 32, "%Y-%m-%dT%H:%M:%SZ", &parts);
+    }
+}
+
+static cbm_daemon_application_index_record_t *application_index_record_find_locked(
+    cbm_daemon_application_t *application, const char *project_key) {
+    for (cbm_daemon_application_index_record_t *record = application->index_records; record;
+         record = record->next) {
+        if (strcmp(record->project_key, project_key) == 0) {
+            return record;
+        }
+    }
+    return NULL;
+}
+
+/* Find or create; NULL only on allocation failure (bookkeeping is then
+ * skipped, never the index itself). */
+static cbm_daemon_application_index_record_t *application_index_record_get_locked(
+    cbm_daemon_application_t *application, const char *project_key) {
+    cbm_daemon_application_index_record_t *record =
+        application_index_record_find_locked(application, project_key);
+    if (record) {
+        return record;
+    }
+    record = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*record));
+    if (!record || !(record->project_key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, project_key))) {
+        cbm_free(CBM_MEM_CLASS_OTHER, record);
+        return NULL;
+    }
+    record->state = "queued";
+    record->next = application->index_records;
+    application->index_records = record;
+    return record;
+}
+
+static void application_index_records_free(cbm_daemon_application_index_record_t *record) {
+    while (record) {
+        cbm_daemon_application_index_record_t *next = record->next;
+        cbm_free(CBM_MEM_CLASS_OTHER, record->project_key);
+        cbm_free(CBM_MEM_CLASS_OTHER, record->error);
+        cbm_free(CBM_MEM_CLASS_OTHER, record);
+        record = next;
+    }
+}
+
+/* A new physical job for the project begins a fresh attempt record. The
+ * cut-short marker deliberately survives: it describes the caller, and the
+ * advice stays pending until a later call has carried it. */
+static void application_index_record_begin_locked(cbm_daemon_application_job_t *job) {
+    cbm_daemon_application_index_record_t *record =
+        application_index_record_get_locked(job->application, job->project_key);
+    if (!record) {
+        return;
+    }
+    record->state = "queued";
+    record->async = false;
+    application_utc_now(record->started_at);
+    record->finished_at[0] = '\0';
+    cbm_free(CBM_MEM_CLASS_OTHER, record->error);
+    record->error = NULL;
+}
+
+/* The first content text of a tool result, bounded for a status summary. */
+static char *application_tool_result_summary(const char *response) {
+    yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *content = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "content") : NULL;
+    yyjson_val *first = content && yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    yyjson_val *text = first && yyjson_is_obj(first) ? yyjson_obj_get(first, "text") : NULL;
+    char *summary = NULL;
+    if (text && yyjson_is_str(text)) {
+        const char *value = yyjson_get_str(text);
+        size_t length = strlen(value);
+        if (length >= APPLICATION_RECORD_ERROR_CAP) {
+            length = APPLICATION_RECORD_ERROR_CAP - 1U;
+            /* Never split a UTF-8 sequence. */
+            while (length > 0 && ((unsigned char)value[length] & 0xC0U) == 0x80U) {
+                length--;
+            }
+        }
+        summary = cbm_alloc(CBM_MEM_CLASS_OTHER, length + 1U);
+        if (summary) {
+            memcpy(summary, value, length);
+            summary[length] = '\0';
+        }
+    }
+    yyjson_doc_free(doc);
+    return summary;
+}
+
+static void application_index_record_finish_locked(cbm_daemon_application_job_t *job) {
+    cbm_daemon_application_index_record_t *record =
+        application_index_record_get_locked(job->application, job->project_key);
+    if (!record) {
+        return;
+    }
+    record->state = job->successful ? "succeeded" : job->cancelled ? "cancelled" : "failed";
+    application_utc_now(record->finished_at);
+    cbm_free(CBM_MEM_CLASS_OTHER, record->error);
+    record->error = job->successful ? NULL : application_tool_result_summary(job->response);
+}
+
+/* A synchronous caller stopped waiting before its index finished. */
+static void application_index_record_mark_cut_short_locked(cbm_daemon_application_t *application,
+                                                           const char *project_key) {
+    cbm_daemon_application_index_record_t *record =
+        application_index_record_get_locked(application, project_key);
+    if (record) {
+        record->sync_cut_short = true;
+    }
+}
+
+static void application_index_record_cut_short_locked(cbm_daemon_application_job_t *job) {
+    if (job && !job->terminal) {
+        application_index_record_mark_cut_short_locked(job->application, job->project_key);
+    }
 }
 
 /* Reap completed job threads only after every logical demand subscription and
@@ -613,7 +894,8 @@ static bool application_unique_recovery_file(char out[APPLICATION_PATH_CAP], con
     int written;
     if (application_cache_dir(cache)) {
         written = snprintf(directory, sizeof(directory), "%s/logs", cache);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+        if (written <= 0 || written >= (int)sizeof(directory) ||
+            !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
     } else {
@@ -667,6 +949,8 @@ static bool application_truncate_file(const char *path) {
 }
 
 static bool application_job_cancel_requested(cbm_daemon_application_job_t *job);
+static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *application,
+                                                     size_t *active_jobs_out);
 
 static char **application_read_suspects(cbm_daemon_application_job_t *job, const char *path,
                                         int *count_out, bool *cancelled_out) {
@@ -1062,11 +1346,33 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
         return APPLICATION_ATTEMPT_CANCELLED;
     }
 
+    /* Decision 2 (#1997 #832): the slice is decided at spawn time from the jobs
+     * active right now (this job included), so a lone worker may use the whole
+     * aggregate and concurrent jobs split it. The divisor is logged so a
+     * fail-whole verdict can be read against the budget the worker really had. */
+    size_t active_jobs = 0;
+    cbm_mutex_lock(&application->mutex);
+    size_t memory_budget_bytes = application_worker_memory_slice_locked(application, &active_jobs);
+    size_t aggregate_memory_budget_bytes = application->aggregate_memory_budget_bytes;
+    cbm_mutex_unlock(&application->mutex);
+    if (memory_budget_bytes > 0) {
+        char active_text[32];
+        char aggregate_text[32];
+        char slice_text[32];
+        (void)snprintf(active_text, sizeof(active_text), "%zu", active_jobs);
+        (void)snprintf(aggregate_text, sizeof(aggregate_text), "%zu",
+                       aggregate_memory_budget_bytes / (1024U * 1024U));
+        (void)snprintf(slice_text, sizeof(slice_text), "%zu",
+                       memory_budget_bytes / (1024U * 1024U));
+        cbm_log_info("daemon.index.worker_budget", "project", job->project_key, "active_jobs",
+                     active_text, "aggregate_mb", aggregate_text, "slice_mb", slice_text);
+    }
+
     cbm_daemon_application_worker_t worker = NULL;
     application_tmp_lock();
-    int start_result = application->worker_ops.start(
-        application->worker_ops.context, job->args_json, application->worker_memory_budget_bytes,
-        marker_path, quarantine_path, &worker);
+    int start_result =
+        application->worker_ops.start(application->worker_ops.context, job->args_json,
+                                      memory_budget_bytes, marker_path, quarantine_path, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
         return application_job_cancel_requested(job) ? APPLICATION_ATTEMPT_CANCELLED
@@ -1075,6 +1381,7 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
 
     cbm_mutex_lock(&application->mutex);
     job->worker = worker;
+    job->worker_started = true;
     bool cancel_now = job->cancel_requested || application->stopping;
     cbm_mutex_unlock(&application->mutex);
     if (cancel_now) {
@@ -1135,11 +1442,22 @@ static char *application_job_failure_response(const cbm_index_worker_result_t *r
     char message[1024];
     if (result && result->cancellation_requested) {
         (void)snprintf(message, sizeof(message),
-                       "index operation cancelled after its final owning session disconnected");
+                       "index operation cancelled before completion (its last waiting "
+                       "client disconnected or the daemon stopped). %s",
+                       CBM_MCP_INDEX_ASYNC_HINT);
     } else if (result && (result->supervision_failed || !result->tree_quiesced)) {
         (void)snprintf(message, sizeof(message),
                        "index worker containment failed (%s); inspect log: %s",
                        cbm_proc_outcome_str(result->outcome), log_path ? log_path : "unavailable");
+    } else if (result && result->response_missing) {
+        /* #1300: name the silent clean exit, where it stopped, and the log. */
+        const char *log = log_path                ? log_path
+                          : result->worker_log[0] ? result->worker_log
+                                                  : "unavailable";
+        (void)snprintf(message, sizeof(message),
+                       "index worker exited cleanly (exit 0) without writing a response; the "
+                       "index was not published; last phase reached: %s; inspect log: %s",
+                       result->last_phase[0] ? result->last_phase : "unknown", log);
     } else if (result) {
         (void)snprintf(message, sizeof(message),
                        "index worker ended with %s (exit=%d, signal=%d); inspect log: %s",
@@ -1218,6 +1536,23 @@ static void application_job_execution_cancel(application_job_execution_t *execut
     execution->unsafe_terminal = true;
 }
 
+/* A clean process exit means the response was delivered, not that indexing
+ * succeeded. The pipeline reports preserved-index aborts and publication errors
+ * as ordinary MCP tool results with isError=true. Keep that response for MCP
+ * callers, but do not publish a successful UI/background job or retry it as a
+ * crashed worker. Older successful responses may omit isError. */
+static bool application_index_response_succeeded(const char *response) {
+    yyjson_doc *document = response ? yyjson_read_opts((char *)response, strlen(response), 0,
+                                                       cbm_json_writer_allocator(), NULL)
+                                    : NULL;
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *error = yyjson_obj_get(root, "isError");
+    bool succeeded = yyjson_is_obj(root) && yyjson_is_arr(yyjson_obj_get(root, "content")) &&
+                     (!error || yyjson_is_false(error));
+    yyjson_doc_free(document);
+    return succeeded;
+}
+
 static application_attempt_decision_t application_consume_attempt(
     cbm_daemon_application_job_t *job, application_attempt_t *attempt,
     application_job_execution_t *execution, cbm_proc_outcome_t *failure_outcome) {
@@ -1228,7 +1563,7 @@ static application_attempt_decision_t application_consume_attempt(
     if (disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
         execution->response = attempt->result.response;
         attempt->result.response = NULL;
-        execution->successful = execution->response != NULL;
+        execution->successful = application_index_response_succeeded(execution->response);
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
     }
@@ -1394,12 +1729,17 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             session->auto_index_retry_pending = false;
             continue;
         }
+        if (!application_session_workspace_allowed(session, "auto_index_retry")) {
+            session->auto_index_retry_pending = false;
+            application_refresh_watch_locked(session);
+            continue;
+        }
         if (application_regular_db_exists(project)) {
             session->auto_index_retry_pending = false;
             application_refresh_watch_locked(session);
             continue;
         }
-        char *args = application_auto_index_args(root_path);
+        char *args = application_auto_index_args(application, root_path);
         if (!args) {
             continue;
         }
@@ -1428,6 +1768,15 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
             execution->have_last_result ? &execution->last_result : NULL,
             execution->last_log[0] ? execution->last_log : NULL);
     }
+    bool cancelled = execution->have_last_result && execution->last_result.cancellation_requested;
+    cbm_log(execution->successful ? CBM_LOG_INFO
+            : cancelled           ? CBM_LOG_WARN
+                                  : CBM_LOG_ERROR,
+            "daemon.index.result", "project", job->project_key, "path", job->root_path, "status",
+            execution->successful ? "indexed"
+            : cancelled           ? "cancelled"
+                                  : "failed",
+            NULL);
     cbm_daemon_application_t *application = job->application;
     cbm_mutex_lock(&application->mutex);
     job->response = execution->response;
@@ -1438,6 +1787,12 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
                                !execution->last_result.cancellation_requested);
     job->terminal = true;
     job->thread_done = true;
+    application_index_record_finish_locked(job);
+    if (job->async_owned) {
+        /* The async reference ends with the job; terminal, so no cancel. */
+        job->async_owned = false;
+        application_job_unsubscribe_locked(job);
+    }
     for (cbm_daemon_application_session_t *session = application->sessions; session;
          session = session->next) {
         if (session->auto_index_job != job || !session->auto_index_subscribed) {
@@ -1451,6 +1806,7 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
         }
     }
     application_auto_index_retry_pending_locked(application);
+    cbm_mem_class_flush_thread();
     cbm_mutex_unlock(&application->mutex);
 }
 
@@ -1517,9 +1873,11 @@ static cbm_daemon_application_job_t *application_find_active_job_locked(
 }
 
 static char *application_index_project_key(const char *root_path, const char *args_json) {
-    char *override = cbm_mcp_get_string_arg(args_json, "name");
+    yyjson_doc *doc = yyjson_read_opts((char *)args_json, strlen(args_json), 0,
+                                       cbm_json_writer_allocator(), NULL);
+    const char *override = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "name"));
     char *key = cbm_project_name_from_path(override && override[0] ? override : root_path);
-    free(override);
+    yyjson_doc_free(doc);
     return key;
 }
 
@@ -1531,6 +1889,37 @@ static size_t application_active_job_count_locked(cbm_daemon_application_t *appl
         }
     }
     return count;
+}
+
+/* Decision 2 (#1997 #832): a worker's memory slice is the aggregate budget
+ * divided by the jobs active at spawn time. The job being spawned is already
+ * in the table, so the divisor never drops below one; a zero aggregate means
+ * "no cap" and the worker falls back to its own RAM-fraction budget.
+ *
+ * The daemon's resident adjacency layers (store/graph_mem.h) are part of the
+ * same aggregate, so workers split what is left after them. They are capped at
+ * a quarter of the daemon budget, which the aggregate defaults to; only a
+ * smaller configured aggregate can be exceeded, and then every job still gets
+ * at least one byte, as above — a zero slice would read as "no cap". */
+static size_t application_worker_memory_slice_locked(cbm_daemon_application_t *application,
+                                                     size_t *active_jobs_out) {
+    size_t active = application_active_job_count_locked(application);
+    if (active == 0) {
+        active = 1;
+    }
+    if (active_jobs_out) {
+        *active_jobs_out = active;
+    }
+    size_t aggregate = application->aggregate_memory_budget_bytes;
+    if (aggregate == 0) {
+        return 0;
+    }
+    size_t held = cbm_graph_mem_cached_bytes();
+    size_t available = held < aggregate ? aggregate - held : 0;
+    if (available < active) {
+        available = active;
+    }
+    return available / active;
 }
 
 /* Compare the effective index request, not its JSON spelling. yyjson's deep
@@ -1557,6 +1946,33 @@ static bool application_index_args_normalize_defaults(yyjson_mut_val *root) {
     return true;
 }
 
+/* One directory is one root. The auto-index job spells repo_path the way the
+ * session policy holds it - the platform's native form, backslashes on
+ * Windows - while an explicit index_repository request arrives in the
+ * handler's forward-slash spelling. Compared byte-exact the two never matched
+ * on Windows, and the request was refused as an options conflict instead of
+ * joining the job already running for its root. The policy keeps its
+ * spelling: the sensitive-root and allowed-root containment checks match it
+ * byte-exact against HOME and the granted roots, and respelling it there
+ * admitted $HOME. So the fold happens here, on this comparison's private copy,
+ * and nothing the daemon stores changes. */
+static bool application_index_args_fold_repo_path(yyjson_mut_doc *document) {
+    yyjson_mut_val *root = yyjson_mut_doc_get_root(document);
+    yyjson_mut_val *repo_path = yyjson_mut_obj_get(root, "repo_path");
+    if (!repo_path || !yyjson_mut_is_str(repo_path)) {
+        return true;
+    }
+    char *folded = strdup(yyjson_mut_get_str(repo_path));
+    if (!folded) {
+        return false;
+    }
+    cbm_normalize_path_sep(folded);
+    yyjson_mut_val *key = yyjson_mut_str(document, "repo_path");
+    yyjson_mut_val *value = yyjson_mut_strcpy(document, folded);
+    free(folded);
+    return key && value && yyjson_mut_obj_replace(root, key, value);
+}
+
 static bool application_index_args_equal(const char *left, const char *right) {
     if (!left || !right) {
         return false;
@@ -1569,12 +1985,18 @@ static bool application_index_args_equal(const char *left, const char *right) {
     yyjson_mut_val *right_root = right_copy ? yyjson_mut_doc_get_root(right_copy) : NULL;
     bool equal = application_index_args_normalize_defaults(left_root) &&
                  application_index_args_normalize_defaults(right_root) &&
+                 application_index_args_fold_repo_path(left_copy) &&
+                 application_index_args_fold_repo_path(right_copy) &&
                  yyjson_mut_equals(left_root, right_root);
     yyjson_mut_doc_free(left_copy);
     yyjson_mut_doc_free(right_copy);
     yyjson_doc_free(left_source);
     yyjson_doc_free(right_source);
     return equal;
+}
+
+bool cbm_daemon_application_index_args_equal_for_test(const char *left, const char *right) {
+    return application_index_args_equal(left, right);
 }
 
 /* Caller holds application->mutex. Keeping watcher ownership validation and
@@ -1627,6 +2049,8 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
     application->jobs = job;
     if (application_job_thread_create(&job->thread, job) == 0) {
         job->thread_started = true;
+        /* Still under the mutex, so this precedes the thread's publish. */
+        application_index_record_begin_locked(job);
     } else {
         /* The job was linked only so a concurrently started thread could
          * observe its reservation. No thread exists on this path, so roll the
@@ -1900,7 +2324,31 @@ static bool application_update_reap(cbm_daemon_application_t *application, bool 
     }
 }
 
-static char *application_auto_index_args(const char *root_path) {
+static bool application_index_args_add_policy(cbm_daemon_application_t *application,
+                                              yyjson_mut_doc *document, yyjson_mut_val *root) {
+    cbm_config_t *owned_config = NULL;
+    cbm_config_t *config = application ? application->config : NULL;
+    if (!config) {
+        owned_config = cbm_config_open(cbm_resolve_cache_dir());
+        config = owned_config;
+    }
+    cbm_index_resource_policy_t policy;
+    char error[CBM_SZ_256] = {0};
+    bool loaded = cbm_config_load_index_policy(config, &policy, error, sizeof(error));
+    /* The worker reads no config: a doc_candidates setting the user set
+     * travels with the request; unset, the worker's index mode decides. */
+    bool doc_candidates_encoded =
+        !loaded || cbm_mcp_index_doc_candidates_add_to_args(document, root, config);
+    cbm_config_close(owned_config);
+    if (!loaded) {
+        cbm_log_error("daemon.index.policy", "error", error);
+        return false;
+    }
+    return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
+}
+
+static char *application_auto_index_args(cbm_daemon_application_t *application,
+                                         const char *root_path) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = document ? yyjson_mut_obj(document) : NULL;
     if (!document || !root) {
@@ -1908,7 +2356,8 @@ static char *application_auto_index_args(const char *root_path) {
         return NULL;
     }
     yyjson_mut_doc_set_root(document, root);
-    char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path)
+    char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path) &&
+                         application_index_args_add_policy(application, document, root)
                      ? yyjson_mut_write(document, 0, NULL)
                      : NULL;
     yyjson_mut_doc_free(document);
@@ -1940,6 +2389,10 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                             : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
     int tracked_files = -1;
     bool auto_index_candidate = auto_index && !db_exists;
+    if (auto_index_candidate &&
+        !application_session_workspace_allowed(session, "auto_index_discovery")) {
+        auto_index_candidate = false;
+    }
     bool within_auto_index_limit =
         !auto_index_candidate ||
         cbm_mcp_auto_index_within_file_limit(root_path, auto_index_limit, &tracked_files);
@@ -1951,7 +2404,7 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                      files);
     }
     bool args_required = auto_index_candidate && within_auto_index_limit;
-    char *args = args_required ? application_auto_index_args(root_path) : NULL;
+    char *args = args_required ? application_auto_index_args(application, root_path) : NULL;
     application_jobs_reap_completed(application);
     cbm_mutex_lock(&application->mutex);
     if (application->stopping || application_request_cancelled_locked(session)) {
@@ -2155,7 +2608,8 @@ static char *application_job_wait_for_session(cbm_daemon_application_session_t *
         cbm_mutex_lock(&application->mutex);
         if (session->active_job != job || !session->active_job_subscribed) {
             cbm_mutex_unlock(&application->mutex);
-            return cbm_mcp_text_result("index operation cancelled for this session", true);
+            return cbm_mcp_text_result(
+                "index operation cancelled for this session. " CBM_MCP_INDEX_ASYNC_HINT, true);
         }
         if (job->terminal) {
             char *response = job->response ? strdup(job->response) : NULL;
@@ -2172,12 +2626,20 @@ static char *application_job_wait_for_session(cbm_daemon_application_session_t *
     }
 }
 
-static char *application_index_execute(void *context, const char *root_path,
-                                       const char *args_json) {
-    cbm_daemon_application_session_t *session = context;
-    if (!session || !root_path || !args_json) {
-        return NULL;
+static const char *application_index_admission_error(application_job_subscribe_status_t status) {
+    if (status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT) {
+        return "another index operation for this project is active with different options";
     }
+    if (status == APPLICATION_JOB_SUBSCRIBE_ALLOCATION_FAILED) {
+        return "daemon index coordinator could not allocate an index job";
+    }
+    return "daemon index coordinator is stopping or unavailable";
+}
+
+/* The synchronous contract: wait for the whole index (queueing behind the
+ * physical job limit); a cancelled request drops only its own reference. */
+static char *application_index_execute_sync(cbm_daemon_application_session_t *session,
+                                            const char *root_path, const char *args_json) {
     char *project_key = application_index_project_key(root_path, args_json);
     if (!project_key) {
         return cbm_mcp_text_result("failed to derive index project identity", true);
@@ -2201,28 +2663,28 @@ static char *application_index_execute(void *context, const char *root_path,
                                   memory_order_release);
         cbm_mutex_lock(&session->application->mutex);
         bool queued_cancelled = application_request_cancelled_locked(session);
+        if (queued_cancelled) {
+            application_index_record_mark_cut_short_locked(session->application, project_key);
+        }
         cbm_mutex_unlock(&session->application->mutex);
         if (queued_cancelled) {
             free(project_key);
-            return cbm_mcp_text_result("index operation cancelled for this session", true);
+            return cbm_mcp_text_result(
+                "index operation cancelled for this session. " CBM_MCP_INDEX_ASYNC_HINT, true);
         }
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
     free(project_key);
     if (!job) {
-        const char *message = "daemon index coordinator is stopping or unavailable";
-        if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT) {
-            message = "another index operation for this project is active with different options";
-        } else if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_ALLOCATION_FAILED) {
-            message = "daemon index coordinator could not allocate an index job";
-        }
-        return cbm_mcp_text_result(message, true);
+        return cbm_mcp_text_result(application_index_admission_error(subscribe_status), true);
     }
     cbm_mutex_lock(&session->application->mutex);
     if (application_request_cancelled_locked(session)) {
+        application_index_record_cut_short_locked(job);
         application_job_unsubscribe_locked(job);
         cbm_mutex_unlock(&session->application->mutex);
-        return cbm_mcp_text_result("index operation cancelled for this session", true);
+        return cbm_mcp_text_result(
+            "index operation cancelled for this session. " CBM_MCP_INDEX_ASYNC_HINT, true);
     }
     if (session->active_job) {
         application_job_unsubscribe_locked(job);
@@ -2233,6 +2695,236 @@ static char *application_index_execute(void *context, const char *root_path,
     session->active_job_subscribed = true;
     cbm_mutex_unlock(&session->application->mutex);
     return application_job_wait_for_session(session, job);
+}
+
+/* Take (and clear) the project's pending cut-short advice. Taken at the START
+ * of a synchronous call: if this call is cut short too, its own cancel path
+ * sets the marker again, so the advice is never consumed by a reply nobody
+ * reads. */
+static bool application_index_take_cut_short(cbm_daemon_application_t *application,
+                                             const char *project_key) {
+    cbm_mutex_lock(&application->mutex);
+    cbm_daemon_application_index_record_t *record =
+        application_index_record_find_locked(application, project_key);
+    bool pending = record && record->sync_cut_short;
+    if (pending) {
+        record->sync_cut_short = false;
+    }
+    cbm_mutex_unlock(&application->mutex);
+    return pending;
+}
+
+#define APPLICATION_CUT_SHORT_NOTICE                                                            \
+    "The previous synchronous index_repository call for this project was cut short before the " \
+    "index finished (client cancel, call deadline or disconnect). " CBM_MCP_INDEX_ASYNC_HINT
+
+static char *application_index_run_sync(cbm_daemon_application_session_t *session,
+                                        const char *root_path, const char *args_json) {
+    char *project_key = application_index_project_key(root_path, args_json);
+    bool notice =
+        project_key && application_index_take_cut_short(session->application, project_key);
+    safe_free(project_key);
+    char *response = application_index_execute_sync(session, root_path, args_json);
+    return notice ? cbm_mcp_tool_result_add_notice(response, APPLICATION_CUT_SHORT_NOTICE)
+                  : response;
+}
+
+static char *application_index_async_response(const char *project_key, const char *state,
+                                              bool joined) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    char *json = NULL;
+    if (root) {
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_strcpy(doc, root, "project", project_key);
+        yyjson_mut_obj_add_str(doc, root, "state", state);
+        yyjson_mut_obj_add_bool(doc, root, "async", true);
+        yyjson_mut_obj_add_bool(doc, root, "joined", joined);
+        yyjson_mut_obj_add_str(doc, root, "poll",
+                               "call index_repository with the same repo_path and status: true "
+                               "until state is succeeded, failed or cancelled");
+        json = yyjson_mut_write(doc, 0, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json ? json : "{}", false);
+    safe_free(json);
+    return result;
+}
+
+/* #2144 user decision: refuse async where the job would certainly die with its
+ * requester. A temporary (non-permanent) daemon stops and cancels every job
+ * when its final live session ends. The one-shot tool channel (`cli ...`)
+ * closes its session right after the reply, so if it is the only live session
+ * the job is doomed. A long-lived MCP session - the IDE case this exists for -
+ * stays connected and is a valid host even when it is the only one, as is any
+ * other live session and every permanent (`daemon start`) generation. */
+static bool application_async_host_missing(cbm_daemon_application_session_t *session) {
+    cbm_daemon_application_t *application = session->application;
+    cbm_mutex_lock(&application->mutex);
+    bool other_live_session = false;
+    for (cbm_daemon_application_session_t *other = application->sessions;
+         other && !other_live_session; other = other->next) {
+        other_live_session = other != session && !other->session_cancelled;
+    }
+    bool missing = !application->permanent && session->one_shot_request && !other_live_session;
+    cbm_mutex_unlock(&application->mutex);
+    return missing;
+}
+
+/* index_repository(async: true) (#2144): start or join the project's job and
+ * return at once. The application keeps one subscriber reference until the
+ * terminal publish, so neither this request returning, nor its client
+ * cancelling, nor this session closing cancels the job: only daemon shutdown
+ * (or the final live session of a non-permanent generation) does. Never
+ * queues behind the physical job limit: a full daemon answers busy. */
+#define APPLICATION_ASYNC_NEEDS_HOST                                                              \
+    "async indexing needs a daemon that outlives this command: this one-shot call is the only "   \
+    "client of a temporary daemon, which stops (cancelling the job) when the command exits. Run " \
+    "`codebase-memory-mcp daemon start` (or keep an MCP session open), then retry; or call "      \
+    "without async"
+
+static char *application_index_start_async(cbm_daemon_application_session_t *session,
+                                           const char *root_path, const char *args_json) {
+    cbm_daemon_application_t *application = session->application;
+    if (application_async_host_missing(session)) {
+        return cbm_mcp_text_result(APPLICATION_ASYNC_NEEDS_HOST, true);
+    }
+    char *project_key = application_index_project_key(root_path, args_json);
+    if (!project_key) {
+        return cbm_mcp_text_result("failed to derive index project identity", true);
+    }
+    application_jobs_reap_completed(application);
+    application_job_subscribe_status_t status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
+    cbm_mutex_lock(&application->mutex);
+    /* Subscribe and claim in one critical section: the job cannot publish in
+     * between, so the async reference is always released by its publish. */
+    cbm_daemon_application_job_t *job =
+        application_job_subscribe_locked(application, project_key, root_path, args_json, &status);
+    bool joined = false;
+    const char *state = "queued";
+    if (job) {
+        joined = job->async_owned || job->subscribers > 1;
+        if (job->async_owned) {
+            application_job_unsubscribe_locked(job); /* one async reference per job */
+        } else {
+            job->async_owned = true;
+        }
+        state = job->worker_started ? "running" : "queued";
+        cbm_daemon_application_index_record_t *record =
+            application_index_record_get_locked(application, project_key);
+        if (record) {
+            record->async = true;
+            record->sync_cut_short = false; /* the advice was taken */
+        }
+    }
+    cbm_mutex_unlock(&application->mutex);
+    char *result = NULL;
+    if (job) {
+        cbm_log_info("daemon.index.async", "project", project_key, "joined",
+                     joined ? "true" : "false");
+        result = application_index_async_response(project_key, state, joined);
+    } else if (status == APPLICATION_JOB_SUBSCRIBE_BUSY) {
+        result = cbm_mcp_text_result(
+            "daemon index job limit reached; async requests do not queue. Retry async later, or "
+            "call without async to wait for a slot",
+            true);
+    } else if (status == APPLICATION_JOB_SUBSCRIBE_CANCELLING) {
+        result = cbm_mcp_text_result(
+            "the previous index of this project is still being cancelled; retry async shortly",
+            true);
+    } else {
+        result = cbm_mcp_text_result(application_index_admission_error(status), true);
+    }
+    safe_free(project_key);
+    return result;
+}
+
+static char *application_index_execute(void *context, const char *root_path, const char *args_json,
+                                       bool async) {
+    cbm_daemon_application_session_t *session = context;
+    if (!session || !root_path || !args_json) {
+        return NULL;
+    }
+    return async ? application_index_start_async(session, root_path, args_json)
+                 : application_index_run_sync(session, root_path, args_json);
+}
+
+static void application_status_add_record(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                          const cbm_daemon_application_index_record_t *record) {
+    yyjson_mut_obj_add_bool(doc, root, "async", record->async);
+    if (record->started_at[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "started_at", record->started_at);
+    }
+    if (record->finished_at[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "finished_at", record->finished_at);
+    }
+    if (record->error) {
+        yyjson_mut_obj_add_strcpy(doc, root, "error", record->error);
+    }
+    if (record->sync_cut_short) {
+        yyjson_mut_obj_add_str(doc, root, "notice", APPLICATION_CUT_SHORT_NOTICE);
+    }
+}
+
+/* index_repository(status: true) (#2144). A live job reports queued, running
+ * or cancelling; otherwise the last recorded outcome. A project with neither a
+ * job record nor a database is an error; one indexed before this daemon
+ * generation reports idle and points at index_status for graph freshness. */
+static char *application_index_status(void *context, const char *project) {
+    cbm_daemon_application_session_t *session = context;
+    if (!session || !project) {
+        return NULL;
+    }
+    cbm_daemon_application_t *application = session->application;
+    bool db_exists = application_regular_db_exists(project);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+    cbm_mutex_lock(&application->mutex);
+    cbm_daemon_application_job_t *job = application_find_active_job_locked(application, project);
+    cbm_daemon_application_index_record_t *record =
+        application_index_record_find_locked(application, project);
+    bool known = job || record || db_exists;
+    if (job) {
+        yyjson_mut_obj_add_str(doc, root, "state",
+                               job->cancel_requested ? "cancelling"
+                               : job->worker_started ? "running"
+                                                     : "queued");
+    } else if (record) {
+        yyjson_mut_obj_add_str(doc, root, "state", record->state);
+    } else {
+        yyjson_mut_obj_add_str(doc, root, "state", "idle");
+        yyjson_mut_obj_add_str(doc, root, "detail",
+                               "no index job has run for this project in this daemon generation; "
+                               "index_status describes the published graph");
+    }
+    if (record) {
+        application_status_add_record(doc, root, record);
+    }
+    if (job && !job->cancel_requested) {
+        yyjson_mut_obj_add_str(doc, root, "poll",
+                               "call again with status: true until state is succeeded, failed or "
+                               "cancelled");
+    }
+    cbm_mutex_unlock(&application->mutex);
+    char *json = known ? yyjson_mut_write(doc, 0, NULL) : NULL;
+    yyjson_mut_doc_free(doc);
+    if (!known) {
+        char message[APPLICATION_PATH_CAP];
+        (void)snprintf(message, sizeof(message),
+                       "no index job or index is known for project '%s'; start one with "
+                       "index_repository(repo_path=..., async: true)",
+                       project);
+        return cbm_mcp_text_result(message, true);
+    }
+    char *result = cbm_mcp_text_result(json ? json : "{}", false);
+    safe_free(json);
+    return result;
 }
 
 static cbm_daemon_runtime_application_session_t *application_session_open(
@@ -2254,7 +2946,9 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     }
     cbm_mcp_server_set_background_tasks(session->mcp, false);
     cbm_mcp_server_set_config(session->mcp, application->config);
+    cbm_mcp_server_set_watch_status_provider(session->mcp, application_watch_status, session);
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
+    cbm_mcp_server_set_index_status_provider(session->mcp, application_index_status, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,
                                               application_session_mutation_end, session);
     cbm_mcp_server_set_project_mutation_try_guard(session->mcp,
@@ -2324,9 +3018,7 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     if (canonical && allowed_present) {
         canonical = cbm_canonical_path(allowed, canonical_allowed, sizeof(canonical_allowed));
     }
-    struct stat root_status;
-    canonical =
-        canonical && stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
+    canonical = canonical && application_canonical_directory_exists(canonical_root);
     bool set =
         canonical && cbm_mcp_server_set_session_context(session->mcp, canonical_root,
                                                         allowed_present ? canonical_allowed : NULL);
@@ -2488,7 +3180,9 @@ static cbm_daemon_runtime_application_status_t application_tool_request(
         free(args);
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     }
+    session->one_shot_request = true; /* only this request thread reads it */
     char *response = cbm_mcp_handle_tool(session->mcp, tool, args);
+    session->one_shot_request = false;
     free(tool);
     free(args);
     if (!response) {
@@ -2720,6 +3414,7 @@ static void application_request_cancel(void *context,
             cbm_daemon_application_job_t *job = session->active_job;
             session->active_job = NULL;
             session->active_job_subscribed = false;
+            application_index_record_cut_short_locked(job);
             application_job_unsubscribe_locked(job);
         }
         if (active_match) {
@@ -2752,6 +3447,7 @@ static void application_session_cancel(void *context,
             cbm_daemon_application_job_t *job = session->active_job;
             session->active_job = NULL;
             session->active_job_subscribed = false;
+            application_index_record_cut_short_locked(job);
             application_job_unsubscribe_locked(job);
         }
         join_auto_index = application_auto_index_release_locked(session);
@@ -2808,6 +3504,7 @@ static void application_session_close(void *context,
         *cursor = session->next;
     }
     if (session->active_job && session->active_job_subscribed) {
+        application_index_record_cut_short_locked(session->active_job);
         application_job_unsubscribe_locked(session->active_job);
         session->active_job = NULL;
         session->active_job_subscribed = false;
@@ -2882,18 +3579,19 @@ cbm_daemon_application_t *cbm_daemon_application_new(
             application->ui_readiness_secret_set = true;
         }
     }
-    /* Equal fixed slices keep admission deterministic: starting fewer jobs does
-     * not let an early worker claim memory reserved for later concurrent jobs.
-     * The absurd sub-byte-per-slot case is made safe by reducing effective
-     * capacity before division; normal daemon budgets are many orders larger. */
+    /* The per-worker slice is decided at spawn time (see
+     * application_worker_memory_slice_locked): the aggregate divided by the
+     * jobs active then, so a lone worker may use the whole aggregate and
+     * concurrent jobs split it (decision 2, #1997 #832) — the former fixed
+     * aggregate/limit slice starved a lone job on hosts like #1864. The absurd
+     * sub-byte-per-slot case is still made safe by reducing effective capacity
+     * so every admitted job can receive at least one byte; normal daemon
+     * budgets are many orders larger. */
     if (aggregate_memory_budget_bytes > 0 &&
         application->physical_job_limit > aggregate_memory_budget_bytes) {
         application->physical_job_limit = aggregate_memory_budget_bytes;
     }
-    if (aggregate_memory_budget_bytes > 0 && application->physical_job_limit > 0) {
-        application->worker_memory_budget_bytes =
-            aggregate_memory_budget_bytes / application->physical_job_limit;
-    }
+    application->aggregate_memory_budget_bytes = aggregate_memory_budget_bytes;
     if (!application->worker_ops.start) {
         application->worker_ops = (cbm_daemon_application_worker_ops_t){
             .context = NULL,
@@ -3018,7 +3716,10 @@ bool cbm_daemon_application_free_with_timeout(cbm_daemon_application_t *applicat
     application->watch_job_subscriptions = NULL;
     cbm_daemon_application_mutation_t *mutations = application->mutations;
     application->mutations = NULL;
+    cbm_daemon_application_index_record_t *index_records = application->index_records;
+    application->index_records = NULL;
     cbm_mutex_unlock(&application->mutex);
+    application_index_records_free(index_records);
     while (sessions) {
         cbm_daemon_application_session_t *next = sessions->next;
         cbm_mcp_server_free(sessions->mcp);
@@ -3339,9 +4040,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     char canonical_root[APPLICATION_PATH_CAP];
-    struct stat root_status;
     if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
-        stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        !application_canonical_directory_exists(canonical_root)) {
         return -1;
     }
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
@@ -3351,7 +4051,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     yyjson_mut_doc_set_root(document, root);
-    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root);
+    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root) &&
+                   application_index_args_add_policy(application, document, root);
     char *default_project = cbm_project_name_from_path(canonical_root);
     bool custom_project =
         project_name[0] && (!default_project || strcmp(default_project, project_name) != 0);
@@ -3493,7 +4194,7 @@ size_t cbm_daemon_application_worker_memory_budget_bytes(cbm_daemon_application_
         return 0;
     }
     cbm_mutex_lock(&application->mutex);
-    size_t budget = application->worker_memory_budget_bytes;
+    size_t budget = application_worker_memory_slice_locked(application, NULL);
     cbm_mutex_unlock(&application->mutex);
     return budget;
 }

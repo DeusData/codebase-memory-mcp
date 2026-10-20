@@ -45,6 +45,10 @@ on:
         description: 'Skip candidate scan; mark unscanned and default to stripped'
         type: boolean
         default: false
+      skip_memwaste:
+        description: 'Skip the waste sanitizer (report-only) and the fuzz smoke'
+        type: boolean
+        default: false
       soak_level:
         description: 'Soak: full (quick+asan), quick (10min), none'
         type: choice
@@ -58,6 +62,13 @@ jobs:
   # ── Security (independent island — does not block main pipeline) ──
   security:
     uses: ./.github/workflows/_security.yml
+    # The called job requests security-events:read to count code-scanning
+    # alerts; a reusable workflow cannot request more than its caller grants,
+    # so withholding this here fails the whole run at startup.
+    permissions:
+      contents: read
+      security-events: read
+      actions: read
     secrets: inherit
 
   # ── Lint (cppcheck + clang-format) ────────────────────────────
@@ -99,6 +110,38 @@ jobs:
     uses: ./.github/workflows/_smoke.yml
     with:
       broad_platforms: true
+
+  # ── Waste sanitizer, REPORT-ONLY (independent island) ─────────
+  # Event lane on Linux, macOS and Windows, access lane and the per-function
+  # scaling lane on Linux. Uploads reports; fails only when the measurement is
+  # unsound (a defect of the tool itself).
+  memwaste:
+    if: ${{ inputs.skip_memwaste != true }}
+    uses: ./.github/workflows/_memwaste.yml
+    with:
+      mode: full
+
+  # ── Fuzz smoke (independent island) ───────────────────────────
+  # A fixed number of executions from a fixed seed per target, so the verdict is
+  # a function of the commit (O9). A crash here is a real defect in a parser
+  # that reads untrusted input; its reproducer is uploaded.
+  fuzz:
+    if: ${{ inputs.skip_memwaste != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev clang llvm libclang-rt-dev
+      - name: Fuzz smoke (extract, cypher, config)
+        run: scripts/fuzz.sh all --runs 20000 --seed 1
+      - name: Upload reproducers
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: build/fuzz/artifacts-*/
+          if-no-files-found: ignore
 
   # ── Soak tests (optional, parallel with smoke) ────────────────
   soak:

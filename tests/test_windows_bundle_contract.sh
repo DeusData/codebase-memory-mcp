@@ -229,6 +229,51 @@ require(
     "install.ps1 must verify and install through the downloaded binary",
 )
 
+# PS 5.1 wraps redirected native stderr into ErrorRecords; under the global
+# ErrorActionPreference=Stop a healthy binary that warns on stderr aborts the
+# version probes (#1255). Pin the guard's two load-bearing parts so neither
+# can be silently dropped: the probe-scoped relaxation with an exception-safe
+# restore, and the $LASTEXITCODE pre-seed that keeps a start-failure from
+# inheriting a stale 0 and reading as success.
+require(
+    installer.count('$ErrorActionPreference = "Continue"') == 2
+    and installer.count("$global:LASTEXITCODE = 1") == 2
+    and installer.count("$ErrorActionPreference = $ProbeEap") == 2,
+    "install.ps1 version probes must relax EAP with restore and pre-seed LASTEXITCODE (#1255)",
+)
+
+# ── 3c. The TLS bitmask must not name a protocol schannel cannot negotiate ───
+# Windows 10's schannel has no TLS 1.3 (it arrives with Windows 11 / Server
+# 2022, build 20348). .NET Framework 4.8 still DEFINES SecurityProtocolType
+# .Tls13, so setting the bit succeeds silently and nothing warns -- then the
+# first HTTPS request dies with "Could not create SSL/TLS secure channel",
+# because an unsupported flag in this bitmask is a hard failure rather than a
+# downgrade. That blocked the installer on every Windows 10 machine before it
+# downloaded a single byte (#1856). Pin both halves of the guard: the build
+# gate, and the enum-name probe that keeps the script parsing on 4.7, where
+# Tls13 does not exist.
+require(
+    "[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13" not in installer,
+    "install.ps1 must not set the TLS 1.3 bit unconditionally -- it hard-fails "
+    "the handshake on Windows 10, whose schannel cannot negotiate it (#1856)",
+)
+require(
+    re.search(r"\[Environment\]::OSVersion\.Version\.Build\s+-ge\s+20348", installer) is not None,
+    "install.ps1 must gate TLS 1.3 on build 20348+ (Windows 11 / Server 2022) (#1856)",
+)
+require(
+    re.search(
+        r"\[enum\]::GetNames\(\[Net\.SecurityProtocolType\]\)\s+-contains\s+'Tls13'", installer
+    )
+    is not None,
+    "install.ps1 must probe the enum before naming Tls13, so it still parses on "
+    ".NET Framework 4.7 where the member is undefined (#1856)",
+)
+require(
+    "[Net.ServicePointManager]::SecurityProtocol = $CbmProtocols" in installer,
+    "install.ps1 must assign the computed protocol set, not a literal bitmask (#1856)",
+)
+
 # ── 4. Package-manager shims resolve the single Windows binary ───────────────
 single_binary_contracts = {
     "pkg/npm/install.js": (

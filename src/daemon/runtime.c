@@ -36,6 +36,66 @@ static atomic_bool runtime_force_peer_image_mismatch_seam;
 void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force) {
     atomic_store(&runtime_force_peer_image_mismatch_seam, force);
 }
+/* #1955 test seam: make the active-image comparison miss, exactly as when the
+ * peer runs a DIFFERENT file with identical bytes (a second install path, a
+ * package-manager cache copy). Everything after that comparison - the full
+ * fingerprint fallback and the verified-image cache - still runs for real. The
+ * counter records every full-image fingerprint the HELLO path computes, so a
+ * test asserts how often the O(image size) hash runs instead of timing it. */
+static atomic_bool runtime_force_peer_image_distinct_copy_seam;
+static atomic_uint_fast64_t runtime_peer_image_hash_count_seam;
+void cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(bool force) {
+    atomic_store(&runtime_force_peer_image_distinct_copy_seam, force);
+}
+uint64_t cbm_daemon_runtime_peer_image_hashes_for_testing(void) {
+    return (uint64_t)atomic_load(&runtime_peer_image_hash_count_seam);
+}
+static void runtime_note_peer_image_hash(void) {
+    (void)atomic_fetch_add(&runtime_peer_image_hash_count_seam, 1);
+}
+/* The abandoned-request containment path ends in process termination, which an
+ * in-process harness cannot observe. The timeout override makes the ceiling
+ * reachable in test time; the hook replaces termination with a recordable
+ * callback. Both stay inert (zero/NULL) outside tests. */
+static _Atomic uint32_t runtime_abandoned_request_join_timeout_seam;
+void cbm_daemon_runtime_set_abandoned_request_join_timeout_for_testing(uint32_t timeout_ms) {
+    atomic_store(&runtime_abandoned_request_join_timeout_seam, timeout_ms);
+}
+static _Atomic(cbm_daemon_runtime_containment_hook_t) runtime_containment_hook_seam;
+void cbm_daemon_runtime_set_containment_hook_for_testing(
+    cbm_daemon_runtime_containment_hook_t hook) {
+    atomic_store(&runtime_containment_hook_seam, hook);
+}
+
+/* Cold-storm ephemeral-linger seam (2026-09). Overrides the bounded linger
+ * window that ephemeral last-committed-client retirement grants while cohort
+ * participants are still mid-bootstrap, so a test can drive both the linger and
+ * its expiry backstop in test time. UINT32_MAX leaves the production constant;
+ * any other value (0 = expire immediately) overrides. */
+static _Atomic uint32_t runtime_ephemeral_linger_timeout_seam = UINT32_MAX;
+void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms) {
+    atomic_store(&runtime_ephemeral_linger_timeout_seam, timeout_ms);
+}
+
+/* Connection-cap seams (flaky-ledger item 12): see runtime.h. */
+static atomic_bool runtime_hold_peer_waits_seam;
+void cbm_daemon_runtime_hold_peer_waits_for_testing(bool hold) {
+    atomic_store(&runtime_hold_peer_waits_seam, hold);
+}
+static _Atomic(cbm_daemon_runtime_hello_hook_t) runtime_hello_hook_seam;
+void cbm_daemon_runtime_set_hello_hook_for_testing(cbm_daemon_runtime_hello_hook_t hook) {
+    atomic_store(&runtime_hello_hook_seam, hook);
+}
+static void runtime_hello_point(cbm_daemon_runtime_hello_point_t point) {
+    cbm_daemon_runtime_hello_hook_t hook = atomic_load(&runtime_hello_hook_seam);
+    if (hook) {
+        hook(point);
+    }
+}
+#define RUNTIME_HELLO_POINT(point) runtime_hello_point(CBM_DAEMON_RUNTIME_HELLO_POINT_##point)
+#else
+static void runtime_note_peer_image_hash(void) {}
+#define RUNTIME_HELLO_POINT(point) ((void)0)
 #endif
 
 #ifdef _WIN32
@@ -50,11 +110,11 @@ void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force) {
 #include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#elif defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#if defined(__FreeBSD__)
+#if defined(__FreeBSD__) || defined(__NetBSD__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
@@ -65,6 +125,11 @@ enum {
     RUNTIME_ACCEPT_POLL_MS = 20,
     RUNTIME_WAIT_POLL_NS = 1000000,
     RUNTIME_WORKER_STACK_SIZE = 256 * 1024,
+    /* Distinct peer image files (install paths / identical copies) whose full
+     * fingerprint already matched this daemon. Each held entry pins one image
+     * inode, so the bound is small; a full table only means later copies are
+     * hashed per admission, exactly as before the table existed. */
+    RUNTIME_VERIFIED_PEER_IMAGE_CAPACITY = 8,
     /* Bounds the drain-before-close wait for a peer consuming its final
      * response; interrupted or already-poisoned connections skip it. */
     RUNTIME_WORKER_DRAIN_TIMEOUT_MS = 2000,
@@ -72,6 +137,24 @@ enum {
      * a local cooperative peer is already blocked in read and consumes the
      * rejection within milliseconds. */
     RUNTIME_REJECT_DRAIN_TIMEOUT_MS = 250,
+    /* Ceiling on how long a disconnecting worker waits for its in-flight
+     * application request to observe cancellation. session_cancel has already
+     * run by the time this wait starts, so a compliant handler returns within
+     * milliseconds; the wait is sized for a handler that only polls its cancel
+     * flag between long pipeline stages. A handler that ignores cancellation
+     * past this ceiling turned the daemon into a permanent zombie once
+     * (2026-08-29): the unbounded join blocked the disconnect path, admission
+     * wedged behind it, and the dead generation held the endpoint pipes and
+     * the UI port for nine hours with nothing logged. */
+    RUNTIME_ABANDONED_REQUEST_JOIN_TIMEOUT_MS = 30000,
+    /* Cold-storm race (2026-09): when the final committed client of an
+     * ephemeral generation disconnects while cohort participants are still
+     * admitted but mid-bootstrap (racing connect()), the generation lingers
+     * this long for them to connect instead of retiring out from under them.
+     * Mirrors the host initial-client window; the linger is always bounded so
+     * a participant that never connects cannot wedge the generation (the
+     * 900s host_serving hang). */
+    RUNTIME_EPHEMERAL_LINGER_MS = 10000,
     RUNTIME_PATH_CAP = 4096,
 
     RENDEZVOUS_REQUEST_ABI_OFFSET = 0,
@@ -159,7 +242,7 @@ typedef struct {
     HANDLE file;
     BY_HANDLE_FILE_INFORMATION information;
     LARGE_INTEGER size;
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     int fd;
     struct stat status;
 #endif
@@ -199,6 +282,10 @@ struct cbm_daemon_runtime_service {
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     cbm_daemon_build_identity_t identity;
     runtime_process_image_reference_t active_image;
+    /* Guarded by mutex. Retained references keep each verified inode alive,
+     * so its stat identity cannot be reused by a different file. */
+    runtime_process_image_reference_t verified_peer_images[RUNTIME_VERIFIED_PEER_IMAGE_CAPACITY];
+    size_t verified_peer_image_count;
     char *conflict_log_path;
     size_t conflict_log_cap_bytes;
     uint64_t lease_timeout_ms;
@@ -208,6 +295,12 @@ struct cbm_daemon_runtime_service {
     /* Owned only by the convenience start() path. start_reserved() callers
      * retain their externally managed participant guard. */
     cbm_daemon_ipc_participant_guard_t *owned_participant_guard;
+    /* Cold-storm ephemeral-retirement gate (2026-09). When the final committed
+     * client disconnects while cohort participants are still admitted but not
+     * yet committed, the generation lingers until this bounded deadline instead
+     * of retiring; reconcile_lifetime retires it once that window elapses with
+     * no new client committing. Zero means no linger is armed. */
+    uint64_t ephemeral_linger_deadline_ms;
 };
 
 struct cbm_daemon_runtime_worker {
@@ -264,6 +357,16 @@ static uint64_t runtime_deadline_after(uint32_t timeout_ms) {
         return UINT64_MAX;
     }
     return now_ms + (uint64_t)timeout_ms;
+}
+
+static uint32_t runtime_ephemeral_linger_timeout_ms(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    uint32_t seam = atomic_load(&runtime_ephemeral_linger_timeout_seam);
+    if (seam != UINT32_MAX) {
+        return seam;
+    }
+#endif
+    return RUNTIME_EPHEMERAL_LINGER_MS;
 }
 
 static void runtime_wait_tick(uint64_t deadline_ms) {
@@ -514,7 +617,7 @@ static bool runtime_activation_response_decode(
 static uint64_t runtime_current_process_id(void) {
 #ifdef _WIN32
     return (uint64_t)GetCurrentProcessId();
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     return (uint64_t)getpid();
 #else
     return 0;
@@ -528,7 +631,7 @@ static void runtime_process_image_reference_init(runtime_process_image_reference
     memset(reference, 0, sizeof(*reference));
 #ifdef _WIN32
     reference->file = INVALID_HANDLE_VALUE;
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     reference->fd = -1;
 #endif
 }
@@ -542,7 +645,7 @@ static bool runtime_process_image_reference_release(runtime_process_image_refere
     if (reference->file != INVALID_HANDLE_VALUE && !CloseHandle(reference->file)) {
         ok = false;
     }
-#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
     if (reference->fd >= 0 && close(reference->fd) != 0) {
         ok = false;
     }
@@ -682,7 +785,7 @@ static bool runtime_mac_process_maps_file_executable(int process_id, const struc
     return false;
 }
 
-#elif defined(__linux__) || defined(__FreeBSD__)
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 
 static bool runtime_posix_stat_same_image(const struct stat *first, const struct stat *second) {
     return first && second && S_ISREG(first->st_mode) && S_ISREG(second->st_mode) &&
@@ -818,12 +921,16 @@ static bool runtime_process_image_reference_acquire(
     } else if (image_fd >= 0) {
         (void)close(image_fd);
     }
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(__NetBSD__)
     if (process_id > INT_MAX) {
         return false;
     }
     int pid = (int)process_id;
+#if defined(__NetBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC_ARGS, pid, KERN_PROC_PATHNAME};
+#else
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, pid};
+#endif
     char path[PATH_MAX];
     size_t path_length = sizeof(path);
     bool ok = sysctl(mib, 4, path, &path_length, NULL, 0) == 0 && path_length > 0;
@@ -855,6 +962,35 @@ static bool runtime_process_image_reference_acquire(
     return ok;
 }
 
+/* True when a retained reference is still the unchanged image it captured AND
+ * the freshly acquired peer maps that same image. Metadata only: no hashing. */
+static bool runtime_process_image_reference_same(const runtime_process_image_reference_t *held,
+                                                 const runtime_process_image_reference_t *peer) {
+    if (!held || !held->held || !peer || !peer->held) {
+        return false;
+    }
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION held_now;
+    LARGE_INTEGER held_size_now;
+    return runtime_windows_file_snapshot(held->file, &held_now, &held_size_now) &&
+           runtime_windows_file_snapshot_same(&held->information, &held->size, &held_now,
+                                              &held_size_now) &&
+           runtime_windows_file_snapshot_same(&held->information, &held->size, &peer->information,
+                                              &peer->size);
+#elif defined(__APPLE__)
+    struct stat held_now;
+    return fstat(held->fd, &held_now) == 0 && runtime_mac_stat_same(&held->status, &held_now) &&
+           runtime_mac_stat_same(&held->status, &peer->status);
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
+    struct stat held_now;
+    return fstat(held->fd, &held_now) == 0 &&
+           runtime_posix_stat_same_image(&held->status, &held_now) &&
+           runtime_posix_stat_same_image(&held->status, &peer->status);
+#else
+    return false;
+#endif
+}
+
 /* A false result means only "not proven identical". The caller must use the
  * full fingerprint fallback before rejecting the peer. */
 static bool runtime_process_image_reference_matches_process(
@@ -862,43 +998,12 @@ static bool runtime_process_image_reference_matches_process(
     if (!active || !active->held || process_id == 0) {
         return false;
     }
-#ifdef _WIN32
     runtime_process_image_reference_t peer;
     runtime_process_image_reference_init(&peer);
-    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
-    BY_HANDLE_FILE_INFORMATION active_now;
-    LARGE_INTEGER active_size_now;
-    same = same && runtime_windows_file_snapshot(active->file, &active_now, &active_size_now) &&
-           runtime_windows_file_snapshot_same(&active->information, &active->size, &active_now,
-                                              &active_size_now) &&
-           runtime_windows_file_snapshot_same(&active->information, &active->size,
-                                              &peer.information, &peer.size);
+    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL) &&
+                runtime_process_image_reference_same(active, &peer);
     bool released = runtime_process_image_reference_release(&peer);
     return same && released;
-#elif defined(__APPLE__)
-    runtime_process_image_reference_t peer;
-    runtime_process_image_reference_init(&peer);
-    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
-    struct stat active_now;
-    same = same && fstat(active->fd, &active_now) == 0 &&
-           runtime_mac_stat_same(&active->status, &active_now) &&
-           runtime_mac_stat_same(&active->status, &peer.status);
-    bool released = runtime_process_image_reference_release(&peer);
-    return same && released;
-#elif defined(__linux__) || defined(__FreeBSD__)
-    runtime_process_image_reference_t peer;
-    runtime_process_image_reference_init(&peer);
-    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
-    struct stat active_now;
-    same = same && fstat(active->fd, &active_now) == 0 &&
-           runtime_posix_stat_same_image(&active->status, &active_now) &&
-           runtime_posix_stat_same_image(&active->status, &peer.status);
-    bool released = runtime_process_image_reference_release(&peer);
-    return same && released;
-#else
-    (void)process_id;
-    return false;
-#endif
 }
 
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
@@ -917,6 +1022,86 @@ bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
         out[0] = '\0';
     }
     return ok;
+}
+
+typedef enum {
+    RUNTIME_PEER_IMAGE_VERIFIED,
+    RUNTIME_PEER_IMAGE_UNVERIFIABLE,
+    RUNTIME_PEER_IMAGE_MISMATCH,
+} runtime_peer_image_verdict_t;
+
+static bool runtime_verified_peer_image_known_locked(
+    const cbm_daemon_runtime_service_t *service, const runtime_process_image_reference_t *peer) {
+    for (size_t i = 0; i < service->verified_peer_image_count; i++) {
+        if (runtime_process_image_reference_same(&service->verified_peer_images[i], peer)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* #1955: the HELLO must prove the peer runs this daemon's build. The cheap
+ * proof is "same image file as the daemon"; a peer running a DIFFERENT file
+ * with identical bytes (a second install path, a package-manager copy) needs
+ * the full fingerprint, i.e. hashing the whole (~300 MB) image. That hash is
+ * slower than the client's HELLO budget, so the client abandoned it and every
+ * re-probe started it again - admission never completed against a healthy
+ * daemon. A copy is now hashed once: its verified reference is retained and
+ * later admissions of the same unchanged file match it by metadata, exactly
+ * like the active image. The accepted set of images is unchanged. */
+static runtime_peer_image_verdict_t runtime_peer_image_verify(cbm_daemon_runtime_service_t *service,
+                                                              uint64_t process_id,
+                                                              const char *requested_build) {
+    runtime_process_image_reference_t peer;
+    runtime_process_image_reference_init(&peer);
+    bool peer_held = runtime_process_image_reference_acquire(process_id, &peer, NULL);
+    bool known = false;
+    if (peer_held) {
+        known = runtime_process_image_reference_same(&service->active_image, &peer);
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (atomic_load(&runtime_force_peer_image_distinct_copy_seam)) {
+            known = false;
+        }
+#endif
+        if (!known) {
+            cbm_mutex_lock(&service->mutex);
+            known = runtime_verified_peer_image_known_locked(service, &peer);
+            cbm_mutex_unlock(&service->mutex);
+        }
+    }
+    bool released = runtime_process_image_reference_release(&peer);
+    if (known && released) {
+        return RUNTIME_PEER_IMAGE_VERIFIED;
+    }
+
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    runtime_process_image_reference_t hashed;
+    runtime_process_image_reference_init(&hashed);
+    runtime_note_peer_image_hash();
+    bool fingerprinted = runtime_process_image_reference_acquire(process_id, &hashed, fingerprint);
+    bool verified = fingerprinted && strcmp(fingerprint, requested_build) == 0 &&
+                    strcmp(fingerprint, service->identity.build_fingerprint) == 0;
+    if (verified) {
+        cbm_mutex_lock(&service->mutex);
+        if (service->verified_peer_image_count < RUNTIME_VERIFIED_PEER_IMAGE_CAPACITY &&
+            !runtime_verified_peer_image_known_locked(service, &hashed)) {
+            service->verified_peer_images[service->verified_peer_image_count++] = hashed;
+            runtime_process_image_reference_init(&hashed);
+        }
+        cbm_mutex_unlock(&service->mutex);
+    }
+    (void)runtime_process_image_reference_release(&hashed);
+    if (verified) {
+        return RUNTIME_PEER_IMAGE_VERIFIED;
+    }
+    return fingerprinted ? RUNTIME_PEER_IMAGE_MISMATCH : RUNTIME_PEER_IMAGE_UNVERIFIABLE;
+}
+
+static void runtime_verified_peer_images_release(cbm_daemon_runtime_service_t *service) {
+    for (size_t i = 0; i < service->verified_peer_image_count; i++) {
+        (void)runtime_process_image_reference_release(&service->verified_peer_images[i]);
+    }
+    service->verified_peer_image_count = 0;
 }
 
 static bool runtime_hello_response_encode(uint8_t out[CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE],
@@ -1147,10 +1332,32 @@ static void runtime_service_interrupt_connections(cbm_daemon_runtime_service_t *
     runtime_service_interrupt_connections_except(service, NULL, false);
 }
 
+/* A cold-storm racer is a connection that has been ACCEPTED but has not yet
+ * passed HELLO admission (in_use with a live connection, not yet admitted, not
+ * tearing down) -- a one-shot client still mid-bootstrap. This deliberately
+ * does NOT count an already-admitted provisional session (HELLO done, app
+ * session opening): a provisional coordinator client must not keep a retiring
+ * generation alive (see runtime_worker_disconnect below and the
+ * daemon_runtime_final_disconnect_rejects_blocked_provisional_session guard).
+ * Caller holds service->mutex. `except` excludes the departing worker. */
+static bool runtime_has_pending_hello_peer_locked(const cbm_daemon_runtime_service_t *service,
+                                                  const cbm_daemon_runtime_worker_t *except) {
+    for (size_t i = 0; i < service->worker_capacity; i++) {
+        const cbm_daemon_runtime_worker_t *worker = &service->workers[i];
+        if (worker != except && worker->in_use && worker->connection && !worker->admitted &&
+            !atomic_load_explicit(&worker->disconnecting, memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
     cbm_daemon_runtime_service_t *service = worker->service;
     cbm_daemon_client_id_t client_id = CBM_DAEMON_CLIENT_ID_INVALID;
     uint64_t shutdown_deadline = runtime_deadline_after(service->shutdown_timeout_ms);
+    bool last_committed_left = false;
+    bool linger_armed = false;
     atomic_store_explicit(&worker->disconnecting, true, memory_order_release);
     cbm_mutex_lock(&service->mutex);
     if (worker->admitted) {
@@ -1168,13 +1375,46 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
              * alive after the final fully committed frontend disconnects.
              * A permanent generation (`daemon start`) deliberately survives
              * this: only the stop/drain ops or a process kill end it. */
-            runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
-                                                  "last_committed_client_disconnected");
+            last_committed_left = true;
+            /* Cold-storm race (2026-09): if another connection is already
+             * accepted and still mid-HELLO (not yet admitted) when the last
+             * committed client leaves, it is a one-shot peer racing to commit —
+             * retiring now strands it on a STOPPING daemon and forces a full
+             * cold respawn ("cold-storm client failed (racing daemon spawn)").
+             * Linger a bounded window for it; the accept loop retires the
+             * generation once that racer drains without committing or the window
+             * elapses, and a racer that does commit clears the linger
+             * (runtime_worker_commit_admission). This deliberately lingers ONLY
+             * for a pre-HELLO racer, never for an already-admitted provisional
+             * session (HELLO done, app session opening): the contract that a
+             * provisional coordinator client cannot keep a retiring generation
+             * alive is preserved (the reject-blocked-provisional-session guard).
+             * With no such racer — the common single-client case — retire
+             * immediately, unchanged. (A cross-process cohort peer count is
+             * unavailable: advisory locks expose presence, not a holder count,
+             * and Windows LockFileEx has no non-owning probe.) */
+            if (runtime_has_pending_hello_peer_locked(service, worker)) {
+                service->ephemeral_linger_deadline_ms =
+                    runtime_deadline_after(runtime_ephemeral_linger_timeout_ms());
+                linger_armed = true;
+            } else {
+                service->ephemeral_linger_deadline_ms = 0;
+                runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
+                                                      "last_committed_client_disconnected");
+            }
         }
     }
     cbm_mutex_unlock(&service->mutex);
     if (client_id == CBM_DAEMON_CLIENT_ID_INVALID) {
         return;
+    }
+    /* Set the coordinator hold BEFORE releasing this client so its last-client
+     * self-transition to STOPPING is suppressed while a racing peer is still
+     * mid-HELLO; when no peer is present the hold stays clear so the release
+     * retires the coordinator normally. last_committed_left implies a committed (hence
+     * admitted) client, so client_id is always valid here. */
+    if (last_committed_left) {
+        cbm_daemon_coordinator_set_linger(service->coordinator, linger_armed);
     }
     (void)cbm_daemon_client_disconnected(service->coordinator, client_id, cbm_now_ms());
     if (worker->application_session_opened && !worker->application_cancelled) {
@@ -1223,8 +1463,18 @@ static bool runtime_worker_commit_admission(cbm_daemon_runtime_worker_t *worker)
     if (committed) {
         worker->admission_committed = true;
         service->committed_clients++;
+        /* A freshly committed client ends any last-client linger window; the
+         * next drop to zero re-arms it against the participants outstanding
+         * then. */
+        service->ephemeral_linger_deadline_ms = 0;
     }
     cbm_mutex_unlock(&service->mutex);
+    if (committed) {
+        /* Mirror the cleared linger onto the coordinator. client_count is
+         * already nonzero (admission incremented it), so this only resets the
+         * hold for the next idle window — it never retires a live coordinator. */
+        cbm_daemon_coordinator_set_linger(service->coordinator, false);
+    }
     return committed;
 }
 
@@ -1309,12 +1559,61 @@ static void *runtime_application_worker(void *opaque) {
     return NULL;
 }
 
+static _Noreturn void runtime_cleanup_fail_stop(const char *component);
+
+static void runtime_contain_unresponsive_application(cbm_daemon_runtime_worker_t *worker) {
+    char peer_pid[32];
+    char token[32];
+    (void)snprintf(peer_pid, sizeof(peer_pid), "%llu", (unsigned long long)worker->peer_process_id);
+    (void)snprintf(token, sizeof(token), "%llu",
+                   (unsigned long long)worker->application_request_token);
+    cbm_log_error("daemon.application_request_unresponsive", "peer_pid", peer_pid, "request_token",
+                  token);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    cbm_daemon_runtime_containment_hook_t hook = atomic_load(&runtime_containment_hook_seam);
+    if (hook) {
+        hook("application_request_join");
+        return;
+    }
+#endif
+    runtime_cleanup_fail_stop("application_request_join");
+}
+
 static bool runtime_worker_reap_application(cbm_daemon_runtime_worker_t *worker, bool wait) {
     if (!worker->application_thread_started) {
         return true;
     }
     if (!wait && !atomic_load_explicit(&worker->application_thread_done, memory_order_acquire)) {
         return false;
+    }
+    if (!atomic_load_explicit(&worker->application_thread_done, memory_order_acquire)) {
+        /* The peer is gone and session_cancel already ran, so the handler owes
+         * a prompt return; only a handler that ignores cancellation reaches
+         * the ceiling. An unbounded join here once turned one wedged request
+         * into a whole-daemon zombie (2026-08-29): the disconnect path
+         * blocked, the worker slot never released, and the dead generation
+         * held the endpoint pipes and UI port for nine hours with nothing
+         * logged while every new client timed out bare. Containment
+         * terminates the process instead — the kernel releases every native
+         * claim and the next client starts a fresh generation. */
+        uint32_t timeout_ms = RUNTIME_ABANDONED_REQUEST_JOIN_TIMEOUT_MS;
+#ifdef CBM_ENABLE_TEST_SEAMS
+        uint32_t seam_timeout = atomic_load(&runtime_abandoned_request_join_timeout_seam);
+        if (seam_timeout != 0) {
+            timeout_ms = seam_timeout;
+        }
+#endif
+        uint64_t deadline = runtime_deadline_after(timeout_ms);
+        while (!atomic_load_explicit(&worker->application_thread_done, memory_order_acquire)) {
+            if (cbm_now_ms() >= deadline) {
+                /* Terminal in production. A test containment hook returns, and
+                 * the join then waits for the harness to release the handler
+                 * so teardown stays leak-free under the sanitizers. */
+                runtime_contain_unresponsive_application(worker);
+                deadline = UINT64_MAX;
+            }
+            runtime_wait_tick(deadline);
+        }
     }
     if (cbm_thread_join(&worker->application_thread) != 0) {
         return false;
@@ -1708,6 +2007,29 @@ static void runtime_worker_handle_activation_shutdown(cbm_daemon_runtime_worker_
     runtime_worker_finish(worker);
 }
 
+/* The first frame is due within the request deadline. Under the item-12 seam a
+ * connection that never sends one holds its slot until it closes; stop still
+ * interrupts the wait like any other worker receive. */
+static uint32_t runtime_first_frame_timeout_ms(const cbm_daemon_runtime_service_t *service) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&runtime_hold_peer_waits_seam)) {
+        return CBM_DAEMON_IPC_WAIT_FOREVER;
+    }
+#endif
+    return service->request_timeout_ms;
+}
+
+/* Under the same seam an inline rejection's drain ends only on the peer's
+ * close, never on the 250 ms bound (the drain only waits on Windows). */
+static uint32_t runtime_reject_drain_timeout_ms(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&runtime_hold_peer_waits_seam)) {
+        return CBM_DAEMON_IPC_WAIT_FOREVER;
+    }
+#endif
+    return RUNTIME_REJECT_DRAIN_TIMEOUT_MS;
+}
+
 static void *runtime_connection_worker(void *opaque) {
     cbm_daemon_runtime_worker_t *worker = opaque;
     cbm_daemon_runtime_service_t *service = worker->service;
@@ -1717,7 +2039,7 @@ static void *runtime_connection_worker(void *opaque) {
     char requested_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
 
     int received = cbm_daemon_ipc_receive_frame_bounded(
-        worker->connection, service->request_timeout_ms,
+        worker->connection, runtime_first_frame_timeout_ms(service),
         CBM_DAEMON_ACTIVATION_SHUTDOWN_REQUEST_SIZE, &frame, &payload);
     if (received != 1 || frame.type != CBM_DAEMON_FRAME_REQUEST) {
         free(payload);
@@ -1775,17 +2097,10 @@ static void *runtime_connection_worker(void *opaque) {
         return NULL;
     }
 
-    bool peer_image_verified = runtime_process_image_reference_matches_process(
-        &service->active_image, worker->peer_process_id);
-    bool peer_image_fingerprinted = false;
-    if (!peer_image_verified) {
-        char peer_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-        peer_image_fingerprinted =
-            cbm_daemon_runtime_process_build_fingerprint(worker->peer_process_id, peer_fingerprint);
-        peer_image_verified = peer_image_fingerprinted &&
-                              strcmp(peer_fingerprint, requested_build) == 0 &&
-                              strcmp(peer_fingerprint, service->identity.build_fingerprint) == 0;
-    }
+    runtime_peer_image_verdict_t peer_image =
+        runtime_peer_image_verify(service, worker->peer_process_id, requested_build);
+    bool peer_image_verified = peer_image == RUNTIME_PEER_IMAGE_VERIFIED;
+    bool peer_image_fingerprinted = peer_image != RUNTIME_PEER_IMAGE_UNVERIFIABLE;
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (atomic_load(&runtime_force_peer_image_unverified_seam)) {
         peer_image_verified = false;
@@ -2000,14 +2315,19 @@ static cbm_daemon_runtime_worker_t *runtime_find_free_worker_locked(
     return NULL;
 }
 
+/* Answers WITHOUT reading the peer's HELLO, so on POSIX (where the drain is a
+ * no-op) the close can land before the peer has even sent it; the client reads
+ * this answer after its failed send (cbm_daemon_runtime_client_connect). */
 static void runtime_reject_inline(cbm_daemon_ipc_connection_t *connection, const char *message) {
     cbm_daemon_runtime_connect_result_t result;
     runtime_result_rejected(&result, message);
+    RUNTIME_HELLO_POINT(DAEMON_REJECTING);
     (void)runtime_send_hello_response(connection, &result);
     /* Same Windows named-pipe discard hazard as runtime_worker_finish: the
      * peer must get to read the rejection before the handle closes. */
-    cbm_daemon_ipc_connection_drain(connection, RUNTIME_REJECT_DRAIN_TIMEOUT_MS);
+    cbm_daemon_ipc_connection_drain(connection, runtime_reject_drain_timeout_ms());
     cbm_daemon_ipc_connection_close(connection);
+    RUNTIME_HELLO_POINT(DAEMON_REJECTED);
 }
 
 static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
@@ -2107,6 +2427,11 @@ static void *runtime_accept_loop(void *opaque) {
             continue;
         }
 
+        /* Self-retire a generation lingering for a cold-storm peer once the peer
+         * drains or the bounded window elapses, without an external driver. A
+         * no-op unless a last-committed-client linger is armed. */
+        cbm_daemon_runtime_service_reconcile_lifetime(service);
+
         cbm_daemon_ipc_connection_t *connection = NULL;
         int accepted =
             cbm_daemon_ipc_accept(service->listener, RUNTIME_ACCEPT_POLL_MS, &connection);
@@ -2198,6 +2523,7 @@ static void runtime_service_destroy_unstarted(cbm_daemon_runtime_service_t *serv
     cbm_daemon_ipc_listener_close(service->listener);
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
+    runtime_verified_peer_images_release(service);
     free(service->conflict_log_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
@@ -2398,6 +2724,36 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
     return count;
 }
 
+void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return;
+    }
+    bool retired = false;
+    cbm_mutex_lock(&service->mutex);
+    if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING && !service->permanent &&
+        service->committed_clients == 0 && service->ephemeral_linger_deadline_ms != 0) {
+        bool peers_drained = !runtime_has_pending_hello_peer_locked(service, NULL);
+        bool window_elapsed = cbm_now_ms() >= service->ephemeral_linger_deadline_ms;
+        if (peers_drained || window_elapsed) {
+            /* The racing peer drained without committing (retire now), or never
+             * committed within the bounded window (the backstop that rules out
+             * an unbounded idle hang — the host_serving 900s mode). */
+            service->ephemeral_linger_deadline_ms = 0;
+            runtime_service_begin_stopping_locked(
+                service, runtime_deadline_after(service->shutdown_timeout_ms), false,
+                peers_drained ? "ephemeral_peer_drained" : "ephemeral_linger_expired");
+            retired = true;
+        }
+    }
+    cbm_mutex_unlock(&service->mutex);
+    if (retired) {
+        /* Release the coordinator hold now that the linger has resolved. With
+         * no client left this transitions the coordinator to STOPPING, so the
+         * service drains and exits cleanly rather than only on the deadline. */
+        cbm_daemon_coordinator_set_linger(service->coordinator, false);
+    }
+}
+
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,
                                                   const char *project_key) {
     return service ? cbm_daemon_job_subscribers(service->coordinator, project_key) : 0;
@@ -2517,6 +2873,7 @@ bool cbm_daemon_runtime_service_free(cbm_daemon_runtime_service_t *service) {
     }
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
+    runtime_verified_peer_images_release(service);
     free(service->conflict_log_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
@@ -2565,8 +2922,11 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
                                          const cbm_daemon_build_identity_t *identity,
                                          cbm_daemon_runtime_operation_t operation,
                                          uint32_t timeout_ms, uint32_t response_size,
-                                         uint8_t **payload_out) {
+                                         uint8_t **payload_out, uint64_t *muted_holder_pid_out) {
     *payload_out = NULL;
+    if (muted_holder_pid_out) {
+        *muted_holder_pid_out = 0;
+    }
     if (!endpoint || !identity || !identity->build_fingerprint ||
         timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER) {
         return false;
@@ -2586,6 +2946,15 @@ static bool runtime_control_request_send(const cbm_daemon_ipc_endpoint_t *endpoi
     int received = sent ? cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms,
                                                                response_size, &frame, &payload)
                         : 0;
+    if (muted_holder_pid_out && sent &&
+        (received != 1 || (frame.type == CBM_DAEMON_FRAME_RESPONSE && frame.flags != operation))) {
+        /* Connected but not served: either total silence (dead runtime), or a
+         * wrong-operation reject frame (a wedged generation whose accept path
+         * still answers inline while every worker slot is stuck). Both are
+         * the zombie class — surface the holder's kernel-reported pid so
+         * `daemon status` can name it instead of reporting "not running". */
+        *muted_holder_pid_out = cbm_daemon_ipc_connection_peer_pid(connection);
+    }
     bool valid = received == 1 && frame.type == CBM_DAEMON_FRAME_RESPONSE &&
                  frame.flags == operation && frame.length == response_size && payload &&
                  payload[0] == 1U;
@@ -2613,7 +2982,8 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
     memset(status_out, 0, sizeof(*status_out));
     uint8_t *payload = NULL;
     if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STATUS, timeout_ms,
-                                      CBM_DAEMON_STATUS_RESPONSE_SIZE, &payload)) {
+                                      CBM_DAEMON_STATUS_RESPONSE_SIZE, &payload,
+                                      &status_out->muted_endpoint_holder_pid)) {
         return false;
     }
     status_out->permanent = (payload[1] & 0x01U) != 0U;
@@ -2634,6 +3004,73 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
     return true;
 }
 
+/* "; CBM sessions using it: pids 1, 2 and 3 more" — empty when none are known. */
+static bool remedy_sessions_format(const cbm_daemon_runtime_status_t *active, char *out,
+                                   size_t out_size) {
+    out[0] = '\0';
+    size_t listed = active->client_count;
+    if (listed > CBM_DAEMON_CONTROL_CLIENT_CAP) {
+        listed = CBM_DAEMON_CONTROL_CLIENT_CAP;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < listed; i++) {
+        int written = snprintf(out + used, out_size - used, "%s%lu",
+                               i == 0 ? "; CBM sessions using it: pids " : ", ",
+                               (unsigned long)active->client_pids[i]);
+        if (written < 0 || (size_t)written >= out_size - used) {
+            return false;
+        }
+        used += (size_t)written;
+    }
+    if (listed > 0 && active->committed_clients > listed) {
+        int written = snprintf(out + used, out_size - used, " and %lu more",
+                               (unsigned long)(active->committed_clients - listed));
+        if (written < 0 || (size_t)written >= out_size - used) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active, char *out,
+                                       size_t out_size) {
+    if (!out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    static const char install_hint[] =
+        "Usually another editor or agent session (for example Codex or Claude Code) "
+        "launched a different codebase-memory-mcp install: close it, or point every client "
+        "at one binary (compare `which -a codebase-memory-mcp` with each client's MCP "
+        "config).";
+    int written;
+    if (!active) {
+        written = snprintf(out, out_size,
+                           "Run `codebase-memory-mcp daemon status` to see the active daemon and "
+                           "the sessions using it. %s `codebase-memory-mcp daemon stop` retires "
+                           "the daemon once no session uses it.",
+                           install_hint);
+    } else {
+        char sessions[160];
+        if (!remedy_sessions_format(active, sessions, sizeof(sessions))) {
+            return false;
+        }
+        const char *lifetime =
+            active->permanent ? "permanent" : "session-managed, exits when its last session closes";
+        written = snprintf(out, out_size,
+                           "Active daemon: pid %lu, version %s, %s%s%s. %s "
+                           "`codebase-memory-mcp daemon stop` retires the daemon once no session "
+                           "uses it.",
+                           (unsigned long)active->daemon_pid, active->semantic_version, lifetime,
+                           active->stopping ? ", already stopping" : "", sessions, install_hint);
+    }
+    if (written < 0 || (size_t)written >= out_size) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
                                      const cbm_daemon_build_identity_t *identity,
                                      uint32_t timeout_ms,
@@ -2644,7 +3081,7 @@ bool cbm_daemon_runtime_request_stop(const cbm_daemon_ipc_endpoint_t *endpoint,
     memset(result_out, 0, sizeof(*result_out));
     uint8_t *payload = NULL;
     if (!runtime_control_request_send(endpoint, identity, CBM_DAEMON_RUNTIME_OP_STOP, timeout_ms,
-                                      CBM_DAEMON_STOP_RESPONSE_SIZE, &payload)) {
+                                      CBM_DAEMON_STOP_RESPONSE_SIZE, &payload, NULL)) {
         return false;
     }
     result_out->accepted = (payload[1] & 0x01U) != 0U;
@@ -2672,21 +3109,46 @@ cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect(
         return NULL;
     }
     cbm_daemon_ipc_connection_t *connection = cbm_daemon_ipc_connect(endpoint, timeout_ms);
-    if (!connection || !cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
-                                                  CBM_DAEMON_RUNTIME_OP_HELLO, request,
-                                                  (uint32_t)sizeof(request))) {
-        cbm_daemon_ipc_connection_close(connection);
+    if (!connection) {
         return NULL;
     }
+    RUNTIME_HELLO_POINT(CLIENT_CONNECTED);
+    bool hello_sent =
+        cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST, CBM_DAEMON_RUNTIME_OP_HELLO,
+                                  request, (uint32_t)sizeof(request));
+    RUNTIME_HELLO_POINT(CLIENT_SENT);
     cbm_daemon_frame_t frame = {0};
     uint8_t *payload = NULL;
-    int received = cbm_daemon_ipc_receive_frame_bounded(
-        connection, timeout_ms, CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE, &frame, &payload);
+    /* A daemon at capacity or stopping answers from its accept loop without
+     * reading this HELLO and closes at once. When that close lands first, the
+     * send fails (EPIPE) with the whole answer already queued here: read it,
+     * or the caller gets a bare transport error and bootstrap classifies by
+     * lock state instead of by the daemon's own "capacity" / "stopping". */
+    int received =
+        hello_sent
+            ? cbm_daemon_ipc_receive_frame_bounded(
+                  connection, timeout_ms, CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE, &frame, &payload)
+            : cbm_daemon_ipc_receive_frame_after_failed_send(
+                  connection, timeout_ms, CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE, &frame, &payload);
     bool valid = received == 1 && frame.type == CBM_DAEMON_FRAME_RESPONSE &&
                  frame.flags == CBM_DAEMON_RUNTIME_OP_HELLO &&
                  frame.length == CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE &&
                  runtime_hello_response_decode(payload, result_out);
     free(payload);
+    if (!hello_sent && (!valid || result_out->status != CBM_DAEMON_RUNTIME_CONNECT_REJECTED)) {
+        /* Only a rejection can answer a HELLO the daemon never received;
+         * anything else stays the plain send failure it always was. */
+        memset(result_out, 0, sizeof(*result_out));
+        cbm_daemon_ipc_connection_close(connection);
+        return NULL;
+    }
+    if (received != 1) {
+        /* The kernel completed the pipe/socket connect, so a server process
+         * exists, yet the HELLO went unanswered. Name that holder: a dead
+         * runtime behind a live endpoint is otherwise indistinguishable from
+         * absence, and the 2026-08-29 zombie hid behind exactly that gap. */
+        result_out->muted_endpoint_holder_pid = cbm_daemon_ipc_connection_peer_pid(connection);
+    }
     if (!valid || result_out->status != CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED) {
         cbm_daemon_ipc_connection_close(connection);
         return NULL;

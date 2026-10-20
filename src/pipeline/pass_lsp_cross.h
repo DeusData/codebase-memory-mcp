@@ -55,8 +55,17 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * receives per-file prefix offsets: file i's defs occupy
  * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
  * needs the per-file slices, which the flat array does not otherwise
- * record. */
-CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
+ * record.
+ *
+ * `ctx` (nullable) enables cross-file base-class resolution: for the
+ * languages whose cross registrars read embedded_types as qualified names
+ * (Python, JS/TS/TSX), every CBMDefinition.base_classes spelling is resolved
+ * to a project QN through ctx->registry plus the file's import map — the same
+ * inputs pass_semantic uses to draw its INHERITS edge, so the LSP's
+ * inheritance view and the graph's cannot diverge. Pass NULL to keep the raw
+ * source spelling (surface-probe paths that build no registry). */
+CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                    CBMFileResult **cache, const cbm_file_info_t *files,
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count, int *out_def_starts);
 
@@ -68,10 +77,24 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
  * Both sequential and parallel drivers use this exact helper so import
  * metadata cannot diverge between pipelines. Values are owned by the returned
  * map (not borrowed from gbuf); release both arrays with
- * cbm_pxc_free_import_map(). */
+ * cbm_pxc_free_import_map(). A complete PHP binding snapshot also permits an
+ * allocated empty map. This compatibility projection alone never proves
+ * vendor absence: consumers require cbm_pipeline_php_vendor_names_build's
+ * separate typed evidence, including completion and full import identities. */
 int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
                              CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
+/* As cbm_pxc_build_import_map (which is include_type_only = false, the CALLS
+ * map), but with include_type_only also binding annotation-only imports
+ * (Python `if TYPE_CHECKING:`), for the consumers that resolve annotations:
+ * the Python LSP and the cross-file base/field-type resolution (#1277). */
+int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name,
+                                const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+                                bool include_type_only, const char ***out_keys,
+                                const char ***out_vals, int *out_count);
+/* True when the file records an annotation-only import (the LSP map then
+ * differs from the CALLS map and must be built separately). */
+bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result);
 
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
 
@@ -144,8 +167,9 @@ void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint
 
 static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r,
                                                          CBMLanguage lang) {
-    if (!r)
+    if (!r) {
         return NULL;
+    }
     switch (lang) {
     case CBM_LANG_GO:
         return r->go;
@@ -170,25 +194,38 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     }
 }
 
-/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
- * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
- * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
+/* Build and borrow the Rust Cargo manifest used for cross-crate (#56) routing.
+ * The manifest owns strings in manifest_arena; callers keep that arena alive
+ * until every resolver worker has joined.  Each worker must install the shared
+ * immutable pointer in its own TLS slot before dispatch and clear it afterward. */
 struct CBMCargoManifest;
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
+                                 struct CBMCargoManifest *out_manifest);
+void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
+/* A resolve worker keeps its per-file cross-LSP scratch arenas between files
+ * from _begin to _end; _end must run on the same thread before it exits. */
+void cbm_pxc_thread_scratch_begin(void);
+void cbm_pxc_thread_scratch_end(void);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
- * owns source, module_qn, all_defs, imp_keys, imp_vals.
- * NOTE: all_defs is read-only in practice but typed non-const to match
+ * owns source, module_qn, defs, imp_names, imp_qns.
+ * NOTE: defs is read-only in practice but typed non-const to match
  * the existing cbm_run_X_lsp_cross callee signatures. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
-                     const char *module_qn, CBMLSPDef *all_defs, int def_count,
-                     const char **imp_keys, const char **imp_vals, int imp_count);
+                     const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
+                     const char **imp_qns, int imp_count);
+
+void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const char *source,
+                                       int source_len, const char *module_qn, CBMLSPDef *defs,
+                                       int def_count, const char **imp_names, const char **imp_qns,
+                                       int imp_count, const CBMPHPImportBindings *bindings);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
-                        CBMLSPDef *all_defs, int def_count, const char **imp_keys,
-                        const char **imp_vals, int imp_count, bool js_mode, bool jsx_mode,
+                        CBMLSPDef *defs, int def_count, const char **imp_names,
+                        const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode);
 
 /* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the
@@ -204,5 +241,13 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
                            void *rust_shared_ctx);
+
+void cbm_pxc_dispatch_file_with_php_bindings(
+    CBMLanguage lang, CBMFileResult *result, const char *source, int source_len, const char *rel,
+    const char *def_module, const CBMCrossLspRegistries *cross_registries,
+    const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs, int all_def_count,
+    const char **imp_keys, const char **imp_vals, int imp_count,
+    CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
+    const CBMPHPImportBindings *bindings);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

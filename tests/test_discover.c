@@ -475,6 +475,163 @@ TEST(discover_bounded_count_matches_shebang_discovery) {
     PASS();
 }
 
+TEST(discover_resource_policy_off_matches_legacy_discovery) {
+    char *base = th_mktempdir("cbm_disc_policy_off");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "src/first.c"), "int first;\n");
+    th_write_file(TH_PATH(base, "src/second.py"), "second = 2\n");
+    th_write_file(TH_PATH(base, "src/ignored.png"), "not source\n");
+
+    cbm_file_info_t *legacy_files = NULL;
+    int legacy_count = 0;
+    cbm_discover_opts_t legacy_opts = {.mode = CBM_MODE_FULL};
+    ASSERT_EQ(cbm_discover(base, &legacy_opts, &legacy_files, &legacy_count), CBM_DISCOVER_OK);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_file_info_t *policy_files = NULL;
+    int policy_count = 0;
+    cbm_discover_opts_t policy_opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_discover_status_t status = cbm_discover(base, &policy_opts, &policy_files, &policy_count);
+
+    ASSERT_EQ(status, CBM_DISCOVER_OK);
+    ASSERT_EQ(policy_count, legacy_count);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_NONE);
+    for (int index = 0; index < legacy_count; index++) {
+        ASSERT_STR_EQ(policy_files[index].rel_path, legacy_files[index].rel_path);
+        ASSERT_EQ(policy_files[index].size, legacy_files[index].size);
+    }
+
+    cbm_discover_free(legacy_files, legacy_count);
+    cbm_discover_free(policy_files, policy_count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_resource_file_limit_is_exact_and_counts_only_accepted_sources) {
+    char *base = th_mktempdir("cbm_disc_policy_files");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, ".gitignore"), "ignored.c\n");
+    th_write_file(TH_PATH(base, "accepted.c"), "int accepted;\n");
+    th_write_file(TH_PATH(base, "ignored.c"), "int ignored;\n");
+    th_write_file(TH_PATH(base, "unsupported.png"), "not source\n");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_NONE);
+    cbm_discover_free(files, count);
+
+    th_write_file(TH_PATH(base, "second.py"), "second = 2\n");
+    files = NULL;
+    count = 99;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_resource_source_bytes_allows_equality_and_rejects_one_more_byte) {
+    char *base = th_mktempdir("cbm_disc_policy_bytes");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "exact.c"), "1234567");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_source_bytes = (cbm_index_limit_u64_t){.enabled = true, .value = 7};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    th_write_file(TH_PATH(base, "plus.py"), "x");
+    files = NULL;
+    count = 99;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT(files == NULL);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_SOURCE_BYTES);
+    ASSERT_EQ(violation.observed, 8);
+    ASSERT_EQ(violation.limit, 7);
+
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_resource_file_budget_excludes_existing_oversized_skip) {
+    char *base = th_mktempdir("cbm_disc_policy_oversized");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "accepted.c"), "x");
+    th_write_file(TH_PATH(base, "oversized.py"), "123");
+    const char *saved_limit = getenv("CBM_MAX_FILE_BYTES");
+    char *saved_limit_copy = saved_limit ? strdup(saved_limit) : NULL;
+    cbm_setenv("CBM_MAX_FILE_BYTES", "2", 1);
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_index_resource_violation_t violation = {0};
+    cbm_discover_opts_t opts = {
+        .mode = CBM_MODE_FULL,
+        .resource_policy = &policy,
+        .resource_violation = &violation,
+    };
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    cbm_discover_status_t initial_status = cbm_discover(base, &opts, &files, &count);
+    bool oversized_did_not_consume_budget = initial_status == CBM_DISCOVER_OK && count == 2 &&
+                                            violation.resource == CBM_INDEX_RESOURCE_NONE;
+    cbm_discover_free(files, count);
+
+    th_write_file(TH_PATH(base, "second.c"), "y");
+    files = NULL;
+    count = 0;
+    cbm_discover_status_t exceeded_status = cbm_discover(base, &opts, &files, &count);
+    bool accepted_sources_exceeded = exceeded_status == CBM_DISCOVER_LIMIT_EXCEEDED &&
+                                     files == NULL && count == 0 &&
+                                     violation.resource == CBM_INDEX_RESOURCE_FILES &&
+                                     violation.observed == 2 && violation.limit == 1;
+
+    if (saved_limit_copy) {
+        cbm_setenv("CBM_MAX_FILE_BYTES", saved_limit_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_MAX_FILE_BYTES");
+    }
+    free(saved_limit_copy);
+    th_cleanup(base);
+
+    ASSERT_TRUE(oversized_did_not_consume_budget);
+    ASSERT_TRUE(accepted_sources_exceeded);
+    PASS();
+}
+
 TEST(discover_skips_git_dir) {
     char *base = th_mktempdir("cbm_disc_git");
     ASSERT(base != NULL);
@@ -734,6 +891,76 @@ TEST(discover_gitignore_dir_excluded_issue234) {
     PASS();
 }
 
+static int disc_git(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=master %s",
+             dir, args);
+    return system(cmd);
+}
+
+static bool disc_has(const cbm_file_info_t *files, int count, const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A .gitignore never hides a file git tracks: git applies ignore rules to
+ * untracked paths only. cluster-api's nested `.gitignore` line `manager`,
+ * meant for a built binary, hid its tracked config/manager/ kustomization.
+ * Untracked ignored files stay out, also inside a directory that is entered
+ * only for its tracked content. */
+TEST(discover_gitignore_never_hides_tracked_files) {
+    char *base = th_mktempdir("cbm_disc_tracked");
+    ASSERT(base != NULL);
+    if (disc_git(base, "init -q") != 0) {
+        th_cleanup(base);
+        FAIL("git init failed");
+    }
+    th_write_file(TH_PATH(base, ".gitignore"), "manager\n*.gen.go\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n\nfunc main() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/manager.go"), "package manager\n\nfunc Run() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/scratch.go"), "package manager\n\nfunc S() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/sub/deep.go"), "package sub\n\nfunc Deep() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/tmp/build.go"), "package tmp\n\nfunc B() {}\n");
+    th_write_file(TH_PATH(base, "api/types.gen.go"), "package api\n\nfunc Gen() {}\n");
+    th_write_file(TH_PATH(base, "api/other.gen.go"), "package api\n\nfunc Other() {}\n");
+    int add_rc = disc_git(base, "add .gitignore main.go");
+    int force_rc = disc_git(base, "add -f config/manager/manager.go config/manager/sub/deep.go "
+                                  "api/types.gen.go");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    bool main_found = rc == 0 && disc_has(files, count, "main.go");
+    bool manager_found = rc == 0 && disc_has(files, count, "config/manager/manager.go");
+    bool deep_found = rc == 0 && disc_has(files, count, "config/manager/sub/deep.go");
+    bool gen_found = rc == 0 && disc_has(files, count, "api/types.gen.go");
+    bool scratch_found = rc == 0 && disc_has(files, count, "config/manager/scratch.go");
+    bool build_found = rc == 0 && disc_has(files, count, "config/manager/tmp/build.go");
+    bool other_found = rc == 0 && disc_has(files, count, "api/other.gen.go");
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_EQ(force_rc, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(main_found);
+    /* Tracked: kept although .gitignore matches them or a directory above. */
+    ASSERT_TRUE(manager_found);
+    ASSERT_TRUE(deep_found);
+    ASSERT_TRUE(gen_found);
+    /* Untracked and ignored: still out, also below the entered directory. */
+    ASSERT_FALSE(scratch_found);
+    ASSERT_FALSE(build_found);
+    ASSERT_FALSE(other_found);
+    PASS();
+}
+
 TEST(discover_max_file_size) {
     char *base = th_mktempdir("cbm_disc_size");
     ASSERT(base != NULL);
@@ -909,6 +1136,46 @@ TEST(discover_symlink_skipped) {
 #endif
 }
 
+/* #1815: a symlink skip must be as visible as the other two skip paths in
+ * the same walk (gitignore/cbmignore/skip-list files, excluded dirs): a
+ * subtree dropped because it's a symlink must not look identical to a
+ * complete index. */
+TEST(discover_symlink_skip_is_reported) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows: symlinks need admin / symlink() unavailable");
+#else
+    char *base = th_mktempdir("cbm_disc_sym_rep");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "real.go"), "package main\n");
+    char real_path[512], link_path[512];
+    snprintf(real_path, sizeof(real_path), "%s/real.go", base);
+    snprintf(link_path, sizeof(link_path), "%s/link.go", base);
+    symlink(real_path, link_path);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    cbm_ignored_file_t *ignored = NULL;
+    int ignored_count = 0;
+    int ignored_total = 0;
+
+    int rc = cbm_discover_ex2(base, &opts, &files, &count, NULL, NULL, &ignored, &ignored_count,
+                              &ignored_total);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1); /* real.go only, same as discover_symlink_skipped */
+    ASSERT_EQ(ignored_total, 1);
+    ASSERT_EQ(ignored_count, 1);
+    ASSERT_STR_EQ(ignored[0].rel_path, "link.go");
+    ASSERT_STR_EQ(ignored[0].reason, "symlink");
+
+    cbm_discover_free(files, count);
+    cbm_discover_free_ignored(ignored, ignored_count);
+    th_cleanup(base);
+    PASS();
+#endif
+}
+
 TEST(discover_new_ignore_patterns) {
     char *base = th_mktempdir("cbm_disc_newign");
     ASSERT(base != NULL);
@@ -1056,6 +1323,82 @@ TEST(discover_cbmignore_negates_always_skip_dir) {
     ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "obj"));
 
     cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* ── Laravel compiled Blade view cache (issue #1735) ─────────────── */
+
+/* storage/framework/views/ holds Laravel's compiled Blade templates: generated
+ * PHP with no source value that the php_only grammar flags as parse damage.
+ * It is skipped by default even when Laravel's stock .gitignore in that folder
+ * is missing. The match is on the path suffix, component-aligned, so ordinary
+ * views/ dirs (resources/views, app/views, app/framework/views) and look-alike
+ * prefixes (mystorage/...) stay indexed. */
+TEST(discover_skips_laravel_compiled_views_issue1735) {
+    char *base = th_mktempdir("cbm_disc_laravel_views");
+    ASSERT(base != NULL);
+
+    /* No .gitignore anywhere: the skip must come from the built-in rule. */
+    th_write_file(TH_PATH(base, "storage/framework/views/abc123.php"),
+                  "<?php $__env->startSection('title'); ?>\n"
+                  "<?php echo e($title); ?>\n"
+                  "<?php $__env->stopSection(); ?>\n");
+    th_write_file(TH_PATH(base, "backend/storage/framework/views/def456.php"),
+                  "<?php echo e($x); ?>\n");
+    th_write_file(TH_PATH(base, "resources/views/welcome.blade.php"), "<h1>{{ $title }}</h1>\n");
+    th_write_file(TH_PATH(base, "app/views/x.php"), "<?php function x() { return 1; }\n");
+    th_write_file(TH_PATH(base, "app/framework/views/y.php"), "<?php function y() {}\n");
+    th_write_file(TH_PATH(base, "mystorage/framework/views/z.php"), "<?php function z() {}\n");
+    th_write_file(TH_PATH(base, "storage/framework/views_old/w.php"), "<?php function w() {}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    char **excluded = NULL;
+    int excluded_count = 0;
+
+    int rc = cbm_discover_ex(base, &opts, &files, &count, &excluded, &excluded_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/framework/views/abc123.php"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "backend/storage/framework/views/def456.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "resources/views/welcome.blade.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/views/x.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/framework/views/y.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "mystorage/framework/views/z.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/framework/views_old/w.php"));
+    ASSERT_EQ(count, 5);
+    /* Reported as an excluded subtree (#411), like every built-in skip dir. */
+    ASSERT_TRUE(discover_excluded_contains(excluded, excluded_count, "storage/framework/views"));
+    ASSERT_TRUE(
+        discover_excluded_contains(excluded, excluded_count, "backend/storage/framework/views"));
+    ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "app/views"));
+    ASSERT_FALSE(discover_excluded_contains(excluded, excluded_count, "resources/views"));
+
+    cbm_discover_free_excluded(excluded, excluded_count);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Like the other ordinary built-in skip dirs (#500), a .cbmignore negation
+ * un-skips the compiled-view cache for a user who really wants it indexed. */
+TEST(discover_cbmignore_negates_laravel_compiled_views_issue1735) {
+    char *base = th_mktempdir("cbm_disc_laravel_views_neg");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, ".cbmignore"), "!storage/framework/views/\n");
+    th_write_file(TH_PATH(base, "storage/framework/views/abc123.php"), "<?php echo 1; ?>\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/framework/views/abc123.php"));
+
     cbm_discover_free(files, count);
     th_cleanup(base);
     PASS();
@@ -1315,6 +1658,212 @@ TEST(discover_worktree_committed_gitignore) {
     PASS();
 }
 
+/* ── Enclosing-repo .gitignore tests (issue #510, second half) ──── */
+
+/* repo_path itself has no .git (indexing a git-less subfolder of a larger
+ * repo). The enclosing repo's root .gitignore must still be honored, exactly
+ * as `git status`/`git check-ignore` run from that subfolder would. Before
+ * this fix, resolve_git_common_dir() only ever stat'd repo_path/.git
+ * directly and gave up, so the enclosing repo's rules were silently never
+ * consulted. */
+TEST(discover_enclosing_repo_gitignore_issue510) {
+    char *base = th_mktempdir("cbm_disc_enc_gi");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "secret.py\n");
+    th_write_file(TH_PATH(base, "pkg/secret.py"), "TOKEN = 1\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "keep.py") != NULL);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "secret.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* The enclosing repo's <common>/info/exclude (per-clone, uncommitted) must
+ * be honored the same way once the enclosing root is found, exactly as it
+ * already is for a repo_path that carries its own .git (issue #489). */
+TEST(discover_enclosing_repo_info_exclude) {
+    char *base = th_mktempdir("cbm_disc_enc_exc");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git/info"));
+    th_write_file(TH_PATH(base, ".git/info/exclude"), "scratch/\n");
+    th_write_file(TH_PATH(base, "pkg/main.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/scratch/tmp.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "main.py") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Precedence: the indexed directory's own .gitignore is more specific than
+ * the enclosing repo's root .gitignore and must still win on conflict,
+ * matching git's shallow-to-deep rule (a later, deeper pattern overrides an
+ * earlier, shallower one). Without this, folding the enclosing root in
+ * ahead of repo_path's own .gitignore in the wrong order would let a root
+ * pattern silently re-ignore a file the subfolder's own .gitignore
+ * un-ignores. */
+TEST(discover_enclosing_repo_gitignore_local_overrides) {
+    char *base = th_mktempdir("cbm_disc_enc_gi_ovr");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.py\n");
+    th_write_file(TH_PATH(base, "pkg/.gitignore"), "!keep.py\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/drop.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "keep.py") != NULL);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* An enclosing repo's patterns are ANCHORED to the enclosing repo's own root,
+ * never to the indexed subfolder. Folding them into the subfolder's matcher
+ * re-anchors every rooted pattern one or more levels too deep, in both
+ * directions. The four tests below pin the four cases; each expectation was
+ * taken from `git check-ignore` run inside the subfolder on an identical
+ * fixture, so they encode git's behaviour, not ours.
+ *
+ * Direction 1 — silent index loss, the worst failure mode for discovery:
+ * `/secret.py` at the enclosing root means "secret.py in the ROOT", so git
+ * indexes pkg/secret.py. Re-anchored onto pkg it becomes "secret.py in pkg"
+ * and the file vanishes from the index with no diagnostic. */
+TEST(discover_enclosing_rooted_pattern_not_reanchored) {
+    char *base = th_mktempdir("cbm_disc_enc_anchor");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "/secret.py\n");
+    th_write_file(TH_PATH(base, "pkg/secret.py"), "TOKEN = 1\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside pkg: both files INDEXED. */
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "secret.py"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "keep.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Direction 2 — the mirror: a pattern the enclosing repo anchors THROUGH the
+ * indexed subfolder ("pkg/scratch/") no longer matches once rel_path is
+ * relative to pkg, so a directory git excludes gets walked and indexed. */
+TEST(discover_enclosing_info_exclude_rooted_subpath) {
+    char *base = th_mktempdir("cbm_disc_enc_exc_sub");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git/info"));
+    th_write_file(TH_PATH(base, ".git/info/exclude"), "pkg/scratch/\n");
+    th_write_file(TH_PATH(base, "pkg/main.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/scratch/tmp.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside pkg: scratch/tmp.py IGNORED, main.py indexed. */
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.py"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "scratch/tmp.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* git consults the .gitignore of EVERY directory between the enclosing root
+ * and the indexed one, not just the root's. Here only <root>/a/.gitignore has
+ * an opinion, and it is rooted at a/ — so it needs both the intermediate file
+ * to be loaded at all and its patterns to be matched relative to a/. */
+TEST(discover_enclosing_intermediate_gitignore) {
+    char *base = th_mktempdir("cbm_disc_enc_mid");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, "a/.gitignore"), "/b/drop.py\n");
+    th_write_file(TH_PATH(base, "a/b/drop.py"), "pass\n");
+    th_write_file(TH_PATH(base, "a/b/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "a/b"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside a/b: drop.py IGNORED, keep.py indexed. */
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "keep.py"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Precedence among ancestors: the deeper .gitignore wins over the shallower
+ * one, negations included. <root>/.gitignore ignores every *.py;
+ * <root>/a/.gitignore re-includes b/keep.py. Merging both into one matcher
+ * would decide this by file order instead of by depth. */
+TEST(discover_enclosing_deeper_ancestor_negation_wins) {
+    char *base = th_mktempdir("cbm_disc_enc_neg");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.py\n");
+    th_write_file(TH_PATH(base, "a/.gitignore"), "!/b/keep.py\n");
+    th_write_file(TH_PATH(base, "a/b/drop.py"), "pass\n");
+    th_write_file(TH_PATH(base, "a/b/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "a/b"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    /* git check-ignore inside a/b: drop.py IGNORED, keep.py indexed. */
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "keep.py"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Nested .gitignore tests (issue #178) ──────────────────────── */
 
 TEST(discover_nested_gitignore) {
@@ -1433,6 +1982,130 @@ TEST(discover_many_nested_gitignores_do_not_exhaust_matcher_ownership) {
     ASSERT_EQ(count, PACKAGE_COUNT);
     ASSERT_EQ(bounded_status, CBM_DISCOVER_OK);
     ASSERT_EQ(bounded_count, PACKAGE_COUNT);
+    PASS();
+}
+
+/* ── Nested .gitignore BELOW another .gitignore (issue #1973) ─────── */
+
+/* Laravel layout: storage/.gitignore exists (here: EMPTY) and
+ * storage/dump/.gitignore contains "*". git ignores every file under
+ * storage/dump/; the walk used to load only the SHALLOWEST nested .gitignore
+ * on a path (try_load_nested_gitignore() bailed once a frame carried a
+ * local matcher), so the deeper "*" was never consulted and thousands of
+ * ignored JSON dumps were discovered — the #1973 OOM kill. The bounded count
+ * (daemon auto-index admission) walks the same frames and must agree. */
+TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973) {
+    enum { DUMP_FILES = 20 };
+    char *base = th_mktempdir("cbm_disc_ngi_1973");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "node_modules/\n");
+    th_write_file(TH_PATH(base, "storage/.gitignore"), "");
+    th_write_file(TH_PATH(base, "storage/dump/.gitignore"), "*\n");
+    th_write_file(TH_PATH(base, "app/x.php"), "<?php\nfunction appFn() { return 1; }\n");
+    th_write_file(TH_PATH(base, "storage/dump/nested/deep.json"), "{\"deep\": true}\n");
+    bool fixture_ready = true;
+    for (int i = 0; i < DUMP_FILES; i++) {
+        char rel[64];
+        snprintf(rel, sizeof(rel), "storage/dump/%05d.json", i);
+        fixture_ready = fixture_ready &&
+                        th_write_file(TH_PATH(base, rel), "{\"route\": \"/api/v1/thing\"}\n") == 0;
+    }
+    ASSERT_TRUE(fixture_ready);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < count; i++) {
+        ASSERT(strstr(files[i].rel_path, "storage/dump/") == NULL);
+    }
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/x.php"));
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    int bounded_count = -1;
+    cbm_discover_status_t bounded_status =
+        cbm_discover_count_bounded(base, &opts, DUMP_FILES + 2, 0, &bounded_count);
+    ASSERT_EQ(bounded_status, CBM_DISCOVER_OK);
+    ASSERT_EQ(bounded_count, 1);
+
+    th_cleanup(base);
+    PASS();
+}
+
+/* Precedence between .gitignore files on one path is git's: patterns in a
+ * deeper file override those in a shallower one, and every ancestor's
+ * patterns still apply to the subtree. A negation in the deepest file
+ * re-includes a file its ancestor ignores; siblings the deeper file does not
+ * mention stay ignored; a root pattern still reaches two levels down. */
+TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern) {
+    char *base = th_mktempdir("cbm_disc_ngi_neg");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.log\n");
+    th_write_file(TH_PATH(base, "storage/.gitignore"), "*.json\n");
+    th_write_file(TH_PATH(base, "storage/dump/.gitignore"), "!keep.json\n");
+    th_write_file(TH_PATH(base, "app/x.php"), "<?php\nfunction appFn() { return 1; }\n");
+    th_write_file(TH_PATH(base, "storage/top.json"), "{\"top\": 1}\n");
+    th_write_file(TH_PATH(base, "storage/dump/keep.json"), "{\"keep\": 1}\n");
+    th_write_file(TH_PATH(base, "storage/dump/drop.json"), "{\"drop\": 1}\n");
+    th_write_file(TH_PATH(base, "storage/dump/run.log"), "log line\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/x.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/dump/keep.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/top.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/dump/drop.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/dump/run.log"));
+    ASSERT_EQ(count, 2);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Three nesting levels: the deepest file wins for the paths it names, an
+ * intermediate negation reaches through an EMPTY .gitignore below it, and the
+ * root pattern still governs everything outside the re-included subtree. */
+TEST(discover_nested_gitignore_three_levels_deeper_file_wins) {
+    char *base = th_mktempdir("cbm_disc_ngi_3lvl");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.json\n");
+    th_write_file(TH_PATH(base, "a/.gitignore"), "!*.json\n");
+    th_write_file(TH_PATH(base, "a/b/.gitignore"), "");
+    th_write_file(TH_PATH(base, "a/b/c/.gitignore"), "drop.json\n");
+    th_write_file(TH_PATH(base, "main.py"), "x = 1\n");
+    th_write_file(TH_PATH(base, "root.json"), "{\"root\": 1}\n");
+    th_write_file(TH_PATH(base, "a/x.json"), "{\"a\": 1}\n");
+    th_write_file(TH_PATH(base, "a/b/x.json"), "{\"b\": 1}\n");
+    th_write_file(TH_PATH(base, "a/b/c/keep.json"), "{\"keep\": 1}\n");
+    th_write_file(TH_PATH(base, "a/b/c/drop.json"), "{\"drop\": 1}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.py"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/x.json"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/b/x.json"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/b/c/keep.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "root.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "a/b/c/drop.json"));
+    ASSERT_EQ(count, 4);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
     PASS();
 }
 
@@ -1767,6 +2440,10 @@ SUITE(discover) {
     RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
     RUN_TEST(discover_bounded_count_fails_closed_after_deadline);
     RUN_TEST(discover_bounded_count_matches_shebang_discovery);
+    RUN_TEST(discover_resource_policy_off_matches_legacy_discovery);
+    RUN_TEST(discover_resource_file_limit_is_exact_and_counts_only_accepted_sources);
+    RUN_TEST(discover_resource_source_bytes_allows_equality_and_rejects_one_more_byte);
+    RUN_TEST(discover_resource_file_budget_excludes_existing_oversized_skip);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
     RUN_TEST(discover_with_global_xdg_ignore);
@@ -1775,6 +2452,7 @@ SUITE(discover) {
     RUN_TEST(discover_missing_global_excludes_is_noop);
     RUN_TEST(discover_cbmignore_negates_global_ignore);
     RUN_TEST(discover_gitignore_dir_excluded_issue234);
+    RUN_TEST(discover_gitignore_never_hides_tracked_files);
     RUN_TEST(discover_max_file_size);
     RUN_TEST(discover_null_path);
     RUN_TEST(discover_nonexistent_path);
@@ -1785,6 +2463,7 @@ SUITE(discover) {
     RUN_TEST(discover_cbmignore);
     RUN_TEST(discover_cbmignore_stacks);
     RUN_TEST(discover_symlink_skipped);
+    RUN_TEST(discover_symlink_skip_is_reported);
     RUN_TEST(discover_new_ignore_patterns);
     RUN_TEST(discover_generic_dirs_full_mode);
     RUN_TEST(discover_generic_dirs_fast_mode);
@@ -1798,6 +2477,10 @@ SUITE(discover) {
     RUN_TEST(discover_cbmignore_negation_last_match_wins);
     RUN_TEST(discover_cbmignore_negation_cannot_unskip_safety_core);
 
+    /* Laravel compiled Blade view cache (issue #1735) */
+    RUN_TEST(discover_skips_laravel_compiled_views_issue1735);
+    RUN_TEST(discover_cbmignore_negates_laravel_compiled_views_issue1735);
+
     /* .git/info/exclude support (issue #489) */
     RUN_TEST(discover_git_info_exclude);
     RUN_TEST(discover_git_info_exclude_stacks_with_gitignore);
@@ -1806,8 +2489,22 @@ SUITE(discover) {
     RUN_TEST(discover_worktree_info_exclude);
     RUN_TEST(discover_worktree_committed_gitignore);
 
+    /* Enclosing-repo .gitignore resolution (issue #510, second half) */
+    RUN_TEST(discover_enclosing_repo_gitignore_issue510);
+    RUN_TEST(discover_enclosing_repo_info_exclude);
+    RUN_TEST(discover_enclosing_repo_gitignore_local_overrides);
+    RUN_TEST(discover_enclosing_rooted_pattern_not_reanchored);
+    RUN_TEST(discover_enclosing_info_exclude_rooted_subpath);
+    RUN_TEST(discover_enclosing_intermediate_gitignore);
+    RUN_TEST(discover_enclosing_deeper_ancestor_negation_wins);
+
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
     RUN_TEST(discover_many_nested_gitignores_do_not_exhaust_matcher_ownership);
+
+    /* Nested .gitignore below another .gitignore (issue #1973) */
+    RUN_TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973);
+    RUN_TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern);
+    RUN_TEST(discover_nested_gitignore_three_levels_deeper_file_wins);
 }

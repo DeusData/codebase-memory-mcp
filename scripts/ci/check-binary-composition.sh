@@ -13,12 +13,15 @@
 # contents independently inspectable; it does not establish which feature, if
 # any, caused an opaque third-party ML verdict.
 #
-# This script is the proof that each removal stayed removed. It asserts only
-# NEGATIVE properties (needle absent), plus one canary string we know ships,
-# because an absence check aimed at the wrong file — a compressed artifact, a
-# stub, a truncated download — would otherwise pass vacuously and read green.
-# A missing tool is a hard error for the same reason: a skipped assertion must
-# never look like a satisfied one.
+# This script is the proof that each removal stayed removed. The needle scans
+# assert NEGATIVE properties (needle absent), plus one canary string we know
+# ships, because an absence check aimed at the wrong file — a compressed
+# artifact, a stub, a truncated download — would otherwise pass vacuously and
+# read green. The A1* checks assert structural properties of the produced ELF
+# instead, for the mirror-image reason: a linker flag that was accepted is not
+# evidence that the binary gained anything, so the mitigation is measured in
+# the artifact. A missing tool is a hard error on both sides: a skipped
+# assertion must never look like a satisfied one.
 #
 # Usage: scripts/ci/check-binary-composition.sh <binary-or-dir>...
 #   Directories are scanned recursively; format (ELF / Mach-O / PE) is detected
@@ -26,6 +29,11 @@
 #   meaningful. Exit 0 = every assertion passed, 1 = at least one failed,
 #   2 = usage error, missing tool, or nothing checkable was found (a vacuous
 #   run is a failure, not a pass).
+#   CBM_COMPOSITION_FIXTURE=1 declares the target a packaging FIXTURE (a stub
+#   compiled by a contract test, not a release link): A1d-bind-now is then
+#   reported n/a instead of asserted, because eager binding is a property of
+#   the release link flags, not of the packaging path the fixture exercises.
+#   Only contract tests set it; release derivation never does.
 set -euo pipefail
 
 case "${1:-}" in
@@ -187,6 +195,62 @@ gnu_stack_flags() {
     esac
 }
 
+# Echoes "<start-dec> <end-dec>" of the PT_GNU_RELRO window, empty if the
+# segment is absent, "unsupported" if the resolved reader cannot report it.
+# The hex→decimal conversion happens in the shell for the same reason
+# exec_load_bytes does it there: strtonum() is a gawk extension and CI's awk is
+# mawk, where it is undefined and the arithmetic would silently be 0.
+relro_range() {
+    case "$ELF_READER_KIND" in
+    readelf)
+        "$ELF_READER" -lW "$1" 2>/dev/null |
+            awk '/GNU_RELRO/ { print $3, $6; exit }' |
+            while read -r vaddr memsz; do
+                start=$((16#${vaddr#0x}))
+                echo "$start $((start + 16#${memsz#0x}))"
+            done
+        ;;
+    objdump)
+        echo unsupported
+        ;;
+    esac
+}
+
+# Echoes "<name> <start-dec> <end-dec>" for every GOT section, one per line.
+# The leading "[ 5]" index column is stripped BEFORE awk splits the line: its
+# width changes with the section count, so field numbers would otherwise shift
+# between binaries and the addresses would be read out of the wrong columns.
+got_sections() {
+    "$ELF_READER" -SW "$1" 2>/dev/null |
+        sed -e 's/^[[:space:]]*\[[[:space:]]*[0-9]*\][[:space:]]*//' |
+        awk '$1 ~ /^\.got/ && $3 ~ /^[0-9a-fA-F]+$/ && $5 ~ /^[0-9a-fA-F]+$/ { print $1, $3, $5 }' |
+        while read -r name addr size; do
+            start=$((16#$addr))
+            echo "$name $start $((start + 16#$size))"
+        done
+}
+
+# static | now | lazy — how the binary binds at load time.
+# Both tests are awk, not `grep -q`: grep exits on its first match, the reader
+# upstream takes EPIPE, and under `set -o pipefail` the satisfied case would be
+# reported as the failing one. awk consumes its whole input and cannot do that.
+bind_now_state() {
+    if ! "$ELF_READER" -lW "$1" 2>/dev/null |
+        awk '$1 == "DYNAMIC" { found = 1 } END { exit !found }'; then
+        echo static
+        return 0
+    fi
+    if "$ELF_READER" -dW "$1" 2>/dev/null |
+        awk '/\(BIND_NOW\)/                 { found = 1 }
+             /\(FLAGS\)/ && /BIND_NOW/      { found = 1 }
+             /\(FLAGS_1\)/ && / NOW([ ]|$)/ { found = 1 }
+             END { exit !found }'; then
+        echo now
+    else
+        echo lazy
+    fi
+}
+
 # ── Reporting ───────────────────────────────────────────────────────
 # PASS and FAIL both go to stdout so the per-assertion sequence stays in order
 # in a CI log (stderr would interleave nondeterministically); only the final
@@ -307,6 +371,103 @@ check_file() {
         fi
     else
         printf 'n/a  %-22s %s: segment-permission check is ELF-only\n' A1b-rodata-noexec "$token"
+    fi
+
+    # A1c — RELRO. PT_GNU_RELRO is the window the loader re-maps read-only once
+    # startup relocation is done. Without it .init_array, .fini_array,
+    # .data.rel.ro and the GOT stay writable for the whole process lifetime,
+    # which is what turns a stray write into control-flow hijack. ELF-only:
+    # Mach-O and PE have no equivalent segment.
+    relro_window=''
+    if [ "$fmt" = elf ]; then
+        relro_window=$(relro_range "$file")
+        if [ "$relro_window" = unsupported ]; then
+            printf 'n/a  %-22s %s: %s cannot report segment addresses\n' \
+                A1c-relro "$token" "$ELF_READER_KIND"
+        elif [ -z "$relro_window" ]; then
+            report FAIL A1c-relro "$token" \
+                "no PT_GNU_RELRO program header — .data.rel.ro and the GOT stay writable for the process lifetime (link with -z relro)"
+        else
+            report PASS A1c-relro "$token" \
+                "PT_GNU_RELRO covers $((${relro_window##* } - ${relro_window%% *})) bytes"
+        fi
+    else
+        printf 'n/a  %-22s %s: RELRO is a GNU/ELF segment\n' A1c-relro "$token"
+    fi
+
+    # A1d — eager binding, asserted on the OUTCOME instead of on the flag.
+    # -z now is what folds .got.plt into the RELRO window, but "the linker
+    # accepted -z now" proves nothing about the artifact, so what is measured
+    # here is the property itself: no GOT slot may be writable after startup,
+    # i.e. every .got* section must lie inside A1c's window.
+    #
+    # That is not a formality on the shipped artifact. The Linux release
+    # binaries are linked -static, and a static link on Ubuntu 24.04 / ld 2.42
+    # emits PT_GNU_RELRO yet places .got.plt immediately PAST its end: in our
+    # own release-shape binary .got.plt ran 0x11d9ffe8+0x40 against a window
+    # ending at 0x11DA0000, so 40 bytes of GOT stayed writable for the process
+    # lifetime. This assertion fails on that binary and passes on the one built
+    # with -z now, which is the only reason to believe it measures anything.
+    #
+    # A binary with a PT_DYNAMIC is additionally required to carry
+    # BIND_NOW/FLAGS_1 NOW, because there RELRO alone cannot help: lazy binding
+    # writes the GOT after the loader has already re-protected it. A static
+    # binary has no PT_DYNAMIC and nothing to bind at runtime, so GOT coverage
+    # is the whole property there — a distinct reported outcome, never a skip.
+    #
+    # Scope: this is a property of the RELEASE link (-z now in Makefile.cbm).
+    # Contract tests hand the gate a stub compiled straight from a .c file to
+    # exercise packaging, format detection and the needle scans; a stub is not
+    # linked with -z now and never ships, so asserting eager binding on it
+    # tests the fixture's compiler defaults, not the artifact. Such a caller
+    # declares itself with CBM_COMPOSITION_FIXTURE=1 and A1d is reported n/a —
+    # a named exemption, printed on every run, never a silent skip. Every
+    # other assertion still runs on the fixture unchanged.
+    if [ "${CBM_COMPOSITION_FIXTURE:-0}" = 1 ]; then
+        printf 'n/a  %-22s %s: packaging fixture (CBM_COMPOSITION_FIXTURE=1) — eager binding is asserted on release links only\n' \
+            A1d-bind-now "$token"
+    elif [ "$fmt" != elf ]; then
+        printf 'n/a  %-22s %s: BIND_NOW is an ELF dynamic-section property\n' \
+            A1d-bind-now "$token"
+    elif [ "$relro_window" = unsupported ]; then
+        printf 'n/a  %-22s %s: %s cannot report section addresses\n' \
+            A1d-bind-now "$token" "$ELF_READER_KIND"
+    elif [ -z "$relro_window" ]; then
+        report FAIL A1d-bind-now "$token" \
+            "no PT_GNU_RELRO, so no GOT section can be read-only after relocation (see A1c)"
+    else
+        relro_start=${relro_window%% *}
+        relro_end=${relro_window##* }
+        got_seen=0
+        got_writable=''
+        while read -r got_name got_start got_end; do
+            [ -z "$got_name" ] && continue
+            got_seen=$((got_seen + 1))
+            if [ "$got_start" -lt "$relro_start" ] || [ "$got_end" -gt "$relro_end" ]; then
+                got_writable="$got_writable $got_name"
+            fi
+        done <<EOF
+$(got_sections "$file")
+EOF
+        bind_state=$(bind_now_state "$file")
+        if [ "$got_seen" -eq 0 ]; then
+            # Same anti-vacuity rule as A0: with no GOT section to place, the
+            # coverage test above is trivially satisfied and would read green.
+            report FAIL A1d-bind-now "$token" \
+                "no .got* section found ($ELF_READER) — the coverage test has nothing to check and would pass vacuously; section headers may have been removed"
+        elif [ -n "$got_writable" ]; then
+            report FAIL A1d-bind-now "$token" \
+                "GOT section(s)$got_writable fall outside PT_GNU_RELRO [$relro_start,$relro_end) — they stay WRITABLE after relocation (link with -z now)"
+        elif [ "$bind_state" = lazy ]; then
+            report FAIL A1d-bind-now "$token" \
+                "dynamic binary with neither BIND_NOW nor FLAGS_1 NOW — the GOT is filled lazily, after the loader has already applied RELRO (link with -z now)"
+        elif [ "$bind_state" = static ]; then
+            report PASS A1d-bind-now "$token" \
+                "$got_seen GOT section(s) inside PT_GNU_RELRO; no PT_DYNAMIC, so nothing binds at runtime"
+        else
+            report PASS A1d-bind-now "$token" \
+                "$got_seen GOT section(s) inside PT_GNU_RELRO and the dynamic section requests BIND_NOW"
+        fi
     fi
 
     # A2 — test-only seams.

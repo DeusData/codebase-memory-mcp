@@ -7,6 +7,7 @@
 
 #include "foundation/constants.h"
 #include "mcp/mcp.h"
+#include "yyjson/yyjson.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -47,6 +48,39 @@ static void sb_append(adapter_sb_t *sb, const char *s) {
     memcpy(sb->buf + sb->len, s, add);
     sb->len += add;
     sb->buf[sb->len] = '\0';
+}
+
+/* Append a single-quoted JavaScript string literal, escaping the characters
+ * that could terminate or corrupt it. Avoids the fixed buffer sizing that
+ * cbm_client_adapter_escape_js imposes, so long registry descriptions fit. */
+static void sb_append_js_string(adapter_sb_t *sb, const char *s) {
+    if (!s) {
+        sb_append(sb, "''");
+        return;
+    }
+    sb_append(sb, "'");
+    for (const char *p = s; *p; p++) {
+        switch (*p) {
+        case '\\':
+            sb_append(sb, "\\\\");
+            break;
+        case '\'':
+            sb_append(sb, "\\'");
+            break;
+        case '\n':
+            sb_append(sb, "\\n");
+            break;
+        case '\r':
+            sb_append(sb, "\\r");
+            break;
+        default: {
+            char ch[2] = {*p, '\0'};
+            sb_append(sb, ch);
+            break;
+        }
+        }
+    }
+    sb_append(sb, "'");
 }
 
 bool cbm_client_adapter_escape_js(const char *in, char *out, size_t out_sz) {
@@ -105,6 +139,167 @@ static void emit_header(adapter_sb_t *sb, const char *client) {
               "// are overwritten; edit outside it, or remove the markers to take ownership.\n");
 }
 
+static void append_typebox_type(adapter_sb_t *sb, yyjson_val *val, const char *description,
+                                bool include_description) {
+    yyjson_val *type_val = yyjson_obj_get(val, "type");
+    yyjson_val *enum_val = yyjson_obj_get(val, "enum");
+    yyjson_val *items_val = yyjson_obj_get(val, "items");
+    const char *type_str = yyjson_get_str(type_val);
+
+    if (type_str && strcmp(type_str, "string") == 0 && enum_val && yyjson_is_arr(enum_val) &&
+        yyjson_arr_size(enum_val) > 0) {
+        sb_append(sb, "Type.Union([");
+        size_t enum_idx = 0;
+        size_t enum_max = yyjson_arr_size(enum_val);
+        bool first_enum = true;
+        for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+            yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
+            const char *enum_str = yyjson_get_str(enum_item);
+            if (!enum_str) {
+                continue;
+            }
+            if (!first_enum) {
+                sb_append(sb, ", ");
+            }
+            first_enum = false;
+            sb_append(sb, "Type.Literal(");
+            sb_append_js_string(sb, enum_str);
+            sb_append(sb, ")");
+        }
+        if (first_enum) {
+            sb_append(sb, "Type.String()");
+        } else {
+            sb_append(sb, "]");
+            if (include_description && description) {
+                sb_append(sb, ", { description: ");
+                sb_append_js_string(sb, description);
+                sb_append(sb, " }");
+            }
+            sb_append(sb, ")");
+            return;
+        }
+        sb_append(sb, ")");
+        return;
+    }
+
+    const char *typebox_name = "Any";
+    if (type_str && strcmp(type_str, "string") == 0) {
+        typebox_name = "String";
+    } else if (type_str && strcmp(type_str, "integer") == 0) {
+        typebox_name = "Integer";
+    } else if (type_str && strcmp(type_str, "number") == 0) {
+        typebox_name = "Number";
+    } else if (type_str && strcmp(type_str, "boolean") == 0) {
+        typebox_name = "Boolean";
+    }
+
+    if (type_str && strcmp(type_str, "array") == 0) {
+        sb_append(sb, "Type.Array(");
+        if (items_val) {
+            append_typebox_type(sb, items_val, NULL, false);
+        } else {
+            sb_append(sb, "Type.Any()");
+        }
+        if (include_description && description) {
+            sb_append(sb, ", { description: ");
+            sb_append_js_string(sb, description);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+        return;
+    }
+
+    sb_append(sb, "Type.");
+    sb_append(sb, typebox_name);
+    sb_append(sb, "(");
+    if (include_description && description) {
+        sb_append(sb, "{ description: ");
+        sb_append_js_string(sb, description);
+        sb_append(sb, " }");
+    }
+    sb_append(sb, ")");
+}
+
+static bool typebox_property_is_required(yyjson_val *required, const char *prop_name) {
+    if (!required || !yyjson_is_arr(required)) {
+        return false;
+    }
+    size_t idx = 0;
+    size_t max = yyjson_arr_size(required);
+    for (idx = 0; idx < max; idx++) {
+        const char *required_name = yyjson_get_str(yyjson_arr_get(required, idx));
+        if (required_name && strcmp(required_name, prop_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_str) {
+    if (!schema_str) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+
+    /* Parse the JSON schema to extract properties and convert to TypeBox */
+    yyjson_doc *doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    if (!doc) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!root) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    yyjson_val *properties = yyjson_obj_get(root, "properties");
+    yyjson_val *required = yyjson_obj_get(root, "required");
+    if (!properties) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    sb_append(sb, "Type.Object({\n");
+
+    bool first_prop = true;
+    size_t idx = 0, max = 0;
+    yyjson_val *key = NULL, *val = NULL;
+
+    yyjson_obj_foreach(properties, idx, max, key, val) {
+        const char *prop_name = yyjson_get_str(key);
+        if (!prop_name) {
+            continue;
+        }
+
+        if (!first_prop) {
+            sb_append(sb, ",\n");
+        }
+        first_prop = false;
+
+        sb_append(sb, "      ");
+        sb_append(sb, prop_name);
+        sb_append(sb, ": ");
+
+        yyjson_val *description_val = yyjson_obj_get(val, "description");
+        const char *description = yyjson_get_str(description_val);
+        bool is_required = typebox_property_is_required(required, prop_name);
+        if (!is_required) {
+            sb_append(sb, "Type.Optional(");
+        }
+        append_typebox_type(sb, val, description, true);
+        if (!is_required) {
+            sb_append(sb, ")");
+        }
+    }
+
+    sb_append(sb, "\n    })");
+    yyjson_doc_free(doc);
+}
+
 char *cbm_client_adapter_pi(const char *binary_path) {
     if (!binary_path || !binary_path[0]) {
         return NULL;
@@ -120,7 +315,12 @@ char *cbm_client_adapter_pi(const char *binary_path) {
 
     adapter_sb_t sb = {0};
     emit_header(&sb, "pi");
-    sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
+    /* Pin the coding-agent contract so a probe against @mariozechner/pi
+     * (pods CLI) or an old AgentTool arity cannot be mistaken for this file. */
+    sb_append(&sb, "// Target: @earendil-works/pi-coding-agent >= 0.74.0 (verified 0.84.2)\n"
+                   "// ToolDefinition.execute(toolCallId, params, signal, onUpdate, ctx)\n");
+    sb_append(&sb, "import { spawn } from 'node:child_process';\n");
+    sb_append(&sb, "import { Type } from 'typebox';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
     sb_append(&sb, "';\n\n");
@@ -131,14 +331,16 @@ char *cbm_client_adapter_pi(const char *binary_path) {
     sb_append(
         &sb, "async function call(tool, args, signal) {\n"
              "  return new Promise((resolve) => {\n"
-             "    const child = spawn(BIN, ['cli', tool, JSON.stringify(args ?? {})], {\n"
-             "      stdio: ['ignore', 'pipe', 'pipe'],\n"
+             "    const child = spawn(BIN, ['cli', '--json', tool], {\n"
+             "      stdio: ['pipe', 'pipe', 'pipe'],\n"
              "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
              "    });\n"
              "    let out = '';\n"
+             "    let stdinError;\n"
              "    const onAbort = () => { if (!child.killed) child.kill(); };\n"
              "    signal?.addEventListener('abort', onAbort, { once: true });\n"
              "    child.stdout.on('data', (d) => (out += d.toString()));\n"
+             "    child.stdin.on('error', (e) => { stdinError = e; });\n"
              "    child.on('error', (e) => {\n"
              "      signal?.removeEventListener('abort', onAbort);\n"
              "      resolve({ error: String(e && e.message ? e.message : e) });\n"
@@ -149,8 +351,12 @@ char *cbm_client_adapter_pi(const char *binary_path) {
              "      for (let i = lines.length - 1; i >= 0; i--) {\n"
              "        try { return resolve(JSON.parse(lines[i])); } catch { /* keep scanning */ }\n"
              "      }\n"
+             "      if (stdinError) {\n"
+             "        return resolve({ error: String(stdinError.message || stdinError) });\n"
+             "      }\n"
              "      resolve({ error: 'no JSON response from codebase-memory-mcp' });\n"
              "    });\n"
+             "    child.stdin.end(JSON.stringify(args ?? {}));\n"
              "  });\n"
              "}\n\n");
 
@@ -170,11 +376,35 @@ char *cbm_client_adapter_pi(const char *binary_path) {
         if (!name || !name[0]) {
             continue;
         }
-        sb_append(&sb, "  pi.registerTool({ name: '");
-        sb_append(&sb, name);
-        sb_append(&sb, "', run: (args, ctx) => call('");
-        sb_append(&sb, name);
-        sb_append(&sb, "', args, ctx?.signal) });\n");
+        const char *description = cbm_mcp_tool_description(name);
+        const char *schema = cbm_mcp_tool_input_schema(name);
+        sb_append(&sb, "  pi.registerTool({\n");
+        sb_append(&sb, "    name: ");
+        sb_append_js_string(&sb, name);
+        sb_append(&sb, ",\n    label: ");
+        /* Tools carry no separate title: the name is the MCP display fallback. */
+        sb_append_js_string(&sb, name);
+        sb_append(&sb, ",\n    description: ");
+        sb_append_js_string(&sb, description ? description : "");
+        sb_append(&sb, ",\n    parameters: ");
+        /* Convert JSON schema to TypeBox format */
+        convert_json_schema_to_typebox(&sb, schema);
+        /* 0.84.2 calls execute(toolCallId, params, signal, onUpdate, ctx).
+         * The previous (args, ctx) shape bound the call id as the MCP args. */
+        sb_append(&sb, ",\n    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {\n");
+        sb_append(&sb, "      const result = await call(");
+        sb_append_js_string(&sb, name);
+        sb_append(&sb,
+                  ", params, signal ?? ctx?.signal);\n"
+                  "      if (result && typeof result === 'object' && result.error) {\n"
+                  "        throw new Error(String(result.error));\n"
+                  "      }\n"
+                  "      const content = result && Array.isArray(result.content)\n"
+                  "        ? result.content\n"
+                  "        : [{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }];\n"
+                  "      return { content, details: result ?? {} };\n"
+                  "    },\n"
+                  "  });\n");
     }
     sb_append(&sb, "}\n");
 
@@ -196,17 +426,23 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
 
     adapter_sb_t sb = {0};
     emit_header(&sb, "OpenCode");
-    sb_append(&sb, "// OpenCode already reaches every tool over MCP; this adds only the\n"
-                   "// automatic graph lookup before a grep/glob, which other clients get\n"
-                   "// through their own hook configuration.\n");
+    sb_append(&sb, "// OpenCode already reaches every tool over MCP; this module adds the\n"
+                   "// context surfaces other clients get through hook configuration: graph\n"
+                   "// lookup after grep/glob, index-coverage notes after read, session-start\n"
+                   "// tier routing (carried on the first tool result of each session, since\n"
+                   "// OpenCode documents no context-output lifecycle hook), and reinjection\n"
+                   "// after compaction via the documented experimental surface.\n");
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
     sb_append(&sb, "';\n\n");
 
-    /* hook-augment requires hook_event_name and accepts Grep/Glob only under
-     * PreToolUse; omitting it makes the whole hook a silent no-op. */
-    sb_append(&sb, "function augment(tool, args) {\n"
+    /* hook-augment requires hook_event_name; its default dialect accepts
+     * Grep/Glob under PreToolUse, Read under PostToolUse, and the
+     * SessionStart lifecycle event — and emits the Claude JSON envelope, so
+     * the plugin unwraps additionalContext instead of pasting raw JSON into
+     * the tool output. Every failure path resolves to '' (fail open). */
+    sb_append(&sb, "function augment(payload) {\n"
                    "  return new Promise((resolve) => {\n"
                    "    const child = spawn(BIN, ['hook-augment'], {\n"
                    "      stdio: ['pipe', 'pipe', 'ignore'],\n"
@@ -215,27 +451,74 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
                    "    let out = '';\n"
                    "    child.stdout.on('data', (d) => (out += d.toString()));\n"
                    "    child.on('error', () => resolve(''));\n"
-                   "    child.on('close', () => resolve(out));\n"
-                   "    child.stdin.end(JSON.stringify({\n"
-                   "      hook_event_name: 'PreToolUse',\n"
-                   "      tool_name: tool,\n"
-                   "      tool_input: args ?? {},\n"
-                   "    }));\n"
+                   "    child.on('close', () => {\n"
+                   "      try {\n"
+                   "        const ctx = JSON.parse(out)?.hookSpecificOutput?.additionalContext;\n"
+                   "        resolve(typeof ctx === 'string' ? ctx : '');\n"
+                   "      } catch { resolve(''); }\n"
+                   "    });\n"
+                   "    child.stdin.end(JSON.stringify(payload));\n"
                    "  });\n"
                    "}\n\n");
 
-    sb_append(&sb,
-              "export const CodebaseMemory = async () => ({\n"
-              "  'tool.execute.after': async (input, output) => {\n"
-              "    const tool = input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' "
-              ": null;\n"
-              "    if (!tool) return;\n"
-              "    const extra = await augment(tool, output?.args);\n"
-              "    if (extra && typeof output?.output === 'string') {\n"
-              "      output.output += '\\n' + extra;\n"
-              "    }\n"
-              "  },\n"
-              "});\n");
+    sb_append(
+        &sb, "export default {\n"
+             "  id: 'codebase-memory-augment',\n"
+             "  // V2 config loader: requires id + setup|effect; no tool domain yet\n"
+             "  // at this point, so there is nothing to register here.\n"
+             "  setup() {},\n"
+             "  // Server runtime: reads default.server and dispatches the hooks it returns.\n"
+             "  server: async (ctx) => {\n"
+             "    const dir = ctx?.directory;\n"
+             "    const seen = new Set();\n"
+             "    const lifecycle = () =>\n"
+             "      augment({ hook_event_name: 'SessionStart', cwd: dir });\n"
+             "    return {\n"
+             "      'tool.execute.after': async (input, output) => {\n"
+             "        if (typeof output?.output !== 'string') return;\n"
+             "        const pieces = [];\n"
+             "        const sid = input?.sessionID;\n"
+             "        if (typeof sid === 'string' && !seen.has(sid)) {\n"
+             "          seen.add(sid);\n"
+             "          pieces.push(await lifecycle());\n"
+             "        }\n"
+             "        const args = input?.args ?? {};\n"
+             "        const search =\n"
+             "          input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' : null;\n"
+             "        if (search) {\n"
+             "          pieces.push(await augment({\n"
+             "            hook_event_name: 'PreToolUse',\n"
+             "            tool_name: search,\n"
+             "            tool_input: args,\n"
+             "            cwd: dir,\n"
+             "          }));\n"
+             "        } else if (input?.tool === 'read') {\n"
+             "          const filePath = args.filePath ?? args.file_path ?? args.path;\n"
+             "          if (typeof filePath === 'string' && filePath) {\n"
+             "            pieces.push(await augment({\n"
+             "              hook_event_name: 'PostToolUse',\n"
+             "              tool_name: 'Read',\n"
+             "              tool_input: { file_path: filePath },\n"
+             "              cwd: dir,\n"
+             "            }));\n"
+             "          }\n"
+             "        }\n"
+             "        const extra = pieces.filter(Boolean).join('\\n');\n"
+             "        if (extra) {\n"
+             "          output.output += '\\n' + extra;\n"
+             "        }\n"
+             "      },\n"
+             "      // Documented (experimental) compaction surface: output.context is the\n"
+             "      // mutable array of context strings for the rebuilt session.\n"
+             "      'experimental.session.compacting': async (_input, output) => {\n"
+             "        const note = await lifecycle();\n"
+             "        if (note && Array.isArray(output?.context)) {\n"
+             "          output.context.push(note);\n"
+             "        }\n"
+             "      },\n"
+             "    };\n"
+             "  },\n"
+             "};\n");
 
     if (sb.failed) {
         free(sb.buf);

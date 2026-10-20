@@ -18,10 +18,16 @@ typedef enum {
 } RubyMixinKind;
 
 /* One class/module discovered in the file (or, cross-file, in the project).
- * `path` is the dotted source-level constant path (e.g. "Admin.User" for
- * `Admin::User`); `qn` is the full graph QN (module_qn.path for file-local
- * classes; the extractor QN for cross-file defs). `superclass_qn` is resolved
- * against the class table + stdlib after collection; NULL when unknown. */
+ * `path` is the dotted constant path used ONLY for constant lookup ("Admin.User"
+ * for both `module Admin; class User` and `class Admin::User`). `qn` is the
+ * graph QN built exactly the way the structural extractor builds it: each
+ * declaration's raw name text appended to the enclosing class QN (or the
+ * module QN at top level), so a compact `class Admin::User` yields
+ * "<module_qn>.Admin::User" while the lexically nested form yields
+ * "<module_qn>.Admin.User". Emitted rows must carry the extractor spelling
+ * or the pipeline's exact-name join silently drops them. `superclass_qn` is
+ * resolved against the class table + stdlib after collection; NULL when
+ * unknown. */
 typedef struct {
     const char *path;
     const char *qn;
@@ -72,8 +78,11 @@ typedef struct {
     CBMTypeRegistry *build_reg;
     CBMScope *current_scope;
 
-    /* Lexical nesting: dotted constant path of the enclosing class/module
-     * chain ("" at top level, "A.B" inside `module A; class B`). */
+    /* Lexical nesting: one frame per enclosing class/module declaration,
+     * frames joined by '.', each frame keeping its raw source spelling ("" at
+     * top level, "M.A::B" inside `module M; class A::B`). Ruby's constant
+     * lookup walks the frames outward — inside `class A::B` the nesting is
+     * [A::B] only, so A's constants are NOT probed. */
     const char *nesting;
 
     /* Class/module table (pass 1). */
@@ -101,6 +110,17 @@ typedef struct {
     const char *enclosing_class_qn; /* class QN, or NULL at top level */
     const char *enclosing_func_qn;  /* enclosing method QN, or NULL */
     bool in_singleton_method;       /* `def self.m` / class << self scope */
+    /* Inside a block that rebinds `self` (instance_eval/exec, class_eval/
+     * exec, module_eval/exec, define_method, Class.new/Module.new): the
+     * receiver of bare and `self.` calls is NOT the enclosing class, and
+     * the resolver cannot know what it is — so they emit nothing. */
+    bool self_unknown;
+    /* Number of enclosing blocks (`{ }`, `do end`, `-> { }`) since the
+     * nearest class/module body. A `def` met here is NOT a method of the
+     * enclosing class — ActiveSupport's `class_methods do … end`,
+     * `included do … end`, RSpec groups — so PASS 1 registers nothing for
+     * it and collects no mixins from it. */
+    int block_depth;
     const char *module_qn;
 
     /* Output: resolved calls accumulate here. */
