@@ -361,14 +361,40 @@ static const char *ruby_ivar_type(RubyLSPContext *ctx, const char *class_qn,
     return NULL;
 }
 
-static RubyClassInfo *ruby_class_by_qn(RubyLSPContext *ctx, const char *qn) {
+/* ── shared (project-wide) class table ──────────────────────────── */
+
+static unsigned ruby_hash(const char *s) {
+    unsigned h = 2166136261u;
+    for (; *s; s++)
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    return h;
+}
+
+/* Probe one of the shared table's hash indexes. `by_path` selects the key. */
+static const RubyClassInfo *ruby_shared_find(const CBMRubyCrossRegistry *sh, const int *slots,
+                                             const char *key, bool by_path) {
+    if (!sh || !slots || !key)
+        return NULL;
+    unsigned i = ruby_hash(key) & sh->slot_mask;
+    while (slots[i]) {
+        const RubyClassInfo *c = &sh->classes[slots[i] - 1];
+        if (strcmp(by_path ? c->path : c->qn, key) == 0)
+            return c;
+        i = (i + 1) & sh->slot_mask;
+    }
+    return NULL;
+}
+
+/* This file's own declaration of a class wins; otherwise the project table.
+ * The own-file scan is bounded by the file, the shared probe is O(1). */
+static const RubyClassInfo *ruby_class_by_qn(RubyLSPContext *ctx, const char *qn) {
     if (!qn)
         return NULL;
     for (int i = 0; i < ctx->class_count; i++) {
         if (strcmp(ctx->classes[i].qn, qn) == 0)
             return &ctx->classes[i];
     }
-    return NULL;
+    return ruby_shared_find(ctx->shared, ctx->shared ? ctx->shared->by_qn : NULL, qn, false);
 }
 
 /* Conventional Rails superclasses for stdlib-seeded types the class table
@@ -391,7 +417,7 @@ static const char *ruby_stdlib_superclass(const char *qn) {
 /* Superclass QN of a class: table entry first, then the conventional
  * stdlib chain above. */
 static const char *ruby_superclass_qn(RubyLSPContext *ctx, const char *class_qn) {
-    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
+    const RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
     if (ci)
         return ci->superclass_qn;
     return ruby_stdlib_superclass(class_qn);
@@ -399,13 +425,15 @@ static const char *ruby_superclass_qn(RubyLSPContext *ctx, const char *class_qn)
 
 /* ── constant resolution ────────────────────────────────────────── */
 
-/* Class-table probe by dotted path. */
+/* Class-table probe by dotted path: this file first, then the project. */
 static const char *ruby_class_qn_by_path(RubyLSPContext *ctx, const char *path) {
     for (int i = 0; i < ctx->class_count; i++) {
         if (strcmp(ctx->classes[i].path, path) == 0)
             return ctx->classes[i].qn;
     }
-    return NULL;
+    const RubyClassInfo *c =
+        ruby_shared_find(ctx->shared, ctx->shared ? ctx->shared->by_path : NULL, path, true);
+    return c ? c->qn : NULL;
 }
 
 const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
@@ -450,17 +478,39 @@ const char *ruby_resolve_constant(RubyLSPContext *ctx, const char *path) {
 /* Depth cap shared by the instance/singleton lookup walks. */
 #define RUBY_LOOKUP_MAX_DEPTH CBM_LSP_MAX_LOOKUP_DEPTH
 
-/* Own instance method of one exact class (no ancestry walk). */
-static const CBMRegisteredFunc *ruby_own_instance_method(RubyLSPContext *ctx, const char *class_qn,
-                                                         const char *method_name) {
-    return cbm_registry_lookup_method(ctx->registry, class_qn, method_name);
+/* Own method of one exact class (no ancestry walk), instance or singleton
+ * ("<qn>.self" receiver key). A class reopened in another file has that file's
+ * QN, so when the class's own QN has no such method the other reopenings of
+ * the same constant path are searched too. */
+static const CBMRegisteredFunc *ruby_own_method(RubyLSPContext *ctx, const char *class_qn,
+                                                const char *method_name, bool singleton) {
+    const char *key = singleton ? cbm_arena_sprintf(ctx->arena, "%s.self", class_qn) : class_qn;
+    const CBMRegisteredFunc *f = cbm_registry_lookup_method(ctx->registry, key, method_name);
+    if (f || !ctx->shared)
+        return f;
+    const RubyClassInfo *ci = ruby_shared_find(ctx->shared, ctx->shared->by_qn, class_qn, false);
+    if (!ci || !ci->group_head)
+        return NULL;
+    for (int j = ci->group_head; j; j = ctx->shared->classes[j - 1].shard_next) {
+        const char *qn = ctx->shared->classes[j - 1].qn;
+        if (strcmp(qn, class_qn) == 0)
+            continue;
+        key = singleton ? cbm_arena_sprintf(ctx->arena, "%s.self", qn) : qn;
+        f = cbm_registry_lookup_method(ctx->registry, key, method_name);
+        if (f)
+            return f;
+    }
+    return NULL;
 }
 
-/* Own singleton method of one exact class ("<qn>.self" receiver key). */
+static const CBMRegisteredFunc *ruby_own_instance_method(RubyLSPContext *ctx, const char *class_qn,
+                                                         const char *method_name) {
+    return ruby_own_method(ctx, class_qn, method_name, false);
+}
+
 static const CBMRegisteredFunc *ruby_own_singleton_method(RubyLSPContext *ctx, const char *class_qn,
                                                           const char *method_name) {
-    const char *key = cbm_arena_sprintf(ctx->arena, "%s.self", class_qn);
-    return cbm_registry_lookup_method(ctx->registry, key, method_name);
+    return ruby_own_method(ctx, class_qn, method_name, true);
 }
 
 /* Fail-closed ancestry. Every lookup below carries a `blocked` flag that is
@@ -480,7 +530,7 @@ static const CBMRegisteredFunc *ruby_lookup_instance_method_depth(RubyLSPContext
 /* True when the class declares a superclass the finalize step could not
  * resolve (stdlib-seeded conventions like ApplicationRecord DO resolve). */
 static bool ruby_superclass_unresolved(RubyLSPContext *ctx, const char *class_qn) {
-    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
+    const RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
     return ci && ci->superclass_ref && !ci->superclass_qn;
 }
 
@@ -597,7 +647,7 @@ static bool ruby_is_ar_model(RubyLSPContext *ctx, const char *class_qn, int dept
         return false;
     if (strcmp(class_qn, "ActiveRecord.Base") == 0 || strcmp(class_qn, "ApplicationRecord") == 0)
         return true;
-    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
+    const RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
     if (ci && ci->superclass_ref &&
         (strcmp(ci->superclass_ref, "ApplicationRecord") == 0 ||
          strcmp(ci->superclass_ref, "ActiveRecord.Base") == 0))
