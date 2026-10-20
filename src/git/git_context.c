@@ -492,34 +492,33 @@ typedef struct {
  * header, so a malformed stream fails closed instead of being misread. */
 static bool status_code_ok(char c) {
     switch (c) {
-        case ' ':
-        case 'M':
-        case 'A':
-        case 'D':
-        case 'R':
-        case 'C':
-        case 'U':
-        case '?':
-        case '!':
-        case 'T':
-        case 'm':
-        case 'a':
-        case 'd':
-        case 'r':
-        case 'c':
-        case 'u':
-        case 't':
-            return true;
-        default:
-            return false;
+    case ' ':
+    case 'M':
+    case 'A':
+    case 'D':
+    case 'R':
+    case 'C':
+    case 'U':
+    case '?':
+    case '!':
+    case 'T':
+    case 'm':
+    case 'a':
+    case 'd':
+    case 'r':
+    case 'c':
+    case 'u':
+    case 't':
+        return true;
+    default:
+        return false;
     }
 }
 
 /* Retain one bounded sample; the running total always advances so the caller
  * sees the true stream count even when samples are capped or OOM. */
-static void status_add_sample(int *total, char ***samples, int *sample_count,
-                              bool *truncated, int max_samples, const char *path,
-                              size_t path_len) {
+static void status_add_sample(int *total, char ***samples, int *sample_count, bool *truncated,
+                              int max_samples, const char *path, size_t path_len) {
     (*total)++;
     if (*sample_count >= max_samples) {
         *truncated = true;
@@ -552,8 +551,8 @@ static bool status_parse_record(cbm_worktree_status_t *out, status_parser_t *par
         parser->expecting_source = false;
         return true; /* second path of a rename/copy record — not counted */
     }
-    if (field_len < STATUS_HEADER_LEN || field[2] != ' ' ||
-        !status_code_ok(field[0]) || !status_code_ok(field[1])) {
+    if (field_len < STATUS_HEADER_LEN || field[2] != ' ' || !status_code_ok(field[0]) ||
+        !status_code_ok(field[1])) {
         return false;
     }
     const char *path = field + STATUS_HEADER_LEN;
@@ -567,9 +566,8 @@ static bool status_parse_record(cbm_worktree_status_t *out, status_parser_t *par
     if (field[0] == 'R' || field[0] == 'C' || field[1] == 'R' || field[1] == 'C') {
         parser->expecting_source = true;
     }
-    status_add_sample(&out->tracked_count, &out->tracked_paths,
-                      &out->tracked_sample_count, &out->tracked_truncated,
-                      parser->max_samples, path, path_len);
+    status_add_sample(&out->tracked_count, &out->tracked_paths, &out->tracked_sample_count,
+                      &out->tracked_truncated, parser->max_samples, path, path_len);
     return true;
 }
 
@@ -591,8 +589,7 @@ static void status_feed(status_parser_t *parser, const char *data, size_t data_l
         parser->partial_len += take;
         i += take;
         if (i < data_len && data[i] == '\0') {
-            if (!status_parse_record(parser->out, parser, parser->partial,
-                                     parser->partial_len)) {
+            if (!status_parse_record(parser->out, parser, parser->partial, parser->partial_len)) {
                 parser->parse_ok = false;
                 return;
             }
