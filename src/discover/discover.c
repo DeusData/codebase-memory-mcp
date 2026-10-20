@@ -1197,7 +1197,12 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     struct stat st;
     bool is_symlink = false;
     if (safe_stat(abs_path, &st, &is_symlink) != 0) {
-        if (out->count_only) {
+        /* A count aborts when it cannot observe an entry, because its caller
+         * (auto-index admission) treats an unreliable count as a refusal. A
+         * symlink is not that case: it is skipped deliberately, on every walk.
+         * Failing here made one symlink anywhere in a tree refuse the whole
+         * repo, and the refusal surfaced as "unsafe_or_unavailable_path". */
+        if (out->count_only && !is_symlink) {
             out->failed = true;
         } else if (is_symlink) {
             /* Deliberately not indexed (#963): record so callers can

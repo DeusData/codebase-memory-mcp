@@ -320,7 +320,13 @@ bool cbm_daemon_ipc_local_transition_begin_work(cbm_daemon_ipc_local_transition_
  * Windows teardown reacquires startup-v2 and the legacy mutex, releases group
  * SH, closes this participant's sentinel last, then releases mutex and v2.
  * Success consumes and clears *transition_io; a retryable native cleanup
- * failure returns false and retains it. */
+ * failure or startup-gate contention returns false and retains it. */
 bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io);
+/* Nonblocking release: 1 consumes and clears *transition_io (also when already
+ * empty), 0 retains it while another startup owns a required gate, and -1
+ * retains it on an unsafe/native I/O failure. A NULL transition_io is invalid.
+ * Callers can give healthy contention its own wait policy without extending
+ * the deadline for repeated native cleanup failures. */
+int cbm_daemon_ipc_local_transition_try_release(cbm_daemon_ipc_local_transition_t **transition_io);
 
 #endif /* CBM_DAEMON_IPC_H */

@@ -1338,6 +1338,30 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     PASS();
 }
 
+/* augment() is awaited inline inside 'tool.execute.after', so a hook-augment
+ * that never exits would stall every grep/glob/read completion in the host
+ * session until the agent is restarted. The generated plugin must bound the
+ * wait: SIGKILL the child after AUGMENT_TIMEOUT_MS and resolve with '' (fail
+ * open). The promise keeps the first resolution, so the kill-triggered
+ * 'close' event arriving late cannot smuggle in partial output. Stream
+ * errors fire on child.stdin, not the child — the emitted listener and the
+ * guarded end() keep a failed write (EPIPE, ENOENT) from crashing the host
+ * as an unhandled 'error' event (reproduced under Bun 1.4 with a >64KB
+ * payload and a non-reading child). */
+TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "const AUGMENT_TIMEOUT_MS = 10000;"));
+    ASSERT_NOT_NULL(strstr(js, "const timer = setTimeout("));
+    ASSERT_NOT_NULL(strstr(js, "child.kill('SIGKILL');"));
+    /* error and close must both stop the timer once they own the outcome. */
+    ASSERT_NOT_NULL(strstr(js, "clearTimeout(timer);"));
+    /* stream-level failures must not escape as unhandled 'error' events. */
+    ASSERT_NOT_NULL(strstr(js, "child.stdin.on('error', () => {});"));
+    free(js);
+    PASS();
+}
+
 /* Empty/NULL inputs must not produce a module at all. */
 TEST(client_adapter_rejects_missing_binary_path) {
     ASSERT_NULL(cbm_client_adapter_pi(NULL));
@@ -1385,5 +1409,6 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
+    RUN_TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }
