@@ -7137,40 +7137,61 @@ TEST(cli_agentty_mcp_config_env_override) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
+    char agentty_dir[512];
+    snprintf(agentty_dir, sizeof(agentty_dir), "%s/.agentty", tmpdir);
+    test_mkdirp(agentty_dir);
     char *saved = save_test_env("AGENTTY_MCP_CONFIG");
     char override_path[512];
     snprintf(override_path, sizeof(override_path), "%s/override.json", tmpdir);
-    cbm_setenv("AGENTTY_MCP_CONFIG", override_path, 1);
+    char default_path[512];
+    snprintf(default_path, sizeof(default_path), "%s/.agentty/mcp.json", tmpdir);
 
+    /* The registry option is the only input the resolver reads. */
     cbm_agent_client_resolve_options_t options;
     memset(&options, 0, sizeof(options));
     options.home_dir = tmpdir;
-
+    options.agentty_mcp_config = override_path;
     char config_path[512];
     ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
                                             sizeof(config_path)),
               0);
     ASSERT_STR_EQ(config_path, override_path);
+    options.agentty_mcp_config = NULL;
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
+                                            sizeof(config_path)),
+              0);
+    ASSERT_STR_EQ(config_path, default_path);
 
-    /* Tilde expansion goes against the home directory. */
+    /* The install plan reads $AGENTTY_MCP_CONFIG through the same registry
+     * env path as every other client override: an absolute or ~ value is
+     * honored, a relative one is ignored instead of landing in whatever
+     * directory install happens to run from. */
+    cbm_setenv("AGENTTY_MCP_CONFIG", override_path, 1);
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool absolute_honored = json && strstr(json, override_path) != NULL;
+    free(json);
+
     cbm_setenv("AGENTTY_MCP_CONFIG", "~/agentty-override.json", 1);
-    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
-                                            sizeof(config_path)),
-              0);
-    char expected[512];
-    snprintf(expected, sizeof(expected), "%s/agentty-override.json", tmpdir);
-    ASSERT_STR_EQ(config_path, expected);
+    char tilde_path[512];
+    snprintf(tilde_path, sizeof(tilde_path), "%s/agentty-override.json", tmpdir);
+    json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool tilde_honored = json && strstr(json, tilde_path) != NULL;
+    free(json);
 
-    /* Unset falls back to ~/.agentty/mcp.json. */
-    cbm_unsetenv("AGENTTY_MCP_CONFIG");
-    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_AGENTTY, &options, config_path,
-                                            sizeof(config_path)),
-              0);
-    snprintf(expected, sizeof(expected), "%s/.agentty/mcp.json", tmpdir);
-    ASSERT_STR_EQ(config_path, expected);
+    cbm_setenv("AGENTTY_MCP_CONFIG", "agentty-relative.json", 1);
+    json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    bool relative_ignored =
+        json && strstr(json, default_path) != NULL && strstr(json, "agentty-relative.json") == NULL;
+    free(json);
 
     restore_test_env("AGENTTY_MCP_CONFIG", saved);
     test_rmdir_r(tmpdir);
+    if (!absolute_honored)
+        FAIL("install plan must target an absolute $AGENTTY_MCP_CONFIG");
+    if (!tilde_honored)
+        FAIL("install plan must expand a leading ~ in $AGENTTY_MCP_CONFIG");
+    if (!relative_ignored)
+        FAIL("install plan must ignore a relative $AGENTTY_MCP_CONFIG");
     PASS();
 }
 
@@ -7718,25 +7739,21 @@ TEST(cli_agentty_install_then_uninstall_roundtrip) {
     cbm_install_agent_configs(tmpdir, binary, false, false);
     struct stat override_state;
     const char *const override_markers[] = {"mcpServers", "codebase-memory-mcp", binary};
-    if (!test_file_contains_all(override_path, override_markers, 3) ||
-        stat(override_path, &override_state) != 0)
-        FAIL("install must honor $AGENTTY_MCP_CONFIG and write the override file");
+    bool override_written = test_file_contains_all(override_path, override_markers, 3) &&
+                            stat(override_path, &override_state) == 0;
     char *default_after_override = read_test_file_alloc(mcp_path);
     bool default_untouched =
         !default_after_override || strstr(default_after_override, "codebase-memory-mcp") == NULL;
     free(default_after_override);
-    if (!default_untouched)
-        FAIL("install must not re-add the entry to ~/.agentty/mcp.json while "
-             "$AGENTTY_MCP_CONFIG is set");
     argv[0] = "uninstall";
-    uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    int override_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *override_after_uninstall = read_test_file_alloc(override_path);
     bool override_entry_removed =
         override_after_uninstall && strstr(override_after_uninstall, "codebase-memory-mcp") == NULL;
     free(override_after_uninstall);
-    if (!override_entry_removed)
-        FAIL("uninstall must honor $AGENTTY_MCP_CONFIG and clean the override file");
 
+    /* Restore HOME/PATH before any FAIL: a failure here must not leave the
+     * rest of the suite running without git on PATH. */
     free(mcp_after_install);
     free(mcp_after_uninstall);
     restore_test_env("HOME", saved_home);
@@ -7745,6 +7762,15 @@ TEST(cli_agentty_install_then_uninstall_roundtrip) {
     restore_test_env("AGENTTY_MCP_CONFIG", saved_override);
     test_rmdir_r(tmpdir);
 
+    if (!override_written)
+        FAIL("install must honor $AGENTTY_MCP_CONFIG and write the override file");
+    if (!default_untouched)
+        FAIL("install must not re-add the entry to ~/.agentty/mcp.json while "
+             "$AGENTTY_MCP_CONFIG is set");
+    if (!override_entry_removed)
+        FAIL("uninstall must honor $AGENTTY_MCP_CONFIG and clean the override file");
+    if (override_uninstall_rc != 0)
+        FAIL("uninstall must exit successfully when $AGENTTY_MCP_CONFIG is set");
     if (!installed)
         FAIL("install must register the codebase-memory server and skill for agentty");
     if (!foreign_survives_install)

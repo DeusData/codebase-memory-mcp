@@ -9142,6 +9142,7 @@ typedef struct {
     char roo_config_path[CLI_BUF_1K];
     char cody_config_path[CLI_BUF_1K];
     char omp_agent_dir[CLI_BUF_1K];
+    char agentty_mcp_config[CLI_BUF_1K];
 } cbm_agent_registry_context_t;
 
 static const char *cbm_agent_registry_env_path(const char *env_name, const char *home,
@@ -9196,6 +9197,9 @@ static void cbm_init_agent_registry_context(const char *home,
     if (cbm_omp_agent_dir(home, registry->omp_agent_dir, sizeof(registry->omp_agent_dir))) {
         registry->options.omp_agent_dir = registry->omp_agent_dir;
     }
+    registry->options.agentty_mcp_config =
+        cbm_agent_registry_env_path("AGENTTY_MCP_CONFIG", home, registry->agentty_mcp_config,
+                                    sizeof(registry->agentty_mcp_config));
 #ifdef _WIN32
     registry->options.is_windows = true;
 #else

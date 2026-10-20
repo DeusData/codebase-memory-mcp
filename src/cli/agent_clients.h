@@ -78,6 +78,8 @@ typedef struct {
     const char *roo_config_path;
     const char *cody_config_path;
     const char *omp_agent_dir;
+    /* $AGENTTY_MCP_CONFIG, already home-expanded by the caller; NULL = default. */
+    const char *agentty_mcp_config;
     bool is_windows;
     cbm_agent_probe_fn path_exists;
     cbm_agent_probe_fn command_exists;
@@ -115,13 +117,6 @@ int cbm_agent_client_install_mcp(cbm_agent_client_id_t id, const char *config_pa
                                  const char *binary_path);
 int cbm_agent_client_remove_mcp(cbm_agent_client_id_t id, const char *config_path,
                                 const char *binary_path);
-
-/* Shared env-override resolution for clients whose documented config path can
- * be redirected by an environment variable (CLAUDE_CONFIG_DIR, GROK_HOME,
- * VIBE_HOME, AGENTTY_MCP_CONFIG). Expands a leading ~ against the home
- * directory; returns false when the variable is unset or empty. */
-bool cbm_agent_env_config_override(const char *env_name, const char *home_dir, char *resolved,
-                                   size_t resolved_size);
 
 #ifdef __cplusplus
 }
