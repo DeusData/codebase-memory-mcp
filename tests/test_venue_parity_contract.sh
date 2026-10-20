@@ -24,10 +24,13 @@
 #   5. Interface probes — every entry must answer --help (exit 0, "Usage:")
 #      and reject unknown flags with exit 2 + "Please consult --help." so an
 #      agent can always discover exactly what a run will do.
+#   6. Sanitizer runtime defaults — scripts/test.sh, not each venue, sets the
+#      ASan options every lane runs with (stack-use-after-return stays off
+#      unless a lane asks for it explicitly, as test-diag does).
 #
 # Usage: tests/test_venue_parity_contract.sh [repo-root]   (root override so
 # the suite can prove the contract FAILS on a violation, not just passes;
-# layer 5 runs only against the real repo root).
+# layers 5 and 6 run only against the real repo root).
 
 set -euo pipefail
 
@@ -392,6 +395,8 @@ scripts/smoke-invariants.sh
 scripts/ci/preflight-docker.sh
 scripts/ci/require-all-green.sh
 scripts/ci/verify-shard-union.sh
+scripts/ci/select-lanes.sh
+scripts/ci/test-impact-shadow.sh
 scripts/ci/generate-sbom.py
 scripts/package-release.sh
 scripts/ci/smoke-artifact.sh
@@ -436,6 +441,8 @@ test-infrastructure/vm/vm-smoke.sh
 scripts/smoke-invariants.sh
 scripts/fuzz.sh
 scripts/memwaste.sh
+scripts/ci/select-lanes.sh
+scripts/ci/test-impact-shadow.sh
 "
     for entry in $STRICT_ENTRIES; do
         out=$(cd "$ROOT" && bash "$entry" --definitely-not-a-flag 2>&1) && rc=0 || rc=$?
@@ -454,4 +461,64 @@ scripts/memwaste.sh
         exit 1
     fi
     echo "interface probes OK ($(printf '%s' "$HELP_ENTRIES" | grep -c .) --help entries, $(printf '%s' "$STRICT_ENTRIES" | grep -c .) strict-flag entries)"
+fi
+
+# ── Layer 6: sanitizer runtime defaults (real repo root only). Drives the REAL
+# scripts/test.sh in --suites mode with a no-op `make` first on PATH and a
+# probe standing in for the test-runner: the probe answers the build-config
+# handshake, then records the ASAN_OPTIONS it inherited. Every case sets or
+# unsets ASAN_OPTIONS itself, because this contract runs INSIDE test.sh, whose
+# own export would otherwise leak in.
+if [ -d "$ROOT/scripts" ] && [ -f "$ROOT/scripts/test.sh" ]; then
+    asan_failures=0
+    asan_tmp="$(mktemp -d)"
+    trap 'rm -rf "$asan_tmp"' EXIT
+    mkdir -p "$asan_tmp/bin" "$asan_tmp/build"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$asan_tmp/bin/make"
+    cat > "$asan_tmp/build/test-runner" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--build-config" ]; then
+    printf 'sanitized=1 test_seams=1\n'
+    exit 0
+fi
+printf '%s' "${ASAN_OPTIONS-<unset>}" > "$CBM_ASAN_PROBE_OUT"
+EOF
+    chmod +x "$asan_tmp/bin/make" "$asan_tmp/build/test-runner"
+
+    # asan_case LABEL GIVEN WANT: GIVEN is the caller's ASAN_OPTIONS ("<unset>"
+    # for none), WANT the exact value the runner must receive.
+    asan_case() {
+        local label="$1" given="$2" want="$3" seen rc
+        rm -f "$asan_tmp/seen"
+        (
+            if [ "$given" = "<unset>" ]; then
+                unset ASAN_OPTIONS
+            else
+                export ASAN_OPTIONS="$given"
+            fi
+            cd "$ROOT" && PATH="$asan_tmp/bin:$PATH" CBM_NO_CCACHE=1 \
+                CBM_ASAN_PROBE_OUT="$asan_tmp/seen" \
+                bash scripts/test.sh --suites probe "BUILD_DIR=$asan_tmp/build"
+        ) >"$asan_tmp/log" 2>&1 && rc=0 || rc=$?
+        seen="$(cat "$asan_tmp/seen" 2>/dev/null || printf '<runner not reached>')"
+        if [ "$rc" -ne 0 ] || [ "$seen" != "$want" ]; then
+            echo "SANITIZER DEFAULTS: $label: runner got ASAN_OPTIONS=[$seen], want [$want] (test.sh rc=$rc)" >&2
+            sed 's/^/      /' "$asan_tmp/log" >&2
+            asan_failures=1
+        fi
+    }
+
+    asan_case "unset" "<unset>" \
+        "detect_stack_use_after_return=0"
+    asan_case "other options kept" "detect_leaks=1:halt_on_error=1" \
+        "detect_leaks=1:halt_on_error=1:detect_stack_use_after_return=0"
+    asan_case "explicit setting wins (test-diag)" \
+        "detect_stack_use_after_return=1:strict_string_checks=1:detect_stack_use_after_scope=1" \
+        "detect_stack_use_after_return=1:strict_string_checks=1:detect_stack_use_after_scope=1"
+
+    if [ "$asan_failures" -ne 0 ]; then
+        echo "VENUE PARITY CONTRACT VIOLATED — sanitizer runtime defaults failed (layer 6)" >&2
+        exit 1
+    fi
+    echo "sanitizer runtime defaults OK (3 ASAN_OPTIONS cases through scripts/test.sh)"
 fi

@@ -50,11 +50,13 @@
 #include "cbm.h"
 #include "discover/discover.h"
 #include "lang_specs.h"
+#include "lsp/py_lsp.h"
 #include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "yyjson/yyjson.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -67,6 +69,13 @@
  * lsp_resolve.h — re-declared here to avoid pulling that header's statics). */
 extern _Atomic uint64_t g_lsp_tail_lookups;
 extern _Atomic uint64_t g_lsp_tail_candidates;
+/* Infra resolver candidate counters (pass_k8s.c, pass_operator.c,
+ * pass_shell.c, pass_terraform.c). */
+extern _Atomic uint64_t g_k8s_candidates;
+extern _Atomic uint64_t g_op_candidates;
+extern _Atomic uint64_t g_sh_candidates;
+extern _Atomic uint64_t g_tf_candidates;
+extern _Atomic uint64_t g_dk_hub_edges;
 
 /* ── Corpus scale ──────────────────────────────────────────────────────
  * Small on purpose: the gate reads exponents from ratios, not magnitudes.
@@ -86,6 +95,9 @@ enum {
      * code path. The sequential path's own per-file registry work is bounded
      * by the 50-file ceiling and is deliberately out of scope here. */
     CX_BIGPKG_FILES_PER_K = 20,
+    CX_PYEXT_FILES_PER_MOD = 20,
+    CX_PYEXT_DEFS_PER_FILE = 120,
+    CX_PYEXT_PROBES_PER_FILE = 3,
 };
 
 /* Linear growth bounds for a 2x input doubling. Fixed structural overhead
@@ -166,8 +178,9 @@ static const CxTemplate CX_TEMPLATES[] = {
 };
 enum { CX_TEMPLATE_COUNT = sizeof(CX_TEMPLATES) / sizeof(CX_TEMPLATES[0]) };
 
-/* Fixture-dir provider: tests/fixtures/complexity/<lang-name>/ — every file in
- * it is copied verbatim into each module dir. Lets a new language join the
+/* Fixture-dir provider: tests/fixtures/complexity/<lang-name>/ — every file
+ * and directory in it (dot-names aside) is copied verbatim into each module
+ * dir. Lets a new language join the
  * guard by dropping fixtures, with no edit to this suite. */
 static bool cx_fixture_dir_for(CBMLanguage lang, char *out, size_t cap) {
     const char *name = cbm_language_name(lang);
@@ -203,6 +216,36 @@ static int cx_copy_file(const char *src, const char *dst) {
     return 0;
 }
 
+/* A fixture entry into `dst`: a file, or a directory with its contents. */
+static int cx_copy_entry(const char *src, const char *dst, bool is_dir) {
+    if (!is_dir) {
+        return cx_copy_file(src, dst);
+    }
+    if (th_mkdir_p(dst) != 0) {
+        return -1;
+    }
+    cbm_dir_t *d = cbm_opendir(src);
+    if (!d) {
+        return -1;
+    }
+    int rc = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (entry->name[0] == '.') {
+            continue;
+        }
+        char from[1024];
+        char to[1024];
+        snprintf(from, sizeof(from), "%s/%s", src, entry->name);
+        snprintf(to, sizeof(to), "%s/%s", dst, entry->name);
+        if (cx_copy_entry(from, to, entry->is_dir) != 0) {
+            rc = -1;
+        }
+    }
+    cbm_closedir(d);
+    return rc;
+}
+
 /* ── Corpus builder ──────────────────────────────────────────────────── */
 
 static int cx_build_corpus(const char *root, int k_modules) {
@@ -230,15 +273,8 @@ static int cx_build_corpus(const char *root, int k_modules) {
      * k module copies. Distinct paths make distinct modules/QNs, which is all
      * the independence argument needs. */
     for (int lang = 0; lang < CBM_LANG_COUNT; lang++) {
-        bool templated = false;
-        for (int t = 0; t < CX_TEMPLATE_COUNT; t++) {
-            if (CX_TEMPLATES[t].lang == (CBMLanguage)lang) {
-                templated = true;
-            }
-        }
-        if (templated) {
-            continue;
-        }
+        /* a templated language may add fixtures too (Go: the operator
+         * corpus); they land in their own fx_<lang> root */
         char fixdir[512];
         if (!cx_fixture_dir_for((CBMLanguage)lang, fixdir, sizeof(fixdir))) {
             continue;
@@ -261,7 +297,7 @@ static int cx_build_corpus(const char *root, int k_modules) {
                 char src[1024];
                 snprintf(src, sizeof(src), "%s/%s", fixdir, entry->name);
                 snprintf(path, sizeof(path), "%s/%s", dir, entry->name);
-                (void)cx_copy_file(src, path);
+                (void)cx_copy_entry(src, path, entry->is_dir);
             }
         }
         cbm_closedir(d);
@@ -306,6 +342,44 @@ static int cx_build_bigpkg(const char *root, int k) {
     return 0;
 }
 
+/* Every file probes absent external submodules and retains a real local-call
+ * control. Independent module copies grow the shared registry without adding
+ * cross-copy dependencies. Both sizes exceed the parallel-driver threshold. */
+static int cx_build_pyext(const char *root, int k) {
+    char dir[1024];
+    char path[1200];
+    for (int m = 0; m < k; m++) {
+        int n = snprintf(dir, sizeof(dir), "%s/pyext/mod%d", root, m);
+        if (n < 0 || (size_t)n >= sizeof(dir) || th_mkdir_p(dir) != 0)
+            return -1;
+        for (int j = 0; j < CX_PYEXT_FILES_PER_MOD; j++) {
+            n = snprintf(path, sizeof(path), "%s/p%d.py", dir, j);
+            if (n < 0 || (size_t)n >= sizeof(path))
+                return -1;
+            FILE *f = fopen(path, "w");
+            if (!f)
+                return -1;
+            bool written = fprintf(f, "import extlib\n\n") >= 0;
+            for (int d = 0; written && d < CX_PYEXT_DEFS_PER_FILE; d++) {
+                written =
+                    fprintf(f, "def cx_pyext_definition_%d(x):\n    return x + %d\n\n", d, d) >= 0;
+            }
+            if (written)
+                written =
+                    fprintf(f, "def cx_pyext_use():\n    return (cx_pyext_definition_0(0)") >= 0;
+            for (int probe = 0; written && probe < CX_PYEXT_PROBES_PER_FILE; probe++) {
+                written = fprintf(f, " + extlib.sub%d.helper(%d)", probe, probe) >= 0;
+            }
+            if (written)
+                written = fprintf(f, ")\n") >= 0;
+            int closed = fclose(f);
+            if (!written || closed != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 /* ── Metrics ─────────────────────────────────────────────────────────── */
 
 /* Per-pass timing capture: a TEE log sink parses `pass.timing` lines during a
@@ -342,6 +416,25 @@ static void cx_pass_sink(const char *line) {
     g_cx_passes[n].ms = atol(ee + 11);
 }
 
+/* Fixture-provided infra corpora (tests/fixtures/complexity/<name>/), scoped
+ * by their copy root: Kubernetes manifests with a kustomization (and a Flux
+ * HelmRelease whose chartRef names an OCIRepository), a Go operator
+ * (controller, API types with +groupName, an embedded CRD, a chart loader), a
+ * shell deploy chain (composite CI action -> make -> scripts -> kubectl / helm
+ * of the copy's own manifests and chart), and Terraform helm_releases (one of
+ * a chart dir of the module, one of an external chart). An API
+ * group/kind is one identity across a repository: copies declaring the same
+ * one ARE joined (a CRD links to every package marking its group), so the
+ * fixtures' CRDs use groups no copy's Go code declares -- the guard measures
+ * accidental growth, not that by-design join. The container layer (Docker)
+ * has Dockerfiles with stage ENV, an ENTRYPOINT script and a compose project
+ * building two components of one repository; an image repository is one
+ * identity too, so every copy's builds of it join one Image -- that join
+ * must stay linear (the component split examines its edges). */
+static const char *const CX_INFRA_DIRS[] = {"fx_Kubernetes", "fx_Go", "fx_Bash", "fx_HCL",
+                                            "fx_Dockerfile"};
+enum { CX_INFRA_COUNT = sizeof(CX_INFRA_DIRS) / sizeof(CX_INFRA_DIRS[0]) };
+
 typedef struct {
     int nodes;
     int edges;
@@ -357,8 +450,254 @@ typedef struct {
     uint64_t fallback_rows;
     uint64_t imp_nodes;       /* symbols scored by the importance pass */
     uint64_t imp_name_visits; /* same-name-group members visited by that pass */
+    uint64_t k8s_candidates;  /* objects the K8s resolvers examined */
+    uint64_t op_candidates;   /* Go types / dirs the operator pass examined */
+    uint64_t sh_candidates;   /* paths / make rules the shell layer examined */
+    uint64_t tf_candidates;   /* blocks the Terraform layer examined */
+    uint64_t dk_hub_edges;    /* Image edges the component split examined */
+    int infra_nodes[CX_INFRA_COUNT];
+    int infra_edges[CX_INFRA_COUNT];
+    uint64_t py_probes;
+    uint64_t py_probe_visits;
+    int pyext_files;
+    int pyext_defs;
+    int pyext_controls;
+    uint64_t py_class_binds;
+    uint64_t py_class_visits;
+    uint64_t py_wildcards;
+    uint64_t py_wildcard_visits;
+    int pyrange_files;
+    int pyrange_defs;
+    int pyrange_classes;
+    int pyrange_peer_classes;
+    int pyrange_controls;
+    int errors;
     double wall_s;
 } CxMetrics;
+
+/* Count the intended corpus, then prove each use() kept its exact local LSP
+ * call. Query errors are failures, never indistinguishable from zero rows. */
+static bool cx_pyext_control(cbm_store_t *store, const char *project, const cbm_node_t *caller) {
+    if (!caller->qualified_name || !caller->file_path)
+        return false;
+    const char *dot = strrchr(caller->qualified_name, '.');
+    if (!dot || dot - caller->qualified_name > 1000)
+        return false;
+    char target_qn[1200];
+    int n = snprintf(target_qn, sizeof(target_qn), "%.*s.cx_pyext_definition_0",
+                     (int)(dot - caller->qualified_name), caller->qualified_name);
+    if (n < 0 || (size_t)n >= sizeof(target_qn))
+        return false;
+    cbm_node_t target = {0};
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    bool found = false;
+    if (cbm_store_find_node_by_qn(store, project, target_qn, &target) == CBM_STORE_OK &&
+        target.label && strcmp(target.label, "Function") == 0 && target.file_path &&
+        strcmp(target.file_path, caller->file_path) == 0 &&
+        cbm_store_find_edges_by_source_type(store, caller->id, "CALLS", &edges, &count) ==
+            CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            if (edges[i].target_id != target.id || !edges[i].properties_json)
+                continue;
+            /* an LSP resolution records an lsp_* strategy (lsp_direct here) */
+            yyjson_doc *doc =
+                yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0);
+            const char *strategy =
+                doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
+            found = found || (strategy && strncmp(strategy, "lsp_", 4) == 0);
+            yyjson_doc_free(doc);
+        }
+    }
+    cbm_store_free_edges(edges, count);
+    cbm_node_free_fields(&target);
+    return found;
+}
+
+static bool cx_pyext_population(cbm_store_t *store, const char *project, CxMetrics *out) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    bool ok = cbm_store_find_nodes_by_label(store, project, "File", &nodes, &count) == CBM_STORE_OK;
+    for (int i = 0; ok && i < count; i++) {
+        if (nodes[i].file_path && strncmp(nodes[i].file_path, "pyext/", 6) == 0)
+            out->pyext_files++;
+    }
+    cbm_store_free_nodes(nodes, count);
+    nodes = NULL;
+    count = 0;
+    ok = ok &&
+         cbm_store_find_nodes_by_label(store, project, "Function", &nodes, &count) == CBM_STORE_OK;
+    for (int i = 0; ok && i < count; i++) {
+        const cbm_node_t *node = &nodes[i];
+        if (!node->file_path || strncmp(node->file_path, "pyext/", 6) != 0 || !node->name)
+            continue;
+        static const char definition_prefix[] = "cx_pyext_definition_";
+        if (strncmp(node->name, definition_prefix, sizeof(definition_prefix) - 1) == 0)
+            out->pyext_defs++;
+        if (strcmp(node->name, "cx_pyext_use") == 0 && cx_pyext_control(store, project, node))
+            out->pyext_controls++;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return ok;
+}
+
+/* Each package has many registered direct members; other packages are decoys.
+ * Wildcards precede definitions so the fixture retains explicit LSP positives.
+ * Exact invalidation-order negatives live in test_py_lsp.c. */
+enum { CX_PYRANGE_FILES_PER_K = 20, CX_PYRANGE_DEFS = 40, CX_PYRANGE_WILDCARDS = 4 };
+
+static int cx_build_pyrange(const char *root, int k) {
+    for (int m = 0; m < k; m++) {
+        for (int j = 0; j < CX_PYRANGE_FILES_PER_K; j++) {
+            char dir[1024], path[1200];
+            int dn = snprintf(dir, sizeof(dir), "%s/pyrange/mod%d/p%d", root, m, j);
+            if (dn < 0 || (size_t)dn >= sizeof(dir) || th_mkdir_p(dir) != 0)
+                return -1;
+            int pn = snprintf(path, sizeof(path), "%s/__init__.py", dir);
+            if (pn < 0 || (size_t)pn >= sizeof(path))
+                return -1;
+            FILE *f = fopen(path, "w");
+            if (!f)
+                return -1;
+            bool written = true;
+            for (int w = 0; written && w < CX_PYRANGE_WILDCARDS; w++)
+                written = fprintf(f, "from range_vendor_%d import *\n", w) >= 0;
+            int peer = (j + 1) % CX_PYRANGE_FILES_PER_K;
+            if (written)
+                written = fprintf(f, "from pyrange.mod%d.p%d import Peer_%d_%d\n\n", m, peer, m,
+                                  peer) >= 0;
+            for (int d = 0; written && d < CX_PYRANGE_DEFS; d++) {
+                written = fprintf(f,
+                                  "def cx_pyrange_definition_%d(x):\n    return x + %d\n\n"
+                                  "class RangeClass_%d:\n    def value(self):\n"
+                                  "        return %d\n\n",
+                                  d, d, d, d) >= 0;
+            }
+            if (written)
+                written = fprintf(f,
+                                  "class Peer_%d_%d:\n    def remote_%d_%d(self):\n"
+                                  "        return %d\n\n"
+                                  "def cx_pyrange_use():\n    obj = RangeClass_0()\n"
+                                  "    peer = Peer_%d_%d()\n"
+                                  "    return (cx_pyrange_definition_0(1) + obj.value()\n"
+                                  "            + peer.remote_%d_%d())\n",
+                                  m, j, m, j, j, m, peer, m, peer) >= 0;
+            int closed = fclose(f);
+            if (!written || closed != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static bool cx_pyrange_exact_control(cbm_store_t *store, const char *project,
+                                     const cbm_node_t *caller, const char *qn,
+                                     const char *target_file, const char *label) {
+    if (!caller->qualified_name || !caller->file_path || !caller->label ||
+        strcmp(caller->label, "Function") != 0)
+        return false;
+    cbm_node_t target = {0};
+    cbm_edge_t *edges = NULL;
+    int count = 0, exact = 0;
+    bool ok = cbm_store_find_node_by_qn(store, project, qn, &target) == CBM_STORE_OK &&
+              target.qualified_name && strcmp(target.qualified_name, qn) == 0 && target.label &&
+              strcmp(target.label, label) == 0 && target.file_path &&
+              strcmp(target.file_path, target_file) == 0 &&
+              cbm_store_find_edges_by_source_type(store, caller->id, "CALLS", &edges, &count) ==
+                  CBM_STORE_OK;
+    for (int i = 0; ok && i < count; i++) {
+        if (edges[i].target_id != target.id)
+            continue;
+        yyjson_doc *doc =
+            edges[i].properties_json
+                ? yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0)
+                : NULL;
+        /* an LSP resolution records an lsp_* strategy */
+        const char *strategy =
+            doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
+        if (strategy && strncmp(strategy, "lsp_", 4) == 0)
+            exact++;
+        yyjson_doc_free(doc);
+    }
+    cbm_store_free_edges(edges, count);
+    cbm_node_free_fields(&target);
+    return ok && exact == 1;
+}
+
+/* A remote method has no declaration in the importer/raw file registry. Its
+ * source=lsp edge proves that cross-file registry evidence reached resolution. */
+static bool cx_pyrange_controls(cbm_store_t *store, const char *project, const cbm_node_t *caller) {
+    if (!caller->qualified_name || !caller->file_path)
+        return false;
+    const char *dot = strrchr(caller->qualified_name, '.');
+    if (!dot || dot - caller->qualified_name > 1000)
+        return false;
+    char module[1200], qn[1400];
+    int n = snprintf(module, sizeof(module), "%.*s", (int)(dot - caller->qualified_name),
+                     caller->qualified_name);
+    if (n < 0 || (size_t)n >= sizeof(module))
+        return false;
+    n = snprintf(qn, sizeof(qn), "%s.cx_pyrange_definition_0", module);
+    bool function =
+        n >= 0 && (size_t)n < sizeof(qn) &&
+        cx_pyrange_exact_control(store, project, caller, qn, caller->file_path, "Function");
+    n = snprintf(qn, sizeof(qn), "%s.RangeClass_0.value", module);
+    bool method = n >= 0 && (size_t)n < sizeof(qn) &&
+                  cx_pyrange_exact_control(store, project, caller, qn, caller->file_path, "Method");
+    int m = -1, j = -1;
+    if (sscanf(caller->file_path, "pyrange/mod%d/p%d/__init__.py", &m, &j) != 2 || m < 0 || j < 0 ||
+        j >= CX_PYRANGE_FILES_PER_K)
+        return false;
+    char path[1200], slot_name[64];
+    n = snprintf(path, sizeof(path), "pyrange/mod%d/p%d/__init__.py", m, j);
+    if (n < 0 || (size_t)n >= sizeof(path) || strcmp(path, caller->file_path) != 0)
+        return false;
+    n = snprintf(slot_name, sizeof(slot_name), "p%d", j);
+    char *slot = strrchr(module, '.');
+    if (n < 0 || (size_t)n >= sizeof(slot_name) || !slot || strcmp(slot + 1, slot_name) != 0)
+        return false;
+    *slot = '\0';
+    int peer = (j + 1) % CX_PYRANGE_FILES_PER_K;
+    n = snprintf(qn, sizeof(qn), "%s.p%d.Peer_%d_%d.remote_%d_%d", module, peer, m, peer, m, peer);
+    int pn = snprintf(path, sizeof(path), "pyrange/mod%d/p%d/__init__.py", m, peer);
+    bool remote = n >= 0 && (size_t)n < sizeof(qn) && pn >= 0 && (size_t)pn < sizeof(path) &&
+                  strcmp(path, caller->file_path) != 0 &&
+                  cx_pyrange_exact_control(store, project, caller, qn, path, "Method");
+    return function && method && remote;
+}
+
+static bool cx_pyrange_population(cbm_store_t *store, const char *project, CxMetrics *out) {
+    static const char *const labels[] = {"File", "Function", "Class"};
+    bool ok = true;
+    for (int l = 0; l < 3; l++) {
+        cbm_node_t *nodes = NULL;
+        int count = 0;
+        bool queried = cbm_store_find_nodes_by_label(store, project, labels[l], &nodes, &count) ==
+                       CBM_STORE_OK;
+        ok = queried && ok;
+        for (int i = 0; queried && i < count; i++) {
+            const cbm_node_t *node = &nodes[i];
+            if (!node->file_path || strncmp(node->file_path, "pyrange/", 8) != 0)
+                continue;
+            if (l == 0)
+                out->pyrange_files++;
+            if (l == 1 && node->name) {
+                static const char def_prefix[] = "cx_pyrange_definition_";
+                if (strncmp(node->name, def_prefix, sizeof(def_prefix) - 1) == 0)
+                    out->pyrange_defs++;
+                if (strcmp(node->name, "cx_pyrange_use") == 0 &&
+                    cx_pyrange_controls(store, project, node))
+                    out->pyrange_controls++;
+            }
+            if (l == 2 && node->name && strncmp(node->name, "RangeClass_", 11) == 0)
+                out->pyrange_classes++;
+            if (l == 2 && node->name && strncmp(node->name, "Peer_", 5) == 0)
+                out->pyrange_peer_classes++;
+        }
+        cbm_store_free_nodes(nodes, count);
+    }
+    return ok;
+}
 
 static double cx_now_s(void) {
     struct timespec ts;
@@ -366,7 +705,7 @@ static double cx_now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
+static int cx_run(const char *root, const char *db_path, CxMetrics *out, bool pyext, bool pyrange) {
     memset(out, 0, sizeof(*out));
 
     uint64_t d0;
@@ -379,6 +718,18 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     uint64_t fb0 = cbm_pp_lsp_linear_fallback_rows();
     uint64_t in0 = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed);
     uint64_t iv0 = atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed);
+    uint64_t kc0 = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed);
+    uint64_t oc0 = atomic_load_explicit(&g_op_candidates, memory_order_relaxed);
+    uint64_t sc0 = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed);
+    uint64_t fc0 = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed);
+    uint64_t dh0 = atomic_load_explicit(&g_dk_hub_edges, memory_order_relaxed);
+    uint64_t pp0 = atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed);
+    uint64_t pv0 = atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed);
+    uint64_t pc0 = atomic_load_explicit(&cbm_py_module_class_binds, memory_order_relaxed);
+    uint64_t pcv0 = atomic_load_explicit(&cbm_py_module_class_bind_visits, memory_order_relaxed);
+    uint64_t pw0 = atomic_load_explicit(&cbm_py_wildcard_invalidations, memory_order_relaxed);
+    uint64_t pwv0 =
+        atomic_load_explicit(&cbm_py_wildcard_invalidation_visits, memory_order_relaxed);
 
     atomic_store_explicit(&g_cx_pass_count, 0, memory_order_relaxed);
     cbm_log_set_sink_ex(cx_pass_sink, CBM_LOG_SINK_TEE);
@@ -390,6 +741,7 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     }
     int rc = cbm_pipeline_run(p);
     out->wall_s = cx_now_s() - t0;
+    cbm_pipeline_get_file_errors(p, NULL, &out->errors);
     cbm_log_set_sink(NULL);
     int captured = atomic_load_explicit(&g_cx_pass_count, memory_order_relaxed);
     out->pass_count = captured < CX_MAX_PASSES ? captured : CX_MAX_PASSES;
@@ -416,6 +768,15 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     out->imp_nodes = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed) - in0;
     out->imp_name_visits =
         atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed) - iv0;
+    out->k8s_candidates = atomic_load_explicit(&g_k8s_candidates, memory_order_relaxed) - kc0;
+    out->op_candidates = atomic_load_explicit(&g_op_candidates, memory_order_relaxed) - oc0;
+    out->sh_candidates = atomic_load_explicit(&g_sh_candidates, memory_order_relaxed) - sc0;
+    out->tf_candidates = atomic_load_explicit(&g_tf_candidates, memory_order_relaxed) - fc0;
+    out->dk_hub_edges = atomic_load_explicit(&g_dk_hub_edges, memory_order_relaxed) - dh0;
+
+    out->py_probes = atomic_load_explicit(&cbm_py_submodule_probes, memory_order_relaxed) - pp0;
+    out->py_probe_visits =
+        atomic_load_explicit(&cbm_py_submodule_probe_visits, memory_order_relaxed) - pv0;
 
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
@@ -427,8 +788,22 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
         out->lang_nodes[t] = cbm_store_count_nodes_scoped(s, project, CX_TEMPLATES[t].dirname);
         out->lang_edges[t] = cbm_store_count_edges_scoped(s, project, CX_TEMPLATES[t].dirname);
     }
+    for (int i = 0; i < CX_INFRA_COUNT; i++) {
+        out->infra_nodes[i] = cbm_store_count_nodes_scoped(s, project, CX_INFRA_DIRS[i]);
+        out->infra_edges[i] = cbm_store_count_edges_scoped(s, project, CX_INFRA_DIRS[i]);
+    }
+    out->py_class_binds =
+        atomic_load_explicit(&cbm_py_module_class_binds, memory_order_relaxed) - pc0;
+    out->py_class_visits =
+        atomic_load_explicit(&cbm_py_module_class_bind_visits, memory_order_relaxed) - pcv0;
+    out->py_wildcards =
+        atomic_load_explicit(&cbm_py_wildcard_invalidations, memory_order_relaxed) - pw0;
+    out->py_wildcard_visits =
+        atomic_load_explicit(&cbm_py_wildcard_invalidation_visits, memory_order_relaxed) - pwv0;
+    bool extra_ok = (!pyext || cx_pyext_population(s, project, out)) &&
+                    (!pyrange || cx_pyrange_population(s, project, out));
     cbm_store_close(s);
-    return 0;
+    return extra_ok ? 0 : -1;
 }
 
 static double cx_ratio(double num, double den) {
@@ -437,10 +812,12 @@ static double cx_ratio(double num, double den) {
 
 typedef int (*CxCorpusBuilder)(const char *root, int k);
 
-static void cx_remove_corpus(const char *root) {
-    if (th_rmtree(root) != 0) {
+static int cx_remove_corpus(const char *root) {
+    int rc = th_rmtree(root);
+    if (rc != 0) {
         fprintf(stderr, "  [complexity] WARN: could not remove temp corpus %s\n", root);
     }
+    return rc;
 }
 
 /* Build one corpus shape at k and 2k in two fresh temp dirs, run the pipeline
@@ -453,26 +830,30 @@ static int cx_measure(CxCorpusBuilder build, const char *prefix_a, const char *p
     const char *tmp = cbm_tmpdir();
     char root_a[512];
     char root_b[512];
-    snprintf(root_a, sizeof(root_a), "%s/%s_XXXXXX", tmp, prefix_a);
-    snprintf(root_b, sizeof(root_b), "%s/%s_XXXXXX", tmp, prefix_b);
+    int na = snprintf(root_a, sizeof(root_a), "%s/%s_XXXXXX", tmp, prefix_a);
+    int nb = snprintf(root_b, sizeof(root_b), "%s/%s_XXXXXX", tmp, prefix_b);
+    if (na < 0 || (size_t)na >= sizeof(root_a) || nb < 0 || (size_t)nb >= sizeof(root_b))
+        return -1;
     bool made_a = cbm_mkdtemp(root_a) != NULL;
     bool made_b = made_a && cbm_mkdtemp(root_b) != NULL;
     int rc = -1;
     if (made_b && build(root_a, CX_K_BASE) == 0 && build(root_b, CX_K_BASE * 2) == 0) {
         char db_a[600];
         char db_b[600];
-        snprintf(db_a, sizeof(db_a), "%s/cx.db", root_a);
-        snprintf(db_b, sizeof(db_b), "%s/cx.db", root_b);
-        if (cx_run(root_a, db_a, out_a) == 0 && cx_run(root_b, db_b, out_b) == 0) {
+        int da = snprintf(db_a, sizeof(db_a), "%s/cx.db", root_a);
+        int db = snprintf(db_b, sizeof(db_b), "%s/cx.db", root_b);
+        bool paths = da >= 0 && (size_t)da < sizeof(db_a) && db >= 0 && (size_t)db < sizeof(db_b);
+        bool pyext = build == cx_build_pyext;
+        bool pyrange = build == cx_build_pyrange;
+        if (paths && cx_run(root_a, db_a, out_a, pyext, pyrange) == 0 &&
+            cx_run(root_b, db_b, out_b, pyext, pyrange) == 0) {
             rc = 0;
         }
     }
-    if (made_b) {
-        cx_remove_corpus(root_b);
-    }
-    if (made_a) {
-        cx_remove_corpus(root_a);
-    }
+    if (made_b && cx_remove_corpus(root_b) != 0 && build == cx_build_pyrange)
+        rc = -1;
+    if (made_a && cx_remove_corpus(root_a) != 0 && build == cx_build_pyrange)
+        rc = -1;
     return rc;
 }
 
@@ -525,6 +906,59 @@ TEST(complexity_replicated_modules_scale_linearly) {
         printf("    %-8s nodes %d -> %d (ratio %.2f)\n", CX_TEMPLATES[t].dirname, a->lang_nodes[t],
                b->lang_nodes[t], lr);
         ASSERT_TRUE(lr >= CX_RATIO_LO && lr <= CX_RATIO_HI);
+    }
+    PASS();
+}
+
+/* The infra resolvers (K8s references / selectors / CRDs / chartRefs, the Go
+ * operator's controller kinds, CRD types and loaded charts, the shell layer's
+ * manifest dirs and make rules, Terraform's helm_release blocks) examine
+ * candidates by name. Independent
+ * copies share every name, so a candidate set that is not scoped to the
+ * bundle / package / module grows with the copy count: the examined count
+ * goes ~4x per doubling while the edges stay ~2x. Both are gated, on the
+ * fixture corpora's own subtrees, and neither may be vacuous. */
+TEST(complexity_infra_resolution_is_linear) {
+    if (cx_measure_pair() != 0) {
+        FAIL("failed to build/run the complexity corpus pair");
+    }
+    const CxMetrics *a = &g_cx_base;
+    const CxMetrics *b = &g_cx_doubled;
+    printf("    k8s_candidates %llu -> %llu  op_candidates %llu -> %llu\n",
+           (unsigned long long)a->k8s_candidates, (unsigned long long)b->k8s_candidates,
+           (unsigned long long)a->op_candidates, (unsigned long long)b->op_candidates);
+    ASSERT_GT((long long)a->k8s_candidates, 0);
+    ASSERT_GT((long long)a->op_candidates, 0);
+    double kr = cx_ratio((double)b->k8s_candidates, (double)a->k8s_candidates);
+    double orr = cx_ratio((double)b->op_candidates, (double)a->op_candidates);
+    printf("    k8s_candidates ratio %.2f  op_candidates ratio %.2f\n", kr, orr);
+    ASSERT_TRUE(kr >= CX_RATIO_LO && kr <= CX_RATIO_HI);
+    ASSERT_TRUE(orr >= CX_RATIO_LO && orr <= CX_RATIO_HI);
+    printf("    sh_candidates %llu -> %llu  tf_candidates %llu -> %llu\n",
+           (unsigned long long)a->sh_candidates, (unsigned long long)b->sh_candidates,
+           (unsigned long long)a->tf_candidates, (unsigned long long)b->tf_candidates);
+    ASSERT_GT((long long)a->sh_candidates, 0);
+    ASSERT_GT((long long)a->tf_candidates, 0);
+    double sr = cx_ratio((double)b->sh_candidates, (double)a->sh_candidates);
+    double fr = cx_ratio((double)b->tf_candidates, (double)a->tf_candidates);
+    printf("    sh_candidates ratio %.2f  tf_candidates ratio %.2f\n", sr, fr);
+    ASSERT_TRUE(sr >= CX_RATIO_LO && sr <= CX_RATIO_HI);
+    ASSERT_TRUE(fr >= CX_RATIO_LO && fr <= CX_RATIO_HI);
+    printf("    dk_hub_edges %llu -> %llu\n", (unsigned long long)a->dk_hub_edges,
+           (unsigned long long)b->dk_hub_edges);
+    ASSERT_GT((long long)a->dk_hub_edges, 0);
+    double dr = cx_ratio((double)b->dk_hub_edges, (double)a->dk_hub_edges);
+    printf("    dk_hub_edges ratio %.2f\n", dr);
+    ASSERT_TRUE(dr >= CX_RATIO_LO && dr <= CX_RATIO_HI);
+    for (int i = 0; i < CX_INFRA_COUNT; i++) {
+        ASSERT_GT(a->infra_nodes[i], 0);
+        ASSERT_GT(a->infra_edges[i], 0);
+        double nr = cx_ratio(b->infra_nodes[i], a->infra_nodes[i]);
+        double er = cx_ratio(b->infra_edges[i], a->infra_edges[i]);
+        printf("    %-14s nodes %d -> %d (%.2f)  edges %d -> %d (%.2f)\n", CX_INFRA_DIRS[i],
+               a->infra_nodes[i], b->infra_nodes[i], nr, a->infra_edges[i], b->infra_edges[i], er);
+        ASSERT_TRUE(nr >= CX_RATIO_LO && nr <= CX_RATIO_HI);
+        ASSERT_TRUE(er >= CX_RATIO_LO && er <= CX_RATIO_HI);
     }
     PASS();
 }
@@ -613,6 +1047,58 @@ TEST(complexity_shared_package_growth_stays_linear) {
     ASSERT_GT((long long)a->perfile_defs, (long long)CX_MIN_BASE_WORK);
     double defs_r = cx_ratio((double)b->perfile_defs, (double)a->perfile_defs);
     ASSERT_TRUE(defs_r <= CX_RATIO_HI);
+    PASS();
+}
+
+TEST(complexity_py_submodule_probe_avoids_registry_scan) {
+    static const char *const keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {NULL, NULL};
+    bool ready = true;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        if (old && !saved[i])
+            ready = false;
+    }
+    CxMetrics a = {0}, b = {0};
+    int rc = -1, restored = 0;
+    if (ready) {
+        int configured = cbm_setenv(keys[0], "2", 1);
+        configured |= cbm_unsetenv(keys[1]);
+        if (configured == 0)
+            rc = cx_measure(cx_build_pyext, "cbm_cxpy_a", "cbm_cxpy_b", &a, &b);
+        for (int i = 0; i < 2; i++)
+            restored |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+    }
+    for (int i = 0; i < 2; i++)
+        free(saved[i]);
+    /* cx_measure removes both owned corpora before any assertion below. */
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(restored, 0);
+    ASSERT_EQ(rc, 0);
+    int files = CX_K_BASE * CX_PYEXT_FILES_PER_MOD;
+    ASSERT_EQ(a.errors, 0);
+    ASSERT_EQ(b.errors, 0);
+    ASSERT_EQ(a.pyext_files, files);
+    ASSERT_EQ(b.pyext_files, files * 2);
+    ASSERT_EQ(a.pyext_defs, files * CX_PYEXT_DEFS_PER_FILE);
+    ASSERT_EQ(b.pyext_defs, files * 2 * CX_PYEXT_DEFS_PER_FILE);
+    ASSERT_EQ(a.pyext_controls, files);
+    ASSERT_EQ(b.pyext_controls, files * 2);
+    ASSERT_GT((long long)a.py_probes, (long long)CX_MIN_BASE_WORK);
+    ASSERT_GT((long long)b.py_probes, (long long)CX_MIN_BASE_WORK);
+    ASSERT_GT((long long)a.py_probe_visits, 0);
+    ASSERT_GT((long long)b.py_probe_visits, 0);
+    double probes_ratio = cx_ratio((double)b.py_probes, (double)a.py_probes);
+    double visits_ratio = cx_ratio((double)b.py_probe_visits, (double)a.py_probe_visits);
+    printf("    py_probes %llu -> %llu (%.2f), visits %llu -> %llu (%.2f)\n",
+           (unsigned long long)a.py_probes, (unsigned long long)b.py_probes, probes_ratio,
+           (unsigned long long)a.py_probe_visits, (unsigned long long)b.py_probe_visits,
+           visits_ratio);
+    ASSERT_TRUE(probes_ratio >= CX_RATIO_LO && probes_ratio <= CX_RATIO_HI);
+    ASSERT_TRUE(visits_ratio <= CX_RATIO_HI);
+    /* The direct registry test also enforces a logarithmic comparison bound,
+     * independently of fixed stdlib size and this corpus-growth ratio. */
     PASS();
 }
 
@@ -841,11 +1327,74 @@ TEST(complexity_rescript_error_recovery_lexing_is_linear) {
     PASS();
 }
 
+TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work) {
+    static const char *const keys[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD"};
+    char *saved[2] = {NULL, NULL};
+    bool ready = true;
+    for (int i = 0; i < 2; i++) {
+        const char *old = getenv(keys[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        if (old && !saved[i])
+            ready = false;
+    }
+    CxMetrics a = {0}, b = {0};
+    int rc = -1, restored = 0;
+    if (ready) {
+        int configured = cbm_setenv(keys[0], "2", 1);
+        configured |= cbm_unsetenv(keys[1]);
+        if (configured == 0)
+            rc = cx_measure(cx_build_pyrange, "cbm_cxrange_a", "cbm_cxrange_b", &a, &b);
+        for (int i = 0; i < 2; i++)
+            restored |= saved[i] ? cbm_setenv(keys[i], saved[i], 1) : cbm_unsetenv(keys[i]);
+    }
+    for (int i = 0; i < 2; i++)
+        free(saved[i]);
+    /* Both owned corpora are removed and environment restored before assertions. */
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(restored, 0);
+    ASSERT_EQ(rc, 0);
+    const int files = CX_K_BASE * CX_PYRANGE_FILES_PER_K;
+    ASSERT_GT(files, 50);
+    ASSERT_EQ(a.errors, 0);
+    ASSERT_EQ(b.errors, 0);
+    ASSERT_EQ(a.pyrange_files, files);
+    ASSERT_EQ(b.pyrange_files, files * 2);
+    ASSERT_EQ(a.pyrange_defs, files * CX_PYRANGE_DEFS);
+    ASSERT_EQ(b.pyrange_defs, files * 2 * CX_PYRANGE_DEFS);
+    ASSERT_EQ(a.pyrange_classes, files * CX_PYRANGE_DEFS);
+    ASSERT_EQ(b.pyrange_classes, files * 2 * CX_PYRANGE_DEFS);
+    ASSERT_EQ(a.pyrange_peer_classes, files);
+    ASSERT_EQ(b.pyrange_peer_classes, files * 2);
+    ASSERT_EQ(a.pyrange_controls, files);
+    ASSERT_EQ(b.pyrange_controls, files * 2);
+    ASSERT_GTE(a.py_class_binds, (uint64_t)files);
+    ASSERT_GTE(b.py_class_binds, (uint64_t)(files * 2));
+    ASSERT_GTE(a.py_wildcards, (uint64_t)(files * CX_PYRANGE_WILDCARDS));
+    ASSERT_GTE(b.py_wildcards, (uint64_t)(files * 2 * CX_PYRANGE_WILDCARDS));
+    ASSERT_GT(a.py_class_visits, (uint64_t)0);
+    ASSERT_GT(b.py_class_visits, (uint64_t)0);
+    ASSERT_GT(a.py_wildcard_visits, (uint64_t)0);
+    ASSERT_GT(b.py_wildcard_visits, (uint64_t)0);
+    double classes = cx_ratio((double)b.py_class_binds, (double)a.py_class_binds);
+    double wildcards = cx_ratio((double)b.py_wildcards, (double)a.py_wildcards);
+    ASSERT_TRUE(classes >= CX_RATIO_LO && classes <= CX_RATIO_HI);
+    ASSERT_TRUE(wildcards >= CX_RATIO_LO && wildcards <= CX_RATIO_HI);
+    ASSERT_TRUE(cx_ratio((double)b.py_class_visits, (double)a.py_class_visits) <= CX_RATIO_HI);
+    ASSERT_TRUE(cx_ratio((double)b.py_wildcard_visits, (double)a.py_wildcard_visits) <=
+                CX_RATIO_HI);
+    /* These counters exclude sorting/string-length work. The direct registry
+     * tests separately pin absolute bounds and exact ordered answers. */
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
     RUN_TEST(complexity_replicated_modules_scale_linearly);
     RUN_TEST(complexity_perfile_registry_work_is_linear);
+    RUN_TEST(complexity_infra_resolution_is_linear);
     RUN_TEST(complexity_importance_scoring_is_linear);
     RUN_TEST(complexity_shared_package_growth_stays_linear);
+    RUN_TEST(complexity_py_submodule_probe_avoids_registry_scan);
     RUN_TEST(complexity_throughput_report_written);
 }

@@ -2713,6 +2713,25 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                                        empty_types, NULL, NULL, tree_sitter_objectscript_routine,
                                        NULL},
 
+    // CBM_LANG_OPENAPI — openapi.json / swagger.json: the JSON grammar without
+    // JSON's node per key (thousands in a generated spec); cbm_extract_openapi
+    // (openapi.c) reads the operations from the tree.
+    [CBM_LANG_OPENAPI] = {CBM_LANG_OPENAPI, empty_types, empty_types, empty_types,
+                          json_module_types, empty_types, empty_types, empty_types, empty_types,
+                          empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
+                          tree_sitter_json, NULL},
+
+    // CBM_LANG_PDF — PDF documents. No grammar row: extraction reads the text
+    // layer itself (cbm_pdf_extract_document, doc_pdf.c) before any grammar is
+    // looked up, so this language never reaches cbm_lang_spec()/cbm_ts_language().
+    // Left as a zero spec.
+
+    // CBM_LANG_ASCIIDOC — AsciiDoc documents. No grammar row, as PDF: extraction
+    // reads the file itself (cbm_adoc_extract_document, doc_adoc.c). Zero spec.
+
+    // CBM_LANG_DIAGRAM — diagram files. No grammar row, as PDF: extraction reads
+    // the file itself (cbm_extract_diagram_file, diagram.c). Zero spec.
+
     // CBM_LANG_OBJECTSCRIPT_EXPORT — Studio Export XML. No grammar row: the
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches
@@ -2736,6 +2755,28 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
 _Static_assert(sizeof(lang_specs) / sizeof(lang_specs[0]) == CBM_LANG_COUNT,
                "lang_specs array size must match CBM_LANG_COUNT");
+
+/* Conditional-compilation blocks per grammar (the `*_in_field_declaration_list`
+ * / `*_in_top_level` forms are aliased to these names by the grammars). */
+static const char *c_family_conditional_types[] = {
+    "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef", NULL};
+
+const char **cbm_conditional_block_types(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_GLSL:
+    case CBM_LANG_HLSL:
+    case CBM_LANG_ISPC:
+    case CBM_LANG_SLANG:
+        return c_family_conditional_types;
+    default:
+        return NULL;
+    }
+}
 
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {
     if (lang < 0 || lang >= CBM_LANG_COUNT) {

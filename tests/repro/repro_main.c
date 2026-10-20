@@ -24,11 +24,29 @@
 int tf_pass_count = 0;
 int tf_fail_count = 0;
 int tf_skip_count = 0;
+int tf_deselected_count = 0;
 
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "repro_runner.h"
 #include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
 #include "daemon/bootstrap.h"  /* refuse the developer's default daemon rendezvous */
+
+/* Per-test selection (CBM_TEST_ONLY) and per-test coverage belong to the gating
+ * runner, tests/test_main.c. This board selects whole suites with
+ * CBM_REPRO_ONLY, and every test of a selected suite runs. */
+bool tf_test_selected(const char *test) {
+    (void)test;
+    return true;
+}
+#ifdef CBM_TEST_COVERAGE
+void tf_coverage_test_begin(const char *test) {
+    (void)test;
+}
+void tf_coverage_test_end(const char *test) {
+    (void)test;
+}
+#endif
 
 /* Per-suite summary + filter. RUN_SUITE prints a one-line
  * "[SUITE] <name> P passed, F failed" report (greppable for which suites still
@@ -139,6 +157,8 @@ int main(void) {
      * loudly instead of reaching it. */
     cbm_daemon_bootstrap_forbid_default_runtime_for_test(true);
 #endif
+    /* #2003: fixture git commands must never reach the caller's repository. */
+    th_clear_git_repo_env();
 
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
      * leak) before stdio flushes — keep every printed line so the summary and the
