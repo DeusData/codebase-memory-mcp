@@ -628,7 +628,9 @@ int cbm_git_worktree_status(const char *validated_root, int max_samples,
         return CBM_NOT_FOUND;
     }
 
-    FILE *fp = cbm_popen(cmd, "r");
+    /* An inherited GIT_DIR/GIT_WORK_TREE (a git hook, an editor) overrides
+     * `git -C`, which would report another repository's worktree here. */
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return 0; /* out is zeroed: available=false */
     }

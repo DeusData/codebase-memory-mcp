@@ -497,10 +497,54 @@ TEST(git_branch_resolve_matches_full_context) {
 #endif /* _WIN32 */
 }
 
+/* The freshness verdict reads this snapshot, so an inherited GIT_DIR /
+ * GIT_WORK_TREE pointing at a dirty decoy must not make a clean fixture
+ * report the decoy's changes as its own (#2003). */
+TEST(worktree_status_ignores_inherited_repo_env) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-based env-isolation test not supported on Windows CI");
+#else
+    char root[256];
+    char *raw = th_mktempdir("cbm_gitenv_status");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
+    snprintf(root, sizeof(root), "%s", raw);
+    if (make_env_isolation_tree(root) != 0) {
+        th_rmtree(root);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    char decoy[512], fixture[512], path[600];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(fixture, sizeof(fixture), "%s/fixture", root);
+    /* Dirty only the decoy: one tracked edit and one untracked file. */
+    snprintf(path, sizeof(path), "%s/a.go", decoy);
+    th_write_file(path, "package a // dirty\n");
+    snprintf(path, sizeof(path), "%s/untracked.go", decoy);
+    th_write_file(path, "package a\n");
+
+    git_env_snapshot_t snap;
+    git_env_hook_enter(&snap, decoy);
+    cbm_worktree_status_t st;
+    int rc = cbm_git_worktree_status(fixture, 4, &st);
+    git_env_hook_leave(&snap);
+    bool available = st.available;
+    int tracked = st.tracked_count;
+    int untracked = st.untracked_count;
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(root);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(available);
+    ASSERT_EQ(tracked, 0); /* the fixture is clean; the decoy is not */
+    ASSERT_EQ(untracked, 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
 /* ── Bounded worktree status (BT-240 increment 3) ──────────────────────
  * These run on EVERY platform, not just POSIX: they shell out through
- * cbm_popen (the same isolated spawn production git_context uses) instead of
- * system(), so they work whenever git is on PATH — Windows CI included. The
+ * cbm_popen instead of system(), so they work whenever git is on PATH —
+ * Windows CI included. The
  * core status parser is platform-neutral and must be exercised everywhere git
  * is available; only a genuinely missing git skips. */
 
@@ -769,6 +813,7 @@ SUITE(git_context) {
     RUN_TEST(canonical_root_linked_worktree);
     RUN_TEST(git_context_ignores_inherited_repo_env);
     RUN_TEST(githistory_ignores_inherited_repo_env);
+    RUN_TEST(worktree_status_ignores_inherited_repo_env);
     RUN_TEST(worktree_status_clean);
     RUN_TEST(worktree_status_tracked_modified);
     RUN_TEST(worktree_status_untracked);
