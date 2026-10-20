@@ -25,7 +25,7 @@ on:
         type: string
         default: all
       test_selection:
-        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the test-unix and test-windows legs run only its tests. Empty = every test (dry run, release, and any PR the selection does not narrow)'
+        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the Linux x86_64 test-unix leg runs only its tests, the arm64, macOS and Windows legs run every test. Empty = every test (dry run, release, and any PR the selection does not narrow)'
         type: string
         default: ''
 
@@ -222,7 +222,11 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.cc }}-
 
       - name: Fetch the test selection
-        if: ${{ inputs.test_selection != '' }}
+        # Only the Linux x86_64 leg narrows (user decision 2026-10-16): the
+        # coverage that justifies an omission comes from the Linux x86_64
+        # producer, so arm64, macOS and Windows code under #ifdef has static
+        # evidence only and those legs run every test.
+        if: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ inputs.test_selection }}
@@ -234,7 +238,7 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.cc }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
-          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && format('{0}/test-selection', runner.temp) || '' }}
+          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' && format('{0}/test-selection', runner.temp) || '' }}
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -254,6 +258,23 @@ jobs:
           # (contract step / build) — that failure is already the job's red;
           # warn instead of stacking a second error on top of it. The
           # shard-completeness job still gates the cross-shard union.
+          if-no-files-found: warn
+
+      # The job log carries a red suite's SUMMARY; these are the complete logs
+      # behind it, so a failure can be read instead of re-run. The harness
+      # copies the log of every suite that did not end green, plus results.txt,
+      # into test-logs/failed/ (scripts/suite-failure-report.sh) — typically a
+      # few kilobytes for a red suite, not the ~25 MB of a whole run's logs.
+      # Runs only on a failed job. warn, not error: a job that failed OUTSIDE
+      # the suite wave (contract step, build, prod-binary guards) has no such
+      # directory, and a second error would only bury the first.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-${{ matrix.os }}-${{ matrix.cc }}-${{ strategy.job-index }}
+          path: build/c/test-logs/failed/
+          retention-days: 7
           if-no-files-found: warn
 
       - name: Compiler cache (save)
@@ -300,6 +321,28 @@ jobs:
       - name: Test Go, npm, and PyPI runtime-set wrappers
         shell: bash
         run: scripts/ci/test-package-wrappers.sh
+
+  # CodeAtlasWeb (graph-ui) leg: the frontend's own vitest suite (2000+
+  # tests; the render tests run under jsdom), its hardcoded-string and
+  # promise scans, its portable frozen acceptance checks, and a production
+  # build with the same npm ci the product build runs. One canonical script
+  # (scripts/ci/test-ui.sh) is the whole leg, here and locally. No browser
+  # is downloaded: the browser proofs (graph-ui/tools/smoke-*.mjs) need a
+  # running server and Playwright browsers, and they stay a local, manually
+  # dispatched venue documented in graph-ui/README.md rather than a hosted
+  # gate.
+  test-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: CodeAtlasWeb leg (install, unit, style, promises, acceptance, build)
+        run: scripts/ci/test-ui.sh
 
   # ThreadSanitizer data-race gate. The threaded production surfaces (watcher,
   # subprocess, httpd, pipeline, mcp, worker pool, diagnostics, the runnable
@@ -353,6 +396,17 @@ jobs:
           scripts/test.sh CC=clang-21 CXX=clang++-21 \
             SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"
 
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-diag
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Compiler cache (save)
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -370,16 +424,19 @@ jobs:
   # artifact — the local ladder cannot answer that, having no faithful x86-64
   # emulation. It has now answered it, and the answer SPLIT the list:
   #
-  #   - the five deep-recursion suites overflow their thread stacks on x86-64
-  #     too, so that limit is NOT architectural;
+  #   - five suites aborted with "stack-overflow ... nested bug" on both
+  #     architectures. That was not deep recursion: it was MSan crashing while
+  #     it reported real uninitialized reads (reporting with the slow unwinder
+  #     exhausted the main thread's stack). scripts/msan.sh now unwinds with
+  #     frame pointers, the
+  #     reports print, the reads are fixed, and the five suites run again;
   #   - `cli` does not overflow here at all — it fails in the install path for
   #     an unrelated, still-undiagnosed reason;
   #   - `incremental` was a shadow-memory RSS artifact, now fixed in the test
   #     itself rather than skipped, so it stays in the lane.
   #
   # Per-cause detail lives in scripts/msan.sh, which is the single authoritative
-  # list both venues now share. Zero use-of-uninitialized-value findings were
-  # reported across the lane on either architecture.
+  # list both venues now share.
   test-msan:
     if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'msan') }}
     runs-on: ubuntu-latest
@@ -436,6 +493,17 @@ jobs:
         run: |
           LLVM_PREFIX="$(brew --prefix llvm@22)"
           scripts/test.sh CC="$LLVM_PREFIX/bin/clang" CXX="$LLVM_PREFIX/bin/clang++"
+
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-lsan-macos
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Compiler cache (save)
         if: always()
@@ -553,13 +621,6 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-
             ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-
 
-      - name: Fetch the test selection
-        if: ${{ inputs.test_selection != '' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ${{ inputs.test_selection }}
-          path: ${{ runner.temp }}/test-selection
-
       - name: Test
         shell: msys2 {0}
         # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
@@ -587,7 +648,8 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
-          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && format('{0}/test-selection', runner.temp) || '' }}
+          # Windows legs run every test: see the Linux x86_64-only fetch in test-unix.
+          CBM_TEST_SELECTION_DIR: ''
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -609,6 +671,17 @@ jobs:
           # (contract step / build) — that failure is already the job's red;
           # warn instead of stacking a second error on top of it. The
           # shard-completeness job still gates the cross-shard union.
+          if-no-files-found: warn
+
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-${{ matrix.os }}-${{ matrix.msystem }}-${{ strategy.job-index }}
+          path: build/c/test-logs/failed/
+          retention-days: 7
           if-no-files-found: warn
 
       # Shard 1 (or the unsharded job) saves the compiler cache; every shard

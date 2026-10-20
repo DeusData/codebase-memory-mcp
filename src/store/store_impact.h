@@ -38,6 +38,13 @@ typedef struct {
      * HANDLES, and a Route reaches whoever calls it over HTTP_CALLS,
      * ASYNC_CALLS or GRPC_CALLS. These rank after every requested type. */
     bool follow_routes;
+    /* Also cross platform variants: a node with a `variant_key` property
+     * reaches every other node of the project with the same key (C-family
+     * platform files, helpers.h cbm_platform_neutral_qn), one hop later, as
+     * if through an edge that ranks after every other step. Its via_edge is
+     * "variant_key". The key -> nodes index is read once, when the walk
+     * opens; a key only one node carries relates nothing. */
+    bool follow_variant_keys;
     /* 0 walks to the fixpoint. A positive value stops expanding nodes that are
      * that many hops from the seeds of their run: the bounded neighbourhood,
      * with the same ordering and parents. */

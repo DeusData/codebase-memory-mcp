@@ -366,6 +366,7 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_imports.c \
     $(CBM_DIR)/extract_usages.c \
     $(CBM_DIR)/extract_unified.c \
+    $(CBM_DIR)/extract_url_fold.c \
     $(CBM_DIR)/extract_semantic.c \
     $(CBM_DIR)/extract_type_refs.c \
     $(CBM_DIR)/extract_type_assigns.c \
@@ -373,6 +374,29 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_channels.c \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/extract_dbt.c \
+    $(CBM_DIR)/doclink.c \
+    $(CBM_DIR)/doclink_cs.c \
+    $(CBM_DIR)/doclink_md.c \
+    $(CBM_DIR)/doclink_rst.c \
+    $(CBM_DIR)/doclink_py.c \
+    $(CBM_DIR)/doc_adr.c \
+    $(CBM_DIR)/doc_pdf.c \
+    $(CBM_DIR)/doc_adoc.c \
+    $(CBM_DIR)/pdf/pdf_obj.c \
+    $(CBM_DIR)/pdf/pdf_font.c \
+    $(CBM_DIR)/pdf/pdf_text.c \
+    $(CBM_DIR)/pdf/pdf_tables.c \
+    $(CBM_DIR)/pdf/pdf_unicode.c \
+    $(CBM_DIR)/doclink_go.c \
+    $(CBM_DIR)/doclink_jvm.c \
+    $(CBM_DIR)/doclink_rs.c \
+    $(CBM_DIR)/doclink_perl.c \
+    $(CBM_DIR)/doclink_ts.c \
+    $(CBM_DIR)/doclink_php.c \
+    $(CBM_DIR)/doclink_c.c \
+    $(CBM_DIR)/diagram.c \
+    $(CBM_DIR)/route_path.c \
+    $(CBM_DIR)/openapi.c \
     $(CBM_DIR)/sql_values.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/cpp_branch_views.c \
@@ -425,13 +449,13 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
+STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c \
+MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c src/mcp/architecture_jobs.c \
 	src/mcp/test_impact.c src/mcp/test_impact_diff.c src/mcp/test_impact_classify.c src/mcp/test_impact_source.c src/mcp/test_impact_seed.c src/mcp/test_impact_engine.c src/mcp/test_impact_engine_snapshot.c src/mcp/test_impact_engine_reach.c src/mcp/test_impact_engine_artifact.c src/mcp/test_impact_cli.c src/mcp/test_impact_artifact.c src/mcp/test_impact_changes.c src/mcp/test_impact_origins.c src/mcp/test_impact_coverage.c src/mcp/test_impact_config.c src/mcp/test_impact_select.c src/mcp/test_impact_policy.c src/mcp/test_impact_git.c src/mcp/test_impact_inventory.c src/mcp/test_impact_inventory_input.c src/mcp/test_impact_tree.c src/mcp/test_impact_tree_audit.c src/mcp/test_impact_tree_read.c src/mcp/test_impact_tree_batch.c src/mcp/test_impact_tree_digest.c src/mcp/test_impact_tree_names.c src/mcp/test_impact_tree_plan.c src/mcp/test_impact_tree_posix.c src/mcp/test_impact_tree_posix_acl.c src/mcp/test_impact_tree_posix_io.c src/mcp/test_impact_tree_util.c src/mcp/test_impact_tree_windows.c src/mcp/test_impact_tree_windows_acl.c src/mcp/test_impact_tree_windows_io.c \
 	src/mcp/test_impact_result.c src/mcp/test_impact_result_json.c src/mcp/test_impact_result_project.c src/mcp/test_impact_result_receipt.c src/mcp/test_impact_result_rows.c src/mcp/test_impact_result_util.c src/mcp/test_impact_result_validate.c src/mcp/test_impact_result_wire.c
 
@@ -493,12 +517,34 @@ PIPELINE_SRCS = \
     src/pipeline/pass_configures.c \
     src/pipeline/pass_configlink.c \
     src/pipeline/pass_doclinks.c \
+    src/pipeline/doc_links.c \
+    src/pipeline/doc_links_cs.c \
+    src/pipeline/doc_links_md.c \
+    src/pipeline/doc_links_pdf.c \
+    src/pipeline/doc_links_rst.c \
+    src/pipeline/doc_links_adoc.c \
+    src/pipeline/doc_links_go.c \
+    src/pipeline/doc_links_jvm.c \
+    src/pipeline/doc_links_rs.c \
+    src/pipeline/doc_links_perl.c \
+    src/pipeline/doc_links_ts.c \
+    src/pipeline/doc_links_php.c \
+    src/pipeline/doc_links_c.c \
+    src/pipeline/pass_diagrams.c \
+    src/pipeline/doc_links_msbuild.c \
     src/pipeline/pass_route_nodes.c \
     src/pipeline/pass_enrichment.c \
-    src/pipeline/pass_envscan.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \
     src/pipeline/pass_k8s.c \
+    src/pipeline/helm_template.c \
+    src/pipeline/pass_operator.c \
+    src/pipeline/pass_shell.c \
+    src/pipeline/pass_terraform.c \
+    src/pipeline/pass_ansible.c \
+    src/pipeline/pass_docker.c \
+    src/pipeline/pass_envjoin.c \
+    src/pipeline/pass_ci.c \
     src/pipeline/pass_similarity.c \
     src/pipeline/pass_semantic_edges.c \
     src/pipeline/pass_complexity.c \
@@ -527,7 +573,7 @@ WATCHER_SRCS = src/watcher/watcher.c
 GIT_SRCS = src/git/git_context.c
 
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
+CLI_SRCS = src/cli/cli.c src/cli/runtime_settings.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
 	src/cli/config_text_edit.c src/cli/config_edit_path.c src/cli/activation_transaction.c
@@ -536,7 +582,16 @@ CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/
 UI_SRCS = \
     src/ui/config.c \
     src/ui/http_server.c \
+    src/ui/activity.c \
+    src/ui/atlas_repository.c \
     src/ui/layout3d.c \
+    src/ui/layout_regions.c \
+    src/ui/atlas_api.c \
+    src/ui/atlas_flows.c \
+    src/ui/atlas_handout.c \
+    src/ui/atlas_why.c \
+    src/ui/atlas_metrics.c \
+    src/ui/atlas_impact.c \
     src/ui/httpd.c \
     src/ui/embedded_stub.c
 
@@ -692,8 +747,10 @@ TEST_STORE_SRCS = \
     tests/test_store_impact.c \
     tests/test_store_scope.c \
     tests/test_store_graph_digest.c \
+    tests/test_graph_mem.c \
     tests/test_store_search.c \
     tests/test_store_arch.c \
+    tests/test_architecture_projection.c \
     tests/test_store_bulk.c \
     tests/test_store_pragmas.c \
     tests/test_store_checkpoint.c \
@@ -754,7 +811,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -790,7 +847,7 @@ TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
 
 TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
 TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
-TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c
+TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
 TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/test_lang_contract.c tests/test_edge_imports.c tests/test_edge_structural.c tests/test_lsp_resolution_probe.c tests/test_node_creation_probe.c tests/test_edge_types_probe.c tests/test_convergence_probe.c tests/test_matrix_known_classes.c tests/test_matrix_new_constructs.c tests/test_grammar_probe_a.c tests/test_grammar_probe_b.c tests/test_grammar_probe_c.c tests/test_grammar_probe_d.c tests/test_grammar_probe_e.c tests/test_grammar_probe_f.c tests/test_grammar_probe_g.c tests/test_conditional_variants.c tests/test_spawns.c
@@ -798,7 +855,7 @@ TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/
 TEST_TRACES_SRCS = tests/test_traces.c
 
 
-TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
+TEST_CLI_SRCS = tests/test_cli.c tests/test_runtime_settings.c tests/test_agent_clients.c tests/test_agent_profiles.c \
 	tests/test_config_json_like.c \
 	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
 	tests/test_activation_transaction.c
@@ -944,7 +1001,7 @@ $(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(PROJE
 	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
 
 test-foundation: $(BUILD_DIR)/test-foundation
-	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
@@ -1103,13 +1160,13 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(LDFLAGS_TEST)
 
 test: $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-runner
 
 # Parallel variant: every suite as its own process; identical gate quality
 # (see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh — union guard
 # against --list-suites + aggregated pass/fail/skip totals).
 test-par: $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
+	cd "$(CURDIR)" && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
 
 # Focused native development is intentionally a separate, explicit target so
 # an inherited TEST_SUITES value cannot silently narrow the gating test target.
@@ -1117,7 +1174,7 @@ TEST_SUITES ?=
 test-focused: $(BUILD_DIR)/test-runner
 	@test -n "$(strip $(TEST_SUITES))" || \
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
-	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
+	cd "$(CURDIR)" && $(BUILD_DIR)/test-runner $(TEST_SUITES)
 
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
@@ -1289,8 +1346,11 @@ PROD_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,
 # Embedded asset object files (generated by embed script)
 EMBED_OBJS = $(wildcard $(BUILD_DIR)/embedded/embed_*.o)
 
+# PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: the UI's dev dependencies include
+# playwright for its local browser proofs; a plain `npm ci` would otherwise
+# download browsers, which no build or gate needs.
 frontend:
-	cd graph-ui && npm ci && npm run build
+	cd graph-ui && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci && npm run build
 
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
@@ -1550,8 +1610,12 @@ fuzz:
 	$(MAKE) -f Makefile.cbm build/fuzz/cbm-fuzz BUILD_DIR=build/fuzz \
 		CC=$(FUZZ_CC) CXX=$(FUZZ_CXX) SANITIZE="$(FUZZ_SANITIZE)"
 
+# -fsanitize-link-c++-runtime: the link runs through the C driver, which on
+# Linux leaves out UBSan's C++ runtime, but the C++ objects (preprocessor,
+# simplecpp) carry -fsanitize=vptr checks that need it
+# (__ubsan_vptr_type_cache, __ubsan_handle_dynamic_type_cache_miss).
 $(BUILD_DIR)/cbm-fuzz: $(FUZZ_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -o $@ \
+	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -fsanitize-link-c++-runtime -o $@ \
 		$(FUZZ_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \

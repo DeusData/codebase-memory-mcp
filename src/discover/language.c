@@ -93,6 +93,7 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Dockerfile */
     {".dockerfile", CBM_LANG_DOCKERFILE},
+    {".Dockerfile", CBM_LANG_DOCKERFILE},
 
     /* Elixir */
     {".ex", CBM_LANG_ELIXIR},
@@ -152,9 +153,11 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Haskell */
     {".hs", CBM_LANG_HASKELL},
 
-    /* HCL / Terraform */
+    /* HCL / Terraform / OpenTofu */
     {".hcl", CBM_LANG_HCL},
     {".tf", CBM_LANG_HCL},
+    {".tofu", CBM_LANG_HCL},
+    {".tfvars", CBM_LANG_HCL},
 
     /* HTML */
     {".htm", CBM_LANG_HTML},
@@ -618,6 +621,21 @@ static const ext_entry_t EXT_TABLE[] = {
     {".clsp", CBM_LANG_CHIALISP},
     {".clib", CBM_LANG_CHIALISP},
     {".clinc", CBM_LANG_CHIALISP},
+    {".pdf", CBM_LANG_PDF},
+    /* AsciiDoc; `.asc` is left out: it is as often an ASCII-armored signature */
+    {".adoc", CBM_LANG_ASCIIDOC},
+    /* Diagram files, read without a grammar (diagram.c) */
+    {".puml", CBM_LANG_DIAGRAM},
+    {".plantuml", CBM_LANG_DIAGRAM},
+    {".iuml", CBM_LANG_DIAGRAM},
+    {".wsd", CBM_LANG_DIAGRAM},
+    {".dot", CBM_LANG_DIAGRAM},
+    {".gv", CBM_LANG_DIAGRAM},
+    {".d2", CBM_LANG_DIAGRAM},
+    {".drawio", CBM_LANG_DIAGRAM},
+    {".dio", CBM_LANG_DIAGRAM},
+    {".excalidraw", CBM_LANG_DIAGRAM},
+    {".asciidoc", CBM_LANG_ASCIIDOC},
 
     /* Slang */
     {".slang", CBM_LANG_SLANG},
@@ -707,7 +725,10 @@ typedef struct {
 
 static const filename_entry_t FILENAME_TABLE[] = {
     {"CMakeLists.txt", CBM_LANG_CMAKE},
+    {"Containerfile", CBM_LANG_DOCKERFILE},
     {"Dockerfile", CBM_LANG_DOCKERFILE},
+    {"openapi.json", CBM_LANG_OPENAPI}, /* API descriptions: their operations, not each key */
+    {"swagger.json", CBM_LANG_OPENAPI},
     {"GNUmakefile", CBM_LANG_MAKEFILE},
     {"Makefile", CBM_LANG_MAKEFILE},
     {"makefile", CBM_LANG_MAKEFILE},
@@ -716,6 +737,7 @@ static const filename_entry_t FILENAME_TABLE[] = {
     {"meson_options.txt", CBM_LANG_MESON},
     {"kustomization.yaml", CBM_LANG_KUSTOMIZE},
     {"kustomization.yml", CBM_LANG_KUSTOMIZE},
+    {"Kustomization", CBM_LANG_KUSTOMIZE}, /* kustomize's extensionless name */
     /* Note: FILENAME_TABLE uses case-sensitive strcmp, so mixed-case variants
      * (e.g. "Kustomization.yaml") are not matched here.  They fall through to
      * CBM_LANG_YAML and are re-classified by cbm_is_kustomize_file() in
@@ -829,6 +851,10 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_NIM] = "Nim",
     [CBM_LANG_SCHEME] = "Scheme",
     [CBM_LANG_CHIALISP] = "Chialisp",
+    [CBM_LANG_PDF] = "PDF",
+    [CBM_LANG_ASCIIDOC] = "AsciiDoc",
+    [CBM_LANG_DIAGRAM] = "Diagram",
+    [CBM_LANG_OPENAPI] = "OpenAPI",
     [CBM_LANG_FENNEL] = "Fennel",
     [CBM_LANG_FISH] = "Fish",
     [CBM_LANG_AWK] = "AWK",
@@ -948,6 +974,35 @@ CBMLanguage cbm_language_for_extension(const char *ext) {
     return lang_for_extension(cbm_get_user_lang_config(), ext);
 }
 
+/* A container build file named for its variant: "Dockerfile.dev",
+ * "Dockerfile-test", "Containerfile.arm64". Not when the suffix is a language
+ * extension of its own (Dockerfile.j2 is a Jinja template) nor a BuildKit
+ * ignore file (Dockerfile.dockerignore). */
+static bool lang_dockerfile_variant(const cbm_userconfig_t *ucfg, const char *filename) {
+    static const char *const BASES[] = {"Dockerfile", "Containerfile"};
+    static const char DOCKERIGNORE[] = ".dockerignore";
+    for (size_t i = 0; i < sizeof(BASES) / sizeof(BASES[0]); i++) {
+        size_t bl = strlen(BASES[i]);
+        /* the base first: only a name that holds it has a character after it */
+        if (strncmp(filename, BASES[i], bl) != 0) {
+            continue;
+        }
+        char sep = filename[bl];
+        if ((sep != '.' && sep != '-' && sep != '_') || !filename[bl + SKIP_ONE]) {
+            continue;
+        }
+        size_t fl = strlen(filename);
+        if (fl >= sizeof(DOCKERIGNORE) - SKIP_ONE &&
+            strcmp(filename + fl - (sizeof(DOCKERIGNORE) - SKIP_ONE), DOCKERIGNORE) == 0) {
+            return false;
+        }
+        const char *last_dot = strrchr(filename, '.');
+        return !last_dot || last_dot < filename + bl ||
+               lang_for_extension(ucfg, last_dot) == CBM_LANG_COUNT;
+    }
+    return false;
+}
+
 static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *filename) {
     if (!filename || !filename[0]) {
         return CBM_LANG_COUNT;
@@ -962,11 +1017,14 @@ static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *f
 
     /* DotEnv variant filenames (".env.local", ".env.production", …): the
      * filename starts with ".env." but its last "extension" (e.g. ".local")
-     * is not a real language extension.  Match the dotenv convention used by
-     * pass_envscan/pass_infrascan (".env" exact, ".env." prefix, "*.env"
-     * suffix) so file-index routing agrees with direct extraction. */
+     * is not a real language extension.  Match the dotenv convention (".env"
+     * exact, ".env." prefix, "*.env" suffix) so file-index routing agrees with
+     * direct extraction. */
     if (strncmp(filename, ".env.", SLEN(".env.")) == 0) {
         return CBM_LANG_DOTENV;
+    }
+    if (lang_dockerfile_variant(ucfg, filename)) {
+        return CBM_LANG_DOCKERFILE;
     }
 
     /* Fall back to extension-based lookup.
@@ -987,6 +1045,9 @@ static CBMLanguage lang_for_filename(const cbm_userconfig_t *ucfg, const char *f
         CBMLanguage lang;
     } COMPOUND_EXT_TABLE[] = {
         {".blade.php", CBM_LANG_BLADE},
+        {".drawio.svg", CBM_LANG_DIAGRAM},     /* draw.io's editable SVG: its diagram, not XML */
+        {".excalidraw.svg", CBM_LANG_DIAGRAM}, /* an Excalidraw export with its scene */
+        {".excalidraw.json", CBM_LANG_DIAGRAM},
     };
     const char *p = strchr(filename, '.');
     while (p && p < last_dot) {
@@ -1522,16 +1583,13 @@ CBMLanguage cbm_disambiguate_cfc(const char *path) {
 
 /* JSON files that are configuration, not source worth indexing. */
 static const char *const IGNORED_JSON_FILES[] = {
-    "package.json",       "package-lock.json", "tsconfig.json",
-    "jsconfig.json",      "composer.json",     "composer.lock",
-    "yarn.lock",          "openapi.json",      "swagger.json",
-    "jest.config.json",   ".eslintrc.json",    ".prettierrc.json",
-    ".babelrc.json",      "tslint.json",       "angular.json",
-    "firebase.json",      "renovate.json",     "lerna.json",
-    "turbo.json",         ".stylelintrc.json", "pnpm-lock.json",
-    "deno.json",          "biome.json",        "devcontainer.json",
-    ".devcontainer.json", "launch.json",       "settings.json",
-    "extensions.json",    "tasks.json",        NULL};
+    "package.json",   "package-lock.json", "tsconfig.json",      "jsconfig.json",
+    "composer.json",  "composer.lock",     "yarn.lock",          "jest.config.json",
+    ".eslintrc.json", ".prettierrc.json",  ".babelrc.json",      "tslint.json",
+    "angular.json",   "firebase.json",     "renovate.json",      "lerna.json",
+    "turbo.json",     ".stylelintrc.json", "pnpm-lock.json",     "deno.json",
+    "biome.json",     "devcontainer.json", ".devcontainer.json", "launch.json",
+    "settings.json",  "extensions.json",   "tasks.json",         NULL};
 
 static bool lang_name_in(const char *name, const char *const *list) {
     for (int i = 0; list[i]; i++) {

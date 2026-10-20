@@ -3,7 +3,10 @@
 # Columns (TAB-separated): name, files (space-separated; "-" = empty list),
 # tier, full, lanes (space-separated, any order; "FULL" = every PR lane,
 # "FULL -a -b" = every PR lane except a and b).
-docs-only	README.md docs/BENCHMARK.md	T0a-docs	false	contracts security-static
+docs-only	CONTRIBUTING.md docs/BENCHMARK.md	T0a-docs	false	contracts security-static
+readme-runs-the-test-legs	README.md	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+site-files-run-the-test-legs	docs/index.html docs/llms.txt	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+npm-readme-runs-the-test-legs	pkg/npm/README.md	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
 issue-template-is-docs	.github/ISSUE_TEMPLATE/bug.yml	T0a-docs	false	contracts security-static
 local-infra	test-infrastructure/run.sh	T0b-nonproduct	false	contracts lint lint-mem security-static
 lint-config	scripts/memory-core-baseline.txt	T0b-nonproduct	false	contracts lint lint-mem security-static
@@ -38,7 +41,17 @@ vendored-code	vendored/sqlite3/sqlite3.c	T5-core	true	FULL
 gate-workflow	.github/workflows/codeql.yml	T5-core	true	FULL
 unmatched-top-level-path	weird/new.file	T5-core	true	FULL
 unmatched-src-directory	src/newthing/x.c	T5-core	true	FULL
-unmatched-script	scripts/README.md	T5-core	true	FULL
+unmatched-script	scripts/new-tool.sh	T5-core	true	FULL
+scripts-readme-is-docs	scripts/README.md	T0a-docs	false	contracts security-static
+license-tool-runs-license-gate	scripts/license-gate.sh	T0b-nonproduct	false	contracts license-gate lint lint-mem security-static
+security-tool-runs-security-static	scripts/security-ui.sh	T0b-nonproduct	false	contracts lint lint-mem security-static
+local-tool-is-non-gating	scripts/repro.sh	T0b-nonproduct	false	contracts lint lint-mem security-static shard-completeness unix-x86
+lint-config-file	.cppcheck	T0b-nonproduct	false	contracts lint lint-mem security-static
+script-c-tests-read	scripts/security-vendored.sh	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+engine-config-c-tests-read	.codebase-memory.json	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+test-failure-report	scripts/suite-failure-report.sh	T1-tests	false	lint lint-mem security-static shard-completeness unix-macos14 unix-x86 windows
+smoke-security-script	scripts/security-strings.sh	T4-platform	false	FULL -msan -diag -memwaste
+shipped-notices-are-pkg	scripts/gen-third-party-notices.sh	T4-platform	false	FULL -msan -diag -memwaste
 non-gate-workflow-forces-full	.github/workflows/stale.yml	T0b-nonproduct	true	FULL
 harness-main-forces-full	tests/test_main.c	T1-tests	true	FULL
 harness-framework-forces-full	tests/test_framework.h	T1-tests	true	FULL

@@ -56,6 +56,17 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 /* Apply a validated discovery resource policy. The value is copied. */
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
 
+/* Doc -> code candidates (the doc_candidates setting). Never set, the index
+ * mode decides: on for full, off for moderate and fast. The setter makes an
+ * explicit choice that wins in every mode. Off skips scoring documentation
+ * sections against code and leaves the project with no doc_link_candidates
+ * rows; nodes and edges are unchanged. On in fast mode scores them without
+ * fast's skipped SIMILAR_TO / SEMANTICALLY_RELATED edges. The scoring grows
+ * with sections x functions, which is the cost on very large repositories.
+ * enabled() reports the effective choice for the pipeline's current mode. */
+void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled);
+bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p);
+
 /* Copy the exact discovery violation from the most recent run. */
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);
@@ -189,6 +200,12 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 /* Module QN: project.dir.parts (no name). Caller must free(). */
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
 
+/* Length of the prefix cbm_pipeline_fqn_compute(project, rel_path, name) puts
+ * before a symbol `name` (the joining dot excluded): the QN prefix every
+ * definition of that file carries, __init__ / index already dropped. Computed
+ * without allocating; 0 when unavailable. */
+size_t cbm_pipeline_fqn_symbol_prefix_len(const char *project, const char *rel_path);
+
 /* Language-aware module QN. When `module_is_dir` is true (Java/Go package
  * semantics) the module is derived from the CONTAINING DIRECTORY (the filename
  * stem is dropped), so it agrees with the extraction-side def QNs; when false
@@ -242,9 +259,23 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
 /* As cbm_registry_add, recording `lang`: the DETECTED language of the file
  * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
- * veto (cbm_registry_name_guess_vetoed) checks against the caller. */
+ * veto (cbm_registry_name_guess_vetoed) checks against the caller. Detects no
+ * function-local symbols: that needs the defining file's module QN, see
+ * cbm_registry_add_lang_in_module. */
 void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
                            const char *label, CBMLanguage lang);
+
+/* As cbm_registry_add_lang. A Python symbol declared inside a function body of
+ * its own file (cbm_registry_qn_is_function_local, bounded by
+ * `module_prefix_len`: cbm_pipeline_fqn_symbol_prefix_len of the defining file)
+ * is registered for exact lookups only, never offered to the short-name
+ * strategies. The three graph
+ * registration sites (pass_definitions.c, pass_parallel.c,
+ * pipeline_incremental.c) all register through this, so full and incremental
+ * indexes agree. 0 = no local detection. */
+void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
+                                     const char *qualified_name, const char *label,
+                                     CBMLanguage lang, size_t module_prefix_len);
 
 /* True when code in `caller` can call a symbol defined in `target` by bare
  * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
@@ -256,6 +287,20 @@ bool cbm_lang_resolution_compatible(CBMLanguage caller, CBMLanguage target);
  * layer ("<python-builtins>" -> Python, "<kotlin-builtins>" -> Kotlin);
  * CBM_LANG_COUNT for anything else. */
 CBMLanguage cbm_registry_synthetic_path_language(const char *file_path);
+
+/* True when a proper prefix of `qualified_name` longer than
+ * `module_prefix_len` (cbm_pipeline_fqn_symbol_prefix_len of the defining file)
+ * is a registered Function or Method, i.e. the symbol was declared inside a
+ * function body of its own file. False when module_prefix_len is 0. */
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name,
+                                       size_t module_prefix_len);
+
+/* Python bare-name lexical lookup: the def or class named `callee_name` bound
+ * in the nearest function scope enclosing `scope_qn` (the caller's QN),
+ * skipping class bodies, stopping at the caller's module (`module_qn`).
+ * Strategy "lexical_scope"; qualified_name is NULL when no such local exists. */
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn, const char *module_qn);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
@@ -367,6 +412,15 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
 
+/* Go analog of the TS/JS guard, same failure class: a selector call whose
+ * receiver the Go LSP could not type must not be bound by a receiver-blind
+ * short-name strategy. Drops suffix_match / fuzzy always, and unique_name only
+ * when its confidence is import-unreachability-penalized (the stdlib/vendor
+ * hijack shape). field_type_hint is deliberately NOT dropped for Go — struct
+ * fields carry declared types, so the hint is receiver-aware there. */
+bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
+                                       double confidence);
+
 /* Import-binding counterpart (#2127). True when the callee's root identifier
  * is bound by an import of this file whose module chain contradicts the
  * resolved target (`from unittest.mock import patch; patch()` must not bind a
@@ -439,6 +493,12 @@ const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *me
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
+
+/* A read, a write or a plain value reference never denotes a call: when `qn`
+ * is a Method whose class body also declares a same-named field (the extractor
+ * fences that field as `<qn>#field`), the field is the target. Returns the
+ * field's QN, else `qn`. Pure; unit-tested in test_registry.c. */
+const char *cbm_registry_value_target(const cbm_registry_t *r, const char *qn);
 
 /* Find all QNs with a given simple name. Sets *out and *count.
  * Caller does NOT free the array (owned by registry). */

@@ -8,6 +8,12 @@ on:
 
 permissions: read-all
 
+# Only the newest main commit is scored: a newer push (or the weekly run)
+# cancels a pending or running score of an older commit.
+concurrency:
+  group: scorecard-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   scorecard:
     runs-on: ubuntu-latest

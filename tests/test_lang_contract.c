@@ -1066,6 +1066,7 @@ static const char *ALL_EDGE_TYPES[] = {"CALLS",
                                        "IMPORTS",
                                        "INHERITS",
                                        "INFRA_MAPS",
+                                       "MENTIONS",
                                        "OVERRIDE",
                                        "REFERENCES_FILE",
                                        "SEMANTICALLY_RELATED",
@@ -1552,6 +1553,54 @@ TEST(contract_edge_infra_routes_from_deploy_configs_still_minted) {
     PASS();
 }
 
+/* A config URL becomes an infra Route only under a key that names an endpoint
+ * this service exposes. Reference links are not: across 17 infra repositories
+ * the infra Routes were changelog `pull_request` links (deckhouse 6,240),
+ * alert `runbook_url`s, chart `home`/`source`, kubeconfig `server`s, Argo
+ * `repoURL`s and docs `link`s -- and one root handler took all of them. */
+TEST(contract_edge_no_infra_routes_from_reference_links) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"CHANGELOG/v1.29.yml", "candi:\n"
+                                "  fixes:\n"
+                                "    - summary: fix a race\n"
+                                "      pull_request: https://github.com/org/repo/pull/1234\n"},
+        {"modules/cni/oss.yaml", "- name: Cilium\n"
+                                 "  link: https://github.com/cilium/cilium\n"},
+        {"charts/app/alerts.yaml", "groups:\n"
+                                   "  - name: app\n"
+                                   "    rules:\n"
+                                   "      - alert: Down\n"
+                                   "        annotations:\n"
+                                   "          runbook_url: https://runbooks.example.io/down\n"},
+        {"apps/app.yaml", "spec:\n"
+                          "  source:\n"
+                          "    repoURL: https://charts.example.io/stable\n"
+                          "  home: https://app.example.io\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 4);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(count_infra_routes_matching(store, lp.project, "https://"), 0);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* The endpoint keys keep minting in their camelCase / _url spellings. */
+TEST(contract_edge_infra_routes_from_endpoint_key_spellings) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"pubsub.yaml", "subscriptions:\n"
+                        "  - name: orders\n"
+                        "    pushEndpoint: https://orders.internal.example/push\n"},
+        {"hooks.yaml", "payments:\n"
+                       "  callbackUrl: https://pay.internal.example/callback\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(count_infra_routes_matching(store, lp.project, "orders.internal.example") >= 1);
+    ASSERT_TRUE(count_infra_routes_matching(store, lp.project, "pay.internal.example") >= 1);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* True if some CALLS edge's TARGET node carries `label` and a QN ending with
  * `qn_suffix` — i.e. the call resolved to that specific definition. */
 static int calls_edge_targets(cbm_store_t *store, const char *project, const char *label,
@@ -1896,6 +1945,8 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
     RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
     RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
+    RUN_TEST(contract_edge_no_infra_routes_from_reference_links);
+    RUN_TEST(contract_edge_infra_routes_from_endpoint_key_spellings);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);

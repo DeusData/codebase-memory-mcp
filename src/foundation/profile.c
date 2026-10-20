@@ -2,6 +2,7 @@
  * profile.c — Activatable profiling implementation.
  */
 #include "foundation/profile.h"
+#include "foundation/platform.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
 
@@ -21,7 +22,7 @@ enum {
 bool cbm_profile_active = false;
 
 void cbm_profile_init(void) {
-    const char *env = getenv("CBM_PROFILE");
+    const char *env = cbm_runtime_getenv("CBM_PROFILE");
     if (env && env[0] != '\0' && env[0] != '0') {
         cbm_profile_active = true;
     }

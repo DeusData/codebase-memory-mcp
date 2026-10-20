@@ -47,6 +47,11 @@ typedef struct {
     /* Platform/toolchain label of the leg the answer is for; part of the
      * coverage compatibility digest, so a map narrows only its own platform. */
     const char *platform;
+    /* Optional, CI diagnostics only (never part of the MCP answer): when the
+     * one run-all reason is RUNNER_REACHED, *vetoed_out receives the answer
+     * with that veto masked — the selection the veto discarded. NULL
+     * otherwise. The caller frees it with cbm_test_result_free. */
+    cbm_test_result_t **vetoed_out;
 } cbm_test_impact_request_t;
 
 typedef enum {

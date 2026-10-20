@@ -56,42 +56,50 @@ typedef struct {
 typedef void (*cbm_proc_log_cb)(const char *line, void *ud);
 
 typedef struct {
-    const char *bin;                 /* executable path or literal PATH name;
-                                      * also argv[0] when argv is NULL */
-    const char *const *argv;         /* NULL-terminated argv; NULL => { bin, NULL } */
-    const char *windows_cmd_payload; /* Windows-only cmd.exe command text. When set, bin must
-                                      * be an absolute path ending in cmd.exe and argv must be
-                                      * NULL. The fixed /D /S /V:OFF /C prefix is added while
-                                      * this payload is copied verbatim for cmd.exe to parse. */
-    const char *log_file;            /* stderr and, when stdout_file is NULL, stdout are
-                                      * redirected here and tailed; NULL => discard those
-                                      * streams, no tailing */
-    cbm_proc_log_cb on_log_line;     /* optional per-line callback */
-    void *log_ud;                    /* user data for on_log_line */
-    int quiet_timeout_ms;            /* <= 0 => no timeout; else kill+HANG after this many
-                                      * ms with no new completed log line */
-    int cancel_grace_ms;             /* graceful tree-termination window; <= 0 uses the finite
-                                      * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
-    size_t memory_limit_bytes;       /* Windows-only hard commit limit for the entire Job Object;
-                                      * 0 => no OS-enforced memory limit */
-    bool delete_log_on_exit;         /* unlink log_file after reaping */
-    bool strip_git_repo_env;         /* child env omits git's repository-local variables
-                                      * (foundation/git_env.h) — set for every git spawn so
-                                      * an inherited GIT_DIR never overrides `git -C` */
-    const char *stdout_file;         /* optional separate stdout capture; NULL preserves
-                                      * merged log_file behavior. Must be nonempty and
-                                      * distinct from log_file; caller supplies private,
-                                      * non-aliasing paths and owns capture-file cleanup.
-                                      * Not tailed; quiet_timeout_ms observes log_file only.
-                                      * delete_log_on_exit never deletes this file. */
-    const char *stdin_file;          /* optional private, immutable regular binary input;
-                                      * NULL => null device, never inherited stdin.
-                                      * Must be nonempty and non-aliasing with log_file and
-                                      * stdout_file; exact equal strings are rejected.
-                                      * Caller closes its writer before spawn and retains
-                                      * the file until the child tree is quiescent.
-                                      * The child chooses its CRT binary mode on Windows.
-                                      * Never modified or deleted by this API. */
+    const char *bin;                  /* executable path or literal PATH name;
+                                       * also argv[0] when argv is NULL */
+    const char *const *argv;          /* NULL-terminated argv; NULL => { bin, NULL } */
+    const char *const *env_overrides; /* NULL-terminated NAME=value entries, merged with the
+                                       * inherited environment for this child only. NAME= keeps
+                                       * an empty value; the last duplicate wins. Names must be
+                                       * nonempty (case-insensitive on Windows). NULL or an empty
+                                       * list preserves normal inheritance. Executable lookup
+                                       * continues to use the caller's PATH. strip_git_repo_env
+                                       * also removes repository-local entries and GIT_DIFF_OPTS
+                                       * from overrides. */
+    const char *windows_cmd_payload;  /* Windows-only cmd.exe command text. When set, bin must
+                                       * be an absolute path ending in cmd.exe and argv must be
+                                       * NULL. The fixed /D /S /V:OFF /C prefix is added while
+                                       * this payload is copied verbatim for cmd.exe to parse. */
+    const char *log_file;             /* stderr and, when stdout_file is NULL, stdout are
+                                       * redirected here and tailed; NULL => discard those
+                                       * streams, no tailing */
+    cbm_proc_log_cb on_log_line;      /* optional per-line callback */
+    void *log_ud;                     /* user data for on_log_line */
+    int quiet_timeout_ms;             /* <= 0 => no timeout; else kill+HANG after this many
+                                       * ms with no new completed log line */
+    int cancel_grace_ms;              /* graceful tree-termination window; <= 0 uses the finite
+                                       * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
+    size_t memory_limit_bytes;        /* Windows-only hard commit limit for the entire Job Object;
+                                       * 0 => no OS-enforced memory limit */
+    bool delete_log_on_exit;          /* unlink log_file after reaping */
+    bool strip_git_repo_env;          /* child env omits git's repository-local variables
+                                       * (foundation/git_env.h) — set for every git spawn so
+                                       * an inherited GIT_DIR never overrides `git -C` */
+    const char *stdout_file;          /* optional separate stdout capture; NULL preserves
+                                       * merged log_file behavior. Must be nonempty and
+                                       * distinct from log_file; caller supplies private,
+                                       * non-aliasing paths and owns capture-file cleanup.
+                                       * Not tailed; quiet_timeout_ms observes log_file only.
+                                       * delete_log_on_exit never deletes this file. */
+    const char *stdin_file;           /* optional private, immutable regular binary input;
+                                       * NULL => null device, never inherited stdin.
+                                       * Must be nonempty and non-aliasing with log_file and
+                                       * stdout_file; exact equal strings are rejected.
+                                       * Caller closes its writer before spawn and retains
+                                       * the file until the child tree is quiescent.
+                                       * The child chooses its CRT binary mode on Windows.
+                                       * Never modified or deleted by this API. */
 } cbm_proc_opts_t;
 
 #define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000

@@ -168,11 +168,13 @@ static bool ts_has_span(const cbm_ti_node_t *nodes, int count, const cbm_node_t 
 }
 
 /* The file's definitions, each with every span it has in the file: a
- * definition written once per #if branch or platform file is ONE node
+ * definition written once per #if branch or Go build-tagged file is ONE node
  * (graph_buffer.c "Definition variants") whose own span is one variant, so
  * its other variants here (other branches, or a node whose file_path names
- * another platform file) join as further spans of the same node. A change
- * in any variant then seeds that definition. */
+ * another file of the same QN) join as further spans of the same node. A
+ * change in any variant then seeds that definition. C-family platform files
+ * are separate nodes sharing a `variant_key`; the walk relates them
+ * (store_impact.h follow_variant_keys). */
 static ts_file_t *ts_load_file(cbm_ti_graph_t *g, const char *file) {
     cbm_node_t *rows = NULL;
     int count = 0;

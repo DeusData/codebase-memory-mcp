@@ -56,9 +56,19 @@ fi
 map() { # out [suite...]
     local out="$1"; shift
     local args=()
+    local rc=0
     for suite in "$@"; do args+=(--suite "$suite"); done
     python3 "$ROOT/scripts/test-impact/coverage-map.py" --runner "$RUNNER" --out "$out" \
-        ${LLVM_BIN:+--llvm-bin "$LLVM_BIN"} ${args[@]+"${args[@]}"}
+        ${LLVM_BIN:+--llvm-bin "$LLVM_BIN"} ${args[@]+"${args[@]}"} || rc=$?
+    # 1 = a suite failed or timed out under coverage: the map is still written
+    # and that suite's tests are `incomplete`, which only ever selects MORE
+    # tests (an incomplete test runs whole). Publish it, but say which suite.
+    # 2 = usage or toolchain error: no trustworthy map, fail.
+    if [ "$rc" -eq 1 ]; then
+        echo "::warning::coverage map: a suite failed under coverage; its tests stay incomplete ($(python3 -c 'import json,sys; print(", ".join(s["suite"] for s in json.load(open(sys.argv[1]))["suites"] if s["exit"] != 0))' "$out/meta.json"))"
+        return 0
+    fi
+    return "$rc"
 }
 
 OBSERVED=""

@@ -5,6 +5,8 @@ typedef struct {
     tir_json *suites;
     uint64_t reasons;
     size_t members;
+    size_t listed;       /* member suites the plan lists (an omitted one is not) */
+    size_t listed_whole; /* of those, the ones that run whole */
     tir_lane_decision decision;
 } tir_lane_plan;
 
@@ -38,6 +40,8 @@ static bool tir_member_suite(tir_context *c, size_t lane_index, tir_lane_plan *p
     if (c->global)
         return true;
     plan->reasons |= reasons;
+    plan->listed++;
+    plan->listed_whole += whole;
     if (!tir_charge(c, &c->suite_occurrences, 1, UINT64_MAX))
         return false;
     if (whole)
@@ -95,7 +99,10 @@ static bool tir_lane_plan_build(tir_context *c, size_t index, tir_lane_plan *pla
     else if (!plan->suites->as.children.first)
         plan->reasons = TIR_REASON(TIR_REASON_NO_SELECTED_TESTS);
     else {
-        plan->decision = lane->source->narrow ? TIR_SELECTED : TIR_ALL;
+        /* A lane that omits no member suite and runs every one whole runs
+         * everything (e.g. no admitted coverage): say so, whatever the reasons. */
+        bool runs_everything = plan->listed == plan->members && plan->listed_whole == plan->listed;
+        plan->decision = lane->source->narrow && !runs_everything ? TIR_SELECTED : TIR_ALL;
         if (!tir_charge(c, &c->runnable, 1, UINT64_MAX))
             return false;
     }

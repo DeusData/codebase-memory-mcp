@@ -29,6 +29,9 @@ enum {
 };
 
 static const char IMPACT_HANDLES[] = "HANDLES";
+/* The via_edge of a node reached as a platform variant (follow_variant_keys):
+ * the property that relates the two, since no edge does. */
+static const char IMPACT_VARIANT_KEY[] = "variant_key";
 static const char IMPACT_ROUTE_LABEL[] = "Route";
 static const char *const IMPACT_ROUTE_IN[IMPACT_ROUTE_IN_COUNT] = {"HTTP_CALLS", "ASYNC_CALLS",
                                                                    "GRPC_CALLS"};
@@ -41,11 +44,21 @@ struct cbm_impact_walk {
     char **edge_types; /* owned copies: a hit's via_edge points into these */
     int edge_type_count;
     bool follow_routes;
+    bool follow_variant_keys;
     int max_hops; /* 0 = fixpoint */
 
     int64_t max_id; /* largest node id when the walk opened */
     int32_t *slot;  /* [max_id + 1]: index into hits + 1; 0 = not reached */
     uint8_t *sink;  /* [max_id + 1]: reached, never expanded */
+
+    /* Platform variant groups (follow_variant_keys), read once at open: the
+     * nodes sharing one `variant_key`, groups of two or more only. The
+     * members of group g are variant_members[variant_start[g] ..
+     * variant_start[g + 1]), by id. variant_group is NULL when no group
+     * exists. */
+    int32_t *variant_group; /* [max_id + 1]: group index + 1; 0 = in none */
+    int64_t *variant_members;
+    int32_t *variant_start; /* [group count + 1] */
 
     cbm_impact_hit_t *hits;
     int count;
@@ -346,25 +359,32 @@ static bool impact_expand(cbm_impact_walk_t *w, sqlite3_stmt *stmt, int from, co
     return rc == SQLITE_DONE && sqlite3_reset(stmt) == SQLITE_OK && impact_check(w);
 }
 
-static bool impact_expand_level(cbm_impact_walk_t *w, const impact_frontier_list_t *frontier,
-                                impact_frontier_list_t *next) {
-    for (int t = 0; t < w->edge_type_count; t++) {
-        for (int f = 0; f < frontier->count; f++) {
-            if (!impact_check(w)) {
-                return false;
-            }
-            int hit = frontier->items[f].hit;
-            if (w->sink[w->hits[hit].id]) {
-                continue;
-            }
-            if (!impact_expand(w, w->stmt_in, hit, w->edge_types[t], next)) {
-                return false;
-            }
-        }
+/* Reach the other platform variants of `from` (a frontier hit): the members
+ * of its variant group not reached yet. */
+static bool impact_expand_variants(cbm_impact_walk_t *w, int from, impact_frontier_list_t *next) {
+    if (!impact_check(w) || w->hits[from].hop == INT_MAX) {
+        return false;
     }
-    if (!w->follow_routes) {
+    int64_t from_id = w->hits[from].id;
+    int32_t group = w->variant_group[from_id];
+    if (group == 0) {
         return true;
     }
+    int hop = w->hits[from].hop + SKIP_ONE;
+    for (int32_t m = w->variant_start[group - SKIP_ONE]; m < w->variant_start[group]; m++) {
+        int64_t id = w->variant_members[m];
+        if (w->slot[id] != 0) {
+            continue;
+        }
+        if (impact_add_hit(w, next, id, hop, from_id, IMPACT_VARIANT_KEY) == IMPACT_ADD_ERROR) {
+            return false;
+        }
+    }
+    return impact_check(w);
+}
+
+static bool impact_expand_routes(cbm_impact_walk_t *w, const impact_frontier_list_t *frontier,
+                                 impact_frontier_list_t *next) {
     for (int f = 0; f < frontier->count; f++) {
         if (!impact_check(w)) {
             return false;
@@ -392,6 +412,38 @@ static bool impact_expand_level(cbm_impact_walk_t *w, const impact_frontier_list
     return true;
 }
 
+static bool impact_expand_level(cbm_impact_walk_t *w, const impact_frontier_list_t *frontier,
+                                impact_frontier_list_t *next) {
+    for (int t = 0; t < w->edge_type_count; t++) {
+        for (int f = 0; f < frontier->count; f++) {
+            if (!impact_check(w)) {
+                return false;
+            }
+            int hit = frontier->items[f].hit;
+            if (w->sink[w->hits[hit].id]) {
+                continue;
+            }
+            if (!impact_expand(w, w->stmt_in, hit, w->edge_types[t], next)) {
+                return false;
+            }
+        }
+    }
+    if (w->follow_routes && !impact_expand_routes(w, frontier, next)) {
+        return false;
+    }
+    /* Platform variants rank last: an edge from the same level wins. */
+    for (int f = 0; w->variant_group && f < frontier->count; f++) {
+        if (!impact_check(w)) {
+            return false;
+        }
+        int hit = frontier->items[f].hit;
+        if (!w->sink[w->hits[hit].id] && !impact_expand_variants(w, hit, next)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void impact_free_strings(cbm_impact_walk_t *w) {
     for (int i = 0; i < w->count; i++) {
         cbm_free(CBM_MEM_CLASS_STORE, (char *)w->hits[i].qualified_name);
@@ -410,6 +462,9 @@ void cbm_impact_walk_close(cbm_impact_walk_t *w) {
     cbm_free(CBM_MEM_CLASS_STORE, w->hits);
     cbm_free(CBM_MEM_CLASS_STORE, w->slot);
     cbm_free(CBM_MEM_CLASS_STORE, w->sink);
+    cbm_free(CBM_MEM_CLASS_STORE, w->variant_group);
+    cbm_free(CBM_MEM_CLASS_STORE, w->variant_members);
+    cbm_free(CBM_MEM_CLASS_STORE, w->variant_start);
     for (int i = 0; i < w->edge_type_count; i++) {
         cbm_free(CBM_MEM_CLASS_STORE, w->edge_types[i]);
     }
@@ -439,6 +494,7 @@ static bool impact_copy_policy(cbm_impact_walk_t *w, const cbm_impact_policy_t *
         w->edge_type_count = i + SKIP_ONE;
     }
     w->follow_routes = policy->follow_routes;
+    w->follow_variant_keys = policy->follow_variant_keys;
     w->max_hops = policy->max_hops > 0 ? policy->max_hops : 0;
     return true;
 }
@@ -484,6 +540,111 @@ static bool impact_prepare(cbm_impact_walk_t *w) {
            impact_check(w);
 }
 
+static bool impact_grow(void **items, int *cap, int count, size_t size) {
+    if (count < *cap) {
+        return true;
+    }
+    if (*cap > INT_MAX / IMPACT_GROWTH) {
+        return false;
+    }
+    int next = *cap ? *cap * IMPACT_GROWTH : IMPACT_INIT_CAP;
+    void *grown = cbm_realloc(CBM_MEM_CLASS_STORE, *items, (size_t)next * size);
+    if (!grown) {
+        return false;
+    }
+    *items = grown;
+    *cap = next;
+    return true;
+}
+
+/* The ids read so far end the run of one key: it is a group when two or more
+ * nodes carry the key; a key on one node relates nothing and is dropped. */
+static bool impact_close_variant_run(cbm_impact_walk_t *w, int run, int *count, int *groups,
+                                     int *group_cap) {
+    if (*count - run < PAIR_LEN) {
+        *count = run;
+        return true;
+    }
+    if (!impact_grow((void **)&w->variant_start, group_cap, *groups, sizeof(int32_t))) {
+        return false;
+    }
+    w->variant_start[(*groups)++] = run;
+    return true;
+}
+
+/* Platform variant groups (follow_variant_keys): every node of the project
+ * that carries a `variant_key`, in one read ordered by (key, id), so the
+ * groups are a pure function of the graph. The instr() guard keeps the JSON
+ * parse to the nodes that have the property. */
+static bool impact_load_variants(cbm_impact_walk_t *w) {
+    if (!w->follow_variant_keys) {
+        return true;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (!impact_check(w) ||
+        sqlite3_prepare_v2(w->db,
+                           "SELECT k, id FROM (SELECT id, CASE WHEN json_valid(properties)"
+                           " THEN json_extract(properties, '$.variant_key') END AS k FROM nodes"
+                           " WHERE project = ?1 AND instr(properties, '\"variant_key\"') > 0)"
+                           " WHERE typeof(k) = 'text' ORDER BY k, id",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, IMPACT_BIND_ID, w->project, CBM_NOT_FOUND, SQLITE_STATIC) !=
+            SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    int count = 0;
+    int cap = 0;
+    int groups = 0;
+    int group_cap = 0;
+    int run = 0;      /* where the current key's ids start in variant_members */
+    char *key = NULL; /* the current key */
+    bool ok = true;
+    int rc = SQLITE_ROW;
+    while (ok && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *k = (const char *)sqlite3_column_text(stmt, 0);
+        int64_t id = sqlite3_column_int64(stmt, SKIP_ONE);
+        ok = impact_check(w);
+        if (!ok || !k || !impact_known_id(w, id)) {
+            continue;
+        }
+        if (!key || strcmp(key, k) != 0) {
+            ok = impact_close_variant_run(w, run, &count, &groups, &group_cap);
+            run = count;
+            cbm_free(CBM_MEM_CLASS_STORE, key);
+            key = cbm_mem_strdup(CBM_MEM_CLASS_STORE, k);
+            ok = ok && key;
+        }
+        ok = ok &&
+             impact_grow((void **)&w->variant_members, &cap, count, sizeof(*w->variant_members));
+        if (ok) {
+            w->variant_members[count++] = id;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, key);
+    ok = ok && rc == SQLITE_DONE && impact_close_variant_run(w, run, &count, &groups, &group_cap);
+    ok = sqlite3_finalize(stmt) == SQLITE_OK && ok && impact_check(w);
+    if (!ok || groups == 0) {
+        return ok;
+    }
+    /* The end of the last group. */
+    if (!impact_grow((void **)&w->variant_start, &group_cap, groups, sizeof(int32_t))) {
+        return false;
+    }
+    w->variant_start[groups] = count;
+    w->variant_group = (int32_t *)cbm_calloc(CBM_MEM_CLASS_STORE,
+                                             ((size_t)w->max_id + SKIP_ONE) * sizeof(int32_t));
+    if (!w->variant_group) {
+        return false;
+    }
+    for (int g = 0; g < groups; g++) {
+        for (int32_t m = w->variant_start[g]; m < w->variant_start[g + SKIP_ONE]; m++) {
+            w->variant_group[w->variant_members[m]] = g + SKIP_ONE;
+        }
+    }
+    return impact_check(w);
+}
+
 static int impact_open(cbm_store_t *s, cbm_store_read_scope_t *scope,
                        const cbm_impact_policy_t *policy, cbm_impact_walk_t **out) {
     if (out) {
@@ -506,7 +667,8 @@ static int impact_open(cbm_store_t *s, cbm_store_read_scope_t *scope,
     }
     w->db = db;
     w->scope = scope;
-    if (!impact_copy_policy(w, policy) || !impact_prepare(w) || !impact_check(w)) {
+    if (!impact_copy_policy(w, policy) || !impact_prepare(w) || !impact_load_variants(w) ||
+        !impact_check(w)) {
         int status = impact_fail(w, CBM_STORE_ERR);
         cbm_impact_walk_close(w);
         return status;

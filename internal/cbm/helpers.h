@@ -23,6 +23,17 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang);
 // stay in sync with kPyBuiltinNodes in internal/cbm/lsp/py_builtins.c.
 bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang);
 
+// The service an environment variable's value addresses -- never the value
+// itself: the host of a URL, of `host:port`, a `<svc>.<ns>.svc[.<domain>]`
+// name inside it, or the whole value when `key` names an address (*_ADDR,
+// *_ADDRESS, *_HOST, *_URL, *_ENDPOINT, *_URI) and it is a bare DNS name. A
+// templated value, localhost or an IP addresses nothing. Writes the host's
+// first label to `svc` and its second (`svc.ns`, `svc.ns.svc...`) to `ns`
+// ("" for one label), and returns the label count when the host is a
+// service DNS name (`svc`, `svc.ns`, `svc.ns.svc[...]`), else 0.
+int cbm_env_address(const char *key, const char *value, char *svc, size_t svc_sz, char *ns,
+                    size_t ns_sz);
+
 // Classify a string literal as URL, config, or neither.
 // Returns CBM_STRREF_URL (0), CBM_STRREF_CONFIG (1), or -1 for neither.
 int cbm_classify_string(const char *str, int len);
@@ -57,6 +68,49 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // found. Shared by the defs, calls, and unified extractors so all three agree on
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
+
+// tree-sitter error recovery around an unknown leading macro: `API RetT name(...)`
+// (`XXH_PUBLIC_API XXH64_hash_t XXH64(...)`, `JEMALLOC_ALWAYS_INLINE T *f(...)`)
+// carries one identifier more than the declaration grammar admits, so the parser
+// recovers in one of two shapes, and neither names the function:
+//   - C++ inserts a zero-width MISSING "::" and reads `RetT name` as the
+//     out-of-line name `RetT::name`; with a pointer return, the name side is a
+//     pointer_type_declarator that wraps the function_declarator;
+//   - C and C++ keep RetT as the declarator identifier and put the real name in
+//     an ERROR node directly before the parameter list.
+// cbm_c_qualifier_is_recovered: true when `qid` (a qualified_identifier or
+// scoped_identifier) is the first shape, i.e. its "::" token is MISSING.
+// cbm_c_recovered_func_name: the real name node of the second shape for a
+// function_declarator, or a null node when the declarator is not that shape.
+// Shared by every C-family declarator walk (defs, call scope, params, C LSP) so
+// the def QN and every caller QN agree on the recovered name.
+bool cbm_c_qualifier_is_recovered(TSNode qid);
+TSNode cbm_c_recovered_func_name(TSNode func_declarator);
+
+// True for a C keyword that error recovery can surface as a function "name"
+// (`else if (a) (b) {` split by #ifdef reads as a definition named `if`).
+// cbm_func_name_node_text returns NULL for these in the C-declarator grammars,
+// so neither a def nor a call scope is minted; the C LSP applies the same test.
+bool cbm_c_reserved_func_name(const char *name);
+
+// True for the languages whose `#define`s become Macro nodes: C, C++, CUDA,
+// GLSL, Objective-C and ISPC. The one predicate for what follows from the C
+// preprocessor: the `#macro` QN namespace (CBM_MACRO_QN_SUFFIX) and the
+// `variants` property (CBMDefinition.variants), because #if branches are what
+// lets one of these files define a name more than once.
+bool cbm_is_c_preprocessor_lang(CBMLanguage lang);
+
+// Macro-wrapped definition name (#946): `void FNAME(first)(void)` and
+// `void Cls::__API_HOOK(Spawn)()` parse as a function_declarator whose own
+// declarator is ANOTHER function_declarator — the macro call. Valid C/C++ never
+// nests them directly (a function cannot return a function; a function-pointer
+// return has a parenthesized_declarator in between), so the shape is always a
+// function-like macro spelling the name. When `decl` is such an outer
+// function_declarator and the macro takes exactly one bare name, returns that
+// name node ("first", "Spawn"); otherwise a null node, and callers keep their
+// ordinary declarator walk. Shared by the declarator resolver and the C LSP so
+// the def name and the LSP caller QN agree.
+TSNode cbm_c_macro_wrapped_name_node(TSNode decl);
 
 // Convert a resolved function/method name node to its name string, normalizing a
 // C++ conversion-operator's `operator_cast` node (which spans the full
@@ -118,6 +172,12 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 // (call-scope) extractor computes the SAME class-qualified enclosing QN as the
 // def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
 char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
+
+/* Go: resolve a method_declaration's receiver parameter_list down to the bare
+ * receiver type_identifier (unwrapping pointer_type / generic_type). Shared by
+ * def extraction (extract_defs.c) and call-scope attribution
+ * (extract_unified.c) so the receiver-qualified method QN has ONE formula. */
+char *cbm_go_receiver_type_name(CBMArena *a, TSNode recv, const char *source);
 
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
@@ -252,12 +312,17 @@ char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *
 
 // C-family platform variants: the same external-linkage function defined in
 // files that differ only by a platform token (foo_win.c / foo_posix.c,
-// src/unix/fs.c / src/win/fs.c) is ONE function with platform variants — two
+// src/unix/fs.c / src/win/fs.c) is one function with platform variants — two
 // external definitions of one name cannot link into one program, so they are
-// alternatives by construction. Returns the platform-neutral QN (the path with
-// its platform tokens removed) for a non-static file-scope function of
-// C/C++/CUDA/ObjC whose `qn` is the plain file-stem form; otherwise `qn`.
-const char *cbm_platform_variant_qn(CBMArena *a, CBMLanguage lang, const char *project,
+// alternatives by construction. Each definition keeps its own path QN (it is
+// found by its file); this returns the KEY that relates the variants: the
+// platform-neutral QN (the path with its platform tokens removed), for a
+// non-static file-scope function of C/C++/CUDA/ObjC whose `qn` is the plain
+// file-stem form and whose path carries a platform token. NULL otherwise. A
+// pure function of the definition's own path, name and linkage: no other file
+// takes part, so a full index and an incremental repair write the same key.
+// It becomes the node's `variant_key` property (CBMDefinition.variant_key).
+const char *cbm_platform_neutral_qn(CBMArena *a, CBMLanguage lang, const char *project,
                                     const char *rel_path, const char *name, const char *qn,
                                     TSNode func_node);
 

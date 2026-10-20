@@ -1,28 +1,30 @@
 class CodebaseMemoryMcp < Formula
   desc "Fast code intelligence engine for AI coding agents"
   homepage "https://github.com/DeusData/codebase-memory-mcp"
-  version "0.10.3"
+  version "0.12.1"
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/DeusData/codebase-memory-mcp/releases/download/v#{version}/codebase-memory-mcp-darwin-arm64.tar.gz"
-      sha256 "0ebf02328207d4c3d862c837b5e973de5bac808df92b0941737721d467287f7f"
+      sha256 "9bfcbe38414b47969a3e1d1c1999f5357409387c86fa3d24221b5458267660d2"
     end
     on_intel do
       url "https://github.com/DeusData/codebase-memory-mcp/releases/download/v#{version}/codebase-memory-mcp-darwin-amd64.tar.gz"
-      sha256 "1107fea28285823e1436e4f38a4e00a0b472d8a43c379da7dfd200c914a4b9dd"
+      sha256 "ca6e64397a8ae80cec898a8205a6aa16750ac798acc05a0c3ed983837944a581"
     end
   end
 
+  # The static -portable build: the dynamic one needs glibc 2.38, which
+  # Ubuntu 22.04, Debian 12 and RHEL 9 do not have.
   on_linux do
     on_arm do
-      url "https://github.com/DeusData/codebase-memory-mcp/releases/download/v#{version}/codebase-memory-mcp-linux-arm64.tar.gz"
-      sha256 "967b9eababfdbd2ef1987c571d55bc7c028cd1db7f99279830634c58db311e32"
+      url "https://github.com/DeusData/codebase-memory-mcp/releases/download/v#{version}/codebase-memory-mcp-linux-arm64-portable.tar.gz"
+      sha256 "ed0f1f548cd79b121c401c2e9f7841c189a001af26d3768368088c24f6a53533"
     end
     on_intel do
-      url "https://github.com/DeusData/codebase-memory-mcp/releases/download/v#{version}/codebase-memory-mcp-linux-amd64.tar.gz"
-      sha256 "74997fb0934e70a22f20c2e112fb4d883867dc1f01a7bcdc94cf86d13b5cbd31"
+      url "https://github.com/DeusData/codebase-memory-mcp/releases/download/v#{version}/codebase-memory-mcp-linux-amd64-portable.tar.gz"
+      sha256 "8c3d0341064301e78ecc84cf7348d4e2c6562a0f57448243ea560aaa34de36c1"
     end
   end
 

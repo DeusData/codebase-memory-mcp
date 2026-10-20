@@ -57,6 +57,28 @@ TEST(test_impact_runner_filter_consumes_public_codec_bytes) {
     PASS();
 }
 
+TEST(test_impact_runner_filter_lane_running_every_suite_whole_is_run_all) {
+    /* A lane that lists every member suite whole runs everything: it says run_all
+     * rather than handing the runner a token list that happens to name it all. */
+    const rf_spec_t sole = {.suite = "str_intern", .test = "rf_case", .whole = true, .sole = true};
+    rf_fixture_t fixture;
+    bool prepared = rf_fixture_open(&fixture) && rf_prepare(&fixture, &sole);
+    cbm_test_result_status_t status =
+        prepared ? rf_build(&fixture, RF_JSON_CAP, false) : CBM_TEST_RESULT_INVALID;
+    bool parsed = status == CBM_TEST_RESULT_OK && rf_parse(&fixture);
+    yyjson_val *lane = parsed ? rf_lane(&fixture) : NULL;
+    bool run_all = lane && yyjson_equals_str(yyjson_obj_get(lane, "decision"), "run_all");
+    if (!run_all) {
+        printf("  sole whole-suite lane: status=%d parsed=%d lane=%d\n", status, parsed,
+               lane != NULL);
+    }
+    bool removed = rf_fixture_close(&fixture);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(run_all);
+    ASSERT_TRUE(removed);
+    PASS();
+}
+
 static bool rf_unknown_run(rf_fixture_t *fixture, const char *token, size_t length) {
     rf_run_t run = {0};
     char diagnostic[640];
@@ -132,7 +154,7 @@ static bool rf_limit_control(void) {
 static bool rf_diagnostic_control(void) {
     char name[513];
     rf_identifier(name, 512);
-    const rf_spec_t spec = {.suite = name, .test = "rf_case", .whole = true};
+    const rf_spec_t spec = {.suite = name, .test = "rf_case", .whole = true, .sole = true};
     rf_fixture_t fixture;
     bool prepared = rf_fixture_open(&fixture) && rf_prepare(&fixture, &spec);
     cbm_test_result_status_t status =
@@ -165,6 +187,7 @@ TEST(test_impact_runner_filter_limits_and_diagnostic_domain) {
 
 SUITE(test_impact_runner_filter) {
     RUN_TEST(test_impact_runner_filter_consumes_public_codec_bytes);
+    RUN_TEST(test_impact_runner_filter_lane_running_every_suite_whole_is_run_all);
     RUN_TEST(test_impact_runner_filter_literal_width_boundaries);
     RUN_TEST(test_impact_runner_filter_limits_and_diagnostic_domain);
 }

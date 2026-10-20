@@ -6,7 +6,9 @@
  * run ever sees: C-family #if/#else, C#/F# #if, Rust #[cfg], Swift #if,
  * Go build-tagged files, D version blocks, Erlang -ifdef, Haskell CPP,
  * Fortran .F90 preprocessing, Verilog `ifdef, Elixir/Python/Ruby/PHP
- * definitions under an `if`, and C platform files (foo_win.c / foo_posix.c).
+ * definitions under an `if`. C platform files (foo_win.c / foo_posix.c) are
+ * the exception: each keeps its own node and path QN, so it is found by its
+ * file, and they share a `variant_key` (cv_platform_check below).
  *
  * Every fixture defines `pick` twice — variant A calls `alpha`, variant B
  * calls `beta` — plus a `caller` that calls `pick`. The graph must hold:
@@ -28,6 +30,7 @@
 #include <pipeline/pipeline_internal.h>
 #include <store/store.h>
 #include <sqlite3.h>
+#include "helpers.h" /* cbm_fqn_compute: the path-derived QN of a definition */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -417,15 +420,122 @@ TEST(cv_verilog_ifdef) {
     PASS();
 }
 
-/* C platform files: the same function in foo_win.c and foo_posix.c is one
- * definition with two variants, and a caller in a shared file binds to it. */
+/* One text value from SQL with text parameters (as cv_count); false when the
+ * query fails or returns no row or NULL. */
+static bool cv_text(cv_proj_t *p, const char *sql, const char *a, const char *b, char *out,
+                    size_t n) {
+    sqlite3 *db = cbm_store_get_db(p->store);
+    sqlite3_stmt *stmt = NULL;
+    out[0] = '\0';
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    int params = sqlite3_bind_parameter_count(stmt);
+    const char *values[] = {p->project, a, b};
+    for (int i = 0; i < params && i < 3; i++) {
+        sqlite3_bind_text(stmt, i + 1, values[i], -1, SQLITE_TRANSIENT);
+    }
+    const char *text =
+        sqlite3_step(stmt) == SQLITE_ROW ? (const char *)sqlite3_column_text(stmt, 0) : NULL;
+    if (text) {
+        snprintf(out, n, "%s", text);
+    }
+    sqlite3_finalize(stmt);
+    return text != NULL;
+}
+
+/* One platform variant of `pick`: its file, the function its body calls, and
+ * the other variant's callee, which must not be reached from it. */
+typedef struct {
+    const char *file;
+    const char *callee;
+    const char *other_callee;
+} cv_platform_t;
+
+/* C platform variants (foo_win.c / foo_posix.c, src/unix/ vs src/win/): every
+ * definition keeps its own node under its path-derived QN, the QN its file
+ * and name compute (findability: a lookup by that QN finds it); it calls what
+ * its own body calls; all of them carry the platform-neutral QN
+ * `<project>.<neutral>.pick` as variant_key, which relates them, and no
+ * `variants` list; a caller in a shared file binds to one of them. */
+static int cv_platform_check(const char *lang, const cv_file_t *files, int count,
+                             const cv_platform_t *variants, int variant_count,
+                             const char *neutral) {
+    cv_proj_t p;
+    if (!cv_index(&p, files, count)) {
+        fprintf(stderr, "  [%s] fixture could not be indexed\n", lang);
+        cv_cleanup(&p);
+        return 0;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    char want_key[512];
+    snprintf(want_key, sizeof(want_key), "%s.%s.pick", p.project, neutral);
+    int ok = 1;
+    int nodes = cv_count(&p,
+                         "SELECT COUNT(DISTINCT qualified_name) FROM nodes WHERE project=?1 "
+                         "AND name='pick' AND label='Function'",
+                         NULL, NULL);
+    if (nodes != variant_count) {
+        fprintf(stderr, "  [%s] pick nodes=%d, want %d\n", lang, nodes, variant_count);
+        ok = 0;
+    }
+    const char *calls = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                        "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+                        "e.type='CALLS' AND s.qualified_name=?2 AND t.name=?3";
+    for (int i = 0; i < variant_count; i++) {
+        const cv_platform_t *v = &variants[i];
+        const char *want_qn = cbm_fqn_compute(&arena, p.project, v->file, "pick");
+        char qn[512];
+        char key[512];
+        bool found = cv_text(&p,
+                             "SELECT qualified_name FROM nodes WHERE project=?1 AND name='pick' "
+                             "AND label='Function' AND file_path=?2",
+                             v->file, NULL, qn, sizeof(qn));
+        bool keyed = found && cv_text(&p,
+                                      "SELECT json_extract(properties,'$.variant_key') FROM nodes "
+                                      "WHERE project=?1 AND qualified_name=?2",
+                                      qn, NULL, key, sizeof(key));
+        int own = found ? cv_count(&p, calls, qn, v->callee) : -1;
+        int other = found ? cv_count(&p, calls, qn, v->other_callee) : -1;
+        if (!found || !want_qn || strcmp(qn, want_qn) != 0 || !keyed ||
+            strcmp(key, want_key) != 0 || own != 1 || other != 0) {
+            fprintf(stderr, "  [%s] %s: qn=%s (want %s) variant_key=%s (want %s) ->%s=%d ->%s=%d\n",
+                    lang, v->file, found ? qn : "-", want_qn ? want_qn : "?", keyed ? key : "-",
+                    want_key, v->callee, own, v->other_callee, other);
+            ok = 0;
+        }
+    }
+    int listed = cv_count(&p,
+                          "SELECT COUNT(*) FROM nodes WHERE project=?1 AND name='pick' "
+                          "AND json_extract(properties,'$.variants') IS NOT NULL",
+                          NULL, NULL);
+    int from_caller = cv_count(&p,
+                               "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                               "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
+                               "e.type='CALLS' AND s.name='caller' AND t.name='pick'",
+                               NULL, NULL);
+    if (listed != 0 || from_caller < 1) {
+        fprintf(stderr, "  [%s] pick nodes with variants=%d caller->pick=%d\n", lang, listed,
+                from_caller);
+        ok = 0;
+    }
+    cbm_arena_destroy(&arena);
+    cv_cleanup(&p);
+    return ok;
+}
+
+/* C platform files: the same function in foo_win.c and foo_posix.c. */
 TEST(cv_c_platform_files) {
     static const cv_file_t files[] = {
         {"src/plat_win.c", "void alpha(void);\nvoid pick(void) { alpha(); }\n"},
         {"src/plat_posix.c", "void beta(void);\nvoid pick(void) { beta(); }\n"},
         {"src/plat.c", "void alpha(void) {}\nvoid beta(void) {}\nvoid pick(void);\n"
                        "void caller(void) { pick(); }\n"}};
-    ASSERT_TRUE(cv_run("c_platform_files", files, 3, "pick", "alpha", "beta", "caller"));
+    static const cv_platform_t variants[] = {{"src/plat_win.c", "alpha", "beta"},
+                                             {"src/plat_posix.c", "beta", "alpha"}};
+    ASSERT_TRUE(cv_platform_check("c_platform_files", files, 3, variants, 2, "src.plat"));
     PASS();
 }
 
@@ -437,13 +547,16 @@ TEST(cv_c_platform_directories) {
         {"src/win/fs.c", "void beta(void);\nvoid pick(void) { beta(); }\n"},
         {"src/core.c", "void alpha(void) {}\nvoid beta(void) {}\nvoid pick(void);\n"
                        "void caller(void) { pick(); }\n"}};
-    ASSERT_TRUE(cv_run("c_platform_dirs", files, 3, "pick", "alpha", "beta", "caller"));
+    static const cv_platform_t variants[] = {{"src/unix/fs.c", "alpha", "beta"},
+                                             {"src/win/fs.c", "beta", "alpha"}};
+    ASSERT_TRUE(cv_platform_check("c_platform_dirs", files, 3, variants, 2, "src.fs"));
     PASS();
 }
 
 /* Not variants: static functions are file-local even in platform files, and
  * same-named external functions in files without a platform token may belong
- * to different programs. Each keeps its own node. */
+ * to different programs. Each keeps its own node, and none carries a
+ * variant_key. */
 TEST(cv_c_non_variants_keep_their_nodes) {
     static const cv_file_t files[] = {{"src/plat_win.c", "static void pick(void) {}\n"},
                                       {"src/plat_posix.c", "static void pick(void) {}\n"},
@@ -459,9 +572,14 @@ TEST(cv_c_non_variants_keep_their_nodes) {
                            "SELECT COUNT(DISTINCT qualified_name) FROM nodes WHERE project=?1 "
                            "AND name='helper' AND label='Function'",
                            NULL, NULL);
+    int keyed = cv_count(&p,
+                         "SELECT COUNT(*) FROM nodes WHERE project=?1 "
+                         "AND json_extract(properties,'$.variant_key') IS NOT NULL",
+                         NULL, NULL);
     cv_cleanup(&p);
     ASSERT_EQ(picks, 2);
     ASSERT_EQ(helpers, 2);
+    ASSERT_EQ(keyed, 0);
     PASS();
 }
 
@@ -499,11 +617,13 @@ TEST(cv_no_cross_language_name_binding) {
 
 /* ── Incremental: a definition written in several files ───────────────
  * Closure repair re-parses only the changed files and their recorded
- * dependents. `pick` written in two platform files is ONE node; editing
- * either file must re-parse the other too, or the repair drops the other
- * variant's span and calls (when the edited file holds the node) or keeps
- * the edited file's stale ones. After each edit the repaired graph must be
- * the graph a full index of the same tree builds. */
+ * dependents. `Pick` written in two Go build-tagged files is ONE node;
+ * editing either file must re-parse the other too, or the repair drops the
+ * other variant's span and calls (when the edited file holds the node) or
+ * keeps the edited file's stale ones. C platform files are separate nodes
+ * whose shared variant_key comes from each file alone, so the changed file
+ * is all a repair re-parses. After each edit the repaired graph must be the
+ * graph a full index of the same tree builds. */
 
 static bool cv_pipeline(const char *repo, const char *db, cbm_incremental_route_t *route) {
     cbm_pipeline_t *p = cbm_pipeline_new(repo, db, CBM_MODE_FULL);
@@ -520,7 +640,8 @@ static bool cv_pipeline(const char *repo, const char *db, cbm_incremental_route_
     return ok;
 }
 
-/* CALLS edges by name plus pick's variant spans, one line each. */
+/* CALLS edges by qualified name, every node's variant spans and every node's
+ * variant_key, one line each. */
 static bool cv_signature(const char *db_path, char *out, size_t n) {
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
@@ -528,10 +649,15 @@ static bool cv_signature(const char *db_path, char *out, size_t n) {
         return false;
     }
     const char *sql =
-        "SELECT line FROM (SELECT s.name || '>' || t.name AS line FROM edges e "
-        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' "
-        "UNION ALL SELECT 'variants ' || json_extract(properties,'$.variants') FROM nodes "
-        "WHERE name='pick' AND label='Function') ORDER BY line";
+        "SELECT line FROM (SELECT s.qualified_name || '>' || t.qualified_name AS line "
+        "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.type='CALLS' "
+        "UNION ALL SELECT 'variants ' || qualified_name || ' ' || "
+        "json_extract(properties,'$.variants') FROM nodes "
+        "WHERE json_extract(properties,'$.variants') IS NOT NULL "
+        "UNION ALL SELECT 'key ' || qualified_name || ' ' || "
+        "json_extract(properties,'$.variant_key') FROM nodes "
+        "WHERE json_extract(properties,'$.variant_key') IS NOT NULL) ORDER BY line";
     sqlite3_stmt *stmt = NULL;
     bool ok = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK;
     out[0] = '\0';
@@ -571,33 +697,79 @@ static bool cv_edit_matches_full(const char *repo, const char *dbdir, const char
     return ok;
 }
 
+/* Write `files` into a fresh repository and index it once (the base the
+ * edits repair). */
+static bool cv_incremental_base(char *repo, size_t repo_n, char *dbdir, size_t dbdir_n,
+                                const cv_file_t *files, int count) {
+    snprintf(repo, repo_n, "%s", th_mktempdir("cbm-cvinc"));
+    snprintf(dbdir, dbdir_n, "%s", th_mktempdir("cbm-cvdb"));
+    bool ok = repo[0] && dbdir[0];
+    for (int i = 0; ok && i < count; i++) {
+        ok = cv_write(repo, &files[i]);
+    }
+    char inc_db[600];
+    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", dbdir);
+    return ok && cv_pipeline(repo, inc_db, NULL);
+}
+
 TEST(cv_incremental_variant_partners) {
     char repo[300];
     char dbdir[300];
-    snprintf(repo, sizeof(repo), "%s", th_mktempdir("cbm-cvinc"));
-    snprintf(dbdir, sizeof(dbdir), "%s", th_mktempdir("cbm-cvdb"));
-    ASSERT_TRUE(repo[0] && dbdir[0]);
+    static const cv_file_t files[] = {
+        {"go.mod", "module example.com/cvinc\n\ngo 1.22\n"},
+        {"pick/util.go", "package pick\n\nfunc alpha() {}\nfunc beta() {}\nfunc gammaFn() {}\n"},
+        {"pick/pick_linux.go", "//go:build linux\npackage pick\n\nfunc Pick() { alpha() }\n"},
+        {"pick/pick_windows.go", "//go:build windows\npackage pick\n\nfunc Pick() { beta() }\n"},
+        {"pick/caller.go", "package pick\n\nfunc Caller() { Pick() }\n"},
+    };
+    ASSERT_TRUE(cv_incremental_base(repo, sizeof(repo), dbdir, sizeof(dbdir), files,
+                                    (int)(sizeof(files) / sizeof(files[0]))));
+    static char sig[8192];
+    /* Edit each variant file in turn (one of them holds the node). */
+    ASSERT_TRUE(cv_edit_matches_full(
+        repo, dbdir, "pick/pick_linux.go",
+        "//go:build linux\npackage pick\n\nfunc Pick() { alpha(); gammaFn() }\n", sig,
+        sizeof(sig)));
+    ASSERT_TRUE(strstr(sig, "cvinc.pick.Pick>cvinc.pick.beta\n") &&
+                strstr(sig, "cvinc.pick.Pick>cvinc.pick.gammaFn\n"));
+    ASSERT_TRUE(cv_edit_matches_full(repo, dbdir, "pick/pick_windows.go",
+                                     "//go:build windows\npackage pick\n\nfunc Pick() {\n"
+                                     "\tbeta()\n}\n",
+                                     sig, sizeof(sig)));
+    ASSERT_TRUE(strstr(sig, "cvinc.pick.Pick>cvinc.pick.alpha\n") &&
+                strstr(sig, "cvinc.pick.Pick>cvinc.pick.beta\n"));
+    th_rmtree(repo);
+    th_rmtree(dbdir);
+    PASS();
+}
+
+/* C platform files: each variant keeps its own node, calls and variant_key
+ * through a repair of either file. */
+TEST(cv_incremental_platform_files) {
+    char repo[300];
+    char dbdir[300];
     static const cv_file_t files[] = {
         {"util.c", "void alpha(void) {}\nvoid beta(void) {}\nvoid gamma_fn(void) {}\n"},
         {"pick_linux.c", "void pick(void) { alpha(); }\n"},
         {"pick_win.c", "void pick(void) { beta(); }\n"},
         {"caller.c", "void caller(void) { pick(); }\n"},
     };
-    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-        ASSERT_TRUE(cv_write(repo, &files[i]));
-    }
-    char inc_db[600];
-    snprintf(inc_db, sizeof(inc_db), "%s/inc.db", dbdir);
-    ASSERT_TRUE(cv_pipeline(repo, inc_db, NULL));
+    ASSERT_TRUE(cv_incremental_base(repo, sizeof(repo), dbdir, sizeof(dbdir), files,
+                                    (int)(sizeof(files) / sizeof(files[0]))));
     static char sig[8192];
-    /* Edit each variant file in turn (one of them holds the node). */
     ASSERT_TRUE(cv_edit_matches_full(repo, dbdir, "pick_linux.c",
                                      "void pick(void) { alpha(); gamma_fn(); }\n", sig,
                                      sizeof(sig)));
-    ASSERT_TRUE(strstr(sig, "pick>beta\n") && strstr(sig, "pick>gamma_fn\n"));
+    ASSERT_TRUE(strstr(sig, "cvinc.pick_linux.pick>cvinc.util.gamma_fn\n") &&
+                strstr(sig, "cvinc.pick_win.pick>cvinc.util.beta\n") &&
+                strstr(sig, "key cvinc.pick_linux.pick cvinc.pick.pick\n") &&
+                strstr(sig, "key cvinc.pick_win.pick cvinc.pick.pick\n"));
     ASSERT_TRUE(cv_edit_matches_full(repo, dbdir, "pick_win.c", "void pick(void) {\n  beta();\n}\n",
                                      sig, sizeof(sig)));
-    ASSERT_TRUE(strstr(sig, "pick>alpha\n") && strstr(sig, "pick>beta\n"));
+    ASSERT_TRUE(strstr(sig, "cvinc.pick_linux.pick>cvinc.util.alpha\n") &&
+                strstr(sig, "cvinc.pick_win.pick>cvinc.util.beta\n") &&
+                strstr(sig, "key cvinc.pick_linux.pick cvinc.pick.pick\n") &&
+                strstr(sig, "key cvinc.pick_win.pick cvinc.pick.pick\n"));
     th_rmtree(repo);
     th_rmtree(dbdir);
     PASS();
@@ -632,4 +804,5 @@ SUITE(conditional_variants) {
     RUN_TEST(cv_c_non_variants_keep_their_nodes);
     RUN_TEST(cv_no_cross_language_name_binding);
     RUN_TEST(cv_incremental_variant_partners);
+    RUN_TEST(cv_incremental_platform_files);
 }

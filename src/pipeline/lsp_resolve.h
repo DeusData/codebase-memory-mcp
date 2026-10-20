@@ -27,6 +27,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "pipeline/pipeline.h" /* cbm_registry_unique_field_qn, cbm_resolution_t */
+#include "service_patterns.h"  /* cbm_service_pattern_match for cbm_pipeline_service_name */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -222,6 +223,24 @@ static inline bool cbm_pipeline_node_is_callable_target(const cbm_gbuf_node_t *n
            strcmp(node->label, "Constructor") == 0 || strcmp(node->label, "Class") == 0;
 }
 
+/* The Kotlin resolver claims a property READ on a typed receiver with an exact
+ * row (lsp_kt_property_ref) so that the raw-name fallback cannot borrow a
+ * same-named function. That row names a property, never a function value. Its
+ * QN is not always materialized under that spelling (a property of a nested
+ * class); the graph lookup then finds nothing, or its unique-callable step
+ * picks a same-named function elsewhere (#1555: okhttp `server.webSocket` -> a
+ * test function `webSocket`, a fabricated CALL_REFERENCE). Such a row is not
+ * admissible: the caller falls back by name, restricted to non-callable
+ * targets, which binds the property's own node as before the receiver was
+ * typed and can never borrow a function. */
+static inline bool cbm_pipeline_reference_target_admissible(const CBMResolvedCall *ref,
+                                                            const cbm_gbuf_node_t *tgt) {
+    if (!ref || !ref->strategy || strcmp(ref->strategy, "lsp_kt_property_ref") != 0) {
+        return true;
+    }
+    return tgt && !cbm_pipeline_node_is_callable_target(tgt);
+}
+
 static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const char *tail) {
     const char *qt = cbm_pipeline_qn_class_method_tail(qn);
     return qt && tail && strcmp(qt, tail) == 0;
@@ -331,6 +350,34 @@ static inline int cbm_pipeline_invocation_site_rank(const CBMResolvedCall *resol
         return 0;
     }
     return call->requires_lsp_resolution || call->source_origin != resolved->source_origin ? 0 : 1;
+}
+
+/* A resolver row that proves the call's receiver is a type OUTSIDE the project:
+ * PHP `$r->m()` / `R::m()` where `R` is imported from a vendor namespace
+ * (#1186). When its target has no graph node, it rules out every name-only
+ * fallback: the method of a vendor class is not a same-named project method. */
+static inline bool cbm_pipeline_lsp_external_receiver(const CBMResolvedCall *resolved) {
+    return resolved && resolved->strategy &&
+           strcmp(resolved->strategy, "php_external_receiver") == 0;
+}
+
+/* The service-pattern name of a call: its callee text, or, when that names no
+ * service and the LSP proved the receiver a vendor class, the vendor method
+ * (`GuzzleClient::get` -> `GuzzleHttp.Client.get`). The extractor names a
+ * scoped call by its method alone, and such a call never reaches the
+ * registry, so the vendor class is its only service evidence (#1186). */
+static inline const char *cbm_pipeline_service_name(const CBMCall *call,
+                                                    const CBMResolvedCall *external,
+                                                    cbm_svc_kind_t *kind) {
+    *kind = cbm_service_pattern_match(call->callee_name);
+    if (*kind == CBM_SVC_NONE && cbm_pipeline_lsp_external_receiver(external) &&
+        external->callee_qn && external->callee_qn[0]) {
+        *kind = cbm_service_pattern_match(external->callee_qn);
+        if (*kind != CBM_SVC_NONE) {
+            return external->callee_qn;
+        }
+    }
+    return call->callee_name;
 }
 
 static inline bool cbm_pipeline_invocation_reason_join_strategy(const char *strategy) {
@@ -1132,23 +1179,38 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
     if (direct) {
         return direct;
     }
-    if (project_name && project_name[0]) {
-        size_t proj_len = strlen(project_name);
-        if (!(strncmp(callee_qn, project_name, proj_len) == 0 && callee_qn[proj_len] == '.')) {
-            size_t callee_len = strlen(callee_qn);
-            if (proj_len <= SIZE_MAX - callee_len - 2U) {
-                size_t prefixed_len = proj_len + 1U + callee_len;
-                char *prefixed_qn = (char *)malloc(prefixed_len + 1U);
-                if (prefixed_qn) {
-                    memcpy(prefixed_qn, project_name, proj_len);
-                    prefixed_qn[proj_len] = '.';
-                    memcpy(prefixed_qn + proj_len + 1U, callee_qn, callee_len + 1U);
-                    const cbm_gbuf_node_t *prefixed = cbm_gbuf_find_by_qn(gbuf, prefixed_qn);
-                    free(prefixed_qn);
-                    if (prefixed) {
-                        return prefixed;
-                    }
+    /* Exact retries, in tie-rule order (CBM_MACRO_QN_SUFFIX): the definition
+     * first -- the QN as given, then with the project prefix -- and only when
+     * neither names a node the C-preprocessor macro of that name, in the same
+     * two spellings. The macro case is a prototype the C resolver knows whose
+     * only node in the graph is its rename macro (`extern T f(...);` plus
+     * `#define f f_v2`). One buffer, "<project>.<callee_qn>#macro", serves all
+     * three retries. */
+    size_t proj_len = (project_name && project_name[0]) ? strlen(project_name) : 0;
+    size_t callee_len = strlen(callee_qn);
+    size_t suffix_len = sizeof(CBM_MACRO_QN_SUFFIX) - 1U;
+    bool add_prefix = proj_len > 0 && !(strncmp(callee_qn, project_name, proj_len) == 0 &&
+                                        callee_qn[proj_len] == '.');
+    if (proj_len <= SIZE_MAX - callee_len - suffix_len - 2U) {
+        char *buf = (char *)malloc(proj_len + 1U + callee_len + suffix_len + 1U);
+        if (buf) {
+            char *own = buf + proj_len + 1U; /* callee_qn inside the buffer */
+            if (proj_len > 0) {
+                memcpy(buf, project_name, proj_len);
+            }
+            buf[proj_len] = '.';
+            memcpy(own, callee_qn, callee_len + 1U);
+            const cbm_gbuf_node_t *hit = add_prefix ? cbm_gbuf_find_by_qn(gbuf, buf) : NULL;
+            if (!hit) {
+                memcpy(own + callee_len, CBM_MACRO_QN_SUFFIX, suffix_len + 1U);
+                hit = cbm_gbuf_find_by_qn(gbuf, own);
+                if (!hit && add_prefix) {
+                    hit = cbm_gbuf_find_by_qn(gbuf, buf);
                 }
+            }
+            free(buf);
+            if (hit) {
+                return hit;
             }
         }
     }

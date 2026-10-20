@@ -290,9 +290,14 @@ cbm_test_selection_t *cbm_test_select(const cbm_test_selection_input_t *input) {
     for (int i = 0; i < input->reach_count; i++)
         if (reach[i].row->changed && !reach[i].registered)
             return sl_full(result, CBM_TEST_SELECT_CHANGED_UNREGISTERED);
-    for (int i = 0; i < runner_count; i++)
+    for (int i = 0; i < runner_count; i++) {
         if (definition_counts[i] != 1 || !registration_counts[i])
             sl_whole(&result->suites[i], CBM_TEST_SELECT_INVENTORY_UNKNOWN);
+        /* After every whole-suite path: a selected suite that some builds do
+         * not register at all may be absent from the runner that executes it. */
+        if ((result->suites[i].whole || result->suites[i].reasons) && runners[i].conditional)
+            sl_whole(&result->suites[i], CBM_TEST_SELECT_CONDITIONAL);
+    }
     /* A later registration can promote an earlier test's suite to whole.
      * Compact cases while the complete, sorted suite table is still present. */
     int used = 0;

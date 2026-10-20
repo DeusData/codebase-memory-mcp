@@ -321,6 +321,63 @@ TEST(impact_walk_crosses_a_route_only_when_asked) {
     PASS();
 }
 
+static int64_t add_keyed(cbm_store_t *s, const char *name, const char *key) {
+    char qn[64];
+    char props[128];
+    snprintf(qn, sizeof(qn), "test.%s", name);
+    snprintf(props, sizeof(props), "{\"variant_key\":\"%s\"}", key);
+    cbm_node_t node = {.project = "test",
+                       .label = "Function",
+                       .name = name,
+                       .qualified_name = qn,
+                       .properties_json = props};
+    return cbm_store_upsert_node(s, &node);
+}
+
+TEST(impact_walk_crosses_platform_variants_only_when_asked) {
+    /* pick_win and pick_posix are the platform variants of one function (one
+     * variant_key); caller binds to pick_posix alone. A change to pick_win
+     * concerns caller. A key on one node relates nothing. */
+    cbm_store_t *s = new_store();
+    int64_t win = add_keyed(s, "pick_win", "test.pick");
+    int64_t posix = add_keyed(s, "pick_posix", "test.pick");
+    int64_t lone = add_keyed(s, "lone_win", "test.lone");
+    int64_t caller = add_node(s, "Function", "caller");
+    int64_t lone_caller = add_node(s, "Function", "lone_caller");
+    add_edge(s, caller, posix, "CALLS");
+    add_edge(s, lone_caller, lone, "CALLS");
+    cbm_impact_walk_t *w = open_walk(s, CALLS_ONLY, 1, false);
+    ASSERT_EQ(cbm_impact_walk_run(w, &win, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_impact_walk_count(w), 1);
+    cbm_impact_walk_close(w);
+
+    cbm_impact_policy_t variants = {.project = "test",
+                                    .edge_types = CALLS_ONLY,
+                                    .edge_type_count = 1,
+                                    .follow_variant_keys = true};
+    ASSERT_EQ(cbm_impact_walk_open(s, &variants, &w), CBM_STORE_OK);
+    ASSERT_EQ(cbm_impact_walk_run(w, &win, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_impact_walk_count(w), 3);
+    ASSERT_EQ(hit_of(w, posix)->hop, 1);
+    ASSERT_EQ(hit_of(w, posix)->via_id, win);
+    ASSERT_STR_EQ(hit_of(w, posix)->via_edge, "variant_key");
+    ASSERT_EQ(hit_of(w, caller)->hop, 2);
+    ASSERT_STR_EQ(hit_of(w, caller)->via_edge, "CALLS");
+    cbm_impact_walk_close(w);
+
+    /* The other direction, and a singleton key. */
+    ASSERT_EQ(cbm_impact_walk_open(s, &variants, &w), CBM_STORE_OK);
+    int64_t seeds[] = {posix, lone};
+    ASSERT_EQ(cbm_impact_walk_run(w, seeds, 2), CBM_STORE_OK);
+    ASSERT_EQ(cbm_impact_walk_count(w), 5);
+    ASSERT_EQ(hit_of(w, win)->hop, 1);
+    ASSERT_EQ(hit_of(w, caller)->hop, 1);
+    ASSERT_EQ(hit_of(w, lone_caller)->hop, 1);
+    cbm_impact_walk_close(w);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(impact_walk_rejects_what_it_cannot_answer) {
     cbm_store_t *s = new_store();
     int64_t seed = add_node(s, "Function", "seed");
@@ -359,5 +416,6 @@ SUITE(store_impact) {
     RUN_TEST(impact_walk_reaches_a_sink_and_stops_there);
     RUN_TEST(impact_walk_second_run_continues_from_the_first);
     RUN_TEST(impact_walk_crosses_a_route_only_when_asked);
+    RUN_TEST(impact_walk_crosses_platform_variants_only_when_asked);
     RUN_TEST(impact_walk_rejects_what_it_cannot_answer);
 }

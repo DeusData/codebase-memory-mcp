@@ -1272,7 +1272,7 @@ TEST(regex_compile_accepts_ordinary_intervals) {
         "(foo|bar|baz){2,5}",
         "^[A-Za-z_][A-Za-z0-9_]{0,255}$",
         "[0-9]{4}-[0-9]{2}-[0-9]{2}",
-        /* pass_calls.c and pass_envscan.c */
+        /* pass_calls.c, and the retired env-URL scanner */
         "Depends\\(([A-Za-z_][A-Za-z0-9_.]*)",
         "^(ENV|ARG)[[:space:]]+([A-Za-z0-9_]+)[= ](.*)",
         "(default|value)[[:space:]]*=[[:space:]]*\"(https?://[^\"]+)\"",

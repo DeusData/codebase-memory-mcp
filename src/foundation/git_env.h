@@ -30,6 +30,10 @@ extern const char *const cbm_git_repo_env_vars[CBM_GIT_REPO_ENV_VAR_COUNT];
  * The name compare is case-insensitive on Windows (its environment is). */
 bool cbm_git_env_entry_is_repo_local(const char *entry);
 
+/* True when an entry must be omitted from a git child: repository-local variables
+ * and GIT_DIFF_OPTS. The name compare is case-insensitive on Windows. */
+bool cbm_git_env_entry_should_strip(const char *entry);
+
 #ifdef _WIN32
 /* A CREATE_UNICODE_ENVIRONMENT block: the current environment minus the
  * repository-local git variables and GIT_DIFF_OPTS. One allocation; release with

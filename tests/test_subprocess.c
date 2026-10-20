@@ -15,6 +15,7 @@
 #include "../src/foundation/platform.h"
 #include "../src/foundation/compat_fs.h"
 #include "../src/foundation/git_env.h"
+#include "../src/foundation/mem_core.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -25,6 +26,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -100,6 +102,174 @@ TEST(subprocess_outcome_str) {
 }
 
 /* ── Layer 2: real spawn/reap (POSIX) ─────────────────────────────────────── */
+
+extern const char *cbm_test_program_path;
+
+TEST(subprocess_environment_is_child_local) {
+    const char *names[] = {"CBM_ENV_TEST_VALUE", "CBM_ENV_TEST_KEEP", "CBM_ENV_TEST_EMPTY",
+                           "CBM_ENV_TEST_NEW"};
+    char *saved[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        const char *value = getenv(names[i]);
+        saved[i] = value ? cbm_strdup(value) : NULL;
+        if (i == 3) {
+            (void)cbm_unsetenv(names[i]);
+        } else {
+            (void)cbm_setenv(names[i], i == 1 ? "kept" : "parent", 1);
+        }
+    }
+    const char *args[] = {cbm_test_program_path,
+                          "__cbm_env_values",
+                          names[0],
+                          "child",
+                          names[1],
+                          "kept",
+                          names[2],
+                          "",
+                          names[3],
+                          "last=tail",
+                          NULL};
+    const char *overrides[] = {
+#ifdef _WIN32
+        "cbm_env_test_value=child",
+#else
+        "CBM_ENV_TEST_VALUE=child",
+#endif
+        "CBM_ENV_TEST_EMPTY=", "CBM_ENV_TEST_NEW=first", "CBM_ENV_TEST_NEW=last=tail", NULL};
+    cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
+                            .argv = args,
+                            .env_overrides = overrides,
+                            .quiet_timeout_ms = 5000};
+    cbm_proc_result_t result;
+    int rc = cbm_subprocess_run(&opts, &result);
+    bool parent_unchanged = strcmp(getenv(names[0]), "parent") == 0 &&
+                            strcmp(getenv(names[1]), "kept") == 0 &&
+                            strcmp(getenv(names[2]), "parent") == 0 && getenv(names[3]) == NULL;
+    for (int i = 0; i < 4; i++) {
+        if (saved[i]) {
+            (void)cbm_setenv(names[i], saved[i], 1);
+        } else {
+            (void)cbm_unsetenv(names[i]);
+        }
+        free(saved[i]);
+    }
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(parent_unchanged);
+    PASS();
+}
+
+TEST(subprocess_environment_rejects_invalid_override) {
+    const char *args[] = {cbm_test_program_path, "--version", NULL};
+    const char *invalid[] = {"MISSING_EQUALS", "", "=value"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        const char *overrides[] = {invalid[i], NULL};
+        cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
+                                .argv = args,
+                                .env_overrides = overrides,
+                                .quiet_timeout_ms = 5000};
+        cbm_proc_result_t result;
+        ASSERT_EQ(cbm_subprocess_run(&opts, &result), -1);
+        ASSERT_EQ(result.outcome, CBM_PROC_SPAWN_FAILED);
+    }
+    PASS();
+}
+
+/* Git scrubbing wins over a repository-local override, while ordinary overrides
+ * remain child-local. The early child probe runs before test-runner scrubbing. */
+TEST(subprocess_environment_overrides_preserve_git_isolation) {
+    const char *names[] = {"GIT_DIR", "GIT_WORK_TREE", "GIT_DIFF_OPTS", "CBM_ENV_GIT_KEEP"};
+    char *saved[4] = {0};
+    bool present[4] = {0};
+    bool setup = true;
+    for (int i = 0; i < 4; i++) {
+        const char *value = getenv(names[i]);
+        present[i] = value != NULL;
+        saved[i] = value ? cbm_strdup(value) : NULL;
+        setup = setup && (!present[i] || saved[i]);
+    }
+    if (setup) {
+        for (int i = 0; i < 4; i++) {
+            setup = cbm_setenv(names[i], "parent", 1) == 0 && setup;
+        }
+    }
+    const char *args[] = {cbm_test_program_path,
+                          "__cbm_env_isolation",
+                          names[3],
+                          "child",
+                          names[0],
+                          names[1],
+                          names[2],
+                          NULL};
+    const char *overrides[] = {
+#ifdef _WIN32
+        "git_dir=/cbm-override-repo",
+#else
+        "GIT_DIR=/cbm-override-repo",
+#endif
+        "GIT_DIFF_OPTS=--unified=999", "CBM_ENV_GIT_KEEP=child", NULL};
+    cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
+                            .argv = args,
+                            .env_overrides = overrides,
+                            .strip_git_repo_env = true,
+                            .quiet_timeout_ms = 5000};
+    cbm_proc_result_t result = {0};
+    int rc = setup ? cbm_subprocess_run(&opts, &result) : -1;
+    bool parent_unchanged = true;
+    for (int i = 0; i < 4; i++) {
+        const char *value = getenv(names[i]);
+        parent_unchanged = parent_unchanged && value && strcmp(value, "parent") == 0;
+        if (saved[i]) {
+            (void)cbm_setenv(names[i], saved[i], 1);
+        } else if (!present[i]) {
+            (void)cbm_unsetenv(names[i]);
+        }
+        free(saved[i]);
+    }
+    ASSERT_TRUE(setup);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(result.exit_code, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(parent_unchanged);
+    PASS();
+}
+
+/* Environment ownership outlives spawn, even if the child already exited.
+ * Count while the handle is retained, then release only after terminal poll.
+ * This also catches a libc/core mismatch on production mimalloc builds. */
+TEST(subprocess_environment_core_ownership) {
+    const char *args[] = {cbm_test_program_path, "__cbm_env_values", "CBM_CORE_ENV_TEST", "child",
+                          NULL};
+    const char *overrides[] = {"CBM_CORE_ENV_TEST=first", "CBM_CORE_ENV_TEST=child", NULL};
+    cbm_proc_opts_t opts = {.bin = cbm_test_program_path,
+                            .argv = args,
+                            .env_overrides = overrides,
+                            .quiet_timeout_ms = 5000};
+    size_t before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    cbm_subprocess_t *process = NULL;
+    int rc = cbm_subprocess_spawn(&opts, &process);
+    bool tracked = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER) > before;
+    cbm_proc_result_t result = {0};
+    cbm_proc_poll_t poll = CBM_PROC_POLL_ERROR;
+    if (rc == 0) {
+        do {
+            poll = cbm_subprocess_poll(process, &result);
+            if (poll == CBM_PROC_POLL_RUNNING) {
+                cbm_usleep(1000);
+            }
+        } while (poll == CBM_PROC_POLL_RUNNING);
+    }
+    if (poll == CBM_PROC_POLL_TERMINAL) {
+        cbm_subprocess_destroy(process);
+    }
+    size_t after = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(poll, CBM_PROC_POLL_TERMINAL);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
+    ASSERT_TRUE(tracked);
+    ASSERT_EQ(after, before);
+    PASS();
+}
 
 #ifndef _WIN32
 static cbm_proc_result_t run_sh(const char *script, int quiet_timeout_ms) {
@@ -193,6 +363,99 @@ TEST(subprocess_run_resolves_literal_binary_name_from_path) {
     PASS();
 #endif
 }
+
+#ifndef _WIN32
+/* Both the native spawn and ENOEXEC shell fallback must select the caller's
+ * tool, even when the child receives a different PATH with the same tool name. */
+TEST(subprocess_environment_path_preserves_caller_lookup) {
+    char parent_dir[] = "/tmp/cbm-env-parent-XXXXXX";
+    char child_dir[] = "/tmp/cbm-env-child-XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(parent_dir));
+    if (!mkdtemp(child_dir)) {
+        (void)rmdir(parent_dir);
+        FAIL("could not create child PATH fixture");
+    }
+    char parent_tool[PATH_MAX];
+    char child_tool[PATH_MAX];
+    char path_override[PATH_MAX];
+    snprintf(parent_tool, sizeof(parent_tool), "%s/cbm-env-probe", parent_dir);
+    snprintf(child_tool, sizeof(child_tool), "%s/cbm-env-probe", child_dir);
+    snprintf(path_override, sizeof(path_override), "PATH=%s", child_dir);
+    const char *old_path = getenv("PATH");
+    char *saved_path = old_path ? cbm_strdup(old_path) : NULL;
+    bool had_path = old_path != NULL;
+    bool setup = !had_path || saved_path != NULL;
+    bool parent_unchanged = true;
+    cbm_proc_result_t results[3] = {0};
+    int spawn_rc[3] = {-1, -1, -1};
+    const char *args[] = {"cbm-env-probe", child_dir, NULL};
+    const char *overrides[] = {path_override, NULL};
+    cbm_proc_opts_t opts = {
+        .bin = args[0], .argv = args, .env_overrides = overrides, .quiet_timeout_ms = 5000};
+    for (int i = 0; setup && i < 2; i++) {
+        FILE *parent_file = fopen(parent_tool, "w");
+        FILE *child_file = fopen(child_tool, "w");
+        if (!parent_file || !child_file) {
+            if (parent_file) {
+                fclose(parent_file);
+            }
+            if (child_file) {
+                fclose(child_file);
+            }
+            setup = false;
+            break;
+        }
+        const char *prefix = i == 0 ? "#!/bin/sh\n" : "";
+        setup = fprintf(parent_file, "%stest \"$PATH\" = \"$1\"\n", prefix) >= 0 &&
+                fprintf(child_file, "%sexit 42\n", prefix) >= 0 &&
+                fchmod(fileno(parent_file), 0700) == 0 && fchmod(fileno(child_file), 0700) == 0;
+        if (fclose(parent_file) != 0) {
+            setup = false;
+        }
+        if (fclose(child_file) != 0) {
+            setup = false;
+        }
+        if (!setup || cbm_setenv("PATH", parent_dir, 1) != 0) {
+            setup = false;
+            break;
+        }
+        spawn_rc[i] = cbm_subprocess_run(&opts, &results[i]);
+        parent_unchanged =
+            parent_unchanged && getenv("PATH") && strcmp(getenv("PATH"), parent_dir) == 0;
+    }
+    if (setup) {
+        /* ENOENT must remain a missing caller-side tool, even though an
+         * executable with the same name exists only in the child's PATH. */
+        setup = unlink(parent_tool) == 0;
+        if (setup) {
+            spawn_rc[2] = cbm_subprocess_run(&opts, &results[2]);
+            parent_unchanged =
+                parent_unchanged && getenv("PATH") && strcmp(getenv("PATH"), parent_dir) == 0;
+        }
+    }
+    if (saved_path) {
+        (void)cbm_setenv("PATH", saved_path, 1);
+    } else if (!had_path) {
+        (void)cbm_unsetenv("PATH");
+    }
+    free(saved_path);
+    (void)unlink(parent_tool);
+    (void)unlink(child_tool);
+    (void)rmdir(parent_dir);
+    (void)rmdir(child_dir);
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(parent_unchanged);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(spawn_rc[i], 0);
+        ASSERT_EQ(results[i].exit_code, 0);
+        ASSERT_EQ(results[i].outcome, CBM_PROC_CLEAN);
+    }
+    ASSERT_EQ(spawn_rc[2], 0);
+    ASSERT_EQ(results[2].exit_code, 127);
+    ASSERT_EQ(results[2].outcome, CBM_PROC_EXIT_NONZERO);
+    PASS();
+}
+#endif
 
 /* A child that dies of SIGSEGV must classify as CRASH — NOT exit_nonzero and NOT
  * killed. This is the whole point of the primitive: distinguish a crash from a
@@ -1521,18 +1784,23 @@ static void sp_stdout_payload(unsigned char bytes[SP_STDOUT_BYTES]) {
     bytes[SP_STDOUT_BYTES - 1] = 'Z'; /* final byte has no newline */
 }
 
-/* Called before normal harness setup. Normal entry remembers argv[0], whose
- * storage lasts through main; the private exact argv grammar never runs suites. */
+/* Normal entry (test_main.c) remembers the runner image, whose storage lasts
+ * through main. */
+void tf_subprocess_set_binary(const char *path);
+void tf_subprocess_set_binary(const char *path) {
+    sp_stdout_test_binary = path;
+}
+
+/* Runner roles (test_main.c's role table), before normal harness setup; the
+ * private exact argv grammar never runs suites. */
 static int sp_stdin_probe(int argc, char **argv);
-const char *tf_runner_image(int argc, char **argv); /* test_main.c */
-int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv);
-int tf_maybe_run_subprocess_stdout_probe(int argc, char **argv) {
-    if (argc >= 2 && argv && strcmp(argv[1], "__cbm_subprocess_stdin_probe") == 0)
-        return sp_stdin_probe(argc, argv);
-    if (argc < 2 || !argv || strcmp(argv[1], "__cbm_subprocess_stdout_probe") != 0) {
-        sp_stdout_test_binary = tf_runner_image(argc, argv);
-        return -1;
-    }
+int tf_role_subprocess_stdin_probe(int argc, char **argv);
+int tf_role_subprocess_stdin_probe(int argc, char **argv) {
+    return sp_stdin_probe(argc, argv);
+}
+
+int tf_role_subprocess_stdout_probe(int argc, char **argv);
+int tf_role_subprocess_stdout_probe(int argc, char **argv) {
     if (argc != 4 || (strcmp(argv[2], "binary") != 0 && strcmp(argv[2], "text") != 0 &&
                       strcmp(argv[2], "empty") != 0))
         return 91;
@@ -2360,6 +2628,13 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_classify_non_fault_signal_is_killed);
     RUN_TEST(subprocess_classify_timeout_dominates);
     RUN_TEST(subprocess_outcome_str);
+    RUN_TEST(subprocess_environment_is_child_local);
+    RUN_TEST(subprocess_environment_core_ownership);
+    RUN_TEST(subprocess_environment_rejects_invalid_override);
+    RUN_TEST(subprocess_environment_overrides_preserve_git_isolation);
+#ifndef _WIN32
+    RUN_TEST(subprocess_environment_path_preserves_caller_lookup);
+#endif
     RUN_TEST(subprocess_run_clean);
     RUN_TEST(subprocess_run_exit_nonzero);
     RUN_TEST(subprocess_run_child_exited_before_group_check);

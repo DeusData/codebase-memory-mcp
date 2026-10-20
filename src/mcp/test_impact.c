@@ -630,8 +630,11 @@ static void tm_add_runner_suite(tm_scan_t *sc, const tm_tok_t *name, bool perf) 
         return;
     }
     m->runner = items;
-    items[m->runner_count++] =
-        (cbm_test_runner_suite_t){.name = copy, .perf = perf, .file = sc->file, .line = name->line};
+    items[m->runner_count++] = (cbm_test_runner_suite_t){.name = copy,
+                                                         .perf = perf,
+                                                         .file = sc->file,
+                                                         .line = name->line,
+                                                         .conditional = sc->conditions > 0};
 }
 
 /* Virtual preset records are immutable. Original configured records are kept
@@ -1407,11 +1410,14 @@ bool cbm_test_model_finish(cbm_test_model_t *m) {
     }
     if (m->runner_count > 1) {
         qsort(m->runner, (size_t)m->runner_count, sizeof(*m->runner), tm_cmp_runner);
-        /* One entry per suite; it is a perf suite when any site says so. */
+        /* One entry per suite; it is a perf suite when any site says so, and
+         * conditional only when every site is. */
         int kept = 0;
         for (int i = 1; i < m->runner_count; i++) {
             if (strcmp(m->runner[kept].name, m->runner[i].name) == 0) {
                 m->runner[kept].perf = m->runner[kept].perf || m->runner[i].perf;
+                m->runner[kept].conditional =
+                    m->runner[kept].conditional && m->runner[i].conditional;
             } else {
                 m->runner[++kept] = m->runner[i];
             }

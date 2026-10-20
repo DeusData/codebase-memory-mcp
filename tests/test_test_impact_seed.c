@@ -344,7 +344,8 @@ TEST(test_impact_seed_unclassified_header_lines_escalate_the_file) {
 /* One definition with variants (graph_buffer.c "Definition variants") is one
  * node holding one variant's span; the others are in its `variants`
  * property, in the same file (#if branches) or in another file that DEFINES
- * it too (platform files). A hunk in ANY variant seeds that node. */
+ * it too (Go build-tagged files; the cross-file node is built by hand here).
+ * A hunk in ANY variant seeds that node. */
 TEST(test_impact_seed_variant_spans_seed_their_definition) {
     static const char pick_src[] = "#ifdef _WIN32\nvoid pick(void) {\n  beta();\n}\n#else\n"
                                    "void pick(void) {\n  alpha();\n}\n#endif\n";

@@ -10,6 +10,7 @@
 #include "compat_fs.h"
 #include "git_env.h" /* strip_git_repo_env: scrubbed child environment for git */
 #include "log.h"
+#include "mem_core.h"
 #include "platform.h"  /* cbm_now_ms */
 #include "sanitized.h" /* CBM_SANITIZED — spawn-retry budget */
 
@@ -28,6 +29,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #ifdef __APPLE__
+#include <paths.h>
 #include <spawn.h>
 #endif
 extern char **environ;
@@ -439,11 +441,16 @@ struct cbm_subprocess {
     cbm_proc_result_t result;
 
 #ifdef _WIN32
+    wchar_t *environment;
     HANDLE process;
     HANDLE job;
     DWORD process_id;
     bool root_forced;
 #else
+    char **environment;
+#ifdef __APPLE__
+    char *search_path;
+#endif
     pid_t pid;
     pid_t pgid;
 #endif
@@ -462,6 +469,157 @@ static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->job_memory_available = false;
 }
 
+#ifdef _WIN32
+/* Preserve the native Unicode environment, including Windows' hidden =C:
+ * drive entries. Names compare ordinally without case, independent of locale. */
+static size_t cbm_win_environment_name_length(const wchar_t *entry) {
+    const wchar_t *equals = wcschr(entry + (entry[0] == L'=' ? 1 : 0), L'=');
+    return equals ? (size_t)(equals - entry) : wcslen(entry);
+}
+
+static int cbm_win_environment_compare(const void *left, const void *right) {
+    const wchar_t *a = *(const wchar_t *const *)left;
+    const wchar_t *b = *(const wchar_t *const *)right;
+    return CompareStringOrdinal(a, (int)cbm_win_environment_name_length(a), b,
+                                (int)cbm_win_environment_name_length(b), TRUE) -
+           CSTR_EQUAL;
+}
+
+static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const char *const *overrides,
+                                            size_t override_count) {
+    wchar_t *inherited =
+        process->strip_git_repo_env ? cbm_git_child_env_block() : GetEnvironmentStringsW();
+    if (!inherited) {
+        return false;
+    }
+    size_t count = 0;
+    for (const wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        count++;
+    }
+    wchar_t **entries = NULL;
+    wchar_t **converted = NULL;
+    bool ok = false;
+    if (override_count > SIZE_MAX / sizeof(*entries) ||
+        count > SIZE_MAX / sizeof(*entries) - override_count) {
+        goto done;
+    }
+    entries = cbm_calloc(CBM_MEM_CLASS_OTHER, (count + override_count) * sizeof(*entries));
+    converted = cbm_calloc(CBM_MEM_CLASS_OTHER, override_count * sizeof(*converted));
+    if (!entries || !converted) {
+        goto done;
+    }
+    size_t index = 0;
+    for (wchar_t *entry = inherited; *entry; entry += wcslen(entry) + 1) {
+        entries[index++] = entry;
+    }
+    for (size_t i = 0; i < override_count; i++) {
+        if (process->strip_git_repo_env && cbm_git_env_entry_should_strip(overrides[i])) {
+            continue;
+        }
+        converted[i] = cbm_utf8_to_wide_in(CBM_MEM_CLASS_OTHER, overrides[i]);
+        if (!converted[i]) {
+            goto done;
+        }
+        size_t slot = 0;
+        while (slot < count && cbm_win_environment_compare(&entries[slot], &converted[i]) != 0) {
+            slot++;
+        }
+        entries[slot] = converted[i];
+        if (slot == count) {
+            count++;
+        }
+    }
+    qsort(entries, count, sizeof(*entries), cbm_win_environment_compare);
+    size_t length = count ? 1 : 2; /* Empty blocks also need two NUL characters. */
+    for (size_t i = 0; i < count; i++) {
+        size_t entry_length = wcslen(entries[i]) + 1;
+        if (entry_length > SIZE_MAX / sizeof(wchar_t) - length) {
+            goto done;
+        }
+        length += entry_length;
+    }
+    process->environment = cbm_calloc(CBM_MEM_CLASS_OTHER, length * sizeof(*process->environment));
+    if (!process->environment) {
+        goto done;
+    }
+    wchar_t *next = process->environment;
+    for (size_t i = 0; i < count; i++) {
+        size_t entry_length = wcslen(entries[i]) + 1;
+        wmemcpy(next, entries[i], entry_length);
+        next += entry_length;
+    }
+    ok = true;
+done:
+    if (converted) {
+        for (size_t i = 0; i < override_count; i++) {
+            cbm_free(CBM_MEM_CLASS_OTHER, converted[i]);
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, converted);
+    cbm_free(CBM_MEM_CLASS_OTHER, entries);
+    if (process->strip_git_repo_env) {
+        cbm_git_child_env_free(inherited);
+    } else {
+        FreeEnvironmentStringsW(inherited);
+    }
+    return ok;
+}
+#else
+static bool cbm_subprocess_copy_environment(cbm_subprocess_t *process, const char *const *overrides,
+                                            size_t override_count) {
+#ifdef __APPLE__
+    const char *search_path = getenv("PATH");
+    process->search_path =
+        cbm_mem_strdup(CBM_MEM_CLASS_OTHER, search_path ? search_path : _PATH_DEFPATH);
+    if (!process->search_path) {
+        return false;
+    }
+#endif
+    char **inherited = process->envp ? process->envp : environ;
+    size_t count = 0;
+    while (inherited && inherited[count]) {
+        count++;
+    }
+    if (override_count >= SIZE_MAX / sizeof(*process->environment) ||
+        count > SIZE_MAX / sizeof(*process->environment) - override_count - 1) {
+        return false;
+    }
+    process->environment = cbm_calloc(CBM_MEM_CLASS_OTHER,
+                                      (count + override_count + 1) * sizeof(*process->environment));
+    if (!process->environment) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        process->environment[i] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, inherited[i]);
+        if (!process->environment[i]) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < override_count; i++) {
+        if (process->strip_git_repo_env && cbm_git_env_entry_should_strip(overrides[i])) {
+            continue;
+        }
+        size_t name_length = (size_t)(strchr(overrides[i], '=') - overrides[i]);
+        size_t slot = 0;
+        while (slot < count &&
+               !(strncmp(process->environment[slot], overrides[i], name_length) == 0 &&
+                 process->environment[slot][name_length] == '=')) {
+            slot++;
+        }
+        char *entry = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, overrides[i]);
+        if (!entry) {
+            return false;
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, process->environment[slot]);
+        process->environment[slot] = entry;
+        if (slot == count) {
+            count++;
+        }
+    }
+    return true;
+}
+#endif
+
 static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
     if (!process) {
         return;
@@ -472,6 +630,17 @@ static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
         }
     }
     free(process->argv);
+#ifndef _WIN32
+    if (process->environment) {
+        for (size_t i = 0; process->environment[i]; i++) {
+            cbm_free(CBM_MEM_CLASS_OTHER, process->environment[i]);
+        }
+    }
+#endif
+    cbm_free(CBM_MEM_CLASS_OTHER, process->environment);
+#ifdef __APPLE__
+    cbm_free(CBM_MEM_CLASS_OTHER, process->search_path);
+#endif
     free(process->bin);
     free(process->windows_cmd_payload);
     free(process->log_file);
@@ -506,6 +675,21 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
         return NULL;
     }
 #endif
+
+    size_t override_count = 0;
+    if (opts->env_overrides) {
+        while (override_count < CBM_SUBPROCESS_ARGV_LIMIT && opts->env_overrides[override_count]) {
+            const char *entry = opts->env_overrides[override_count];
+            const char *equals = strchr(entry, '=');
+            if (!equals || equals == entry) {
+                return NULL;
+            }
+            override_count++;
+        }
+        if (override_count == CBM_SUBPROCESS_ARGV_LIMIT) {
+            return NULL;
+        }
+    }
 
     size_t argc = 1;
     if (opts->argv) {
@@ -584,6 +768,11 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
         }
     }
 #endif
+    if (override_count > 0 &&
+        !cbm_subprocess_copy_environment(process, opts->env_overrides, override_count)) {
+        cbm_subprocess_free_config(process);
+        return NULL;
+    }
     atomic_init(&process->lifecycle, CBM_SUBPROCESS_ACTIVE);
     cbm_subprocess_result_init(&process->result);
     return process;
@@ -891,15 +1080,20 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     ZeroMemory(&child, sizeof(child));
     DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
                   CREATE_NO_WINDOW;
-    /* Fail closed: a git child must never inherit a caller's GIT_DIR. */
-    wchar_t *env = process->strip_git_repo_env ? cbm_git_child_env_block() : NULL;
+    /* Scrubbing remains authoritative even when explicit overrides are present. */
+    wchar_t *env = process->environment;
+    if (!env && process->strip_git_repo_env) {
+        env = cbm_git_child_env_block();
+    }
     if (env) {
         flags |= CREATE_UNICODE_ENVIRONMENT;
     }
     BOOL created = (!process->strip_git_repo_env || env) &&
                    CreateProcessW(wbin, wcmdline, NULL, NULL, TRUE, flags, (LPVOID)env, NULL,
                                   &startup.StartupInfo, &child);
-    cbm_git_child_env_free(env); /* CreateProcessW copied the block into the child */
+    if (!process->environment) {
+        cbm_git_child_env_free(env); /* CreateProcessW copied the block into the child */
+    }
     cbm_win_close_spawn_handles(nul, input, log, stdout_capture, attrs, attrs_init);
     free(wbin);
     free(wcmdline);
@@ -1298,7 +1492,20 @@ static void cbm_posix_child_exec(cbm_subprocess_t *process, int input, int outpu
     /* A fixed literal tool name (for example "git" or "curl") uses the
      * caller's normal PATH without introducing a shell. An explicit path
      * still has execvp's exact-path semantics because it contains '/'. */
-    execvp(process->bin, process->argv);
+    if (process->environment) {
+#ifdef __APPLE__
+        /* Only this child changes environ. execvP keeps the caller's PATH for
+         * executable lookup, including execvp's ENOEXEC shell fallback. */
+        environ = process->environment;
+        execvP(process->bin, process->search_path, process->argv);
+#else
+        /* execvpe searches the inherited caller PATH while passing the owned
+         * environment to the executed image; the parent's environ is untouched. */
+        execvpe(process->bin, process->argv, process->environment);
+#endif
+    } else {
+        execvp(process->bin, process->argv);
+    }
     _exit(127);
 }
 
@@ -1373,9 +1580,13 @@ static int cbm_posix_spawn_apple(cbm_subprocess_t *process, int input, int outpu
                       posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO) == 0 &&
                       posix_spawn_file_actions_adddup2(&actions, error, STDERR_FILENO) == 0;
     pid_t pid = -1;
-    int rc = configured ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv,
-                                       process->envp ? process->envp : environ)
-                        : -1;
+    char **environment = process->environment;
+    if (!environment) {
+        environment = process->envp ? process->envp : environ;
+    }
+    int rc = configured
+                 ? posix_spawnp(&pid, process->bin, &actions, &attr, process->argv, environment)
+                 : -1;
     (void)posix_spawn_file_actions_destroy(&actions);
     (void)posix_spawnattr_destroy(&attr);
     if (configured && rc == 0 && pid > 0) {

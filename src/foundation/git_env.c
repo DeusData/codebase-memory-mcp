@@ -82,6 +82,15 @@ static bool git_env_name_should_strip(const char *name, size_t name_len) {
            git_env_name_equals(name, name_len, "GIT_DIFF_OPTS");
 }
 
+bool cbm_git_env_entry_should_strip(const char *entry) {
+    if (!entry) {
+        return false;
+    }
+    const char *eq = strchr(entry, '=');
+    size_t name_len = eq ? (size_t)(eq - entry) : strlen(entry);
+    return git_env_name_should_strip(entry, name_len);
+}
+
 #ifdef _WIN32
 
 /* Wide entry name → should the child omit it? Names we match are ASCII, so any
@@ -135,17 +144,11 @@ wchar_t *cbm_git_child_env_block(void) {
 
 #else
 
-static bool git_env_entry_should_strip(const char *entry) {
-    const char *eq = strchr(entry, '=');
-    size_t name_len = eq ? (size_t)(eq - entry) : strlen(entry);
-    return git_env_name_should_strip(entry, name_len);
-}
-
 char **cbm_git_child_envp(void) {
     size_t count = 0;
     size_t bytes = 0;
     for (char **e = environ; e && *e; e++) {
-        if (!git_env_entry_should_strip(*e)) {
+        if (!cbm_git_env_entry_should_strip(*e)) {
             count++;
             bytes += strlen(*e) + 1;
         }
@@ -158,7 +161,7 @@ char **cbm_git_child_envp(void) {
     char *strings = (char *)envp + table;
     size_t slot = 0;
     for (char **e = environ; e && *e && slot < count; e++) {
-        if (!git_env_entry_should_strip(*e)) {
+        if (!cbm_git_env_entry_should_strip(*e)) {
             size_t len = strlen(*e) + 1;
             memcpy(strings, *e, len);
             envp[slot++] = strings;

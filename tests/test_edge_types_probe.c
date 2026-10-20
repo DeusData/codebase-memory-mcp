@@ -546,6 +546,84 @@ TEST(handles_gin_go) {
     PASS();
 }
 
+/* #686: Go router groups. Fiber (and Gin/Echo, same syntax) build the external
+ * path from `grp := app.Group("/admin")` plus `grp.Post("/x")`, so the full
+ * path is never one literal at the registration site. The Route must carry
+ * the composed path, including nested groups (`v1 := api.Group("/v1")`) and
+ * groups built inline (`app.Group("/x").Get(...)`). Controls: a route on the
+ * root app keeps its own path, a variable later re-bound to a different group
+ * uses the binding in effect at the call, and a non-literal group prefix
+ * leaves the route unprefixed (never guessed). Exact Route set on BOTH the
+ * sequential and the parallel pipeline. */
+static const EtFile et_fiber_groups_issue686[] = {
+    {"main.go",
+     "package main\n\n"
+     "import \"github.com/gofiber/fiber/v2\"\n\n"
+     "func health(c *fiber.Ctx) error { return nil }\n"
+     "func getUser(c *fiber.Ctx) error { return nil }\n"
+     "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
+     "func listOrders(c *fiber.Ctx) error { return nil }\n"
+     "func ping(c *fiber.Ctx) error { return nil }\n"
+     "func report(c *fiber.Ctx) error { return nil }\n"
+     "func dyn(c *fiber.Ctx) error { return nil }\n\n"
+     "func main() {\n"
+     "    app := fiber.New()\n"
+     "    app.Get(\"/health\", health)\n"
+     "    api := app.Group(\"/api\")\n"
+     "    v1 := api.Group(\"/v1\", authMiddleware)\n"
+     "    v1.Get(\"/users/:id\", getUser)\n"
+     "    admin := app.Group(\"/admin\")\n"
+     "    admin.Post(\"/customers/:id\", updateCustomer)\n"
+     "    grp := api.Group(\"/shop\")\n"
+     "    grp.Get(\"/orders\", listOrders)\n"
+     "    grp = app.Group(\"/internal\")\n"
+     "    grp.Get(\"/ping\", ping)\n"
+     "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
+     "    prefix := \"/p\"\n"
+     "    dg := app.Group(prefix)\n"
+     "    dg.Get(\"/dyn\", dyn)\n"
+     "    app.Listen(\":3000\")\n"
+     "}\n\n"
+     "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
+
+static const char *et_fiber_groups_issue686_routes[] = {
+    "/health",      "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
+    "/internal/ping", "/reports/daily",  "/dyn",                 NULL};
+
+TEST(handles_fiber_group_prefix_sequential_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
+                                     false, NULL));
+    PASS();
+}
+
+TEST(handles_fiber_group_prefix_parallel_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
+                                     true, NULL));
+    PASS();
+}
+
+/* #686 control for the same mechanism on Gin: `v1 := r.Group("/v1")` with the
+ * idiomatic brace block. */
+TEST(handles_gin_group_prefix_issue686) {
+    static const EtFile f[] = {
+        {"main.go",
+         "package main\n\n"
+         "import \"github.com/gin-gonic/gin\"\n\n"
+         "func listOrders(c *gin.Context) {}\n"
+         "func createOrder(c *gin.Context) {}\n\n"
+         "func main() {\n"
+         "    r := gin.Default()\n"
+         "    v1 := r.Group(\"/v1\")\n"
+         "    {\n"
+         "        v1.GET(\"/orders\", listOrders)\n"
+         "        v1.POST(\"/orders\", createOrder)\n"
+         "    }\n"
+         "}\n"}};
+    static const char *routes[] = {"/v1/orders", "/v1/orders", NULL}; /* GET + POST */
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* Spring (Java) — class-level @RequestMapping must prefix method mappings.
  * Reproduce-first: a HANDLES count alone can pass with partial routes
  * ("/orders"), but callers/search_graph need the actual endpoint names
@@ -734,6 +812,126 @@ TEST(handles_aspnet_csharp) {
     PASS();
 }
 
+/* ASP.NET Core attribute routing (C#, #1692) — the reporter's controller shape:
+ * stacked class attributes with a relative [Route("api/[controller]")] prefix,
+ * verb attributes with and without a template, and a verb + separate method
+ * [Route]. Every action got 0 Route nodes: the route extractor knew no
+ * HttpGet/HttpPost/Route attribute, and relative templates were dropped for lacking a
+ * leading '/'. The exact Route-name set also pins the [controller] token
+ * (class name minus "Controller") and the class-prefix join. */
+TEST(handles_aspnet_attribute_routes_issue1692) {
+    static const char *routes[] = {"/api/Quotes/{symbol}", "/api/Quotes/orders/{id}/confirm",
+                                   "/api/Quotes/x/{id}", NULL};
+    static const EtFile f[] = {
+        {"Controllers/QuotesController.cs",
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "namespace Feeder.Api.Controllers\n{\n"
+         "    [ServiceFilter(typeof(ClientIpCheckFilter))]\n"
+         "    [Route(\"api/[controller]\")]\n"
+         "    [ApiController]\n"
+         "    public class QuotesController : ControllerBase\n    {\n"
+         "        [HttpGet(\"{symbol}\")]\n"
+         "        public IActionResult Get(string symbol) { return Ok(symbol); }\n\n"
+         "        [HttpPost]\n"
+         "        [Route(\"orders/{id}/confirm\")]\n"
+         "        public IActionResult Confirm(int id) { return Ok(id); }\n\n"
+         "        [HttpPut(\"x/{id}\")]\n"
+         "        public IActionResult Update(int id) { return Ok(id); }\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 3));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* ASP.NET Core (#1041) — the reporter's shape: [ApiController] before a
+ * versioned [Route("api/v1/[controller]")] and an async [HttpPost("login")]
+ * action produced no server-side Route node at all. */
+TEST(handles_aspnet_attribute_routes_issue1041) {
+    static const char *routes[] = {"/api/v1/Auth/login", NULL};
+    static const EtFile f[] = {
+        {"Controllers/AuthController.cs",
+         "using System.Threading.Tasks;\n"
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "[ApiController]\n"
+         "[Route(\"api/v1/[controller]\")]\n"
+         "public class AuthController : ControllerBase\n{\n"
+         "    [HttpPost(\"login\")]\n"
+         "    public async Task<IActionResult> Login(LoginRequest req) { return Ok(); }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* ASP.NET Core [controller]/[action] token replacement (#1692): the action
+ * token is the method name ("Async" suffix trimmed, as ASP.NET Core does by
+ * default) or its [ActionName]; [AcceptVerbs] takes its path from Route=. */
+TEST(handles_aspnet_route_tokens_issue1692) {
+    static const char *routes[] = {"/api/Items/List", "/api/Items/Details/{id}",
+                                   "/api/Items/Find/{name}", "/api/Items/archive", NULL};
+    static const EtFile f[] = {
+        {"ItemsController.cs", "using Microsoft.AspNetCore.Mvc;\n\n"
+                               "[Route(\"api/[controller]\")]\n"
+                               "public class ItemsController : Controller\n{\n"
+                               "    [HttpGet(\"[action]\")]\n"
+                               "    public IActionResult List() { return View(); }\n\n"
+                               "    [HttpGet(\"[action]/{id}\")]\n"
+                               "    public System.Threading.Tasks.Task<IActionResult> "
+                               "DetailsAsync(int id) { return null; }\n\n"
+                               "    [HttpGet(\"[action]/{name}\")]\n"
+                               "    [ActionName(\"Find\")]\n"
+                               "    public IActionResult Search(string name) { return View(); }\n\n"
+                               "    [AcceptVerbs(\"POST\", \"PUT\", Route = \"archive\")]\n"
+                               "    public IActionResult Archive() { return View(); }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* ASP.NET Core absolute override + constraints (#1692): a method template that
+ * starts with "/" or "~/" ignores the class prefix; route constraints,
+ * optional markers and defaults are stripped to the bare parameter so the
+ * Route name matches the clients' "{id}" spelling ("{code:regex(...)}" nests
+ * braces). A controller without a class [Route] uses the method template as
+ * the whole path. */
+TEST(handles_aspnet_override_constraints_issue1692) {
+    static const char *routes[] = {
+        "/health", "/ping", "/api/Orders/{id}", "/api/Orders/{code}/{page}", "/api/ping", NULL};
+    static const EtFile f[] = {
+        {"OrdersController.cs",
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "[Route(\"api/[controller]\")]\n"
+         "public class OrdersController : ControllerBase\n{\n"
+         "    [HttpGet(\"/health\")]\n"
+         "    public IActionResult Health() { return Ok(); }\n\n"
+         "    [Microsoft.AspNetCore.Mvc.HttpHeadAttribute(\"~/ping\")]\n"
+         "    public IActionResult Ping() { return Ok(); }\n\n"
+         "    [HttpDelete(\"{id:int:min(1)}\")]\n"
+         "    public IActionResult Delete(int id) { return Ok(); }\n\n"
+         "    [HttpGet(\"{code:regex(^\\\\d{{3}}$)}/{page=1}\")]\n"
+         "    public IActionResult ByCode(string code, int page) { return Ok(); }\n}\n"},
+        {"PingController.cs", "using Microsoft.AspNetCore.Mvc;\n\n"
+                              "public class PingController : ControllerBase\n{\n"
+                              "    [HttpGet(\"api/ping\", Name = \"PingRoute\")]\n"
+                              "    public IActionResult Get() { return Ok(); }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 2, routes));
+    PASS();
+}
+
+/* Control (#1692): a C# class with ordinary attributes — including string
+ * arguments that look like paths — must not produce Route nodes. */
+TEST(handles_aspnet_non_controller_control_issue1692) {
+    static const char *routes[] = {NULL};
+    static const EtFile f[] = {{"Helper.cs", "using System;\n\n"
+                                             "[Serializable]\n"
+                                             "[Description(\"api/helper\")]\n"
+                                             "public class Helper\n{\n"
+                                             "    [Obsolete(\"/use/other\")]\n"
+                                             "    public void Run() { }\n\n"
+                                             "    [Fact]\n"
+                                             "    [Trait(\"Category\", \"api/[controller]\")]\n"
+                                             "    public void Check() { }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* Laravel (PHP) — Route facade whose QN contains "Laravel".
  * REAL BUG: internal/cbm/extract_calls.c:extract_handler_arg only accepts an
  * identifier/member_expression/selector_expression/attribute/field_expression as
@@ -919,6 +1117,546 @@ TEST(routes_laravel_withrouting_parallel_subdir_issue1146) {
          "        api: __DIR__.'/../routes/api.php',\n" ET_L11_BOOTSTRAP_TAIL},
         {"gateway/routes/api.php", ET_L11_API_ROUTES}};
     ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, true, "__route__POST__/api/orders"));
+    PASS();
+}
+
+/* Assert the exact HANDLES edge set as "<handler-QN tail> -> <route name>"
+ * pairs. The tail is matched at a segment boundary against the handler's
+ * qualified name ("UserController.show" matches
+ * "<project>.app.Http.Controllers.UserController.UserController.show"), so a
+ * same-named method on another class never satisfies it; the total count must
+ * match too, so a fabricated extra edge fails the assertion. */
+typedef struct {
+    const char *handler_tail;
+    const char *route;
+} EtHandles;
+
+static int et_qn_has_tail(const char *qn, const char *tail) {
+    size_t ql = qn ? strlen(qn) : 0;
+    size_t tl = strlen(tail);
+    return ql >= tl && strcmp(qn + ql - tl, tail) == 0 && (ql == tl || qn[ql - tl - 1] == '.');
+}
+
+/* route_qns (optional, NULL-terminated): Route qualified_names that must
+ * exist, so a test asserting that a route gets NO handler cannot pass merely
+ * because the route itself was never extracted. */
+static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHandles *want,
+                                   int parallel, const char *const *route_qns) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    int wanted = 0;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+    while (want[wanted].handler_tail && wanted < ET_ROUTE_ASSERT_MAX) {
+        wanted++;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    int ok = store != NULL &&
+             cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n) ==
+                 CBM_STORE_OK &&
+             n == wanted;
+    for (int i = 0; store && i < n; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        int have_src = cbm_store_find_node_by_id(store, edges[i].source_id, &src) == CBM_STORE_OK;
+        int have_tgt = cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) == CBM_STORE_OK;
+        int matched = 0;
+        for (int wi = 0; have_src && have_tgt && wi < wanted; wi++) {
+            if (!found[wi] && tgt.name && strcmp(tgt.name, want[wi].route) == 0 &&
+                et_qn_has_tail(src.qualified_name, want[wi].handler_tail)) {
+                found[wi] = matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            ok = 0;
+            fprintf(stderr, "  [ET-HANDLES] unexpected %s -> %s\n",
+                    have_src && src.qualified_name ? src.qualified_name : "<?>",
+                    have_tgt && tgt.name ? tgt.name : "<?>");
+        }
+        if (have_src) cbm_node_free_fields(&src);
+        if (have_tgt) cbm_node_free_fields(&tgt);
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        if (!found[wi]) {
+            ok = 0;
+            fprintf(stderr, "  [ET-HANDLES] missing %s -> %s\n", want[wi].handler_tail,
+                    want[wi].route);
+        }
+    }
+    for (int ri = 0; route_qns && route_qns[ri]; ri++) {
+        cbm_node_t route = {0};
+        if (!store ||
+            cbm_store_find_node_by_qn(store, lp.project, route_qns[ri], &route) != CBM_STORE_OK) {
+            ok = 0;
+            fprintf(stderr, "  [ET-HANDLES] missing Route %s\n", route_qns[ri]);
+        } else {
+            cbm_node_free_fields(&route);
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-HANDLES] FAIL (%s path) expected=%d actual=%d\n",
+                parallel ? "parallel" : "sequential", wanted, n);
+    }
+    if (edges) cbm_store_free_edges(edges, n);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+static int et_handles_exact(const EtFile *files, int nfiles, const EtHandles *want, int parallel) {
+    return et_handles_exact_routes(files, nfiles, want, parallel, NULL);
+}
+
+/* The exact DATA_FLOWS set, caller -> handler by QN tail. route_qns (NULL-terminated) must
+ * exist, so a test that expects NO flow on a path cannot pass because the caller's or the
+ * handler's Route was never created; handles is the exact HANDLES count. */
+typedef struct {
+    const char *caller_tail;
+    const char *handler_tail;
+} EtFlow;
+
+static int et_flow_matches(cbm_store_t *store, const cbm_edge_t *e, const EtFlow *want,
+                           int wanted, int *found) {
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    int have_src = cbm_store_find_node_by_id(store, e->source_id, &src) == CBM_STORE_OK;
+    int have_tgt = cbm_store_find_node_by_id(store, e->target_id, &tgt) == CBM_STORE_OK;
+    int matched = 0;
+    for (int wi = 0; have_src && have_tgt && wi < wanted; wi++) {
+        if (!found[wi] && et_qn_has_tail(src.qualified_name, want[wi].caller_tail) &&
+            et_qn_has_tail(tgt.qualified_name, want[wi].handler_tail)) {
+            found[wi] = matched = 1;
+            break;
+        }
+    }
+    if (!matched) {
+        fprintf(stderr, "  [ET-FLOWS] unexpected %s -> %s\n",
+                have_src && src.qualified_name ? src.qualified_name : "<?>",
+                have_tgt && tgt.qualified_name ? tgt.qualified_name : "<?>");
+    }
+    if (have_src) cbm_node_free_fields(&src);
+    if (have_tgt) cbm_node_free_fields(&tgt);
+    return matched;
+}
+
+static int et_data_flows_exact(const EtFile *files, int nfiles, const EtFlow *want, int parallel,
+                               const char *const *route_qns, int handles) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    int wanted = 0;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+    while (want[wanted].caller_tail && wanted < ET_ROUTE_ASSERT_MAX) {
+        wanted++;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    int ok = store != NULL &&
+             cbm_store_find_edges_by_type(store, lp.project, "DATA_FLOWS", &edges, &n) ==
+                 CBM_STORE_OK &&
+             n == wanted;
+    for (int i = 0; store && i < n; i++) {
+        if (!et_flow_matches(store, &edges[i], want, wanted, found)) {
+            ok = 0;
+        }
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        if (!found[wi]) {
+            ok = 0;
+            fprintf(stderr, "  [ET-FLOWS] missing %s -> %s\n", want[wi].caller_tail,
+                    want[wi].handler_tail);
+        }
+    }
+    for (int ri = 0; route_qns && route_qns[ri]; ri++) {
+        cbm_node_t route = {0};
+        if (!store ||
+            cbm_store_find_node_by_qn(store, lp.project, route_qns[ri], &route) != CBM_STORE_OK) {
+            ok = 0;
+            fprintf(stderr, "  [ET-FLOWS] missing Route %s\n", route_qns[ri]);
+        } else {
+            cbm_node_free_fields(&route);
+        }
+    }
+    int got_handles = store ? cbm_store_count_edges_by_type(store, lp.project, "HANDLES") : -1;
+    if (got_handles != handles) {
+        ok = 0;
+        fprintf(stderr, "  [ET-FLOWS] HANDLES=%d expected %d\n", got_handles, handles);
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-FLOWS] FAIL (%s path) expected=%d actual=%d\n",
+                parallel ? "parallel" : "sequential", wanted, n);
+    }
+    if (edges) cbm_store_free_edges(edges, n);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* R1 + R2 (user decision, 2026-10-18): DATA_FLOWS pair a test-file caller only with handlers in its
+ * own file, and a test-file handler only with callers in its own file. A Spring controller and a
+ * mock controller under src/test/ both answer `@RequestMapping` (any method). A production TS
+ * client and a TS test (.test.ts) call them with fetch, which names no method, so every caller and
+ * handler meets on the same __route__ANY__ node. Only the production client -> production
+ * controller pair is a data flow of the application, on the sequential and the parallel path. */
+static const EtFile et_r12_files[] = {
+    {"server/OrderController.java",
+     "package com.example;\n\n"
+     "import org.springframework.web.bind.annotation.RequestMapping;\n"
+     "import org.springframework.web.bind.annotation.RestController;\n\n"
+     "@RestController\n@RequestMapping(\"/api\")\npublic class OrderController {\n"
+     "    @RequestMapping(\"/orders\")\n"
+     "    public String orders() {\n        return \"orders\";\n    }\n}\n"},
+    {"server/src/test/java/com/example/MockPaymentController.java",
+     "package com.example;\n\n"
+     "import org.springframework.web.bind.annotation.RequestMapping;\n"
+     "import org.springframework.web.bind.annotation.RestController;\n\n"
+     "@RestController\n@RequestMapping(\"/api\")\npublic class MockPaymentController {\n"
+     "    @RequestMapping(\"/payments\")\n"
+     "    public String pay() {\n        return \"paid\";\n    }\n}\n"},
+    {"web/src/api.ts",
+     "export async function loadOrders() {\n  return fetch(\"/api/orders\");\n}\n\n"
+     "export async function loadPayments() {\n  return fetch(\"/api/payments\");\n}\n"},
+    {"web/src/api.test.ts",
+     "export async function testLoadOrders() {\n  return fetch(\"/api/orders\");\n}\n"}};
+
+static const EtFlow et_r12_flows[] = {{"api.loadOrders", "OrderController.orders"}, {NULL, NULL}};
+
+static const char *const et_r12_routes[] = {"__route__ANY__/api/orders",
+                                            "__route__ANY__/api/payments", NULL};
+
+TEST(data_flows_test_files_pair_within_their_file_sequential) {
+    ASSERT_TRUE(et_data_flows_exact(et_r12_files, 4, et_r12_flows, 0, et_r12_routes, 2));
+    PASS();
+}
+
+TEST(data_flows_test_files_pair_within_their_file_parallel) {
+    ASSERT_TRUE(et_data_flows_exact(et_r12_files, 4, et_r12_flows, 1, et_r12_routes, 2));
+    PASS();
+}
+
+/* ASP.NET Core MVC (#1692): a GET form action and its POST submit share one
+ * method name, so both overloads collapse into one Method node whose merged
+ * properties keep only one route. The parallel resolver emitted each
+ * definition's route at node creation and kept both; the sequential one rebuilt
+ * routes from the merged properties afterwards and kept only the last (28
+ * HANDLES on 6 ASP.NET corpora, 2026-10-18). Both venues keep both. */
+TEST(handles_aspnet_overload_verbs_both_venues_issue1692) {
+    static const EtHandles want[] = {{"AccountController.Login", "/Account/login"},
+                                     {"AccountController.Login", "/Account/login"},
+                                     {NULL, NULL}};
+    static const char *const route_qns[] = {"__route__GET__/Account/login",
+                                            "__route__POST__/Account/login", NULL};
+    static const EtFile f[] = {
+        {"Controllers/AccountController.cs",
+         "using Microsoft.AspNetCore.Mvc;\n\n"
+         "namespace Shop.Web.Controllers\n{\n"
+         "    [Route(\"[controller]\")]\n"
+         "    public class AccountController : Controller\n    {\n"
+         "        [HttpGet(\"login\")]\n"
+         "        public IActionResult Login() { return View(); }\n\n"
+         "        [HttpPost(\"login\")]\n"
+         "        public IActionResult Login(LoginModel model) { return Redirect(\"/\"); }\n"
+         "    }\n}\n"}};
+    ASSERT_TRUE(et_handles_exact_routes(f, 1, want, 0, route_qns));
+    ASSERT_TRUE(et_handles_exact_routes(f, 1, want, 1, route_qns));
+    PASS();
+}
+
+/* #1146: Laravel's two class-based handler forms —
+ *   Route::get('/x', [UserController::class, 'show'])   (controller method)
+ *   Route::get('/x', GetCurrentUserController::class)   (invokable: __invoke)
+ * got no HANDLES edge, because the handler scan only took identifiers and
+ * strings. The cross-repo matcher needs HANDLES on the Route, so apps written
+ * this way (the #1146 reporter's included) produced 0 CROSS_HTTP_CALLS.
+ * Controls: an Admin\UserController::show with the same short name (the `use`
+ * statement picks the class), an alias import, a fully-qualified class that is
+ * not imported, a package class under a PSR-4 root whose folder does not
+ * mirror its namespace (Acme\Blog\ -> packages/blog/src/), a decoy __invoke on
+ * another class, and two vendor classes that are not in the repo — those must
+ * get no HANDLES edge at all rather than bind to some other class's
+ * same-named method. composer.json comes first so the no-composer variant
+ * below can index the same fixture without it. */
+static const EtFile et_laravel_class_handlers[] = {
+    {"composer.json", "{\"autoload\": {\"psr-4\": {\"App\\\\\": \"app/\", "
+                      "\"Acme\\\\Blog\\\\\": \"packages/blog/src/\"}}}\n"},
+    {"packages/blog/src/Http/PostsController.php",
+     "<?php\nnamespace Acme\\Blog\\Http;\n\n"
+     "class PostsController {\n"
+     "    public function index() { return ['posts' => []]; }\n}\n"},
+    {"app/Http/Controllers/UserController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class UserController {\n"
+     "    public function show($id) { return ['id' => $id]; }\n"
+     "    public function index() { return []; }\n}\n"},
+    {"app/Http/Controllers/Admin/UserController.php",
+     "<?php\nnamespace App\\Http\\Controllers\\Admin;\n\n"
+     "class UserController {\n"
+     "    public function show($id) { return ['admin' => $id]; }\n}\n"},
+    {"app/Http/Controllers/PostController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class PostController {\n"
+     "    public function show($id) { return ['post' => $id]; }\n}\n"},
+    {"app/Http/Controllers/GetCurrentUserController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class GetCurrentUserController {\n"
+     "    public function __invoke() { return ['me' => true]; }\n}\n"},
+    {"app/Http/Controllers/HealthController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class HealthController {\n"
+     "    public function __invoke() { return ['ok' => true]; }\n}\n"},
+    {"routes/api.php",
+     "<?php\n"
+     "use App\\Http\\Controllers\\UserController;\n"
+     "use App\\Http\\Controllers\\GetCurrentUserController as CurrentUser;\n"
+     "use Acme\\Blog\\Http\\PostsController;\n"
+     "use Illuminate\\Support\\Facades\\Route;\n\n"
+     "Route::get('/users/{id}', [UserController::class, 'show']);\n"
+     "Route::get('/me', CurrentUser::class);\n"
+     "Route::get('/posts/{id}', [\\App\\Http\\Controllers\\PostController::class, 'show']);\n"
+     "Route::get('/blog', [PostsController::class, 'index']);\n"
+     "Route::get('/vendor/{id}', [VendorController::class, 'show']);\n"
+     "Route::get('/vendor-ping', VendorInvokable::class);\n"}};
+
+enum { ET_LARAVEL_CLASS_FILES = 8 };
+
+static const EtHandles et_laravel_class_handles[] = {
+    {"Controllers.UserController.UserController.show", "/users/{id}"},
+    {"GetCurrentUserController.__invoke", "/me"},
+    {"PostController.show", "/posts/{id}"},
+    {"PostsController.index", "/blog"},
+    {NULL, NULL}};
+
+TEST(handles_laravel_class_handlers_issue1146) {
+    ASSERT_TRUE(et_handles_exact(et_laravel_class_handlers, ET_LARAVEL_CLASS_FILES,
+                                 et_laravel_class_handles, 0));
+    PASS();
+}
+
+/* Same fixture through the parallel pipeline (> MIN_FILES_FOR_PARALLEL),
+ * whose route emitter (pass_parallel.c) is a separate code path. */
+TEST(handles_laravel_class_handlers_parallel_issue1146) {
+    ASSERT_TRUE(et_handles_exact(et_laravel_class_handlers, ET_LARAVEL_CLASS_FILES,
+                                 et_laravel_class_handles, 1));
+    PASS();
+}
+
+/* Without composer.json there is no PSR-4 map: a class is placed only where
+ * its namespace mirrors the folders (App\Http\Controllers -> app/Http/
+ * Controllers). The package class, whose folder does not mirror its
+ * namespace, then gets no handler rather than a guessed one. */
+TEST(handles_laravel_class_handlers_no_composer_issue1146) {
+    static const EtHandles want[] = {
+        {"Controllers.UserController.UserController.show", "/users/{id}"},
+        {"GetCurrentUserController.__invoke", "/me"},
+        {"PostController.show", "/posts/{id}"},
+        {NULL, NULL}};
+    ASSERT_TRUE(
+        et_handles_exact(et_laravel_class_handlers + 1, ET_LARAVEL_CLASS_FILES - 1, want, 0));
+    PASS();
+}
+
+/* A PSR-4 prefix that covers a handler class decides where the class lives,
+ * as it does for the class's `use` import (#1186): when composer would load
+ * no file holding the member, the route stays without a handler. Both routes
+ * below are covered by Acme\Blog\ -> packages/blog/src/:
+ *   /blog/missing  MissingController has no class file there at all;
+ *   /blog/archive  PostsController's class file exists but has no archive().
+ * legacy/Acme/Blog/Http mirrors the namespace and holds both members, so the
+ * namespace/folder fallback would bind both routes to a class composer never
+ * loads. It must not run for a covered class. These files are added to the
+ * fixture above, whose four handlers must keep their edges. */
+static const EtFile et_laravel_psr4_absent_extra[] = {
+    {"legacy/Acme/Blog/Http/MissingController.php",
+     "<?php\nnamespace Acme\\Blog\\Http;\n\n"
+     "class MissingController {\n"
+     "    public function index() { return ['stale' => true]; }\n}\n"},
+    {"legacy/Acme/Blog/Http/PostsController.php",
+     "<?php\nnamespace Acme\\Blog\\Http;\n\n"
+     "class PostsController {\n"
+     "    public function archive() { return ['stale' => true]; }\n}\n"},
+    {"routes/blog.php",
+     "<?php\n"
+     "use Illuminate\\Support\\Facades\\Route;\n\n"
+     "Route::get('/blog/missing', [\\Acme\\Blog\\Http\\MissingController::class, 'index']);\n"
+     "Route::get('/blog/archive', [\\Acme\\Blog\\Http\\PostsController::class, 'archive']);\n"}};
+
+enum { ET_LARAVEL_PSR4_ABSENT_EXTRA = 3 };
+
+static const char *const et_laravel_psr4_absent_routes[] = {
+    "__route__GET__/blog/missing", "__route__GET__/blog/archive", NULL};
+
+static int et_laravel_psr4_absent(int parallel) {
+    EtFile f[ET_LARAVEL_CLASS_FILES + ET_LARAVEL_PSR4_ABSENT_EXTRA];
+    memcpy(f, et_laravel_class_handlers, sizeof(et_laravel_class_handlers));
+    memcpy(f + ET_LARAVEL_CLASS_FILES, et_laravel_psr4_absent_extra,
+           sizeof(et_laravel_psr4_absent_extra));
+    return et_handles_exact_routes(f, ET_LARAVEL_CLASS_FILES + ET_LARAVEL_PSR4_ABSENT_EXTRA,
+                                   et_laravel_class_handles, parallel,
+                                   et_laravel_psr4_absent_routes);
+}
+
+TEST(handles_laravel_psr4_absent_class_issue1146) {
+    ASSERT_TRUE(et_laravel_psr4_absent(0));
+    PASS();
+}
+
+TEST(handles_laravel_psr4_absent_class_parallel_issue1146) {
+    ASSERT_TRUE(et_laravel_psr4_absent(1));
+    PASS();
+}
+
+/* Assert the exact Route set as "METHOD /path" strings: the method comes from
+ * the Route QN ("__route__PUT__/articles/{}"), the path from the node name
+ * (the raw composed path). The count must match too, so a junk Route fails. */
+static int et_route_set_exact(const EtFile *files, int nfiles, const char **want, int parallel) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int wanted = 0;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+    while (want[wanted] && wanted < ET_ROUTE_ASSERT_MAX) {
+        wanted++;
+    }
+    int ok = store != NULL &&
+             cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) ==
+                 CBM_STORE_OK &&
+             node_count == wanted;
+    for (int ni = 0; store && ni < node_count; ni++) {
+        char got[512];
+        const char *qn = nodes[ni].qualified_name ? nodes[ni].qualified_name : "";
+        const char *m = strncmp(qn, "__route__", 9) == 0 ? qn + 9 : qn;
+        const char *end = strstr(m, "__");
+        snprintf(got, sizeof(got), "%.*s %s", end ? (int)(end - m) : 0, m,
+                 nodes[ni].name ? nodes[ni].name : "");
+        int matched = 0;
+        for (int wi = 0; wi < wanted; wi++) {
+            if (!found[wi] && strcmp(got, want[wi]) == 0) {
+                found[wi] = matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            ok = 0;
+            fprintf(stderr, "  [ET-ROUTESET] unexpected %s\n", got);
+        }
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        if (!found[wi]) {
+            ok = 0;
+            fprintf(stderr, "  [ET-ROUTESET] missing %s\n", want[wi]);
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-ROUTESET] FAIL (%s path) expected=%d actual=%d\n",
+                parallel ? "parallel" : "sequential", wanted, node_count);
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* #1146: Laravel writes most route URIs without the leading slash —
+ * Route::get('users', ...) serves /users, Route::put('{article}', ...) inside
+ * prefix('articles') serves /articles/{article}, and '' is the group root.
+ * Both route passes only minted a Route for a first argument starting with
+ * '/', so Firefly III's API (258 registrations) and laravel.io's PUT/DELETE
+ * API routes had no Route at all. Covers the facade, a facade chain
+ * (Route::middleware()->get), the $router instance, the chain-form and the
+ * array-form prefix group (Route::group(['prefix' => ...], fn)), and a
+ * trailing slash. */
+static const EtFile et_laravel_slashless[] = {
+    {"routes/api.php",
+     "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+     "Route::get('users', 'UserController@index');\n"
+     "Route::post('users/', 'UserController@store');\n"
+     "Route::prefix('articles')->group(function () {\n"
+     "    Route::get('', 'ArticlesController@index');\n"
+     "    Route::put('{article}', 'ArticlesController@update');\n"
+     "    Route::delete('{article}', 'ArticlesController@delete');\n"
+     "});\n"
+     "Route::group(['prefix' => 'v1/autocomplete', 'as' => 'api.v1.'], static function (): void {\n"
+     "    Route::get('accounts', ['uses' => 'AccountController@accounts', 'as' => 'accounts']);\n"
+     "});\n"
+     "Route::middleware('auth')->get('dashboard', 'DashboardController@show');\n"
+     "$router->get('lumen/users', 'UserController@index');\n"}};
+
+static const char *et_laravel_slashless_routes[] = {"GET /users",
+                                                    "POST /users",
+                                                    "GET /articles",
+                                                    "PUT /articles/{article}",
+                                                    "DELETE /articles/{article}",
+                                                    "GET /v1/autocomplete/accounts",
+                                                    "GET /dashboard",
+                                                    "GET /lumen/users",
+                                                    NULL};
+
+TEST(routes_laravel_slashless_issue1146) {
+    ASSERT_TRUE(et_route_set_exact(et_laravel_slashless, 1, et_laravel_slashless_routes, 0));
+    PASS();
+}
+
+TEST(routes_laravel_slashless_parallel_issue1146) {
+    ASSERT_TRUE(et_route_set_exact(et_laravel_slashless, 1, et_laravel_slashless_routes, 1));
+    PASS();
+}
+
+/* The string action of a slashless registration — 'index' inside a
+ * Route::controller() group, 'UserController@store' — does not say which
+ * class owns the method, so resolving it could only guess a same-named
+ * function anywhere in the repo (on krayin/laravel-crm 'update' and 'destroy'
+ * bound a chart.js function). Such routes are minted without a guessed
+ * HANDLES edge. Decoys: a JS function and a PHP method per action name. */
+TEST(routes_laravel_slashless_no_guessed_handlers_issue1146) {
+    static const char *want[] = {"GET /leads", "PUT /leads/edit/{id}", "POST /users", NULL};
+    static const EtFile f[] = {
+        {"routes/web.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+         "Route::controller(LeadController::class)->prefix('leads')->group(function () {\n"
+         "    Route::get('', 'index');\n"
+         "    Route::put('edit/{id}', 'update');\n"
+         "});\n"
+         "Route::post('users', 'UserController@store');\n"},
+        {"resources/js/chart.js",
+         "function index() { return 1; }\nfunction update() { return 2; }\n"},
+        {"app/Http/Controllers/ActivityController.php",
+         "<?php\nnamespace App\\Http\\Controllers;\n\n"
+         "class ActivityController {\n    public function store() { return 1; }\n}\n"}};
+    ASSERT_TRUE(et_route_set_exact(f, 3, want, 0));
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, f, 3);
+    int handles = store ? cbm_store_count_edges_by_type(store, lp.project, "HANDLES") : -1;
+    et_cleanup(&lp, store);
+    ASSERT_EQ(handles, 0);
+    PASS();
+}
+
+/* Precision guard for the slashless form: only a Laravel route registration
+ * (the Route facade, or $router) has its URI normalised. A string first
+ * argument of any other get/post call — a request input, a cache key, config,
+ * a collection or session lookup, a property that merely holds a router, a
+ * test client call — stays what it is and mints no Route. */
+TEST(routes_laravel_slashless_no_junk_issue1146) {
+    static const char *want[] = {"GET /real", NULL};
+    static const EtFile f[] = {
+        {"routes/web.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+         "use Illuminate\\Support\\Facades\\Cache;\n\n"
+         "Route::get('real', 'RealController@show');\n\n"
+         "class UsersController {\n"
+         "    public function index($request) {\n"
+         "        $name = $request->get('name');\n"
+         "        $q = $request->query->get('q');\n"
+         "        $v = Cache::get('users.count');\n"
+         "        $c = config('app.name');\n"
+         "        $k = collect(['a' => 1])->get('a');\n"
+         "        $s = session()->get('key');\n"
+         "        $r = $this->router->get('status');\n"
+         "        $p = $this->post('login', []);\n"
+         "        return $this->get('users');\n"
+         "    }\n}\n"}};
+    ASSERT_TRUE(et_route_set_exact(f, 1, want, 0));
     PASS();
 }
 
@@ -2121,7 +2859,12 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_express_ts);
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
+    RUN_TEST(handles_fiber_group_prefix_sequential_issue686);
+    RUN_TEST(handles_fiber_group_prefix_parallel_issue686);
+    RUN_TEST(handles_gin_group_prefix_issue686);
     RUN_TEST(handles_spring_java);
+    RUN_TEST(data_flows_test_files_pair_within_their_file_sequential);
+    RUN_TEST(data_flows_test_files_pair_within_their_file_parallel);
     RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_jaxrs_java);
@@ -2129,6 +2872,12 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_spring_java_relative_string_not_route);
     RUN_TEST(handles_jaxrs_scala);
     RUN_TEST(handles_aspnet_csharp);
+    RUN_TEST(handles_aspnet_attribute_routes_issue1692);
+    RUN_TEST(handles_aspnet_attribute_routes_issue1041);
+    RUN_TEST(handles_aspnet_route_tokens_issue1692);
+    RUN_TEST(handles_aspnet_override_constraints_issue1692);
+    RUN_TEST(handles_aspnet_non_controller_control_issue1692);
+    RUN_TEST(handles_aspnet_overload_verbs_both_venues_issue1692);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
     RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
@@ -2138,6 +2887,15 @@ SUITE(edge_types_probe) {
     RUN_TEST(routes_laravel_routeserviceprovider_control_issue1146);
     RUN_TEST(routes_laravel_withrouting_nonliteral_prefix_issue1146);
     RUN_TEST(routes_laravel_withrouting_parallel_subdir_issue1146);
+    RUN_TEST(handles_laravel_class_handlers_issue1146);
+    RUN_TEST(handles_laravel_class_handlers_parallel_issue1146);
+    RUN_TEST(handles_laravel_class_handlers_no_composer_issue1146);
+    RUN_TEST(handles_laravel_psr4_absent_class_issue1146);
+    RUN_TEST(handles_laravel_psr4_absent_class_parallel_issue1146);
+    RUN_TEST(routes_laravel_slashless_issue1146);
+    RUN_TEST(routes_laravel_slashless_parallel_issue1146);
+    RUN_TEST(routes_laravel_slashless_no_guessed_handlers_issue1146);
+    RUN_TEST(routes_laravel_slashless_no_junk_issue1146);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 

@@ -2713,6 +2713,25 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                                        empty_types, NULL, NULL, tree_sitter_objectscript_routine,
                                        NULL},
 
+    // CBM_LANG_OPENAPI — openapi.json / swagger.json: the JSON grammar without
+    // JSON's node per key (thousands in a generated spec); cbm_extract_openapi
+    // (openapi.c) reads the operations from the tree.
+    [CBM_LANG_OPENAPI] = {CBM_LANG_OPENAPI, empty_types, empty_types, empty_types,
+                          json_module_types, empty_types, empty_types, empty_types, empty_types,
+                          empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
+                          tree_sitter_json, NULL},
+
+    // CBM_LANG_PDF — PDF documents. No grammar row: extraction reads the text
+    // layer itself (cbm_pdf_extract_document, doc_pdf.c) before any grammar is
+    // looked up, so this language never reaches cbm_lang_spec()/cbm_ts_language().
+    // Left as a zero spec.
+
+    // CBM_LANG_ASCIIDOC — AsciiDoc documents. No grammar row, as PDF: extraction
+    // reads the file itself (cbm_adoc_extract_document, doc_adoc.c). Zero spec.
+
+    // CBM_LANG_DIAGRAM — diagram files. No grammar row, as PDF: extraction reads
+    // the file itself (cbm_extract_diagram_file, diagram.c). Zero spec.
+
     // CBM_LANG_OBJECTSCRIPT_EXPORT — Studio Export XML. No grammar row: the
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches

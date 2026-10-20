@@ -540,7 +540,7 @@
             Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI,
             Plandex, and SWE-agent. Warp is counted above for its detected skill installation; its MCP connection
             remains manual. Windows users run <code>install.ps1</code>. Also available via <code>npm</code>,
-            <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
+            <code>pip</code>, Homebrew, Scoop, AUR, and <code>go install</code>.
         </p>
         <p class="muted">
             Lifecycle installation follows documented context contracts: Qoder uses <code>SessionStart</code>,
@@ -728,7 +728,7 @@
             </div>
             <div class="feature">
                 <h3>Auto-sync</h3>
-                <p>A background watcher detects changes and re-indexes incrementally. No manual reindex after editing files.</p>
+                <p>A background watcher detects changes in the project your MCP session is working in and re-indexes it incrementally. No manual reindex after editing files there.</p>
             </div>
             <div class="feature">
                 <h3>Team-shared graph artifact</h3>
@@ -805,7 +805,7 @@
 
         <h3>Do I need Docker or a runtime?</h3>
         <p>The native install needs no language runtime. It is a native executable with authenticated release-owned
-           assets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64); npm, PyPI, and Go wrapper
+           assets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64); npm, PyPI, and Go wrapper
            installations naturally use their package runtime.</p>
 
         <h3>How does it stay up to date as I edit code?</h3>

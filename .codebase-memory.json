@@ -14,12 +14,30 @@
       },
       {
         "id": "engine",
-        "paths": [".codebase-memory.json", "src/mcp/test_impact*", "src/store/store_impact.*"],
+        "paths": [
+          ".codebase-memory.json",
+          "src/mcp/test_impact*",
+          "src/store/store_impact.*",
+          "scripts/test-impact/**",
+          "scripts/ci/test-impact-*"
+        ],
         "action": "run_all"
       },
       {
         "id": "build",
-        "paths": ["scripts/**", "test-infrastructure/**", "pkg/**"],
+        "paths": [
+          "scripts/build.sh",
+          "scripts/env.sh",
+          "scripts/test.sh",
+          "scripts/run-tests-parallel.sh",
+          "scripts/run-test-wave.py",
+          "scripts/path-safety.sh",
+          "scripts/clean.sh",
+          "scripts/suite-failure-report.sh",
+          "scripts/ci/verify-shard-union.sh",
+          "scripts/embed-frontend.sh",
+          "/.gitattributes"
+        ],
         "action": "run_all"
       },
       {
@@ -35,13 +53,31 @@
       },
       {
         "id": "contracts",
-        "paths": ["tests/**/*.{sh,py,json,txt}"],
+        "paths": ["tests/**/*.{sh,py,json,txt,ps1}"],
         "action": "ignore"
       },
       {
         "id": "notices",
         "paths": ["NOTICE*", "CHANGELOG*", "THIRD_PARTY*"],
         "action": "ignore"
+      },
+      {
+        "id": "repo-data",
+        "paths": [
+          "scripts/**",
+          "pkg/**",
+          "test-infrastructure/**",
+          "docs/**",
+          "**/*.md",
+          "graph-ui/**",
+          "tools/**",
+          "tests/fuzz/corpus/**",
+          "/{.clang-format,.clang-tidy,.cppcheck,.gitignore,.gitleaksignore,DCO,Formula}",
+          "/{flake.lock,flake.nix,glama.json,install.ps1,install.sh,server.json}"
+        ],
+        "action": "referencing_tests",
+        "key": "path",
+        "unreferenced": "ignore"
       }
     ],
     "unmapped_files": "run_all",

@@ -66,6 +66,16 @@ CBM_SOAK_MODE="${CBM_SOAK_MODE:-default}"
 RESULTS_DIR="${RESULTS_DIR:-soak-results}"
 mkdir -p "$RESULTS_DIR"
 
+# One latency ceiling judges a slow call (Check 4 below). The per-call read
+# waits past it, so the measured latency, not the read timeout, gives the
+# verdict; a reply that never comes still ends the read. GitHub's
+# windows-11-arm image (2026-10) answers the PowerShell-backed search_code in
+# ~23 s per call (1.1 s for v0.11.0 and v0.12.0 alike on a local Windows ARM64
+# VM), and the old fixed 30 s read failed that leg on one borderline call while
+# the 60 s ceiling itself held.
+SOAK_MAX_QUERY_LATENCY_S=60
+SOAK_CALL_READ_TIMEOUT_S=$((SOAK_MAX_QUERY_LATENCY_S + 30))
+
 # Every product process below must reach a daemon rendezvous this run owns.
 # Only CBM_RUNTIME_DIR moves that rendezvous — a private CBM_CACHE_DIR alone
 # still shares the operator's account daemon (#1691, #1696).
@@ -502,12 +512,13 @@ mcp_call() {
     # Send request to server stdin
     echo "$req" >&3
 
-    # Read and validate one response (wait up to 30s). A JSON-RPC error or
-    # tool-level isError is a failed operation, not a successful round-trip.
+    # Read and validate one response (wait past the latency ceiling, see
+    # SOAK_CALL_READ_TIMEOUT_S). A JSON-RPC error or tool-level isError is a
+    # failed operation, not a successful round-trip.
     local resp=""
     local exit_code=1
     MCP_LAST_RESPONSE=""
-    if read -r -t 30 resp <&4 2>/dev/null; then
+    if read -r -t "$SOAK_CALL_READ_TIMEOUT_S" resp <&4 2>/dev/null; then
         MCP_LAST_RESPONSE="$resp"
         if json_rpc_response_ok "$id" "$resp"; then
             exit_code=0
@@ -947,9 +958,9 @@ fi
 MAX_LATENCY=$(awk -F, 'NR>1 && $2!="index_repository" { if ($3>max) max=$3 } END { print max+0 }' "$LATENCY_CSV")
 MAX_INDEX=$(awk -F, 'NR>1 && $2=="index_repository" { if ($3>max) max=$3 } END { print max+0 }' "$LATENCY_CSV")
 echo "Max query latency: ${MAX_LATENCY}ms (index: ${MAX_INDEX}ms)" | tee -a "$SUMMARY"
-# 60s threshold — MSYS2/Wine adds significant overhead to all operations
-if [ "${MAX_LATENCY:-0}" -gt 60000 ] 2>/dev/null; then
-    echo "FAIL: max query latency ${MAX_LATENCY}ms > 60s" | tee -a "$SUMMARY"
+# SOAK_MAX_QUERY_LATENCY_S — MSYS2/Wine adds significant overhead to all operations
+if [ "${MAX_LATENCY:-0}" -gt $((SOAK_MAX_QUERY_LATENCY_S * 1000)) ] 2>/dev/null; then
+    echo "FAIL: max query latency ${MAX_LATENCY}ms > ${SOAK_MAX_QUERY_LATENCY_S}s" | tee -a "$SUMMARY"
     PASS=false
 fi
 

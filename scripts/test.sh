@@ -195,6 +195,18 @@ if [ "$SANITIZE_GIVEN" -eq 0 ] && [ "${MSYSTEM:-}" = "CLANGARM64" ]; then
     MAKE_ARGS+=("SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer")
 fi
 
+# ASan stack-use-after-return runs in the test-diag lane only (_test.yml and
+# `make -f Makefile.cbm diag` set detect_stack_use_after_return=1). gcc's
+# libasan turns it ON by default, and on aarch64 gcc 13/14 never clear a freed
+# fake frame's in-use flag: past 8,192 frames per size class every instrumented
+# call scans that flag array and the check stops detecting anything (gcc arm64
+# ran `extraction` in 688 s, amd64 in 16 s). Off here; an explicit setting wins.
+case "${ASAN_OPTIONS:-}" in
+    *detect_stack_use_after_return*) ;;
+    *) ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_stack_use_after_return=0" ;;
+esac
+export ASAN_OPTIONS
+
 EXPECTED_SANITIZED=1
 if [ "$SANITIZE_GIVEN" -eq 1 ]; then
     case "$SANITIZE_VALUE" in
@@ -297,6 +309,12 @@ bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 
 echo "=== Step 0i: parallel suite scheduler contract ==="
 bash "$ROOT/tests/test_parallel_harness_contract.sh"
+
+# Step 0i2: a red suite's summary must show the sanitizer report and the test
+# that was running, not only "FAIL" lines and a shadow-byte legend. Drives the
+# real summary functions with fabricated suite logs, so it runs everywhere.
+echo "=== Step 0i2: suite failure-report contract ==="
+bash "$ROOT/tests/test_failure_report_contract.sh"
 
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"

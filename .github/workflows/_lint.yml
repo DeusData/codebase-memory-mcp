@@ -23,8 +23,11 @@ jobs:
     runs-on: ubuntu-24.04
     # 15 min proved too tight on a slow runner day and a timed-out lint reads
     # as "cancelled", which the release graph must treat as a hard stop; keep
-    # a bound, but one only a genuine hang can hit (normal runtime ~5 min).
-    timeout-minutes: 30
+    # a bound, but one only a genuine hang can hit. 30 min stopped being that
+    # in 2026-10: single-process cppcheck over a src tree that grew ~60 % in
+    # files took the lint step from ~8 to 22-29 min, and three runs on
+    # 2026-10-13 were cancelled at 30 min with cppcheck still alive.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

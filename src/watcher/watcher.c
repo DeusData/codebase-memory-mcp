@@ -99,6 +99,12 @@ typedef struct {
      * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
      * the signature needs this to stat them. Resolved once at baseline. */
     char repo_cdup[CBM_SZ_4K];
+    /* Published status for cbm_watcher_project_info (#2167). The poll path
+     * writes these while index_status reads them from a session thread, so
+     * they are atomics: the diagnostic read is never a data race. */
+    atomic_int status_strategy;         /* cbm_watcher_strategy_t */
+    atomic_int status_interval_ms;      /* mirrors interval_ms */
+    _Atomic int64_t status_last_scan_s; /* wall-clock seconds; 0 = none yet */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -117,6 +123,7 @@ struct cbm_watcher {
     cbm_watcher_project_pruned_fn project_pruned;
     void *mutation_context;
     atomic_int stopped;
+    atomic_bool running;
     /* Opt-in (#1948): poll non-git roots by tree signature. Default false —
      * non-git roots are not watched. Read at each project's baseline. */
     atomic_bool poll_non_git;
@@ -635,21 +642,18 @@ static uint64_t sig_fold(uint64_t h, const void *data, size_t len) {
     return h;
 }
 
-/* Platform-portable mtime_ns (mirrors pipeline_incremental.c). */
-static int64_t sig_stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * NS_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 /* Fold a listed path's (size, mtime) into the signature so an in-place edit
  * of an already-dirty file still produces a new signature. A failed stat
  * (deleted file, quoting artifact) degrades to the entry text alone — the
- * deletion itself is represented by the porcelain status. */
+ * deletion itself is represented by the porcelain status.
+ *
+ * cbm_path_info_utf8 rather than raw stat(): on Windows, stat()'s st_mtime
+ * is SECOND-granularity, so two edits inside one second with an unchanged
+ * size produced the same signature — a missed reindex the Windows leg
+ * caught as test_watcher:2045. The path-info helper reads FILETIME (100ns
+ * ticks) and handles non-ASCII paths. A transiently unreadable file (AV
+ * real-time scan holding a just-written file) gets ONE short retry so the
+ * degradation stays for genuinely-gone files only. */
 /* `rel` is repository-relative (that is what porcelain prints), so it is joined
  * through `cdup` — the hop from root_path up to the repository root — rather than
  * onto root_path directly. cdup is "" when the project IS the repository root,
@@ -658,12 +662,15 @@ static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char
                                    const char *rel) {
     char abs[CBM_SZ_4K];
     snprintf(abs, sizeof(abs), "%s/%s%s", root_path, cdup ? cdup : "", rel);
-    struct stat st;
-    if (stat(abs, &st) == 0) {
-        int64_t mt = sig_stat_mtime_ns(&st);
-        int64_t sz = (int64_t)st.st_size;
-        h = sig_fold(h, &mt, sizeof(mt));
-        h = sig_fold(h, &sz, sizeof(sz));
+    cbm_path_info_t info;
+    int rc = cbm_path_info_utf8(abs, &info);
+    if (rc != 0) {
+        cbm_usleep(1000);
+        rc = cbm_path_info_utf8(abs, &info);
+    }
+    if (rc == 0) {
+        h = sig_fold(h, &info.mtime_ns, sizeof(info.mtime_ns));
+        h = sig_fold(h, &info.size, sizeof(info.size));
     }
     return h;
 }
@@ -922,6 +929,9 @@ static project_state_t *state_new(const char *name, const char *root_path) {
     }
     atomic_init(&s->registered, true);
     s->interval_ms = POLL_BASE_MS;
+    atomic_init(&s->status_strategy, CBM_WATCHER_STRATEGY_PENDING);
+    atomic_init(&s->status_interval_ms, POLL_BASE_MS);
+    atomic_init(&s->status_last_scan_s, 0);
     return s;
 }
 
@@ -995,7 +1005,7 @@ static root_status_t root_status(const char *root_path, int *out_errno) {
  * each call so tests/operators can adjust via setenv without a restart —
  * same convention as cbm_max_file_bytes in limits.c. */
 static long prune_grace_s(void) {
-    const char *raw = getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    const char *raw = cbm_runtime_getenv("CBM_WATCHER_PRUNE_GRACE_S");
     if (raw && raw[0]) {
         errno = 0;
         char *end = NULL;
@@ -1096,6 +1106,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     cbm_mutex_init(&w->projects_lock);
     cbm_mutex_init(&w->coordination_lock);
     atomic_init(&w->stopped, 0);
+    atomic_init(&w->running, false);
     atomic_init(&w->poll_non_git, false);
     return w;
 }
@@ -1251,6 +1262,21 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_unlock(&w->projects_lock);
 }
 
+cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w,
+                                                        const char *project_name) {
+    cbm_watcher_project_status_t status = {0};
+    if (!w) {
+        return status;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *project = project_name ? cbm_ht_get(w->projects, project_name) : NULL;
+    status.registered = project && atomic_load_explicit(&project->registered, memory_order_acquire);
+    status.running = atomic_load_explicit(&w->running, memory_order_acquire) &&
+                     !atomic_load_explicit(&w->stopped, memory_order_acquire);
+    cbm_mutex_unlock(&w->projects_lock);
+    return status;
+}
+
 int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return -1;
@@ -1260,6 +1286,25 @@ int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name) 
     int failures = s ? s->index_failures : -1;
     cbm_mutex_unlock(&w->projects_lock);
     return failures;
+}
+
+bool cbm_watcher_project_info(cbm_watcher_t *w, const char *project_name,
+                              cbm_watcher_project_info_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!w || !project_name || !out) {
+        return false;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    if (s) {
+        out->strategy = (cbm_watcher_strategy_t)atomic_load(&s->status_strategy);
+        out->poll_interval_ms = atomic_load(&s->status_interval_ms);
+        out->last_scan_unix_s = atomic_load(&s->status_last_scan_s);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    return s != NULL;
 }
 
 int cbm_watcher_watch_count(cbm_watcher_t *w) {
@@ -1274,6 +1319,23 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
+/* Publish what index_status reports: the strategy, the current cadence and,
+ * when a check just completed, the wall-clock time of that scan. A non-git
+ * root is "tree" when watch_non_git polls it (#1948), else "none". */
+static void publish_status(project_state_t *s, bool scanned) {
+    cbm_watcher_strategy_t strategy = CBM_WATCHER_STRATEGY_NONE;
+    if (s->is_git) {
+        strategy = CBM_WATCHER_STRATEGY_GIT;
+    } else if (s->tree_poll) {
+        strategy = CBM_WATCHER_STRATEGY_TREE;
+    }
+    atomic_store(&s->status_strategy, strategy);
+    atomic_store(&s->status_interval_ms, s->interval_ms);
+    if (scanned) {
+        atomic_store(&s->status_last_scan_s, (int64_t)time(NULL));
+    }
+}
+
 /* Init baseline for a project: check if git, get HEAD, count files */
 static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
     struct stat st;
@@ -1281,6 +1343,7 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
         s->is_git = false;
+        publish_status(s, false);
         return true;
     }
 
@@ -1358,6 +1421,7 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
     }
 
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+    publish_status(s, true);
     return true;
 }
 
@@ -1524,6 +1588,7 @@ static void commit_baselines(cbm_watcher_t *w, project_state_t *s) {
     if (git_file_count(w, s, &file_count) == WATCHER_GIT_OK) {
         s->file_count = file_count;
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+        publish_status(s, false);
     }
 }
 
@@ -1595,6 +1660,7 @@ static void poll_project(const char *key, void *val, void *ud) {
     if (!check_changes(ctx->w, s, &changed)) {
         return;
     }
+    publish_status(s, true);
     if (!changed) {
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
         return;
@@ -1734,6 +1800,7 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
         base_interval_ms = POLL_BASE_MS;
     }
 
+    atomic_store_explicit(&w->running, true, memory_order_release);
     cbm_log_info("watcher.start", "interval_ms", base_interval_ms > 999 ? "multi-sec" : "fast");
 
     while (!atomic_load(&w->stopped)) {
@@ -1751,11 +1818,37 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
         }
     }
 
+    atomic_store_explicit(&w->running, false, memory_order_release);
     cbm_log_info("watcher.stop");
     return 0;
 }
 
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: expose one project's dirty-state signatures so a failing
+ * watcher assertion can print WHY. The watcher-poll flake family blocked
+ * two releases precisely because a bare count assert cannot distinguish
+ * "the poll saw an unchanged signature" (sigs equal — a detection miss)
+ * from "the reindex path itself misbehaved" (sigs differ). Returns 0 and
+ * fills the committed and pending signatures, or nonzero when the project
+ * is not watched. */
+int cbm_watcher_test_dirty_sigs(cbm_watcher_t *w, const char *project, uint64_t *last_out,
+                                uint64_t *pending_out) {
+    if (!w || !project) {
+        return -1;
+    }
+    project_state_t *s = cbm_ht_get(w->projects, project);
+    if (!s) {
+        return -1;
+    }
+    if (last_out) {
+        *last_out = s->last_dirty_sig;
+    }
+    if (pending_out) {
+        *pending_out = s->pending_dirty_sig;
+    }
+    return 0;
+}
+
 int cbm_watcher_test_pending_free_count(cbm_watcher_t *w) {
     if (!w) {
         return -1;

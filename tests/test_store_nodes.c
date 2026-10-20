@@ -402,6 +402,122 @@ TEST(store_node_find_by_label) {
     PASS();
 }
 
+static bool scan_str_same(const char *a, const char *b) {
+    return (!a && !b) || (a && b && strcmp(a, b) == 0);
+}
+
+static bool scan_node_same(const cbm_node_t *a, const cbm_node_t *b) {
+    return a->id == b->id && scan_str_same(a->project, b->project) &&
+           scan_str_same(a->label, b->label) && scan_str_same(a->name, b->name) &&
+           scan_str_same(a->qualified_name, b->qualified_name) &&
+           scan_str_same(a->file_path, b->file_path) && a->start_line == b->start_line &&
+           a->end_line == b->end_line && scan_str_same(a->properties_json, b->properties_json);
+}
+
+/* The streamed scan gives the eager scan's rows, field for field and in the
+ * same order, at any batch size, while other lookups (including the eager
+ * scans' own cached statements) run between batches. Returns the row count,
+ * or -1 on the first difference; *paged tells whether the scan paged. */
+static int scan_matches_eager(cbm_store_t *s, const char *project, const char *label, int batch,
+                              bool *paged) {
+    cbm_node_t *eager = NULL;
+    int n = 0;
+    int rc = label ? cbm_store_find_nodes_by_label(s, project, label, &eager, &n)
+                   : cbm_store_find_nodes(s, project, &eager, &n);
+    if (rc != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_node_scan_t *scan = cbm_store_node_scan_open(s, project, label);
+    *paged = cbm_store_node_scan_paged(scan);
+    cbm_node_t buf[64];
+    int seen = 0;
+    bool same = scan != NULL && batch <= 64;
+    int got = 0;
+    while (same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got > 0) {
+        for (int i = 0; i < got; i++, seen++) {
+            same = same && seen < n && scan_node_same(&buf[i], &eager[seen]);
+            cbm_node_free_fields(&buf[i]);
+        }
+        cbm_node_t *other = NULL;
+        int other_n = 0;
+        (void)cbm_store_find_nodes(s, project, &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+        (void)cbm_store_find_nodes_by_label(s, project, "Class", &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+    }
+    /* An exhausted scan stays exhausted. */
+    same = same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got == 0;
+    cbm_store_node_scan_close(scan);
+    cbm_store_free_nodes(eager, n);
+    return same && seen == n ? n : -1;
+}
+
+/* Pages of 1, 3 and 64 rows end inside files, at file boundaries and inside
+ * the NULL file_path rows, which the eager all-nodes order puts first. The
+ * upsert API stores "" for a missing path; other writers may store NULL. */
+TEST(store_node_scan_streams_eager_scan_order) {
+    enum { SCAN_NODES = 60 };
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_store_upsert_project(s, "other", "/tmp/other");
+    static const char *const labels[] = {"Function", "Class", "Method"};
+    static const char *const files[] = {"b.c", "a.c", "", "c.c"};
+    int in_test = 0;
+    int test_functions = 0;
+    int other_methods = 0;
+    for (int i = 0; i < SCAN_NODES; i++) {
+        bool other = i % 4 == 3;
+        char name[32];
+        char qn[64];
+        char props[64];
+        snprintf(name, sizeof(name), "n%d", (i * 17) % 40);
+        snprintf(qn, sizeof(qn), "%s.n%d", other ? "other" : "test", i);
+        snprintf(props, sizeof(props), "{\"complexity\":%d}", i);
+        cbm_node_t n = {.project = other ? "other" : "test",
+                        .label = labels[i % 3],
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = files[(i / 2) % 4],
+                        .start_line = i,
+                        .end_line = i + 5,
+                        .properties_json = i % 5 ? props : NULL};
+        ASSERT_GT(cbm_store_upsert_node(s, &n), 0);
+        in_test += other ? 0 : 1;
+        test_functions += !other && i % 3 == 0 ? 1 : 0;
+        other_methods += other && i % 3 == 2 ? 1 : 0;
+    }
+    ASSERT_EQ(cbm_store_exec(s, "UPDATE nodes SET file_path = NULL WHERE start_line % 7 = 0;"), 0);
+    cbm_node_t *eager = NULL;
+    int eager_n = 0;
+    ASSERT_EQ(cbm_store_find_nodes(s, "test", &eager, &eager_n), CBM_STORE_OK);
+    ASSERT_TRUE(eager_n > 0 && eager[0].file_path == NULL); /* NULL rows come first */
+    cbm_store_free_nodes(eager, eager_n);
+
+    static const int batches[] = {1, 3, 64};
+    bool paged = false;
+    for (size_t b = 0; b < sizeof(batches) / sizeof(batches[0]); b++) {
+        ASSERT_EQ(scan_matches_eager(s, "test", NULL, batches[b], &paged), in_test);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "test", "Function", batches[b], &paged), test_functions);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "other", NULL, batches[b], &paged),
+                  SCAN_NODES - in_test); /* project filter */
+        ASSERT_EQ(scan_matches_eager(s, "other", "Method", batches[b], &paged), other_methods);
+        ASSERT_EQ(scan_matches_eager(s, "test", "NoSuchLabel", batches[b], &paged), 0);
+        ASSERT_EQ(scan_matches_eager(s, "missing", NULL, batches[b], &paged), 0);
+    }
+
+    /* Without the node indexes the eager queries take other plans, which the
+     * pages would not reproduce: the scan hands out the eager rows instead. */
+    ASSERT_EQ(cbm_store_drop_indexes(s), 0);
+    ASSERT_EQ(scan_matches_eager(s, "test", NULL, 3, &paged), in_test);
+    ASSERT_FALSE(paged);
+    ASSERT_EQ(scan_matches_eager(s, "test", "Function", 3, &paged), test_functions);
+    ASSERT_FALSE(paged);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_node_find_by_file) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -2516,6 +2632,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
+    RUN_TEST(store_node_scan_streams_eager_scan_order);
     RUN_TEST(store_node_find_by_file);
     RUN_TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469);
     RUN_TEST(store_file_outline_fails_closed_on_text_budget_issue469);

@@ -317,11 +317,13 @@ void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
     free(coll);
 }
 
-char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module_path) {
-    if (!map || !module_path) {
-        return NULL;
+bool cbm_path_alias_resolve_into(const cbm_path_alias_map_t *map, const char *module_path,
+                                 char *out, size_t cap) {
+    if (!map || !module_path || !out || cap == 0) {
+        return false;
     }
     size_t mod_len = strlen(module_path);
+    int n = CBM_NOT_FOUND;
 
     for (int i = 0; i < map->count; i++) {
         const cbm_path_alias_t *e = &map->entries[i];
@@ -339,41 +341,35 @@ char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module
                 strcmp(module_path + mod_len - suffix_len, e->alias_suffix) != 0) {
                 continue;
             }
-            size_t wild_len = mod_len - prefix_len - suffix_len;
-            const char *wild_start = module_path + prefix_len;
-            size_t tp_len = strlen(e->target_prefix);
-            size_t ts_len = strlen(e->target_suffix);
-            char *result = malloc(tp_len + wild_len + ts_len + 1);
-            if (!result) {
-                return NULL;
-            }
-            memcpy(result, e->target_prefix, tp_len);
-            memcpy(result + tp_len, wild_start, wild_len);
-            memcpy(result + tp_len + wild_len, e->target_suffix, ts_len);
-            result[tp_len + wild_len + ts_len] = '\0';
-            return strip_resolved_ext(result);
+            int wild_len = (int)(mod_len - prefix_len - suffix_len);
+            n = snprintf(out, cap, "%s%.*s%s", e->target_prefix, wild_len, module_path + prefix_len,
+                         e->target_suffix);
+            break;
         }
 
         if (strcmp(module_path, e->alias_prefix) == 0) {
-            return strip_resolved_ext(strdup(e->target_prefix));
+            n = snprintf(out, cap, "%s", e->target_prefix);
+            break;
         }
     }
 
     /* baseUrl fallback. Apply only to non-relative imports that look
      * sub-path-ish (contain '/' but don't start with '.' or '@'); skips
      * obvious package names like "react" or "lodash". */
-    if (map->base_url && module_path[0] != '.' && module_path[0] != '@' &&
+    if (n < 0 && map->base_url && module_path[0] != '.' && module_path[0] != '@' &&
         strchr(module_path, '/') != NULL) {
-        size_t bu_len = strlen(map->base_url);
-        size_t need = bu_len + 1 + mod_len + 1;
-        char *result = malloc(need);
-        if (!result) {
-            return NULL;
-        }
-        snprintf(result, need, "%s/%s", map->base_url, module_path);
-        return strip_resolved_ext(result);
+        n = snprintf(out, cap, "%s/%s", map->base_url, module_path);
     }
-    return NULL;
+    if (n < 0 || (size_t)n >= cap) {
+        return false;
+    }
+    strip_resolved_ext(out);
+    return true;
+}
+
+char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module_path) {
+    char buf[CBM_PATH_ALIAS_RESULT_MAX];
+    return cbm_path_alias_resolve_into(map, module_path, buf, sizeof(buf)) ? strdup(buf) : NULL;
 }
 
 /* ── Repo walk ─────────────────────────────────────────────────── */

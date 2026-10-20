@@ -9,8 +9,12 @@ on:
 permissions:
   contents: read
 
+# One analysis per pull request and one per pushed branch. A newer push to main
+# cancels the analysis of an older main commit; only the newest commit's
+# results matter for main, and a merge-heavy day otherwise queues one 40-100
+# minute analysis per merge ahead of every pull request run.
 concurrency:
-  group: codeql-${{ github.ref }}-${{ github.event.pull_request.number || github.sha }}
+  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

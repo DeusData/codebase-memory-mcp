@@ -1,0 +1,110 @@
+{
+  "phase": "after-restart",
+  "startedAt": "2026-09-09T19:42:36.487Z",
+  "syntheticFixture": true,
+  "origin": "http://127.0.0.1:9749",
+  "cache": "/tmp/cbm-2068-cache",
+  "project": "cbm-pr2068",
+  "browserRequests": [
+    "http://127.0.0.1:9749/?project=cbm-pr2068&agents=4142",
+    "http://127.0.0.1:9749/assets/index-C-1nbEbY.js",
+    "http://127.0.0.1:9749/assets/index-DxDVy-h7.css",
+    "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn",
+    "http://127.0.0.1:9749/api/layout?project=cbm-pr2068&max_nodes=5000",
+    "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068",
+    "http://127.0.0.1:9749/rpc",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068",
+    "http://127.0.0.1:9749/rpc",
+    "http://127.0.0.1:9749/rpc",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github",
+    "http://127.0.0.1:9749/rpc",
+    "http://127.0.0.1:9749/rpc",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=test-infrastructure",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tests",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tools",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2FISSUE_TEMPLATE",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2Fworkflows",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs%2Fdevelopment",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fagents",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fdocs",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Feval",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ffixtures",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fllm",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fspike",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fsrc",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftests",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftools",
+    "http://127.0.0.1:9749/api/agent-events?project=cbm-pr2068&after=0&limit=200",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fverification",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal%2Fcbm",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fchocolatey",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fglama",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fgo",
+    "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fhomebrew"
+  ],
+  "externalAttempts": [],
+  "directRequests": [
+    {
+      "path": "/api/agent-events?project=cbm-pr2068&limit=500",
+      "method": "GET",
+      "status": 200
+    },
+    {
+      "path": "/api/processes",
+      "method": "GET",
+      "status": 200
+    }
+  ],
+  "screenshots": [
+    "agents-daemon-restart.png"
+  ],
+  "checks": {
+    "daemonRestartPreservedHistory": {
+      "previousPid": 46544,
+      "currentPid": 59866,
+      "generation": "9c6e02a31c8712115131afa1f33cc0b3",
+      "rows": [
+        {
+          "id": 1,
+          "seq": 1,
+          "ts": 1788982343109,
+          "path": "src/ui/http_server.c",
+          "phase": "end"
+        },
+        {
+          "id": 2,
+          "seq": 2,
+          "ts": 1788982343198,
+          "path": "src/store/store.c",
+          "phase": "end"
+        },
+        {
+          "id": 5,
+          "seq": 4,
+          "ts": 1788982379139,
+          "path": "src/ui/atlas_api.c",
+          "phase": "end"
+        },
+        {
+          "id": 6,
+          "seq": 3,
+          "ts": 1788982378139,
+          "path": "src/daemon/host.c",
+          "phase": "end"
+        }
+      ]
+    },
+    "noBridgeRequests": true
+  },
+  "run": "pr2068-verification-1788982342942",
+  "agent": "PR2068 verification fixture (pr2068-verification-1788982342942)",
+  "daemonPid": 59866,
+  "complete": true,
+  "finishedAt": "2026-09-09T19:42:38.483Z"
+}

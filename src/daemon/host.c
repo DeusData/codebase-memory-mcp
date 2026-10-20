@@ -161,6 +161,7 @@ static void host_start_failure_record(const cbm_daemon_ipc_endpoint_t *endpoint,
 
 static void host_log_close(void) {
     cbm_log_set_sink(NULL);
+    cbm_ui_log_close();
     if (g_host_log_mutex_initialized) {
         cbm_mutex_lock(&g_host_log_mutex);
     }
