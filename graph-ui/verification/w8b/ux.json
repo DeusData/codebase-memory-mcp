@@ -1,0 +1,6196 @@
+{
+  "nativeTitlesWithExplanation": 0,
+  "domTooltipsMeasured": 363,
+  "tooltipCoversNothing": true,
+  "tooltipOpensByKeyboard": true,
+  "tooltipClosesByEscape": true,
+  "collapseLabelsAreWords": true,
+  "collapseLabelFollowsView": true,
+  "viewToggleShowsState": true,
+  "twinCutHasHint": true,
+  "twinAtHundredPercentReadable": true,
+  "honestyBlockChars": 142,
+  "honestyBlockParagraphs": 2,
+  "walkBoundOnDiagram": true,
+  "unresolvedCallsReported": false,
+  "stepNoteKept": true,
+  "depthChangeOffersRerun": true,
+  "rerunMakesNewTurn": true,
+  "oldTurnKeepsItsDepth": true,
+  "placeholderShowsExample": true,
+  "examplesClickable": 3,
+  "examplesUseRealSymbols": true,
+  "handleVisibleWithoutHover": true,
+  "handleHitAreaPx": 10,
+  "allZoneHandlesLookAlike": true,
+  "chatHeadVisibleAt100": true,
+  "chatHeadVisibleAt67": true,
+  "whyClosesOnOpenFile": true,
+  "whyClosesByEscape": true,
+  "fileOpensBehindNothing": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "screenshotsAtRest": true,
+  "port": 4541,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w8b",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "walkTarget": "createUser",
+  "explorerFile": "src/services/orderService.ts",
+  "method": "Jeder eigene Tooltip wird EINZELN geoeffnet (abwechselnd mit dem Zeiger und mit der Tastatur) und danach gegen die geschuetzten Flaechen gehalten: den eigenen Ausloeser, Regler und Eingabefelder, und die mit data-hint-keep ausgewiesenen Beschriftungen der Sektion. Dieselbe Liste, nach der die Oberflaeche selbst platziert (src/ui/tooltip/tooltip-model.ts). Native title-Attribute werden an jedem Halt gezaehlt, und zwar nur die, die mehr sagen als der sichtbare Text.",
+  "unresolvedCallsMethod": "Gezaehlt werden die Symbole des Walks, die der Index GENANNT und nicht aufgeloest hat (kind \"unknown\", siehe unresolvedCallee in src/provider/closure.ts). Was diese Zahl NICHT sieht: ein Aufruf, den der Index ganz ohne qualifizierten Namen meldet, wird schon im Walk verworfen (getClosure filtert auf einen nichtleeren Zielschluessel) und ist an dieser Stelle nicht mehr zaehlbar. Die Zahl ist damit eine Untergrenze, und der Satz unter dem Bild sagt \"at least\".",
+  "timings": {
+    "buildMs": 10764,
+    "totalMs": 75828
+  },
+  "generatedAt": "2026-08-30T18:34:11.455Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "Ruhezustand mit Beispielen",
+        "scrolledRegions": 0,
+        "top": {
+          "candidates": 132,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 132,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "hierarchie mit Walk",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 174,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 154,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Twin voll, Graph offen, 100 Prozent",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 163,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 152,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Flow-Erklaerer offen",
+        "scrolledRegions": 3,
+        "top": {
+          "candidates": 194,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 158,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Chat bei 67 Prozent",
+        "scrolledRegions": 2,
+        "top": {
+          "candidates": 166,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 166,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Datei offen, Frage weg",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 158,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 147,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "tooltips": [
+      {
+        "where": "start",
+        "name": "menu-a",
+        "how": "pointer",
+        "text": "atlas: hide the galaxy panel (alt+a)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 272,
+          "y": 40,
+          "width": 278,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-a-why",
+        "how": "keyboard",
+        "text": "atlas: put the question again and pick a way in (alt+w)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 354,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-a-bug",
+        "how": "pointer",
+        "text": "atlas: compare the expected path into a symbol with the observed one (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 503,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-a-impact",
+        "how": "keyboard",
+        "text": "atlas: what a change would reach, and what covers it (alt+c)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 611,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-a-layout",
+        "how": "pointer",
+        "text": "atlas: put every zone back to the width and height it starts with (alt",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 752,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-a-llm",
+        "how": "keyboard",
+        "text": "atlas: turn the local model on (nothing is probed while it is off)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 893,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-a-settings",
+        "how": "pointer",
+        "text": "atlas: which model answers, and everything that costs computing time (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1042,
+          "y": 40,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-a-agents",
+        "how": "keyboard",
+        "text": "atlas: live mode is off, and not one request goes to the bridge. Turn ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1150,
+          "y": 40,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "menu-?",
+        "how": "pointer",
+        "text": "help: what this reads, what it cannot do, and every key it listens to ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1332,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 182,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 205,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 227,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 250,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 273,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 296,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 319,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 341,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 364,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 387,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 410,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 433,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 455,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 478,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 501,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 524,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 547,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "why-decline",
+        "how": "pointer",
+        "text": "Close this panel and read. The question is not asked again for this pr",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 370,
+          "y": 724,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "explain-tab-flow",
+        "how": "keyboard",
+        "text": "the recorded calls of the symbol in the twin, as a sequence and as ste",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 282,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "explain-tab-walk",
+        "how": "pointer",
+        "text": "the walk in front of you: one step, what it is, and where it sits",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 340,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "explain-tab-chat",
+        "how": "keyboard",
+        "text": "what was asked in this session, with the cards each answer was given",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 398,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "explain-tab-bug",
+        "how": "pointer",
+        "text": "the expected path into a symbol against the observed one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 456,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "explain-tab-change",
+        "how": "keyboard",
+        "text": "what a change would reach, and what covers it",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 544,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "explain-fold",
+        "how": "pointer",
+        "text": "unfold this area again, on the tab that was open last",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1160,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "llm-toggle",
+        "how": "keyboard",
+        "text": "turn the local model on",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1488,
+          "y": 134,
+          "width": 184,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-flow",
+        "how": "pointer",
+        "text": "Draw the code this symbol reaches as a sequence, beside the steps it i",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 174,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-depth",
+        "how": "pointer",
+        "text": "The same recorded facts, chosen for one reader. Five readers ask five ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 320,
+          "height": 149
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-facet-logic",
+        "how": "pointer",
+        "text": "Hide Logic",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-facet-calls",
+        "how": "keyboard",
+        "text": "Hide Calls",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-facet-data",
+        "how": "pointer",
+        "text": "Hide Data",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1359,
+          "y": 367,
+          "width": 83,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-facet-errors",
+        "how": "keyboard",
+        "text": "Hide Errors",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1405,
+          "y": 367,
+          "width": 97,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-facet-tests",
+        "how": "pointer",
+        "text": "Hide Tests",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1464,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-facet-runtime",
+        "how": "keyboard",
+        "text": "Show Runtime",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1516,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-facet-changes",
+        "how": "pointer",
+        "text": "Show Changes",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1567,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-tab-facts",
+        "how": "keyboard",
+        "text": "Back to the panel.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 148,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "twin-tab-pseudocode",
+        "how": "pointer",
+        "text": "Show the facts the index recorded for this symbol as a numbered block,",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "graph-mode-galaxy",
+        "how": "keyboard",
+        "text": "galaxy is already showing: click to fold the graph away",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1346,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "graph-mode-hierarchy",
+        "how": "pointer",
+        "text": "hierarchy: open a symbol or pick a way in first, then this shows what ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "galaxy-legend",
+        "how": "keyboard",
+        "text": "show the legend: what the colours, sizes and positions mean",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "galaxy-collapse",
+        "how": "pointer",
+        "text": "hide the graph panel: the header stays, so it can be brought back",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "start",
+        "name": "galaxy-fit",
+        "how": "keyboard",
+        "text": "put the whole graph back in the picture: the camera stands square on i",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 720,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a",
+        "how": "pointer",
+        "text": "atlas: hide the galaxy panel (alt+a)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 272,
+          "y": 40,
+          "width": 278,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a-why",
+        "how": "keyboard",
+        "text": "atlas: put the question again and pick a way in (alt+w)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 354,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a-bug",
+        "how": "pointer",
+        "text": "atlas: compare the expected path into a symbol with the observed one (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 503,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a-impact",
+        "how": "keyboard",
+        "text": "atlas: what a change would reach, and what covers it (alt+c)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 611,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a-layout",
+        "how": "pointer",
+        "text": "atlas: put every zone back to the width and height it starts with (alt",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 752,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a-llm",
+        "how": "keyboard",
+        "text": "atlas: turn the local model on (nothing is probed while it is off)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 893,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a-settings",
+        "how": "pointer",
+        "text": "atlas: which model answers, and everything that costs computing time (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1042,
+          "y": 40,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-a-agents",
+        "how": "keyboard",
+        "text": "atlas: live mode is off, and not one request goes to the bridge. Turn ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1150,
+          "y": 40,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "menu-?",
+        "how": "pointer",
+        "text": "help: what this reads, what it cannot do, and every key it listens to ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1332,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tab",
+        "how": "keyboard",
+        "text": "src/services/userService.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 12,
+          "y": 99,
+          "width": 213,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 182,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 205,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 227,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 250,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 273,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 296,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 319,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 341,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 364,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 387,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 410,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 433,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 455,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 478,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 501,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 524,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 547,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "explain-tab-flow",
+        "how": "keyboard",
+        "text": "the recorded calls of the symbol in the twin, as a sequence and as ste",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 282,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "explain-tab-walk",
+        "how": "pointer",
+        "text": "the walk in front of you: one step, what it is, and where it sits",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 340,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "explain-tab-chat",
+        "how": "keyboard",
+        "text": "what was asked in this session, with the cards each answer was given",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 398,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "explain-tab-bug",
+        "how": "pointer",
+        "text": "the expected path into a symbol against the observed one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 456,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "explain-tab-change",
+        "how": "keyboard",
+        "text": "what a change would reach, and what covers it",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 544,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "explain-fold",
+        "how": "pointer",
+        "text": "fold this area away. Nothing in it is lost: the chat keeps its history",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1134,
+          "y": 687,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "tour-diagram",
+        "how": "keyboard",
+        "text": "draw the flow of this step: what it calls, in order, and what each cal",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 518,
+          "y": 849,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "llm-toggle",
+        "how": "pointer",
+        "text": "turn the local model on",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1488,
+          "y": 134,
+          "width": 184,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-flow",
+        "how": "keyboard",
+        "text": "Draw the code this symbol reaches as a sequence, beside the steps it i",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 174,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-depth",
+        "how": "pointer",
+        "text": "The same recorded facts, chosen for one reader. Five readers ask five ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 320,
+          "height": 149
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-facet-logic",
+        "how": "keyboard",
+        "text": "Hide Logic",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-facet-calls",
+        "how": "pointer",
+        "text": "Hide Calls",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-facet-data",
+        "how": "keyboard",
+        "text": "Hide Data",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1359,
+          "y": 367,
+          "width": 83,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-facet-errors",
+        "how": "pointer",
+        "text": "Hide Errors",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1405,
+          "y": 367,
+          "width": 97,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-facet-tests",
+        "how": "keyboard",
+        "text": "Hide Tests",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1464,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-facet-runtime",
+        "how": "pointer",
+        "text": "Show Runtime",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1516,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-facet-changes",
+        "how": "keyboard",
+        "text": "Show Changes",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1567,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-tab-facts",
+        "how": "pointer",
+        "text": "Back to the panel.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 148,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-tab-pseudocode",
+        "how": "keyboard",
+        "text": "Show the facts the index recorded for this symbol as a numbered block,",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-state-inferred",
+        "how": "pointer",
+        "text": "This sentence is generated from the calls, environment values and erro",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1322,
+          "y": 429,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1383,
+          "y": 427,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1305,
+          "y": 501,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 525,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "This step constructs a class rather than calling a function.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 547,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 545,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "This step constructs a class rather than calling a function.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 493,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 566,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1416,
+          "y": 534,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1395,
+          "y": 547,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1416,
+          "y": 568,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1338,
+          "y": 490,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 514,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 535,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1397,
+          "y": 584,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "userService.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 494,
+          "width": 119,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1315,
+          "y": 491,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "types.ts:27",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 545,
+          "width": 97,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1299,
+          "y": 542,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-state-inferred",
+        "how": "pointer",
+        "text": "The dependency comes from the index; the statement, its line and the n",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1330,
+          "y": 415,
+          "width": 320,
+          "height": 149
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../repo/db",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 662,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1315,
+          "y": 661,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1385,
+          "y": 659,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../repo/db",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1423,
+          "y": 494,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "Nothing the index recorded for this symbol mentions this name. Another",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 493,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 491,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../repo/db",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 520,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "Nothing the index recorded for this symbol mentions this name. Another",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1291,
+          "y": 393,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1386,
+          "y": 518,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../types",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1424,
+          "y": 520,
+          "width": 76,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 520,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 518,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../types",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 547,
+          "width": 76,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1299,
+          "y": 546,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1370,
+          "y": 544,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../util/validate",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1408,
+          "y": 547,
+          "width": 134,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 546,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 544,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../util/validate",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 574,
+          "width": 134,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 481,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 571,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "graph-mode-galaxy",
+        "how": "pointer",
+        "text": "galaxy: the whole project, laid out by the server",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1327,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "graph-mode-hierarchy",
+        "how": "keyboard",
+        "text": "hierarchy is already showing: click to fold the graph away",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "galaxy-legend",
+        "how": "pointer",
+        "text": "show the legend: what the colours, sizes and positions mean",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "galaxy-collapse",
+        "how": "keyboard",
+        "text": "hide the graph panel: the header stays, so it can be brought back",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "hierarchie",
+        "name": "galaxy-fit",
+        "how": "pointer",
+        "text": "put the whole graph back in the picture: the camera stands square on i",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 720,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a",
+        "how": "pointer",
+        "text": "atlas: hide the galaxy panel (alt+a)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 272,
+          "y": 40,
+          "width": 278,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a-why",
+        "how": "keyboard",
+        "text": "atlas: put the question again and pick a way in (alt+w)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 354,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a-bug",
+        "how": "pointer",
+        "text": "atlas: compare the expected path into a symbol with the observed one (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 503,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a-impact",
+        "how": "keyboard",
+        "text": "atlas: what a change would reach, and what covers it (alt+c)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 611,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a-layout",
+        "how": "pointer",
+        "text": "atlas: put every zone back to the width and height it starts with (alt",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 752,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a-llm",
+        "how": "keyboard",
+        "text": "atlas: turn the local model on (nothing is probed while it is off)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 893,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a-settings",
+        "how": "pointer",
+        "text": "atlas: which model answers, and everything that costs computing time (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1042,
+          "y": 40,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-a-agents",
+        "how": "keyboard",
+        "text": "atlas: live mode is off, and not one request goes to the bridge. Turn ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1150,
+          "y": 40,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "menu-?",
+        "how": "pointer",
+        "text": "help: what this reads, what it cannot do, and every key it listens to ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1332,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tab",
+        "how": "keyboard",
+        "text": "src/services/userService.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 12,
+          "y": 99,
+          "width": 213,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tab",
+        "how": "pointer",
+        "text": "src/repo/db.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 182,
+          "y": 99,
+          "width": 119,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tab",
+        "how": "keyboard",
+        "text": "src/util/validate.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 266,
+          "y": 99,
+          "width": 163,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 182,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 205,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 227,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 250,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 273,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 296,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 319,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 341,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 364,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 387,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 410,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 433,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 455,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 478,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 501,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 524,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 547,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "explain-tab-flow",
+        "how": "keyboard",
+        "text": "the recorded calls of the symbol in the twin, as a sequence and as ste",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 282,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "explain-tab-walk",
+        "how": "pointer",
+        "text": "the walk in front of you: one step, what it is, and where it sits",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 340,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "explain-tab-chat",
+        "how": "keyboard",
+        "text": "what was asked in this session, with the cards each answer was given",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 398,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "explain-tab-bug",
+        "how": "pointer",
+        "text": "the expected path into a symbol against the observed one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 456,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "explain-tab-change",
+        "how": "keyboard",
+        "text": "what a change would reach, and what covers it",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 544,
+          "y": 687,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "explain-fold",
+        "how": "pointer",
+        "text": "fold this area away. Nothing in it is lost: the chat keeps its history",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1134,
+          "y": 687,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "keyboard",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 805,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "pointer",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 826,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "keyboard",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 847,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "pointer",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 869,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "keyboard",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 890,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "pointer",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 911,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "keyboard",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 932,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "pointer",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 953,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "flow-step-line",
+        "how": "keyboard",
+        "text": "Open the line this came from.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 813,
+          "y": 851,
+          "width": 228,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "llm-toggle",
+        "how": "pointer",
+        "text": "turn the local model on",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1488,
+          "y": 134,
+          "width": 184,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-flow",
+        "how": "keyboard",
+        "text": "Close the flow of this symbol.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1380,
+          "y": 209,
+          "width": 235,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-depth",
+        "how": "pointer",
+        "text": "The same recorded facts, chosen for one reader. Five readers ask five ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 320,
+          "height": 149
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-facet-logic",
+        "how": "keyboard",
+        "text": "Hide Logic",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-facet-calls",
+        "how": "pointer",
+        "text": "Hide Calls",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-facet-data",
+        "how": "keyboard",
+        "text": "Hide Data",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1359,
+          "y": 367,
+          "width": 83,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-facet-errors",
+        "how": "pointer",
+        "text": "Hide Errors",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1405,
+          "y": 367,
+          "width": 97,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-facet-tests",
+        "how": "keyboard",
+        "text": "Hide Tests",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1464,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-facet-runtime",
+        "how": "pointer",
+        "text": "Show Runtime",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1516,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-facet-changes",
+        "how": "keyboard",
+        "text": "Show Changes",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1567,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-tab-facts",
+        "how": "pointer",
+        "text": "Back to the panel.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 148,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-tab-pseudocode",
+        "how": "keyboard",
+        "text": "Show the facts the index recorded for this symbol as a numbered block,",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 533,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 574,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 519,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 491,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 510,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 551,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 496,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 569,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../repo/db",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1262,
+          "y": 554,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1315,
+          "y": 521,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1385,
+          "y": 558,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../repo/db",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 493,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "Nothing the index recorded for this symbol mentions this name. Another",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 493,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1401,
+          "y": 491,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../repo/db",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 516,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "Nothing the index recorded for this symbol mentions this name. Another",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1291,
+          "y": 515,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1386,
+          "y": 513,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../types",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 539,
+          "width": 76,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1346,
+          "y": 538,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 536,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../types",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 562,
+          "width": 76,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1299,
+          "y": 469,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1370,
+          "y": 559,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../util/validate",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 585,
+          "width": 134,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 492,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 582,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../util/validate",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1262,
+          "y": 548,
+          "width": 134,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 515,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1416,
+          "y": 552,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 708,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 706,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 729,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 727,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "graph-mode-galaxy",
+        "how": "keyboard",
+        "text": "galaxy: the whole project, laid out by the server",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1327,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "graph-mode-hierarchy",
+        "how": "pointer",
+        "text": "hierarchy is already showing: click to fold the graph away",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "galaxy-legend",
+        "how": "keyboard",
+        "text": "show the legend: what the colours, sizes and positions mean",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "galaxy-collapse",
+        "how": "pointer",
+        "text": "hide the graph panel: the header stays, so it can be brought back",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "flow",
+        "name": "galaxy-fit",
+        "how": "keyboard",
+        "text": "put the whole graph back in the picture: the camera stands square on i",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 720,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a",
+        "how": "pointer",
+        "text": "atlas: hide the galaxy panel (alt+a)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 272,
+          "y": 40,
+          "width": 278,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a-why",
+        "how": "keyboard",
+        "text": "atlas: put the question again and pick a way in (alt+w)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 354,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a-bug",
+        "how": "pointer",
+        "text": "atlas: compare the expected path into a symbol with the observed one (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 503,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a-impact",
+        "how": "keyboard",
+        "text": "atlas: what a change would reach, and what covers it (alt+c)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 611,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a-layout",
+        "how": "pointer",
+        "text": "atlas: put every zone back to the width and height it starts with (alt",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 752,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a-llm",
+        "how": "keyboard",
+        "text": "atlas: turn the local model on (nothing is probed while it is off)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 893,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a-settings",
+        "how": "pointer",
+        "text": "atlas: which model answers, and everything that costs computing time (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1042,
+          "y": 40,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-a-agents",
+        "how": "keyboard",
+        "text": "atlas: live mode is off, and not one request goes to the bridge. Turn ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1150,
+          "y": 40,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "menu-?",
+        "how": "pointer",
+        "text": "help: what this reads, what it cannot do, and every key it listens to ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1332,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tab",
+        "how": "keyboard",
+        "text": "src/services/userService.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 12,
+          "y": 99,
+          "width": 213,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tab",
+        "how": "pointer",
+        "text": "src/repo/db.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 182,
+          "y": 99,
+          "width": 119,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tab",
+        "how": "keyboard",
+        "text": "src/util/validate.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 266,
+          "y": 99,
+          "width": 163,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 182,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 205,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 227,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 250,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 273,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 296,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 319,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 341,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 364,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 387,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 410,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 433,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 455,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 478,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 501,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 524,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 547,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "explain-tab-flow",
+        "how": "keyboard",
+        "text": "the recorded calls of the symbol in the twin, as a sequence and as ste",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 282,
+          "y": 598,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "explain-tab-walk",
+        "how": "pointer",
+        "text": "the walk in front of you: one step, what it is, and where it sits",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 340,
+          "y": 598,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "explain-tab-chat",
+        "how": "keyboard",
+        "text": "what was asked in this session, with the cards each answer was given",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 398,
+          "y": 598,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "explain-tab-bug",
+        "how": "pointer",
+        "text": "the expected path into a symbol against the observed one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 456,
+          "y": 598,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "explain-tab-change",
+        "how": "keyboard",
+        "text": "what a change would reach, and what covers it",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 544,
+          "y": 598,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "explain-fold",
+        "how": "pointer",
+        "text": "fold this area away. Nothing in it is lost: the chat keeps its history",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 898,
+          "y": 546,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "chat-depth-0",
+        "how": "keyboard",
+        "text": "the focus symbol alone: no caller and no callee goes into the cards",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 972,
+          "y": 721,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "chat-depth-1",
+        "how": "pointer",
+        "text": "the focus symbol plus its direct callers and callees. The default.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1036,
+          "y": 721,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "chat-depth-2",
+        "how": "keyboard",
+        "text": "the focus symbol plus two rings of neighbours. More context, more to c",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1093,
+          "y": 721,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "chat-clear",
+        "how": "pointer",
+        "text": "forget this session: every question and every answer in this panel is ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1163,
+          "y": 721,
+          "width": 320,
+          "height": 114
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "llm-toggle",
+        "how": "keyboard",
+        "text": "turn the local model on",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1488,
+          "y": 134,
+          "width": 184,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-flow",
+        "how": "pointer",
+        "text": "Draw the code this symbol reaches as a sequence, beside the steps it i",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 174,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-depth",
+        "how": "pointer",
+        "text": "The same recorded facts, chosen for one reader. Five readers ask five ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 320,
+          "height": 149
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-facet-logic",
+        "how": "pointer",
+        "text": "Hide Logic",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-facet-calls",
+        "how": "keyboard",
+        "text": "Hide Calls",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-facet-data",
+        "how": "pointer",
+        "text": "Hide Data",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1359,
+          "y": 367,
+          "width": 83,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-facet-errors",
+        "how": "keyboard",
+        "text": "Hide Errors",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1405,
+          "y": 367,
+          "width": 97,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-facet-tests",
+        "how": "pointer",
+        "text": "Hide Tests",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1464,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-facet-runtime",
+        "how": "keyboard",
+        "text": "Show Runtime",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1516,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-facet-changes",
+        "how": "pointer",
+        "text": "Show Changes",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1567,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-tab-facts",
+        "how": "keyboard",
+        "text": "Back to the panel.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 148,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "twin-tab-pseudocode",
+        "how": "pointer",
+        "text": "Show the facts the index recorded for this symbol as a numbered block,",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "graph-mode-galaxy",
+        "how": "pointer",
+        "text": "galaxy: the whole project, laid out by the server",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1327,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "graph-mode-hierarchy",
+        "how": "keyboard",
+        "text": "hierarchy is already showing: click to fold the graph away",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "galaxy-legend",
+        "how": "pointer",
+        "text": "show the legend: what the colours, sizes and positions mean",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "galaxy-collapse",
+        "how": "keyboard",
+        "text": "hide the graph panel: the header stays, so it can be brought back",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "chat",
+        "name": "galaxy-fit",
+        "how": "pointer",
+        "text": "put the whole graph back in the picture: the camera stands square on i",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 720,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a",
+        "how": "pointer",
+        "text": "atlas: hide the galaxy panel (alt+a)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 272,
+          "y": 40,
+          "width": 278,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a-why",
+        "how": "keyboard",
+        "text": "atlas: put the question again and pick a way in (alt+w)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 354,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a-bug",
+        "how": "pointer",
+        "text": "atlas: compare the expected path into a symbol with the observed one (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 503,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a-impact",
+        "how": "keyboard",
+        "text": "atlas: what a change would reach, and what covers it (alt+c)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 611,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a-layout",
+        "how": "pointer",
+        "text": "atlas: put every zone back to the width and height it starts with (alt",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 752,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a-llm",
+        "how": "keyboard",
+        "text": "atlas: turn the local model on (nothing is probed while it is off)",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 893,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a-settings",
+        "how": "pointer",
+        "text": "atlas: which model answers, and everything that costs computing time (",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1042,
+          "y": 40,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-a-agents",
+        "how": "keyboard",
+        "text": "atlas: live mode is off, and not one request goes to the bridge. Turn ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1150,
+          "y": 40,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "menu-?",
+        "how": "pointer",
+        "text": "help: what this reads, what it cannot do, and every key it listens to ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1332,
+          "y": 40,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tab",
+        "how": "keyboard",
+        "text": "src/services/userService.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 12,
+          "y": 99,
+          "width": 213,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tab",
+        "how": "pointer",
+        "text": "src/repo/db.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 166,
+          "y": 99,
+          "width": 119,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tab",
+        "how": "keyboard",
+        "text": "src/util/validate.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 250,
+          "y": 99,
+          "width": 163,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tab",
+        "how": "pointer",
+        "text": "src/services/orderService.ts",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 381,
+          "y": 99,
+          "width": 220,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 182,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 205,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 227,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 250,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 273,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 296,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 319,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 341,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 364,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 387,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 410,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 433,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 455,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 478,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "every file below it is in the graph without a recorded issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 501,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 524,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "tree-row",
+        "how": "pointer",
+        "text": "indexed: the graph carries this file and no source recorded an issue",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 8,
+          "y": 547,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "explain-tab-flow",
+        "how": "pointer",
+        "text": "the recorded calls of the symbol in the twin, as a sequence and as ste",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 282,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "explain-tab-walk",
+        "how": "keyboard",
+        "text": "the walk in front of you: one step, what it is, and where it sits",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 340,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "explain-tab-chat",
+        "how": "pointer",
+        "text": "what was asked in this session, with the cards each answer was given",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 398,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "explain-tab-bug",
+        "how": "keyboard",
+        "text": "the expected path into a symbol against the observed one",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 456,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "explain-tab-change",
+        "how": "pointer",
+        "text": "what a change would reach, and what covers it",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 544,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "explain-fold",
+        "how": "keyboard",
+        "text": "unfold this area again, on the tab that was open last",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1160,
+          "y": 905,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "llm-toggle",
+        "how": "pointer",
+        "text": "turn the local model on",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1488,
+          "y": 134,
+          "width": 184,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-flow",
+        "how": "keyboard",
+        "text": "Draw the code this symbol reaches as a sequence, beside the steps it i",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 174,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-depth",
+        "how": "pointer",
+        "text": "The same recorded facts, chosen for one reader. Five readers ask five ",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 320,
+          "height": 149
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-facet-logic",
+        "how": "keyboard",
+        "text": "Hide Logic",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-facet-calls",
+        "how": "pointer",
+        "text": "Hide Calls",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-facet-data",
+        "how": "keyboard",
+        "text": "Hide Data",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1359,
+          "y": 367,
+          "width": 83,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-facet-errors",
+        "how": "pointer",
+        "text": "Hide Errors",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1405,
+          "y": 367,
+          "width": 97,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-facet-tests",
+        "how": "keyboard",
+        "text": "Hide Tests",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1464,
+          "y": 367,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-facet-runtime",
+        "how": "pointer",
+        "text": "Show Runtime",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1516,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-facet-changes",
+        "how": "keyboard",
+        "text": "Show Changes",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1567,
+          "y": 367,
+          "width": 105,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-tab-facts",
+        "how": "pointer",
+        "text": "Back to the panel.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 367,
+          "width": 148,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-tab-pseudocode",
+        "how": "keyboard",
+        "text": "Show the facts the index recorded for this symbol as a numbered block,",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 367,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 533,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1255,
+          "y": 574,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1352,
+          "y": 519,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1416,
+          "y": 539,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../repo/db",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1262,
+          "y": 577,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "Nothing the index recorded for this symbol mentions this name. Another",
+        "described": "",
+        "side": "above",
+        "rect": {
+          "x": 1315,
+          "y": 509,
+          "width": 320,
+          "height": 97
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1409,
+          "y": 644,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../repo/db",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 493,
+          "width": 90,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 492,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1377,
+          "y": 490,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-row",
+        "how": "pointer",
+        "text": "../types",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 516,
+          "width": 76,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1307,
+          "y": 515,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "evidence",
+        "how": "pointer",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1377,
+          "y": 513,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-row",
+        "how": "keyboard",
+        "text": "../util/validate",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1262,
+          "y": 539,
+          "width": 134,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-badge",
+        "how": "pointer",
+        "text": "The index records this symbol reaching this name, so the import is one",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1346,
+          "y": 538,
+          "width": 320,
+          "height": 62
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 536,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "twin-confidence",
+        "how": "pointer",
+        "text": "Read directly from the index. There is no score because nothing was gu",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "evidence",
+        "how": "keyboard",
+        "text": "Show what this claim is based on.",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1416,
+          "y": 491,
+          "width": 256,
+          "height": 27
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "graph-mode-galaxy",
+        "how": "pointer",
+        "text": "galaxy is already showing: click to fold the graph away",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1346,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "graph-mode-hierarchy",
+        "how": "keyboard",
+        "text": "hierarchy: what the chosen symbol reaches, one column per call depth",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "galaxy-legend",
+        "how": "pointer",
+        "text": "show the legend: what the colours, sizes and positions mean",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "galaxy-collapse",
+        "how": "keyboard",
+        "text": "hide the graph panel: the header stays, so it can be brought back",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 644,
+          "width": 320,
+          "height": 45
+        },
+        "covers": []
+      },
+      {
+        "where": "nach dem Oeffnen",
+        "name": "galaxy-fit",
+        "how": "pointer",
+        "text": "put the whole graph back in the picture: the camera stands square on i",
+        "described": "",
+        "side": "below",
+        "rect": {
+          "x": 1352,
+          "y": 720,
+          "width": 320,
+          "height": 80
+        },
+        "covers": []
+      }
+    ],
+    "nativeTitleHits": [],
+    "folds": [
+      {
+        "where": "galaxy",
+        "switches": [
+          {
+            "state": "open",
+            "of": "explain",
+            "label": "unfold",
+            "testId": "atlas-explain-collapse",
+            "expanded": "false"
+          },
+          {
+            "state": "open",
+            "of": "flow",
+            "label": "flow (no symbol)open flow",
+            "testId": "atlas-twin-subject",
+            "expanded": "false"
+          },
+          {
+            "state": "open",
+            "of": "legend",
+            "label": "show legend",
+            "testId": "atlas-galaxy-legend-toggle",
+            "expanded": "false"
+          },
+          {
+            "state": "collapse",
+            "of": "galaxy",
+            "label": "collapse galaxy",
+            "testId": "atlas-galaxy-collapse",
+            "expanded": "true"
+          }
+        ]
+      },
+      {
+        "where": "hierarchy",
+        "switches": [
+          {
+            "state": "collapse",
+            "of": "explain",
+            "label": "[esc] fold",
+            "testId": "atlas-explain-collapse",
+            "expanded": "true"
+          },
+          {
+            "state": "open",
+            "of": "flow",
+            "label": "flow (createUser)open flow",
+            "testId": "atlas-twin-subject",
+            "expanded": "false"
+          },
+          {
+            "state": "open",
+            "of": "legend",
+            "label": "show legend",
+            "testId": "atlas-galaxy-legend-toggle",
+            "expanded": "false"
+          },
+          {
+            "state": "collapse",
+            "of": "hierarchy",
+            "label": "collapse hierarchy",
+            "testId": "atlas-galaxy-collapse",
+            "expanded": "true"
+          }
+        ]
+      }
+    ],
+    "shots": [
+      {
+        "name": "collapse-words.png",
+        "atRest": true,
+        "regions": []
+      },
+      {
+        "name": "twin-full.png",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 1275
+          }
+        ]
+      },
+      {
+        "name": "tooltip-open.png",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 1275
+          }
+        ]
+      },
+      {
+        "name": "flow-short.png",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-flow-overlay",
+            "top": 0,
+            "left": 0,
+            "hidden": 239
+          },
+          {
+            "name": "atlas-flow-step-list",
+            "top": 0,
+            "left": 0,
+            "hidden": 41
+          },
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 1275
+          }
+        ]
+      }
+    ],
+    "tooltipProtected": [
+      {
+        "selector": "input, textarea, select",
+        "reason": "Regler und Eingabefelder. Genau der Fall aus dem Screenshot vom 2026-08-29: ein Tooltip lag ueber dem Detail-Regler des Twin."
+      },
+      {
+        "selector": "[data-hint-keep]",
+        "reason": "Die Beschriftungen und Schalter der Sektion, in der der Ausloeser steht. Wer einen Knopf beruehrt, um zu erfahren was er tut, schaut danach auf seine Nachbarn."
+      }
+    ],
+    "zoom": {
+      "factor": 0.67,
+      "full": {
+        "width": 1680,
+        "height": 1050
+      },
+      "small": {
+        "width": 2507,
+        "height": 1567
+      },
+      "method": "Ein Zoom von z verkleinert jedes CSS-Pixel auf z Geraetepixel, also passen in dasselbe Fenster 1/z mal so viele davon. Chromium stellt seinen Zoom headless nicht wie ein Nutzer; das GLEICHWERTIGE Fenster ist die messbare Fassung derselben Lage."
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4540,
+    "handles": [
+      {
+        "testId": "atlas-split-left",
+        "orientation": "vertical",
+        "hit": 10,
+        "className": "atlas-splitter",
+        "hint": "",
+        "mark": {
+          "content": "\"\"",
+          "background": "rgb(31, 127, 76)",
+          "width": "2px",
+          "height": "26px"
+        },
+        "line": {
+          "background": "rgb(29, 41, 38)"
+        }
+      },
+      {
+        "testId": "atlas-split-explain",
+        "orientation": "horizontal",
+        "hit": 10,
+        "className": "atlas-splitter",
+        "hint": "",
+        "mark": {
+          "content": "\"\"",
+          "background": "rgb(31, 127, 76)",
+          "width": "26px",
+          "height": "2px"
+        },
+        "line": {
+          "background": "rgb(29, 41, 38)"
+        }
+      },
+      {
+        "testId": "atlas-split-right",
+        "orientation": "vertical",
+        "hit": 10,
+        "className": "atlas-splitter",
+        "hint": "",
+        "mark": {
+          "content": "\"\"",
+          "background": "rgb(31, 127, 76)",
+          "width": "2px",
+          "height": "26px"
+        },
+        "line": {
+          "background": "rgb(29, 41, 38)"
+        }
+      },
+      {
+        "testId": "atlas-split-twin",
+        "orientation": "horizontal",
+        "hit": 10,
+        "className": "atlas-splitter",
+        "hint": "",
+        "mark": {
+          "content": "\"\"",
+          "background": "rgb(31, 127, 76)",
+          "width": "26px",
+          "height": "2px"
+        },
+        "line": {
+          "background": "rgb(29, 41, 38)"
+        }
+      }
+    ],
+    "commandExamples": {
+      "placeholder": "@create what does it do?",
+      "open": true,
+      "rows": [
+        {
+          "id": "search",
+          "symbol": "create",
+          "text": "cr",
+          "tag": "BUTTON",
+          "focusable": true
+        },
+        {
+          "id": "at",
+          "symbol": "create",
+          "text": "@create what does it do?",
+          "tag": "BUTTON",
+          "focusable": true
+        },
+        {
+          "id": "question",
+          "symbol": "create",
+          "text": "Who calls create?",
+          "tag": "BUTTON",
+          "focusable": true
+        }
+      ]
+    },
+    "exampleSymbols": [
+      {
+        "symbol": "create",
+        "found": true,
+        "askedAs": "create"
+      }
+    ],
+    "exampleWritesLine": {
+      "value": "@create what does it do?",
+      "turnsBefore": 0,
+      "turnsAfter": 0
+    },
+    "escapeOnTooltip": {
+      "name": "menu-a",
+      "opened": true,
+      "afterEscape": false
+    },
+    "viewToggle": {
+      "galaxy": {
+        "role": "group",
+        "borderWidth": 1,
+        "borderStyle": "solid",
+        "chips": [
+          {
+            "mode": "galaxy",
+            "pressed": "true",
+            "active": true,
+            "hint": "galaxy is already showing: click to fold the graph away",
+            "disabled": false
+          },
+          {
+            "mode": "hierarchy",
+            "pressed": "false",
+            "active": false,
+            "hint": "hierarchy: open a symbol or pick a way in first, then this shows what it reaches",
+            "disabled": false
+          }
+        ]
+      },
+      "hierarchy": {
+        "role": "group",
+        "borderWidth": 1,
+        "borderStyle": "solid",
+        "chips": [
+          {
+            "mode": "galaxy",
+            "pressed": "false",
+            "active": false,
+            "hint": "galaxy: the whole project, laid out by the server",
+            "disabled": false
+          },
+          {
+            "mode": "hierarchy",
+            "pressed": "true",
+            "active": true,
+            "hint": "hierarchy is already showing: click to fold the graph away",
+            "disabled": false
+          }
+        ]
+      }
+    },
+    "twinAfterWalk": {
+      "symbol": "createUser",
+      "qualifiedName": "codeatlasweb-w8b.src.services.userService.createUser",
+      "fetches": 1,
+      "sectionNames": [
+        "purpose",
+        "steps",
+        "callers",
+        "state",
+        "imports",
+        "errors",
+        "effects",
+        "tests"
+      ],
+      "flowOpen": false,
+      "flowSteps": 0,
+      "flowArrows": 0,
+      "flowParticipants": 0,
+      "flowStep": -1,
+      "view": "facts",
+      "stepLines": [
+        24,
+        27,
+        29,
+        29,
+        30,
+        35
+      ],
+      "pseudocode": {
+        "lead": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+        "leadKind": "unused-imports",
+        "lines": 8,
+        "steps": 6,
+        "stepsWithTarget": 6,
+        "stepsWithoutTarget": 0,
+        "enrichedSteps": 2,
+        "enrichment": {
+          "usable": [
+            {
+              "kind": "raises",
+              "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+              "symbols": 1
+            },
+            {
+              "kind": "calls-on",
+              "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+              "symbols": 2
+            }
+          ],
+          "silent": [
+            {
+              "kind": "reads-env",
+              "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+            }
+          ],
+          "missing": [
+            {
+              "kind": "what the callee reads or writes",
+              "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+            },
+            {
+              "kind": "the callee's own steps, in order",
+              "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+            },
+            {
+              "kind": "whether a raised error escapes through this call",
+              "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+            },
+            {
+              "kind": "the callee's signature and return type",
+              "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+            },
+            {
+              "kind": "anything at all about an unresolved callee",
+              "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+            }
+          ]
+        },
+        "imports": 7,
+        "importFindings": 2,
+        "metaVisibleChars": 58,
+        "metaMovedChars": 289
+      },
+      "level": 2,
+      "levelName": "medior",
+      "question": "What is actually written here?",
+      "mode": "sections",
+      "rewritableSentences": 6,
+      "voiceState": "idle",
+      "voiceMessage": "",
+      "voicedSentences": 0,
+      "subject": [
+        {
+          "id": "section-purpose-text",
+          "text": "Function createUser in userService.ts. Makes 6 calls, touches 1 environment value, can raise 1 error type.",
+          "facts": [
+            "createUser",
+            "userService.ts",
+            "6",
+            "1",
+            "1"
+          ]
+        },
+        {
+          "id": "section-imports-text",
+          "text": "5 used by this symbol, 2 not used by it, 0 that CodeAtlas cannot check.",
+          "facts": [
+            "5",
+            "2",
+            "0",
+            "CodeAtlas"
+          ]
+        },
+        {
+          "id": "section-imports-note",
+          "text": "The dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Whether a name is used is checked against what the index recorded for this symbol alone, which is why an import can be listed as not used here and still be used by the file.",
+          "facts": [
+            "CodeAtlas"
+          ]
+        },
+        {
+          "id": "section-errors-note",
+          "text": "Where these are handled is not visible to the index: it records where an error is raised, not where it is caught.",
+          "facts": []
+        },
+        {
+          "id": "section-effects-empty",
+          "text": "The index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.",
+          "facts": [
+            "2",
+            "UPSTREAM",
+            "ASKS.md"
+          ]
+        },
+        {
+          "id": "section-tests-empty",
+          "text": "No test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "facts": []
+        }
+      ]
+    },
+    "twin": {
+      "present": true,
+      "hidden": 1275,
+      "scrollHeight": 1508,
+      "clientHeight": 233,
+      "empty": false,
+      "depth": "architect",
+      "top": 0,
+      "mark": "bottom",
+      "markText": "▾ more below",
+      "markVisible": true
+    },
+    "tooltipShot": {
+      "open": true,
+      "name": "twin-depth",
+      "side": "below",
+      "text": "The same recorded facts, chosen for one reader. Five readers ask five questions of one sym",
+      "rect": {
+        "x": 1255,
+        "y": 367,
+        "width": 320,
+        "height": 149
+      },
+      "covers": []
+    },
+    "honesty": {
+      "present": true,
+      "paragraphs": [
+        "Neither the picture nor the list shows a call the index did not resolve.",
+        "What those calls reach in turn is one hop further than this box draws."
+      ],
+      "chars": 142,
+      "bound": {
+        "present": true,
+        "text": "walk: 1 hop, at most 15 symbols",
+        "depth": "1",
+        "cap": "15",
+        "onDiagram": true
+      },
+      "provenance": {
+        "present": true,
+        "hint": "The diagram and the list are two readings of one walk: one lifeline per file, one line per call the index reported. Neither shows a call the index did not resolve. Derived from the index and nothing else: every line is a call, a raised error or an environment read that the analysis reported, in the order it reported them. Anything the index did not resolve is absent from this block, not absent from the code. Nobody drew this picture. CodeAtlas laid it out from what the index recorded for this walk, so it can be incomplete about the code and exact about what was reported. The picture shows the calls this symbol makes itself: the walk went 1 hop and kept at most 15 symbols. What those calls reach in turn is one hop further than this box draws."
+      },
+      "unresolved": 0,
+      "stepNote": ""
+    },
+    "stepNoteSearch": {
+      "steps": 11,
+      "foundAt": 7,
+      "note": "This step is not an arrow in the picture: the index recorded it as an error path or an environment read, and neither has a lifeline of its own in a sequence of calls. The code is still opened."
+    },
+    "chat": {
+      "asked": {
+        "turns": [
+          {
+            "depth": "1",
+            "status": "refused",
+            "question": "> @createUser what does it do?",
+            "rerun": ""
+          }
+        ],
+        "depth": "1"
+      },
+      "offered": {
+        "turns": [
+          {
+            "depth": "1",
+            "status": "refused",
+            "question": "> @createUser what does it do?",
+            "rerun": "ask again with 2 hops"
+          }
+        ],
+        "depth": "2"
+      },
+      "after": {
+        "turns": [
+          {
+            "depth": "1",
+            "status": "refused",
+            "question": "> @createUser what does it do?",
+            "rerun": ""
+          },
+          {
+            "depth": "2",
+            "status": "refused",
+            "question": "> @createUser what does it do?",
+            "rerun": ""
+          }
+        ],
+        "depth": "2"
+      }
+    },
+    "chatHead": {
+      "at100": {
+        "present": true,
+        "visible": true,
+        "chips": true,
+        "clear": true,
+        "height": 34
+      },
+      "at67": {
+        "present": true,
+        "visible": true,
+        "chips": true,
+        "clear": true,
+        "height": 34
+      }
+    },
+    "why": {
+      "opened": {
+        "why": true,
+        "decline": "Close this question",
+        "readerPath": "src/services/userService.ts",
+        "breadcrumb": "src › services › userService.ts",
+        "readerVisible": true
+      },
+      "afterEscape": {
+        "why": false,
+        "decline": "",
+        "readerPath": "src/services/userService.ts",
+        "breadcrumb": "src › services › userService.ts",
+        "readerVisible": true
+      },
+      "explorer": {
+        "before": {
+          "why": true,
+          "decline": "Close this question",
+          "readerPath": "src/services/userService.ts",
+          "breadcrumb": "src › services › userService.ts",
+          "readerVisible": true
+        },
+        "after": {
+          "why": false,
+          "decline": "",
+          "readerPath": "src/services/orderService.ts",
+          "breadcrumb": "src › services › orderService.ts",
+          "readerVisible": true
+        },
+        "path": "src/services/orderService.ts"
+      }
+    },
+    "apiRoutes": {
+      "/api/layout": 1,
+      "/api/tree": 7
+    },
+    "rpcTools": {
+      "index_status": 2,
+      "query_graph": 212,
+      "check_index_coverage": 7,
+      "search_graph": 10,
+      "get_architecture": 1,
+      "get_code_snippet": 14
+    },
+    "leftovers": [
+      {
+        "port": 4540,
+        "listeners": 0
+      },
+      {
+        "port": 4541,
+        "listeners": 0
+      }
+    ]
+  }
+}

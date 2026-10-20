@@ -594,7 +594,15 @@ size_t cbm_mem_allocator_committed(void) {
 }
 
 static _Atomic size_t g_peak_charged;
+static _Atomic size_t g_charged_for_tests; /* 0 = live reading */
+void cbm_mem_set_charged_for_tests(size_t bytes) {
+    atomic_store_explicit(&g_charged_for_tests, bytes, memory_order_relaxed);
+}
 size_t cbm_mem_charged(void) {
+    size_t pinned = atomic_load_explicit(&g_charged_for_tests, memory_order_relaxed);
+    if (pinned != 0) {
+        return pinned;
+    }
     /* The OS number (phys_footprint on macOS, RSS elsewhere) is the charge for
      * everything the process maps, and the memory core's own live bytes are its
      * floor: macOS was measured under-reporting the OS number after

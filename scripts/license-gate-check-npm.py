@@ -3,18 +3,21 @@
 
 Usage: license-gate-check-npm.py <graph-ui-dir> <license-policy.json>
 
-Walks the production tree (the packages whose code is compiled into the UI
-bundle; platform-restricted native build tooling is excluded the same way
-gen-ui-licenses.py excludes it) and fails if ANY package's license is not
-on the policy allow-list. Packages with no declared license fall back to
-the first line of their shipped license file; if that cannot be resolved
-either, the gate fails — unknown is not allowed.
+Walks the WHOLE production tree (including prebundled dependencies and
+platform-restricted native packages) and fails if ANY package's license is not
+on the policy allow-list. There are no exceptions: a package that is installed
+but never bundled still blocks, because "unshipped" is a claim about a build,
+and a non-permissive license must never be one build change away from shipping.
+Packages with no declared license fall back to the first line of their shipped
+license file; if that cannot be resolved either, the gate fails — unknown is
+not allowed. The current app + worker build evidence must also verify.
 """
 import json
 import os
 import re
 import subprocess
 import sys
+from ui_browser_licenses import validate_browser_build
 
 FILE_HEADER_MAP = {
     "mit license": "MIT",
@@ -52,8 +55,8 @@ def collect(ui_dir, dep_tree, out):
                 meta = json.load(fh)
         except (OSError, ValueError):
             continue
-        if meta.get("os") or meta.get("cpu"):
-            continue  # platform-restricted native build tooling, not bundled
+        # Platform-restricted packages (os/cpu) are checked like any other:
+        # skipping them is how sharp's LGPL libvips binaries passed unseen.
         lic = meta.get("license", "")
         if isinstance(lic, dict):
             lic = lic.get("type", "")
@@ -81,6 +84,12 @@ def main():
               "is node_modules installed?")
         sys.exit(1)
 
+    try:
+        validate_browser_build(ui_dir)
+    except ValueError as exc:
+        print(f"BLOCKED: browser build evidence does not verify: {exc}")
+        sys.exit(1)
+
     violations = []
     for (name, version), (lic, pkg_dir) in sorted(pkgs.items()):
         if name in ignored_pkgs:
@@ -102,7 +111,7 @@ def main():
         for pkg, lic in violations[:25]:
             print(f"  {pkg}: {lic}")
         sys.exit(1)
-    print(f"OK: {len(pkgs)} bundled npm packages, all allow-listed")
+    print(f"OK: {len(pkgs)} npm packages covered, all allow-listed")
 
 
 if __name__ == "__main__":

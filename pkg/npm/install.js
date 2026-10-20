@@ -3,12 +3,13 @@
 // Postinstall script: downloads the platform-appropriate binary from GitHub Releases.
 // Runs automatically via `postinstall` in package.json.
 
+const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const { pipeline } = require('stream');
 
 const REPO = 'DeusData/codebase-memory-mcp';
@@ -17,7 +18,16 @@ const BIN_DIR = path.join(__dirname, 'bin');
 const MAX_REDIRECTS = 5;
 const DOWNLOAD_HOP_TIMEOUT_MS = 120_000;
 const CANDIDATE_TIMEOUT_MS = 15_000;
-const MAX_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
+// Entry-count guard for the zip namespace check. Keep in sync with the Go
+// wrapper (pkg/go/cmd/codebase-memory-mcp/main.go) and the PyPI wrapper.
+const MAX_ARCHIVE_MEMBERS = 64;
+const DEFAULT_DOWNLOAD_BASE = `https://github.com/${REPO}/releases/download/v${VERSION}`;
+// install.sh's loopback pattern: plain HTTP only to an exact loopback
+// authority, for local smoke tests.
+const LOOPBACK_HTTP_URL = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?([/?#].*)?$/;
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+// Bytes of tar's own diagnostics kept for the failure message.
+const MAX_TAR_STDERR_CHARS = 4096;
 const WINDOWS_BINARY_NAME = 'codebase-memory-mcp.exe';
 const UNIX_ARCHIVE_NAMES = [
   'codebase-memory-mcp',
@@ -69,6 +79,32 @@ function validateUrl(rawUrl) {
   return parsed.href;
 }
 
+// Plain HTTP is accepted only for an exact loopback authority, as in
+// install.sh; such a fetch uses no proxy and follows no redirect.
+function validateLoopbackUrl(rawUrl) {
+  let parsed = null;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (_) {
+    // Refused below.
+  }
+  if (!LOOPBACK_HTTP_URL.test(rawUrl) || !parsed || parsed.protocol !== 'http:' ||
+      !LOOPBACK_HOSTNAMES.has(parsed.hostname) || parsed.username || parsed.password) {
+    throw new Error(`Refusing non-loopback HTTP URL: ${rawUrl}`);
+  }
+  return parsed.href;
+}
+
+// CBM_DOWNLOAD_URL replaces the release download base (for testing), with
+// install.sh's policy: HTTPS, or plain HTTP to an exact loopback authority.
+function resolveDownloadBase(env = process.env) {
+  const override = env.CBM_DOWNLOAD_URL;
+  if (!override) return { base: DEFAULT_DOWNLOAD_BASE, loopback: false };
+  if (override.startsWith('https://')) return { base: override, loopback: false };
+  if (LOOPBACK_HTTP_URL.test(override)) return { base: override, loopback: true };
+  throw new Error(`Refusing non-HTTPS download URL (CBM_DOWNLOAD_URL): ${override}`);
+}
+
 function validateExactTarMemberListing(listing, expectedNames) {
   if (listing.includes('\0')) {
     throw new Error('tar member listing contains a NUL byte');
@@ -90,24 +126,108 @@ function validateExactTarMemberListing(listing, expectedNames) {
   }
 }
 
-function extractExactTarArchive(
-  archivePath, destPath, expectedNames, targetName, runFile = execFileSync,
-) {
-  const listing = runFile('tar', ['-tzf', archivePath], {
-    encoding: 'utf8',
-    maxBuffer: MAX_CHECKSUM_MANIFEST_BYTES,
-    windowsHide: true,
-  });
-  validateExactTarMemberListing(listing, expectedNames);
-  // Extract only the fixed root executable. Even a malformed tar implementation
-  // cannot write an unvalidated companion member outside the private temp tree.
-  runFile('tar', ['-xzf', archivePath, '-C', destPath, targetName], {
-    stdio: 'inherit',
-    windowsHide: true,
+function requireRegularArchive(archivePath) {
+  if (!fs.statSync(archivePath).isFile()) {
+    throw new Error('release archive is not a regular file');
+  }
+}
+
+// Streams one member through `tar -xzOf` into a file this call creates. The
+// file is removed only when this call created it: a pre-existing target
+// fails untouched.
+function extractTarMember(archivePath, target, memberName, spawnFile = spawn) {
+  return new Promise((resolve, reject) => {
+    let fd;
+    try {
+      fd = fs.openSync(target, 'wx', 0o600);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let written = 0;
+    let failure = null;
+    let settled = false;
+    let stderr = '';
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      try { fs.closeSync(fd); } catch (closeError) { err = err || closeError; }
+      if (err) {
+        try { fs.unlinkSync(target); } catch (_) { /* already gone */ }
+        reject(err);
+        return;
+      }
+      resolve(written);
+    };
+    const child = spawnFile('tar', ['-xzOf', archivePath, memberName], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const fail = (err) => {
+      if (failure) return;
+      failure = err;
+      child.kill();
+    };
+    child.stdout.on('data', (chunk) => {
+      if (failure) return;
+      written += chunk.length;
+      try {
+        let offset = 0;
+        while (offset < chunk.length) {
+          offset += fs.writeSync(fd, chunk, offset, chunk.length - offset);
+        }
+      } catch (err) {
+        fail(err);
+      }
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (text) => {
+      if (stderr.length < MAX_TAR_STDERR_CHARS) stderr += text;
+    });
+    child.on('error', (err) => {
+      failure = failure || err;
+      // A process that never started (no tar on PATH) has no exit to wait for.
+      if (child.pid === undefined) finish(failure);
+    });
+    child.on('close', (code, signal) => {
+      const detail = stderr.trim();
+      let err = failure;
+      if (!err && signal) {
+        err = new Error(
+          `tar was terminated by ${signal} while extracting ${memberName}: ${detail}`,
+        );
+      } else if (!err && code !== 0) {
+        err = new Error(
+          `tar exited with status ${code} while extracting ${memberName}: ${detail}`,
+        );
+      } else if (!err && written === 0) {
+        err = new Error(`archive member ${memberName} is empty`);
+      }
+      finish(err);
+    });
   });
 }
 
-function downloadHop(url, dest, maxBytes) {
+async function extractExactTarArchive(
+  archivePath, destPath, expectedNames, targetName,
+  runFile = execFileSync, spawnFile = spawn,
+) {
+  requireRegularArchive(archivePath);
+  // The exact root namespace is the member bound: the listing must name
+  // exactly the expected root files.
+  const listing = runFile('tar', ['-tzf', archivePath], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  validateExactTarMemberListing(listing, expectedNames);
+  // Only the fixed root executable is ever written; the companions are
+  // listed but never extracted.
+  const target = path.join(destPath, targetName);
+  await extractTarMember(archivePath, target, targetName, spawnFile);
+  fs.chmodSync(target, 0o755);
+}
+
+function downloadHop(url, dest, loopback) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let response = null;
@@ -121,12 +241,25 @@ function downloadHop(url, dest, maxBytes) {
       else resolve(result);
     }
 
-    const req = https.get(url, (res) => {
+    // A loopback hop gets a fresh agent, so no proxy configuration applies.
+    const get = loopback
+      ? (target, callback) => http.get(target, { agent: false }, callback)
+      : (target, callback) => https.get(target, callback);
+    const req = get(url, (res) => {
       response = res;
-      res.on('error', (err) => finish(err));
+      let piped = false;
+      // Before the body is piped, a response error ends the hop directly;
+      // afterwards the pipeline reports it, so the partial file is discarded
+      // before the hop settles.
+      res.on('error', (err) => { if (!piped) finish(err); });
       const redirectCodes = new Set([301, 302, 303, 307, 308]);
       if (redirectCodes.has(res.statusCode)) {
         const location = res.headers.location;
+        if (loopback) {
+          res.destroy();
+          finish(new Error(`Refusing redirect from loopback download ${url}`));
+          return;
+        }
         if (!location) {
           res.destroy();
           finish(new Error(`Redirect with no location for ${url}`));
@@ -150,16 +283,21 @@ function downloadHop(url, dest, maxBytes) {
         return;
       }
 
-      let received = 0;
-      res.on('data', (chunk) => {
-        received += chunk.length;
-        if (maxBytes && received > maxBytes) {
-          res.destroy(new Error(`Download exceeds the ${maxBytes}-byte safety limit`));
-        }
-      });
       const file = fs.createWriteStream(dest, { flags: 'w' });
+      piped = true;
       pipeline(res, file, (err) => {
-        finish(err, { redirect: null });
+        if (!err) {
+          finish(null, { redirect: null });
+          return;
+        }
+        // Discard the partial file once its handle is closed (Windows refuses
+        // to unlink an open file), then report the failure.
+        const discard = () => {
+          try { fs.unlinkSync(dest); } catch (_) { /* nothing was written */ }
+          finish(err);
+        };
+        if (file.closed) discard();
+        else file.once('close', discard);
       });
     });
     req.on('error', (err) => finish(err));
@@ -171,10 +309,10 @@ function downloadHop(url, dest, maxBytes) {
   });
 }
 
-async function download(rawUrl, dest, maxBytes = 0) {
-  let url = validateUrl(rawUrl);
+async function download(rawUrl, dest, loopback = false) {
+  let url = loopback ? validateLoopbackUrl(rawUrl) : validateUrl(rawUrl);
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
-    const result = await downloadHop(url, dest, maxBytes);
+    const result = await downloadHop(url, dest, loopback);
     if (!result.redirect) return;
     if (redirects === MAX_REDIRECTS) throw new Error('Too many redirects');
     url = result.redirect;
@@ -457,19 +595,28 @@ function installWindowsBinaryAtomically(sourceDir, destDir, verifier = verifyCan
   }
 }
 
-function extractZipOnWindows(archivePath, destPath, requiredNames, extractNames) {
+function extractZipOnWindows(
+  archivePath, destPath, requiredNames, extractNames,
+  maxMembers = MAX_ARCHIVE_MEMBERS, shell = 'powershell',
+) {
+  requireRegularArchive(archivePath);
   // -EncodedCommand is a constant program. Paths travel only through the child
   // environment and are consumed with -LiteralPath, so PowerShell never parses
   // user/TEMP path bytes as source code or wildcard syntax.
   const script = [
     "$ErrorActionPreference = 'Stop'",
     'Add-Type -AssemblyName System.IO.Compression.FileSystem',
+    '$maxMembers = [int]$env:CBM_NPM_MAX_MEMBERS',
+    '$memberCount = 0',
     '$zip = [System.IO.Compression.ZipFile]::OpenRead($env:CBM_NPM_ARCHIVE_PATH)',
     "$seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)",
     "$requiredNames = @($env:CBM_NPM_REQUIRED_NAMES.Split('|'))",
     '$targetCounts = @{}',
     'foreach ($requiredName in $requiredNames) { $targetCounts[$requiredName] = 0 }',
     'try { foreach ($entry in $zip.Entries) { ' +
+      '$memberCount = $memberCount + 1; ' +
+      'if ($memberCount -gt $maxMembers) { ' +
+      'throw "archive exceeds the $maxMembers-member safety limit" }; ' +
       "$name = $entry.FullName.Replace('\\', '/'); " +
       "$directory = $name.EndsWith('/'); " +
       "$segmentsPath = if ($directory) { $name.TrimEnd('/') } else { $name }; " +
@@ -491,46 +638,64 @@ function extractZipOnWindows(archivePath, destPath, requiredNames, extractNames)
     'if ($seen.Count -ne $requiredNames.Count) { ' +
       'throw "archive does not match the exact release root-file allowlist" }',
     "$extractNames = @($env:CBM_NPM_EXTRACT_NAMES.Split('|'))",
+    '$buffer = New-Object byte[] 65536',
     '$extractZip = [System.IO.Compression.ZipFile]::OpenRead($env:CBM_NPM_ARCHIVE_PATH)',
+    // Copy by hand so the bytes written can be compared with the declared
+    // size; ExtractToFile would accept whatever the compressed stream yields.
     'try { foreach ($extractName in $extractNames) { ' +
       '$entry = @($extractZip.Entries | Where-Object { $_.FullName -ceq $extractName })[0]; ' +
-      '[System.IO.Compression.ZipFileExtensions]::ExtractToFile(' +
-      '$entry, (Join-Path $env:CBM_NPM_DEST_PATH $extractName), $false) ' +
+      '$targetPath = Join-Path $env:CBM_NPM_DEST_PATH $extractName; ' +
+      '$copied = [long]0; ' +
+      '$source = $entry.Open(); ' +
+      '$target = [System.IO.File]::Open($targetPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write); ' +
+      'try { while ($true) { ' +
+      '$count = $source.Read($buffer, 0, $buffer.Length); ' +
+      'if ($count -le 0) { break }; ' +
+      '$copied = $copied + $count; ' +
+      '$target.Write($buffer, 0, $count) } ' +
+      '} catch { $target.Dispose(); ' +
+      'Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue; throw ' +
+      '} finally { $target.Dispose(); $source.Dispose() }; ' +
+      'if ($copied -ne $entry.Length) { ' +
+      'Remove-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue; ' +
+      'throw "archive member $extractName actual size $copied does not match declared size $($entry.Length)" } ' +
       '} } finally { $extractZip.Dispose() }',
   ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
-  execFileSync('powershell', [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded,
-  ], {
-    env: {
-      ...process.env,
-      CBM_NPM_ARCHIVE_PATH: archivePath,
-      CBM_NPM_DEST_PATH: destPath,
-      CBM_NPM_REQUIRED_NAMES: requiredNames.join('|'),
-      CBM_NPM_EXTRACT_NAMES: extractNames.join('|'),
-    },
-    stdio: 'inherit',
-    windowsHide: true,
-  });
+  try {
+    execFileSync(shell, [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded,
+    ], {
+      env: {
+        ...process.env,
+        CBM_NPM_ARCHIVE_PATH: archivePath,
+        CBM_NPM_DEST_PATH: destPath,
+        CBM_NPM_REQUIRED_NAMES: requiredNames.join('|'),
+        CBM_NPM_EXTRACT_NAMES: extractNames.join('|'),
+        CBM_NPM_MAX_MEMBERS: String(maxMembers),
+      },
+      encoding: 'utf8',
+      stdio: ['ignore', 'inherit', 'pipe'],
+      windowsHide: true,
+    });
+  } catch (err) {
+    // Surface the script's own reason (for example which check failed)
+    // instead of a bare "Command failed".
+    const detail = err && err.stderr ? String(err.stderr).trim() : '';
+    throw new Error(detail ? `zip extraction failed: ${detail}` : err.message);
+  }
 }
 
-// Fetch checksums.txt and verify the archive hash.
-async function verifyChecksum(archivePath, archiveName) {
-  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/checksums.txt`;
+// Fetch checksums.txt from the same download base and verify the archive hash.
+async function verifyChecksum(archivePath, archiveName, source) {
+  const url = `${source.base}/checksums.txt`;
   const tmpChecksums = archivePath + '.checksums';
   try {
-    await download(url, tmpChecksums, MAX_CHECKSUM_MANIFEST_BYTES);
-    const manifestSize = fs.statSync(tmpChecksums).size;
-    if (manifestSize > MAX_CHECKSUM_MANIFEST_BYTES) {
-      throw new Error('checksums.txt exceeds the 1 MiB safety limit');
-    }
+    await download(url, tmpChecksums, source.loopback);
     const expected = parseExpectedChecksum(
       fs.readFileSync(tmpChecksums, 'utf-8'), archiveName,
     );
-    const actual = crypto
-      .createHash('sha256')
-      .update(fs.readFileSync(archivePath))
-      .digest('hex');
+    const actual = fileSha256(archivePath);
     if (expected !== actual) {
       throw new Error(
         `Checksum mismatch for ${archiveName}:\n  expected: ${expected}\n  actual:   ${actual}`,
@@ -574,6 +739,7 @@ async function main() {
     }
   }
 
+  const source = resolveDownloadBase();
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
   // Linux ships a fully-static "-portable" build; the standard linux binary
@@ -584,7 +750,7 @@ async function main() {
   // always embedded. The old CBM_VARIANT=ui opt-in pointed at ui-* archives
   // that no longer exist, so honoring it could only 404 (#1538).
   const archive = `codebase-memory-mcp-${platform}-${arch}${variant}.${ext}`;
-  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
+  const url = `${source.base}/${archive}`;
 
   process.stdout.write(`codebase-memory-mcp: downloading v${VERSION} for ${platform}/${arch}...\n`);
 
@@ -592,12 +758,12 @@ async function main() {
   const tmpArchive = path.join(tmpDir, `cbm.${ext}`);
 
   try {
-    await download(url, tmpArchive);
-    await verifyChecksum(tmpArchive, archive);
+    await download(url, tmpArchive, source.loopback);
+    await verifyChecksum(tmpArchive, archive, source);
 
     // Validate the complete archive namespace, then extract only executables.
     if (ext === 'tar.gz') {
-      extractExactTarArchive(
+      await extractExactTarArchive(
         tmpArchive, tmpDir, archiveNames, binName,
       );
     } else {
@@ -675,9 +841,13 @@ if (require.main === module || module.parent == null) {
 
 module.exports = {
   UNIX_ARCHIVE_NAMES,
+  WINDOWS_ARCHIVE_NAMES,
   WINDOWS_BINARY_NAME,
+  download,
   extractExactTarArchive,
+  extractZipOnWindows,
   installWindowsBinaryAtomically,
+  resolveDownloadBase,
   validateExactTarMemberListing,
   windowsBinaryReady,
 };

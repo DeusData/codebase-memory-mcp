@@ -1,0 +1,87 @@
+# Team artifact for test selection (smart CI, report-only until the oracles
+# and the shadow comparison are green). Every push to main publishes the
+# commit's bundle — its frozen graph, built incrementally from the previous
+# bundle, and its per-test coverage map, re-run only for the suites the push
+# selects — as the Actions artifact test-impact-<sha>. A weekly run rebuilds
+# both from scratch and fails when the incremental graph differs from the full
+# one. PR selection fetches the bundle of its merge base
+# (scripts/ci/test-impact-bundle.sh) and never narrows on anything else.
+name: test-impact-artifact
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 3 * * 0" # weekly full refresh, Sunday 03:23 UTC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: incremental or full
+        type: choice
+        options: [incremental, full]
+        default: full
+
+permissions:
+  contents: read
+  actions: read # fetch the previous bundle
+
+concurrency:
+  # Bundles chain: each push builds on the previous one, so runs never overlap
+  # and are never cancelled half-way.
+  group: test-impact-artifact
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: `test-impact select/publish` certify the history they
+          # read and refuse a shallow clone.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install build deps and LLVM 21 (coverage toolchain)
+        run: |
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update
+          sudo apt-get install -y clang-21 llvm-21 libclang-rt-21-dev
+
+      - name: Build the production binary and the coverage runner
+        run: |
+          scripts/build.sh CC=gcc CXX=g++
+          make -f Makefile.cbm test-runner-cov COV_LLVM_BIN=/usr/lib/llvm-21/bin -j"$(nproc)"
+
+      - name: Publish the bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          REQUESTED: ${{ inputs.mode }}
+          # The selection lane excludes @perf and PR CI skips perf, so their
+          # (slowest, longest under coverage) suites are neither mapped nor
+          # listed: the runner then neither lists nor runs them.
+          CBM_SKIP_PERF: "1"
+        run: |
+          mode=incremental
+          if [ "$EVENT" = schedule ] || [ "$REQUESTED" = full ]; then mode=full; fi
+          before="$(git rev-parse HEAD^1)"
+          if [ "$EVENT" = push ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            before="$BEFORE"
+          fi
+          scripts/ci/test-impact-publish.sh --binary build/c/codebase-memory-mcp \
+            --runner build/cov/test-runner --llvm-bin /usr/lib/llvm-21/bin \
+            --out "$RUNNER_TEMP/bundle" --mode "$mode" --before "$before"
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-impact-${{ github.sha }}
+          path: ${{ runner.temp }}/bundle
+          include-hidden-files: true # the graph lives in .codebase-memory/
+          retention-days: 30
+          if-no-files-found: error

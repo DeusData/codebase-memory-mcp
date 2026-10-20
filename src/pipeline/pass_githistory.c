@@ -130,7 +130,7 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
              "--since=\"1 year ago\" --max-count=10000 2>%s",
              repo_path, null_dev);
 
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }

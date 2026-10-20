@@ -1,0 +1,377 @@
+{
+  "schemaVersion": 1,
+  "symbol": {
+    "nodeId": "codeatlas-atlas-sample.src.services.orderService.getOrder",
+    "name": "getOrder",
+    "qualifiedName": "codeatlas-atlas-sample.src.services.orderService.getOrder",
+    "kind": "function",
+    "uri": "file:///workspace/atlas-sample/src/services/orderService.ts",
+    "range": {
+      "start": {
+        "line": 7,
+        "character": 0
+      },
+      "end": {
+        "line": 25,
+        "character": 0
+      }
+    },
+    "projectName": "codeatlas-atlas-sample"
+  },
+  "generation": 2,
+  "snippetHash": "34d49a32f1c4ae63e23c90731d5c97651e348831d3715f253d57524cfadcebe2",
+  "purpose": {
+    "value": "Function getOrder in orderService.ts. Makes 2 calls, touches 0 environment values, can raise 0 error types.",
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "graph-node",
+        "strategy": "derived-summary",
+        "file": "file:///workspace/atlas-sample/src/services/orderService.ts",
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "steps": {
+    "value": [
+      {
+        "targetName": "validateId",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.util.validate.validateId",
+        "targetFile": "file:///workspace/atlas-sample/src/util/validate.ts",
+        "line": 10,
+        "targetLine": 33,
+        "strategy": "direct-call"
+      },
+      {
+        "targetName": "query",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+        "targetFile": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 11,
+        "targetLine": 17,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/util/validate.ts",
+        "range": {
+          "startLine": 10,
+          "endLine": 10
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 11,
+          "endLine": 11
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calls": {
+    "value": [
+      {
+        "targetName": "validateId",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.util.validate.validateId",
+        "targetFile": "file:///workspace/atlas-sample/src/util/validate.ts",
+        "line": 10,
+        "targetLine": 33,
+        "strategy": "direct-call"
+      },
+      {
+        "targetName": "query",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+        "targetFile": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 11,
+        "targetLine": 17,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/util/validate.ts",
+        "range": {
+          "startLine": 10,
+          "endLine": 10
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 11,
+          "endLine": 11
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calledBy": {
+    "value": [
+      {
+        "name": "registerOrderRoutes",
+        "qualifiedName": "codeatlas-atlas-sample.src.routes.orders.registerOrderRoutes",
+        "file": "file:///workspace/atlas-sample/src/routes/orders.ts",
+        "line": 8,
+        "isTest": false
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/routes/orders.ts",
+        "range": {
+          "startLine": 8,
+          "endLine": 8
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "reads": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "writes": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "typeRefs": {
+    "value": [
+      {
+        "name": "Order",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.Order",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "line": 32
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "startLine": 32,
+          "endLine": 32
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "throws": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "externalEffects": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "tests": {
+    "value": [],
+    "state": "inferred",
+    "evidence": []
+  },
+  "missingTests": {
+    "value": true,
+    "state": "inferred",
+    "evidence": []
+  },
+  "complexity": {
+    "value": {
+      "cyclomatic": 0,
+      "cognitive": 0,
+      "loopDepth": 0,
+      "transitiveLoopDepth": 0,
+      "linearScanInLoop": false,
+      "allocInLoop": false,
+      "unguardedRecursion": false,
+      "recursive": false,
+      "isEntryPoint": false,
+      "isExported": false
+    },
+    "state": "unsupported",
+    "evidence": []
+  },
+  "risks": [],
+  "checklist": [
+    {
+      "id": "3f9c1e23724e0399c94797d26a76277c465689a5",
+      "category": "core-logic",
+      "label": "Understand the call to validateId",
+      "target": {
+        "name": "validateId",
+        "qualifiedName": "codeatlas-atlas-sample.src.util.validate.validateId",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/util/validate.ts",
+        "range": {
+          "start": {
+            "line": 32,
+            "character": 0
+          },
+          "end": {
+            "line": 33,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 32,
+            "character": 0
+          },
+          "end": {
+            "line": 32,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "eb143f2b436c85c8494980deacb81bf60a7eab36",
+      "category": "core-logic",
+      "label": "Understand the call to query",
+      "target": {
+        "name": "query",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 16,
+            "character": 0
+          },
+          "end": {
+            "line": 17,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 16,
+            "character": 0
+          },
+          "end": {
+            "line": 16,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "4e841fd0207e9edaab5341c1391c78456e972734",
+      "category": "inputs",
+      "label": "Know the shape of Order",
+      "target": {
+        "name": "Order",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.Order",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "start": {
+            "line": 31,
+            "character": 0
+          },
+          "end": {
+            "line": 32,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 31,
+            "character": 0
+          },
+          "end": {
+            "line": 31,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "afbaf68afd17acb95749d7a705d8a2be610bb15c",
+      "category": "callers",
+      "label": "See who calls this: registerOrderRoutes",
+      "target": {
+        "name": "registerOrderRoutes",
+        "qualifiedName": "codeatlas-atlas-sample.src.routes.orders.registerOrderRoutes",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/routes/orders.ts",
+        "range": {
+          "start": {
+            "line": 7,
+            "character": 0
+          },
+          "end": {
+            "line": 8,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 7,
+            "character": 0
+          },
+          "end": {
+            "line": 7,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "7512d458235451601fb03f7e087b9beeb3854f6a",
+      "category": "tests",
+      "label": "No test callers found (inferred): decide if this needs a test",
+      "target": {
+        "nodeId": "codeatlas-atlas-sample.src.services.orderService.getOrder",
+        "name": "getOrder",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.orderService.getOrder",
+        "kind": "function",
+        "uri": "file:///workspace/atlas-sample/src/services/orderService.ts",
+        "range": {
+          "start": {
+            "line": 7,
+            "character": 0
+          },
+          "end": {
+            "line": 25,
+            "character": 0
+          }
+        },
+        "projectName": "codeatlas-atlas-sample"
+      },
+      "done": false
+    }
+  ]
+}
