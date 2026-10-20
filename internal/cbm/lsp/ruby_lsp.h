@@ -210,8 +210,7 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
 /* Resolve one file against a prebuilt shared registry. Reads `shared` only;
  * everything it allocates lives in `arena`. */
 void cbm_run_ruby_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn,
-                                          const CBMRubyCrossRegistry *shared,
+                                          const char *module_qn, const CBMRubyCrossRegistry *shared,
                                           const char **import_names, const char **import_qns,
                                           int import_count,
                                           TSTree *cached_tree, /* NULL = parse internally */

@@ -1840,8 +1840,8 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
     sh->slot_mask = slots - 1;
     sh->by_qn = (int *)cbm_arena_alloc(arena, slots * sizeof(int));
     sh->by_path = (int *)cbm_arena_alloc(arena, slots * sizeof(int));
-    sh->classes = (RubyClassInfo *)cbm_arena_alloc(
-        arena, (size_t)(max_classes ? max_classes : 1) * sizeof(RubyClassInfo));
+    sh->classes = (RubyClassInfo *)cbm_arena_alloc(arena, (size_t)(max_classes ? max_classes : 1) *
+                                                              sizeof(RubyClassInfo));
     const char **decl_nesting = (const char **)cbm_arena_alloc(
         arena, (size_t)(max_classes ? max_classes : 1) * sizeof(const char *));
     if (!sh->by_qn || !sh->by_path || !sh->classes || !decl_nesting)
@@ -1879,8 +1879,7 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
             /* Declaring scope = every frame but the last; the superclass is
              * resolved from there, as in the per-file pass. */
             const char *last = strrchr(suffix, '.');
-            decl_nesting[n] =
-                last ? cbm_arena_strndup(arena, suffix, (size_t)(last - suffix)) : "";
+            decl_nesting[n] = last ? cbm_arena_strndup(arena, suffix, (size_t)(last - suffix)) : "";
             ruby_shared_insert(sh, sh->by_qn, n, false);
             if (head) {
                 /* The same constant reopened in another file: join its group. */
@@ -1948,8 +1947,7 @@ CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *
 /* ── cross-file: per-file entry ─────────────────────────────────── */
 
 void cbm_run_ruby_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn,
-                                          const CBMRubyCrossRegistry *shared,
+                                          const char *module_qn, const CBMRubyCrossRegistry *shared,
                                           const char **import_names, const char **import_qns,
                                           int import_count, TSTree *cached_tree,
                                           CBMResolvedCallArray *out) {
@@ -2015,9 +2013,8 @@ void cbm_run_ruby_lsp_cross(CBMArena *arena, const char *source, int source_len,
     cbm_arena_init(&build);
     CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, def_count);
     if (sh) {
-        cbm_run_ruby_lsp_cross_with_registry(arena, source, source_len, module_qn, sh,
-                                             import_names, import_qns, import_count, cached_tree,
-                                             out);
+        cbm_run_ruby_lsp_cross_with_registry(arena, source, source_len, module_qn, sh, import_names,
+                                             import_qns, import_count, cached_tree, out);
     }
     cbm_arena_destroy(&build);
 }
