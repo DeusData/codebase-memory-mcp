@@ -35,6 +35,7 @@ trap 'rm -rf "$WORK"' EXIT
 # explicit path): a bare "bash" argv can resolve to the WSL alias on Windows.
 python3 - "$BASH" "$SELECTOR" "$CASES" "$WORK" <<'PY'
 import json
+import os
 import pathlib
 import random
 import subprocess
@@ -47,12 +48,14 @@ failures = []
 # Every lane of the full PR pipeline, spelled out here rather than read from
 # the selector, so a lane silently dropped from the selector's universe fails.
 FULL = {
-    "codeql-gate", "diag", "license-gate", "lint", "lint-mem", "lsan-macos",
+    "diag", "license-gate", "lint", "lint-mem", "lsan-macos",
     "memwaste", "msan", "pkg-wrappers", "security-static",
     "shard-completeness", "smoke-mac", "smoke-ubuntu", "smoke-win",
     "tsan-arm", "tsan-mac", "tsan-x86", "unix-arm64", "unix-macos-intel",
     "unix-macos14", "unix-x86", "windows", "windows-guards",
+    "codeql-cpp", "codeql-js", "codeql-py", "codeql-actions",
 }
+CODEQL = {"codeql-cpp", "codeql-js", "codeql-py", "codeql-actions"}
 UNIVERSE = FULL | {"contracts"}
 
 
@@ -200,6 +203,88 @@ for bad in ("many", ""):   # "" = a workflow whose count went missing
     if rc != 2 or "Please consult --help." not in err:
         failures.append(f"--expect-files {bad!r} must be a usage error (exit 2), never "
                         f"a silently skipped truncation check")
+
+# 8. The CodeQL PR scans (codeql-* lanes) fail closed:
+#    (a) a C/C++ change -- first-party or vendored -- always selects the C scan;
+#    (b) an undeterminable diff (an empty or truncated list here; a diff the
+#        retrace helper cannot compute below) selects every language's full
+#        first-party scan, and so does a change to the workflows, the build or
+#        the CodeQL machinery;
+#    (c) a vendored-only change scans the changed vendored files: the C lane
+#        is selected and the retrace helper lists exactly those files, which
+#        codeql.yml then compiles under tracing.
+#    Tests, docs and vendored non-C select no CodeQL lane.
+def lanes_for(files, args=()):
+    rc, out, _ = run(list(args), "".join(f + "\n" for f in files))
+    return set(json.loads(out)["lanes"]) if rc == 0 else None
+
+
+for c_file in ("src/pipeline/pass_calls.c", "src/foundation/mem_core.c",
+               "internal/cbm/extract_calls.c", "internal/cbm/lsp/go_lsp.c",
+               "internal/cbm/cbm.h", "src/newdir/x.c",
+               "internal/cbm/vendored/grammars/go/parser.c",
+               "internal/cbm/vendored/lz4/lz4.c", "vendored/sqlite3/sqlite3.c",
+               "vendored/mimalloc/src/options.c"):
+    got = lanes_for([c_file])
+    if got is None or "codeql-cpp" not in got:
+        failures.append(f"codeql (a): a C/C++ change ({c_file}) must select codeql-cpp, "
+                        f"got {sorted(got or [])}")
+for label, files, args in (("empty file list", [], ()),
+                           ("truncated list", ["docs/a.md"], ("--expect-files", "5")),
+                           ("a workflow", [".github/workflows/stale.yml"], ()),
+                           ("Makefile.cbm", ["Makefile.cbm"], ()),
+                           ("scripts/build.sh", ["scripts/build.sh"], ()),
+                           ("the selector", ["scripts/ci/select-lanes.sh"], ()),
+                           ("the CodeQL config", [".github/codeql/codeql-config.yml"], ()),
+                           ("the retrace helper", ["scripts/ci/codeql-retrace-vendored.sh"], ())):
+    got = lanes_for(files, args)
+    if got is None or not CODEQL <= got:
+        failures.append(f"codeql (b): {label} must select every CodeQL language, "
+                        f"got {sorted((got or set()) & CODEQL)}")
+for quiet in ("tests/test_store.c", "tests/fixtures/x.py", "README.md", "docs/a.md",
+              "graph-ui/vendor/lib.js", "scripts/repro.sh"):
+    got = lanes_for([quiet])
+    if got is None or got & CODEQL:
+        failures.append(f"codeql: {quiet} must select no CodeQL lane, "
+                        f"got {sorted((got or set()) & CODEQL)}")
+for language, path in (("javascript-typescript", "graph-ui/src/App.tsx"),
+                       ("javascript-typescript", "pkg/npm/install.js"),
+                       ("python", "scripts/test-impact/x.py"),
+                       ("actions", ".github/workflows/pr.yml")):
+    rc, out, _ = run(["--codeql-scope", language], path + "\n")
+    if rc != 0 or out.split() != [path]:
+        failures.append(f"--codeql-scope {language} must keep {path}, printed {out!r}")
+rc, _, err = run(["--codeql-scope", "go"], "src/main.c\n")
+if rc != 2 or "Please consult --help." not in err:
+    failures.append("--codeql-scope with an unknown language must be a usage error (exit 2)")
+
+retrace = pathlib.Path(selector).parent / "codeql-retrace-vendored.sh"
+env = {k: v for k, v in os.environ.items() if k != "GITHUB_EVENT_NAME"}
+changed = work / "codeql-changed.txt"
+changed.write_text("src/main.c\ninternal/cbm/vendored/grammars/go/parser.c\n"
+                   "vendored/sqlite3/sqlite3.c\nvendored/no-such-file.c\n"
+                   "internal/cbm/grammar_json.c\ninternal/cbm/ts_runtime.c\n"
+                   "graph-ui/src/App.tsx\n", encoding="utf-8")
+listed = work / "codeql-retrace.txt"
+proc = subprocess.run([bash, str(retrace), "--changed", str(changed), str(listed)],
+                      capture_output=True, text=True, env=env)
+got = listed.read_text(encoding="utf-8").split() if listed.exists() else None
+if proc.returncode != 0 or got != ["internal/cbm/grammar_go.c",
+                                   "internal/cbm/grammar_json.c",
+                                   "internal/cbm/ts_runtime.c",
+                                   "vendored/sqlite3/sqlite3.c"]:
+    failures.append(f"codeql (c): the retrace helper must list the translation units for "
+                    f"changed vendored code and wrappers, got {got} (exit {proc.returncode})")
+for label, args in (("an unreadable change list", ["--changed", str(work / "missing.txt")]),
+                    ("no pull request", [])):
+    listed.write_text("stale\n", encoding="utf-8")
+    proc = subprocess.run([bash, str(retrace), *args, str(listed)],
+                          capture_output=True, text=True, env=env)
+    if proc.returncode != 0 or listed.read_text(encoding="utf-8") != "" \
+            or "undetermined" not in proc.stdout:
+        failures.append(f"codeql (b): with {label} the retrace helper must succeed with an "
+                        f"empty list (the scan still covers all first-party C), "
+                        f"exit {proc.returncode}: {proc.stdout.strip()!r}")
 
 if failures:
     print("LANE SELECTOR CONTRACT VIOLATED:")

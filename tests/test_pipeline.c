@@ -9659,6 +9659,163 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* #606: a receiver typed as an unindexed (vendor/) class must not weakly bind a
+ * same-named project method. */
+static void write_php_receiver_fixture(const char *tmp) {
+    write_temp_file(tmp, "src/Item.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "class Item\n"
+                    "{\n"
+                    "    public function getUid(): int\n"
+                    "    {\n"
+                    "        return 1;\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/Domain/Repository.php",
+                    "<?php\n"
+                    "namespace App\\Domain;\n"
+                    "\n"
+                    "use App\\Item;\n"
+                    "use Vendor\\Storage\\File;\n"
+                    "\n"
+                    "class Repository\n"
+                    "{\n"
+                    "    public function findItem(): Item\n"
+                    "    {\n"
+                    "        return new Item();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function findFile(): File\n"
+                    "    {\n"
+                    "        return new File();\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/Listener.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "use Vendor\\Storage\\File;\n"
+                    "use function sprintf;\n"
+                    "\n"
+                    "class Listener\n"
+                    "{\n"
+                    "    public function vendorCall(File $file): int\n"
+                    "    {\n"
+                    "        return $file->getUid();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function selfCall(): int\n"
+                    "    {\n"
+                    "        return $this->localHelper();\n"
+                    "    }\n"
+                    "\n"
+                    "    private function localHelper(): int\n"
+                    "    {\n"
+                    "        return 1;\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/ChainListener.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "use App\\Domain\\Repository;\n"
+                    "\n"
+                    "class ChainListener\n"
+                    "{\n"
+                    "    public function chainedVendorCall(Repository $repository): int\n"
+                    "    {\n"
+                    "        return $repository->findFile()->getUid();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function projectCall(Repository $repository): Item\n"
+                    "    {\n"
+                    "        return $repository->findItem();\n"
+                    "    }\n"
+                    "}\n");
+}
+
+/* Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_php_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_php_receiver_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/php_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "src/Item.php", "getUid", "Method"), 1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "vendorCall", "getUid"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "chainedVendorCall", "getUid"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "projectCall", "findItem"));
+    ASSERT_GTE(named_edge_count(s, project, "CALLS", "selfCall", "localHelper"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* >= 50 files forces pass_parallel.c. */
+TEST(pipeline_php_receiver_parallel_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_php_receiver_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/Filler%d.php", i);
+        snprintf(body, sizeof(body), "<?php\nfunction filler%d(): int\n{\n    return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/php_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "src/Item.php", "getUid", "Method"), 1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "vendorCall", "getUid"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "chainedVendorCall", "getUid"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "projectCall", "findItem"));
+    ASSERT_GTE(named_edge_count(s, project, "CALLS", "selfCall", "localHelper"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* The member guard's one exemption (2026-09-16, v0.10.8 → v0.11.0 A/B on
  * django/django): a member call whose receiver is an attribute chain rooted at
  * self/cls, whose callee has exactly ONE definition in the project and is not a
@@ -27522,6 +27679,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
     RUN_TEST(pipeline_ts_param_property_injection_issue514);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_php_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_php_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_method_caller_keeps_lsp_join);

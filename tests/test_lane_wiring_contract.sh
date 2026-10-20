@@ -156,10 +156,10 @@ require("test_selection: ${{ needs.select-tests.result == 'success' && "
 MATRIX = {"unix-x86": "_test.yml", "unix-arm64": "_test.yml", "unix-macos14": "_test.yml",
           "unix-macos-intel": "_test.yml", "windows": "_test.yml", "tsan-x86": "_test.yml",
           "tsan-arm": "_test.yml", "tsan-mac": "_test.yml", "smoke-ubuntu": "pr.yml",
-          "smoke-mac": "pr.yml", "smoke-win": "pr.yml"}
+          "smoke-mac": "pr.yml", "smoke-win": "pr.yml", "codeql-cpp": "pr.yml",
+          "codeql-js": "pr.yml", "codeql-py": "pr.yml", "codeql-actions": "pr.yml"}
 SINGLE = {"lint": ("_lint.yml", "lint"), "lint-mem": ("_lint.yml", "lint-mem"),
           "license-gate": ("_security.yml", "license-gate"),
-          "codeql-gate": ("_security.yml", "codeql-gate"),
           "pkg-wrappers": ("_test.yml", "test-package-wrappers"),
           "diag": ("_test.yml", "test-diag"), "msan": ("_test.yml", "test-msan"),
           "lsan-macos": ("_test.yml", "test-lsan-macos"),

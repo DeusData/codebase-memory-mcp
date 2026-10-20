@@ -1496,6 +1496,21 @@ const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *me
     return only;
 }
 
+bool cbm_registry_has_type_named(const cbm_registry_t *r, const char *name) {
+    if (!r || !name || !name[0]) {
+        return false;
+    }
+    const char **qns = NULL;
+    int count = 0;
+    cbm_registry_find_by_name(r, name, &qns, &count);
+    for (int i = 0; i < count; i++) {
+        if (cbm_label_is_type_like(cbm_registry_label_of(r, qns[i]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int cbm_registry_size(const cbm_registry_t *r) {
     return r ? (int)cbm_ht_count(r->exact) : 0;
 }

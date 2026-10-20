@@ -2115,6 +2115,37 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
+/* The File an explicit relative import (`./x`, `../x`) names exactly, for
+ * files whose File QN differs from the module QN Strategy 1 tries
+ * (`../styles/global.css`, `../layouts/Layout.astro`, #2558). Resolved in
+ * stack buffers by cbm_repo_rel_join, which refuses a path above the
+ * repository root. */
+static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
+                                                    const char *source_rel, const char *module_path,
+                                                    bool php_only) {
+    if (!source_rel || !module_path || module_path[0] != '.' ||
+        !(module_path[1] == '/' || (module_path[1] == '.' && module_path[2] == '/'))) {
+        return NULL;
+    }
+    char dir[PKGMAP_PATH_BUF];
+    int dir_len = snprintf(dir, sizeof(dir), "%s", source_rel);
+    if (dir_len < 0 || (size_t)dir_len >= sizeof(dir)) {
+        return NULL;
+    }
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        dir[0] = '\0';
+    }
+    char path[PKGMAP_PATH_BUF];
+    if (!cbm_repo_rel_join(dir, module_path, path, sizeof(path))) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+    return file && (!php_only || node_in_php_file(file)) ? file : NULL;
+}
+
 /* ── PHP PSR-4 class imports (#1186) ──────────────────────────────── */
 
 typedef enum {
@@ -2387,6 +2418,15 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         if (sib) {
             return sib;
         }
+    }
+
+    /* Strategy 1c: relative non-module files can have a File QN that does not
+     * match the module QN above. Resolve the exact file after module and
+     * sibling lookup. */
+    const cbm_gbuf_node_t *rel_file =
+        resolve_relative_file(ctx, source_rel, imp->module_path, php_only);
+    if (rel_file) {
+        return rel_file;
     }
 
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,

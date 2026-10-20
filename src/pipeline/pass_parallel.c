@@ -3421,7 +3421,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              cbm_suppress_weak_import_bound_call(true, true, res.strategy) &&
              cbm_python_import_binding_contradicts(&result->imports, call->callee_name,
                                                    res.qualified_name, rc->main_gbuf,
-                                                   rc->project_name, rel));
+                                                   rc->project_name, rel)) ||
+            /* MUST match pass_calls.c exactly. */
+            (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
+             cbm_pipeline_php_receiver_type_unindexed(&result->resolved_calls, call, rc->registry));
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
