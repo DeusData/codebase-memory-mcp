@@ -1080,7 +1080,6 @@ static int text_upsert_managed_block(const char *file_path, const char *begin_ma
     }
     char *old_data = doc.data;
     size_t old_len = doc.len;
-    size_t bom_len = doc.bom_len;
     text_file_snapshot_t snapshot = doc.snapshot;
     text_managed_region_t region = doc.region;
 
@@ -1102,6 +1101,7 @@ static int text_upsert_managed_block(const char *file_path, const char *begin_ma
                                        &snapshot);
         }
     } else {
+        size_t bom_len = doc.bom_len;
         const char *eol = NULL;
         size_t eol_len = 0U;
         text_detect_eol(old_data + bom_len, old_len - bom_len, &eol, &eol_len);
