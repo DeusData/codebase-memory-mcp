@@ -106,6 +106,31 @@ struct cbm_result_spill {
  * target to race against, and a failed write stays handled underneath. */
 enum { SPILL_FREE_FLOOR_GB = 10, SPILL_FREE_SHARE_DIV = 2 };
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Set by the test's main thread before any worker exists; atomic so a reading
+ * worker and a restoring test can never race under TSan. */
+static _Atomic size_t g_free_bytes_pin;
+
+size_t cbm_result_spill_pin_free_bytes_for_tests(size_t bytes) {
+    return atomic_exchange_explicit(&g_free_bytes_pin, bytes, memory_order_relaxed);
+}
+
+size_t cbm_result_spill_free_floor_bytes_for_tests(void) {
+    return (size_t)SPILL_FREE_FLOOR_GB * 1024 * 1024 * 1024;
+}
+#endif
+
+/* Free space under the spill directory. Production always asks the disk. */
+static size_t spill_free_bytes(const char *spill_dir) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    size_t pinned = atomic_load_explicit(&g_free_bytes_pin, memory_order_relaxed);
+    if (pinned > 0) {
+        return pinned;
+    }
+#endif
+    return cbm_fs_free_bytes(spill_dir);
+}
+
 /* Remove spill files left by runs that are no longer here. Only files this
  * module names (spill-<pid>-<writer>.bin) are touched, and on Windows an open
  * file refuses deletion, which is exactly the liveness check we want: a running
@@ -164,7 +189,7 @@ cbm_result_spill_t *cbm_result_spill_open(const char *dir, int writers, int slot
      * caller in the memory path it was already in (back-pressure, then its own
      * budget decision) — the same outcome as a disk that fills mid-run, minus
      * the filled disk. */
-    size_t free_bytes = cbm_fs_free_bytes(spill_dir);
+    size_t free_bytes = spill_free_bytes(spill_dir);
     int64_t byte_cap = 0;
     if (free_bytes > 0) {
         size_t floor_bytes = (size_t)SPILL_FREE_FLOOR_GB * 1024 * 1024 * 1024;
@@ -233,7 +258,8 @@ bool cbm_result_spill_park(cbm_result_spill_t *sp, int writer, int slot, CBMFile
      * result that owns sub-results (embedded languages) has more arenas than
      * that and stays in memory. A retained parse tree is a re-parse cache,
      * not data: it is dropped with the in-memory result below. */
-    if (result->arena.nblocks != 1 || result->owned_result_count != 0) {
+    if (result->arena.nblocks != 1 || result->owned_result_count != 0 ||
+        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
         return false;
     }
     /* The disk ceiling. Refusing a park leaves the result in memory, which is
@@ -331,6 +357,10 @@ CBMFileResult *cbm_result_spill_load(const cbm_result_spill_t *sp, int slot) {
     }
     cbm_result_relocate(r, (const char *)(uintptr_t)hdr.old_base, (size_t)hdr.block_len,
                         r->arena.blocks[0]);
+    if (!cbm_py_namespace_facts_valid(&r->py_namespace)) {
+        cbm_free_result(r);
+        return NULL;
+    }
     atomic_fetch_add_explicit((_Atomic int64_t *)&sp->loads, 1, memory_order_relaxed);
     return r;
 }

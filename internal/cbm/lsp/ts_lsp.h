@@ -65,10 +65,6 @@ typedef struct {
     // first completed eval; see TsEvalMemo in ts_lsp.c). Kills the exponential
     // re-evaluation of shared subexpressions under overload resolution.
     struct TsEvalMemo *eval_memo;
-    // Recursion guard for lookup_member_type: cyclic type graphs (mutually
-    // recursive unions/wrappers across registered types) otherwise recurse
-    // without bound — stack overflow on real repos.
-    int member_depth;
 } TSLSPContext;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -76,6 +72,10 @@ typedef struct {
 // for the calling thread, valid after a cbm_run_ts_lsp on the same thread.
 long cbm_ts_lsp_test_budget_remaining(void);
 bool cbm_ts_lsp_test_budget_warned(void);
+// Maximum recursive calls in one member/method lookup during the last TS LSP run,
+// including attempts rejected by the depth or visited-type guard.
+int cbm_ts_lsp_test_max_member_lookup_steps(void);
+int cbm_ts_lsp_test_max_method_lookup_steps(void);
 #endif
 
 // --- Initialization ---

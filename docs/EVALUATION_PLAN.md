@@ -311,15 +311,16 @@ SHA, and — **not just totals** — a **per-type breakdown**:
 - `node-types.json` — a histogram of **node count by label** (`Function`, `Method`, `Class`,
   `Interface`, `Type`/`Enum`/`Struct`, `Field`, `Variable`, `Route`, `Module`, `Section`, `Macro`,
   `File`, `Folder`) + total.
-- `edge-types.json` — a histogram of **edge count by type, with one entry for every one of the 32
+- `edge-types.json` — a histogram of **edge count by type, with one entry for every one of the 33
   edge types, including those that came back `0`**. The canonical set is the indexer's own
-  `ALL_EDGE_TYPES[]` (26 intra-repo types — `tests/test_lang_contract.c`): `CALLS`, `ASYNC_CALLS`,
+  `ALL_EDGE_TYPES[]` (27 intra-repo types — `tests/test_lang_contract.c`): `CALLS`, `ASYNC_CALLS`,
   `HTTP_CALLS`, `GRPC_CALLS`, `GRAPHQL_CALLS`, `TRPC_CALLS`, `DEFINES`, `DEFINES_METHOD`, `IMPLEMENTS`,
   `INHERITS`, `OVERRIDE`, `DECORATES`, `IMPORTS`, `HANDLES`, `CONFIGURES`, `DEPENDS_ON`, `USAGE`,
   `DATA_FLOWS`, `SEMANTICALLY_RELATED`, `SIMILAR_TO`, `TESTS`, `TESTS_FILE`, `INFRA_MAPS`,
-  `FILE_CHANGES_WITH`, `CONTAINS_FILE`, `CONTAINS_FOLDER` — **plus the 6 cross-repo types** from the
+  `FILE_CHANGES_WITH`, `CONTAINS_FILE`, `CONTAINS_FOLDER`, `MENTIONS` (doc comment -> referenced
+  code) — **plus the 6 cross-repo types** from the
   cross-repo pass (`CROSS_HTTP_CALLS`, `CROSS_ASYNC_CALLS`, `CROSS_GRPC_CALLS`, `CROSS_GRAPHQL_CALLS`,
-  `CROSS_TRPC_CALLS`, `CROSS_CHANNEL`) and a total. The writer **emits the full 32-type list and
+  `CROSS_TRPC_CALLS`, `CROSS_CHANNEL`) and a total. The writer **emits the full 33-type list and
   back-fills missing types with `0`** rather than recording only the types that appeared.
 
 These come straight from `query_graph` (`MATCH (n) RETURN labels(n), count(*)` and

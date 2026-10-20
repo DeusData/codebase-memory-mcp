@@ -10,7 +10,7 @@ enum TokenType {
     LINE_DOC_CONTENT,
 };
 
-void *tree_sitter_wit_external_scanner_create(void) {}
+void *tree_sitter_wit_external_scanner_create(void) { return NULL; }
 
 void tree_sitter_wit_external_scanner_destroy(void *payload) {}
 

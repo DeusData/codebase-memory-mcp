@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 enum {
     CBM_DAEMON_IPC_SEND_TIMEOUT_MS = 5000,
@@ -28,6 +31,8 @@ enum {
     CBM_DAEMON_IPC_RETRY_INTERVAL_MS = 10,
     CBM_DAEMON_IPC_COORDINATION_CLEANUP_MS = 500,
     CBM_DAEMON_IPC_WINDOWS_RENDEZVOUS_RETRY_MS = 250,
+    CBM_DAEMON_IPC_RELEASE_ERROR = -1,
+    CBM_DAEMON_IPC_RELEASE_COMPLETE = 1,
 };
 
 /* Last private-namespace validation refusal, set at the exact failing check.
@@ -52,6 +57,76 @@ void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail) {
 
 const char *cbm_daemon_ipc_validation_detail(void) {
     return ipc_validation_detail_buffer;
+}
+
+/* #1717: a cache root on a network filesystem (a shared HPC home, an NFS or
+ * SMB mount) is ACCEPTED -- this is advice, never a refusal. SQLite's WAL mode
+ * relies on shared-memory locking that network filesystems do not provide
+ * reliably, so indexes there can be slow or corrupt. Detection is statfs
+ * f_type, Linux only; other platforms never warn. */
+static const char *ipc_network_fs_name(unsigned long magic) {
+    static const struct {
+        unsigned long magic;
+        const char *name;
+    } kinds[] = {
+        {0x6969UL, "NFS"},        {0xFF534D42UL, "CIFS"}, {0xFE534D42UL, "SMB2"},
+        {0x0BD00BD0UL, "Lustre"}, {0x47504653UL, "GPFS"},
+    };
+    for (size_t index = 0; index < sizeof(kinds) / sizeof(kinds[0]); index++) {
+        if (kinds[index].magic == magic) {
+            return kinds[index].name;
+        }
+    }
+    return NULL;
+}
+
+static atomic_bool g_ipc_network_cache_warned;
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_ipc_fs_magic_override_active;
+static unsigned long g_ipc_fs_magic_override;
+void cbm_daemon_ipc_set_fs_magic_for_test(bool active, unsigned long magic) {
+    g_ipc_fs_magic_override_active = active;
+    g_ipc_fs_magic_override = magic;
+    atomic_store(&g_ipc_network_cache_warned, false);
+}
+#endif
+
+static bool ipc_path_fs_magic(const char *path, unsigned long *magic_out) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_ipc_fs_magic_override_active) {
+        *magic_out = g_ipc_fs_magic_override;
+        return true;
+    }
+#endif
+#if defined(__linux__)
+    struct statfs status;
+    if (statfs(path, &status) != 0) {
+        return false;
+    }
+    /* f_type is a signed word on some ABIs; the magics are 32-bit. */
+    *magic_out = (unsigned long)status.f_type & 0xFFFFFFFFUL;
+    return true;
+#else
+    (void)path;
+    (void)magic_out;
+    return false;
+#endif
+}
+
+bool cbm_daemon_ipc_warn_if_network_cache_root(const char *cache_root) {
+    unsigned long magic = 0;
+    const char *kind = NULL;
+    if (!cache_root || !cache_root[0] || !ipc_path_fs_magic(cache_root, &magic) ||
+        !(kind = ipc_network_fs_name(magic))) {
+        return false;
+    }
+    if (atomic_exchange(&g_ipc_network_cache_warned, true)) {
+        return false; /* one warning per process */
+    }
+    cbm_log_warn("daemon.cache_root_network_fs", "path", cache_root, "fs", kind, "reason",
+                 "sqlite_wal_unreliable_on_network_fs", "hint",
+                 "set CBM_CACHE_DIR to local storage (docs/CONFIGURATION.md)");
+    return true;
 }
 
 static cbm_daemon_ipc_listen_failure_t ipc_listen_failure;
@@ -210,6 +285,31 @@ static void ipc_startup_gate_run(void) {
     cbm_daemon_ipc_startup_gate_fn gate = g_startup_gate_for_test;
     if (gate) {
         gate(g_startup_gate_context_for_test);
+    }
+}
+#endif
+
+#ifdef _WIN32
+static cbm_daemon_ipc_win_directory_create_hook_fn g_win_directory_create_hook_for_test;
+static void *g_win_directory_create_hook_context_for_test;
+#endif
+
+void cbm_daemon_ipc_win_directory_create_hook_set_for_test(
+    cbm_daemon_ipc_win_directory_create_hook_fn hook, void *context) {
+#ifdef _WIN32
+    g_win_directory_create_hook_context_for_test = context;
+    g_win_directory_create_hook_for_test = hook;
+#else
+    (void)hook;
+    (void)context;
+#endif
+}
+
+#ifdef _WIN32
+static void ipc_win_directory_create_hook_run(const wchar_t *path) {
+    cbm_daemon_ipc_win_directory_create_hook_fn hook = g_win_directory_create_hook_for_test;
+    if (hook) {
+        hook(path, g_win_directory_create_hook_context_for_test);
     }
 }
 #endif
@@ -376,6 +476,9 @@ int cbm_daemon_ipc_wait_pending(const cbm_ipc_pending_ops_t *ops, uint32_t timeo
 #include <poll.h>
 #include <pthread.h>
 #include <stddef.h>
+#if !defined(__linux__)
+#include <pwd.h>
+#endif
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -383,6 +486,9 @@ int cbm_daemon_ipc_wait_pending(const cbm_ipc_pending_ops_t *ops, uint32_t timeo
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -1655,6 +1761,55 @@ static bool posix_ancestor_stat_ok(uid_t owner, mode_t mode, uid_t euid, uid_t o
     return true;
 }
 
+/* #1687: WSL2 mounts Windows drives (/mnt/c, /mnt/e, ...) as DrvFs over 9p.
+ * Without the `metadata` mount option such a mount reports 0777 for every
+ * directory and ignores chmod, so both the ancestor rule (not world-writable)
+ * and the leaf 0700 rule refuse it -- correctly: the 0777 is real. The gate
+ * stays exactly as it is; this only lets the refusal name the remedy instead
+ * of leaving a WSL user to guess. Detection is a statfs magic (9p) confirmed by
+ * a WSL kernel release string, so plain 9p mounts elsewhere (QEMU virtfs) keep
+ * the generic message. Diagnostic only: it never changes accept/refuse. */
+#define POSIX_WSL_DRVFS_REMEDY                                                                   \
+    "WSL DrvFs mount: set /etc/wsl.conf [automount] options = "                                  \
+    "\"metadata,umask=22,fmask=11\", then run `wsl --shutdown`; or keep the cache on the Linux " \
+    "filesystem (e.g. ~/.cache)"
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_posix_force_wsl_drvfs;
+void cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(bool force) {
+    g_posix_force_wsl_drvfs = force;
+}
+#endif
+
+#if defined(__linux__)
+#define POSIX_V9FS_MAGIC 0x01021997UL
+
+static bool posix_kernel_is_wsl(void) {
+    char release[128];
+    if (!posix_read_small_proc_file("/proc/sys/kernel/osrelease", release, sizeof(release))) {
+        return false;
+    }
+    return strstr(release, "microsoft") != NULL || strstr(release, "Microsoft") != NULL ||
+           strstr(release, "WSL") != NULL;
+}
+#endif
+
+static bool posix_fd_on_wsl_drvfs(int directory_fd) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_posix_force_wsl_drvfs) {
+        return true;
+    }
+#endif
+#if defined(__linux__)
+    struct statfs filesystem;
+    return directory_fd >= 0 && fstatfs(directory_fd, &filesystem) == 0 &&
+           (unsigned long)filesystem.f_type == POSIX_V9FS_MAGIC && posix_kernel_is_wsl();
+#else
+    (void)directory_fd;
+    return false;
+#endif
+}
+
 static bool posix_directory_ancestor_owner_trusted(uid_t owner) {
     return posix_ancestor_owner_ok(owner, geteuid(), posix_ancestor_overflow_uid());
 }
@@ -1711,14 +1866,138 @@ static bool posix_directory_parent_secure(int directory_fd) {
  * never chmod'd or ACL-rewritten.  The euid-only enforcement that stops a
  * squatted private directory lives in the created/final/snapshot checks, not
  * here — this only walks ancestors. */
-static bool posix_directory_transition_secure(int parent_fd, int child_fd) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1717 seam: report one directory (by dev/ino) as owned by a foreign uid, so
+ * the foreign-owned-ancestor refusal and its diagnostic are testable without
+ * root (an unprivileged test cannot chown a directory to another account). */
+static bool g_posix_foreign_owner_active;
+static dev_t g_posix_foreign_owner_dev;
+static ino_t g_posix_foreign_owner_ino;
+static uid_t g_posix_foreign_owner_uid;
+bool cbm_daemon_ipc_posix_set_foreign_owned_dir_for_test(const char *directory_path,
+                                                         unsigned long foreign_uid) {
+    struct stat status;
+    g_posix_foreign_owner_active = false;
+    if (!directory_path || lstat(directory_path, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        return false;
+    }
+    g_posix_foreign_owner_dev = status.st_dev;
+    g_posix_foreign_owner_ino = status.st_ino;
+    g_posix_foreign_owner_uid = (uid_t)foreign_uid;
+    g_posix_foreign_owner_active = true;
+    return true;
+}
+void cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test(void) {
+    g_posix_foreign_owner_active = false;
+}
+#endif
+
+static uid_t posix_directory_observed_owner(const struct stat *status) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_posix_foreign_owner_active && status->st_dev == g_posix_foreign_owner_dev &&
+        status->st_ino == g_posix_foreign_owner_ino) {
+        return g_posix_foreign_owner_uid;
+    }
+#endif
+    return status->st_uid;
+}
+
+enum { POSIX_OWNER_NAME_CAP = 33, POSIX_PASSWD_LINE_CAP = 1024 };
+
+/* The account name for uid, or "" when it cannot be named. Diagnostic only.
+ *
+ * Linux reads /etc/passwd directly instead of calling getpwuid(): the Linux
+ * release binary is statically linked against glibc, where getpwuid() loads the
+ * HOST's NSS modules at runtime -- a version-mismatch crash hazard exactly on
+ * the sssd/LDAP hosts (#1717's shared HPC filesystems) this message serves.
+ * A directory-service account is then shown by uid only. */
+static void posix_owner_name(uid_t uid, char out[POSIX_OWNER_NAME_CAP]) {
+    out[0] = '\0';
+#if defined(__linux__)
+    FILE *passwd = cbm_fopen("/etc/passwd", "r");
+    if (!passwd) {
+        return;
+    }
+    char line[POSIX_PASSWD_LINE_CAP];
+    while (fgets(line, sizeof(line), passwd)) {
+        char *name_end = strchr(line, ':');
+        char *password_end = name_end ? strchr(name_end + 1, ':') : NULL;
+        if (!password_end || name_end == line) {
+            continue;
+        }
+        char *uid_end = NULL;
+        errno = 0;
+        unsigned long line_uid = strtoul(password_end + 1, &uid_end, 10);
+        if (errno == 0 && uid_end != password_end + 1 && *uid_end == ':' &&
+            line_uid == (unsigned long)uid) {
+            (void)snprintf(out, POSIX_OWNER_NAME_CAP, "%.*s", (int)(name_end - line), line);
+            break;
+        }
+    }
+    (void)fclose(passwd);
+#else
+    struct passwd entry;
+    struct passwd *found = NULL;
+    char storage[POSIX_PASSWD_LINE_CAP];
+    if (getpwuid_r(uid, &entry, storage, sizeof(storage), &found) == 0 && found && found->pw_name) {
+        (void)snprintf(out, POSIX_OWNER_NAME_CAP, "%s", found->pw_name);
+    }
+#endif
+}
+
+/* The foreign-owned-ancestor refusal. The remedy is the part the reader acts
+ * on, so it must survive the fixed detail buffer: the path is shortened from
+ * the LEFT ("...") to fit, which keeps the refusing component at its end. */
+static void posix_foreign_owner_detail_set(const char *child_path, uid_t owner) {
+    char name[POSIX_OWNER_NAME_CAP];
+    posix_owner_name(owner, name);
+    char owner_text[64];
+    if (name[0]) {
+        (void)snprintf(owner_text, sizeof(owner_text), "uid %ld (%s)", (long)owner, name);
+    } else {
+        (void)snprintf(owner_text, sizeof(owner_text), "uid %ld", (long)owner);
+    }
+    char tail[sizeof(ipc_validation_detail_buffer)];
+    int tail_length = snprintf(tail, sizeof(tail),
+                               "' is owned by %s, not by you (uid %ld) or root; that account "
+                               "controls this path. Use a location whose parent directories are "
+                               "yours or root's (e.g. set CBM_CACHE_DIR)",
+                               owner_text, (long)geteuid());
+    if (tail_length < 0) {
+        return;
+    }
+    size_t used = (size_t)tail_length + 1; /* the opening quote */
+    size_t room = used < sizeof(ipc_validation_detail_buffer)
+                      ? sizeof(ipc_validation_detail_buffer) - 1 - used
+                      : 0;
+    size_t path_length = strlen(child_path);
+    const char *ellipsis = "";
+    const char *shown = child_path;
+    if (path_length > room) {
+        ellipsis = "...";
+        shown = child_path + path_length - (room > 3 ? room - 3 : 0);
+    }
+    ipc_validation_detail_set("'%s%s%s", ellipsis, shown, tail);
+}
+
+static bool posix_directory_transition_secure(int parent_fd, int child_fd, const char *child_path) {
     struct stat parent;
     struct stat child;
     if (parent_fd < 0 || child_fd < 0 || !posix_directory_parent_secure(parent_fd) ||
         fstat(parent_fd, &parent) != 0 || fstat(child_fd, &child) != 0 ||
         !S_ISDIR(parent.st_mode) || !S_ISDIR(child.st_mode) ||
-        !posix_directory_ancestor_owner_trusted(parent.st_uid) ||
-        !posix_directory_ancestor_owner_trusted(child.st_uid)) {
+        !posix_directory_ancestor_owner_trusted(posix_directory_observed_owner(&parent))) {
+        return false;
+    }
+    uid_t child_owner = posix_directory_observed_owner(&child);
+    if (!posix_directory_ancestor_owner_trusted(child_owner)) {
+        /* #1717: this refusal used to set no detail, so the caller printed
+         * "ancestry component validation failed (errno 17)" -- a stale EEXIST
+         * from the mkdirat() on the existing component, naming neither the
+         * directory nor the reason. The policy is unchanged: an account that
+         * owns an ancestor can rename or replace everything below it after
+         * this walk, so it could redirect the private directory. Name it. */
+        posix_foreign_owner_detail_set(child_path, child_owner);
         return false;
     }
     return true;
@@ -1771,11 +2050,18 @@ static int private_directory_tree_open(const char *directory_path) {
                  * refusing, found it clean, and said so — correctly. Naming the
                  * containing directory is the difference between a report we
                  * can act on and weeks of talking past each other. */
-                ipc_validation_detail_set(
-                    "%s: the directory CONTAINING '%s' is not a usable private-directory parent "
-                    "(it must be owned by you, not world-writable, and carry no allow-ACL). Check "
-                    "that containing directory, not '%s' itself",
-                    directory_path, component, component);
+                if (posix_fd_on_wsl_drvfs(current_fd)) {
+                    /* #1687: shorter rule text so the remedy fits the buffer. */
+                    ipc_validation_detail_set("%s: the directory CONTAINING '%s' is not private "
+                                              "(DrvFs reports 0777). " POSIX_WSL_DRVFS_REMEDY,
+                                              directory_path, component);
+                } else {
+                    ipc_validation_detail_set(
+                        "%s: the directory CONTAINING '%s' is not a usable private-directory "
+                        "parent (it must be owned by you, not world-writable, and carry no "
+                        "allow-ACL). Check that containing directory, not '%s' itself",
+                        directory_path, component, component);
+                }
             }
             bool created = ok && mkdirat(current_fd, component, 0700) == 0;
             if (!created && errno != EEXIST) {
@@ -1786,7 +2072,8 @@ static int private_directory_tree_open(const char *directory_path) {
                    : -1;
             struct stat status;
             ok = next_fd >= 0 && fd_set_cloexec(next_fd) && fstat(next_fd, &status) == 0 &&
-                 S_ISDIR(status.st_mode) && posix_directory_transition_secure(current_fd, next_fd);
+                 S_ISDIR(status.st_mode) &&
+                 posix_directory_transition_secure(current_fd, next_fd, path);
             if (ok && created) {
                 ok = status.st_uid == geteuid() && fchmod(next_fd, 0700) == 0 &&
                      cbm_macos_extended_acl_fd_clear(next_fd) &&
@@ -1829,8 +2116,11 @@ static int private_directory_tree_open(const char *directory_path) {
         ok = false;
     }
     if (ok && (fstat(current_fd, &final_status) != 0 || (final_status.st_mode & 07777) != 0700)) {
-        ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700", directory_path,
-                                  (unsigned)(final_status.st_mode & 07777));
+        /* #1687: DrvFs without `metadata` ignores chmod; name the remedy. */
+        bool drvfs = posix_fd_on_wsl_drvfs(current_fd);
+        ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700%s%s", directory_path,
+                                  (unsigned)(final_status.st_mode & 07777), drvfs ? ". " : "",
+                                  drvfs ? POSIX_WSL_DRVFS_REMEDY : "");
         ok = false;
     }
     if (ok && !cbm_macos_extended_acl_fd_is_empty(current_fd)) {
@@ -3700,19 +3990,19 @@ bool cbm_daemon_ipc_local_transition_begin_work(cbm_daemon_ipc_local_transition_
     return true;
 }
 
-bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io) {
+int cbm_daemon_ipc_local_transition_try_release(cbm_daemon_ipc_local_transition_t **transition_io) {
     if (!transition_io) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     cbm_daemon_ipc_local_transition_t *transition = *transition_io;
     if (!transition) {
-        return true;
+        return CBM_DAEMON_IPC_RELEASE_COMPLETE;
     }
     if (transition->legacy_fd < 0 || !transition->legacy_process_entry ||
         transition->owner_pid != getpid() ||
         (!transition->work_begun &&
          (transition->startup_v2_fd < 0 || !transition->startup_v2_process_entry))) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     posix_named_lock_release(transition->legacy_fd, transition->legacy_process_entry);
     if (!transition->work_begun) {
@@ -3720,7 +4010,7 @@ bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t *
     }
     free(transition);
     *transition_io = NULL;
-    return true;
+    return CBM_DAEMON_IPC_RELEASE_COMPLETE;
 }
 
 #else /* _WIN32 */
@@ -3992,6 +4282,16 @@ static char *wide_to_utf8(const wchar_t *value) {
         return NULL;
     }
     return utf8;
+}
+
+/* Record "<path>: <message>" as the validation detail, with the wide path
+ * rendered as UTF-8. One place owns the conversion buffer, so every refusal on
+ * the directory walk can name its component without each call site carrying
+ * its own allocation. */
+static void ipc_validation_detail_set_for_path(const wchar_t *path, const char *message) {
+    char *path_utf8 = wide_to_utf8(path);
+    ipc_validation_detail_set("%s: %s", path_utf8 ? path_utf8 : "<path>", message);
+    free(path_utf8);
 }
 
 static wchar_t *wide_copy(const wchar_t *value) {
@@ -4861,13 +5161,28 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
         return false;
     }
     bool created = CreateDirectoryW(runtime_dir, &security.directory_attributes) != 0;
-    if (!created && GetLastError() != ERROR_ALREADY_EXISTS) {
+    DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
+    if (!created && create_error != ERROR_ALREADY_EXISTS) {
+        char message[96];
+        (void)snprintf(message, sizeof(message),
+                       "could not create the directory (Windows error %lu)",
+                       (unsigned long)create_error);
+        ipc_validation_detail_set_for_path(runtime_dir, message);
         win_security_destroy(&security);
         return false;
     }
     DWORD attributes = GetFileAttributesW(runtime_dir);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
         (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        /* What already exists at this path is adopted only if it is a plain
+         * directory. Say which rule refused it: the walk in front of this
+         * function tolerates losing a creation race, so this check is what
+         * stands between that tolerance and a planted file or junction. */
+        const char *rule = attributes == INVALID_FILE_ATTRIBUTES ? "cannot be inspected"
+                           : (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                               ? "exists but is not a directory"
+                               : "is a reparse point (junction or symlink)";
+        ipc_validation_detail_set_for_path(runtime_dir, rule);
         win_security_destroy(&security);
         return false;
     }
@@ -5021,8 +5336,35 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
             DWORD attributes = GetFileAttributesW(path);
             if (attributes == INVALID_FILE_ATTRIBUTES) {
                 DWORD error = GetLastError();
-                ok = (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
-                     CreateDirectoryW(path, &security.directory_attributes) != 0;
+                bool absent = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+                if (absent) {
+                    ipc_win_directory_create_hook_run(path);
+                    /* Several processes first-starting together all observe
+                     * this component absent; one CreateDirectoryW wins and
+                     * the rest get ERROR_ALREADY_EXISTS. Losing that race is
+                     * not a failure -- the directory this process wanted now
+                     * exists, exactly as if it had been there all along. It
+                     * is NOT trusted for that: an ancestor still goes through
+                     * win_directory_component_secure() below, and the final
+                     * component through win_runtime_directory_secure(), which
+                     * refuses a non-directory or reparse point and enforces
+                     * owner and DACL. The POSIX walk tolerates EEXIST at the
+                     * same point for the same reason. */
+                    if (CreateDirectoryW(path, &security.directory_attributes) == 0) {
+                        error = GetLastError();
+                        absent = error == ERROR_ALREADY_EXISTS;
+                    }
+                }
+                ok = absent;
+                if (!ok) {
+                    /* Never a bare "(endpoint)": name the component and the
+                     * Windows error that refused it. */
+                    char message[96];
+                    (void)snprintf(message, sizeof(message),
+                                   "could not create or inspect the directory (Windows error %lu)",
+                                   (unsigned long)error);
+                    ipc_validation_detail_set_for_path(path, message);
+                }
             }
             /* Ancestors are observe-only and must already be secure.  The
              * final current-user directory is intentionally handled below by
@@ -5034,10 +5376,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
                      * at this walk position; the helper set the inner rule. */
                     char inner[384];
                     (void)snprintf(inner, sizeof(inner), "%s", ipc_validation_detail_buffer);
-                    char *component_utf8 = wide_to_utf8(path);
-                    ipc_validation_detail_set(
-                        "%s: %s", component_utf8 ? component_utf8 : "<component>", inner);
-                    free(component_utf8);
+                    ipc_validation_detail_set_for_path(path, inner);
                 }
             }
         }
@@ -5866,35 +6205,39 @@ static void win_participant_group_release_complete(cbm_private_file_lock_t **gro
     }
 }
 
-static bool win_participant_state_release(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                          cbm_private_lock_directory_t *directory,
-                                          cbm_private_file_lock_t **startup_v2_io,
-                                          win_legacy_mutex_guard_t **legacy_guard_io,
-                                          cbm_private_file_lock_t **group_io, HANDLE *sentinel_io) {
+static int win_participant_state_release(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                         cbm_private_lock_directory_t *directory,
+                                         cbm_private_file_lock_t **startup_v2_io,
+                                         win_legacy_mutex_guard_t **legacy_guard_io,
+                                         cbm_private_file_lock_t **group_io, HANDLE *sentinel_io) {
     if (!endpoint || !directory || !startup_v2_io || !legacy_guard_io || !group_io ||
         !sentinel_io) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     if (!*startup_v2_io) {
         int startup = win_startup_v2_try_acquire(directory, startup_v2_io);
         if (startup != 1) {
-            return false;
+            return startup;
         }
     }
     if (!*legacy_guard_io) {
         int legacy = win_legacy_mutex_guard_try_acquire(endpoint, legacy_guard_io);
         if (legacy != 1) {
-            (void)cbm_private_file_lock_release(startup_v2_io);
-            return false;
+            if (cbm_private_file_lock_release(startup_v2_io) != CBM_PRIVATE_FILE_LOCK_OK) {
+                return CBM_DAEMON_IPC_RELEASE_ERROR;
+            }
+            return legacy;
         }
     }
     if (!win_participant_group_release_locked(group_io, sentinel_io)) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     if (!win_legacy_mutex_guard_release(legacy_guard_io)) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
-    return cbm_private_file_lock_release(startup_v2_io) == CBM_PRIVATE_FILE_LOCK_OK;
+    return cbm_private_file_lock_release(startup_v2_io) == CBM_PRIVATE_FILE_LOCK_OK
+               ? CBM_DAEMON_IPC_RELEASE_COMPLETE
+               : CBM_DAEMON_IPC_RELEASE_ERROR;
 }
 
 cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
@@ -6670,9 +7013,9 @@ bool cbm_daemon_ipc_startup_lock_release(cbm_daemon_ipc_startup_lock_t **lock_io
     if (!lock) {
         return true;
     }
-    if (!win_participant_state_release(lock->endpoint, lock->directory, &lock->startup_v2_lock,
-                                       &lock->legacy_guard, &lock->group_lock,
-                                       &lock->legacy_sentinel)) {
+    if (win_participant_state_release(lock->endpoint, lock->directory, &lock->startup_v2_lock,
+                                      &lock->legacy_guard, &lock->group_lock,
+                                      &lock->legacy_sentinel) != CBM_DAEMON_IPC_RELEASE_COMPLETE) {
         return false;
     }
     cbm_private_lock_directory_close(lock->directory);
@@ -6735,9 +7078,10 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     if (!guard) {
         return true;
     }
-    if (!win_participant_state_release(
-            guard->endpoint, guard->directory, &guard->teardown_startup_v2_lock,
-            &guard->teardown_legacy_guard, &guard->group_lock, &guard->legacy_sentinel)) {
+    if (win_participant_state_release(guard->endpoint, guard->directory,
+                                      &guard->teardown_startup_v2_lock,
+                                      &guard->teardown_legacy_guard, &guard->group_lock,
+                                      &guard->legacy_sentinel) != CBM_DAEMON_IPC_RELEASE_COMPLETE) {
         return false;
     }
     cbm_private_lock_directory_close(guard->directory);
@@ -6832,38 +7176,44 @@ bool cbm_daemon_ipc_local_transition_begin_work(cbm_daemon_ipc_local_transition_
     return true;
 }
 
-bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io) {
+int cbm_daemon_ipc_local_transition_try_release(cbm_daemon_ipc_local_transition_t **transition_io) {
     if (!transition_io) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     cbm_daemon_ipc_local_transition_t *transition = *transition_io;
     if (!transition) {
-        return true;
+        return CBM_DAEMON_IPC_RELEASE_COMPLETE;
     }
     if (!transition->endpoint || !transition->directory) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     if (transition->group_lock || transition->legacy_sentinel != INVALID_HANDLE_VALUE ||
         transition->teardown_legacy_guard) {
-        if (!win_participant_state_release(transition->endpoint, transition->directory,
-                                           &transition->startup_v2_lock,
-                                           &transition->teardown_legacy_guard,
-                                           &transition->group_lock, &transition->legacy_sentinel)) {
-            return false;
+        int released = win_participant_state_release(
+            transition->endpoint, transition->directory, &transition->startup_v2_lock,
+            &transition->teardown_legacy_guard, &transition->group_lock,
+            &transition->legacy_sentinel);
+        if (released != CBM_DAEMON_IPC_RELEASE_COMPLETE) {
+            return released;
         }
     } else if (transition->startup_v2_lock &&
                cbm_private_file_lock_release(&transition->startup_v2_lock) !=
                    CBM_PRIVATE_FILE_LOCK_OK) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     cbm_private_lock_directory_close(transition->directory);
     transition->directory = NULL;
     free(transition);
     *transition_io = NULL;
-    return true;
+    return CBM_DAEMON_IPC_RELEASE_COMPLETE;
 }
 
 #endif /* _WIN32 */
+
+bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io) {
+    return cbm_daemon_ipc_local_transition_try_release(transition_io) ==
+           CBM_DAEMON_IPC_RELEASE_COMPLETE;
+}
 
 bool cbm_daemon_ipc_send_frame(cbm_daemon_ipc_connection_t *connection,
                                cbm_daemon_frame_type_t type, uint16_t flags, const void *payload,
@@ -6941,4 +7291,22 @@ int cbm_daemon_ipc_receive_frame(cbm_daemon_ipc_connection_t *connection, uint32
                                  cbm_daemon_frame_t *frame_out, uint8_t **payload_out) {
     return cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms, CBM_DAEMON_MAX_FRAME_SIZE,
                                                 frame_out, payload_out);
+}
+
+int cbm_daemon_ipc_receive_frame_after_failed_send(cbm_daemon_ipc_connection_t *connection,
+                                                   uint32_t timeout_ms, uint32_t max_payload_length,
+                                                   cbm_daemon_frame_t *frame_out,
+                                                   uint8_t **payload_out) {
+    if (!connection) {
+        return cbm_daemon_ipc_receive_frame_bounded(NULL, timeout_ms, max_payload_length, frame_out,
+                                                    payload_out);
+    }
+    /* The poison came from the failed send alone (nothing was read yet), and it
+     * guards the OUTBOUND frame boundary; the inbound one is intact. Lift it for
+     * this one receive, then restore it so no later send can reuse the stream. */
+    atomic_store_explicit(&connection->poisoned, false, memory_order_release);
+    int received = cbm_daemon_ipc_receive_frame_bounded(connection, timeout_ms, max_payload_length,
+                                                        frame_out, payload_out);
+    atomic_store_explicit(&connection->poisoned, true, memory_order_release);
+    return received;
 }

@@ -4,6 +4,7 @@
  * Polls indexed projects for git changes (HEAD movement or dirty working tree)
  * and triggers re-indexing via a callback. Uses adaptive polling intervals
  * based on project size (5s base + 1s per 500 files, capped at 60s).
+ * Non-git roots are not polled unless cbm_watcher_set_poll_non_git() opts in.
  *
  * Depends on: foundation, store (for project metadata)
  */
@@ -59,6 +60,17 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
                                             cbm_watcher_project_mutation_end_fn end,
                                             cbm_watcher_project_pruned_fn pruned, void *context);
 
+/* Opt in to polling NON-GIT project roots (#1948; default off — non-git roots
+ * are not watched). When on, a non-git root is polled on the same adaptive
+ * cadence by a tree signature: the indexer's own discovery walk (same skip
+ * lists, .gitignore and .cbmignore rules), folded over each file's (relative
+ * path, size, mtime). A changed signature triggers index_fn; the first poll
+ * after baseline reindexes once, since nothing records which tree state the
+ * index holds. Paths discovery skips — including cbm's own .codebase-memory
+ * artifact directory and cache directory — never change the signature.
+ * Read at each project's baseline, so set it before registering projects. */
+void cbm_watcher_set_poll_non_git(cbm_watcher_t *w, bool enabled);
+
 /* ── Watch list management ──────────────────────────────────────── */
 
 /* Add a project to the watch list. root_path is copied. Returns true only when
@@ -79,6 +91,13 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name);
  * Returns the number of projects that were reindexed. */
 int cbm_watcher_poll_once(cbm_watcher_t *w);
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: read one project's committed/pending dirty-state signatures so
+ * failing assertions can self-diagnose (see the definition for why). */
+int cbm_watcher_test_dirty_sigs(cbm_watcher_t *w, const char *project, uint64_t *last_out,
+                                uint64_t *pending_out);
+#endif
+
 /* Run the blocking poll loop. Polls every base_interval_ms until
  * cbm_watcher_stop() is called. Returns 0 on clean shutdown. */
 int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
@@ -86,13 +105,95 @@ int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms);
 /* Request the run loop to stop (thread-safe). */
 void cbm_watcher_stop(cbm_watcher_t *w);
 
-/* ── Introspection (for testing) ────────────────────────────────── */
+/* ── Introspection ─────────────────────────────────────────────── */
+
+typedef struct {
+    bool registered; /* this project's physical registration exists */
+    bool running;    /* run loop entered and stop has not been requested */
+} cbm_watcher_project_status_t;
+
+/* Thread-safe snapshot with a constant-time registry lookup. A NULL watcher
+ * reports both fields false; a NULL project reports only the run-loop state.
+ * Registrations can remain present after the watcher has stopped. */
+cbm_watcher_project_status_t cbm_watcher_project_status(cbm_watcher_t *w, const char *project_name);
 
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);
 
+/* Return a watched project's consecutive hard-index-failure count, or -1 when
+ * it is not watched. Exposed so the failure state machine (increment on a
+ * hard error, reset on success) can be asserted directly rather than inferred
+ * from the poll deadline it feeds.
+ *
+ * Memory visibility: this reads under projects_lock, but poll_project WRITES
+ * the counter outside that lock — it runs against a state snapshot taken
+ * while the lock was held, which is the same discipline the other
+ * poll-mutated fields here already follow (last_head, last_dirty_sig,
+ * interval_ms, next_poll_ns, missing_root_count). It is NOT the discipline of
+ * every field: active_git is serialized by projects_lock and registered is an
+ * atomic_bool. Reading concurrently with a live poll is therefore formally a
+ * data race and may observe a stale value; it is a diagnostic and test
+ * accessor, not a synchronisation point.
+ * Single-threaded callers (the tests, and any caller between poll cycles)
+ * always see the current value. Do not build scheduling decisions on it
+ * without first giving the counter atomic accessors. */
+int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Test seam: number of unwatched/replaced project states parked on the
+ * deferred-free list, read under projects_lock. The drain in poll_once is
+ * otherwise unobservable — cbm_watcher_free frees the same list, so a poll
+ * that stopped draining would neither crash nor leak. Test builds only. */
+int cbm_watcher_test_pending_free_count(cbm_watcher_t *w);
+#endif
+
+/* Per-project watch status, for index_status (#2167). */
+typedef enum {
+    CBM_WATCHER_STRATEGY_PENDING = 0, /* registered; first poll not done yet */
+    CBM_WATCHER_STRATEGY_GIT = 1,     /* git HEAD + dirty-state polling */
+    CBM_WATCHER_STRATEGY_NONE = 2,    /* not a git project: never polled */
+    CBM_WATCHER_STRATEGY_TREE = 3,    /* not a git project: file-tree polling (watch_non_git) */
+} cbm_watcher_strategy_t;
+
+typedef struct {
+    cbm_watcher_strategy_t strategy;
+    int poll_interval_ms;     /* current adaptive cadence */
+    int64_t last_scan_unix_s; /* wall clock of the last completed scan; 0 = none */
+} cbm_watcher_project_info_t;
+
+/* Return true when project_name is physically watched and fill *out with its
+ * published status; false (and *out zeroed) otherwise. Safe to call while the
+ * poll loop runs: the fields are published atomically by the poll path. */
+bool cbm_watcher_project_info(cbm_watcher_t *w, const char *project_name,
+                              cbm_watcher_project_info_t *out);
+
 /* Return the adaptive poll interval (ms) for a given file count. */
 int cbm_watcher_poll_interval_ms(int file_count);
+
+/* Return the delay (ms) before the next index attempt for a project with
+ * `consecutive_failures` consecutive hard index failures. Zero failures
+ * yields `interval_ms` unchanged; each further failure doubles the delay, so
+ * a permanently failing project stops re-forking a worker at the poll cadence
+ * without ever being abandoned.
+ *
+ * Doubling stops at a fixed shift cap, so the delay plateaus at
+ * `interval_ms << INDEX_FAIL_SHIFT_MAX` — which is the ceiling only when
+ * `interval_ms` is large enough to reach it (>= 4688 ms for the current cap
+ * and ceiling). Below that the plateau sits strictly under the ceiling. Every
+ * interval this watcher generates is >= POLL_BASE_MS, so in practice the
+ * ceiling is always reached; the distinction is stated because this is an
+ * exported function and a caller may pass a smaller interval.
+ *
+ * The result is clamped at BOTH ends: never above the ceiling, and never
+ * below `interval_ms`, so backing off can only ever delay the next attempt,
+ * never bring it forward. That lower clamp matters only for an `interval_ms`
+ * already above the ceiling, which the current constants cannot produce
+ * (POLL_MAX_MS < the ceiling) — it is stated because this is an exported
+ * function and the guarantee should hold for any argument a caller passes,
+ * not only for the ones today's constants generate.
+ *
+ * Negative inputs are treated as zero. */
+int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures);
 
 /* Classify a stat() errno observed on a watched project root: returns true
  * only for values that mean the root itself is gone (ENOENT, ENOTDIR) and

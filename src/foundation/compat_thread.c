@@ -2,7 +2,7 @@
  * compat_thread.c — Portable thread, mutex, and aligned allocation.
  *
  * POSIX: thin wrappers around pthreads and posix_memalign.
- * Windows: CreateThread, CRITICAL_SECTION, _aligned_malloc.
+ * Windows: CreateThread, CRITICAL_SECTION, aligned allocation.
  */
 #include "foundation/mem_events.h"
 #include "foundation/constants.h"
@@ -279,12 +279,20 @@ void cbm_mutex_destroy(cbm_mutex_t *m) {
 #ifdef _WIN32
 
 int cbm_aligned_alloc(void **ptr, size_t alignment, size_t size) {
+#if defined(CBM_MEM_GLOBAL_OVERRIDE) && CBM_MEM_GLOBAL_OVERRIDE
+    *ptr = mi_malloc_aligned(size, alignment);
+#else
     *ptr = _aligned_malloc(size, alignment);
+#endif
     return *ptr ? 0 : -1;
 }
 
 void cbm_aligned_free(void *ptr) {
+#if defined(CBM_MEM_GLOBAL_OVERRIDE) && CBM_MEM_GLOBAL_OVERRIDE
+    mi_free(ptr);
+#else
     _aligned_free(ptr);
+#endif
 }
 
 #else /* POSIX */

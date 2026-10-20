@@ -41,6 +41,11 @@ static const lib_pattern_t http_libraries[] = {
 
     /* JavaScript / TypeScript */
     {"axios", CBM_SVC_HTTP, NULL},
+    /* `import Axios from "axios"`: the capitalized default-import binding
+     * (also axios's own Axios / AxiosInstance types). Matching is
+     * case-sensitive, so without this entry `Axios.get(url)` fell through to
+     * the `.get` route-suffix fallback and became a route registration. */
+    {"Axios", CBM_SVC_HTTP, NULL},
     {"superagent", CBM_SVC_HTTP, NULL},
     {"needle", CBM_SVC_HTTP, NULL},
     {"node-fetch", CBM_SVC_HTTP, NULL},
@@ -139,6 +144,20 @@ static const lib_pattern_t http_libraries[] = {
     /* Lua */
     {"socket.http", CBM_SVC_HTTP, NULL},
     {"resty.http", CBM_SVC_HTTP, NULL},
+
+    /* Glued-name libraries. match_qn needs an identifier boundary around an
+     * id, so a library whose own name glues a lowercase prefix/suffix onto
+     * another id ("grequests", "curlpp") is listed explicitly: no boundary
+     * rule can tell "grequests" from "myrequests". */
+    {"grequests", CBM_SVC_HTTP, NULL},  /* Python: gevent + requests */
+    {"txrequests", CBM_SVC_HTTP, NULL}, /* Python: Twisted + requests */
+    {"redaxios", CBM_SVC_HTTP, NULL},   /* JS: axios-compatible fetch client */
+    {"gaxios", CBM_SVC_HTTP, NULL},     /* JS: Google's axios-style client */
+    {"libcurl", CBM_SVC_HTTP, NULL},    /* C, node-libcurl */
+    {"curlpp", CBM_SVC_HTTP, NULL},     /* C++ libcurl wrapper */
+    {"curlcpp", CBM_SVC_HTTP, NULL},    /* C++ libcurl wrapper */
+    {"hyperlocal", CBM_SVC_HTTP, NULL}, /* Rust: hyper over unix sockets */
+    {"guzzlehttp", CBM_SVC_HTTP, NULL}, /* PHP: Guzzle's composer vendor */
 
     {NULL, CBM_SVC_NONE, NULL},
 };
@@ -263,6 +282,33 @@ static const lib_pattern_t async_libraries[] = {
     {"dapr.clients.grpc", CBM_SVC_ASYNC, "dapr"},
     {"DaprClient", CBM_SVC_ASYNC, "dapr"},
 
+    /* Glued-name libraries (see the note in http_libraries). */
+    {"aiokafka", CBM_SVC_ASYNC, "kafka"},
+    {"pykafka", CBM_SVC_ASYNC, "kafka"},
+    {"librdkafka", CBM_SVC_ASYNC, "kafka"},
+    {"rdkafkacpp", CBM_SVC_ASYNC, "kafka"},
+    {"rskafka", CBM_SVC_ASYNC, "kafka"},
+    {"aioamqp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"amqpstorm", CBM_SVC_ASYNC, "rabbitmq"},
+    {"pamqp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"pyamqp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"amqprs", CBM_SVC_ASYNC, "rabbitmq"},
+    {"amqpcpp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"pynats", CBM_SVC_ASYNC, "nats"},
+    {"jnats", CBM_SVC_ASYNC, "nats"},
+    {"aiomqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"amqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"hbmqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"umqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"mqttools", CBM_SVC_ASYNC, "mqtt"},
+    {"emqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"rumqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"gomqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"libmosquitto", CBM_SVC_ASYNC, "mqtt"},
+    {"mosquittopp", CBM_SVC_ASYNC, "mqtt"},
+    {"pubsublite", CBM_SVC_ASYNC, "pubsub"},
+    {"gocelery", CBM_SVC_ASYNC, "celery"},
+
     {NULL, CBM_SVC_NONE, NULL},
 };
 
@@ -307,6 +353,13 @@ static const lib_pattern_t config_libraries[] = {
     /* Elixir */
     {"Application.get_env", CBM_SVC_CONFIG, NULL},
     {"Application.fetch_env", CBM_SVC_CONFIG, NULL},
+
+    /* Glued-name accessors (see the note in http_libraries). */
+    {"wgetenv", CBM_SVC_CONFIG, NULL},   /* Windows CRT: _wgetenv, _wgetenv_s */
+    {"getenvb", CBM_SVC_CONFIG, NULL},   /* Python: os.getenvb */
+    {"qgetenv", CBM_SVC_CONFIG, NULL},   /* Qt */
+    {"dotenvx", CBM_SVC_CONFIG, NULL},   /* JS: @dotenvx/dotenvx */
+    {"phpdotenv", CBM_SVC_CONFIG, NULL}, /* PHP: vlucas/phpdotenv */
 
     {NULL, CBM_SVC_NONE, NULL},
 };
@@ -376,6 +429,11 @@ static const lib_pattern_t route_reg_libraries[] = {
     /* Scala */
     {"akka.http.scaladsl.server", CBM_SVC_ROUTE_REG, NULL},
     {"play.api.routing", CBM_SVC_ROUTE_REG, NULL},
+
+    /* Glued-name frameworks (see the note in http_libraries). */
+    {"apiflask", CBM_SVC_ROUTE_REG, NULL},       /* Python: Flask-based */
+    {"honox", CBM_SVC_ROUTE_REG, NULL},          /* JS: Hono meta-framework */
+    {"fasthttprouter", CBM_SVC_ROUTE_REG, NULL}, /* Go: httprouter for fasthttp */
 
     {NULL, CBM_SVC_NONE, NULL},
 };
@@ -448,6 +506,11 @@ static const lib_pattern_t graphql_libraries[] = {
     {"async-graphql", CBM_SVC_GRAPHQL, NULL},
     {"juniper", CBM_SVC_GRAPHQL, NULL},
 
+    /* Glued-name libraries (see the note in http_libraries). */
+    {"gqlparser", CBM_SVC_GRAPHQL, NULL}, /* Go: vektah/gqlparser */
+    {"gqlgenc", CBM_SVC_GRAPHQL, NULL},   /* Go: gqlgen client generator */
+    {"aiogqlc", CBM_SVC_GRAPHQL, NULL},   /* Python: asyncio GraphQL client */
+
     {NULL, CBM_SVC_NONE, NULL},
 };
 
@@ -514,6 +577,11 @@ static const method_suffix_t route_reg_suffixes[] = {
     {".add_route", "ANY"},
     {".add_api_route", "ANY"},
     {".add_api_websocket_route", "ANY"},
+    /* FastAPI/Starlette WebSocket decorators (`@router.websocket('/ws')`,
+     * `@app.websocket_route('/events')`): not an HTTP verb, so ANY — mirrors
+     * .add_api_websocket_route above (#1245). */
+    {".websocket", "ANY"},
+    {".websocket_route", "ANY"},
     {NULL, NULL},
 };
 
@@ -534,17 +602,67 @@ static const method_suffix_t method_suffixes[] = {
 
 /* ── Matching implementation ───────────────────────────────────── */
 
-/* Check if any library identifier appears as a substring in the QN.
- * Case-sensitive: "requests" matches "project.venv.requests.api.get"
- * but not "Requests". Library names are specific enough to avoid
- * false positives even with substring matching. */
+static bool qn_is_lower(char ch) {
+    return ch >= 'a' && ch <= 'z';
+}
+
+static bool is_digit_char(char ch) {
+    return ch >= '0' && ch <= '9';
+}
+
+static bool qn_is_alnum(char ch) {
+    return qn_is_lower(ch) || is_digit_char(ch) || (ch >= 'A' && ch <= 'Z');
+}
+
+/* True when the occurrence of `id` at `hit` sits on identifier boundaries.
+ *
+ * A raw substring match let short ids fire inside unrelated words: "gin."
+ * in "plugin.", "dio" in "studio", "surf" in "surface", "express" in
+ * "expression". Every character that is not an ASCII letter or digit is a
+ * separator ('.', '/', '\\', ':', '_', '-', '$', '@', ...).
+ *
+ *   BEFORE: start of string, a separator, an id that itself starts with a
+ *           separator ("@trpc/server"), or an id that starts with an
+ *           uppercase letter — a capital opens a new CamelCase word whatever
+ *           precedes it ("AsyncHttpClient", "IHttpClientFactory",
+ *           "NSURLSession"). Rejected: a lowercase/digit-initial id glued to
+ *           a letter or digit ("plugin." / "studio" / "myrequests").
+ *   AFTER:  end of string, a separator, an id that itself ends in a
+ *           separator ("gin."), an uppercase letter (CamelCase glue:
+ *           "GuzzleHttp", "FeignClient", "KafkaProducer", "kafkaProducer")
+ *           or a digit (version suffix: "urllib2", "amqp091-go").
+ *           Rejected: a lowercase letter continuing the word ("surface",
+ *           "curly", "expression"). */
+static bool qn_hit_on_boundary(const char *qn, const char *hit, const char *id, size_t id_len) {
+    char first = id[0];
+    char last = id[id_len - 1];
+    if (hit > qn && qn_is_alnum(hit[-1]) && (qn_is_lower(first) || is_digit_char(first))) {
+        return false;
+    }
+    if (qn_is_alnum(last) && qn_is_lower(hit[id_len])) {
+        return false;
+    }
+    return true;
+}
+
+/* Check if any library identifier appears in the QN on identifier
+ * boundaries (see qn_hit_on_boundary). Case-sensitive: "requests" matches
+ * "project.venv.requests.api.get" and "svc.requests_get" but neither
+ * "Requests" nor "myrequests". */
 static const lib_pattern_t *match_qn(const char *qn, const lib_pattern_t *patterns) {
     if (!qn || !qn[0]) {
         return NULL;
     }
     for (int i = 0; patterns[i].library_id != NULL; i++) {
-        if (strstr(qn, patterns[i].library_id) != NULL) {
-            return &patterns[i];
+        const char *id = patterns[i].library_id;
+        size_t id_len = strlen(id);
+        if (id_len == 0) {
+            continue;
+        }
+        for (const char *hit = strstr(qn, id); hit != NULL; hit = strstr(hit + 1, id)) {
+            if (qn_hit_on_boundary(qn, hit, id, id_len)) {
+                return &patterns[i];
+            }
         }
     }
     return NULL;
@@ -572,10 +690,6 @@ static bool contains_segment(const char *path, const char *segment) {
         }
     }
     return false;
-}
-
-static bool is_digit_char(char ch) {
-    return ch >= '0' && ch <= '9';
 }
 
 static bool has_http_route_marker(const char *path) {
@@ -648,9 +762,9 @@ static bool has_filesystem_extension(const char *path) {
     ext[ext_len] = '\0';
 
     static const char *const hard_file_exts[] = {
-        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
-        ".ini",  ".key",    ".pem",         ".pid",  ".properties", ".service",
-        ".sock", ".socket", ".sqlite",      ".toml", NULL};
+        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",  ".env",        ".ini", ".key",
+        ".log",  ".md",     ".pdf",         ".pem",  ".pid", ".properties", ".rst", ".service",
+        ".sock", ".socket", ".sqlite",      ".toml", ".txt", NULL};
     for (int i = 0; hard_file_exts[i]; i++) {
         if (path_ext_matches(ext, hard_file_exts[i])) {
             return true;
@@ -688,6 +802,62 @@ static bool callee_is_delimiter_or_filesystem_builder(const char *callee_name) {
     return strstr(callee_name, "os.path.join") != NULL || strstr(callee_name, "path.join") != NULL;
 }
 
+/* Case-insensitive "text ends with suffix" over [text, text + len). */
+static bool span_ends_with_ci(const char *text, size_t len, const char *suffix) {
+    size_t sl = strlen(suffix);
+    if (len < sl) {
+        return false;
+    }
+    const char *tail = text + (len - sl);
+    for (size_t i = 0; i < sl; i++) {
+        char a = tail[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (a != suffix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cbm_service_pattern_is_client_navigation(bool js_family, const char *callee_name) {
+    if (!js_family || !callee_name || !callee_name[0]) {
+        return false;
+    }
+    const char *last_dot = strrchr(callee_name, '.');
+    const char *method = last_dot ? last_dot + 1 : callee_name;
+    size_t recv_len = last_dot ? (size_t)(last_dot - callee_name) : 0;
+    /* Angular Router.navigate/navigateByUrl, Ionic NavController.navigateForward/
+     * Back/Root, Nuxt navigateTo, react-router/Gatsby navigate — any receiver. */
+    if (strcmp(method, "navigate") == 0 || strcmp(method, "navigateByUrl") == 0 ||
+        strcmp(method, "navigateTo") == 0 || strcmp(method, "navigateForward") == 0 ||
+        strcmp(method, "navigateBack") == 0 || strcmp(method, "navigateRoot") == 0) {
+        return true;
+    }
+    /* History API: the URL is the third argument of pushState/replaceState. */
+    if (strcmp(method, "pushState") == 0 || strcmp(method, "replaceState") == 0) {
+        return true;
+    }
+    /* Bare SvelteKit goto, Next.js/Remix redirect helpers. */
+    if (!last_dot && (strcmp(method, "goto") == 0 || strcmp(method, "redirect") == 0 ||
+                      strcmp(method, "permanentRedirect") == 0)) {
+        return true;
+    }
+    /* Next.js / Vue router and react-router history objects: router.push,
+     * this.$router.push, props.history.push, Router.prefetch. */
+    if ((strcmp(method, "push") == 0 || strcmp(method, "replace") == 0 ||
+         strcmp(method, "prefetch") == 0) &&
+        (span_ends_with_ci(callee_name, recv_len, "router") ||
+         span_ends_with_ci(callee_name, recv_len, "history"))) {
+        return true;
+    }
+    /* Angular Location.go, window.location.assign / replace. */
+    return (strcmp(method, "go") == 0 || strcmp(method, "assign") == 0 ||
+            strcmp(method, "replace") == 0) &&
+           span_ends_with_ci(callee_name, recv_len, "location");
+}
+
 static const char *strip_string_delimiters(const char *literal, char *buf, size_t buf_sz) {
     if (!literal || !literal[0]) {
         return NULL;
@@ -714,6 +884,25 @@ static const char *strip_string_delimiters(const char *literal, char *buf, size_
     return buf;
 }
 
+/* A comment opens with the slash a route opens with, and an argument list
+ * that starts with one handed three Java block comments to the Route pass as
+ * URLs (elasticsearch, 2026-09-16). The wildcard route (slash-star alone) is a
+ * path, so the block-comment shape needs its closing star-slash; a route
+ * literal never holds a line break. */
+bool cbm_service_pattern_is_comment_text(const char *text) {
+    if (!text || text[0] != '/') {
+        return false;
+    }
+    if (strchr(text, '\n') != NULL || strchr(text, '\r') != NULL) {
+        return true;
+    }
+    size_t n = strlen(text);
+    if (text[1] == '*' && n >= 4 && text[n - 2] == '*' && text[n - 1] == '/') {
+        return true;
+    }
+    return text[1] == '/' && (text[2] == ' ' || text[2] == '\t');
+}
+
 bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name) {
     char path_buf[1024];
     const char *path = strip_string_delimiters(literal, path_buf, sizeof(path_buf));
@@ -729,6 +918,9 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
     if (path[0] != '/') {
         return false;
     }
+    if (cbm_service_pattern_is_comment_text(path)) {
+        return false;
+    }
     if (callee_is_delimiter_or_filesystem_builder(callee_name)) {
         return false;
     }
@@ -737,6 +929,139 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
         return false;
     }
     return true;
+}
+
+/* ── GraphQL operation identity (#598) ─────────────────────────── */
+
+static bool gql_name_start(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static bool gql_name_char(unsigned char c) {
+    return gql_name_start(c) || (c >= '0' && c <= '9');
+}
+
+/* Skip one lexical unit whose braces are not structure: a # comment, a "..."
+ * or """...""" string, or a JS ${...} template interpolation. Returns p
+ * unchanged when p starts none of them. */
+static const char *gql_skip_opaque(const char *p) {
+    if (*p == '#') {
+        while (*p && *p != '\n' && *p != '\r') {
+            p++;
+        }
+        return p;
+    }
+    if (strncmp(p, "\"\"\"", 3) == 0) {
+        const char *end = strstr(p + 3, "\"\"\"");
+        return end ? end + 3 : p + strlen(p);
+    }
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"') {
+            p += (*p == '\\' && p[1]) ? 2 : 1;
+        }
+        return *p ? p + 1 : p;
+    }
+    if (p[0] == '$' && p[1] == '{') {
+        int depth = 1;
+        p += 2;
+        while (*p && depth > 0) {
+            depth += (*p == '{') - (*p == '}');
+            p++;
+        }
+        return p;
+    }
+    return p;
+}
+
+/* Skip GraphQL "ignored tokens" (whitespace, commas, comments). */
+static const char *gql_skip_ignored(const char *p) {
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') {
+            p++;
+        }
+        if (*p != '#') {
+            return p;
+        }
+        p = gql_skip_opaque(p);
+    }
+}
+
+/* Copy the Name token at p (bounded). Returns false when p is not a Name. */
+static bool gql_copy_name(const char *p, char *name_buf, size_t name_sz) {
+    if (!gql_name_start((unsigned char)*p) || !name_buf || name_sz == 0) {
+        return false;
+    }
+    size_t n = 0;
+    while (gql_name_char((unsigned char)p[n]) && n + 1 < name_sz) {
+        name_buf[n] = p[n];
+        n++;
+    }
+    name_buf[n] = '\0';
+    return true;
+}
+
+static const char *gql_operation_keyword(const char *tok, size_t len) {
+    static const char *const kws[] = {"query", "mutation", "subscription", NULL};
+    for (int i = 0; kws[i]; i++) {
+        if (strlen(kws[i]) == len && strncmp(tok, kws[i], len) == 0) {
+            return kws[i];
+        }
+    }
+    return NULL;
+}
+
+bool cbm_service_pattern_graphql_operation(const char *doc, const char **op_type, char *name_buf,
+                                           size_t name_sz) {
+    *op_type = "operation";
+    if (name_buf && name_sz > 0) {
+        name_buf[0] = '\0';
+    }
+    if (!doc) {
+        return false;
+    }
+    int depth = 0;
+    bool in_fragment = false;
+    const char *p = doc;
+    while (*p) {
+        const char *q = gql_skip_opaque(p);
+        if (q != p) {
+            p = q;
+            continue;
+        }
+        unsigned char c = (unsigned char)*p;
+        if (c == '{' && depth == 0 && !in_fragment) {
+            *op_type = "query"; /* `{ ... }` shorthand is an anonymous query */
+            return false;
+        }
+        if (c == '{' || c == '}') {
+            depth += (c == '{') ? 1 : -1;
+            depth = depth < 0 ? 0 : depth;
+            in_fragment = in_fragment && depth > 0;
+            p++;
+            continue;
+        }
+        if (depth > 0 || in_fragment || !gql_name_start(c)) {
+            p++;
+            continue;
+        }
+        const char *tok = p;
+        while (gql_name_char((unsigned char)*p)) {
+            p++;
+        }
+        size_t len = (size_t)(p - tok);
+        if (len == strlen("fragment") && strncmp(tok, "fragment", len) == 0) {
+            in_fragment = true;
+            continue;
+        }
+        const char *kw = gql_operation_keyword(tok, len);
+        if (!kw) {
+            return false; /* not a GraphQL document (URL, dict key, variable ...) */
+        }
+        *op_type = kw;
+        return gql_copy_name(gql_skip_ignored(p), name_buf, name_sz);
+    }
+    return false;
 }
 
 /* ── Public API ────────────────────────────────────────────────── */

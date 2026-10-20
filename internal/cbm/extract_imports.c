@@ -4,8 +4,10 @@
 #include "lang_specs.h"      // CBMLangSpec, CBMEmbeddedLangSpec, cbm_lang_spec, cbm_ts_language
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
+#include "foundation/compat.h" /* CBM_TLS */
 #include "extract_node_stack.h"
 #include <stdint.h> // uint32_t
+#include <limits.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -13,6 +15,8 @@
 enum {
     USE_PREFIX_LEN = 4, /* strlen("use ") */
     MIN_WOLFRAM_CHILDREN = 2,
+    /* Nested `#if` branches followed while collecting C includes. */
+    C_INCLUDE_NEST_LIMIT = 64,
     SECOND_IDX = 1,
 };
 
@@ -45,7 +49,8 @@ static void parse_lisp_imports(CBMExtractCtx *ctx);
 static void parse_starlark_imports(CBMExtractCtx *ctx);
 static void parse_tcl_imports(CBMExtractCtx *ctx);
 static void parse_teal_imports(CBMExtractCtx *ctx);
-static void parse_zsh_imports(CBMExtractCtx *ctx);
+static void parse_shell_source_imports(CBMExtractCtx *ctx);
+static void parse_make_imports(CBMExtractCtx *ctx);
 static void parse_css_imports(CBMExtractCtx *ctx);
 static void parse_html_imports(CBMExtractCtx *ctx);
 static void parse_cmake_imports(CBMExtractCtx *ctx);
@@ -118,6 +123,19 @@ static const char *python_import_root(CBMArena *a, const char *path) {
     return dot ? cbm_arena_strndup(a, path, (size_t)(dot - path)) : path;
 }
 
+/* Spell `from <module> import <name>` as one dotted path. A package-relative
+ * module (`from . import x`, `from .. import x`) is nothing but dots, which
+ * already end in the separator: joining with another '.' would add a level and
+ * name the PARENT package ("..x"), so the import resolved one package too high
+ * and fell to a same-named definition anywhere in the project. */
+static const char *python_join_from_import(CBMArena *a, const char *module, const char *name) {
+    size_t len = strlen(module);
+    if (len > 0 && module[len - SKIP_ONE] == '.') {
+        return cbm_arena_sprintf(a, "%s%s", module, name);
+    }
+    return cbm_arena_sprintf(a, "%s.%s", module, name);
+}
+
 // --- Go imports ---
 // import_declaration -> import_spec_list -> import_spec -> (name, path)
 
@@ -130,6 +148,19 @@ static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
     }
     char *path = strip_quotes(a, cbm_node_text(a, path_node, ctx->source));
     if (!path || !path[0]) {
+        return;
+    }
+
+    /* cgo: `import "C"` names the cgo PSEUDO-package, not a real one — "C" is
+     * reserved by go/build and no package with that import path can exist.
+     * Emitting it as an ordinary import makes the import resolver fall through
+     * to its symbol-name fallback (cbm_pipeline_resolve_import_node Strategy 3,
+     * pass_pkgmap.c), which matches the literal name "C" against every project
+     * node called C and picks the lexicographically smallest: on a real Go repo
+     * all 27 cgo files pointed their IMPORTS edge at the same unrelated `C`
+     * member of a test helper. Drop it — the C side is not a graph package, and
+     * the file's remaining imports are unaffected. */
+    if (strcmp(path, "C") == 0) {
         return;
     }
 
@@ -191,7 +222,7 @@ static void emit_py_aliased_import(CBMExtractCtx *ctx, TSNode child, const char 
     }
     const char *local = !ts_node_is_null(alias_node) ? cbm_node_text(a, alias_node, ctx->source)
                                                      : path_last(a, name);
-    const char *full = mod_prefix ? cbm_arena_sprintf(a, "%s.%s", mod_prefix, name) : name;
+    const char *full = mod_prefix ? python_join_from_import(a, mod_prefix, name) : name;
     CBMImport imp = {.local_name = local, .module_path = full};
     cbm_imports_push(&ctx->result->imports, a, imp);
 }
@@ -249,7 +280,7 @@ static void emit_py_import_from_name(CBMExtractCtx *ctx, TSNode child, const cha
     CBMArena *a = ctx->arena;
     char *name = cbm_node_text(a, child, ctx->source);
     if (name && name[0]) {
-        const char *full = mod_path ? cbm_arena_sprintf(a, "%s.%s", mod_path, name) : name;
+        const char *full = mod_path ? python_join_from_import(a, mod_path, name) : name;
         CBMImport imp = {.local_name = name, .module_path = full};
         cbm_imports_push(&ctx->result->imports, a, imp);
     }
@@ -303,6 +334,139 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
+/* `TYPE_CHECKING` or `<module>.TYPE_CHECKING` (typing.TYPE_CHECKING, t.TYPE_CHECKING). */
+static bool py_is_type_checking_condition(CBMExtractCtx *ctx, TSNode cond) {
+    if (ts_node_is_null(cond)) {
+        return false;
+    }
+    TSNode name = cond;
+    if (strcmp(ts_node_type(cond), "attribute") == 0) {
+        name = ts_node_child_by_field_name(cond, TS_FIELD("attribute"));
+    }
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0) {
+        return false;
+    }
+    const char *text = cbm_node_text(ctx->arena, name, ctx->source);
+    return text && strcmp(text, "TYPE_CHECKING") == 0;
+}
+
+/* One import statement; `type_only` flags every import it records. */
+static void process_py_import_node(CBMExtractCtx *ctx, TSNode node, bool type_only) {
+    const char *kind = ts_node_type(node);
+    int before = ctx->result->imports.count;
+    if (strcmp(kind, "import_statement") == 0) {
+        process_py_import_stmt(ctx, node);
+    } else if (strcmp(kind, "import_from_statement") == 0 ||
+               strcmp(kind, "future_import_statement") == 0) {
+        // `from __future__ import annotations` is a distinct node type in
+        // tree-sitter-python but has the same shape (module + name list).
+        process_py_import_from(ctx, node);
+    }
+    for (int i = before; type_only && i < ctx->result->imports.count; i++) {
+        ctx->result->imports.items[i].type_checking_only = true;
+    }
+}
+
+static bool py_is_import_node(TSNode node) {
+    const char *kind = ts_node_type(node);
+    return strcmp(kind, "import_statement") == 0 || strcmp(kind, "import_from_statement") == 0 ||
+           strcmp(kind, "future_import_statement") == 0;
+}
+
+static bool py_import_is_wildcard(TSNode import_node) {
+    uint32_t n = ts_node_child_count(import_node);
+    for (uint32_t i = 0; i < n; i++) {
+        if (strcmp(ts_node_type(ts_node_child(import_node, i)), "wildcard_import") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Records, unflagged, every import statement anywhere under `root` (the
+ * runtime alternative of a TYPE_CHECKING block usually nests them in
+ * try/except ImportError). An iterative pre-order walk: adversarially deep
+ * nesting must not exhaust the stack. Returns true when one of them is a star
+ * import. */
+static bool py_record_subtree_imports(CBMExtractCtx *ctx, TSNode root) {
+    bool star = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool is_import = py_is_import_node(node);
+        if (is_import) {
+            process_py_import_node(ctx, node, false);
+            star = star || py_import_is_wildcard(node);
+        }
+        if (!is_import && ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                return star;
+            }
+        }
+    }
+}
+
+/* Drops the imports [first, mark) whose local name an import at [mark, count)
+ * binds as well (every one when `star`), then the imports [mark, count). */
+static void py_drop_rebound_imports(CBMImportArray *imports, int first, int mark, bool star) {
+    int keep = first;
+    for (int i = first; i < mark; i++) {
+        const CBMImport *imp = &imports->items[i];
+        bool rebound = star;
+        for (int j = mark; !rebound && j < imports->count; j++) {
+            rebound = imp->local_name && imports->items[j].local_name &&
+                      strcmp(imp->local_name, imports->items[j].local_name) == 0;
+        }
+        if (!rebound) {
+            imports->items[keep++] = *imp;
+        }
+    }
+    imports->count = keep;
+}
+
+/* A module-level `if TYPE_CHECKING:` holds imports a type checker sees and
+ * the interpreter never runs (#1277: an annotated field's type is usually
+ * imported exactly there, to avoid an import cycle). Record the imports of
+ * its consequence block, flagged type_checking_only. Its elif/else branches
+ * are runtime alternatives and stay unrecorded, as every other compound
+ * statement's imports do; a name they bind again (the compat shape: the same
+ * name imported in `else:` under try/except ImportError) is bound at runtime,
+ * so its TYPE_CHECKING import is no annotation-only import and is dropped as
+ * well, and a star import there may bind any name. */
+static void process_py_type_checking_block(CBMExtractCtx *ctx, TSNode if_node) {
+    if (!py_is_type_checking_condition(
+            ctx, ts_node_child_by_field_name(if_node, TS_FIELD("condition")))) {
+        return;
+    }
+    TSNode body = ts_node_child_by_field_name(if_node, TS_FIELD("consequence"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    int first = ctx->result->imports.count;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            process_py_import_node(ctx, ts_tree_cursor_current_node(&cursor), true);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    int mark = ctx->result->imports.count;
+    bool star = false;
+    uint32_t n = ts_node_child_count(if_node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode alt = ts_node_child(if_node, i);
+        const char *kind = ts_node_type(alt);
+        if (strcmp(kind, "elif_clause") == 0 || strcmp(kind, "else_clause") == 0) {
+            star = py_record_subtree_imports(ctx, alt) || star;
+        }
+    }
+    py_drop_rebound_imports(&ctx->result->imports, first, mark, star);
+}
+
 static void parse_python_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
@@ -311,18 +475,1161 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
     }
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char *kind = ts_node_type(node);
-
-        if (strcmp(kind, "import_statement") == 0) {
-            process_py_import_stmt(ctx, node);
-        } else if (strcmp(kind, "import_from_statement") == 0 ||
-                   strcmp(kind, "future_import_statement") == 0) {
-            // `from __future__ import annotations` is a distinct node type in
-            // tree-sitter-python but has the same shape (module + name list).
-            process_py_import_from(ctx, node);
+        if (strcmp(ts_node_type(node), "if_statement") == 0) {
+            process_py_type_checking_block(ctx, node);
+        } else {
+            process_py_import_node(ctx, node, false);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+/* A proven same-module function (its OWN_DEF fact and definition), and
+ * whether a top-level call of it leaves the namespace intact (see
+ * py_ns_allowed_call). */
+typedef enum {
+    PY_NS_CALL_UNCHECKED = 0,
+    PY_NS_CALL_ALLOWED = 1,
+    PY_NS_CALL_EFFECT = 2,
+} PyNsCallVerdict;
+
+typedef struct {
+    int fact;
+    TSNode node;
+    PyNsCallVerdict verdict;
+    const char **shadows; /* submodules the body imports into the package */
+    int shadow_count;
+} PyNsFunction;
+
+/* Ordered Python namespace facts are a separate content-only pass. The older
+ * import records keep their existing graph/heuristic meaning. */
+typedef struct {
+    CBMExtractCtx *ctx;
+    CBMPyNamespaceFacts facts;
+    CBMPyNamespaceFailure failure;
+    PyNsFunction *functions; /* in fact order; scratch, never part of the result */
+    int function_count;
+    int function_cap;
+} PyNamespaceBuilder;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static CBM_TLS int py_namespace_capture_left = -1;
+void cbm_py_namespace_test_capture_fail_after(int successful_allocations) {
+    py_namespace_capture_left = successful_allocations;
+}
+#endif
+
+static void *py_ns_alloc(PyNamespaceBuilder *b, size_t size) {
+    if (b->failure)
+        return NULL;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (py_namespace_capture_left == 0) {
+        b->failure = CBM_PY_NS_FAILURE_ALLOCATION;
+        return NULL;
+    }
+    if (py_namespace_capture_left > 0)
+        py_namespace_capture_left--;
+#endif
+    void *p = cbm_arena_alloc(b->ctx->arena, size);
+    if (!p)
+        b->failure = CBM_PY_NS_FAILURE_ALLOCATION;
+    return p;
+}
+
+/* Builder bookkeeping nothing in the result points at: the extraction scratch
+ * when the context has one. */
+static void *py_ns_scratch_alloc(PyNamespaceBuilder *b, size_t size) {
+    if (b->failure)
+        return NULL;
+    CBMArena *arena = b->ctx->scratch ? b->ctx->scratch : b->ctx->arena;
+    void *p = cbm_arena_alloc(arena, size);
+    if (!p)
+        b->failure = CBM_PY_NS_FAILURE_ALLOCATION;
+    return p;
+}
+
+static const char *py_ns_copy(PyNamespaceBuilder *b, const char *text, size_t len) {
+    if (len == SIZE_MAX) {
+        b->failure = CBM_PY_NS_FAILURE_LIMIT;
+        return NULL;
+    }
+    char *copy = py_ns_alloc(b, len + 1);
+    if (!copy)
+        return NULL;
+    memcpy(copy, text, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+static bool py_ns_slice(PyNamespaceBuilder *b, TSNode node, const char **text, size_t *len) {
+    if (ts_node_is_null(node))
+        return false;
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    if (end < start || end > (uint32_t)b->ctx->source_len)
+        return false;
+    *text = b->ctx->source + start;
+    *len = (size_t)(end - start);
+    return memchr(*text, '\0', *len) == NULL;
+}
+
+static bool py_ns_identifier_bytes(const char *s, size_t n, bool dotted) {
+    bool initial = true;
+    if (!n)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (dotted && c == '.' && !initial) {
+            initial = true;
+            continue;
+        }
+        if (c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (!initial && c >= '0' && c <= '9')) {
+            initial = false;
+            continue;
+        }
+        return false;
+    }
+    return !initial;
+}
+
+static const char *py_ns_name(PyNamespaceBuilder *b, TSNode node, bool dotted) {
+    const char *text = NULL;
+    size_t len = 0;
+    if (!py_ns_slice(b, node, &text, &len) || !py_ns_identifier_bytes(text, len, dotted))
+        return NULL;
+    return py_ns_copy(b, text, len);
+}
+
+static bool py_ns_push(PyNamespaceBuilder *b, CBMPyNamespaceFact fact) {
+    if (b->failure)
+        return false;
+    if (b->facts.count == b->facts.cap) {
+        if (b->facts.cap > INT_MAX / 2) {
+            b->failure = CBM_PY_NS_FAILURE_LIMIT;
+            return false;
+        }
+        int cap = b->facts.cap ? b->facts.cap * 2 : 8;
+        if ((size_t)cap > SIZE_MAX / sizeof(*b->facts.items)) {
+            b->failure = CBM_PY_NS_FAILURE_LIMIT;
+            return false;
+        }
+        CBMPyNamespaceFact *items = py_ns_alloc(b, (size_t)cap * sizeof(*items));
+        if (!items)
+            return false;
+        if (b->facts.count)
+            memcpy(items, b->facts.items, (size_t)b->facts.count * sizeof(*items));
+        b->facts.items = items;
+        b->facts.cap = cap;
+    }
+    b->facts.items[b->facts.count++] = fact;
+    return true;
+}
+
+static bool py_ns_unknown(PyNamespaceBuilder *b, CBMPyNamespaceUnknownReason reason) {
+    return py_ns_push(b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_UNKNOWN, .reason = reason});
+}
+
+static bool py_ns_plain_string(PyNamespaceBuilder *b, TSNode node, const char **text, size_t *len) {
+    if (strcmp(ts_node_type(node), "string") != 0 || !py_ns_slice(b, node, text, len) || *len < 2)
+        return false;
+    char quote = (*text)[0];
+    if ((quote != '\'' && quote != '"') || (*text)[*len - 1] != quote)
+        return false;
+    for (size_t i = 1; i + 1 < *len; i++) {
+        if ((*text)[i] == '\\' || (*text)[i] == quote || (*text)[i] == '\n' || (*text)[i] == '\r')
+            return false;
+    }
+    (*text)++;
+    *len -= 2;
+    return true;
+}
+
+/* One string of a literal: any quoting or prefix (r, b, u, rb), unless it is an
+ * f-string with a replacement field, whose __format__ / __str__ may run code. */
+static bool py_ns_string_without_field(TSNode node) {
+    if (strcmp(ts_node_type(node), "string") != 0)
+        return false;
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (strcmp(ts_node_type(ts_node_named_child(node, i)), "interpolation") == 0)
+            return false;
+    }
+    return true;
+}
+
+/* A string literal, implicit concatenations included, evaluates nothing: a
+ * docstring (module, class or attribute) is no namespace effect. */
+static bool py_ns_literal_string(TSNode node) {
+    if (strcmp(ts_node_type(node), "concatenated_string") != 0)
+        return py_ns_string_without_field(node);
+    uint32_t count = ts_node_named_child_count(node);
+    bool parts = false;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode part = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(part), "comment") == 0)
+            continue;
+        if (!py_ns_string_without_field(part))
+            return false;
+        parts = true;
+    }
+    return parts;
+}
+
+/* Bounded syntactic proof only. Unsupported or deep expressions become an
+ * unknown-effect barrier; no evaluator or source execution is involved. */
+static bool py_ns_safe_expr(PyNamespaceBuilder *b, TSNode node, int depth) {
+    if (ts_node_is_null(node))
+        return true;
+    if (depth >= 64)
+        return false;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "integer") == 0 ||
+        strcmp(kind, "float") == 0 || strcmp(kind, "true") == 0 || strcmp(kind, "false") == 0 ||
+        strcmp(kind, "none") == 0 || strcmp(kind, "comment") == 0)
+        return true;
+    if (strcmp(kind, "string") == 0 || strcmp(kind, "concatenated_string") == 0)
+        return py_ns_literal_string(node);
+    bool container =
+        strcmp(kind, "tuple") == 0 || strcmp(kind, "list") == 0 ||
+        strcmp(kind, "parenthesized_expression") == 0 || strcmp(kind, "parameters") == 0 ||
+        strcmp(kind, "default_parameter") == 0 || strcmp(kind, "typed_parameter") == 0 ||
+        strcmp(kind, "typed_default_parameter") == 0 || strcmp(kind, "list_splat_pattern") == 0 ||
+        strcmp(kind, "dictionary_splat_pattern") == 0 || strcmp(kind, "type") == 0;
+    if (!container)
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool safe = true;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child) && !py_ns_safe_expr(b, child, depth + 1)) {
+                safe = false;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return safe;
+}
+
+static bool py_ns_signature_safe(PyNamespaceBuilder *b, TSNode node) {
+    return py_ns_safe_expr(b, ts_node_child_by_field_name(node, TS_FIELD("parameters")), 0) &&
+           py_ns_safe_expr(b, ts_node_child_by_field_name(node, TS_FIELD("return_type")), 0);
+}
+
+static bool py_ns_class_safe(PyNamespaceBuilder *b, TSNode node) {
+    if (!ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("superclasses"))))
+        return false;
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(body))
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    bool safe = true;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child))
+                continue;
+            const char *kind = ts_node_type(child);
+            if (strcmp(kind, "pass_statement") == 0 || strcmp(kind, "comment") == 0)
+                continue;
+            if (strcmp(kind, "function_definition") == 0 && py_ns_signature_safe(b, child))
+                continue;
+            if (strcmp(kind, "expression_statement") == 0 &&
+                ts_node_named_child_count(child) == 1) {
+                if (py_ns_literal_string(ts_node_named_child(child, 0)))
+                    continue;
+                /* Even an identifier assignment can install a descriptor whose
+                 * __set_name__ hook executes during class creation. */
+            }
+            safe = false;
+            break;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return safe;
+}
+
+/* One imported name of an import statement: `import a.b [as c]` binds the root
+ * `a` (or the alias), `from m import x [as y]` binds `x` (or the alias), and
+ * `from m import *` is a star. False for an unsupported child or a failed copy. */
+static bool py_ns_import_fact(PyNamespaceBuilder *b, TSNode child, bool from,
+                              const char *module_name, uint32_t level, CBMPyNamespaceFact *out) {
+    const char *kind = ts_node_type(child);
+    CBMPyNamespaceFact f = {.kind = from ? CBM_PY_NS_IMPORT_NAME : CBM_PY_NS_IMPORT_MODULE,
+                            .module_name = module_name,
+                            .relative_level = level};
+    if (from && strcmp(kind, "wildcard_import") == 0) {
+        f.kind = CBM_PY_NS_IMPORT_STAR;
+        *out = f;
+        return true;
+    }
+    bool alias = strcmp(kind, "aliased_import") == 0;
+    if (!alias && strcmp(kind, "dotted_name") != 0 && strcmp(kind, "identifier") != 0)
+        return false;
+    TSNode name = alias ? ts_node_child_by_field_name(child, TS_FIELD("name")) : child;
+    const char *imported = py_ns_name(b, name, !from);
+    if (!imported)
+        return false;
+    if (from)
+        f.member_name = imported;
+    else
+        f.module_name = imported;
+    if (alias) {
+        f.local_name = py_ns_name(b, ts_node_child_by_field_name(child, TS_FIELD("alias")), false);
+    } else if (from) {
+        f.local_name = imported;
+    } else {
+        f.local_name = py_ns_copy(b, imported, strcspn(imported, "."));
+        f.flags = CBM_PY_NS_IMPORT_BINDS_ROOT;
+    }
+    *out = f;
+    return f.local_name != NULL;
+}
+
+static bool py_ns_import(PyNamespaceBuilder *b, TSNode node, bool from) {
+    TSNode module = from ? ts_node_child_by_field_name(node, TS_FIELD("module_name")) : (TSNode){0};
+    const char *module_name = NULL;
+    uint32_t level = 0;
+    if (from) {
+        const char *text = NULL;
+        size_t len = 0;
+        if (!py_ns_slice(b, module, &text, &len))
+            return false;
+        while ((size_t)level < len && text[level] == '.')
+            level++;
+        if (level == len ? level == 0 : !py_ns_identifier_bytes(text + level, len - level, true))
+            return false;
+        module_name = py_ns_copy(b, text + level, len - level);
+        if (!module_name)
+            return false;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool ok = true;
+    int emitted = 0;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            /* a plain import has no module node: the null node equals no child */
+            if (!ts_node_is_named(child) || ts_node_eq(child, module) ||
+                strcmp(ts_node_type(child), "comment") == 0)
+                continue;
+            CBMPyNamespaceFact f;
+            if (!py_ns_import_fact(b, child, from, module_name, level, &f) || !py_ns_push(b, f)) {
+                ok = false;
+                break;
+            }
+            emitted++;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok && emitted > 0;
+}
+
+static bool py_ns_all_literal(PyNamespaceBuilder *b, TSNode node, CBMPyNamespaceFact *fact) {
+    if (ts_node_is_null(node))
+        return false;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "list") != 0 && strcmp(kind, "tuple") != 0)
+        return false;
+    /* One bound for both limits, on every platform: the names are counted in an
+     * int, and count * sizeof(*names) <= INT_MAX fits even a 32-bit size_t. */
+    uint32_t count = ts_node_named_child_count(node);
+    if (count > INT_MAX / sizeof(*fact->names)) {
+        b->failure = CBM_PY_NS_FAILURE_LIMIT;
+        return false;
+    }
+    const char **names = count ? py_ns_alloc(b, (size_t)count * sizeof(*names)) : NULL;
+    if (count && !names)
+        return false;
+    int used = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool ok = true;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child) || strcmp(ts_node_type(child), "comment") == 0)
+                continue;
+            const char *text = NULL;
+            size_t len = 0;
+            if (!py_ns_plain_string(b, child, &text, &len) ||
+                !(names[used] = py_ns_copy(b, text, len))) {
+                ok = false;
+                break;
+            }
+            used++;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (!ok)
+        return false;
+    fact->sequence_kind =
+        strcmp(kind, "list") == 0 ? CBM_PY_NS_SEQUENCE_LIST : CBM_PY_NS_SEQUENCE_TUPLE;
+    fact->names = used ? names : NULL;
+    fact->name_count = used;
+    return true;
+}
+
+static bool py_ns_assignment(PyNamespaceBuilder *b, TSNode node) {
+    TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
+    TSNode right = ts_node_child_by_field_name(node, TS_FIELD("right"));
+    TSNode annotation = ts_node_child_by_field_name(node, TS_FIELD("type"));
+    const char *name = py_ns_name(b, left, false);
+    if (!name)
+        return false;
+    if (!py_ns_safe_expr(b, right, 0) || !py_ns_safe_expr(b, annotation, 0)) {
+        if (!py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT))
+            return false;
+    }
+    if (ts_node_is_null(right))
+        return true; /* annotation alone does not bind the target */
+    bool augmented = strcmp(ts_node_type(node), "augmented_assignment") == 0;
+    if (strcmp(name, "__all__") != 0) {
+        if (augmented)
+            return py_ns_unknown(b, CBM_PY_NS_REASON_UNSUPPORTED);
+        return py_ns_push(b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
+                                                  .local_name = name,
+                                                  .reason = CBM_PY_NS_REASON_VALUE});
+    }
+    CBMPyNamespaceFact fact = {.kind = augmented ? CBM_PY_NS_ALL_APPEND : CBM_PY_NS_ALL_SET};
+    bool plus = true;
+    if (augmented) {
+        const char *op = NULL;
+        size_t len = 0;
+        plus = py_ns_slice(b, ts_node_child_by_field_name(node, TS_FIELD("operator")), &op, &len) &&
+               len == 2 && memcmp(op, "+=", 2) == 0;
+    }
+    if (plus && py_ns_all_literal(b, right, &fact))
+        return py_ns_push(b, fact);
+    return py_ns_push(
+        b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_ALL_UNKNOWN, .reason = CBM_PY_NS_REASON_VALUE});
+}
+
+static bool py_ns_delete(PyNamespaceBuilder *b, TSNode node, int depth) {
+    if (depth > 2)
+        return false;
+    if (strcmp(ts_node_type(node), "identifier") == 0) {
+        const char *name = py_ns_name(b, node, false);
+        if (!name)
+            return false;
+        return py_ns_push(b,
+                          strcmp(name, "__all__") == 0
+                              ? (CBMPyNamespaceFact){.kind = CBM_PY_NS_ALL_DELETE}
+                              : (CBMPyNamespaceFact){.kind = CBM_PY_NS_DELETE, .local_name = name});
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "delete_statement") != 0 && strcmp(kind, "expression_list") != 0)
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool ok = true;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child) && strcmp(ts_node_type(child), "comment") != 0 &&
+                !py_ns_delete(b, child, depth + 1)) {
+                ok = false;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
+static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node);
+
+/* `if TYPE_CHECKING:` / `if <module>.TYPE_CHECKING:` */
+static bool py_ns_is_type_checking_if(PyNamespaceBuilder *b, TSNode node) {
+    TSNode cond = ts_node_child_by_field_name(node, TS_FIELD("condition"));
+    if (ts_node_is_null(cond))
+        return false;
+    TSNode name = cond;
+    if (strcmp(ts_node_type(cond), "attribute") == 0)
+        name = ts_node_child_by_field_name(cond, TS_FIELD("attribute"));
+    const char *text = NULL;
+    size_t len = 0;
+    return !ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0 &&
+           py_ns_slice(b, name, &text, &len) && len == strlen("TYPE_CHECKING") &&
+           memcmp(text, "TYPE_CHECKING", len) == 0;
+}
+
+/* An import in an elif/else branch of a TYPE_CHECKING block rebinds its names
+ * at runtime from wherever that branch says (the compat shape: `else: try:
+ * from runtime.place import name`). A static reader cannot tell which source
+ * the module ends up exporting, so every name such an import binds becomes a
+ * SHADOW (reason UNSUPPORTED: the re-export is withdrawn, as for a later
+ * assignment); a star import, or an import form the builder does not read,
+ * may bind any name, so the whole namespace becomes unknown. An iterative
+ * walk of the branch: deep nesting must not exhaust the stack. */
+static bool py_ns_alternative_imports(PyNamespaceBuilder *b, TSNode root) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool done = false;
+    while (!done && !b->failure) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool from = strcmp(kind, "import_from_statement") == 0;
+        bool is_import = from || strcmp(kind, "import_statement") == 0;
+        if (is_import) {
+            int start = b->facts.count;
+            bool star = !py_ns_import(b, node, from);
+            for (int i = start; !star && i < b->facts.count; i++) {
+                star = b->facts.items[i].kind == CBM_PY_NS_IMPORT_STAR;
+                b->facts.items[i] = (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
+                                                         .local_name = b->facts.items[i].local_name,
+                                                         .reason = CBM_PY_NS_REASON_UNSUPPORTED};
+            }
+            if (star && !b->failure) {
+                b->facts.count = start;
+                py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND);
+            }
+        }
+        if (!is_import && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return !b->failure;
+}
+
+/* The type checker view of a module-level `if TYPE_CHECKING:`: its
+ * consequence runs, its elif/else branches never do. Packages that load
+ * their public names lazily at runtime (`else: sys.modules[...] =
+ * _LazyModule(...)`) publish them exactly there, so a static reader of the
+ * namespace must take this branch to see them; every other compound
+ * statement stays a whole-namespace unknown. A name an elif/else branch
+ * imports again is withdrawn (py_ns_alternative_imports). */
+static bool py_ns_type_checking_block(PyNamespaceBuilder *b, TSNode node) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("consequence"));
+    if (ts_node_is_null(body))
+        return py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND);
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count && !b->failure; i++) {
+        TSNode stmt = ts_node_named_child(body, i);
+        int start = b->facts.count;
+        if (!py_ns_statement(b, stmt) && !b->failure) {
+            b->facts.count = start;
+            if (!py_ns_unknown(b, CBM_PY_NS_REASON_UNSUPPORTED))
+                return false;
+        }
+    }
+    uint32_t children = ts_node_child_count(node);
+    for (uint32_t i = 0; i < children && !b->failure; i++) {
+        TSNode alt = ts_node_child(node, i);
+        const char *kind = ts_node_type(alt);
+        if (strcmp(kind, "elif_clause") == 0 || strcmp(kind, "else_clause") == 0)
+            py_ns_alternative_imports(b, alt);
+    }
+    return !b->failure;
+}
+
+/* `from __future__ import x [as y]` is its own node type, without a module
+ * field: a compiler directive that also binds x (or y) to the feature object,
+ * like a from-import of module `__future__`. */
+static bool py_ns_future_import(PyNamespaceBuilder *b, TSNode node) {
+    const char *module_name = py_ns_copy(b, "__future__", strlen("__future__"));
+    if (!module_name)
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool ok = true;
+    int emitted = 0;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            const char *field = ts_tree_cursor_current_field_name(&cursor);
+            if (!field || strcmp(field, "name") != 0)
+                continue;
+            CBMPyNamespaceFact f;
+            if (!py_ns_import_fact(b, ts_tree_cursor_current_node(&cursor), true, module_name, 0,
+                                   &f) ||
+                !py_ns_push(b, f)) {
+                ok = false;
+                break;
+            }
+            emitted++;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok && emitted > 0;
+}
+
+/* ── A top-level call the namespace survives ──────────────────────────────
+ * Any top-level call may rebind any name of the module, so it withdraws the
+ * whole namespace (UNKNOWN, reason EFFECT). sqlalchemy's sql/__init__.py ends
+ * with `__go(locals())`, which withdrew all of its 108 re-exports. A call is
+ * allowed when its callee provably cannot rebind the caller's names:
+ *   - the callee is the latest binding of its name, a proven (undecorated)
+ *     same-module function, with no star import or unknown effect since;
+ *   - every argument is a safe expression or a bare `locals()` / `globals()`
+ *     the module does not rebind;
+ *   - the body, nested scopes included, has no `global` / `nonlocal` and never
+ *     names a parameter, a function or class this module defined earlier (it
+ *     could rebind through `global`), the module's own name, or a name that
+ *     reaches a namespace (py_ns_namespace_names).
+ * The body may import: each submodule of this package it imports becomes a
+ * package attribute, so in a package `__init__` those names are shadowed at
+ * the call. Every other call stays a whole-namespace effect. */
+
+static const char *const py_ns_namespace_names[] = {
+    "globals",    "vars",     "locals",    "exec",      "eval",     "setattr",     "delattr",
+    "__import__", "sys",      "importlib", "__name__",  "__dict__", "__globals__", "__builtins__",
+    "builtins",   "__self__", "inspect",   "f_globals", "f_locals", "f_back",      "gc",
+};
+
+typedef struct {
+    const char *text;
+    size_t len;
+} PyNsSlice;
+
+typedef struct {
+    PyNamespaceBuilder *b;
+    PyNsSlice own;
+    bool package;
+    PyNsSlice *params;
+    int param_count;
+    const char **defs; /* earlier same-module functions and classes, sorted */
+    int def_count;
+    const char **shadows;
+    int shadow_count;
+    int shadow_cap;
+} PyNsCallCheck;
+
+static bool py_ns_text_is(const char *text, size_t len, const char *s) {
+    return strlen(s) == len && memcmp(text, s, len) == 0;
+}
+
+/* strcmp of a NUL-terminated string against a slice. */
+static int py_ns_slice_cmp(const char *s, const char *text, size_t len) {
+    int r = strncmp(s, text, len);
+    if (r != 0)
+        return r;
+    return s[len] ? 1 : 0;
+}
+
+static int py_ns_cmp_cstr(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* `pkg/sub/__init__.py` -> "sub", a package; `pkg/mod.py` -> "mod". */
+static bool py_ns_own_name(const char *rel_path, PyNsSlice *own, bool *package) {
+    if (!rel_path)
+        return false;
+    const char *slash = strrchr(rel_path, '/');
+    const char *file = slash ? slash + 1 : rel_path;
+    const char *ext = strrchr(file, '.');
+    if (!ext || ext == file)
+        return false;
+    size_t stem = (size_t)(ext - file);
+    *package = py_ns_text_is(file, stem, "__init__");
+    if (!*package) {
+        *own = (PyNsSlice){file, stem};
+    } else {
+        if (!slash)
+            return false;
+        const char *dir = slash;
+        while (dir > rel_path && dir[-1] != '/')
+            dir--;
+        *own = (PyNsSlice){dir, (size_t)(slash - dir)};
+    }
+    return py_ns_identifier_bytes(own->text, own->len, false);
+}
+
+static bool py_ns_reaches_namespace(const char *text, size_t len) {
+    for (size_t i = 0; i < sizeof(py_ns_namespace_names) / sizeof(py_ns_namespace_names[0]); i++) {
+        if (py_ns_text_is(text, len, py_ns_namespace_names[i]))
+            return true;
+    }
+    return false;
+}
+
+/* A name of the body (not a module path) the call cannot allow. */
+static bool py_ns_forbidden_name(const PyNsCallCheck *c, const char *text, size_t len) {
+    if (py_ns_reaches_namespace(text, len) ||
+        (len == c->own.len && memcmp(text, c->own.text, len) == 0))
+        return true;
+    for (int i = 0; i < c->param_count; i++) {
+        if (len == c->params[i].len && memcmp(text, c->params[i].text, len) == 0)
+            return true;
+    }
+    int lo = 0, hi = c->def_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        int r = py_ns_slice_cmp(c->defs[mid], text, len);
+        if (r == 0)
+            return true;
+        if (r < 0)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return false;
+}
+
+static bool py_ns_node_forbidden(const PyNsCallCheck *c, TSNode node) {
+    const char *text = NULL;
+    size_t len = 0;
+    return ts_node_is_null(node) || !py_ns_slice(c->b, node, &text, &len) ||
+           py_ns_forbidden_name(c, text, len);
+}
+
+static bool py_ns_add_shadow(PyNsCallCheck *c, const char *text, size_t len) {
+    if (!py_ns_identifier_bytes(text, len, false))
+        return false;
+    if (c->shadow_count == c->shadow_cap) {
+        int cap = c->shadow_cap ? c->shadow_cap * 2 : 8;
+        const char **items = py_ns_scratch_alloc(c->b, (size_t)cap * sizeof(*items));
+        if (!items)
+            return false;
+        if (c->shadow_count)
+            memcpy(items, c->shadows, (size_t)c->shadow_count * sizeof(*items));
+        c->shadows = items;
+        c->shadow_cap = cap;
+    }
+    const char *name = py_ns_copy(c->b, text, len);
+    if (!name)
+        return false;
+    c->shadows[c->shadow_count++] = name;
+    return true;
+}
+
+/* The segments of a dotted module path: none may reach a namespace. Sets
+ * *own_at to the index of the segment naming this module (-1: none) and
+ * *next to the slice after it (empty when it is the last segment). */
+static bool py_ns_check_path(const PyNsCallCheck *c, const char *text, size_t len, int *own_at,
+                             PyNsSlice *next) {
+    *own_at = -1;
+    *next = (PyNsSlice){NULL, 0};
+    int index = 0;
+    size_t start = 0;
+    while (start <= len && len > 0) {
+        size_t end = start;
+        while (end < len && text[end] != '.')
+            end++;
+        const char *seg = text + start;
+        size_t seg_len = end - start;
+        if (py_ns_reaches_namespace(seg, seg_len))
+            return false;
+        if (*own_at >= 0 && *own_at == index - 1)
+            *next = (PyNsSlice){seg, seg_len};
+        if (*own_at < 0 && seg_len == c->own.len && memcmp(seg, c->own.text, seg_len) == 0)
+            *own_at = index;
+        index++;
+        start = end + 1;
+    }
+    return true;
+}
+
+/* The relative level of a `from` module path: its leading dots. */
+static size_t py_ns_leading_dots(const char *text, size_t len) {
+    const char *end = text + len;
+    const char *p = text;
+    while (p != end && *p == '.')
+        p++;
+    return (size_t)(p - text);
+}
+
+/* An import in the callee's body. When its module is this package, the
+ * submodule it installs as a package attribute is shadowed: the first
+ * segment after the package, or every imported member when the import names
+ * the package itself. A relative import of a package `__init__` is relative
+ * to the package (level 1) or to its parent (level 2, whose first segment
+ * then names this package or a sibling). Deeper relative imports that name
+ * this module cannot be placed and are refused. The names an import binds are
+ * checked like every name of the body; this module's own name is allowed in a
+ * module path only. */
+static bool py_ns_check_import(PyNsCallCheck *c, TSNode node, bool from) {
+    TSNode module = from ? ts_node_child_by_field_name(node, TS_FIELD("module_name")) : (TSNode){0};
+    bool into_package = false; /* the import's module is this package */
+    PyNsSlice sub = {NULL, 0}; /* the submodule after the package, if any */
+    if (from) {
+        const char *text = NULL;
+        size_t len = 0;
+        if (!py_ns_slice(c->b, module, &text, &len))
+            return false;
+        size_t level = py_ns_leading_dots(text, len);
+        PyNsSlice rest = {text + level, len - level};
+        if (rest.len && !py_ns_identifier_bytes(rest.text, rest.len, true))
+            return false;
+        int own_at = -1;
+        PyNsSlice next;
+        if (!py_ns_check_path(c, rest.text, rest.len, &own_at, &next))
+            return false;
+        if (c->package && level == 1) {
+            /* `from . import x` names the package; `from .x.y import z` installs x */
+            const char *dot = rest.len ? memchr(rest.text, '.', rest.len) : NULL;
+            into_package = rest.len == 0;
+            sub = (PyNsSlice){rest.text, dot ? (size_t)(dot - rest.text) : rest.len};
+        } else if (c->package && (level == 0 || (level == 2 && own_at == 0)) && own_at >= 0) {
+            /* level 2: the parent's child of this name is this package; a
+             * later segment of the same name is a package further down */
+            if (next.len)
+                sub = next;
+            else
+                into_package = true;
+        } else if (c->package && level > 2 && own_at >= 0) {
+            return false;
+        }
+        if (sub.len && !py_ns_add_shadow(c, sub.text, sub.len))
+            return false;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    bool ok = true;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child) || ts_node_eq(child, module) ||
+                strcmp(ts_node_type(child), "comment") == 0)
+                continue;
+            const char *kind = ts_node_type(child);
+            bool alias = strcmp(kind, "aliased_import") == 0;
+            if (!alias && strcmp(kind, "dotted_name") != 0) {
+                ok = false; /* a star import, or a form this check does not read */
+                break;
+            }
+            TSNode name = alias ? ts_node_child_by_field_name(child, TS_FIELD("name")) : child;
+            const char *text = NULL;
+            size_t len = 0;
+            if (!py_ns_slice(c->b, name, &text, &len)) {
+                ok = false;
+                break;
+            }
+            if (alias &&
+                py_ns_node_forbidden(c, ts_node_child_by_field_name(child, TS_FIELD("alias")))) {
+                ok = false;
+                break;
+            }
+            if (from) {
+                /* a member is a name the import binds (or a submodule) */
+                if (py_ns_forbidden_name(c, text, len) ||
+                    (into_package && !py_ns_add_shadow(c, text, len))) {
+                    ok = false;
+                    break;
+                }
+                continue;
+            }
+            int own_at = -1;
+            PyNsSlice next;
+            if (!py_ns_identifier_bytes(text, len, true) ||
+                !py_ns_check_path(c, text, len, &own_at, &next) ||
+                (alias && own_at >= 0 && !next.len)) {
+                ok = false; /* `import pkg.own as alias` hands out this module */
+                break;
+            }
+            if (c->package && own_at >= 0 && next.len &&
+                !py_ns_add_shadow(c, next.text, next.len)) {
+                ok = false;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
+static bool py_ns_collect_params(PyNsCallCheck *c, TSNode def) {
+    TSNode params = ts_node_child_by_field_name(def, TS_FIELD("parameters"));
+    if (ts_node_is_null(params))
+        return false;
+    uint32_t count = ts_node_named_child_count(params);
+    c->params = count ? py_ns_scratch_alloc(c->b, (size_t)count * sizeof(*c->params)) : NULL;
+    if (count && !c->params)
+        return false;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode p = ts_node_named_child(params, i);
+        const char *kind = ts_node_type(p);
+        if (strcmp(kind, "comment") == 0 || strcmp(kind, "keyword_separator") == 0 ||
+            strcmp(kind, "positional_separator") == 0)
+            continue;
+        TSNode name = p;
+        if (strcmp(kind, "default_parameter") == 0 ||
+            strcmp(kind, "typed_default_parameter") == 0) {
+            name = ts_node_child_by_field_name(p, TS_FIELD("name"));
+        } else if (strcmp(kind, "typed_parameter") == 0 ||
+                   strcmp(kind, "list_splat_pattern") == 0 ||
+                   strcmp(kind, "dictionary_splat_pattern") == 0) {
+            name = ts_node_named_child(p, 0);
+            const char *inner = ts_node_is_null(name) ? "" : ts_node_type(name);
+            if (strcmp(inner, "list_splat_pattern") == 0 ||
+                strcmp(inner, "dictionary_splat_pattern") == 0)
+                name = ts_node_named_child(name, 0);
+        } else if (strcmp(kind, "identifier") != 0) {
+            return false;
+        }
+        PyNsSlice s;
+        if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0 ||
+            !py_ns_slice(c->b, name, &s.text, &s.len))
+            return false;
+        c->params[c->param_count++] = s;
+    }
+    return true;
+}
+
+static bool py_ns_collect_defs(PyNsCallCheck *c, int before) {
+    c->defs = before ? py_ns_scratch_alloc(c->b, (size_t)before * sizeof(*c->defs)) : NULL;
+    if (before && !c->defs)
+        return false;
+    for (int i = 0; i < before; i++) {
+        const CBMPyNamespaceFact *f = &c->b->facts.items[i];
+        bool def = f->kind == CBM_PY_NS_OWN_DEF ||
+                   (f->kind == CBM_PY_NS_SHADOW && (f->reason == CBM_PY_NS_REASON_DECORATED ||
+                                                    f->reason == CBM_PY_NS_REASON_UNPROVEN_CLASS));
+        if (def && f->local_name)
+            c->defs[c->def_count++] = f->local_name;
+    }
+    if (c->def_count > 1)
+        qsort(c->defs, (size_t)c->def_count, sizeof(*c->defs), py_ns_cmp_cstr);
+    return true;
+}
+
+/* Walk the callee's body (iteratively: nesting must not exhaust the stack). */
+static bool py_ns_check_body(PyNsCallCheck *c, TSNode body) {
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    bool ok = true;
+    bool done = false;
+    while (ok && !done && !c->b->failure) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool from = strcmp(kind, "import_from_statement") == 0;
+        bool is_import = from || strcmp(kind, "import_statement") == 0;
+        if (strcmp(kind, "global_statement") == 0 || strcmp(kind, "nonlocal_statement") == 0 ||
+            strcmp(kind, "future_import_statement") == 0) {
+            ok = false;
+        } else if (is_import) {
+            ok = py_ns_check_import(c, node, from);
+        } else if (strcmp(kind, "identifier") == 0) {
+            ok = !py_ns_node_forbidden(c, node);
+        }
+        if (!ok)
+            break;
+        if (!is_import && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return ok && !c->b->failure;
+}
+
+static PyNsCallVerdict py_ns_check_function(PyNamespaceBuilder *b, PyNsFunction *fn) {
+    PyNsCallCheck c = {.b = b};
+    TSNode body = ts_node_child_by_field_name(fn->node, TS_FIELD("body"));
+    if (ts_node_is_null(body) || !py_ns_own_name(b->ctx->rel_path, &c.own, &c.package) ||
+        !py_ns_collect_params(&c, fn->node) || !py_ns_collect_defs(&c, fn->fact) ||
+        !py_ns_check_body(&c, body))
+        return PY_NS_CALL_EFFECT;
+    if (!c.package)
+        c.shadow_count = 0; /* a plain module's imports install nothing in it */
+    fn->shadows = c.shadows;
+    fn->shadow_count = c.shadow_count;
+    return PY_NS_CALL_ALLOWED;
+}
+
+static void py_ns_note_function(PyNamespaceBuilder *b, int fact, TSNode node) {
+    if (b->function_count == b->function_cap) {
+        int cap = b->function_cap ? b->function_cap * 2 : 16;
+        PyNsFunction *items = py_ns_scratch_alloc(b, (size_t)cap * sizeof(*items));
+        if (!items)
+            return;
+        if (b->function_count)
+            memcpy(items, b->functions, (size_t)b->function_count * sizeof(*items));
+        b->functions = items;
+        b->function_cap = cap;
+    }
+    b->functions[b->function_count++] = (PyNsFunction){.fact = fact, .node = node};
+}
+
+enum { PY_NS_UNBOUND = -1, PY_NS_BARRIER = -2 };
+
+/* The index of the latest fact binding `name`: PY_NS_UNBOUND when none did,
+ * PY_NS_BARRIER when a star import or an unknown effect may have since. */
+static int py_ns_latest_binding(const PyNamespaceBuilder *b, const char *name, size_t len) {
+    for (int i = b->facts.count - 1; i >= 0; i--) {
+        const CBMPyNamespaceFact *f = &b->facts.items[i];
+        if (f->kind == CBM_PY_NS_UNKNOWN || f->kind == CBM_PY_NS_IMPORT_STAR)
+            return PY_NS_BARRIER;
+        if (f->local_name && py_ns_slice_cmp(f->local_name, name, len) == 0)
+            return i;
+    }
+    return PY_NS_UNBOUND;
+}
+
+/* Safe expressions, or a bare `locals()` / `globals()` of the builtins (the
+ * body never names the parameter that receives it). */
+static bool py_ns_call_arguments_safe(PyNamespaceBuilder *b, TSNode args) {
+    if (ts_node_is_null(args) || strcmp(ts_node_type(args), "argument_list") != 0)
+        return false;
+    uint32_t count = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (py_ns_safe_expr(b, arg, 0))
+            continue;
+        if (strcmp(ts_node_type(arg), "call") != 0)
+            return false;
+        TSNode fn = ts_node_child_by_field_name(arg, TS_FIELD("function"));
+        TSNode inner = ts_node_child_by_field_name(arg, TS_FIELD("arguments"));
+        const char *text = NULL;
+        size_t len = 0;
+        if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0 ||
+            !py_ns_slice(b, fn, &text, &len) ||
+            !(py_ns_text_is(text, len, "locals") || py_ns_text_is(text, len, "globals")) ||
+            ts_node_is_null(inner) || ts_node_named_child_count(inner) != 0 ||
+            py_ns_latest_binding(b, text, len) != PY_NS_UNBOUND)
+            return false;
+    }
+    return true;
+}
+
+/* True when the top-level call `call` cannot rebind a name of this module's
+ * namespace; the submodules its callee imports into the package are then
+ * shadowed here. False when it stays a whole-namespace effect. */
+static bool py_ns_allowed_call(PyNamespaceBuilder *b, TSNode call) {
+    TSNode callee = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    const char *name = NULL;
+    size_t len = 0;
+    if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "identifier") != 0 ||
+        !py_ns_slice(b, callee, &name, &len) ||
+        !py_ns_call_arguments_safe(b, ts_node_child_by_field_name(call, TS_FIELD("arguments"))))
+        return false;
+    int at = py_ns_latest_binding(b, name, len);
+    if (at < 0 || b->facts.items[at].kind != CBM_PY_NS_OWN_DEF ||
+        b->facts.items[at].def_kind != CBM_PY_NS_DEF_FUNCTION)
+        return false;
+    int lo = 0, hi = b->function_count - 1;
+    PyNsFunction *fn = NULL;
+    while (lo <= hi && !fn) {
+        int mid = lo + (hi - lo) / 2;
+        if (b->functions[mid].fact == at)
+            fn = &b->functions[mid];
+        else if (b->functions[mid].fact < at)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    if (!fn)
+        return false;
+    if (fn->verdict == PY_NS_CALL_UNCHECKED)
+        fn->verdict = py_ns_check_function(b, fn);
+    if (fn->verdict != PY_NS_CALL_ALLOWED || b->failure)
+        return false;
+    for (int i = 0; i < fn->shadow_count; i++) {
+        if (!py_ns_push(b, (CBMPyNamespaceFact){.kind = CBM_PY_NS_SHADOW,
+                                                .local_name = fn->shadows[i],
+                                                .reason = CBM_PY_NS_REASON_VALUE}))
+            return false;
+    }
+    return true;
+}
+
+static bool py_ns_statement(PyNamespaceBuilder *b, TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "comment") == 0 || strcmp(kind, "pass_statement") == 0)
+        return true;
+    if (strcmp(kind, "import_statement") == 0)
+        return py_ns_import(b, node, false);
+    if (strcmp(kind, "import_from_statement") == 0)
+        return py_ns_import(b, node, true);
+    if (strcmp(kind, "future_import_statement") == 0)
+        return py_ns_future_import(b, node);
+    bool decorated = strcmp(kind, "decorated_definition") == 0;
+    TSNode def = decorated ? ts_node_child_by_field_name(node, TS_FIELD("definition")) : node;
+    if (!ts_node_is_null(def)) {
+        const char *dk = ts_node_type(def);
+        bool function = strcmp(dk, "function_definition") == 0;
+        bool class_def = strcmp(dk, "class_definition") == 0;
+        if (function || class_def) {
+            const char *name =
+                py_ns_name(b, ts_node_child_by_field_name(def, TS_FIELD("name")), false);
+            if (!name)
+                return false;
+            bool proven = !decorated && (function || py_ns_class_safe(b, def));
+            if (!proven || (function && !py_ns_signature_safe(b, def))) {
+                if (!py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT))
+                    return false;
+            }
+            if (!py_ns_push(
+                    b, proven ? (CBMPyNamespaceFact){.kind = CBM_PY_NS_OWN_DEF,
+                                                     .local_name = name,
+                                                     .def_kind = function ? CBM_PY_NS_DEF_FUNCTION
+                                                                          : CBM_PY_NS_DEF_CLASS}
+                              : (CBMPyNamespaceFact){
+                                    .kind = CBM_PY_NS_SHADOW,
+                                    .local_name = name,
+                                    .reason = decorated ? CBM_PY_NS_REASON_DECORATED
+                                                        : CBM_PY_NS_REASON_UNPROVEN_CLASS}))
+                return false;
+            if (proven && function)
+                py_ns_note_function(b, b->facts.count - 1, def);
+            return !b->failure;
+        }
+    }
+    if (strcmp(kind, "delete_statement") == 0)
+        return py_ns_delete(b, node, 0);
+    if (strcmp(kind, "expression_statement") == 0 && ts_node_named_child_count(node) == 1) {
+        TSNode expr = ts_node_named_child(node, 0);
+        const char *ek = ts_node_type(expr);
+        if (strcmp(ek, "assignment") == 0 || strcmp(ek, "augmented_assignment") == 0)
+            return py_ns_assignment(b, expr);
+        if (py_ns_safe_expr(b, expr, 0) || (strcmp(ek, "call") == 0 && py_ns_allowed_call(b, expr)))
+            return true;
+        return py_ns_unknown(b, CBM_PY_NS_REASON_EFFECT);
+    }
+    if (strcmp(kind, "if_statement") == 0 && py_ns_is_type_checking_if(b, node))
+        return py_ns_type_checking_block(b, node);
+    if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "try_statement") == 0 ||
+        strcmp(kind, "for_statement") == 0 || strcmp(kind, "while_statement") == 0 ||
+        strcmp(kind, "with_statement") == 0 || strcmp(kind, "match_statement") == 0)
+        return py_ns_unknown(b, CBM_PY_NS_REASON_COMPOUND);
+    return false;
+}
+
+CBMPyNamespaceStatus cbm_extract_python_namespace_facts(CBMExtractCtx *ctx) {
+    if (!ctx || !ctx->result)
+        return CBM_PY_NS_INCOMPLETE;
+    PyNamespaceBuilder b = {.ctx = ctx,
+                            .facts = {.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                      .language = ctx->language,
+                                      .status = CBM_PY_NS_COMPLETE}};
+    if (ctx->language != CBM_LANG_PYTHON) {
+        b.facts.status = CBM_PY_NS_NOT_APPLICABLE;
+    } else if (!ctx->arena || !ctx->source || ctx->source_len < 0) {
+        b.failure = CBM_PY_NS_FAILURE_INVALID_INPUT;
+    } else if (ts_node_is_null(ctx->root) || ts_node_has_error(ctx->root)) {
+        py_ns_unknown(&b, CBM_PY_NS_REASON_PARSE);
+    } else {
+        TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode node = ts_tree_cursor_current_node(&cursor);
+                if (!ts_node_is_named(node))
+                    continue;
+                int start = b.facts.count;
+                if (!py_ns_statement(&b, node) && !b.failure) {
+                    b.facts.count = start;
+                    py_ns_unknown(&b, CBM_PY_NS_REASON_UNSUPPORTED);
+                }
+                if (b.failure)
+                    break;
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+    }
+    if (!b.failure && !cbm_py_namespace_facts_valid(&b.facts))
+        b.failure = CBM_PY_NS_FAILURE_INVALID_INPUT;
+    if (b.failure) {
+        b.facts = (CBMPyNamespaceFacts){.version = CBM_PY_NAMESPACE_FACTS_VERSION,
+                                        .language = ctx->language,
+                                        .status = CBM_PY_NS_INCOMPLETE,
+                                        .failure = b.failure};
+    }
+    ctx->result->py_namespace = b.facts;
+    return b.facts.status;
 }
 
 // --- ES module imports (JS/TS/TSX) ---
@@ -361,9 +1668,12 @@ static bool process_named_imports(CBMExtractCtx *ctx, TSNode sub, const char *pa
             orig = ts_node_child(imp_spec, 0);
         }
         if (!ts_node_is_null(orig)) {
-            char *local_name = !ts_node_is_null(local) ? cbm_node_text(a, local, ctx->source)
-                                                       : cbm_node_text(a, orig, ctx->source);
-            CBMImport imp = {.local_name = local_name, .module_path = path};
+            char *member = cbm_node_text(a, orig, ctx->source);
+            char *local_name =
+                !ts_node_is_null(local) ? cbm_node_text(a, local, ctx->source) : member;
+            /* The member the local binds survives an alias: a call through
+             * `navigate` from `{ get as navigate }` is the module's `get`. */
+            CBMImport imp = {.local_name = local_name, .module_path = path, .member = member};
             cbm_imports_push(&ctx->result->imports, a, imp);
             found = true;
         }
@@ -381,7 +1691,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
         const char *sk = ts_node_type(sub);
         if (strcmp(sk, "identifier") == 0) {
             char *name = cbm_node_text(a, sub, ctx->source);
-            CBMImport imp = {.local_name = name, .module_path = path};
+            CBMImport imp = {.local_name = name, .module_path = path, .is_default = true};
             cbm_imports_push(&ctx->result->imports, a, imp);
             found = true;
         } else if (strcmp(sk, "namespace_import") == 0) {
@@ -650,10 +1960,22 @@ static char *strip_angle_brackets(CBMArena *a, char *path) {
     return path;
 }
 
-static void parse_c_imports(CBMExtractCtx *ctx) {
+/* Node kinds that only group file-level items: the branches of `#if` /
+ * `#ifdef` (an include guard is one) and the body of `extern "C" { ... }`. */
+static bool is_c_include_container(const char *kind) {
+    return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_ifdef") == 0 ||
+           strcmp(kind, "preproc_else") == 0 || strcmp(kind, "preproc_elif") == 0 ||
+           strcmp(kind, "preproc_elifdef") == 0 || strcmp(kind, "linkage_specification") == 0 ||
+           strcmp(kind, "declaration_list") == 0;
+}
+
+/* Collect the includes among `parent`'s children, descending into
+ * preprocessor branches: every header keeps its includes inside its include
+ * guard, so the top level alone gave a guarded header no imports at all. */
+static void parse_c_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
     CBMArena *a = ctx->arena;
 
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSTreeCursor cursor = ts_tree_cursor_new(parent);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
         return;
@@ -662,6 +1984,9 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
         if (strcmp(kind, "preproc_include") != 0 && strcmp(kind, "preproc_import") != 0) {
+            if (depth < C_INCLUDE_NEST_LIMIT && is_c_include_container(kind)) {
+                parse_c_imports_in(ctx, node, depth + SKIP_ONE);
+            }
             continue;
         }
 
@@ -680,6 +2005,10 @@ static void parse_c_imports(CBMExtractCtx *ctx) {
         cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+static void parse_c_imports(CBMExtractCtx *ctx) {
+    parse_c_imports_in(ctx, ctx->root, 0);
 }
 
 // --- Ruby imports ---
@@ -1192,7 +2521,29 @@ static void parse_wolfram_imports(CBMExtractCtx *ctx) {
 // require/include forms remain `expression_statement`s and are still handled by
 // the text fallback.  Take the first qualified_name/name descendant of each
 // clause as the module path.
-static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix) {
+// `use function` / `use const` carry the keyword as an anonymous direct child
+// of the declaration (flat form) or of the clause (grouped form
+// `use A\{function f, const C, K}`). DEFAULT when neither is present.
+static CBMImportKind php_use_kind(TSNode node) {
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (ts_node_is_named(c)) {
+            continue;
+        }
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "function") == 0) {
+            return CBM_IMPORT_KIND_FUNCTION;
+        }
+        if (strcmp(k, "const") == 0) {
+            return CBM_IMPORT_KIND_CONST;
+        }
+    }
+    return CBM_IMPORT_KIND_DEFAULT;
+}
+
+static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *group_prefix,
+                                CBMImportKind decl_kind) {
     CBMArena *a = ctx->arena;
     // The path node is the qualified_name / namespace_name / name child.
     TSNode path_node = clause;
@@ -1217,12 +2568,14 @@ static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *g
     TSNode alias = ts_node_child_by_field_name(clause, TS_FIELD("alias"));
     const char *local =
         !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
-    CBMImport imp = {.local_name = local, .module_path = path};
+    CBMImportKind kind = decl_kind != CBM_IMPORT_KIND_DEFAULT ? decl_kind : php_use_kind(clause);
+    CBMImport imp = {.local_name = local, .module_path = path, .kind = kind};
     cbm_imports_push(&ctx->result->imports, a, imp);
 }
 
 static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     CBMArena *a = ctx->arena;
+    const CBMImportKind decl_kind = php_use_kind(decl);
     // Grouped form: namespace_use_group with a leading prefix qualified_name.
     TSNode group = decl;
     if (find_first_descendant_of(decl, "namespace_use_group", &group)) {
@@ -1244,7 +2597,7 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
             const char *ck = ts_node_type(clause);
             if (strcmp(ck, "namespace_use_group_clause") == 0 ||
                 strcmp(ck, "namespace_use_clause") == 0) {
-                emit_php_use_clause(ctx, clause, prefix);
+                emit_php_use_clause(ctx, clause, prefix, decl_kind);
             }
         }
         return;
@@ -1255,13 +2608,13 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     for (uint32_t i = 0; i < dc; i++) {
         TSNode clause = ts_node_named_child(decl, i);
         if (strcmp(ts_node_type(clause), "namespace_use_clause") == 0) {
-            emit_php_use_clause(ctx, clause, NULL);
+            emit_php_use_clause(ctx, clause, NULL, decl_kind);
             any = true;
         }
     }
     if (!any) {
         // Some grammar versions inline the path directly under the declaration.
-        emit_php_use_clause(ctx, decl, NULL);
+        emit_php_use_clause(ctx, decl, NULL, decl_kind);
     }
 }
 
@@ -2129,10 +3482,13 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
     }
 }
 
-// --- Zsh imports ---
+// --- Bash / Zsh imports ---
 // source file / . file — `command` nodes whose command_name is "source" or ".".
-// The argument field carries the sourced path.
-static void parse_zsh_imports(CBMExtractCtx *ctx) {
+// The argument field carries the sourced path. Every other command is a call,
+// not an import: read as an import, `set -e` imported "set", which the import
+// resolver then bound to whatever project symbol is named set (a TSX method),
+// and every `set` call in the script followed it.
+static void parse_shell_source_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_512);
@@ -2157,6 +3513,52 @@ static void parse_zsh_imports(CBMExtractCtx *ctx) {
             }
         }
         ts_nstack_push_children(&stack, node);
+    }
+}
+
+// --- Make imports: include / -include / sinclude FILE... ---
+// Every name of an include directive -- outside recipes, conditionals
+// included -- imports that file; its local name is the file's base name. A
+// name holding a variable reference is known only to make and stays out.
+// (The generic text fallback kept the directive's trailing newlines in the
+// path and split it at the extension's dot.)
+static void push_make_include(CBMExtractCtx *ctx, TSNode word) {
+    CBMArena *a = ctx->arena;
+    char *path = cbm_node_text(a, word, ctx->source);
+    if (!path || !path[0] || strchr(path, '$')) {
+        return;
+    }
+    const char *slash = strrchr(path, '/');
+    CBMImport imp = {.local_name = slash ? slash + SKIP_ONE : path, .module_path = path};
+    cbm_imports_push(&ctx->result->imports, a, imp);
+}
+
+static void parse_make_imports(CBMExtractCtx *ctx) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        const char *k = ts_node_type(node);
+        if (strcmp(k, "recipe") == 0) {
+            continue;
+        }
+        if (strcmp(k, "include_directive") != 0) {
+            ts_nstack_push_children(&stack, node);
+            continue;
+        }
+        TSNode names = ts_node_child_by_field_name(node, TS_FIELD("filenames"));
+        if (ts_node_is_null(names)) {
+            continue;
+        }
+        uint32_t n = ts_node_named_child_count(names);
+        if (strcmp(ts_node_type(names), "list") != 0 || n == 0) {
+            push_make_include(ctx, names);
+            continue;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            push_make_include(ctx, ts_node_named_child(names, i));
+        }
     }
 }
 
@@ -2991,8 +4393,10 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_generic_imports(ctx, "call");
         break;
     case CBM_LANG_BASH:
-        // source/. commands
-        parse_generic_imports(ctx, "command");
+        parse_shell_source_imports(ctx);
+        break;
+    case CBM_LANG_MAKEFILE:
+        parse_make_imports(ctx);
         break;
     case CBM_LANG_ZIG:
         parse_zig_imports(ctx);
@@ -3062,7 +4466,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_teal_imports(ctx);
         break;
     case CBM_LANG_ZSH:
-        parse_zsh_imports(ctx);
+        parse_shell_source_imports(ctx);
         break;
     case CBM_LANG_CMAKE:
         parse_cmake_imports(ctx);

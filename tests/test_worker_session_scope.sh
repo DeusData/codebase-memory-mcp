@@ -70,8 +70,15 @@ run_worker() {
     --response-out "${response}" >"${out}" 2>"${err}"
 }
 
+# A worker never reads the resource policy from config or environment: the
+# supervisor resolves it and sends it inside the request, and a request
+# without one is refused ("missing or incomplete trusted worker policy").
+# This script plays the supervisor, so it sends what the supervisor sends --
+# both limits off, the default.
+policy='"_cbm_index_policy":{"index_max_files":"off","index_max_source_mb":"off"}'
+
 response="${tmpdir}/scoped.response"
-if ! run_worker "{\"repo_path\":\"${repo}\",\"mode\":\"fast\"}" "${response}" \
+if ! run_worker "{\"repo_path\":\"${repo}\",\"mode\":\"fast\",${policy}}" "${response}" \
   "${tmpdir}/scoped.out" "${tmpdir}/scoped.err"; then
   echo "worker exited nonzero for an admitted request" >&2
   cat "${tmpdir}/scoped.err" >&2
@@ -94,7 +101,7 @@ fi
 
 # Fail closed: no repo_path means no request scope, so no indexing at all.
 unscoped="${tmpdir}/unscoped.response"
-if run_worker '{"mode":"fast"}' "${unscoped}" "${tmpdir}/unscoped.out" "${tmpdir}/unscoped.err"; then
+if run_worker "{\"mode\":\"fast\",${policy}}" "${unscoped}" "${tmpdir}/unscoped.out" "${tmpdir}/unscoped.err"; then
   echo "worker ran without a request workspace scope" >&2
   exit 1
 fi

@@ -45,7 +45,11 @@ void cbm_activation_transaction_set_before_absent_publish_for_test(
 void cbm_activation_transaction_rename_failures_set_for_test(unsigned int count);
 
 /* Stage a candidate beside target_path (therefore on the same filesystem).
- * The staged file is private to the current account and executable. */
+ * The staged file is private to the current account and executable.
+ * On POSIX, an IO result leaves errno at the error of the failing system call
+ * (0 when none applies, e.g. a short read), through the stage cleanup, so a
+ * caller can name it: a full disk reads "No space left on device". The same
+ * holds for stage_file below. */
 cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
     const char *target_path, const void *candidate, size_t candidate_size,
     cbm_activation_transaction_t **transaction_out);
@@ -100,6 +104,7 @@ const char *cbm_activation_transaction_refusal_note(void);
 #ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
                                                          unsigned long os_error);
+void cbm_activation_transaction_write_failures_set_for_testing(unsigned int count, int os_error);
 #endif
 
 #endif /* CBM_ACTIVATION_TRANSACTION_H */

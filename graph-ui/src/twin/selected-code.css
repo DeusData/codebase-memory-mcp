@@ -1,0 +1,82 @@
+.selected-code {
+    min-width: 0;
+    color: var(--text, #d7e5de);
+    background: rgba(11, 22, 18, .94);
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.selected-code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 11px 14px 7px;
+}
+
+.selected-code h2,
+.selected-code h3 { margin: 0; font-size: 12px; font-weight: 600; }
+.selected-code h2 { color: #d7e5de; letter-spacing: .03em; }
+.selected-code button { font: inherit; cursor: pointer; }
+.selected-code button:disabled { opacity: .45; cursor: default; }
+.selected-code button:focus-visible,
+.selected-code summary:focus-visible { outline: 2px solid #61dcc4; outline-offset: 3px; }
+
+.selected-code-pin {
+    padding: 3px 9px;
+    border: 1px solid #294d3d;
+    border-radius: 6px;
+    color: #97b7a8;
+    background: transparent;
+}
+.selected-code-pin[aria-pressed="true"] { color: #39ffad; border-color: #21815b; background: #112d22; }
+.selected-code-identity { padding: 0 14px 9px; }
+.selected-code-symbol { display: flex; align-items: baseline; gap: 10px; }
+.selected-code-symbol strong { font-size: 15px; color: #e3efe8; }
+.selected-code-symbol > span,
+.selected-code-path { color: #8da99b; font-size: 11px; }
+.selected-code-path { font-family: var(--mono, ui-monospace, monospace); }
+.selected-code-signature { display: block; margin-top: 6px; color: #c0dacd; white-space: pre-wrap; }
+.selected-code-actions { display: flex; gap: 7px; flex-wrap: wrap; padding: 0 14px 12px; }
+.selected-code-actions button,
+.selected-code-flow {
+    border: 1px solid #2a5140;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #b9d1c5;
+    background: #11221b;
+}
+.selected-code-actions .selected-code-ask { color: #3affa9; border-color: #27764e; background: #102b1f; }
+.selected-code-actions button:hover,
+.selected-code-flow:hover { background: #17372a; }
+.selected-code-message { margin: 0; padding: 8px 14px 14px; color: #aac2b5; }
+.selected-code-note { margin: 6px 0; color: #89a798; font-size: 11px; }
+.selected-code-selection { margin: 0 14px 10px; padding: 7px 9px; border: 1px solid #275342; border-radius: 7px; background: #10251c; }
+.selected-code-selection summary { cursor: pointer; color: #afddc8; }
+.selected-code-selection summary span { color: #829e90; font-size: 10px; }
+.selected-code-selection pre { margin: 8px 0; max-height: 150px; overflow: auto; white-space: pre; color: #ddede2; font-size: 11px; }
+.selected-code-file { padding: 2px 14px 12px; }
+.selected-code-file h3 { margin-bottom: 5px; color: #94b1a1; }
+.selected-code-file ul { margin: 0; padding: 0; list-style: none; max-height: 168px; overflow: auto; }
+.selected-code-file li button { display: flex; justify-content: space-between; gap: 12px; width: 100%; text-align: left; border: 0; border-radius: 4px; padding: 5px 6px; color: #c5d8cb; background: transparent; }
+.selected-code-file li button:hover { background: #142b20; }
+.selected-code-file li button span:last-child { color: #789887; font-size: 10px; flex-shrink: 0; }
+.selected-code-fact { border-top: 1px solid #233c30; }
+.selected-code-fact > summary { padding: 9px 14px; cursor: pointer; color: #afc9ba; }
+.selected-code-fact > summary:hover { background: #10271b; }
+.selected-code-fact[open] > summary { color: #d3e8d9; }
+.selected-code-count { float: right; color: #709a81; font-size: 10px; margin-left: 8px; }
+.selected-code-fact > .selected-code-note { padding: 0 14px 8px; }
+.selected-code-fact > .selected-code-flow { margin: 0 14px 10px; }
+.selected-code-fact .atlas-twin-section { padding: 0 14px 12px; margin: 0; border: 0; }
+.selected-code-fact .atlas-twin-block-label,
+.selected-code-fact .atlas-twin-section-title { display: none; }
+.selected-code-fact .atlas-twin-section-head { min-height: 0; margin-bottom: 5px; }
+.selected-code-fact .atlas-twin-section-empty,
+.selected-code-fact .atlas-twin-section-note,
+.selected-code-fact .atlas-twin-section-text { font-size: 11px; }
+.selected-code-fact .atlas-twin-row,
+.selected-code-fact .atlas-twin-row-chip { font-size: 11px; }
+.selected-code-fact .atlas-pseudocode { padding: 0 14px 14px; }
+.selected-code-coverage { padding: 7px 14px 10px; border-top: 1px solid #233c30; margin: 0; }

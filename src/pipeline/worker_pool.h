@@ -11,6 +11,13 @@
 #define CBM_WORKER_POOL_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include "foundation/constants.h" /* CBM_SZ_1K */
+
+/* 8 MB stack per worker — matches main thread default. Required for deep AST
+ * recursion (tree-sitter + walk_defs). Shared here so a test can run an
+ * extraction on a thread of exactly the size the pipeline gives it. */
+#define CBM_WORKER_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
 
 /* Worker callback: called once per iteration with index [0..count-1]. */
 typedef void (*cbm_parallel_fn)(int idx, void *ctx);

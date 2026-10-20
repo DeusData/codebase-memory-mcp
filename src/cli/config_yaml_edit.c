@@ -2698,8 +2698,28 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
     return quote != '\0' ? YAML_MATCH : 0;
 }
 
-static int yaml_sequence_validate_document(const yaml_doc_t *doc) {
-    for (size_t i = 0U; i < doc->line_count; i++) {
+/* Validates only the top-level section the edit descends into. The root
+ * mapping itself was already validated when the document was parsed, so the
+ * section boundaries are sound; every OTHER top-level section is opaque user
+ * content, the same contract the mapping-entry editor applies. Validating the
+ * whole document refused the stock Hermes config for flow sequences such as
+ * `cli: [hermes-cli]` under `platform_toolsets:`, which the hook edit never
+ * reads or rewrites (#2209). An absent root key means the sequence is appended
+ * as a new top-level section, which touches no existing line. */
+static int yaml_sequence_validate_document(const yaml_doc_t *doc, const char *root_key,
+                                           size_t root_key_len) {
+    bool found = false;
+    size_t section_line = 0U;
+    size_t section_colon = 0U;
+    if (yaml_find_unique_key(doc, 0U, root_key, root_key_len, &found, &section_line,
+                             &section_colon) != 0) {
+        return YAML_ERROR;
+    }
+    if (!found) {
+        return 0;
+    }
+    size_t section_end = yaml_top_level_section_end(doc, section_line);
+    for (size_t i = section_line; i < section_end; i++) {
         const yaml_line_t *line = &doc->lines[i];
         if (line->blank || line->comment || line->dquote_cont) {
             continue;
@@ -2947,7 +2967,7 @@ static int yaml_sequence_analyze(const yaml_doc_t *doc, const char *const *seque
                                  const char *identity_key, const char *identity_value,
                                  yaml_mapping_sequence_target_t *target) {
     memset(target, 0, sizeof(*target));
-    if (yaml_sequence_validate_document(doc) != 0) {
+    if (yaml_sequence_validate_document(doc, sequence_path[0], path_lengths[0]) != 0) {
         return YAML_ERROR;
     }
     size_t parent_begin = 0U;

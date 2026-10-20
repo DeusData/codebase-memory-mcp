@@ -1,0 +1,140 @@
+================================================================================
+JSX attribute: lone ampersand in a double-quoted string (#1736)
+================================================================================
+
+<link href="https://x.com/a?a=1&b=2" />;
+
+--------------------------------------------------------------------------------
+
+(program
+  (expression_statement
+    (jsx_self_closing_element
+      (identifier)
+      (jsx_attribute
+        (property_identifier)
+        (string
+          (string_fragment)
+          (string_fragment)
+          (string_fragment))))))
+
+================================================================================
+JSX attribute: lone ampersand in a single-quoted string (#1736)
+================================================================================
+
+<link href='https://x.com/a?a=1&b=2' />;
+
+--------------------------------------------------------------------------------
+
+(program
+  (expression_statement
+    (jsx_self_closing_element
+      (identifier)
+      (jsx_attribute
+        (property_identifier)
+        (string
+          (string_fragment)
+          (string_fragment)
+          (string_fragment))))))
+
+================================================================================
+JSX attribute: ampersand before the closing quote (#1736)
+================================================================================
+
+<p title="a&" alt='b&' />;
+
+--------------------------------------------------------------------------------
+
+(program
+  (expression_statement
+    (jsx_self_closing_element
+      (identifier)
+      (jsx_attribute
+        (property_identifier)
+        (string
+          (string_fragment)
+          (string_fragment)))
+      (jsx_attribute
+        (property_identifier)
+        (string
+          (string_fragment)
+          (string_fragment))))))
+
+================================================================================
+JSX text: lone ampersand (#1736)
+================================================================================
+
+<p>Tom &Jerry, Tom & Jerry, x &1 y, a&</p>;
+
+--------------------------------------------------------------------------------
+
+(program
+  (expression_statement
+    (jsx_element
+      (jsx_opening_element
+        (identifier))
+      (jsx_text)
+      (jsx_text)
+      (jsx_text)
+      (jsx_text)
+      (jsx_text)
+      (jsx_text)
+      (jsx_text)
+      (jsx_text)
+      (jsx_closing_element
+        (identifier)))))
+
+================================================================================
+JSX: character references still parse as references
+================================================================================
+
+<p title="x&amp;y&#38;z">A&amp;B &#38; C &#x26;</p>;
+
+--------------------------------------------------------------------------------
+
+(program
+  (expression_statement
+    (jsx_element
+      (jsx_opening_element
+        (identifier)
+        (jsx_attribute
+          (property_identifier)
+          (string
+            (string_fragment)
+            (html_character_reference)
+            (string_fragment)
+            (html_character_reference)
+            (string_fragment))))
+      (jsx_text)
+      (html_character_reference)
+      (jsx_text)
+      (html_character_reference)
+      (jsx_text)
+      (html_character_reference)
+      (jsx_closing_element
+        (identifier)))))
+
+================================================================================
+JSX: bitwise and logical and in expressions are unaffected
+================================================================================
+
+<b title={a & b}>{a && b}</b>;
+
+--------------------------------------------------------------------------------
+
+(program
+  (expression_statement
+    (jsx_element
+      (jsx_opening_element
+        (identifier)
+        (jsx_attribute
+          (property_identifier)
+          (jsx_expression
+            (binary_expression
+              (identifier)
+              (identifier)))))
+      (jsx_expression
+        (binary_expression
+          (identifier)
+          (identifier)))
+      (jsx_closing_element
+        (identifier)))))
