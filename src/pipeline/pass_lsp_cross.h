@@ -144,13 +144,14 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
  * per-file registry build entirely. NULL → fall back to the per-file
  * cbm_pxc_run_one path. */
 typedef struct {
-    CBMTypeRegistry *go;     /* CBM_LANG_GO */
-    CBMTypeRegistry *c;      /* CBM_LANG_C, CBM_LANG_CPP, CBM_LANG_CUDA */
-    CBMTypeRegistry *python; /* CBM_LANG_PYTHON */
-    CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
-    CBMTypeRegistry *php;    /* CBM_LANG_PHP */
-    CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
-    CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
+    CBMTypeRegistry *go;        /* CBM_LANG_GO */
+    CBMTypeRegistry *c;         /* CBM_LANG_C, CBM_LANG_CPP, CBM_LANG_CUDA */
+    CBMTypeRegistry *python;    /* CBM_LANG_PYTHON */
+    CBMTypeRegistry *ts;        /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
+    CBMTypeRegistry *php;       /* CBM_LANG_PHP */
+    CBMTypeRegistry *cs;        /* CBM_LANG_CSHARP */
+    CBMTypeRegistry *java;      /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
+    CBMRubyCrossRegistry *ruby; /* CBM_LANG_RUBY: method registry + hashed class table */
     /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
      * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
@@ -189,6 +190,8 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
         return r->cs;
     case CBM_LANG_JAVA:
         return r->java;
+    case CBM_LANG_RUBY:
+        return r->ruby ? &r->ruby->reg : NULL;
     default:
         return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
     }

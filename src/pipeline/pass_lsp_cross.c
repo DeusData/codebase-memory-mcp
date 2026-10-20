@@ -2339,6 +2339,15 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                                                imp_vals, imp_count, result->cached_tree, &out);
             used_prebuilt = true;
             break;
+        case CBM_LANG_RUBY:
+            /* The shared registry is sealed and read-only: methods and the
+             * hashed class table are looked up in it, nothing is built per
+             * file, so no per-file work scales with the project. */
+            cbm_run_ruby_lsp_cross_with_registry(&scratch, source, source_len, def_module,
+                                                 cross_registries->ruby, imp_keys, imp_vals,
+                                                 imp_count, result->cached_tree, &out);
+            used_prebuilt = true;
+            break;
         case CBM_LANG_JAVA:
             /* Java builds its own-module overlay on top of the one it is
              * handed; both live in scratch now. */
@@ -2602,6 +2611,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.ruby = cbm_ruby_build_cross_registry(xa, all_defs, def_count);
     }
 
     int processed = 0;

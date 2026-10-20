@@ -34,7 +34,17 @@ typedef struct {
     const char *superclass_ref; /* raw dotted superclass spelling, or NULL */
     const char *superclass_qn;  /* resolved QN (table/stdlib), or NULL */
     bool is_module;             /* `module` (mixin source) vs `class` */
+    /* Shared (project-wide) table only. A class reopened in another file has
+     * a different QN there (the QN carries the file's module QN) but the same
+     * constant path; the entries for one path form a group so a method defined
+     * in any reopening is found. `group_head` is the first entry of the group,
+     * `shard_next` the next one; both are table index + 1, 0 = none. Entries
+     * of a per-file table leave both 0. */
+    int group_head;
+    int shard_next;
 } RubyClassInfo;
+
+struct CBMRubyCrossRegistry;
 
 /* One `include`/`prepend`/`extend` record: owner class QN → module ref. */
 typedef struct {
@@ -85,7 +95,12 @@ typedef struct {
      * [A::B] only, so A's constants are NOT probed. */
     const char *nesting;
 
-    /* Class/module table (pass 1). */
+    /* Project-wide read-only class table + method registry (cross-file
+     * resolution). NULL for per-file extraction. Consulted after this file's
+     * own table, so a class declared here always wins. */
+    const struct CBMRubyCrossRegistry *shared;
+
+    /* Class/module table (pass 1) — this file's own declarations only. */
     RubyClassInfo *classes;
     int class_count;
     int class_cap;
@@ -168,12 +183,43 @@ void cbm_ruby_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 
 /* --- Cross-file LSP resolution ---
  *
- * Mirrors cbm_run_java_lsp_cross / cbm_run_kotlin_lsp_cross (fallback
- * cbm_pxc_run_one path — no prebuilt tier-2 registry yet). Caller supplies
- * the combined CBMLSPDef[] (file-local + cross-file) and the resolved
- * require/require_relative import map. Ruby constants live in one global
- * namespace, so the def registry is consulted by constant path rather than
- * by import binding; the import map only scopes candidate modules. */
+ * Ruby constants live in one global namespace and Rails/Zeitwerk autoloads
+ * them with no require, so a file may name any class in the project. The
+ * project's definitions are therefore indexed ONCE (cbm_ruby_build_cross_
+ * registry) into a sealed, read-only registry: a finalized method registry
+ * plus a hashed class table. Each file then resolves against it with O(1)
+ * lookups and builds nothing proportional to the project. */
+typedef struct CBMRubyCrossRegistry {
+    CBMTypeRegistry reg; /* stdlib + every project method; finalized, sealed */
+    RubyClassInfo *classes;
+    int class_count;
+    /* Open-addressing hash indexes over `classes` (values are index + 1, 0 =
+     * empty slot): by QN, and by dotted constant path (group head only). */
+    int *by_qn;
+    int *by_path;
+    unsigned slot_mask;
+} CBMRubyCrossRegistry;
+
+/* Build the shared registry from every project def. Strings are borrowed from
+ * `defs` (as the other languages' cross registries do) or copied into `arena`.
+ * Returns NULL on allocation failure; callers then fall back to the
+ * per-file path. */
+CBMRubyCrossRegistry *cbm_ruby_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
+                                                    int def_count);
+
+/* Resolve one file against a prebuilt shared registry. Reads `shared` only;
+ * everything it allocates lives in `arena`. */
+void cbm_run_ruby_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, const CBMRubyCrossRegistry *shared,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count,
+                                          TSTree *cached_tree, /* NULL = parse internally */
+                                          CBMResolvedCallArray *out);
+
+/* Convenience for callers with a def list but no prebuilt registry (the
+ * per-file fallback path and tests): builds a registry in a scratch arena for
+ * this one call. Cost is proportional to the def list, so the pipeline uses
+ * the prebuilt path instead. */
 void cbm_run_ruby_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
