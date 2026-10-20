@@ -1,0 +1,134 @@
+CODEATLAS
+v0.0.1
+dirty
+Explore
+Galaxy
+Architecture
+Agents
+System
+Daemon
+Chat
+Search
+⌘ / Ctrl K
+Tools
+Brief
+Explained
+sym 40226
+edg 173902
+Project
+cbm-pr2068
+⌄
+Project events · cbm-pr2068
+Last checked 10:14:16 PM
+History (1 retained)
+All daemon history
+Refresh events
+Inspect index coverage
+
+Index coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.
+
+Earlier events are in history; these records do not describe current frontend health.
+
+cbm-pr2068
+Architecture
+
+Understand the structure. Follow the evidence.
+
+Read by import order
+Refresh
+Overview
+Dependencies
+Entry points
+Routes
+Hotspots
+View saved on this device
+Reset view
+REPOSITORY MAP
+
+Start at an entry point, follow a component boundary, then inspect the symbols behind it.
+
+Evidence legend
+1,427 indexed files · 62,273 retained edges · snapshot and limits
+Repository
+Where to start
+
+Entry candidates identified by the index; these are declarations, not a verified execution order.
+
+Read project README
+App
+Function · graph-ui/src/App.tsx:750
+main
+Function · src/main.c:2546
+GalaxyPanel
+Function · graph-ui/src/galaxy/GalaxyPanel.tsx:729
+main
+Function · graph-ui/tools/smoke-w10.mjs:1187
+Connected areas
+
+Grouped by source location, ranked by recorded links across areas. Open an area to see its responsibilities through entry symbols, interfaces and connections.
+
+SOURCE AREA · INFERRED BOUNDARY
+tests
+174 files · 5 entry candidates · 9 exported symbols
+Incoming 54 ← · → Outgoing 11557
+main · main · main
+SOURCE AREA · INFERRED BOUNDARY
+internal/cbm
+248 files · 0 entry candidates · 2268 exported symbols
+Incoming 4553 ← · → Outgoing 1435
+cbm_free_result · cbm_node_text · cbm_arena_alloc
+SOURCE AREA · INFERRED BOUNDARY
+src/foundation
+65 files · 0 entry candidates · 574 exported symbols
+Incoming 4109 ← · → Outgoing 31
+cbm_mkdtemp · cbm_mutex_unlock · cbm_mutex_lock
+SOURCE AREA · INFERRED BOUNDARY
+src/daemon
+24 files · 0 entry candidates · 773 exported symbols
+Incoming 1382 ← · → Outgoing 570
+cbm_daemon_ipc_endpoint_free · cbm_daemon_ipc_endpoint_new · cbm_daemon_ipc_endpoint_runtime_dir
+SOURCE AREA · INFERRED BOUNDARY
+src/pipeline
+43 files · 0 entry candidates · 984 exported symbols
+Incoming 435 ← · → Outgoing 1442
+cbm_project_name_from_path · cbm_pipeline_fqn_compute · cbm_pipeline_fqn_module
+SOURCE AREA · INFERRED BOUNDARY
+src/store
+2 files · 0 entry candidates · 321 exported symbols
+Incoming 1308 ← · → Outgoing 99
+cbm_store_close · store_set_error_sqlite · bind_text
+SOURCE AREA · INFERRED BOUNDARY
+src/cli
+21 files · 0 entry candidates · 1036 exported symbols
+Incoming 1165 ← · → Outgoing 241
+cbm_install_agent_configs · stat · record_agent_config_error
+SOURCE AREA · INFERRED BOUNDARY
+src/semantic
+6 files · 0 entry candidates · 83 exported symbols
+Incoming 1137 ← · → Outgoing 36
+cbm_sem_normalize · cbm_ast_profile_from_str · cbm_ast_profile_to_vector
+SOURCE AREA · INFERRED BOUNDARY
+graph-ui
+610 files · 967 entry candidates · 2399 exported symbols
+Incoming 579 ← · → Outgoing 212
+normalize · sleep · weigh
+SOURCE AREA · INFERRED BOUNDARY
+src/mcp
+7 files · 0 entry candidates · 501 exported symbols
+Incoming 335 ← · → Outgoing 413
+cbm_mcp_handle_tool · cbm_mcp_server_new · cbm_mcp_server_free
+SOURCE AREA · INFERRED BOUNDARY
+src/graph_buffer
+2 files · 0 entry candidates · 76 exported symbols
+Incoming 611 ← · → Outgoing 101
+cbm_gbuf_upsert_node · cbm_gbuf_insert_edge · cbm_gbuf_free
+SOURCE AREA · INFERRED BOUNDARY
+src/ui
+22 files · 0 entry candidates · 312 exported symbols
+Incoming 218 ← · → Outgoing 352
+cbm_http_server_port · cbm_http_replyf · cbm_http_query_param
+All 25 areas
+Index summary, layers and communities
+About this view
+server ready
+Connection details

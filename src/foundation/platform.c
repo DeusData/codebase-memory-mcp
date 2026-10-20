@@ -370,7 +370,37 @@ static const char *platform_copy_environment_value(char *buf, size_t buf_sz, con
     return buf;
 }
 
+static cbm_environment_resolver_t environment_resolver;
+
+void cbm_set_environment_resolver(cbm_environment_resolver_t resolver) {
+    environment_resolver = resolver;
+}
+
+const char *cbm_runtime_getenv(const char *name) {
+    /* A small per-thread ring supports callers that inspect several inherited
+     * values together without exposing libc's mutable environment storage. */
+    static CBM_TLS char inherited[4][CBM_SZ_4K];
+    static CBM_TLS unsigned slot;
+    const char *value = NULL;
+    if (environment_resolver && environment_resolver(name, &value)) {
+        return value;
+    }
+    char *buffer = inherited[slot++ % 4U];
+    return cbm_native_getenv(name, buffer, CBM_SZ_4K, NULL);
+}
+
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    const char *value = NULL;
+    if (environment_resolver && environment_resolver(name, &value)) {
+        if (buf && buf_sz) {
+            buf[0] = '\0';
+        }
+        return platform_copy_environment_value(buf, buf_sz, value ? value : fallback);
+    }
+    return cbm_native_getenv(name, buf, buf_sz, fallback);
+}
+
+const char *cbm_native_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
     if (!name || !name[0] || !buf || buf_sz == 0) {
         return NULL;
     }

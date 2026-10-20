@@ -507,16 +507,38 @@ TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610) {
 }
 
 /* GUARD: a MISSING/ERROR node WITH WIDTH at EOF is a genuine loss and must
- * still be flagged. A Makefile whose final recipe line lacks its newline really
- * does drop the recipe from the tree — cbm's flag is honest there. */
+ * still be flagged. The construct here is broken whether or not the line is
+ * terminated, so neither the zero-width rule nor the virtual final newline
+ * (#2078) may excuse it.
+ *
+ * This guard used a Makefile whose final recipe line lacks its newline, which
+ * really did drop the recipe from the tree. Since #2078 the parser sees that
+ * line terminated and the recipe parses, so there is no loss left to report --
+ * see makefile_unterminated_recipe_is_parsed_issue2078. */
 TEST(width_bearing_error_at_eof_still_flagged_issue1610) {
-    const char *src = "all:\n\techo hi"; /* no trailing newline; recipe is lost */
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1,"; /* unclosed at EOF */
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
     if (!flagged) {
         FAIL("a width-bearing parse failure at EOF must still be reported");
+    }
+    PASS();
+}
+
+/* #2078: the recipe the old #1610 guard lost is now parsed -- the file is not
+ * flagged, with or without a trailing blank. */
+TEST(makefile_unterminated_recipe_is_parsed_issue2078) {
+    const char *cases[] = {"all:\n\techo hi", "all:\n\techo hi "};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MAKEFILE, "Makefile");
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("an unterminated final recipe line must parse like a terminated one");
+        }
     }
     PASS();
 }
@@ -611,11 +633,12 @@ TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746) {
     PASS();
 }
 
-/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too — the
- * Makefile recipe really is dropped, and only zero-width nodes are excused. */
+/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too, and
+ * only zero-width nodes are excused. (Formerly the unterminated Makefile
+ * recipe, which #2078 now parses -- see the #1610 guard above.) */
 TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746) {
-    const char *src = "all:\n\techo hi ";
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1, ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
@@ -1514,7 +1537,507 @@ TEST(jsx_broken_markup_still_parse_partial_issue1736) {
     PASS();
 }
 
+/* ── #1748: C# 12 collection expressions in conditional branches ─────────────
+ * The vendored tree-sitter-c-sharp (pin 88366631d598) predated upstream's
+ * collection-expression support (#402, first released in v0.23.4): `[...]` was
+ * only reachable as an element_binding_expression, so an empty or a second
+ * collection literal after `?`/`:` had no valid parse and error recovery ate
+ * the surrounding statement. Every body below is valid C# 12; the method that
+ * FOLLOWS it pins that extraction resumes after the conditional. */
+#define CS_1748_WRAP(body)                         \
+    "class M\n"                                    \
+    "{\n"                                          \
+    "    async Task Go(bool c, List<int> items)\n" \
+    "    {\n" body "\n"                            \
+    "    }\n"                                      \
+    "    Task<List<int>> F() => null;\n"           \
+    "    void AfterConditional() { }\n"            \
+    "}\n"
+
+TEST(cs_collection_expression_in_conditional_is_complete_issue1748) {
+    static const char *const bodies[] = {
+        /* the reported shape: wrapped ternary, empty collection first */
+        CS_1748_WRAP("        var x = c\n            ? []\n            : await F();"),
+        CS_1748_WRAP("        var x = c ? []\n            : await F();"),
+        CS_1748_WRAP("        List<int> x = c\n            ? []\n            : [items.First()];"),
+        /* both branches collection expressions, single line */
+        CS_1748_WRAP("        List<int> x = c ? [] : [1];"),
+        /* single-line, single collection branch (also failed on the old pin) */
+        CS_1748_WRAP("        var x = c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? [] : await F();"),
+        CS_1748_WRAP("        return c ? [] : items;"),
+        CS_1748_WRAP("        if (c) return c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? items : [];"),
+        CS_1748_WRAP("        var x = c switch { true => [], _ => items };"),
+        CS_1748_WRAP("        int[] a = [1, 2, ..items];"),
+        /* control: the same wrapped shape without a collection expression */
+        CS_1748_WRAP("        var x = c\n            ? null\n            : await F();"),
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        CBMFileResult *r = do_extract(bodies[i], CBM_LANG_CSHARP, "M.cs");
+        ASSERT_NOT_NULL(r);
+        bool partial = r->parse_incomplete;
+        bool has_after = has_def(r, "AfterConditional");
+        if (partial || !has_after) {
+            fprintf(stderr, "  case %zu: partial=%d ranges=%s after_def=%d\n", i, partial,
+                    r->error_ranges ? r->error_ranges : "(none)", has_after);
+            failures++;
+        }
+        cbm_free_result(r);
+    }
+    if (failures != 0) {
+        FAIL("valid C# 12 collection expressions in conditional branches must parse completely");
+    }
+    PASS();
+}
+
+/* Calls nested in a collection expression (element and spread) must still be
+ * extracted after the refresh moved them under collection_expression /
+ * expression_element / spread_element (previously element_binding_expression /
+ * argument / range_expression). */
+TEST(cs_calls_inside_collection_expression_extracted_issue1748) {
+    const char *src = "class M\n"
+                      "{\n"
+                      "    int[] Build(bool c)\n"
+                      "    {\n"
+                      "        return c ? [] : [Head(), ..Tail()];\n"
+                      "    }\n"
+                      "    int Head() => 1;\n"
+                      "    int[] Tail() => null;\n"
+                      "}\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    bool partial = r->parse_incomplete;
+    bool head = false;
+    bool tail = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *n = r->calls.items[i].callee_name;
+        if (n && strcmp(n, "Head") == 0) {
+            head = true;
+        }
+        if (n && strcmp(n, "Tail") == 0) {
+            tail = true;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_FALSE(partial);
+    ASSERT_TRUE(head);
+    ASSERT_TRUE(tail);
+    PASS();
+}
+
+/* GUARD: the refreshed grammar must not hide genuinely broken C#. */
+TEST(cs_malformed_conditional_remains_partial_issue1748) {
+    CBMFileResult *r =
+        do_extract(CS_1748_WRAP("        var x = c ? ] : ;"), CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── #2078: every file is parsed as if it ended with a newline ───────────────
+ *
+ * Several grammars need a line terminator that a file's last line may simply
+ * not have. tree-sitter-markdown is the sharpest case: an opening code fence,
+ * an ATX heading or a bare list marker as the final bytes of a file leaves a
+ * WIDTH-BEARING ERROR (so the #1610 zero-width rule cannot excuse it), and a
+ * file that is only "```" came back as a whole-file error. Appending one "\n"
+ * made every one of these clean -- the reporter proved it on 21 real files.
+ *
+ * cbm now feeds the parser one virtual "\n" past EOF when the last byte is not
+ * already a newline, then clamps the tree back to the real length, so no
+ * consumer sees a byte, a line or a range that is not in the file. */
+TEST(markdown_unterminated_last_line_is_clean_issue2078) {
+    const char *cases[] = {
+        "text\n```", /* opening fence at EOF (upstream PR #262, closed unmerged) */
+        "```",       /* the whole file is one opening fence */
+        "# Top",     /* ATX heading */
+        "- ",        /* bare list marker */
+    };
+    int flagged = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        if (r->parse_incomplete || r->parse_unusable) {
+            fprintf(stderr, "  case %zu flagged: partial=%d unusable=%d ranges=%s\n", i,
+                    r->parse_incomplete, r->parse_unusable,
+                    r->error_ranges ? r->error_ranges : "(none)");
+            flagged++;
+        }
+        cbm_free_result(r);
+    }
+    if (flagged) {
+        FAIL("a markdown file must not be flagged only because its last line is unterminated");
+    }
+    PASS();
+}
+
+/* Controls: the same bytes WITH the newline were already clean and stay so. */
+TEST(markdown_terminated_last_line_controls_unchanged_issue2078) {
+    const char *cases[] = {"text\n```\n", "```\n", "# Top\n", "- \n"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT_FALSE(r->parse_unusable);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Everything extraction reports, as one string, so two results compare
+ * byte-for-byte: defs (every text field and range), calls (exact byte spans),
+ * imports and the coverage verdict. */
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+} dump_buf_t;
+
+static void dump_str(dump_buf_t *b, const char *tag, const char *s) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%s", tag, s ? s : "~");
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+static void dump_num(dump_buf_t *b, const char *tag, long v) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%ld", tag, v);
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+/* The Module def spans the whole file, and its end line follows the line
+ * convention for a terminated last line (#1967), so it is compared on its own
+ * rather than through the dump. */
+static char *dump_extraction(const CBMFileResult *r) {
+    dump_buf_t b = {(char *)calloc(1u << 16, 1), 1u << 16, 0};
+    if (!b.buf) {
+        return NULL;
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Module") == 0) {
+            continue;
+        }
+        dump_str(&b, "\nD", d->qualified_name);
+        dump_str(&b, "name", d->name);
+        dump_str(&b, "label", d->label);
+        dump_num(&b, "start", d->start_line);
+        dump_num(&b, "end", d->end_line);
+        dump_num(&b, "lines", d->lines);
+        dump_num(&b, "cx", d->complexity);
+        dump_num(&b, "params", d->param_count);
+        dump_str(&b, "sig", d->signature);
+        dump_str(&b, "ret", d->return_type);
+        dump_str(&b, "doc", d->docstring);
+        dump_str(&b, "prof", d->structural_profile);
+        dump_str(&b, "tok", d->body_tokens);
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        dump_str(&b, "\nC", c->callee_name);
+        dump_str(&b, "in", c->enclosing_func_qn);
+        dump_num(&b, "line", c->start_line);
+        dump_num(&b, "from", (long)c->site_start_byte);
+        dump_num(&b, "to", (long)c->site_end_byte);
+        dump_num(&b, "args", c->arg_count);
+    }
+    for (int i = 0; i < r->imports.count; i++) {
+        dump_str(&b, "\nI", r->imports.items[i].local_name);
+        dump_str(&b, "path", r->imports.items[i].module_path);
+    }
+    dump_str(&b, "\nP", r->error_ranges);
+    dump_num(&b, "partial", r->parse_incomplete);
+    dump_num(&b, "unusable", r->parse_unusable);
+    dump_str(&b, "", "\n");
+    return b.buf;
+}
+
+static uint32_t module_end_line(const CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Module") == 0) {
+            return r->defs.items[i].end_line;
+        }
+    }
+    return 0;
+}
+
+static char *extract_dump(const char *src, CBMLanguage lang, const char *path,
+                          uint32_t *module_end) {
+    CBMFileResult *r = do_extract(src, lang, path);
+    if (!r) {
+        return NULL;
+    }
+    char *d = dump_extraction(r);
+    if (module_end) {
+        *module_end = module_end_line(r);
+    }
+    cbm_free_result(r);
+    return d;
+}
+
+/* GUARD: for code grammars a trailing newline is insignificant, so a file
+ * without one must extract byte-identically to the same file with one -- every
+ * def, range, text field and call byte span. The virtual newline may never
+ * show up as phantom content or a phantom line. */
+TEST(code_without_final_newline_extracts_identically_issue2078) {
+    struct {
+        const char *src; /* no trailing newline */
+        CBMLanguage lang;
+        const char *path;
+        uint32_t lines;
+    } cases[] = {
+        {"#include <stdio.h>\n\nstatic int beta(int x) {\n    return x + 1;\n}\n\n"
+         "void alpha(void) { printf(\"a\"); beta(2); }",
+         CBM_LANG_C, "a.c", 7},
+        {"import os\n\n\nclass K:\n    def m(self, a):\n        return os.path.join(a)\n\n\n"
+         "def f(x):\n    \"\"\"doc\"\"\"\n    return K().m(x)",
+         CBM_LANG_PYTHON, "a.py", 11},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t n = strlen(cases[i].src);
+        char *terminated = (char *)malloc(n + 2);
+        ASSERT_NOT_NULL(terminated);
+        memcpy(terminated, cases[i].src, n);
+        terminated[n] = '\n';
+        terminated[n + 1] = '\0';
+        uint32_t bare_module_end = 0;
+        char *bare = extract_dump(cases[i].src, cases[i].lang, cases[i].path, &bare_module_end);
+        char *term = extract_dump(terminated, cases[i].lang, cases[i].path, NULL);
+        free(terminated);
+        ASSERT_NOT_NULL(bare);
+        ASSERT_NOT_NULL(term);
+        bool same = strcmp(bare, term) == 0;
+        if (!same) {
+            fprintf(stderr, "  %s differs:\n--- without final newline%s--- with final newline%s",
+                    cases[i].path, bare, term);
+        }
+        free(bare);
+        free(term);
+        if (!same) {
+            FAIL("extraction must not depend on whether the last line is terminated");
+        }
+        if (bare_module_end != cases[i].lines) {
+            fprintf(stderr, "  %s: module ends on line %u, file has %u\n", cases[i].path,
+                    bare_module_end, cases[i].lines);
+            FAIL("the virtual newline must not add a line to the module");
+        }
+    }
+    PASS();
+}
+
+/* GUARD against phantom content: a heading on an unterminated last line is a
+ * one-line file. No def may end past line 1, no text may carry the virtual
+ * newline, and the result must equal the terminated file's. */
+TEST(virtual_newline_adds_no_phantom_line_or_text_issue2078) {
+    CBMFileResult *r = do_extract("# Top", CBM_LANG_MARKDOWN, "top.md");
+    ASSERT_NOT_NULL(r);
+    bool found = has_def(r, "Top");
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->end_line > 1 || d->start_line > 1) {
+            fprintf(stderr, "  def %s spans %u-%u\n", d->name ? d->name : "?", d->start_line,
+                    d->end_line);
+            cbm_free_result(r);
+            FAIL("no def may reach past the last real line");
+        }
+        if ((d->name && strchr(d->name, '\n')) || (d->signature && strchr(d->signature, '\n'))) {
+            cbm_free_result(r);
+            FAIL("no extracted text may contain the virtual newline");
+        }
+    }
+    cbm_free_result(r);
+    if (!found) {
+        /* Before #2078 the unterminated heading was silently dropped: no
+         * Section, and no parse_partial flag to say so. */
+        FAIL("the heading on an unterminated last line must be extracted as a Section");
+    }
+    PASS();
+}
+
+/* GUARD: the empty file and a file that is exactly "\n" get no virtual
+ * newline (nothing is unterminated) and stay clean. */
+TEST(empty_and_newline_only_files_unchanged_issue2078) {
+    const char *srcs[] = {"", "\n"};
+    CBMLanguage langs[] = {CBM_LANG_MARKDOWN, CBM_LANG_PYTHON, CBM_LANG_C};
+    const char *paths[] = {"e.md", "e.py", "e.c"};
+    for (size_t s = 0; s < 2; s++) {
+        for (size_t l = 0; l < 3; l++) {
+            CBMFileResult *r = do_extract(srcs[s], langs[l], paths[l]);
+            ASSERT_NOT_NULL(r);
+            ASSERT_FALSE(r->parse_incomplete);
+            ASSERT_FALSE(r->parse_unusable);
+            cbm_free_result(r);
+        }
+    }
+    PASS();
+}
+
+/* #1967: every line counter over one source buffer answers the same
+ * question the same way. A trailing newline ends the last line; it does not
+ * open a new one. */
+TEST(source_line_count_one_convention) {
+    ASSERT_EQ(cbm_source_line_count("", 0), 1u);
+    ASSERT_EQ(cbm_source_line_count("a", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\n", 2), 1u);
+    ASSERT_EQ(cbm_source_line_count("\n", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\nb", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\nb\n", 4), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\n\n", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\r\nb\r\n", 6), 2u);
+    /* src_len bounds the count, not a NUL terminator. */
+    ASSERT_EQ(cbm_source_line_count("a\nb\nc", 2), 1u);
+    PASS();
+}
+
+/* ── #2211: Pascal/Delphi identifiers with non-ASCII letters ─────────────────
+ * Delphi accepts non-ASCII letters in identifiers; 1C integrations call its
+ * OLE API through late-bound Variants with Cyrillic member names. Upstream
+ * tree-sitter-pascal's identifier token was ASCII-only, so every such name was
+ * an ERROR node and the unit came out parse_partial. The Cyrillic text is
+ * written as UTF-8 hex escapes (the source stays ASCII); a `" "` split follows
+ * an escape run whenever the next character is a hex digit. */
+
+/* The reporter's snippet (#2211), verbatim apart from the escaping:
+ * v8_Base.<Dokumenty>.<SchetNaOplatuPostavshchika>.<NaytiPoNomeru>(...),
+ * v8_dst.<Pustaya>(), v8_Base.<Spravochniki>.<Nomenklatura>.<NaytiPoKodu>(...),
+ * NM.<PoluchitObyekt>().<Zapisat>() -- <...> = the Cyrillic name, transliterated. */
+static const char *PAS_CYRILLIC_MEMBERS =
+    "unit Demo;\n"
+    "interface\n"
+    "procedure Demo1C;\n"
+    "implementation\n"
+    "procedure Demo1C;\n"
+    "var\n"
+    "  v8_Base, v8_dst, NM: Variant;\n"
+    "begin\n"
+    "  v8_dst := "
+    "v8_Base.\xd0\x94\xd0\xbe\xd0\xba\xd1\x83\xd0\xbc\xd0\xb5\xd0\xbd\xd1\x82\xd1\x8b."
+    "\xd0\xa1\xd1\x87\xd0\xb5\xd1\x82\xd0\x9d\xd0\xb0\xd0\x9e\xd0\xbf\xd0\xbb\xd0\xb0\xd1\x82\xd1"
+    "\x83\xd0\x9f\xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd0\xb2\xd1\x89\xd0\xb8\xd0\xba\xd0\xb0."
+    "\xd0\x9d\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb8\xd0\x9f\xd0\xbe\xd0\x9d\xd0\xbe\xd0\xbc\xd0\xb5\xd1"
+    "\x80\xd1\x83('1', Now);\n"
+    "  if v8_dst.\xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd1\x8f() then Exit;\n"
+    "  NM := "
+    "v8_Base.\xd0\xa1\xd0\xbf\xd1\x80\xd0\xb0\xd0\xb2\xd0\xbe\xd1\x87\xd0\xbd\xd0\xb8\xd0\xba\xd0"
+    "\xb8.\xd0\x9d\xd0\xbe\xd0\xbc\xd0\xb5\xd0\xbd\xd0\xba\xd0\xbb\xd0\xb0\xd1\x82\xd1\x83\xd1\x80"
+    "\xd0\xb0.\xd0\x9d\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb8\xd0\x9f\xd0\xbe\xd0\x9a\xd0\xbe\xd0\xb4\xd1"
+    "\x83('123', 0);\n"
+    "  if not NM.\xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd1\x8f() then\n"
+    "    "
+    "NM."
+    "\xd0\x9f\xd0\xbe\xd0\xbb\xd1\x83\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c\xd0\x9e\xd0\xb1\xd1\x8a\xd0"
+    "\xb5\xd0\xba\xd1\x82().\xd0\x97\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x81\xd0\xb0\xd1\x82\xd1\x8c();\n"
+    "end;\n"
+    "end.\n";
+
+/* A procedure whose own name, parameter and locals are Cyrillic (<ObrabotatDokument>,
+ * <Imya>, <Schyotchik>2), plus the keyword-boundary cases the wider identifier token must
+ * not swallow: `begin<Znachenie>` is ONE identifier, `&begin` is an escaped
+ * identifier, and upper-case BEGIN/END still open and close a block. An ASCII
+ * neighbour follows, so a keyword lost to the identifier token would surface as
+ * a missing definition as well as an ERROR. */
+#define PAS_CYR_PROC_NAME                                                                          \
+    "\xd0\x9e\xd0\xb1\xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0\xd1\x82\xd1\x8c\xd0\x94\xd0" \
+    "\xbe\xd0\xba\xd1\x83\xd0\xbc\xd0\xb5\xd0\xbd\xd1\x82"
+#define PAS_CYR_COUNTER "\xd0\xa1\xd1\x87\xd1\x91\xd1\x82\xd1\x87\xd0\xb8\xd0\xba"
+#define PAS_CYR_VALUE "begin\xd0\x97\xd0\xbd\xd0\xb0\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5"
+static const char *PAS_CYRILLIC_PROC =
+    "unit Kw;\n"
+    "interface\n"
+    "implementation\n"
+    "procedure " PAS_CYR_PROC_NAME "(const \xd0\x98\xd0\xbc\xd1\x8f: string);\n"
+    "var\n"
+    "  " PAS_CYR_VALUE ", &begin: Integer;\n"
+    "  " PAS_CYR_COUNTER "2: Integer;\n"
+    "begin\n"
+    "  BEGIN " PAS_CYR_COUNTER "2 := 1; END;\n"
+    "  " PAS_CYR_VALUE " := " PAS_CYR_COUNTER "2;\n"
+    "end;\n"
+    "procedure AfterIt;\n"
+    "begin\n"
+    "end;\n"
+    "end.\n";
+
+/* ASCII control: the same shapes with ASCII names parsed before the fork and
+ * must still parse identically. */
+static const char *PAS_ASCII_CONTROL = "unit Plain;\n"
+                                       "interface\n"
+                                       "procedure Run;\n"
+                                       "implementation\n"
+                                       "procedure Run;\n"
+                                       "var\n"
+                                       "  Base, Doc: Variant;\n"
+                                       "begin\n"
+                                       "  Doc := Base.Documents.Invoice.FindByNumber('1', Now);\n"
+                                       "  if Doc.IsEmpty() then Exit;\n"
+                                       "  Doc.GetObject().Write();\n"
+                                       "end;\n"
+                                       "end.\n";
+
+/* Genuinely broken Pascal (a doubled `:=` and stray parens) must stay flagged:
+ * the wider identifier token must not make the parser accept garbage. */
+static const char *PAS_BROKEN = "unit Broken;\n"
+                                "interface\n"
+                                "implementation\n"
+                                "procedure Bad;\n"
+                                "begin\n"
+                                "  x := := 1 )) ;\n"
+                                "end;\n"
+                                "procedure Good;\n"
+                                "begin\n"
+                                "end;\n"
+                                "end.\n";
+
+TEST(pascal_cyrillic_member_calls_not_partial_issue2211) {
+    CBMFileResult *r = do_extract(PAS_CYRILLIC_MEMBERS, CBM_LANG_PASCAL, "Demo.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    ASSERT_TRUE(has_def(r, "Demo1C"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_cyrillic_procedure_name_extracted_issue2211) {
+    CBMFileResult *r = do_extract(PAS_CYRILLIC_PROC, CBM_LANG_PASCAL, "Kw.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_TRUE(has_def(r, PAS_CYR_PROC_NAME));
+    ASSERT_TRUE(has_def(r, "AfterIt"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_ascii_control_still_clean_issue2211) {
+    CBMFileResult *r = do_extract(PAS_ASCII_CONTROL, CBM_LANG_PASCAL, "Plain.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_TRUE(has_def(r, "Run"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_broken_source_still_flagged_issue2211) {
+    CBMFileResult *r = do_extract(PAS_BROKEN, CBM_LANG_PASCAL, "Broken.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
+    ASSERT_TRUE(has_def(r, "Good"));
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
+    RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
     RUN_TEST(c_error_range_points_at_failed_region);
@@ -1539,6 +2062,7 @@ SUITE(parse_coverage) {
     RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
     RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(makefile_unterminated_recipe_is_parsed_issue2078);
     RUN_TEST(c_ifdef_split_range_narrows_to_dropped_branch);
     RUN_TEST(c_ifdef_split_range_excludes_lines_the_preprocessor_explained);
     RUN_TEST(c_ifdef_split_range_never_starts_on_a_directive);
@@ -1562,4 +2086,17 @@ SUITE(parse_coverage) {
     RUN_TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735);
     RUN_TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736);
     RUN_TEST(jsx_broken_markup_still_parse_partial_issue1736);
+    RUN_TEST(cs_collection_expression_in_conditional_is_complete_issue1748);
+    RUN_TEST(cs_calls_inside_collection_expression_extracted_issue1748);
+    RUN_TEST(cs_malformed_conditional_remains_partial_issue1748);
+    RUN_TEST(markdown_unterminated_last_line_is_clean_issue2078);
+    RUN_TEST(markdown_terminated_last_line_controls_unchanged_issue2078);
+    RUN_TEST(code_without_final_newline_extracts_identically_issue2078);
+    RUN_TEST(virtual_newline_adds_no_phantom_line_or_text_issue2078);
+    RUN_TEST(empty_and_newline_only_files_unchanged_issue2078);
+
+    RUN_TEST(pascal_cyrillic_member_calls_not_partial_issue2211);
+    RUN_TEST(pascal_cyrillic_procedure_name_extracted_issue2211);
+    RUN_TEST(pascal_ascii_control_still_clean_issue2211);
+    RUN_TEST(pascal_broken_source_still_flagged_issue2211);
 }
