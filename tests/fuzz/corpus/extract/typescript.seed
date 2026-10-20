@@ -1,0 +1,9 @@
+svc.ts
+import { readFile } from 'fs/promises';
+
+export interface Repo { get(id: string): Promise<string>; }
+
+export class FileRepo implements Repo {
+  constructor(private dir: string) {}
+  async get(id: string) { return readFile(`${this.dir}/${id}`, 'utf8'); }
+}

@@ -4,6 +4,7 @@
  * RED phase: These tests define the expected behavior for registered languages.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "discover/discover.h"
 
@@ -385,6 +386,14 @@ TEST(lang_ext_hcl2) {
     ASSERT_EQ(cbm_language_for_extension(".hcl"), CBM_LANG_HCL);
     PASS();
 }
+/* OpenTofu's own configuration files and Terraform/OpenTofu variable files
+ * are HCL too; neither was indexed (cloud-foundation-fabric: 104 .tofu,
+ * 208 .tfvars). */
+TEST(lang_ext_tofu_tfvars) {
+    ASSERT_EQ(cbm_language_for_extension(".tofu"), CBM_LANG_HCL);
+    ASSERT_EQ(cbm_language_for_extension(".tfvars"), CBM_LANG_HCL);
+    PASS();
+}
 TEST(lang_ext_sql) {
     ASSERT_EQ(cbm_language_for_extension(".sql"), CBM_LANG_SQL);
     PASS();
@@ -411,6 +420,36 @@ TEST(lang_ext_xsd) {
 }
 TEST(lang_ext_svg) {
     ASSERT_EQ(cbm_language_for_extension(".svg"), CBM_LANG_XML);
+    PASS();
+}
+/* Issue #2229: the XML documents that make up a .NET repository's project
+ * system were unmapped, so a solution's package references, target frameworks,
+ * localized strings and app manifests were never indexed or searchable. */
+TEST(lang_ext_msbuild_projects) {
+    ASSERT_EQ(cbm_language_for_extension(".csproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".vbproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".fsproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".props"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".targets"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".nuspec"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".slnx"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".runsettings"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_resx) {
+    ASSERT_EQ(cbm_language_for_extension(".resx"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_xaml) {
+    ASSERT_EQ(cbm_language_for_extension(".xaml"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".axaml"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_app_manifests) {
+    ASSERT_EQ(cbm_language_for_extension(".plist"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".xcprivacy"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".manifest"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".appxmanifest"), CBM_LANG_XML);
     PASS();
 }
 TEST(lang_ext_markdown) {
@@ -508,6 +547,39 @@ TEST(lang_fn_cmake) {
 }
 TEST(lang_fn_dockerfile) {
     ASSERT_EQ(cbm_language_for_filename("Dockerfile"), CBM_LANG_DOCKERFILE);
+    PASS();
+}
+/* Build files named for a variant; a template or ignore file of one is not. */
+TEST(lang_fn_dockerfile_variants) {
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.debug"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.multiarch"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile-test"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile_base"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Containerfile"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Containerfile.arm64"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("pipeline.Dockerfile"), CBM_LANG_DOCKERFILE);
+    ASSERT_EQ(cbm_language_for_filename("Dockerfile.j2"), CBM_LANG_JINJA2);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfile.dockerignore"), CBM_LANG_DOCKERFILE);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfile."), CBM_LANG_DOCKERFILE);
+    ASSERT_NEQ(cbm_language_for_filename("Dockerfiles"), CBM_LANG_DOCKERFILE);
+    PASS();
+}
+/* A name shorter than "Dockerfile" / "Containerfile" is read no further than
+ * its end: each name sits in a heap block of exactly its size, so a sanitizer
+ * sees the overread the variant check once made (GCC ASan, doc-link code
+ * asking for the language of `a.go`). */
+TEST(lang_fn_short_names_read_in_bounds) {
+    static const char *const NAMES[] = {"a",    "a.go",       "go.mod", "Dock",
+                                        "Dockerf", "Containe", "x.yaml"};
+    for (size_t i = 0; i < sizeof(NAMES) / sizeof(NAMES[0]); i++) {
+        size_t n = strlen(NAMES[i]) + 1;
+        char *exact = malloc(n);
+        ASSERT_NOT_NULL(exact);
+        memcpy(exact, NAMES[i], n);
+        CBMLanguage lang = cbm_language_for_filename(exact);
+        free(exact);
+        ASSERT_NEQ(lang, CBM_LANG_DOCKERFILE);
+    }
     PASS();
 }
 TEST(lang_fn_meson_build) {
@@ -703,6 +775,35 @@ TEST(lang_frm_form_stays_form) {
     ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_FORM);
     remove(path);
     ASSERT_EQ(cbm_disambiguate_frm("/tmp/nonexistent_file_12345.frm"), CBM_LANG_FORM);
+    PASS();
+}
+
+/* #2176: a Godot binary resource shares the .res extension with ReScript.
+ * Parsed as ReScript it produced an error tree that never finished indexing;
+ * binary content is not ReScript source and must not be indexed as such. */
+TEST(lang_res_binary_resource_unsupported) {
+    static const unsigned char godot_head[] = {'R',  'S',  'R',  'C',  0x00, 0x00, 0x00, 0x00,
+                                               0x04, 0x00, 0x00, 0x00, 'A',  'r',  'r',  'a',
+                                               'y',  'M',  'e',  's',  'h',  0x00, 0xff, 0x80};
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_godot.res", cbm_tmpdir());
+    FILE *f = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(fwrite(godot_head, 1, sizeof(godot_head), f), sizeof(godot_head));
+    fclose(f);
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_res_rescript_stays_rescript) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_rescript.res", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "let greet = name => `Hello ${name}`\n"
+                                       "module M = {\n  let x = 1\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_res(path), CBM_LANG_RESCRIPT);
+    remove(path);
+    ASSERT_EQ(cbm_disambiguate_res("/tmp/nonexistent_file_12345.res"), CBM_LANG_RESCRIPT);
     PASS();
 }
 
@@ -1254,6 +1355,180 @@ TEST(lang_all_have_names) {
     PASS();
 }
 
+/* ── One classifier for a name plus its first bytes ─────────────────
+ * Discovery reads files from disk; the pinned test-impact inventory reads git
+ * blobs. Both must give every file the same language, so both go through
+ * cbm_language_classify with the bytes cbm_language_probe_bytes asks for. */
+
+/* The file `name` with `content`, written byte for byte (no text-mode
+ * conversion on any platform). */
+static bool write_exact(const char *path, const char *content, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return false;
+    }
+    bool ok = fwrite(content, 1, len, f) == len;
+    return fclose(f) == 0 && ok;
+}
+
+/* The classifier on the first probe_bytes(name) bytes of `content`, as the
+ * pinned inventory calls it. */
+static CBMLanguage classify_content(const char *name, const char *content, size_t len) {
+    size_t probe = cbm_language_probe_bytes(name);
+    size_t head = len < probe ? len : probe;
+    return cbm_language_classify(name, (const unsigned char *)content, head, len > head, true);
+}
+
+typedef CBMLanguage (*path_probe_fn)(const char *path);
+
+TEST(lang_probe_bytes_follow_the_name) {
+    ASSERT_EQ(cbm_language_probe_bytes("main.go"), 0);
+    ASSERT_EQ(cbm_language_probe_bytes("Makefile"), 0);
+    ASSERT_EQ(cbm_language_probe_bytes("Foo.m"), 4096);
+    ASSERT_EQ(cbm_language_probe_bytes("Foo.cls"), 4096);
+    ASSERT_EQ(cbm_language_probe_bytes("foo.inc"), 4096);
+    ASSERT_EQ(cbm_language_probe_bytes("Form1.frm"), 4096);
+    ASSERT_EQ(cbm_language_probe_bytes("App.res"), 4096);
+    ASSERT_EQ(cbm_language_probe_bytes("Widget.cfc"), 16384);
+    ASSERT_EQ(cbm_language_probe_bytes("pom.xml"), 255);
+    /* An unknown name falls back to a shebang probe of the first line. */
+    ASSERT_EQ(cbm_language_probe_bytes("run-tests"), 255);
+    ASSERT_EQ(cbm_language_probe_bytes("package.json"), 0);
+    PASS();
+}
+
+/* Every content rule, through the classifier and through the path probe
+ * discovery used before: both must agree, and agree with the expectation. */
+TEST(lang_classify_matches_every_content_rule) {
+    static const struct {
+        const char *name;
+        const char *content;
+        CBMLanguage expect;
+        path_probe_fn path_probe; /* NULL: no public path probe for this rule */
+    } cases[] = {
+        {"a.m", "#import <Foundation/Foundation.h>\n@interface A\n@end\n", CBM_LANG_OBJC,
+         cbm_disambiguate_m},
+        {"b.m", "function f(x)\n  return x;\nend function;\n", CBM_LANG_MAGMA, cbm_disambiguate_m},
+        {"c.m", "intrinsic Foo(x) -> RngIntElt\n{}\n", CBM_LANG_MAGMA, cbm_disambiguate_m},
+        {"d.m", "% a comment\nx = 1;\n", CBM_LANG_MATLAB, cbm_disambiguate_m},
+        {"e.cls", "VERSION 1.0 CLASS\r\nAttribute VB_Name = \"W\"\r\n", CBM_LANG_COUNT,
+         cbm_disambiguate_cls},
+        {"f.cls", "/// doc\nClass Demo.Person Extends %Persistent\n{\n}\n",
+         CBM_LANG_OBJECTSCRIPT_UDL, cbm_disambiguate_cls},
+        {"g.cls", "public class Account { }\n", CBM_LANG_APEX, cbm_disambiguate_cls},
+        {"h.inc", "ROUTINE MyMacros [Type=INC]\n", CBM_LANG_OBJECTSCRIPT_ROUTINE,
+         cbm_disambiguate_inc},
+        {"i.inc", "#define Max 10\n", CBM_LANG_OBJECTSCRIPT_ROUTINE, cbm_disambiguate_inc},
+        {"j.inc", "# a BitBake comment\nSRC_URI = \"x\"\n", CBM_LANG_BITBAKE, cbm_disambiguate_inc},
+        {"k.cfc", "<!--- header --->\n<cfcomponent>\n</cfcomponent>\n", CBM_LANG_CFML,
+         cbm_disambiguate_cfc},
+        {"l.cfc", "<!--- header --->\n<cfscript>component {}</cfscript>\n", CBM_LANG_CFSCRIPT,
+         cbm_disambiguate_cfc},
+        {"m.cfc", "<cfquery name=\"q\">select 1</cfquery>\n", CBM_LANG_CFML, cbm_disambiguate_cfc},
+        {"n.cfc", "component {\n  function f() {}\n}\n", CBM_LANG_CFSCRIPT, cbm_disambiguate_cfc},
+        {"o.frm", "VERSION 5.00\r\nBegin VB.Form Form1\r\n", CBM_LANG_COUNT, cbm_disambiguate_frm},
+        {"p.frm", "#procedure foo\nLocal F = a;\n", CBM_LANG_FORM, cbm_disambiguate_frm},
+        {"q.res", "RSRC\0\0\0\1binary", CBM_LANG_COUNT, cbm_disambiguate_res},
+        {"r.res", "let x = 1\n", CBM_LANG_RESCRIPT, cbm_disambiguate_res},
+        {"s.xml", "<?xml version=\"1.0\"?>\n<Export generator=\"IRIS\" version=\"26\">\n",
+         CBM_LANG_OBJECTSCRIPT_EXPORT, NULL},
+        {"t.xml", "<?xml version=\"1.0\"?>\n<project/>\n", CBM_LANG_XML, NULL},
+        {"package.json", "{}\n", CBM_LANG_COUNT, NULL},
+        {"data.json", "{}\n", CBM_LANG_JSON, NULL},
+        {"u", "#!/usr/bin/env python3\nprint(1)\n", CBM_LANG_PYTHON, cbm_language_from_shebang},
+        {"v", "#!/bin/sh\r\necho hi\r\n", CBM_LANG_BASH, cbm_language_from_shebang},
+        {"w", "#!/usr/bin/env -S node --no-warnings\n", CBM_LANG_JAVASCRIPT,
+         cbm_language_from_shebang},
+        {"x", "#!/usr/bin/env PYTHON=/usr/bin/python python\n", CBM_LANG_COUNT,
+         cbm_language_from_shebang},
+        {"y", "plain text, no shebang\n", CBM_LANG_COUNT, cbm_language_from_shebang},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        /* q.res holds NULs: its length is the literal's, not strlen. */
+        size_t len = strcmp(cases[i].name, "q.res") == 0 ? 15 : strlen(cases[i].content);
+        CBMLanguage got = classify_content(cases[i].name, cases[i].content, len);
+        if (got != cases[i].expect) {
+            printf("  %s: classifier %d, expected %d\n", cases[i].name, (int)got,
+                   (int)cases[i].expect);
+        }
+        ASSERT_EQ(got, cases[i].expect);
+        if (cases[i].path_probe) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/cbm_lang_classify_%s", cbm_tmpdir(), cases[i].name);
+            ASSERT_TRUE(write_exact(path, cases[i].content, len));
+            CBMLanguage by_path = cases[i].path_probe(path);
+            remove(path);
+            if (by_path != cases[i].expect) {
+                printf("  %s: path probe %d, expected %d\n", cases[i].name, (int)by_path,
+                       (int)cases[i].expect);
+            }
+            ASSERT_EQ(by_path, cases[i].expect);
+        }
+    }
+    PASS();
+}
+
+/* Content that cannot be read gets what a failed open gave before: the
+ * name's default, and no language for a name that needed a shebang. */
+TEST(lang_classify_unreadable_content_keeps_the_name_default) {
+    ASSERT_EQ(cbm_language_classify("a.m", NULL, 0, false, false), CBM_LANG_MATLAB);
+    ASSERT_EQ(cbm_language_classify("a.cls", NULL, 0, false, false), CBM_LANG_APEX);
+    ASSERT_EQ(cbm_language_classify("a.inc", NULL, 0, false, false), CBM_LANG_BITBAKE);
+    ASSERT_EQ(cbm_language_classify("a.cfc", NULL, 0, false, false), CBM_LANG_CFSCRIPT);
+    ASSERT_EQ(cbm_language_classify("a.frm", NULL, 0, false, false), CBM_LANG_FORM);
+    ASSERT_EQ(cbm_language_classify("a.res", NULL, 0, false, false), CBM_LANG_RESCRIPT);
+    ASSERT_EQ(cbm_language_classify("a.xml", NULL, 0, false, false), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_classify("run-tests", NULL, 0, false, false), CBM_LANG_COUNT);
+    ASSERT_EQ(cbm_language_classify("main.go", NULL, 0, false, false), CBM_LANG_GO);
+    ASSERT_EQ(cbm_language_classify("package.json", NULL, 0, false, false), CBM_LANG_COUNT);
+    PASS();
+}
+
+/* A shebang counts only when the whole first line was seen: a first line that
+ * runs past the probe is cut, and a cut line names no interpreter. */
+TEST(lang_classify_shebang_needs_the_whole_first_line) {
+    char line[300];
+    memset(line, ' ', sizeof(line));
+    memcpy(line, "#!/bin/sh", 9);
+    /* 255 bytes of first line, and more bytes follow: cut. */
+    ASSERT_EQ(cbm_language_classify("tool", (const unsigned char *)line, 255, true, true),
+              CBM_LANG_COUNT);
+    /* The same 255 bytes are the whole file: the line is complete. */
+    ASSERT_EQ(cbm_language_classify("tool", (const unsigned char *)line, 255, false, true),
+              CBM_LANG_BASH);
+    /* The path probe agrees on both shapes. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cbm_lang_classify_long_shebang", cbm_tmpdir());
+    ASSERT_TRUE(write_exact(path, line, sizeof(line)));
+    ASSERT_EQ(cbm_language_from_shebang(path), CBM_LANG_COUNT);
+    ASSERT_TRUE(write_exact(path, line, 255));
+    ASSERT_EQ(cbm_language_from_shebang(path), CBM_LANG_BASH);
+    remove(path);
+    PASS();
+}
+
+/* A probe reads a fixed number of leading bytes and nothing beyond: a marker
+ * past the probe does not count, on either path. */
+TEST(lang_classify_reads_only_its_probe) {
+    static char content[5000];
+    memset(content, ' ', sizeof(content));
+    content[sizeof(content) - 1] = '\0';
+    memcpy(content + 4500, "@interface", 10);
+    size_t len = strlen(content);
+    ASSERT_EQ(classify_content("late.m", content, len), CBM_LANG_MATLAB);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cbm_lang_classify_late.m", cbm_tmpdir());
+    ASSERT_TRUE(write_exact(path, content, len));
+    ASSERT_EQ(cbm_disambiguate_m(path), CBM_LANG_MATLAB);
+    /* Moved inside the probe it counts. */
+    memcpy(content + 100, "@interface", 10);
+    ASSERT_EQ(classify_content("late.m", content, len), CBM_LANG_OBJC);
+    ASSERT_TRUE(write_exact(path, content, len));
+    ASSERT_EQ(cbm_disambiguate_m(path), CBM_LANG_OBJC);
+    remove(path);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(language) {
@@ -1354,6 +1629,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_toml);
     RUN_TEST(lang_ext_hcl);
     RUN_TEST(lang_ext_hcl2);
+    RUN_TEST(lang_ext_tofu_tfvars);
     RUN_TEST(lang_ext_sql);
     RUN_TEST(lang_ext_dockerfile);
     RUN_TEST(lang_ext_json);
@@ -1361,6 +1637,10 @@ SUITE(language) {
     RUN_TEST(lang_ext_xsl);
     RUN_TEST(lang_ext_xsd);
     RUN_TEST(lang_ext_svg);
+    RUN_TEST(lang_ext_msbuild_projects);
+    RUN_TEST(lang_ext_resx);
+    RUN_TEST(lang_ext_xaml);
+    RUN_TEST(lang_ext_app_manifests);
     RUN_TEST(lang_ext_markdown);
     RUN_TEST(lang_ext_mdx);
     RUN_TEST(lang_ext_makefile);
@@ -1388,6 +1668,8 @@ SUITE(language) {
     RUN_TEST(lang_fn_makefile_lower);
     RUN_TEST(lang_fn_cmake);
     RUN_TEST(lang_fn_dockerfile);
+    RUN_TEST(lang_fn_dockerfile_variants);
+    RUN_TEST(lang_fn_short_names_read_in_bounds);
     RUN_TEST(lang_fn_meson_build);
     RUN_TEST(lang_fn_meson_opts);
     RUN_TEST(lang_fn_meson_opts_txt);
@@ -1422,6 +1704,8 @@ SUITE(language) {
     RUN_TEST(lang_cls_objectscript_stays_objectscript);
     RUN_TEST(lang_frm_vb6_form_unsupported);
     RUN_TEST(lang_frm_form_stays_form);
+    RUN_TEST(lang_res_binary_resource_unsupported);
+    RUN_TEST(lang_res_rescript_stays_rescript);
 
     /* Go test ports */
     /* New languages */
@@ -1511,4 +1795,9 @@ SUITE(language) {
     RUN_TEST(lang_ext_sosl);
 
     RUN_TEST(lang_all_have_names);
+    RUN_TEST(lang_probe_bytes_follow_the_name);
+    RUN_TEST(lang_classify_matches_every_content_rule);
+    RUN_TEST(lang_classify_unreadable_content_keeps_the_name_default);
+    RUN_TEST(lang_classify_shebang_needs_the_whole_first_line);
+    RUN_TEST(lang_classify_reads_only_its_probe);
 }

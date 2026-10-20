@@ -4,7 +4,12 @@
 name: Security Gate
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      lanes:
+        description: 'PR lane selection (scripts/ci/select-lanes.sh JSON list); "all" = every job (dry run, release)'
+        type: string
+        default: all
 
 permissions:
   contents: read
@@ -16,19 +21,28 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: "Layer 1: Static allow-list audit"
-        run: scripts/security-audit.sh
+        run: |
+          bash tests/test_security_audit_subprocess_calls.sh
+          scripts/security-audit.sh
       - name: "Layer 6: UI security audit"
-        run: scripts/security-ui.sh
+        run: |
+          bash tests/test_security_ui_urls.sh
+          scripts/security-ui.sh
       - name: "Layer 8: Vendored dependency integrity"
         run: scripts/security-vendored.sh
 
   license-gate:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'license-gate') }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install ScanCode Toolkit
-        run: pipx install scancode-toolkit
+        # Pinned: an unpinned install picked up pluggy 1.7.0, which breaks
+        # scancode at import (see .github/scancode-constraints.txt).
+        env:
+          PIP_CONSTRAINT: ${{ github.workspace }}/.github/scancode-constraints.txt
+        run: pipx install scancode-toolkit==32.5.0
       - name: "Gate self-test (a planted violation must be detected)"
         run: scripts/license-gate.sh --selftest
       - name: "License compliance gate (one finding fails)"
@@ -39,6 +53,7 @@ jobs:
         run: scripts/audit-license-provenance.py
 
   codeql-gate:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'codeql-gate') }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     # Without security-events:read this job inherits the workflow's

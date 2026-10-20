@@ -33,99 +33,12 @@ enum {
 #include <stdint.h>
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
-#include "service_patterns.h" /* cbm_service_pattern_is_http_route_literal */
+#include "service_patterns.h"  /* cbm_service_pattern_is_http_route_literal */
+#include "helpers.h"           /* cbm_is_test_file */
+#include "discover/discover.h" /* cbm_language_for_filename */
 
 #include <stdio.h>
 #include <string.h>
-
-/* True for characters that may appear in a ":name" route parameter. */
-static inline bool is_route_ident_char(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
-}
-
-/* Canonicalize route-path parameter placeholders to a single "{}" token so that
- * client call sites and server handlers rendezvous on the same Route QN
- * regardless of framework syntax. Each parameter token collapses to "{}":
- *
- *   :name    Express / React-Router / Rails / typical JS API clients
- *   {name}   Axum / Spring / OpenAPI / ASP.NET
- *   <name>   Flask / Rocket (incl. typed "<int:id>")
- *   ${...}   JS template interpolation captured into the path
- *
- * Parameter names are intentionally discarded so the same logical endpoint
- * matches across services that name the path variable differently. Static path
- * text is copied verbatim; the result never exceeds the input length. */
-const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz) {
-    if (out == NULL || out_sz == 0) {
-        /* WHY: cppcheck value-flow follows a caller that passes an as-yet
-         * uninitialized output buffer (e.g. `char cpath[256];`) and flags this
-         * `return out` as uninitvar. False positive: we only return the pointer
-         * here and never read the buffer; returning it (NULL, or a buffer too
-         * small to write into) is the intended early-out contract. */
-        // cppcheck-suppress uninitvar
-        return out;
-    }
-    if (in == NULL) {
-        out[0] = '\0';
-        return out;
-    }
-    const size_t last = out_sz - 1;
-    size_t oi = 0;
-    size_t i = 0;
-    while (in[i] != '\0' && oi < last) {
-        char c = in[i];
-        bool at_seg_start = (oi == 0) || (out[oi - 1] == '/');
-        bool is_param = false;
-
-        if (c == ':' && at_seg_start && is_route_ident_char(in[i + 1])) {
-            i++;
-            while (in[i] != '\0' && is_route_ident_char(in[i])) {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '{') {
-            i++;
-            while (in[i] != '\0' && in[i] != '}' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '}') {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '<') {
-            i++;
-            while (in[i] != '\0' && in[i] != '>' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '>') {
-                i++;
-            }
-            is_param = true;
-        } else if (c == '$' && in[i + 1] == '{') {
-            i += 2;
-            while (in[i] != '\0' && in[i] != '}' && in[i] != '/') {
-                i++;
-            }
-            if (in[i] == '}') {
-                i++;
-            }
-            is_param = true;
-        }
-
-        if (is_param) {
-            if (oi + 2 > last) {
-                break;
-            }
-            out[oi++] = '{';
-            out[oi++] = '}';
-            continue;
-        }
-        out[oi++] = c;
-        i++;
-    }
-    out[oi] = '\0';
-    return out;
-}
 
 /* Extract a JSON string value by key from properties.
  * Returns pointer into buf (caller provides buffer). NULL if not found. */
@@ -166,6 +79,17 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     /* Only process HTTP_CALLS and ASYNC_CALLS */
     if (strcmp(edge->type, "HTTP_CALLS") != 0 && strcmp(edge->type, "ASYNC_CALLS") != 0) {
         return;
+    }
+    /* A script's request (pass_shell.c) names its host and already ends at
+     * its Route, which keeps the host for one outside the repository: a
+     * path-only Route made from its url_path would meet a handler it never
+     * calls. A code client's edge names none and refreshes its Route here. */
+    char host_buf[CBM_SZ_256];
+    if (json_extract(edge->properties_json, "host", host_buf, sizeof(host_buf))) {
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gb, edge->target_id);
+        if (target && target->label && strcmp(target->label, "Route") == 0) {
+            return;
+        }
     }
 
     /* Extract url_path from properties */
@@ -234,6 +158,44 @@ static const char *url_path(const char *url) {
     }
     const char *path = strchr(scheme_end + RN_SCHEME_SKIP, '/');
     return path ? path : "/";
+}
+
+/* Route path `needle` inside URL path `hay`, ending where a segment does:
+ * `/items` is in `/api/items` and `/items/42`; `/a` is not in `/acidjunk`
+ * (fastapi: a `/a` prefix route matched every github.com/a... URL). */
+static bool path_has_route(const char *hay, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0) {
+        return false;
+    }
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + SKIP_ONE, needle)) {
+        char c = p[n];
+        bool start = needle[0] == '/' || p == hay || p[-SKIP_ONE] == '/';
+        bool end = needle[n - SKIP_ONE] == '/' || c == '\0' || c == '/' || c == '?' || c == '#';
+        if (start && end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A route prefix's segments (`items`, `api/v1`) as whole segments of a file
+ * path: `app/routers/items.py`, `items/views.py`; `a` is not in
+ * `docs_src/app_testing/main.py`. */
+static bool file_has_segments(const char *path, const char *segs) {
+    size_t n = strlen(segs);
+    if (n == 0) {
+        return false;
+    }
+    for (const char *p = strstr(path, segs); p; p = strstr(p + SKIP_ONE, segs)) {
+        char c = p[n];
+        bool start = p == path || p[-SKIP_ONE] == '/';
+        bool end = segs[n - SKIP_ONE] == '/' || c == '\0' || c == '/' || c == '.';
+        if (start && end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Check if a trailing dash-segment is a hash/project-number (strippable).
@@ -308,7 +270,7 @@ static bool is_broker_route(const char *qn) {
     static const char *const prefixes[] = {
         "__route__infra__", "__route__pubsub__",          "__route__cloud_tasks__",
         "__route__async__", "__route__cloud_scheduler__", "__route__kafka__",
-        "__route__sqs__"};
+        "__route__sqs__",   "__route__ingress__"};
     if (!qn) {
         return false;
     }
@@ -322,9 +284,34 @@ static bool is_broker_route(const char *qn) {
 
 /* Try to match a single infra Route to a handler Route and create HANDLES bridge.
  * Returns 1 if matched, 0 otherwise. */
+/* Total order over candidates, so "which handler" never depends on the order
+ * nodes happened to land in the graph buffer. Qualified names are unique per
+ * node, so this is a tie-break that always decides; a NULL name sorts last and
+ * therefore only wins when nothing else matched. */
+static bool infra_candidate_is_better(const cbm_gbuf_node_t *candidate,
+                                      const cbm_gbuf_node_t *best) {
+    if (!best) {
+        return true;
+    }
+    if (!candidate->qualified_name) {
+        return false;
+    }
+    if (!best->qualified_name) {
+        return true;
+    }
+    return strcmp(candidate->qualified_name, best->qualified_name) < 0;
+}
+
 static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
                                  const char *infra_path, const char *svc_name,
                                  const cbm_gbuf_node_t **all_routes, int route_count) {
+    /* The FIRST match in array order used to win, and that array is in graph
+     * buffer insertion order — parallel worker interleaving. Two runs of the
+     * same corpus linked the same infra route to different handlers, so the
+     * HANDLES edge set moved between runs (kubernetes, 2026-09-18: 229 vs 242
+     * HANDLES with an identical node set). Collect the best candidate under a
+     * total order instead, and match on it. */
+    const cbm_gbuf_node_t *best = NULL;
     for (int j = 0; j < route_count; j++) {
         const cbm_gbuf_node_t *handler_route = all_routes[j];
         if (is_broker_route(handler_route->qualified_name)) {
@@ -348,22 +335,29 @@ static int match_one_infra_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *infra,
         }
 
         int path_match =
-            (strlen(handler_path) > SKIP_ONE && (strstr(infra_path, handler_path) != NULL ||
-                                                 strstr(handler_path, infra_path) != NULL));
-        int root_svc_match = (strcmp(handler_path, "/") == 0);
+            (strlen(handler_path) > SKIP_ONE && path_has_route(infra_path, handler_path)) ||
+            (strlen(infra_path) > SKIP_ONE && path_has_route(handler_path, infra_path));
+        /* a root route stands for a URL's service only when its file is that
+         * service's; any prefix or ANY route at `/` matched every URL (a docs
+         * site's chat link took the root handlers) */
+        int root_svc_match = file_matches && strcmp(handler_path, "/") == 0;
         if (path_match || root_svc_match) {
-            const cbm_gbuf_edge_t **fn_handles = NULL;
-            int fn_hcount = 0;
-            cbm_gbuf_find_edges_by_target_type(gb, handler_route->id, "HANDLES", &fn_handles,
-                                               &fn_hcount);
-            for (int fh = 0; fh < fn_hcount; fh++) {
-                cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
-                                     "{\"source\":\"infra_match\"}");
+            if (infra_candidate_is_better(handler_route, best)) {
+                best = handler_route;
             }
-            return SKIP_ONE;
         }
     }
-    return 0;
+    if (!best) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **fn_handles = NULL;
+    int fn_hcount = 0;
+    cbm_gbuf_find_edges_by_target_type(gb, best->id, "HANDLES", &fn_handles, &fn_hcount);
+    for (int fh = 0; fh < fn_hcount; fh++) {
+        cbm_gbuf_insert_edge(gb, fn_handles[fh]->source_id, infra->id, "HANDLES",
+                             "{\"source\":\"infra_match\"}");
+    }
+    return SKIP_ONE;
 }
 
 /* Phase 2: Match infra Route URLs to handler Route nodes by URL path + service name. */
@@ -401,6 +395,27 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
         snprintf(buf, sizeof(buf), "%d", matched);
         cbm_log_info("pass.route_match", "infra_matched", buf);
     }
+}
+
+void cbm_pipeline_emit_def_route(cbm_gbuf_t *gb, int64_t func_id, const CBMDefinition *def,
+                                 const char *rel) {
+    if (!def->route_path || def->route_path[0] == '\0') {
+        return;
+    }
+    const char *rm = def->route_method ? def->route_method : "ANY";
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    char cpath[CBM_SZ_256];
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", rm,
+             cbm_route_canon_path(def->route_path, cpath, sizeof(cpath)));
+    char rprops[CBM_SZ_256];
+    snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", rm);
+    int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", def->route_path, route_qn,
+                                            def->file_path ? def->file_path : rel, 0, 0, rprops);
+    char hprops[CBM_SZ_512];
+    char esc_h[CBM_SZ_512];
+    cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
+    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
+    cbm_gbuf_insert_edge(gb, func_id, route_id, "HANDLES", hprops);
 }
 
 /* Phase 2a: Ensure all functions with route_path properties have Route+HANDLES edges.
@@ -535,7 +550,7 @@ static int bridge_funcs_to_prefix(cbm_gbuf_t *gb, const cbm_gbuf_node_t *prefix_
         if (!func->properties_json || !strstr(func->properties_json, "\"route_path\"")) {
             continue;
         }
-        if (prefix_segs && prefix_segs[0] && !strstr(func->file_path, prefix_segs)) {
+        if (prefix_segs && prefix_segs[0] && !file_has_segments(func->file_path, prefix_segs)) {
             continue;
         }
         cbm_gbuf_insert_edge(gb, func->id, prefix_route->id, "HANDLES",
@@ -563,29 +578,37 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
             continue;
         }
 
-        const cbm_gbuf_edge_t **calls_in = NULL;
-        int calls_count = 0;
-        cbm_gbuf_find_edges_by_target_type(gb, prefix_route->id, "CALLS", &calls_in, &calls_count);
-        if (calls_count == 0) {
-            continue;
-        }
-
-        const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[0]->source_id);
-        if (!registrar || !registrar->file_path) {
-            continue;
-        }
-        const char *last_slash = strrchr(registrar->file_path, '/');
-        if (!last_slash) {
-            continue;
-        }
-        int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
-
         const char *prefix_path = prefix_route->name;
         const char *prefix_segs =
             (prefix_path && prefix_path[0] == '/') ? prefix_path + SKIP_ONE : prefix_path;
+        /* A root mount (`app.mount("/", ...)`) names no part of a handler's
+         * path, so nothing tells its handlers from the rest of the directory:
+         * bridging it linked every decorated function there (fastapi: 702
+         * handlers to `/`, then to every infra URL through it). */
+        if (!prefix_segs || !prefix_segs[0]) {
+            continue;
+        }
 
-        connected +=
-            bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len, prefix_segs);
+        const cbm_gbuf_edge_t **calls_in = NULL;
+        int calls_count = 0;
+        cbm_gbuf_find_edges_by_target_type(gb, prefix_route->id, "CALLS", &calls_in, &calls_count);
+
+        /* Every registrar's directory, not the first CALLS edge's: their
+         * order is the workers' merge order, so the first one moved between
+         * runs of the same corpus. Edges dedup, so the union is order-free. */
+        for (int ci = 0; ci < calls_count; ci++) {
+            const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[ci]->source_id);
+            if (!registrar || !registrar->file_path) {
+                continue;
+            }
+            const char *last_slash = strrchr(registrar->file_path, '/');
+            if (!last_slash) {
+                continue;
+            }
+            int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
+            connected += bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len,
+                                                prefix_segs);
+        }
     }
 
     if (connected > 0) {
@@ -677,12 +700,6 @@ static void finish_data_flow_props(char *props, size_t propsz, size_t pos,
     }
 }
 
-typedef struct {
-    int64_t source_id;
-    const char *props;
-    const char *edge_type;
-} caller_edge_ref_t;
-
 static bool http_call_edge_has_valid_route(const cbm_gbuf_edge_t *edge) {
     char url_buf[CBM_SZ_512];
     const char *url = json_extract(edge->properties_json, "url_path", url_buf, sizeof(url_buf));
@@ -692,13 +709,50 @@ static bool http_call_edge_has_valid_route(const cbm_gbuf_edge_t *edge) {
     return cbm_service_pattern_is_http_route_literal(url, callee);
 }
 
+/* try_create_data_flow's refusal for a pair across the test-file boundary. */
+enum { RN_FLOW_TEST_SCOPED = -2 };
+
+/* Is this node defined in a test file, by the extraction's own per-language rule? */
+static bool node_in_test_file(const cbm_gbuf_node_t *n) {
+    if (!n || !n->file_path || !n->file_path[0]) {
+        return false;
+    }
+    const char *slash = strrchr(n->file_path, '/');
+    const char *base = slash ? slash + SKIP_ONE : n->file_path;
+    return cbm_is_test_file(n->file_path, cbm_language_for_filename(base));
+}
+
+/* R1 + R2 (user decision, 2026-10-18): a handler defined in a test file pairs only with
+ * callers in that same file, and a caller in a test file pairs only with handlers in that same
+ * file. A test's request to the application, a production caller matched to a test's mock
+ * server, and two tests' private mock servers pairing across files are not data flows of the
+ * application. The HTTP_CALLS / HANDLES edges themselves stay; only the pairing is scoped. */
+static bool data_flow_crosses_test_scope(const cbm_gbuf_t *gb, int64_t caller_id,
+                                         int64_t handler_id) {
+    const cbm_gbuf_node_t *caller = cbm_gbuf_find_by_id(gb, caller_id);
+    const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_id(gb, handler_id);
+    if (!caller || !handler) {
+        return false;
+    }
+    const char *cf = caller->file_path ? caller->file_path : "";
+    const char *hf = handler->file_path ? handler->file_path : "";
+    if (strcmp(cf, hf) == 0) {
+        return false;
+    }
+    return node_in_test_file(caller) || node_in_test_file(handler);
+}
+
 /* Try to create a DATA_FLOWS edge between caller and handler via a route.
- * Returns: 1=created, 0=skipped (self/duplicate), -1=skipped (has direct call). */
+ * Returns: 1=created, 0=skipped (self/duplicate), -1=skipped (has direct call),
+ * RN_FLOW_TEST_SCOPED=skipped (the pair crosses the test-file boundary, R1 + R2). */
 static int try_create_data_flow(cbm_gbuf_t *gb, int64_t caller_id, int64_t handler_id,
                                 const cbm_gbuf_node_t *route, const char *edge_type,
                                 const char *caller_props, bool via_infra) {
     if (caller_id == handler_id) {
         return 0;
+    }
+    if (data_flow_crosses_test_scope(gb, caller_id, handler_id)) {
+        return RN_FLOW_TEST_SCOPED;
     }
     if (has_direct_call(gb, caller_id, handler_id)) {
         return CBM_NOT_FOUND;
@@ -747,84 +801,92 @@ static int try_create_data_flow(cbm_gbuf_t *gb, int64_t caller_id, int64_t handl
     return SKIP_ONE;
 }
 
-/* Collect extra handler IDs reachable via INFRA_MAPS chain from a route. */
-static int collect_infra_handlers(cbm_gbuf_t *gb, int64_t route_id, int64_t *out, int max_out) {
-    const cbm_gbuf_edge_t **infra_edges = NULL;
-    int infra_count = 0;
-    cbm_gbuf_find_edges_by_source_type(gb, route_id, "INFRA_MAPS", &infra_edges, &infra_count);
+/* One route's DATA_FLOWS context: its direct handlers (handler -[HANDLES]-> route) and its
+ * INFRA_MAPS hops (route -[INFRA_MAPS]-> endpoint, whose handlers are reached via the endpoint).
+ * The edge arrays are the graph buffer's own index arrays. Inserting DATA_FLOWS never appends to
+ * a HANDLES, INFRA_MAPS, HTTP_CALLS or ASYNC_CALLS array, so they stay valid while flows are added
+ * (only edge deletion rebuilds the indexes). */
+typedef struct {
+    cbm_gbuf_t *gb;
+    const cbm_gbuf_node_t *route;
+    const cbm_gbuf_edge_t **handles;
+    int handles_count;
+    const cbm_gbuf_edge_t **infra;
+    int infra_count;
+    int flows;
+    int skipped;
+    int test_scoped;
+} route_flows_t;
 
-    int n = 0;
-    for (int ie = 0; ie < infra_count; ie++) {
-        const cbm_gbuf_edge_t **ep_handles = NULL;
-        int ep_hcount = 0;
-        cbm_gbuf_find_edges_by_target_type(gb, infra_edges[ie]->target_id, "HANDLES", &ep_handles,
-                                           &ep_hcount);
-        for (int eh = 0; eh < ep_hcount && n < max_out; eh++) {
-            out[n++] = ep_handles[eh]->source_id;
-        }
+typedef struct {
+    int flows;
+    int skipped;     /* the caller already CALLS the handler */
+    int test_scoped; /* the pair crosses the test-file boundary (R1 + R2) */
+} data_flow_stats_t;
+
+static void route_flow_add(route_flows_t *rf, const cbm_gbuf_edge_t *caller, int64_t handler_id,
+                           const char *edge_type, bool via_infra) {
+    int rc = try_create_data_flow(rf->gb, caller->source_id, handler_id, rf->route, edge_type,
+                                  caller->properties_json, via_infra);
+    if (rc > 0) {
+        rf->flows++;
+    } else if (rc == RN_FLOW_TEST_SCOPED) {
+        rf->test_scoped++;
+    } else if (rc < 0) {
+        rf->skipped++;
     }
-    return n;
 }
 
-/* Collect caller edges (HTTP_CALLS + ASYNC_CALLS) targeting a route. */
-static int collect_caller_edges(cbm_gbuf_t *gb, int64_t route_id, caller_edge_ref_t *out,
-                                int max_out) {
-    int n = 0;
+/* DATA_FLOWS from one caller edge to every handler of the route, direct and via infra. */
+static void caller_data_flows(route_flows_t *rf, const cbm_gbuf_edge_t *caller,
+                              const char *edge_type) {
+    for (int hi = 0; hi < rf->handles_count; hi++) {
+        route_flow_add(rf, caller, rf->handles[hi]->source_id, edge_type, false);
+    }
+    for (int ie = 0; ie < rf->infra_count; ie++) {
+        const cbm_gbuf_edge_t **ep_handles = NULL;
+        int ep_hcount = 0;
+        cbm_gbuf_find_edges_by_target_type(rf->gb, rf->infra[ie]->target_id, "HANDLES", &ep_handles,
+                                           &ep_hcount);
+        for (int eh = 0; eh < ep_hcount; eh++) {
+            route_flow_add(rf, caller, ep_handles[eh]->source_id, edge_type, true);
+        }
+    }
+}
+
+/* Create DATA_FLOWS between EVERY caller (HTTP_CALLS + ASYNC_CALLS) and EVERY handler of one
+ * route node.
+ *
+ * Callers were copied into a 64-slot buffer and infra handlers into a 32-slot one, each keeping the
+ * first entries in edge-insertion order -- i.e. in parallel worker interleaving. Which DATA_FLOWS
+ * existed therefore changed between two indexes of the same tree with the same binary
+ * (thingsboard, 2026-10-17), and every caller past the 64th lost its flow outright. The flow set
+ * is now the full caller x handler product. A (caller, handler) pair reached twice -- through two
+ * routes, or directly and via infra -- keeps the order-free property winner of
+ * cbm_gbuf_insert_edge. */
+static void create_route_data_flows(cbm_gbuf_t *gb, const cbm_gbuf_node_t *route,
+                                    data_flow_stats_t *st) {
+    route_flows_t rf = {.gb = gb, .route = route};
+    cbm_gbuf_find_edges_by_target_type(gb, route->id, "HANDLES", &rf.handles, &rf.handles_count);
+    cbm_gbuf_find_edges_by_source_type(gb, route->id, "INFRA_MAPS", &rf.infra, &rf.infra_count);
+
     const cbm_gbuf_edge_t **http_edges = NULL;
     int http_count = 0;
-    cbm_gbuf_find_edges_by_target_type(gb, route_id, "HTTP_CALLS", &http_edges, &http_count);
-    for (int i = 0; i < http_count && n < max_out; i++) {
-        if (!http_call_edge_has_valid_route(http_edges[i])) {
-            continue;
+    cbm_gbuf_find_edges_by_target_type(gb, route->id, "HTTP_CALLS", &http_edges, &http_count);
+    for (int i = 0; i < http_count; i++) {
+        if (http_call_edge_has_valid_route(http_edges[i])) {
+            caller_data_flows(&rf, http_edges[i], "HTTP_CALLS");
         }
-        out[n].source_id = http_edges[i]->source_id;
-        out[n].props = http_edges[i]->properties_json;
-        out[n].edge_type = "HTTP_CALLS";
-        n++;
     }
     const cbm_gbuf_edge_t **async_edges = NULL;
     int async_count = 0;
-    cbm_gbuf_find_edges_by_target_type(gb, route_id, "ASYNC_CALLS", &async_edges, &async_count);
-    for (int i = 0; i < async_count && n < max_out; i++) {
-        out[n].source_id = async_edges[i]->source_id;
-        out[n].props = async_edges[i]->properties_json;
-        out[n].edge_type = "ASYNC_CALLS";
-        n++;
+    cbm_gbuf_find_edges_by_target_type(gb, route->id, "ASYNC_CALLS", &async_edges, &async_count);
+    for (int i = 0; i < async_count; i++) {
+        caller_data_flows(&rf, async_edges[i], "ASYNC_CALLS");
     }
-    return n;
-}
-
-/* Create DATA_FLOWS between callers and handlers for one route node. */
-static void create_route_data_flows(cbm_gbuf_t *gb, const cbm_gbuf_node_t *route,
-                                    const caller_edge_ref_t *callers, int n_callers, int *flows,
-                                    int *skipped) {
-    const cbm_gbuf_edge_t **handles_edges = NULL;
-    int handles_count = 0;
-    cbm_gbuf_find_edges_by_target_type(gb, route->id, "HANDLES", &handles_edges, &handles_count);
-
-    int64_t extra_handlers[CBM_SZ_32];
-    int n_extra = collect_infra_handlers(gb, route->id, extra_handlers, CBM_SZ_32);
-
-    for (int ci = 0; ci < n_callers; ci++) {
-        for (int hi = 0; hi < handles_count; hi++) {
-            int rc = try_create_data_flow(gb, callers[ci].source_id, handles_edges[hi]->source_id,
-                                          route, callers[ci].edge_type, callers[ci].props, false);
-            if (rc > 0) {
-                (*flows)++;
-            } else if (rc < 0) {
-                (*skipped)++;
-            }
-        }
-        for (int xi = 0; xi < n_extra; xi++) {
-            int rc = try_create_data_flow(gb, callers[ci].source_id, extra_handlers[xi], route,
-                                          callers[ci].edge_type, callers[ci].props, true);
-            if (rc > 0) {
-                (*flows)++;
-            } else if (rc < 0) {
-                (*skipped)++;
-            }
-        }
-    }
+    st->flows += rf.flows;
+    st->skipped += rf.skipped;
+    st->test_scoped += rf.test_scoped;
 }
 
 /* Find the enclosing proto service for a function by file + line range. */
@@ -850,20 +912,41 @@ static void create_grpc_routes(cbm_gbuf_t *gb) {
         return;
     }
 
-    const cbm_gbuf_node_t *services[CBM_SZ_64];
+    /* EVERY proto service, not a fixed-size prefix of them.
+     *
+     * This array held 64 and the loop stopped at that many, so WHICH services
+     * were considered depended on the order Class nodes happened to land in the
+     * graph buffer — i.e. on parallel worker interleaving. Two indexes of the
+     * same corpus with the same binary produced different __grpc__ Routes
+     * (kubernetes, 2026-09-18: 5 Routes present in one run and absent from the
+     * other, 4 the other way, plus their HANDLES edges). It was a silent
+     * quality cut as well: every service past the 64th got no Routes at all,
+     * and a repository with more than 64 services is not unusual. */
+    int svc_total = 0;
+    for (int i = 0; i < class_count; i++) {
+        if (classes[i]->file_path && strstr(classes[i]->file_path, ".proto")) {
+            svc_total++;
+        }
+    }
+    if (svc_total == 0) {
+        return;
+    }
+    const cbm_gbuf_node_t **services =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)svc_total * sizeof(*services));
+    if (!services) {
+        return; /* the borrowed `classes` array belongs to the graph buffer */
+    }
     int svc_count = 0;
-    for (int i = 0; i < class_count && svc_count < CBM_SZ_64; i++) {
+    for (int i = 0; i < class_count && svc_count < svc_total; i++) {
         if (classes[i]->file_path && strstr(classes[i]->file_path, ".proto")) {
             services[svc_count++] = classes[i];
         }
-    }
-    if (svc_count == 0) {
-        return;
     }
 
     const cbm_gbuf_node_t **funcs = NULL;
     int func_count = 0;
     if (cbm_gbuf_find_by_label(gb, "Function", &funcs, &func_count) != 0 || func_count == 0) {
+        cbm_free(CBM_MEM_CLASS_OTHER, services);
         return;
     }
 
@@ -888,10 +971,13 @@ static void create_grpc_routes(cbm_gbuf_t *gb) {
         cbm_gbuf_insert_edge(gb, fn->id, route_id, "HANDLES", "{\"via\":\"proto_rpc\"}");
         grpc_routes++;
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, services);
     if (grpc_routes > 0) {
         char buf[CBM_SZ_16];
+        char svc_buf[CBM_SZ_16];
         snprintf(buf, sizeof(buf), "%d", grpc_routes);
-        cbm_log_info("pass.route_nodes.grpc", "routes", buf);
+        snprintf(svc_buf, sizeof(svc_buf), "%d", svc_count);
+        cbm_log_info("pass.route_nodes.grpc", "routes", buf, "services", svc_buf);
     }
 }
 
@@ -903,21 +989,21 @@ static void create_data_flows(cbm_gbuf_t *gb) {
         return;
     }
 
-    int flows = 0;
-    int skipped = 0;
+    data_flow_stats_t st = {0};
 
     for (int ri = 0; ri < route_count; ri++) {
-        caller_edge_ref_t caller_edges[CBM_SZ_64];
-        int n_callers = collect_caller_edges(gb, routes[ri]->id, caller_edges, CBM_SZ_64);
-        create_route_data_flows(gb, routes[ri], caller_edges, n_callers, &flows, &skipped);
+        create_route_data_flows(gb, routes[ri], &st);
     }
 
-    if (flows > 0 || skipped > 0) {
+    if (st.flows > 0 || st.skipped > 0 || st.test_scoped > 0) {
         char buf1[CBM_SZ_16];
         char buf2[CBM_SZ_16];
-        snprintf(buf1, sizeof(buf1), "%d", flows);
-        snprintf(buf2, sizeof(buf2), "%d", skipped);
-        cbm_log_info("pass.data_flows", "created", buf1, "skipped_has_call", buf2);
+        char buf3[CBM_SZ_16];
+        snprintf(buf1, sizeof(buf1), "%d", st.flows);
+        snprintf(buf2, sizeof(buf2), "%d", st.skipped);
+        snprintf(buf3, sizeof(buf3), "%d", st.test_scoped);
+        cbm_log_info("pass.data_flows", "created", buf1, "skipped_has_call", buf2,
+                     "skipped_test_scope", buf3);
     }
 }
 

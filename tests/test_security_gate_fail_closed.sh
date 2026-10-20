@@ -98,8 +98,25 @@ require(
 #    downgrade, it fails the entire run with a startup_failure before a single
 #    job executes. Checking only the called workflow is how this test passed
 #    while the PR pipeline never started.
-for caller_name in ("pr.yml", "release.yml"):
-    caller = (root / ".github" / "workflows" / caller_name).read_text(encoding="utf-8")
+#    The caller list is DERIVED, never hardcoded. An earlier revision listed
+#    ("pr.yml", "release.yml") by hand and stayed green while dry-run.yml -- a
+#    third caller nobody had listed -- failed every run at startup. A test that
+#    only checks the callers you remembered cannot catch the one you forgot.
+workflow_dir = root / ".github" / "workflows"
+callers = sorted(
+    path.name
+    for path in workflow_dir.glob("*.yml")
+    if "uses: ./.github/workflows/_security.yml" in path.read_text(encoding="utf-8")
+)
+require(
+    len(callers) >= 3,
+    "expected at least 3 callers of _security.yml, found: "
+    + (", ".join(callers) or "none")
+    + " -- if a caller was deliberately removed, lower this floor on purpose",
+)
+
+for caller_name in callers:
+    caller = (workflow_dir / caller_name).read_text(encoding="utf-8")
     # The next sibling may be a comment line, not a key, so the lookahead has to
     # accept any 2-space-indented non-space -- matching only `  \w` silently
     # failed to find release.yml's job at all.

@@ -1,0 +1,9 @@
+name: deploy
+description: build and deploy
+runs:
+  using: composite
+  steps:
+    - run: make -C "${{ github.action_path }}" all
+      shell: bash
+    - run: ${{ github.action_path }}/deploy.sh
+      shell: bash

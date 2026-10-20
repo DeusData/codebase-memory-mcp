@@ -1,0 +1,13 @@
+app.py
+import os
+
+class Store:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        with open(self.path) as fh:
+            return fh.read()
+
+def main():
+    print(Store(os.getcwd()).load())

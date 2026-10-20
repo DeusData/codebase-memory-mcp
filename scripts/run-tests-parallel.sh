@@ -24,6 +24,11 @@ RUNNER="${1:?usage: run-tests-parallel.sh <path-to-test-runner> [jobs]}"
 JOBS="${2:-${CBM_TEST_PAR_JOBS:-}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEDULER="$SCRIPT_DIR/run-test-wave.py"
+# The end-of-run failure summary and the failing-log selection live in one
+# sourced file so tests/test_failure_report_contract.sh can drive the real
+# functions with fabricated logs.
+# shellcheck source=suite-failure-report.sh
+source "$SCRIPT_DIR/suite-failure-report.sh"
 
 if [ -z "$JOBS" ]; then
     if command -v nproc >/dev/null 2>&1; then
@@ -35,7 +40,10 @@ if [ -z "$JOBS" ]; then
     fi
 fi
 
-LOGDIR="$(dirname "$RUNNER")/test-logs"
+# CBM_TEST_LOG_DIR: a private log directory (tests/test_harness_selection.sh
+# drives this harness before the real run and must not touch its logs). Keep
+# it relative: the native Windows runner reads the selection file below it.
+LOGDIR="${CBM_TEST_LOG_DIR:-$(dirname "$RUNNER")/test-logs}"
 rm -rf "$LOGDIR"
 mkdir -p "$LOGDIR"
 
@@ -127,6 +135,54 @@ NSUITES=$(wc -l < "$SUITES_FILE" | tr -d ' ')
 if [ "$NSUITES" -lt 1 ] || grep -qvE '^[a-z0-9_]+$' "$SUITES_FILE"; then
     echo "FAIL: suite list empty or malformed (runner too old for --list-suites?)" >&2
     exit 1
+fi
+
+# Test selection (smart CI; PR CI only, scripts/test-impact/selection.py).
+# CBM_TEST_SELECTION_FILE lists `suite` / `suite:test` tokens. Only the suites
+# it names are launched, and every launched runner judges its own tokens
+# through CBM_TEST_ONLY_FILE, so a selected test the runner cannot find fails
+# that suite. A selected suite this build does not register fails the run,
+# unless CBM_TEST_SELECTION_OPTIONAL names it (registered only in some builds,
+# e.g. the coverage runner): then it is dropped with a notice, exactly as a
+# full run of this build never runs it. Everything below — sharding, the
+# manifest, the union guard — then works on the selected list. Unset: the
+# full list, unchanged.
+SELECTION="none"
+if [ -n "${CBM_TEST_SELECTION_FILE:-}" ]; then
+    SEL_TOKENS="$LOGDIR/selection-tokens.txt"
+    if ! tr -d '\r' < "$CBM_TEST_SELECTION_FILE" > "$SEL_TOKENS"; then
+        echo "FAIL: cannot read the test selection $CBM_TEST_SELECTION_FILE" >&2
+        exit 1
+    fi
+    if [ ! -s "$SEL_TOKENS" ] || grep -qvE '^[A-Za-z0-9_]+(:[A-Za-z0-9_]+)?$' "$SEL_TOKENS"; then
+        echo "FAIL: test selection empty or malformed: $CBM_TEST_SELECTION_FILE" >&2
+        exit 1
+    fi
+    cut -d: -f1 "$SEL_TOKENS" | sort -u > "$LOGDIR/selection-suites.txt"
+    if [ -n "${CBM_TEST_SELECTION_OPTIONAL:-}" ]; then
+        tr -d '\r' < "$CBM_TEST_SELECTION_OPTIONAL" | sort -u > "$LOGDIR/selection-optional.txt"
+    else
+        : > "$LOGDIR/selection-optional.txt"
+    fi
+    ABSENT=$(comm -23 "$LOGDIR/selection-suites.txt" <(sort -u "$SUITES_FILE"))
+    REQUIRED_ABSENT=$(comm -23 <(printf '%s\n' $ABSENT | sed '/^$/d' | sort -u) "$LOGDIR/selection-optional.txt")
+    if [ -n "$REQUIRED_ABSENT" ]; then
+        echo "FAIL: the test selection names suites this build does not register:" $REQUIRED_ABSENT >&2
+        exit 1
+    fi
+    [ -z "$ABSENT" ] || echo "selection: conditional suites not in this build, not run:" $ABSENT
+    # The runner's filter keeps only this build's suites (an unknown suite's
+    # token would fail every process); the suite list keeps list order.
+    awk 'NR == FNR { listed[$0] = 1; next } { split($0, p, ":") } p[1] in listed' \
+        "$SUITES_FILE" "$SEL_TOKENS" > "$LOGDIR/selection.txt"
+    awk 'NR == FNR { selected[$0] = 1; next } $0 in selected' \
+        "$LOGDIR/selection-suites.txt" "$SUITES_FILE" > "$SUITES_FILE.selected"
+    mv "$SUITES_FILE.selected" "$SUITES_FILE"
+    SELECTION="$(sort "$LOGDIR/selection.txt" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
+    echo "selection: $(wc -l < "$SUITES_FILE" | tr -d ' ') of $NSUITES suites, $(wc -l < "$LOGDIR/selection.txt" | tr -d ' ') tokens ($SELECTION)"
+    NSUITES=$(wc -l < "$SUITES_FILE" | tr -d ' ')
+    export CBM_TEST_ONLY_FILE="$LOGDIR/selection.txt"
+    unset CBM_TEST_ONLY
 fi
 
 # CBM_TEST_SHARD="i/N" runs this invocation's deterministic slice of the
@@ -246,10 +302,19 @@ NSHARD=$(wc -l < "$SHARD_EXPECT" | tr -d ' ')
     echo "leg=${CBM_TEST_LEG:-local}"
     echo "shard=${SHARD_INDEX}/${SHARD_TOTAL}"
     echo "list_sha256=$(sort "$SUITES_FILE" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
+    echo "selection_sha256=$SELECTION"
     echo "--- slice ---"
     cat "$SHARD_EXPECT"
 } > "$LOGDIR/shard-manifest.txt"
 echo "=== parallel test run: $NSHARD of $NSUITES suites (shard ${SHARD_INDEX}/${SHARD_TOTAL}, $(wc -l < "$SER_FILE" | tr -d ' ') serial-tail), $JOBS jobs ==="
+
+# Leave the logs of every non-green suite in $LOGDIR/failed for CI to upload
+# when the job fails. An EXIT trap rather than a call next to the summary
+# below, because the run has three ways out — the scheduler giving up, the
+# union guard, and the normal end — and the first two are exactly the runs
+# whose logs are otherwise unrecoverable. The trap only copies files: it never
+# calls exit, so the status this script ends with is untouched.
+trap 'collect_failed_suite_logs "$LOGDIR" "$RESULTS_FILE" "$SHARD_EXPECT"' EXIT
 
 # Per-suite wall-clock ceilings make a wedged child fail loudly. The
 # `incremental` suite legitimately re-indexes large fixtures (minutes), while
@@ -337,14 +402,15 @@ echo "── 8 slowest suites ──"
 sort -t= -k6 -rn "$RESULTS_FILE" | head -8
 grep -v ' rc=0 ' "$RESULTS_FILE" || true
 for f in $(grep -v ' rc=0 ' "$RESULTS_FILE" | awk '{print $1}'); do
-    echo "──── $f: every failure site ────"
-    grep -B2 -A8 "FAIL" "$LOGDIR/$f.log" | head -120
-    echo "──── $f: last 15 lines ────"
-    tail -15 "$LOGDIR/$f.log"
+    suite_failure_summary "$f" "$LOGDIR/$f.log"
 done
 
 echo "────────────────────────────────────────────"
-echo "  $TOTAL_PASS passed, $TOTAL_FAIL failed, $TOTAL_SKIP skipped  ($NSUITES suites, $JOBS jobs)"
+if [ "$SELECTION" = none ]; then
+    echo "  $TOTAL_PASS passed, $TOTAL_FAIL failed, $TOTAL_SKIP skipped  ($NSUITES suites, $JOBS jobs)"
+else
+    echo "  $TOTAL_PASS passed, $TOTAL_FAIL failed, $TOTAL_SKIP skipped  ($NSUITES selected suites, $JOBS jobs; selection $SELECTION)"
+fi
 echo "────────────────────────────────────────────"
 
 if [ "$TOTAL_FAIL" -gt 0 ] || [ "$BAD_RC" -gt 0 ]; then

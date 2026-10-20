@@ -7,7 +7,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable, its authenticated integration asset, and—when requested—the content-addressed UI pack.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 162 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 45 automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 162 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 17 MCP tools. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 45 automatic/conditional client surfaces.
 
 ## Installation
 
@@ -16,6 +16,8 @@ npm install -g codebase-memory-mcp
 ```
 
 The runtime set for your platform is downloaded automatically at install time. There is one composition per platform and the graph UI is always included — the former `CBM_VARIANT=ui` opt-in is obsolete.
+
+For testing, `CBM_DOWNLOAD_URL` overrides the download base URL (default `https://github.com/DeusData/codebase-memory-mcp/releases/download/v<version>`): the archive and `checksums.txt` are fetched from `<CBM_DOWNLOAD_URL>/<file>`. It must be `https://`, or plain `http://` to exactly `localhost`, `127.0.0.1`, or `[::1]` (optional port; no proxy, no redirects).
 
 Then configure your coding agents:
 
@@ -38,7 +40,7 @@ Restart your agent. Say **"Index this project"** — done.
 - **Lifecycle hooks stay conservative** — Kimi uses `UserPromptSubmit`; on macOS/Linux, GitLab Duo gets a fail-open user `SessionStart`, while Devin gets `UserPromptSubmit`, `PostCompaction`, and a deduplicated `SessionStart` when Claude does not already provide it. Qoder, GitLab Duo, Devin, and Factory hooks are withheld on Windows without a documented shell/executor contract. Cline's auto-activating file hooks are withheld because their context output is not reliably consumed, CodeBuddy beta hooks are not auto-installed, and Cursor context hooks remain withheld.
 - **Subagent access is explicit** — Claude, Gemini, Kiro, Qwen, CodeBuddy, KiloCode, Mistral Vibe, Grok Build, Qoder, Junie, and Factory get documented graph profiles with the narrowest tool/server filters their schemas support. KiloCode and Vibe enumerate read-only query tools rather than using server wildcards. Cursor, Rovo, Pochi, and Cline use explicit parent handoff where child MCP is unavailable or unsafe; IBM Bob receives no invented hook or agent.
 - **Manual, UI, cloud, or repository-managed (not counted)** — Qodo, Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI, Plandex, and SWE-agent. Warp is counted above for its detected skill installation; its MCP connection remains manual.
-- **15 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **17 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Supported Platforms
 
@@ -55,8 +57,10 @@ codebase-memory-mcp install          # configure all detected coding agents
 codebase-memory-mcp --version
 codebase-memory-mcp --help
 codebase-memory-mcp update           # update to latest release
-codebase-memory-mcp uninstall        # remove agent configs
+codebase-memory-mcp uninstall        # remove agent configs; keep indexes by default
 ```
+
+Uninstall keeps project indexes with `--yes`, `--no`, or noninteractive input unless you explicitly add `--delete-indexes`. An interactive terminal without the flag asks separately and defaults to keeping them. `--delete-indexes` overrides `--no`; add `--dry-run` to preview without changing files. Kept indexes remain in the cache directory printed by uninstall.
 
 ### CLI Mode
 

@@ -1,15 +1,23 @@
 #ifndef CBM_MCP_INTERNAL_H
 #define CBM_MCP_INTERNAL_H
 
+#include "foundation/index_policy.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h" /* cbm_changed_hunk_t */
 #include "store/store.h"       /* cbm_node_t */
+
+#include <yyjson/yyjson.h>
 
 /* White-box fault injection for deterministic cross-platform quarantine
  * safety tests. This header is internal and is not part of the MCP API. */
 typedef bool (*cbm_mcp_quarantine_test_hook_fn)(void *context, const char *step);
 typedef bool (*cbm_mcp_command_test_hook_fn)(void *context, const char *command);
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* One-shot sample JSON string-copy allocation failure, not a backing-pool
+ * growth event: 0 is next, 4 is fifth, -1 disables. Setting clears consumption. */
+void cbm_mcp_doc_links_test_fail_sample_alloc_after(int successful_copies);
+bool cbm_mcp_doc_links_test_sample_alloc_failed(void);
+
 typedef void (*cbm_mcp_auto_index_count_test_hook_fn)(void *context);
 #endif
 
@@ -26,6 +34,18 @@ void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
 void cbm_mcp_server_set_search_scan_command_for_test(cbm_mcp_server_t *srv, const char *command);
 void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint64_t timeout_ms,
                                                      bool override_set);
+/* Parent directory for search_code's private cbm-search-XXXXXX scratch
+ * (NULL restores cbm_tmpdir()). Tests point it at a private directory so a
+ * scratch count cannot see other processes' entries in the shared temp dir.
+ * The server borrows dir until it is reset or the server is freed. */
+void cbm_mcp_server_set_search_scratch_dir_for_test(cbm_mcp_server_t *srv, const char *dir);
+/* search_code's in-process scan of `filelist_path` (records separated as the
+ * scoped list is written: NUL on POSIX, newline on Windows) into `out_path`.
+ * Returns the scan cause in mcp_scan_cause_t order: 0 success, 1 command
+ * failure, 3 output limit, 4 deadline, 5 cancelled. */
+int cbm_mcp_search_scan_for_test(cbm_mcp_server_t *srv, const char *filelist_path,
+                                 const char *pattern, bool use_regex, const char *out_path,
+                                 size_t output_limit, uint64_t deadline_ms);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use
@@ -35,6 +55,17 @@ bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv);
 /* Prepend one daemon-owned notice to a successful JSON-RPC tool response.
  * On success replaces and frees *response_io; on failure it is unchanged. */
 bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *notice);
+
+/* Encode the complete trusted policy on an internal worker request. Callers
+ * must remove any untrusted field with the same name before invoking this. */
+bool cbm_mcp_index_policy_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                      const cbm_index_resource_policy_t *policy);
+
+/* Encode a doc_candidates setting the user set to a boolean on an internal
+ * worker request (the worker reads no config). Unset or unparseable adds no
+ * key, so the worker's index mode decides. False only when encoding fails. */
+bool cbm_mcp_index_doc_candidates_add_to_args(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                              struct cbm_config *config);
 
 enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 

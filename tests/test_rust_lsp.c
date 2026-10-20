@@ -591,6 +591,9 @@ TEST(rustlsp_shared_registry_resolves_like_per_file) {
     defs[1].receiver_type = "test.demo.Database";
     defs[1].def_module_qn = "test.demo";
     defs[1].return_types = "alloc.string.String";
+    /* The shared build registers Rust defs only, as the pipeline tags them. */
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].lang = CBM_LANG_RUST;
 
     const char *imp_names[] = {"demo"};
     const char *imp_qns[] = {"test::demo"};
@@ -695,6 +698,7 @@ TEST(rustlsp_shared_registry_macro_hidden_call_has_carrier) {
     defs[0].label = "Function";
     defs[0].def_module_qn = "test.lib";
     defs[0].return_types = "str";
+    defs[0].lang = CBM_LANG_RUST;
 
     const char *imp_names[] = {"lib"};
     const char *imp_qns[] = {"test::lib"};
