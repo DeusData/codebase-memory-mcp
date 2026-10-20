@@ -5,9 +5,9 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable, its authenticated integration asset, and—when requested—the content-addressed UI pack.
+**Local code intelligence for developers and AI agents.** CBM connects source code, documentation and infrastructure in a persistent knowledge graph. Explore through MCP, the CLI or CBM Lens to find code, trace dependencies and deployments, and understand what a change affects.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 162 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 17 MCP tools. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 45 automatic/conditional client surfaces.
+This npm wrapper downloads, verifies and caches the native executable, its authenticated integration asset and the content-addressed Lens frontend pack. Node.js manages installation and launch; the graph is processed locally without a hosted service or API key. The installer offers 45 client integration targets, with capabilities that vary by client.
 
 ## Installation
 
@@ -25,14 +25,16 @@ Then configure your coding agents:
 codebase-memory-mcp install
 ```
 
-Restart your agent. Say **"Index this project"** — done.
+Restart your agent and ask it to **"Index this project"**. Use `codebase-memory-mcp daemon start --open` to open CBM Lens. Supported integrations also install graph instructions, skills, agent profiles and context hooks; consult the full client matrix for differences.
 
 ## Why codebase-memory-mcp
 
-- **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
+- **Connected repository knowledge** — source symbols and calls, documentation sections and references, configuration, infrastructure and cross-service links.
 - **Plug and play** — verified native runtime sets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). No Docker or API keys; Node.js owns package download, cache repair, and launch.
-- **162 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
-- **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
+- **Broad language and format support** — bundled parsers, with deeper semantic resolution for supported language families. See the [language reference](https://github.com/DeusData/codebase-memory-mcp#language-support) for coverage.
+- **Focused context** — retrieve symbols, relationships and bounded source excerpts instead of repeatedly reading whole files. Savings depend on the task and workflow.
+- **CBM Lens** — explore source, architecture, call paths, decisions and index coverage in a local browser workspace.
+- **Smart CI** — experimental change-aware test selection for supported C/C++ test runners, using graph relationships and admitted per-test coverage. Missing evidence broadens execution. See the [Smart CI guide](https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/SMART_CI.md).
 - **45 supported automatic/conditional client surfaces** — `install` configures the appropriate MCP, durable-context, and documented hook surfaces without widening client permissions.
 - **Detected automatically (39)** — Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Grok Build, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, Pi, and Oh My Pi (omp).
 - **Conditional or explicit (6)** — Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE, and Sourcegraph Cody. Bob IDE is touched only when `~/.bob/mcp.json` already exists.
@@ -68,30 +70,25 @@ Every MCP tool is also available directly from the command line:
 
 ```bash
 codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
-codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
-codebase-memory-mcp cli trace_call_path '{"function_name": "main", "direction": "both"}'
-codebase-memory-mcp cli get_architecture '{}'
+codebase-memory-mcp cli list_projects '{}'
+# Replace PROJECT with the indexed project name returned above.
+codebase-memory-mcp cli search_graph '{"project":"PROJECT","name_pattern":".*Handler.*","label":"Function"}'
+codebase-memory-mcp cli trace_path '{"project":"PROJECT","function_name":"main","direction":"both"}'
+codebase-memory-mcp cli get_architecture '{"project":"PROJECT"}'
 ```
 
 ## MCP Tools
 
 | Category | Tools |
 |----------|-------|
-| **Indexing** | `index_repository`, `list_projects`, `delete_project`, `index_status` |
-| **Querying** | `search_graph`, `trace_call_path`, `detect_changes`, `query_graph` |
-| **Analysis** | `get_architecture`, `get_graph_schema`, `get_code_snippet`, `search_code` |
-| **Advanced** | `manage_adr`, `ingest_traces` |
+| **Indexing and coverage** | `index_repository`, `list_projects`, `delete_project`, `index_status`, `check_index_coverage` |
+| **Search and source** | `search_graph`, `search_code`, `get_code_snippet`, `get_file_outline` |
+| **Relationships and changes** | `trace_path`, `query_graph`, `detect_changes`, `compare_graphs` |
+| **Architecture and evidence** | `get_architecture`, `get_graph_schema`, `manage_adr`, `ingest_traces` |
 
 ## Performance
 
-Benchmarked on Apple M3 Pro:
-
-| Operation | Time |
-|-----------|------|
-| Linux kernel full index (28M LOC, 75K files) | 3 min |
-| Django full index | ~6s |
-| Cypher query | <1ms |
-| Trace call path (depth=5) | <10ms |
+Performance and context savings depend on the repository, query, machine and agent workflow. See the [scoped benchmark results](https://github.com/DeusData/codebase-memory-mcp#performance) and [methodology](https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md) for recorded measurements and limitations.
 
 ## Full Documentation
 
