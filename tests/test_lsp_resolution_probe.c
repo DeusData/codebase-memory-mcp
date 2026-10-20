@@ -1850,6 +1850,57 @@ TEST(lrp_python_usage_instantiation) {
     PASS();
 }
 
+/* ── Ruby: cross-file through the prebuilt project registry ──────────
+ * Rails/Zeitwerk code names classes in other files with no require, and a
+ * class may be reopened in a third file. Both edges must come out of the
+ * Ruby resolver (ruby_* strategy), not the name-based one. */
+TEST(lrp_ruby_cross_file_zeitwerk) {
+    const LRP_File files[] = {
+        {"app/widget.rb", "class Widget\n"
+                          "  def run\n"
+                          "    h = Helper.new\n"
+                          "    h.assist\n"
+                          "    h.extra_step\n"
+                          "  end\n"
+                          "end\n"},
+        {"app/helper.rb", "class Helper\n"
+                          "  def assist\n"
+                          "    1\n"
+                          "  end\n"
+                          "end\n"},
+        {"lib/helper_ext.rb", "class Helper\n"
+                              "  def extra_step\n"
+                              "    2\n"
+                              "  end\n"
+                              "end\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, 3);
+    int assist = lrp_exact_calls_by_name(store, lp.project, "run", "assist");
+    int extra = lrp_exact_calls_by_name(store, lp.project, "run", "extra_step");
+    int typed = lrp_count_calls_with_strategy(store, lp.project, "ruby_method_typed");
+    if (assist < 1 || extra < 1 || typed < 2) {
+        fprintf(stderr, "  [LRP] ruby cross-file FAIL assist=%d extra_step=%d typed_edges=%d\n",
+                assist, extra, typed);
+        lrp_diag(store, lp.project, "ruby cross-file");
+        cbm_edge_t *edges = NULL;
+        int n = 0;
+        if (store &&
+            cbm_store_find_edges_by_type(store, lp.project, "CALLS", &edges, &n) == CBM_STORE_OK) {
+            for (int i = 0; i < n; i++)
+                fprintf(stderr, "    [LRP] CALLS %s\n",
+                        edges[i].properties_json ? edges[i].properties_json : "(none)");
+            cbm_store_free_edges(edges, n);
+        }
+    }
+    lrp_cleanup(&lp, store);
+    ASSERT_TRUE(assist >= 1);
+    ASSERT_TRUE(extra >= 1);
+    ASSERT_TRUE(typed >= 2);
+    PASS();
+}
+
+
 /* ══════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ══════════════════════════════════════════════════════════════════════ */
@@ -1967,4 +2018,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_usage_import_type_with_decoy);
     RUN_TEST(lrp_tsx_usage_import_type_with_decoy);
     RUN_TEST(lrp_python_usage_instantiation);
+
+    /* ── Ruby (project registry built once) ── */
+    RUN_TEST(lrp_ruby_cross_file_zeitwerk);
 }

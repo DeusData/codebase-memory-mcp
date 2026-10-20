@@ -25,6 +25,9 @@
  *   16c. Blocks that rebind self emit NO self edge (negative)
  *   17. Cross-file: defs from another file resolve
  *   18. Cross-file: ActiveRecord repro mirroring the Rails-shaped e2e fixture
+ *   19. Cross-file: a class reopened in a second file
+ *   20. Cross-file: compact `class A::B` in another file
+ *   21. Cross-file: one prebuilt registry serves many files unchanged
  *   Fail-closed ancestry (7c) and block-nested defs (7d) sit with mixins.
  *
  * Scope: rows 1-16 are SINGLE-FILE, driven through cbm_extract_file so they
@@ -1476,6 +1479,165 @@ TEST(rubylsp_cross_file_ar_repro) {
     PASS();
 }
 
+/* ── 19-21. Cross-file: the shared project registry ─────────────── */
+
+static void cross_def(CBMLSPDef *d, const char *qn, const char *short_name, const char *label,
+                      const char *module_qn, const char *receiver, const char *embedded) {
+    memset(d, 0, sizeof(*d));
+    d->qualified_name = qn;
+    d->short_name = short_name;
+    d->label = label;
+    d->def_module_qn = module_qn;
+    d->receiver_type = receiver;
+    d->embedded_types = embedded;
+    d->lang = CBM_LANG_RUBY;
+}
+
+static bool out_has(const CBMResolvedCallArray *out, const char *caller_sub, const char *callee) {
+    for (int i = 0; i < out->count; i++) {
+        if (out->items[i].caller_qn && out->items[i].callee_qn &&
+            strstr(out->items[i].caller_qn, caller_sub) &&
+            strcmp(out->items[i].callee_qn, callee) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void out_dump(const CBMResolvedCallArray *out) {
+    for (int i = 0; i < out->count; i++)
+        printf("    %s -> %s [%s]\n", out->items[i].caller_qn, out->items[i].callee_qn,
+               out->items[i].strategy);
+}
+
+TEST(rubylsp_cross_reopened_class_across_files) {
+    /* `class User` is reopened in a second file. Each file's class has its
+     * own QN (it carries the file's module QN) but one constant path, so a
+     * method defined in either reopening must be found, and the constructor
+     * edge lands on the first declaration. */
+    CBMLSPDef defs[4];
+    cross_def(&defs[0], "test.a.User", "User", "Class", "test.a", NULL, NULL);
+    cross_def(&defs[1], "test.a.User.name", "name", "Method", "test.a", "test.a.User", NULL);
+    cross_def(&defs[2], "test.b.User", "User", "Class", "test.b", NULL, NULL);
+    cross_def(&defs[3], "test.b.User.email", "email", "Method", "test.b", "test.b.User", NULL);
+
+    const char *src = "class Report\n"
+                      "  def run\n"
+                      "    u = User.new\n"
+                      "    u.name\n"
+                      "    u.email\n"
+                      "  end\n"
+                      "end\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.report", defs, 4, NULL, NULL, 0,
+                           NULL, &out);
+    bool ctor = out_has(&out, "Report.run", "test.a.User");
+    bool name = out_has(&out, "Report.run", "test.a.User.name");
+    bool email = out_has(&out, "Report.run", "test.b.User.email");
+    if (!(ctor && name && email))
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    ASSERT(ctor);
+    ASSERT(name);
+    ASSERT(email);
+    PASS();
+}
+
+TEST(rubylsp_cross_compact_class_name) {
+    /* A compact `class Admin::User` in another file has QN
+     * "<module>.Admin::User" but is found through the dotted path
+     * "Admin.User". */
+    CBMLSPDef defs[2];
+    cross_def(&defs[0], "test.admin.Admin::User", "User", "Class", "test.admin", NULL, NULL);
+    cross_def(&defs[1], "test.admin.Admin::User.greet", "greet", "Method", "test.admin",
+              "test.admin.Admin::User", NULL);
+
+    const char *src = "class Welcome\n"
+                      "  def run\n"
+                      "    Admin::User.new.greet\n"
+                      "  end\n"
+                      "end\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_ruby_lsp_cross(&arena, src, (int)strlen(src), "test.app.welcome", defs, 2, NULL, NULL,
+                           0, NULL, &out);
+    bool ctor = out_has(&out, "Welcome.run", "test.admin.Admin::User");
+    bool greet = out_has(&out, "Welcome.run", "test.admin.Admin::User.greet");
+    if (!(ctor && greet))
+        out_dump(&out);
+    cbm_arena_destroy(&arena);
+    ASSERT(ctor);
+    ASSERT(greet);
+    PASS();
+}
+
+TEST(rubylsp_cross_registry_built_once_serves_many_files) {
+    /* One registry, several files, superclass chain across files: the shared
+     * registry is read-only, so later files see exactly what earlier ones did
+     * and nothing a file declares leaks into it. */
+    CBMLSPDef defs[4];
+    cross_def(&defs[0], "test.base.Base", "Base", "Class", "test.base", NULL, NULL);
+    cross_def(&defs[1], "test.base.Base.shared_m", "shared_m", "Method", "test.base",
+              "test.base.Base", NULL);
+    cross_def(&defs[2], "test.child.Child", "Child", "Class", "test.child", NULL, "Base");
+    cross_def(&defs[3], "test.child.Child.own_m", "own_m", "Method", "test.child",
+              "test.child.Child", NULL);
+
+    CBMArena build;
+    cbm_arena_init(&build);
+    CBMRubyCrossRegistry *sh = cbm_ruby_build_cross_registry(&build, defs, 4);
+    ASSERT(sh != NULL);
+    int classes_before = sh->class_count;
+    int funcs_before = sh->reg.func_count;
+
+    const char *src1 =
+        "class One\n  def run\n    c = Child.new\n    c.shared_m\n    c.own_m\n  end\nend\n";
+    const char *src2 = "class Two\n  def run\n    Child.new.shared_m\n  end\nend\n";
+    const char *src3 = "class Three\n  def run\n    Local.new.shared_m\n  end\nend\n";
+    CBMArena a1;
+    CBMArena a2;
+    CBMArena a3;
+    cbm_arena_init(&a1);
+    cbm_arena_init(&a2);
+    cbm_arena_init(&a3);
+    CBMResolvedCallArray o1;
+    CBMResolvedCallArray o2;
+    CBMResolvedCallArray o3;
+    memset(&o1, 0, sizeof(o1));
+    memset(&o2, 0, sizeof(o2));
+    memset(&o3, 0, sizeof(o3));
+    cbm_run_ruby_lsp_cross_with_registry(&a1, src1, (int)strlen(src1), "test.app.one", sh, NULL,
+                                         NULL, 0, NULL, &o1);
+    cbm_run_ruby_lsp_cross_with_registry(&a2, src2, (int)strlen(src2), "test.app.two", sh, NULL,
+                                         NULL, 0, NULL, &o2);
+    cbm_run_ruby_lsp_cross_with_registry(&a3, src3, (int)strlen(src3), "test.app.three", sh, NULL,
+                                         NULL, 0, NULL, &o3);
+    bool one_inherited = out_has(&o1, "One.run", "test.base.Base.shared_m");
+    bool one_own = out_has(&o1, "One.run", "test.child.Child.own_m");
+    bool two_inherited = out_has(&o2, "Two.run", "test.base.Base.shared_m");
+    bool three_none = !out_has(&o3, "Three.run", "test.base.Base.shared_m");
+    bool untouched = sh->class_count == classes_before && sh->reg.func_count == funcs_before;
+    if (!(one_inherited && one_own && two_inherited && three_none && untouched)) {
+        out_dump(&o1);
+        out_dump(&o2);
+        out_dump(&o3);
+    }
+    cbm_arena_destroy(&a1);
+    cbm_arena_destroy(&a2);
+    cbm_arena_destroy(&a3);
+    cbm_arena_destroy(&build);
+    ASSERT(one_inherited);
+    ASSERT(one_own);
+    ASSERT(two_inherited);
+    ASSERT(three_none);
+    ASSERT(untouched);
+    PASS();
+}
+
 /* ── suite ──────────────────────────────────────────────────────── */
 
 void suite_ruby_lsp(void) {
@@ -1514,4 +1676,7 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_self_rebinding_blocks_no_edge);
     RUN_TEST(rubylsp_cross_file_defs);
     RUN_TEST(rubylsp_cross_file_ar_repro);
+    RUN_TEST(rubylsp_cross_reopened_class_across_files);
+    RUN_TEST(rubylsp_cross_compact_class_name);
+    RUN_TEST(rubylsp_cross_registry_built_once_serves_many_files);
 }
