@@ -20,9 +20,7 @@ enum { WP_TRUE = 1, WP_MIN = 1, WP_STEP = 1 };
 #include <stdatomic.h>
 #include <stdlib.h>
 
-/* 8 MB stack per worker — matches main thread default.
- * Required for deep AST recursion (tree-sitter + walk_defs). */
-#define CBM_WORKER_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
+/* CBM_WORKER_STACK_SIZE (8 MB per worker) lives in worker_pool.h. */
 
 /* ── Serial fallback ─────────────────────────────────────────────── */
 

@@ -25,10 +25,19 @@ NETWORK:src/daemon/ipc.c:connect:1:unix:local_socket_connect:single sockaddr_un-
 NETWORK:src/main.c:socket:1:loopback-v4:main_daemon_ctl_ui_endpoint_ready:single AF_INET stream client for authenticated daemon UI readiness
 NETWORK:src/main.c:connect:1:loopback-v4:main_daemon_ctl_socket_connected:single sockaddr_in connect whose address is hardcoded to 127.0.0.1 and whose response must prove the daemon generation HMAC
 
-# ── Coordination daemon: count-bounded private internal file writes ────────
+# ── Reviewed count-bounded file writes: private or caller-selected paths ───
 # Format: WRITE:file:expected-count:justification
 WRITE:src/main.c:3:supervised worker response path; cache-scoped hook notice marker; test-seam-only browser-open marker at the caller-supplied test path
 WRITE:src/daemon/application.c:1:recovery truncates only its private uniquely-created per-job marker file
+WRITE:src/cli/config_json_like.c:1:Windows exclusive temporary file beside the caller-selected config for atomic replacement
+WRITE:src/cli/config_text_edit.c:1:Windows exclusive temporary file beside the caller-selected config for atomic replacement and descriptor-bound identity checks
+WRITE:src/cli/config_yaml_edit.c:1:Windows exclusive temporary file beside the caller-selected config for atomic replacement
+WRITE:src/foundation/compat_fs.c:1:stream-copy fallback writes only the clone/copy destination selected by its caller
+WRITE:src/foundation/mem.c:1:opt-in allocator diagnostics write to the explicit CBM_MEM_STATS_OUT destination
+WRITE:src/mcp/test_impact_artifact.c:1:receipt staging file in the caller-selected artifact bundle before atomic replacement
+WRITE:src/mcp/test_impact_engine.c:1:merge-base configuration staged inside the engine's private working directory
+WRITE:src/mcp/test_impact_engine_artifact.c:1:reviewed coverage bytes copied into the newly-created output bundle
+WRITE:src/mcp/test_impact_git.c:1:bounded Git batch stdin staged in the private capture directory
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
 src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
@@ -65,6 +74,7 @@ src/pipeline/artifact.c:popen:via cbm_popen wrapper calls
 src/ui/http_server.c:popen:ps process listing for metrics endpoint
 src/ui/http_server.c:fork:spawn indexing subprocess
 src/ui/http_server.c:execl:exec indexing binary in child process
+src/ui/atlas_metrics.c:cbm_popen:local git churn/history/origin reads with validated paths and fixed log arguments; child Git environment isolation via cbm_popen_git
 
 # ── Allowed URLs ───────────────────────────────────────────────────────────
 # Format: URL:justification

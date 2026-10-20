@@ -1715,6 +1715,7 @@ TEST(mem_core_class_names_are_total) {
     ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_STORE), "store") == 0);
     ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_HASH_TABLE), "hash_table") == 0);
     ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_DYN_ARRAY), "dyn_array") == 0);
+    ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_GRAPH_CACHE), "graph_cache") == 0);
     /* Out of range must still answer, so a log line never takes a NULL. */
     ASSERT_TRUE(cbm_mem_class_name((cbm_mem_class_t)(CBM_MEM_CLASS_COUNT + 5)) != NULL);
     ASSERT_TRUE(cbm_mem_class_name((cbm_mem_class_t)-1) != NULL);

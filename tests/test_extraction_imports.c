@@ -1255,6 +1255,62 @@ TEST(csharp_local_name_last_segment) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * ES named imports keep the member their local binds
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static const CBMImport *imp_by_local(const CBMFileResult *r, const char *local) {
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].local_name && strcmp(r->imports.items[i].local_name, local) == 0) {
+            return &r->imports.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* `navigate` from `{ get as navigate }` binds axios's `get`: the call
+ * resolvers spell a call through it as axios.get. The member is set for a
+ * named import only (aliased or not) and survives compaction into the
+ * result's one exact arena block. */
+TEST(es_named_import_member_survives_compaction) {
+    CBMFileResult *r = do_extract("import ax from 'axios';\n"
+                                  "import * as ns from 'axios';\n"
+                                  "import { get as navigate, post } from 'axios';\n",
+                                  CBM_LANG_TYPESCRIPT, "member.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_result_compact(r);
+    const CBMImport *aliased = imp_by_local(r, "navigate");
+    const CBMImport *plain = imp_by_local(r, "post");
+    const CBMImport *def = imp_by_local(r, "ax");
+    const CBMImport *ns = imp_by_local(r, "ns");
+    ASSERT_NOT_NULL(aliased);
+    ASSERT_NOT_NULL(plain);
+    ASSERT_NOT_NULL(def);
+    ASSERT_NOT_NULL(ns);
+    ASSERT_STR_EQ(aliased->module_path, "axios");
+    ASSERT_STR_EQ(aliased->member, "get");
+    ASSERT_STR_EQ(plain->member, "post");
+    ASSERT_NULL(def->member);
+    ASSERT_NULL(ns->member);
+    uintptr_t member_addr = (uintptr_t)aliased->member;
+    uintptr_t arena_addr = (uintptr_t)r->arena.blocks[0];
+    ASSERT_EQ(r->arena.nblocks, 1);
+    ASSERT(member_addr >= arena_addr);
+    ASSERT(member_addr - arena_addr < r->arena.used);
+    cbm_free_result(r);
+
+    CBMFileResult *py =
+        do_extract("from paho.mqtt import publish as send\n", CBM_LANG_PYTHON, "member.py");
+    ASSERT_NOT_NULL(py);
+    const CBMImport *send = imp_by_local(py, "send");
+    ASSERT_NOT_NULL(send);
+    ASSERT_STR_EQ(send->module_path, "paho.mqtt.publish");
+    ASSERT_NULL(send->member);
+    cbm_free_result(py);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * SUITE declaration — do NOT register in test_main.c; the main workstream will
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1294,4 +1350,7 @@ SUITE(extraction_imports) {
     RUN_TEST(rust_local_name_last_segment);
     RUN_TEST(java_local_name_last_segment);
     RUN_TEST(csharp_local_name_last_segment);
+
+    /* ES named-import member (call resolution spells calls through it) */
+    RUN_TEST(es_named_import_member_survives_compaction);
 }

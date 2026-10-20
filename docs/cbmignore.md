@@ -70,7 +70,12 @@ For directories:
 
 1. **Built-in skip list** — `.git`, `node_modules`, `dist`, `target`,
    `vendor`, tool caches, etc. (60+ names; the fast/moderate index modes add
-  more, e.g. `docs`, `examples`, `testdata`). A `.cbmignore` negation
+  more, e.g. `docs`, `examples`, `testdata`). Generated output whose
+  folder name alone is too common to skip everywhere is matched by path
+  suffix instead: Laravel's compiled Blade view cache
+  `storage/framework/views/` (at any depth) is skipped even without
+  Laravel's stock `.gitignore` there, while other `views/` folders stay
+  indexed. A `.cbmignore` negation
   (for example `!target/`) can un-skip these directories, except the
   non-negatable safety core: `.git`, `node_modules`, `.worktrees`, and
   `.claude-worktrees`.

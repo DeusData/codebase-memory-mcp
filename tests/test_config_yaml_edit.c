@@ -1228,12 +1228,14 @@ TEST(config_yaml_edit_hermes_accepts_interior_brackets_in_plain_scalar_issue1924
 
 TEST(config_yaml_edit_hermes_hook_still_refuses_block_scalar_value_issue1924) {
     /* A `>` or `|` that BEGINS a value is a real block scalar whose
-     * indentation contract this editor does not model: the fail-closed
-     * refusal stays, and the file stays byte-identical. */
+     * indentation contract this editor does not model: inside the `hooks`
+     * subtree the edit descends into, the fail-closed refusal stays and the
+     * file stays byte-identical. The same construct in an untouched section
+     * is opaque user content (#2209). */
     static const char *const initials[] = {
-        "agent:\n  personalities:\n    probe: >\n      folded face\n",
-        "agent:\n  personalities:\n    probe: |\n      literal face\n",
-        "agent:\n  personalities:\n    probe: >-\n      chomped face\n",
+        "hooks:\n  probe: >\n    folded face\n",
+        "hooks:\n  probe: |\n    literal face\n",
+        "hooks:\n  probe: >-\n    chomped face\n",
     };
     for (size_t i = 0U; i < sizeof(initials) / sizeof(initials[0]); i++) {
         yaml_fixture_t fixture;
@@ -1250,10 +1252,10 @@ TEST(config_yaml_edit_hermes_hook_still_refuses_block_scalar_value_issue1924) {
 
 TEST(config_yaml_edit_hermes_hook_still_refuses_nonempty_flow_sequence_value_issue1924) {
     /* Pins the #1631 line: exact `[]` is accepted, a non-empty flow sequence
-     * value is still unsupported in the sequence-document scan. */
-    const char *initial = "agent:\n"
-                          "  personalities:\n"
-                          "    probe: [a, b]\n";
+     * value inside the edited `hooks` subtree is still unsupported. Outside
+     * it, the value is opaque user content (#2209). */
+    const char *initial = "hooks:\n"
+                          "  probe: [a, b]\n";
     yaml_fixture_t fixture;
     ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
     ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_ERROR);
@@ -2027,6 +2029,57 @@ TEST(config_yaml_edit_remove_on_absent_config_is_a_no_op) {
     PASS();
 }
 
+/* #2209: the stock Hermes config carries flow sequences and block scalars in
+ * sections the hook edit never touches (`platform_toolsets:` -> `cli:
+ * [hermes-cli]`, `plugins:` -> `enabled: [...]`, `|` prompts). They are opaque
+ * user content, exactly as for the mapping-entry editor that writes
+ * `mcp_servers` into the same file; only the `hooks` subtree is validated. */
+TEST(config_yaml_edit_nested_sequence_ignores_foreign_flow_and_block_scalars_issue2209) {
+    const char *initial = "plugins:\n"
+                          "  enabled: [disk-cleanup]\n"
+                          "platform_toolsets:\n"
+                          "  cli: [hermes-cli]\n"
+                          "  telegram: [hermes-telegram]\n"
+                          "toolsets: [all]\n"
+                          "agent:\n"
+                          "  system_prompt: |\n"
+                          "    You are helpful.\n"
+                          "      - keep: [this, text]\n"
+                          "  note: >\n"
+                          "    folded\n"
+                          "model:\n"
+                          "  default: \"anthropic/claude-opus-4.6\"\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(cbm_yaml_upsert_mapping_sequence_item(fixture.path, yaml_hook_sequence_path, 2U, "id",
+                                                    yaml_hook_identity, yaml_hook_canonical_item),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *installed = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_EQ(strncmp(installed, initial, strlen(initial)), 0);
+    ASSERT_NOT_NULL(strstr(installed, "hooks:\n"
+                                      "  pre_llm_call:\n"
+                                      "    - id: \"codebase-memory-mcp\"\n"));
+    ASSERT_EQ(cbm_yaml_upsert_mapping_sequence_item(fixture.path, yaml_hook_sequence_path, 2U, "id",
+                                                    yaml_hook_identity, yaml_hook_canonical_item),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *second = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_EQ(second, installed);
+    free(second);
+    free(installed);
+    ASSERT_EQ(cbm_yaml_remove_mapping_sequence_item(fixture.path, yaml_hook_sequence_path, 2U, "id",
+                                                    yaml_hook_identity, yaml_hook_canonical_item),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *removed = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(removed);
+    ASSERT_NULL(strstr(removed, "codebase-memory-mcp"));
+    ASSERT_EQ(strncmp(removed, initial, strlen(initial)), 0);
+    free(removed);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically) {
     const char *cases[] = {
         "hooks:\n   pre_llm_call:\n    - id: \"bad-indent\"\n",
@@ -2192,6 +2245,7 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_nested_sequence_preserves_crlf);
     RUN_TEST(config_yaml_edit_nested_sequence_foreign_identity_is_preserved);
     RUN_TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item);
+    RUN_TEST(config_yaml_edit_nested_sequence_ignores_foreign_flow_and_block_scalars_issue2209);
     RUN_TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically);
     RUN_TEST(config_yaml_edit_remove_on_absent_config_is_a_no_op);
 #ifndef _WIN32

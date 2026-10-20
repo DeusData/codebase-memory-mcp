@@ -16,6 +16,7 @@
 #include "test_framework.h"
 #include "repro_harness.h" /* RProj, rh_index_files, rh_count_label, rh_cleanup */
 #include "foundation/log.h"
+#include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -243,7 +244,60 @@ TEST(index_format_legacy_index_rebuilds_and_repairs) {
     PASS();
 }
 
+/* ── Test 3: an index from before format 3 drops its invented hosts ─── */
+
+/* Format 2 stored an image without a registry host under an invented
+ * docker.io identity. Refreshed in place, only touched files would get the
+ * new identity: both forms of one image in a single graph. */
+static const RFile k_image_files[] = {
+    {"a/Dockerfile", "FROM nginx:1.27\n"},
+    {"k8s.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+                 "  template:\n    spec:\n      containers:\n        - name: web\n"
+                 "          image: nginx:1.27\n"},
+};
+
+TEST(index_format_v2_images_rebuild_without_invented_host) {
+    RProj lp;
+    cbm_store_t *q0 = rh_index_files(&lp, k_image_files, 2);
+    ASSERT_NOT_NULL(q0);
+    cbm_store_close(q0);
+
+    /* The format-2 shape: the same node, edges kept, under its old identity. */
+    cbm_store_t *w = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(w);
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(w),
+                           "UPDATE nodes SET name='docker.io/library/nginx', "
+                           "qualified_name='__image__docker.io/library/nginx', "
+                           "properties='{\"repository\":\"docker.io/library/nginx\"}' "
+                           "WHERE label='Image' AND name='nginx'",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_changes(cbm_store_get_db(w)), 1);
+    ASSERT_EQ(cbm_store_set_format_version(w, 2), CBM_STORE_OK);
+    cbm_store_close(w);
+
+    char *resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    if (!strstr(g_log_buf, "format_change_reindex")) {
+        FAIL("a format-2 index was not routed through the full-reindex path");
+    }
+    cbm_store_t *r = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(r);
+    cbm_node_t n = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(r, lp.project, "__image__docker.io/library/nginx", &n),
+              CBM_STORE_NOT_FOUND);
+    cbm_node_free_fields(&n);
+    ASSERT_EQ(cbm_store_find_node_by_qn(r, lp.project, "__image__nginx", &n), CBM_STORE_OK);
+    ASSERT_NOT_NULL(n.properties_json);
+    ASSERT_NOT_NULL(strstr(n.properties_json, "\"registry\":\"unknown\""));
+    cbm_node_free_fields(&n);
+    rh_cleanup(&lp, r);
+    PASS();
+}
+
 SUITE(index_format) {
     RUN_TEST(index_format_siblings_distinct_and_searchable);
     RUN_TEST(index_format_legacy_index_rebuilds_and_repairs);
+    RUN_TEST(index_format_v2_images_rebuild_without_invented_host);
 }

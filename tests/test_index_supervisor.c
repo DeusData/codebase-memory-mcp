@@ -9,7 +9,9 @@
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/profile.h"
+#include "foundation/constants.h"
 #include "mcp/index_supervisor.h"
+#include "mcp/mcp.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -838,6 +840,82 @@ TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained) {
     PASS();
 }
 
+static char g_index_supervisor_no_response_log[CBM_SZ_2K];
+
+static void index_supervisor_test_no_response_sink(const char *line) {
+    if (strstr(line, "index.supervisor.no_response")) {
+        (void)snprintf(g_index_supervisor_no_response_log,
+                       sizeof(g_index_supervisor_no_response_log), "%s", line);
+    }
+}
+
+/* #1300: a worker that exits 0 without writing its response. The supervisor
+ * pre-creates the response file, so the old read returned "" and the run was
+ * a SUCCESS with an empty response; the clean-exit branch then deleted the
+ * worker log, the only record of where the run stopped. It must instead be a
+ * named failure: no response, the log retained, and the last phase the log
+ * recorded (incremental.edge_snapshot, not the plain stderr line after it). */
+TEST(index_supervisor_clean_exit_without_response_is_named_failure_issue1300) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-silent-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    g_index_supervisor_no_response_log[0] = '\0';
+    cbm_log_set_sink_ex(index_supervisor_test_no_response_sink, CBM_LOG_SINK_TEE);
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"silent-exit\"}", 0, false, NULL,
+                                          NULL, &handle);
+    char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
+    if (handle) {
+        (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
+    }
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool clean_exit = terminal && result && result->outcome == CBM_PROC_CLEAN &&
+                      result->exit_code == 0 && result->tree_quiesced;
+    bool no_response = terminal && result && result->response == NULL;
+    bool named = terminal && result && result->response_missing &&
+                 strcmp(result->last_phase, "incremental.edge_snapshot") == 0 &&
+                 strcmp(result->worker_log, log_path) == 0;
+    bool not_success =
+        terminal && result &&
+        cbm_mcp_supervised_result_disposition(0, result) != CBM_MCP_SUPERVISED_RESULT_SUCCESS;
+    bool log_retained = log_path[0] && cbm_file_size(log_path) > 0;
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_dump("silent-exit worker log", log_path);
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_log_set_format(saved_format);
+    bool event_named = strstr(g_index_supervisor_no_response_log,
+                              "last_phase=incremental.edge_snapshot") != NULL &&
+                       log_path[0] && strstr(g_index_supervisor_no_response_log, log_path) != NULL;
+    (void)cbm_unlink(log_path);
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(clean_exit);
+    ASSERT_TRUE(no_response);
+    ASSERT_TRUE(not_success);
+    ASSERT_TRUE(named);
+    ASSERT_TRUE(log_retained);
+    ASSERT_TRUE(event_named);
+    PASS();
+}
+
 /* #1070, #1130, #1132, #1133, #1145, #1450: six reports of an indexing worker
  * that died leaving "the worker log file is completely empty (0 KB)". Nothing
  * was ever flushed, so not one of them is reproducible or attributable — the
@@ -950,5 +1028,6 @@ SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat);
     RUN_TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback);
     RUN_TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained);
+    RUN_TEST(index_supervisor_clean_exit_without_response_is_named_failure_issue1300);
     RUN_TEST(index_supervisor_killed_worker_log_is_never_empty_and_names_the_run);
 }
