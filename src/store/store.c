@@ -5072,7 +5072,7 @@ void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
     free((char *)meta->index_mode);
     free((char *)meta->recorded_at);
     free((char *)meta->recording_status);
-    free((char *)meta->indexed_checkout_sha);
+    cbm_free(CBM_MEM_CLASS_STORE, (char *)meta->indexed_checkout_sha);
     memset(meta, 0, sizeof(*meta));
 }
 
@@ -5117,7 +5117,8 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
         if (has_checkout_column) {
             const char *sha = (const char *)sqlite3_column_text(stmt, 9);
-            out->indexed_checkout_sha = sha && sha[0] ? heap_strdup(sha) : NULL;
+            out->indexed_checkout_sha =
+                sha && sha[0] ? cbm_mem_strdup(CBM_MEM_CLASS_STORE, sha) : NULL;
         }
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||

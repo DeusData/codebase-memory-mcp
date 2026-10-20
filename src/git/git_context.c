@@ -3,6 +3,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 
@@ -524,16 +525,17 @@ static void status_add_sample(int *total, char ***samples, int *sample_count,
         *truncated = true;
         return;
     }
-    char *copy = (char *)malloc(path_len + 1);
+    char *copy = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, path_len + 1);
     if (!copy) {
         *truncated = true;
         return;
     }
     memcpy(copy, path, path_len);
     copy[path_len] = '\0';
-    char **grown = (char **)realloc(*samples, (size_t)(*sample_count + 1) * sizeof(char *));
+    char **grown = (char **)cbm_realloc(CBM_MEM_CLASS_OTHER, *samples,
+                                        (size_t)(*sample_count + 1) * sizeof(char *));
     if (!grown) {
-        free(copy);
+        cbm_free(CBM_MEM_CLASS_OTHER, copy);
         *truncated = true;
         return;
     }
@@ -668,12 +670,12 @@ void cbm_git_worktree_status_free(cbm_worktree_status_t *st) {
         return;
     }
     for (int i = 0; i < st->tracked_sample_count; i++) {
-        free(st->tracked_paths[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, st->tracked_paths[i]);
     }
-    free(st->tracked_paths);
+    cbm_free(CBM_MEM_CLASS_OTHER, st->tracked_paths);
     for (int i = 0; i < st->untracked_sample_count; i++) {
-        free(st->untracked_paths[i]);
+        cbm_free(CBM_MEM_CLASS_OTHER, st->untracked_paths[i]);
     }
-    free(st->untracked_paths);
+    cbm_free(CBM_MEM_CLASS_OTHER, st->untracked_paths);
     memset(st, 0, sizeof(*st));
 }
