@@ -1080,7 +1080,7 @@ TEST(index_attempt_only_project_can_be_deleted) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptOnlyFixture", cache),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptOnlyFixture"),
               CBM_INDEX_ATTEMPT_NONE);
     yyjson_mut_doc_free(document);
     restore_cache_dir(saved_copy);
@@ -8629,14 +8629,14 @@ TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture", cache),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     char *json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"state\":\"failed\""));
     ASSERT_NOT_NULL(strstr(json, "\"failure_code\":\"worker_lost\""));
     ASSERT_NOT_NULL(strstr(json, "\"profile\":\"strict\""));
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\":\"unknown\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
     free(json);
     yyjson_mut_doc_free(document);
 
@@ -8655,7 +8655,7 @@ TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job) {
     document = yyjson_mut_doc_new(NULL);
     root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture", cache),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
@@ -8683,13 +8683,13 @@ TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job) {
     document = yyjson_mut_doc_new(NULL);
     root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture", cache),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "AttemptFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"origin\":\"explicit\""));
     ASSERT_NOT_NULL(strstr(json, "\"watcher_observed_change\":true"));
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\":\"stale\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
     free(json);
     yyjson_mut_doc_free(document);
 
@@ -8700,7 +8700,7 @@ TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job) {
     PASS();
 }
 
-TEST(index_attempt_freshness_requires_same_clean_git_snapshot) {
+TEST(index_attempt_status_omits_freshness_string) {
     char *cache_created = th_mktempdir("cbm_attempt_fresh_cache");
     char *cache = cache_created ? strdup(cache_created) : NULL;
     char *repo_created = th_mktempdir("cbm_attempt_fresh_repo");
@@ -8748,11 +8748,11 @@ TEST(index_attempt_freshness_requires_same_clean_git_snapshot) {
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture", repo),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     char *json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\":\"fresh\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
     free(json);
     yyjson_mut_doc_free(document);
 
@@ -8766,12 +8766,12 @@ TEST(index_attempt_freshness_requires_same_clean_git_snapshot) {
     document = yyjson_mut_doc_new(NULL);
     root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture", repo),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"state\":\"failed\""));
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\":\"fresh\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
     free(json);
     yyjson_mut_doc_free(document);
 
@@ -8779,11 +8779,11 @@ TEST(index_attempt_freshness_requires_same_clean_git_snapshot) {
     document = yyjson_mut_doc_new(NULL);
     root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture", repo),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\":\"unknown\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
     free(json);
     yyjson_mut_doc_free(document);
 
@@ -8802,11 +8802,11 @@ TEST(index_attempt_freshness_requires_same_clean_git_snapshot) {
     document = yyjson_mut_doc_new(NULL);
     root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture", repo),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\":\"stale\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
     free(json);
     yyjson_mut_doc_free(document);
 
@@ -8831,12 +8831,12 @@ TEST(index_attempt_freshness_requires_same_clean_git_snapshot) {
     document = yyjson_mut_doc_new(NULL);
     root = yyjson_mut_obj(document);
     yyjson_mut_doc_set_root(document, root);
-    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture", repo),
+    ASSERT_EQ(cbm_mcp_index_attempt_add_status(document, root, "FreshFixture"),
               CBM_INDEX_ATTEMPT_AVAILABLE);
     json = yyjson_mut_write(document, 0, NULL);
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"generation_snapshot_available\":false"));
-    ASSERT_NOT_NULL(strstr(json, "\"freshness\":\"unknown\""));
+    ASSERT_NULL(strstr(json, "\"freshness\""));
     free(json);
     yyjson_mut_doc_free(document);
 
@@ -28647,7 +28647,7 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_freshness_status_unavailable_non_git);
     RUN_TEST(tool_index_status_freshness_sample_cap_truncates);
     RUN_TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job);
-    RUN_TEST(index_attempt_freshness_requires_same_clean_git_snapshot);
+    RUN_TEST(index_attempt_status_omits_freshness_string);
     RUN_TEST(index_attempt_only_project_can_be_deleted);
 
     /* Tool handlers with validation */
