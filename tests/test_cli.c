@@ -9220,6 +9220,106 @@ TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
         FAIL("dry-run must predict a refused hook-script rewrite (#1387)");
     PASS();
 }
+
+/* #2204: the OpenCode adapter is an auto-loaded module, and the generated block
+ * tells readers to "remove the markers to take ownership". A marker-less file
+ * with content is the user's: appending the block to a hand-ported module
+ * produces a file the client cannot even parse (the prelude redeclares the
+ * user's own import and const names, and both sides declare a default export).
+ * The installer must leave that file alone, and the dry run must say so instead
+ * of promising a write it will not make. */
+TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+
+    /* An `opencode` CLI on the isolated PATH marks OpenCode as installed. */
+    char exe[512];
+    snprintf(exe, sizeof(exe), "%s/opencode", bin);
+    if (write_test_file(exe, "#!/bin/sh\nexit 0\n") != 0 || chmod(exe, 0755) != 0)
+        FAIL("opencode fixture failed");
+
+    char plugins_dir[512];
+    snprintf(plugins_dir, sizeof(plugins_dir), "%s/.config/opencode/plugins", home);
+    test_mkdirp(plugins_dir);
+    char plugin_path[768];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/cbm-augment.ts", plugins_dir);
+    const char foreign[] = "import { spawn } from 'node:child_process';\n"
+                           "const BIN = '/opt/other/codebase-memory-mcp';\n"
+                           "export default { id: 'codebase-memory-augment', setup() {} };\n";
+    if (write_test_file(plugin_path, foreign) != 0)
+        FAIL("foreign module fixture failed");
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    bool redirected = false;
+    if (capture && saved_stdout >= 0) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
+    }
+    long plan_output_start = -1;
+    char *plan = NULL;
+    if (redirected) {
+        (void)cbm_install_agent_configs(home, "/opt/other/codebase-memory-mcp", false, true);
+        fflush(stdout);
+        /* The --plan receipt (#388) replays the same path with writes off. It
+         * must not list a module the run leaves alone, and it must print
+         * nothing: stdout carries the receipt JSON. */
+        plan_output_start = (long)lseek(STDOUT_FILENO, 0, SEEK_CUR);
+        plan = cbm_build_install_plan_json(home, "/opt/other/codebase-memory-mcp");
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (saved_stdout >= 0)
+        close(saved_stdout);
+
+    char bytes[512] = {0};
+    FILE *file = cbm_fopen(plugin_path, "rb");
+    size_t got = file ? fread(bytes, 1U, sizeof(bytes) - 1U, file) : 0U;
+    if (file)
+        fclose(file);
+
+    /* Control: with the user's module gone the receipt does list the path, so
+     * the omission above cannot pass just because OpenCode went undetected. */
+    char *control_plan = NULL;
+    if (unlink(plugin_path) == 0)
+        control_plan = cbm_build_install_plan_json(home, "/opt/other/codebase-memory-mcp");
+    client_detect_env_restore(&saved);
+
+    char output[16384] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+
+    bool warned = strstr(output, "cbm-augment.ts") != NULL && strstr(output, "not ours") != NULL;
+    bool untouched = got == sizeof(foreign) - 1U && memcmp(bytes, foreign, got) == 0;
+    bool plan_omits = plan && strstr(plan, "cbm-augment.ts") == NULL;
+    bool plan_silent = plan_output_start >= 0 && (size_t)plan_output_start <= strlen(output) &&
+                       strstr(output + plan_output_start, "cbm-augment.ts") == NULL;
+    bool control_lists = control_plan && strstr(control_plan, "cbm-augment.ts") != NULL;
+    free(plan);
+    free(control_plan);
+
+    test_rmdir_r(home);
+    if (!redirected)
+        FAIL("stdout capture failed");
+    if (!warned)
+        FAIL("dry-run must predict an untouched user-owned OpenCode module (#2204)");
+    if (!untouched)
+        FAIL("the user-owned OpenCode module must not be modified (#2204)");
+    if (!plan_omits)
+        FAIL("the install plan must not list a module the run leaves untouched (#2204)");
+    if (!plan_silent)
+        FAIL("plan mode must keep stdout for the receipt JSON (#2204)");
+    if (!control_lists)
+        FAIL("control: the install plan must list the module once it is not user-owned");
+    PASS();
+}
 #endif
 
 TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
@@ -18451,6 +18551,7 @@ SUITE(cli) {
 #endif
 #ifndef _WIN32
     RUN_TEST(cli_dry_run_predicts_refused_hook_script_issue1387);
+    RUN_TEST(cli_extension_leaves_user_owned_module_untouched_issue2204);
 #endif
     RUN_TEST(cli_agent_client_registry_routes_plan_install_and_uninstall);
     RUN_TEST(cli_registry_installs_kimi_rovo_amp_durable_context);
