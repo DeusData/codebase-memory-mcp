@@ -67,7 +67,7 @@ enum {
     MIN_ARGC_CMD = 3,
     /* minimum argc for subcommand with arg */ /* sqlite3_bind parameter index 2 */ /* 10 MB cap
                                                                                        factor */
-        CLI_MB_FACTOR = CLI_BUF_1K * CLI_BUF_1K,
+    CLI_MB_FACTOR = CLI_BUF_1K * CLI_BUF_1K,
     NUM_RETRIES = 5,
     NUM_DIRS = 4,
     DECOMP_FACTOR = 10,
