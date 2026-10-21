@@ -1,5 +1,7 @@
 #include "foundation/index_policy.h"
 
+#include "foundation/log.h"
+
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -197,7 +199,10 @@ void cbm_index_policy_finalize(cbm_index_resource_policy_t *policy, uint64_t hos
             policy->max_rss_bytes = limit_value(baseline);
         }
     }
-    if (policy->max_rss_bytes.enabled && host_cap > 0 && policy->max_rss_bytes.value > host_cap) {
+    uint64_t requested_rss = policy->max_rss_bytes.value;
+    bool host_tightened =
+        policy->max_rss_bytes.enabled && host_cap > 0 && requested_rss > host_cap;
+    if (host_tightened) {
         policy->max_rss_bytes.value = host_cap;
     }
     if (policy->max_rss_bytes.enabled) {
@@ -208,6 +213,16 @@ void cbm_index_policy_finalize(cbm_index_resource_policy_t *policy, uint64_t hos
         } else if (policy->max_rss_bytes.value > maximum) {
             policy->max_rss_bytes.value = maximum;
         }
+    }
+    if (host_tightened && policy->max_rss_bytes.value != requested_rss) {
+        char requested_bytes[32];
+        char applied_bytes[32];
+        (void)snprintf(requested_bytes, sizeof(requested_bytes), "%llu",
+                       (unsigned long long)requested_rss);
+        (void)snprintf(applied_bytes, sizeof(applied_bytes), "%llu",
+                       (unsigned long long)policy->max_rss_bytes.value);
+        cbm_log_warn("index.policy.host_rss_clamp", "requested_bytes", requested_bytes,
+                     "applied_bytes", applied_bytes);
     }
 }
 

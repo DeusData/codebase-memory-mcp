@@ -2368,8 +2368,11 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
         return false;
     }
     cbm_system_info_t system = cbm_system_info();
-    cbm_index_policy_finalize(&policy, (uint64_t)system.total_ram,
-                              application ? (uint64_t)application->worker_memory_budget_bytes : 0);
+    /* Strict measures itself against the per-worker slice, which is what the
+     * daemon budgets for one index today. */
+    uint64_t soft_budget =
+        application ? (uint64_t)cbm_daemon_application_worker_memory_budget_bytes(application) : 0;
+    cbm_index_policy_finalize(&policy, (uint64_t)system.total_ram, soft_budget);
     return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
 }
 

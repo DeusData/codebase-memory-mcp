@@ -939,7 +939,9 @@ codebase-memory-mcp config reset auto_index              # reset to default
 `index_resource_profile` defaults to `off` and accepts `off`, `balanced`, or
 `strict`. The six individual resource settings also default to `off`; an
 explicit value, including `off`, replaces that dimension of a selected
-profile. Exceeding an effective limit fails the complete index attempt rather
+profile. `index_max_rss_mb` cannot exceed 80% of detected host memory: a higher
+explicit value is lowered to that ceiling and logged. Exceeding an effective
+limit fails the complete index attempt rather
 than publishing a partial graph, and an existing serving index is preserved.
 Storage probes also fail closed when an enabled measurement cannot be
 completed. See
