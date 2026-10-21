@@ -203,6 +203,10 @@ struct cbm_pipeline {
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     cbm_index_resource_policy_t resource_policy;
     cbm_index_resource_violation_t resource_violation;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    cbm_pipeline_storage_probe_fn storage_probe;
+    void *storage_probe_context;
+#endif
 
     /* Snapshot of the artifact export failure of THIS run (set only by
      * export_after_publish failure, zeroed at run start, cleared on success).
@@ -935,6 +939,17 @@ const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
     return p ? p->export_error : "";
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_set_storage_probe_for_testing(cbm_pipeline_t *p,
+                                                cbm_pipeline_storage_probe_fn probe,
+                                                void *context) {
+    if (p) {
+        p->storage_probe = probe;
+        p->storage_probe_context = context;
+    }
+}
+#endif
+
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     if (!p || !name || !name[0]) {
         return false;
@@ -1195,7 +1210,8 @@ const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
 }
 
 const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p) {
-    return p && cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL;
+    return p && cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy
+                                                                        : NULL;
 }
 
 cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p) {
@@ -3291,7 +3307,6 @@ static int publish_generation_impl(const cbm_pipeline_generation_t *generation,
     if (generation->cancelled && atomic_load(generation->cancelled)) {
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
-
     /* The staging name must be unpredictable and created exclusively. It used
      * to be "<db>.stage.<pid>.<counter>", which any other process can compute
      * in advance; this path is then unlinked and written, so in a
@@ -3941,7 +3956,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         .ignore_file = NULL,
         .max_file_size = 0,
         .resource_policy =
-            cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
+            cbm_index_policy_discovery_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
         .resource_violation = &p->resource_violation,
     };
     cbm_file_info_t *files = NULL;
@@ -4122,6 +4137,216 @@ cleanup:
     return rc;
 }
 
+static const cbm_index_limit_u64_t *storage_limit_for_resource(
+    const cbm_index_resource_policy_t *policy, cbm_index_resource_t resource) {
+    if (!policy) {
+        return NULL;
+    }
+    switch (resource) {
+    case CBM_INDEX_RESOURCE_CACHE_BYTES:
+        return &policy->max_cache_bytes;
+    case CBM_INDEX_RESOURCE_FREE_DISK_BYTES:
+        return &policy->min_free_disk_bytes;
+    case CBM_INDEX_RESOURCE_FINAL_DB_BYTES:
+        return &policy->max_final_db_bytes;
+    case CBM_INDEX_RESOURCE_STAGING_BYTES:
+        return &policy->max_staging_bytes;
+    case CBM_INDEX_RESOURCE_TASK_TEMP_BYTES:
+        return &policy->max_task_temp_bytes;
+    default:
+        return NULL;
+    }
+}
+
+static cbm_index_resource_t storage_enabled_probe_resource(
+    const cbm_index_resource_policy_t *policy) {
+    if (policy->max_cache_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_CACHE_BYTES;
+    }
+    if (policy->min_free_disk_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_FREE_DISK_BYTES;
+    }
+    if (policy->max_staging_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_STAGING_BYTES;
+    }
+    if (policy->max_task_temp_bytes.enabled) {
+        return CBM_INDEX_RESOURCE_TASK_TEMP_BYTES;
+    }
+    return policy->max_final_db_bytes.enabled ? CBM_INDEX_RESOURCE_FINAL_DB_BYTES
+                                              : CBM_INDEX_RESOURCE_NONE;
+}
+
+static char *storage_root_from_final_path(const char *final_path) {
+    if (!final_path) {
+        return NULL;
+    }
+    char *root = strdup(final_path);
+    if (!root) {
+        return NULL;
+    }
+    char *slash = strrchr(root, '/');
+#ifdef _WIN32
+    char *backslash = strrchr(root, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    if (!slash) {
+        free(root);
+        return strdup(".");
+    }
+    if (slash == root) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return root;
+}
+
+static bool storage_regular_file_bytes(const char *path, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    cbm_path_info_t info;
+    int status = cbm_path_info_utf8(path, &info);
+    if (status == CBM_PATH_INFO_ABSENT) {
+        *bytes_out = 0;
+        return true;
+    }
+    if (status != CBM_PATH_INFO_OK || !info.is_regular || info.is_symlink || info.size < 0) {
+        return false;
+    }
+    *bytes_out = (uint64_t)info.size;
+    return true;
+}
+
+static bool storage_replaceable_old_bytes(const char *final_path, uint64_t *bytes_out) {
+    if (!final_path || !bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+    cbm_path_info_t info;
+    int status = cbm_path_info_utf8(final_path, &info);
+    if (status == CBM_PATH_INFO_ABSENT) {
+        return true;
+    }
+    if (status != CBM_PATH_INFO_OK || !info.is_regular || info.is_symlink) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(final_path);
+    if (!store) {
+        /* A file that cannot be opened is not proven replaceable. Keep its
+         * bytes in the projection rather than blocking repair of a confirmed
+         * corrupt/non-database destination. */
+        return true;
+    }
+    cbm_integrity_verdict_t verdict = cbm_store_check_integrity_verdict(store);
+    cbm_store_close(store);
+    if (verdict == CBM_INTEGRITY_TRANSIENT) {
+        return false;
+    }
+    /* A generation that cannot be proven healthy remains in current_cache but is
+     * not deducted: publication may quarantine it instead of replacing it. */
+    return verdict != CBM_INTEGRITY_OK || cbm_db_artifact_bytes(final_path, bytes_out);
+}
+
+static bool storage_probe_default(const cbm_index_resource_policy_t *policy,
+                                  cbm_pipeline_storage_checkpoint_t checkpoint,
+                                  const char *final_path, const char *staging_path,
+                                  cbm_index_storage_sample_t *sample,
+                                  cbm_index_resource_t *failed_resource) {
+    *sample = (cbm_index_storage_sample_t){0};
+    *failed_resource = CBM_INDEX_RESOURCE_NONE;
+    char *storage_root = NULL;
+    if (policy->max_cache_bytes.enabled || policy->min_free_disk_bytes.enabled) {
+        storage_root = storage_root_from_final_path(final_path);
+        if (!storage_root) {
+            *failed_resource = storage_enabled_probe_resource(policy);
+            return false;
+        }
+    }
+    uint64_t operation_bytes = 0;
+    bool need_operation =
+        staging_path &&
+        (policy->max_cache_bytes.enabled || policy->max_staging_bytes.enabled ||
+         policy->max_task_temp_bytes.enabled ||
+         (checkpoint == CBM_PIPELINE_STORAGE_PREPUBLISH && policy->max_final_db_bytes.enabled));
+    if (need_operation && !cbm_db_artifact_bytes(staging_path, &operation_bytes)) {
+        *failed_resource =
+            policy->max_staging_bytes.enabled
+                ? CBM_INDEX_RESOURCE_STAGING_BYTES
+                : (policy->max_task_temp_bytes.enabled
+                       ? CBM_INDEX_RESOURCE_TASK_TEMP_BYTES
+                       : (policy->max_final_db_bytes.enabled ? CBM_INDEX_RESOURCE_FINAL_DB_BYTES
+                                                             : CBM_INDEX_RESOURCE_CACHE_BYTES));
+        free(storage_root);
+        return false;
+    }
+    if (policy->max_cache_bytes.enabled) {
+        uint64_t cache_with_operation = 0;
+        if (!cbm_directory_size_bytes(storage_root, &cache_with_operation) ||
+            !storage_replaceable_old_bytes(final_path, &sample->replaceable_old_bytes)) {
+            *failed_resource = CBM_INDEX_RESOURCE_CACHE_BYTES;
+            free(storage_root);
+            return false;
+        }
+        sample->current_cache_bytes =
+            cache_with_operation > operation_bytes ? cache_with_operation - operation_bytes : 0;
+        sample->operation_bytes = operation_bytes;
+    }
+    if (policy->min_free_disk_bytes.enabled &&
+        !cbm_filesystem_free_bytes(storage_root, &sample->free_disk_bytes)) {
+        *failed_resource = CBM_INDEX_RESOURCE_FREE_DISK_BYTES;
+        free(storage_root);
+        return false;
+    }
+    free(storage_root);
+    if (checkpoint != CBM_PIPELINE_STORAGE_PREFLIGHT) {
+        sample->staging_bytes = operation_bytes;
+        sample->task_temp_bytes = operation_bytes;
+    }
+    if (checkpoint == CBM_PIPELINE_STORAGE_PREPUBLISH && policy->max_final_db_bytes.enabled &&
+        !storage_regular_file_bytes(staging_path, &sample->final_db_bytes)) {
+        *failed_resource = CBM_INDEX_RESOURCE_FINAL_DB_BYTES;
+        return false;
+    }
+    return true;
+}
+
+int cbm_pipeline_storage_admit(cbm_pipeline_t *p, cbm_pipeline_storage_checkpoint_t checkpoint,
+                               const char *final_path, const char *staging_path) {
+    if (!p || !cbm_index_policy_storage_enabled(&p->resource_policy)) {
+        return 0;
+    }
+    cbm_index_storage_sample_t sample;
+    cbm_index_resource_t failed_resource = CBM_INDEX_RESOURCE_NONE;
+    bool measured;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (p->storage_probe) {
+        measured = p->storage_probe(checkpoint, final_path, staging_path, &sample, &failed_resource,
+                                    p->storage_probe_context);
+    } else
+#endif
+    {
+        measured = storage_probe_default(&p->resource_policy, checkpoint, final_path, staging_path,
+                                         &sample, &failed_resource);
+    }
+    if (!measured) {
+        const cbm_index_limit_u64_t *limit =
+            storage_limit_for_resource(&p->resource_policy, failed_resource);
+        p->resource_violation = (cbm_index_resource_violation_t){
+            .resource = failed_resource,
+            .limit = limit && limit->enabled ? limit->value : 0,
+            .probe_failed = true,
+        };
+        return CBM_PIPELINE_RESOURCE_LIMIT;
+    }
+    if (!cbm_index_policy_check_storage(&p->resource_policy, &sample, &p->resource_violation)) {
+        return CBM_PIPELINE_RESOURCE_LIMIT;
+    }
+    return 0;
+}
+
 static void cleanup_staging_db(const char *path) {
     if (!path) {
         return;
@@ -4156,66 +4381,122 @@ static bool ensure_db_parent(const char *path) {
 }
 
 /* Length of the path a stage was minted for: the input itself unless its
- * basename has exactly the minted shape "<name>.stage.<6 alphanumerics>", in
- * which case the root is <name>. The outer run rewrites the pipeline's db_path
- * to its stage, so the inner publication (dump and delta clone) used to mint
- * ITS stage from that stage: <db>.stage.A.stage.B, with -wal/-shm beside it
- * (#1839). Minting from the root keeps every generation's stage a sibling of
- * the live database. Only the exact minted shape is recognised: a database
- * named "x.stage.y.db" is not a stage and keeps its full name. */
+ * basename has exactly the minted shape "<name>.stage.<6 alphanumerics>" or
+ * "<name>.stage.<token>.<6 alphanumerics>", in which case the root is <name>.
+ * The outer run rewrites the pipeline's db_path to its stage, so the inner
+ * publication (dump and delta clone) used to mint ITS stage from that stage:
+ * <db>.stage.A.stage.B, with -wal/-shm beside it (#1839). Minting from the
+ * root keeps every generation's stage a sibling of the live database. Only
+ * the exact minted shape is recognised: a database named "x.stage.y.db" is
+ * not a stage and keeps its full name. A worker stage token, when present,
+ * sits between the marker and the random suffix so the supervisor can find
+ * this attempt's temporary files. */
 enum { CBM_STAGE_SUFFIX_RANDOM_CHARS = 6 };
 static const char cbm_stage_marker[] = ".stage.";
 
-static bool stage_suffix_at(const char *tail) {
-    if (strncmp(tail, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
-        return false;
-    }
-    const char *random = tail + sizeof(cbm_stage_marker) - 1;
+static bool stage_token_char(unsigned char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+           ch == '-' || ch == '_';
+}
+
+static bool stage_random_suffix(const char *text) {
     for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
-        if (!isalnum((unsigned char)random[i])) {
+        if (!isalnum((unsigned char)text[i])) {
             return false;
         }
     }
-    return random[CBM_STAGE_SUFFIX_RANDOM_CHARS] == '\0';
+    return text[CBM_STAGE_SUFFIX_RANDOM_CHARS] == '\0';
+}
+
+/* after ".stage.": 6 alphanumerics, or <token>.<6 alphanumerics>, through end. */
+static bool stage_body_at(const char *after_marker) {
+    if (stage_random_suffix(after_marker)) {
+        return true;
+    }
+    const char *dot = strchr(after_marker, '.');
+    if (!dot || dot == after_marker) {
+        return false;
+    }
+    size_t token_len = (size_t)(dot - after_marker);
+    if (token_len < 6U || token_len >= CBM_SZ_64) {
+        return false;
+    }
+    for (size_t i = 0; i < token_len; i++) {
+        if (!stage_token_char((unsigned char)after_marker[i])) {
+            return false;
+        }
+    }
+    return stage_random_suffix(dot + 1);
 }
 
 static size_t stage_root_length(const char *path) {
     size_t len = strlen(path);
-    const size_t suffix_len = sizeof(cbm_stage_marker) - 1 + CBM_STAGE_SUFFIX_RANDOM_CHARS;
-    if (len <= suffix_len) {
+    const char *marker = NULL;
+    for (const char *next = strstr(path, cbm_stage_marker); next;
+         next = strstr(next + 1, cbm_stage_marker)) {
+        marker = next;
+    }
+    if (!marker) {
         return len;
     }
-    size_t root_len = len - suffix_len;
-    /* The marker must sit inside the basename, never span a separator. */
-    for (size_t i = root_len; i < len; i++) {
-        if (path[i] == '/'
+    for (const char *scan = marker; *scan; scan++) {
+        if (*scan == '/'
 #ifdef _WIN32
-            || path[i] == '\\'
+            || *scan == '\\'
 #endif
         ) {
             return len;
         }
     }
-    return stage_suffix_at(path + root_len) ? root_len : len;
+    if (!stage_body_at(marker + sizeof(cbm_stage_marker) - 1)) {
+        return len;
+    }
+    return (size_t)(marker - path);
+}
+
+static bool staging_token_valid(const char *token) {
+    size_t length = token ? strlen(token) : 0;
+    if (length < 6U || length >= CBM_SZ_64) {
+        return false;
+    }
+    for (size_t index = 0; index < length; index++) {
+        if (!stage_token_char((unsigned char)token[index])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static char *stage_allocate_template(const char *final_path) {
-    if (!final_path)
+    if (!final_path) {
         return NULL;
-    static const char suffix[] = ".stage.XXXXXX";
+    }
+    char suffix[CBM_SZ_128];
+    const char *stage_token = getenv("CBM_INDEX_STAGE_TOKEN");
+    if (!staging_token_valid(stage_token)) {
+        stage_token = NULL;
+    }
+    int suffix_length = stage_token && stage_token[0]
+                            ? snprintf(suffix, sizeof(suffix), ".stage.%s.XXXXXX", stage_token)
+                            : snprintf(suffix, sizeof(suffix), ".stage.XXXXXX");
+    if (suffix_length <= 0 || (size_t)suffix_length >= sizeof(suffix)) {
+        return NULL;
+    }
     size_t final_len = stage_root_length(final_path);
-    if (final_len > SIZE_MAX - sizeof(suffix))
+    if (final_len > SIZE_MAX - (size_t)suffix_length - 1U) {
         return NULL;
-    size_t path_size = final_len + sizeof(suffix);
+    }
+    size_t path_size = final_len + (size_t)suffix_length + 1U;
 #ifdef _WIN32
-    if (path_size > CBM_SZ_4K)
+    if (path_size > CBM_SZ_4K) {
         return NULL;
+    }
     path_size = CBM_SZ_4K;
 #endif
     char *path = malloc(path_size);
     if (path) {
         memcpy(path, final_path, final_len);
-        memcpy(path + final_len, suffix, sizeof(suffix));
+        memcpy(path + final_len, suffix, (size_t)suffix_length + 1U);
     }
     return path;
 }
@@ -4269,7 +4550,7 @@ static char *create_staging_path_impl(const char *final_path, cbm_pipeline_t *fr
     char *path = stage_allocate_template(final_path);
     if (!path)
         return NULL;
-    char *random_at = path + stage_root_length(final_path) + sizeof(cbm_stage_marker) - 1;
+    char *random_at = path + strlen(path) - CBM_STAGE_SUFFIX_RANDOM_CHARS;
     for (int attempt = 0; attempt < 128; attempt++) {
         int rc = stage_create_attempt(path, random_at, frozen);
         if (rc > 0)
@@ -4435,6 +4716,34 @@ static size_t stage_entry_stage_length_any_base(const char *name) {
     return stage_entry_stage_length(name, name, (size_t)(marker - name));
 }
 
+static const char *stage_name_after_marker(const char *after_marker) {
+    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
+        if (!isalnum((unsigned char)after_marker[i])) {
+            const char *dot = strchr(after_marker, '.');
+            if (!dot || dot == after_marker) {
+                return NULL;
+            }
+            size_t token_len = (size_t)(dot - after_marker);
+            if (token_len < 6U || token_len >= CBM_SZ_64) {
+                return NULL;
+            }
+            for (size_t n = 0; n < token_len; n++) {
+                if (!stage_token_char((unsigned char)after_marker[n])) {
+                    return NULL;
+                }
+            }
+            after_marker = dot + 1;
+            for (int j = 0; j < CBM_STAGE_SUFFIX_RANDOM_CHARS; j++) {
+                if (!isalnum((unsigned char)after_marker[j])) {
+                    return NULL;
+                }
+            }
+            return after_marker + CBM_STAGE_SUFFIX_RANDOM_CHARS;
+        }
+    }
+    return after_marker + CBM_STAGE_SUFFIX_RANDOM_CHARS;
+}
+
 static size_t stage_entry_stage_length(const char *name, const char *base, size_t base_len) {
     if (strncmp(name, base, base_len) != 0) {
         return 0;
@@ -4443,14 +4752,10 @@ static size_t stage_entry_stage_length(const char *name, const char *base, size_
     if (strncmp(at, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
         return 0;
     }
-    at += sizeof(cbm_stage_marker) - 1;
-    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
-        /* NUL is not alphanumeric, so a short name fails here too. */
-        if (!isalnum((unsigned char)at[i])) {
-            return 0;
-        }
+    at = stage_name_after_marker(at + sizeof(cbm_stage_marker) - 1);
+    if (!at) {
+        return 0;
     }
-    at += CBM_STAGE_SUFFIX_RANDOM_CHARS;
     for (size_t i = 0; i < sizeof(cbm_stage_sidecar_tails) / sizeof(cbm_stage_sidecar_tails[0]);
          i++) {
         if (strcmp(at, cbm_stage_sidecar_tails[i]) == 0) {
@@ -4652,10 +4957,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_log_debug("pipeline.setup", "step", "stage");
     pipeline_release_test_config(p);
     p->export_error[0] = '\0';
+    p->resource_violation = (cbm_index_resource_violation_t){0};
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);
         return CBM_NOT_FOUND;
+    }
+    int storage_rc =
+        cbm_pipeline_storage_admit(p, CBM_PIPELINE_STORAGE_PREFLIGHT, final_path, NULL);
+    if (storage_rc != 0) {
+        free(final_path);
+        return storage_rc;
     }
     struct stat final_st;
     bool final_existed = stat(final_path, &final_st) == 0;
@@ -4707,6 +5019,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         pipeline_release_test_config(p);
         return rc;
     }
+    storage_rc =
+        cbm_pipeline_storage_admit(p, CBM_PIPELINE_STORAGE_GROWTH, final_path, staging_path);
+    if (storage_rc != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        pipeline_release_test_config(p);
+        return storage_rc;
+    }
     /* A cancelled run and a live no-op both end here without publishing:
      * the stage placeholder is discarded, and only the no-op goes on to
      * finish on the live generation. */
@@ -4746,6 +5067,14 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         pipeline_release_test_config(p);
         return CBM_PIPELINE_PERSIST_FAILED;
+    }
+    storage_rc =
+        cbm_pipeline_storage_admit(p, CBM_PIPELINE_STORAGE_PREPUBLISH, final_path, staging_path);
+    if (storage_rc != 0) {
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return storage_rc;
     }
 
     /* Check after the before-publish hook and the final seal, while the

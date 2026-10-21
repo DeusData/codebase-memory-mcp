@@ -159,6 +159,7 @@ struct cbm_daemon_application_job {
      * job outlives the request and session that started it. */
     bool async_owned;
     bool worker_started;
+    uint64_t request_started_ms;
     cbm_daemon_application_job_t *next;
 };
 
@@ -361,8 +362,20 @@ static void application_worker_diagnostic(const char *line, void *context) {
 static int application_worker_start_default(void *context, const char *args_json,
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
+                                            uint64_t duration_origin_ms,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
+    cbm_index_resource_policy_t resource_policy;
+    char error[CBM_SZ_256] = {0};
+    char task_db_path[CBM_SZ_1K];
+    if (!cbm_mcp_index_policy_from_internal_args(args_json, &resource_policy, error,
+                                                 sizeof(error)) ||
+        !cbm_mcp_index_task_db_path(args_json, task_db_path, sizeof(task_db_path))) {
+        cbm_log_error("daemon.index.worker_policy", "error",
+                      error[0] ? error : "could not resolve worker index path");
+        *worker_out = NULL;
+        return -1;
+    }
     application_default_worker_t *worker = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*worker));
     if (!worker) {
         return -1;
@@ -372,9 +385,10 @@ static int application_worker_start_default(void *context, const char *args_json
     const char *root = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(args_doc), "repo_path"));
     worker->project = application_index_project_key(root, args_json);
     yyjson_doc_free(args_doc);
-    int result = cbm_index_worker_start_with_log(args_json, memory_budget_bytes, false, marker_file,
-                                                 quarantine_file, application_worker_diagnostic,
-                                                 worker, &worker->handle);
+    int result = cbm_index_worker_start_with_storage_policy(
+        args_json, memory_budget_bytes, &resource_policy, task_db_path, false, marker_file,
+        quarantine_file, application_worker_diagnostic, worker, duration_origin_ms,
+        &worker->handle);
     if (result != 0) {
         application_worker_destroy_default(NULL, worker);
         *worker_out = NULL;
@@ -1369,10 +1383,13 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     }
 
     cbm_daemon_application_worker_t worker = NULL;
+    if (job->request_started_ms == 0) {
+        job->request_started_ms = cbm_index_worker_now_ms();
+    }
     application_tmp_lock();
-    int start_result =
-        application->worker_ops.start(application->worker_ops.context, job->args_json,
-                                      memory_budget_bytes, marker_path, quarantine_path, &worker);
+    int start_result = application->worker_ops.start(
+        application->worker_ops.context, job->args_json, memory_budget_bytes, marker_path,
+        quarantine_path, job->request_started_ms, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
         return application_job_cancel_requested(job) ? APPLICATION_ATTEMPT_CANCELLED
@@ -1566,6 +1583,12 @@ static application_attempt_decision_t application_consume_attempt(
         execution->successful = application_index_response_succeeded(execution->response);
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
+    }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+        execution->response =
+            cbm_mcp_index_worker_resource_response(job->args_json, &attempt->result);
+        application_attempt_free(attempt);
+        return APPLICATION_ATTEMPT_DECISION_STOP;
     }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
         execution->unsafe_terminal = true;
@@ -2344,7 +2367,33 @@ static bool application_index_args_add_policy(cbm_daemon_application_t *applicat
         cbm_log_error("daemon.index.policy", "error", error);
         return false;
     }
+    cbm_system_info_t system = cbm_system_info();
+    /* Strict measures itself against the per-worker slice, which is what the
+     * daemon budgets for one index today. */
+    uint64_t soft_budget =
+        application ? (uint64_t)cbm_daemon_application_worker_memory_budget_bytes(application) : 0;
+    cbm_index_policy_finalize(&policy, (uint64_t)system.total_ram, soft_budget);
     return doc_candidates_encoded && cbm_mcp_index_policy_add_to_args(document, root, &policy);
+}
+
+static char *application_index_args_replace_policy(cbm_daemon_application_t *application,
+                                                   const char *args_json) {
+    yyjson_doc *source = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_mut_doc *document = source ? yyjson_doc_mut_copy(source, NULL) : NULL;
+    yyjson_doc_free(source);
+    yyjson_mut_val *root = document ? yyjson_mut_doc_get_root(document) : NULL;
+    if (!root || !yyjson_mut_is_obj(root)) {
+        yyjson_mut_doc_free(document);
+        return NULL;
+    }
+    while (yyjson_mut_obj_get(root, "_cbm_index_policy")) {
+        (void)yyjson_mut_obj_remove_key(root, "_cbm_index_policy");
+    }
+    char *rewritten = application_index_args_add_policy(application, document, root)
+                          ? yyjson_mut_write(document, 0, NULL)
+                          : NULL;
+    yyjson_mut_doc_free(document);
+    return rewritten;
 }
 
 static char *application_auto_index_args(cbm_daemon_application_t *application,
@@ -2640,14 +2689,19 @@ static const char *application_index_admission_error(application_job_subscribe_s
  * physical job limit); a cancelled request drops only its own reference. */
 static char *application_index_execute_sync(cbm_daemon_application_session_t *session,
                                             const char *root_path, const char *args_json) {
-    char *project_key = application_index_project_key(root_path, args_json);
+    char *trusted_args = application_index_args_replace_policy(session->application, args_json);
+    if (!trusted_args) {
+        return cbm_mcp_text_result("failed to resolve daemon index resource policy", true);
+    }
+    char *project_key = application_index_project_key(root_path, trusted_args);
     if (!project_key) {
+        free(trusted_args);
         return cbm_mcp_text_result("failed to derive index project identity", true);
     }
     application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
     cbm_daemon_application_job_t *job = NULL;
     for (;;) {
-        job = application_job_subscribe(session->application, project_key, root_path, args_json,
+        job = application_job_subscribe(session->application, project_key, root_path, trusted_args,
                                         &subscribe_status);
         if (job || (subscribe_status != APPLICATION_JOB_SUBSCRIBE_BUSY &&
                     subscribe_status != APPLICATION_JOB_SUBSCRIBE_CANCELLING)) {
@@ -2669,12 +2723,14 @@ static char *application_index_execute_sync(cbm_daemon_application_session_t *se
         cbm_mutex_unlock(&session->application->mutex);
         if (queued_cancelled) {
             free(project_key);
+            free(trusted_args);
             return cbm_mcp_text_result(
                 "index operation cancelled for this session. " CBM_MCP_INDEX_ASYNC_HINT, true);
         }
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
     free(project_key);
+    free(trusted_args);
     if (!job) {
         return cbm_mcp_text_result(application_index_admission_error(subscribe_status), true);
     }
