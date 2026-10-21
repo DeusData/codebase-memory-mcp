@@ -21711,10 +21711,11 @@ static void mcp_result_attach_failed_attempt(char **result_io, const char *warni
     }
 }
 
-/* Tools that answer from the published graph. A stale graph makes their
- * answers quietly wrong, which is exactly the case the warning exists for.
- * index_status and check_index_coverage already report freshness themselves,
- * and index_repository is the remedy, so none of them are annotated. */
+/* Tools that answer from the published graph. A failed rebuild can leave that
+ * graph missing later changes, which is the case this notice exists for.
+ * index_status and check_index_coverage already surface the attempt and
+ * coverage themselves, and index_repository is the remedy, so none of them
+ * are annotated. */
 static bool mcp_tool_answers_from_graph(const char *tool_name) {
     static const char *GRAPH_TOOLS[] = {
         "search_graph",     "query_graph",      "trace_path",  "trace_call_path",
