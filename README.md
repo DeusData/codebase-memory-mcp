@@ -578,6 +578,30 @@ Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-
 You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 ```
 
+### Install via Claude Code plugin
+
+This repository is also a Claude Code plugin marketplace, so you can find and
+add the server from inside Claude Code:
+
+```bash
+claude plugin marketplace add DeusData/codebase-memory-mcp
+claude plugin install codebase-memory@codebase-memory
+```
+
+The plugin registers the MCP server only. It starts the server with
+`npx -y codebase-memory-mcp@<version>`, pinned to the current release; the first
+start downloads that release's binary through the npm package, which verifies
+it against the release checksums. The skill, the three graph agents and the
+context hooks are not part of the plugin: they come from
+`codebase-memory-mcp install`.
+
+Use one or the other. `install` registers the same server for Claude Code, so
+with both you run it twice, under two tool namespaces
+(`mcp__codebase-memory-mcp__*` and
+`mcp__plugin_codebase-memory_codebase-memory-mcp__*`). Choose `install` for the
+full Claude Code setup; choose the plugin to add just the server without
+running an installer.
+
 ### Build from Source
 
 <details>
