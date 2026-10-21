@@ -26,13 +26,10 @@ jobs:
   security:
     needs: [changes]
     uses: ./.github/workflows/_security.yml
-    # The called job requests security-events:read to count code-scanning
-    # alerts; a reusable workflow cannot request more than its caller grants,
-    # so withholding this here fails the whole run at startup.
+    # No job in _security.yml reads code scanning or the Actions API any more
+    # (the CodeQL gate moved to codeql.yml), so the token stays read-only.
     permissions:
       contents: read
-      security-events: read
-      actions: read
     secrets: inherit
     with:
       lanes: ${{ needs.changes.outputs.lanes }}
@@ -128,6 +125,7 @@ jobs:
       full: ${{ steps.select.outputs.full }}
       lanes: ${{ steps.select.outputs.lanes }}
       smoke: ${{ steps.select.outputs.smoke }}
+      codeql: ${{ steps.select.outputs.codeql }}
     steps:
       - name: List the changed files
         env:
@@ -180,6 +178,10 @@ jobs:
           SMOKE='[{"os":"ubuntu-latest","lane":"smoke-ubuntu"},{"os":"macos-14","lane":"smoke-mac"},{"os":"windows-latest","lane":"smoke-win"}]'
           LANES=$(sed -n 's/^lanes=//p' "$RUNNER_TEMP/selection.txt")
           echo "smoke={\"include\":$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$SMOKE")}" >> "$GITHUB_OUTPUT"
+          # The CodeQL legs, tagged the same way (codeql.yml's full matrix has
+          # the same entries, so PR and main share a configuration).
+          CODEQL='[{"language":"c-cpp","build-mode":"manual","lane":"codeql-cpp"},{"language":"javascript-typescript","build-mode":"none","lane":"codeql-js"},{"language":"python","build-mode":"none","lane":"codeql-py"},{"language":"actions","build-mode":"none","lane":"codeql-actions"}]'
+          echo "codeql={\"include\":$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$CODEQL")}" >> "$GITHUB_OUTPUT"
 
   # ── Light smoke: build the PRODUCTION binary and run the core smoke on the
   #    three RELIABLE NATIVE platforms. Catches built-binary regressions at PR
@@ -361,13 +363,34 @@ jobs:
       - name: Contract steps only
         run: scripts/test.sh --contracts-only
 
+  # ── CodeQL PR scan (lanes codeql-cpp / -js / -py / -actions): one leg per
+  #    language whose first-party scope this PR changes; each analyses that
+  #    language's whole first-party scope, c-cpp with the vendored objects
+  #    compiled before tracing (except vendored files the PR changes), and
+  #    reports alerts on the changed lines (diff-informed). A job of this run,
+  #    needed by ci-ok -- nothing waits for a separate CodeQL run. Push to
+  #    main, dry run and release run the full scan (codeql.yml). ──
+  codeql:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (contains(fromJSON(needs.changes.outputs.lanes), 'codeql-cpp') || contains(fromJSON(needs.changes.outputs.lanes), 'codeql-js') || contains(fromJSON(needs.changes.outputs.lanes), 'codeql-py') || contains(fromJSON(needs.changes.outputs.lanes), 'codeql-actions')) }}
+    uses: ./.github/workflows/codeql.yml
+    # codeql.yml uploads results and reads alerts: a called workflow cannot
+    # request more than its caller grants (startup failure otherwise).
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    with:
+      light: true
+      matrix: ${{ needs.changes.outputs.codeql }}
+
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage
     # succeeded, so matrix renames can never silently deadlock merges, and
     # every lane the selector chose ran green: `skipped` is OK only for a lane
     # nobody selected (a selected lane that skipped is a silent gate loss).
     # memwaste and the test-impact shadow are report-only and not needed here.
-    needs: [changes, security, lint, test, pr-smoke, contracts]
+    needs: [changes, security, lint, test, pr-smoke, contracts, codeql]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

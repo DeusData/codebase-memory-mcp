@@ -1299,6 +1299,16 @@ $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c $(BUILD_DIR)/.build-co
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
+# The part of OBJS_VENDORED_PROD that holds no first-party code: everything but
+# prod_lsp_all.o (first-party LSP unity) and prod_preprocessor.o (first-party
+# code around vendored simplecpp). CodeQL's light PR scan builds these BEFORE
+# it starts tracing (scripts/build.sh --vendored-only), so the traced build
+# (--reuse-vendored) compiles first-party code only: the grammars alone are
+# most of the 1.3 GB of vendored C, against ~45 MB of first-party code.
+OBJS_THIRD_PARTY_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+.PHONY: cbm-third-party
+cbm-third-party: $(OBJS_THIRD_PARTY_PROD)
+
 MAIN_SRC = src/main.c
 
 # Rebuild when the build CONFIGURATION changes, not only when sources do. The

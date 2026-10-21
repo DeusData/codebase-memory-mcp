@@ -46,14 +46,12 @@ if [[ "$manifest_count" != "$expected" ]]; then
 fi
 
 # --- 3. Every published surface must claim exactly that number. ---
+# The #2729 messaging refresh dropped the count from docs/index.html,
+# docs/llms.txt, pkg/npm/README.md, scripts/package-release.sh and server.json;
+# section 4 below still fails if any of them states a count again unregistered.
 SURFACES=(
     README.md
-    docs/index.html
-    docs/llms.txt
-    pkg/npm/README.md
     pkg/chocolatey/codebase-memory-mcp.nuspec
-    scripts/package-release.sh
-    server.json
 )
 
 # Files that legitimately say "<N> languages" about something OTHER than the
