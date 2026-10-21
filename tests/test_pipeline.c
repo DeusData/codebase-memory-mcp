@@ -13,6 +13,7 @@
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
 #include "pipeline/lsp_surface.h"
+#include "pipeline/worker_pool.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/helm_template.h"
@@ -163,6 +164,129 @@ TEST(pipeline_background_worker_policy_preserves_overrides) {
     ASSERT_TRUE(recovery_override);
     PASS();
 }
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+enum { SURFACE_BUDGET_FILES = 5 };
+
+typedef struct {
+    atomic_int expected;
+    atomic_int arrivals;
+    atomic_int live;
+    atomic_int peak;
+    atomic_bool released;
+    atomic_int visits[SURFACE_BUDGET_FILES];
+    int helpers;
+} surface_budget_probe_t;
+
+static void surface_budget_spawned(int count, int helpers, void *arg) {
+    surface_budget_probe_t *probe = arg;
+    probe->helpers = helpers;
+    int participants = helpers + 1;
+    atomic_store(&probe->expected, count < participants ? count : participants);
+}
+
+static void surface_budget_row(int index, bool entering, void *arg) {
+    surface_budget_probe_t *probe = arg;
+    if (!entering) {
+        atomic_fetch_sub(&probe->live, 1);
+        return;
+    }
+    atomic_fetch_add(&probe->visits[index], 1);
+    int live = atomic_fetch_add(&probe->live, 1) + 1;
+    int peak = atomic_load(&probe->peak);
+    while (peak < live && !atomic_compare_exchange_weak(&probe->peak, &peak, live)) {}
+    atomic_fetch_add(&probe->arrivals, 1);
+    /* No timing window: hold the first wave until every possible participant
+     * has entered. The post-spawn observation accounts for partial thread
+     * creation and serial fallback, so neither can strand this gate. The test
+     * runner's watchdog bounds a broken dispatch without making time a verdict. */
+    while (!atomic_load(&probe->released)) {
+        int expected = atomic_load(&probe->expected);
+        if (expected > 0 && atomic_load(&probe->arrivals) >= expected) {
+            atomic_store(&probe->released, true);
+        }
+    }
+}
+
+TEST(pipeline_surface_respects_total_worker_budget) {
+    CBMFileResult results[SURFACE_BUDGET_FILES] = {0};
+    CBMFileResult *cache[SURFACE_BUDGET_FILES];
+    cbm_file_info_t files[SURFACE_BUDGET_FILES] = {
+        {.rel_path = "a.go", .language = CBM_LANG_GO},
+        {.rel_path = "b.go", .language = CBM_LANG_GO},
+        {.rel_path = "c.go", .language = CBM_LANG_GO},
+        {.rel_path = "d.go", .language = CBM_LANG_GO},
+        {.rel_path = "e.go", .language = CBM_LANG_GO},
+    };
+    surface_budget_probe_t probe = {0};
+    for (int i = 0; i < SURFACE_BUDGET_FILES; i++) {
+        cache[i] = &results[i];
+        atomic_init(&probe.visits[i], 0);
+    }
+    cache[1] = NULL; /* The skipped row must not change stable file ordering. */
+    atomic_init(&probe.expected, 0);
+    atomic_init(&probe.arrivals, 0);
+    atomic_init(&probe.live, 0);
+    atomic_init(&probe.peak, 0);
+    atomic_init(&probe.released, false);
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_setenv("CBM_WORKERS", "2", 1);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_pipeline_t *pipeline = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    cbm_pipeline_set_background(pipeline, true);
+    cbm_pipeline_ctx_t ctx = {.pipeline = pipeline};
+    cbm_lsp_surface_row_t *rows = NULL;
+    int count = 0;
+    cbm_parallel_test_set_spawn_observer(surface_budget_spawned, &probe);
+    cbm_lsp_surface_test_set_row_observer(surface_budget_row, &probe);
+    int rc = cbm_lsp_surface_build_rows(&ctx, "budget", cache, files, SURFACE_BUDGET_FILES, NULL,
+                                        NULL, &rows, &count);
+    int parallel_peak = atomic_load(&probe.peak);
+    int parallel_helpers = probe.helpers;
+    atomic_store(&probe.expected, 0);
+    atomic_store(&probe.arrivals, 0);
+    atomic_store(&probe.peak, 0);
+    atomic_store(&probe.released, false);
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    cbm_lsp_surface_row_t *serial_rows = NULL;
+    int serial_count = 0;
+    int serial_rc = cbm_lsp_surface_build_rows(&ctx, "budget", cache, files, SURFACE_BUDGET_FILES,
+                                               NULL, NULL, &serial_rows, &serial_count);
+    cbm_lsp_surface_test_set_row_observer(NULL, NULL);
+    cbm_parallel_test_set_spawn_observer(NULL, NULL);
+    bool same = rc == 0 && serial_rc == 0 && rows && serial_rows &&
+                count == SURFACE_BUDGET_FILES - 1 && count == serial_count;
+    for (int i = 0; same && i < count; i++) {
+        same = strcmp(rows[i].rel_path, files[i < 1 ? i : i + 1].rel_path) == 0 &&
+               strcmp(rows[i].defs_json, serial_rows[i].defs_json) == 0 &&
+               strcmp(rows[i].surface_sha, serial_rows[i].surface_sha) == 0;
+    }
+    cbm_store_free_lsp_surfaces(rows, count);
+    cbm_store_free_lsp_surfaces(serial_rows, serial_count);
+    cbm_pipeline_free(pipeline);
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                 : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(serial_rc, 0);
+    ASSERT_TRUE(same);
+    ASSERT_GTE(parallel_helpers, 1); /* A serial setup is not a concurrency repro. */
+    ASSERT_EQ(probe.helpers, 0);
+    ASSERT_EQ(atomic_load(&probe.live), 0);
+    for (int i = 0; i < SURFACE_BUDGET_FILES; i++) {
+        ASSERT_EQ(atomic_load(&probe.visits[i]), 2);
+    }
+    ASSERT_EQ(atomic_load(&probe.peak), 1);
+    ASSERT_EQ(parallel_peak, 2);
+    PASS();
+}
+#endif
 
 TEST(pipeline_background_policy_preserves_index_results) {
     ASSERT_EQ(setup_test_repo(), 0);
@@ -27721,6 +27845,9 @@ SUITE(pipeline) {
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
     RUN_TEST(pipeline_background_worker_policy_preserves_overrides);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_surface_respects_total_worker_budget);
+#endif
     RUN_TEST(pipeline_background_policy_preserves_index_results);
     RUN_TEST(pipeline_null_repo);
     RUN_TEST(pipeline_free_null);
