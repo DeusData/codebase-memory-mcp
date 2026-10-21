@@ -166,6 +166,7 @@ $guards = @(
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py",
+    "tests\windows\test_mcp_stdio.py",
     "tests\windows\test_windows_update_handoff.py"
 )
 
