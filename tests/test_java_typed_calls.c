@@ -17,8 +17,8 @@
  *   - a project type in the caller's own package that shares its simple
  *     name with a java.lang type (Process), or such a type declared in the
  *     caller's own file (Record): the own package wins.
- * The fixture is padded past MIN_FILES_FOR_PARALLEL: only the parallel path
- * builds the Java cross registry that proves a receiver external.
+ * The same fixture runs on the sequential path and, padded past
+ * MIN_FILES_FOR_PARALLEL, on the parallel one: both must agree.
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
@@ -250,6 +250,33 @@ static int jt_expect_no_edge(jt_index_t *ix, const char *caller, const char *lea
     return 0;
 }
 
+/* The CALLS edges out of the svc package, one sorted line each, with the
+ * project prefix dropped so two indexes compare. The Java resolver's
+ * strategies are kept; the textual registry's are one label, as its names
+ * already differ between the two paths before this resolver runs (a
+ * constructor is import_map on one and unique_name on the other). */
+static char *jt_edge_set(jt_index_t *ix) {
+    const char *sql =
+        "SELECT group_concat(x, char(10)) FROM (SELECT s.name || '|' || "
+        "coalesce(json_extract(e.properties,'$.callee'),'') || '|' || "
+        "substr(t.qualified_name, length(?1) + 2) || '|' || "
+        "CASE WHEN json_extract(e.properties,'$.strategy') LIKE 'lsp%' "
+        "THEN json_extract(e.properties,'$.strategy') ELSE 'registry' END AS x FROM edges e "
+        "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+        "WHERE e.type = 'CALLS' AND s.file_path LIKE '%/svc/%' ORDER BY x)";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(ix->db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+    sqlite3_bind_text(st, 1, ix->project, -1, SQLITE_STATIC);
+    char *out = NULL;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+        out = strdup((const char *)sqlite3_column_text(st, 0));
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
 /* ── Tests ───────────────────────────────────────────────────────── */
 
 static int jt_check_external(jt_index_t *ix) {
@@ -290,11 +317,38 @@ static int jt_run_all(int filler) {
     return ok;
 }
 
+TEST(java_typed_calls_sequential) {
+    ASSERT_TRUE(jt_run_all(0));
+    PASS();
+}
+
 TEST(java_typed_calls_parallel) {
     ASSERT_TRUE(jt_run_all(60));
     PASS();
 }
 
+/* The sequential and the parallel path produce the same svc edges. */
+TEST(java_typed_calls_paths_agree) {
+    jt_index_t seq;
+    jt_index_t par;
+    int seq_rc = jt_index(&seq, 0);
+    int par_rc = jt_index(&par, 60);
+    char *a = seq_rc == 0 ? jt_edge_set(&seq) : NULL;
+    char *b = par_rc == 0 ? jt_edge_set(&par) : NULL;
+    int same = a && b && strcmp(a, b) == 0;
+    if (!same) {
+        printf("\n  sequential:\n%s\n  parallel:\n%s\n", a ? a : "(none)", b ? b : "(none)");
+    }
+    free(a);
+    free(b);
+    jt_close(&seq);
+    jt_close(&par);
+    ASSERT_TRUE(same);
+    PASS();
+}
+
 SUITE(java_typed_calls) {
+    RUN_TEST(java_typed_calls_sequential);
     RUN_TEST(java_typed_calls_parallel);
+    RUN_TEST(java_typed_calls_paths_agree);
 }
