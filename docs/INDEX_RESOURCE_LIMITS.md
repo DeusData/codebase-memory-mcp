@@ -198,16 +198,17 @@ response shape.
 A background rebuild that fails reaches only the logs and `index_status`, which
 leaves a caller querying an older graph with nothing to warn it. Once a record
 is in a `failed` or `cancelled` state, the next answer served from that
-project's graph carries a stale-index warning naming the origin, the recorded
-finish time, and the limit that ended the attempt. The warning is attached to
-`search_graph`, `query_graph`, `trace_path`, `trace_call_path`,
-`get_architecture`, `get_code_snippet`, and `search_code`; `index_status` and
-`check_index_coverage` already report freshness themselves, and
+project's graph says the last attempt failed and that the published graph may
+be missing later changes. That is not a claim the graph is stale: a failed
+rebuild can still match the tree, and a dirty tree is never evidence either
+way. The notice is attached to `search_graph`, `query_graph`, `trace_path`,
+`trace_call_path`, `get_architecture`, `get_code_snippet`, and `search_code`;
+`index_status` and `check_index_coverage` already describe the index, and
 `index_repository` is the remedy. A JSON payload receives a
-`stale_index_warning` field so a structured reader cannot miss it, and a text
-or tree payload receives a trailing content block; the answer itself keeps its
-position and content. A queued or running rebuild is not yet a failure and
-produces no warning, and a completed rebuild clears it.
+`last_index_attempt_failed` field so a structured reader cannot miss it, and a
+text or tree payload receives a trailing content block; the answer itself keeps
+its position and content. A queued or running rebuild is not yet a failure and
+produces no notice, and a completed rebuild clears it.
 
 ## Trust and compatibility
 

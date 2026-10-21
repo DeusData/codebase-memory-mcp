@@ -154,9 +154,9 @@ left to its own object. `delete_project` also removes a matching attempt
 record when no database was published.
 
 While the recorded attempt is `failed` or `cancelled`, the graph-answering
-tools also attach a stale-index warning to their results, so a rebuild that
-failed in the background cannot leave a caller trusting an older graph in
-silence. A completed rebuild clears it.
+tools also attach a `last_index_attempt_failed` notice. It says the last
+rebuild failed and that the published graph may be missing later changes; it
+does not claim the graph is stale. A completed rebuild clears it.
 
 ## 3. UI Settings
 

@@ -8026,7 +8026,7 @@ cbm_index_attempt_read_status_t cbm_mcp_index_attempt_add_status(yyjson_mut_doc 
 /* Describe why the recorded attempt left the caller on an older graph. The
  * violation detail is optional: an attempt can fail before any resource is
  * attributed, and the warning still has to say something useful. */
-static void index_attempt_stale_cause(yyjson_val *root, char *out, size_t out_size) {
+static void index_attempt_failure_cause(yyjson_val *root, char *out, size_t out_size) {
     out[0] = '\0';
     yyjson_val *failure = yyjson_obj_get(root, "resource_failure");
     yyjson_val *resource =
@@ -8063,8 +8063,9 @@ static void index_attempt_stale_cause(yyjson_val *root, char *out, size_t out_si
 
 /* Fires only on a recorded terminal failure, so it costs one small record read
  * per answered query and never probes git or the filesystem. A queued or
- * running rebuild stays silent here and is reported by index_status. */
-static bool index_attempt_stale_warning(const char *project, char *out, size_t out_size) {
+ * running rebuild stays silent here and is reported by index_status. Failure
+ * is not evidence that the published graph diverges from the tree. */
+static bool index_attempt_failure_notice(const char *project, char *out, size_t out_size) {
     if (!project || !project[0] || !out || out_size == 0) {
         return false;
     }
@@ -8084,12 +8085,11 @@ static bool index_attempt_stale_warning(const char *project, char *out, size_t o
     yyjson_val *origin = yyjson_obj_get(root, "origin");
     yyjson_val *finished = yyjson_obj_get(root, "finished_at");
     char cause[CBM_SZ_256];
-    index_attempt_stale_cause(root, cause, sizeof(cause));
+    index_attempt_failure_cause(root, cause, sizeof(cause));
     snprintf(out, out_size,
-             "Stale index warning: the last %s index attempt for project '%s' %s%s%s%s. These "
-             "results come from the previously published graph and may not match the current "
-             "working tree. Call index_status for the recorded attempt, then index_repository to "
-             "rebuild once the cause is addressed.",
+             "The last %s index attempt for project '%s' %s%s%s%s. The published graph may "
+             "be missing changes made since that attempt. Call index_status for the recorded "
+             "attempt, then index_repository to rebuild once the cause is addressed.",
              origin && yyjson_is_str(origin) ? yyjson_get_str(origin) : "recorded", project,
              cancelled ? "was cancelled" : "failed",
              finished && yyjson_is_str(finished) ? " at " : "",
@@ -21648,12 +21648,13 @@ static void release_request_store(cbm_mcp_server_t *srv) {
     cbm_mem_collect();
 }
 
-/* Attach one stale-graph warning to a finished tool result. A JSON payload
- * gains a `stale_index_warning` field so the signal survives structured
+/* Attach one failed-attempt notice to a finished tool result. A JSON payload
+ * gains a `last_index_attempt_failed` field so the signal survives structured
  * parsing; text and tree payloads gain a trailing content block instead. The
  * first content item is never displaced, because hook_augment and the smoke
- * tests read it as the payload. */
-static void mcp_result_attach_stale_warning(char **result_io, const char *warning) {
+ * tests read it as the payload. The notice says the last rebuild failed; it
+ * does not claim the published graph is stale. */
+static void mcp_result_attach_failed_attempt(char **result_io, const char *warning) {
     yyjson_doc *parsed = yyjson_read(*result_io, strlen(*result_io), 0);
     yyjson_mut_doc *document = parsed ? yyjson_mut_doc_new(NULL) : NULL;
     yyjson_mut_val *root =
@@ -21680,7 +21681,7 @@ static void mcp_result_attach_stale_warning(char **result_io, const char *warnin
         yyjson_mut_doc *rewritten = yyjson_doc_mut_copy(payload_document, NULL);
         yyjson_mut_val *rewritten_root = rewritten ? yyjson_mut_doc_get_root(rewritten) : NULL;
         char *rendered = rewritten_root && yyjson_mut_obj_add_strcpy(rewritten, rewritten_root,
-                                                                     "stale_index_warning", warning)
+                                                                     "last_index_attempt_failed", warning)
                              ? yyjson_mut_write(rewritten, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL)
                              : NULL;
         yyjson_mut_doc_free(rewritten);
@@ -21690,7 +21691,7 @@ static void mcp_result_attach_stale_warning(char **result_io, const char *warnin
             yyjson_mut_val *structured = yyjson_mut_obj_get(root, "structuredContent");
             if (attached && structured && yyjson_mut_is_obj(structured)) {
                 attached =
-                    yyjson_mut_obj_add_strcpy(document, structured, "stale_index_warning", warning);
+                    yyjson_mut_obj_add_strcpy(document, structured, "last_index_attempt_failed", warning);
             }
             free(rendered);
         }
@@ -21732,15 +21733,15 @@ static bool mcp_tool_answers_from_graph(const char *tool_name) {
  * which leaves a caller querying an older graph with no visible signal. Say so
  * on the next answer served from that graph. Every failure here is silent:
  * a warning that cannot be produced must never turn a good answer into one. */
-static void mcp_result_warn_if_stale(const char *tool_name, const char *args_json,
+static void mcp_result_note_failed_attempt(const char *tool_name, const char *args_json,
                                      char **result_io) {
     if (!args_json || !result_io || !*result_io || !mcp_tool_answers_from_graph(tool_name)) {
         return;
     }
     char *project = get_project_arg(args_json);
     char warning[CBM_SZ_1K];
-    if (project && index_attempt_stale_warning(project, warning, sizeof(warning))) {
-        mcp_result_attach_stale_warning(result_io, warning);
+    if (project && index_attempt_failure_notice(project, warning, sizeof(warning))) {
+        mcp_result_attach_failed_attempt(result_io, warning);
     }
     free(project);
 }
@@ -21767,7 +21768,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         srv->read_batch_tool = false;
         cbm_store_read_batch_end(srv->store);
     }
-    mcp_result_warn_if_stale(tool_name, args_json, &result);
+    mcp_result_note_failed_attempt(tool_name, args_json, &result);
     cbm_mem_phase_mark("request.scope_end");
     if (srv) {
         cbm_mcp_server_request_scope_end(srv);

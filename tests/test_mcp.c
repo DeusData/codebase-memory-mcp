@@ -7044,9 +7044,9 @@ TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job) {
 }
 
 /* A rebuild that dies on a resource limit leaves the previously published
- * graph in service. Without a signal on the answers themselves, the caller
- * keeps trusting a graph that no longer matches the tree. */
-TEST(stale_index_warning_reaches_graph_answers) {
+ * graph in service. The next graph answer says that attempt failed. It does
+ * not claim the graph is stale: a failed rebuild may still match the tree. */
+TEST(last_index_attempt_failed_reaches_graph_answers) {
     char *cache = th_mktempdir("cbm_stale_warning");
     ASSERT_NOT_NULL(cache);
     const char *saved_cache = getenv("CBM_CACHE_DIR");
@@ -7099,7 +7099,7 @@ TEST(stale_index_warning_reaches_graph_answers) {
     /* The answer keeps its place at content[0]; the warning rides along in the
      * same object so a structured reader cannot miss it. */
     ASSERT_NOT_NULL(strstr(inner, "StaleProbe"));
-    ASSERT_NOT_NULL(strstr(inner, "\"stale_index_warning\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"last_index_attempt_failed\""));
     ASSERT_NOT_NULL(strstr(inner, "index_max_files"));
     ASSERT_NOT_NULL(strstr(inner, "120000"));
     ASSERT_NOT_NULL(strstr(inner, "watcher"));
@@ -7111,7 +7111,7 @@ TEST(stale_index_warning_reaches_graph_answers) {
              "{\"project\":\"%s\",\"name_pattern\":\".*StaleProbe.*\"}", project);
     resp = cbm_mcp_handle_tool(srv, "search_graph", default_args);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "Stale index warning"));
+    ASSERT_NOT_NULL(strstr(resp, "may be missing changes"));
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "StaleProbe"));
@@ -7123,7 +7123,7 @@ TEST(stale_index_warning_reaches_graph_answers) {
     snprintf(status_args, sizeof(status_args), "{\"project\":\"%s\"}", project);
     resp = cbm_mcp_handle_tool(srv, "index_status", status_args);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NULL(strstr(resp, "stale_index_warning"));
+    ASSERT_NULL(strstr(resp, "last_index_attempt_failed"));
     free(resp);
 
     /* A rebuild that is merely in flight is not yet a failure. */
@@ -7134,7 +7134,7 @@ TEST(stale_index_warning_reaches_graph_answers) {
                                                  false));
     resp = cbm_mcp_handle_tool(srv, "search_graph", json_args);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NULL(strstr(resp, "stale_index_warning"));
+    ASSERT_NULL(strstr(resp, "last_index_attempt_failed"));
     free(resp);
 
     ASSERT_TRUE(cbm_mcp_index_attempt_transition(project, cache, inflight_id, "completed", NULL,
@@ -7142,7 +7142,7 @@ TEST(stale_index_warning_reaches_graph_answers) {
     resp = cbm_mcp_handle_tool(srv, "search_graph", json_args);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "StaleProbe"));
-    ASSERT_NULL(strstr(resp, "stale_index_warning"));
+    ASSERT_NULL(strstr(resp, "last_index_attempt_failed"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -25635,7 +25635,7 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
     RUN_TEST(index_attempt_record_rejects_stale_transition_and_recovers_abandoned_job);
-    RUN_TEST(stale_index_warning_reaches_graph_answers);
+    RUN_TEST(last_index_attempt_failed_reaches_graph_answers);
     RUN_TEST(index_attempt_status_omits_freshness_string);
     RUN_TEST(index_attempt_only_project_can_be_deleted);
 
