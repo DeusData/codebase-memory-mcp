@@ -5,6 +5,7 @@
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 #include "foundation/index_policy.h"
+#include "foundation/log.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -153,22 +154,43 @@ TEST(index_policy_explicit_override_and_off_replace_profile_dimensions) {
     PASS();
 }
 
+static char g_host_clamp_log[512];
+
+static void capture_host_clamp_log(const char *line) {
+    (void)snprintf(g_host_clamp_log, sizeof(g_host_clamp_log), "%s", line ? line : "");
+}
+
 TEST(index_policy_host_clamp_only_tightens_explicit_rss) {
     cbm_index_resource_policy_t policy;
     cbm_index_policy_init(&policy);
     char error[256];
+    CBMLogLevel saved_level = cbm_log_get_level();
 
     ASSERT_TRUE(
         cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "4096", error, sizeof(error)));
+    g_host_clamp_log[0] = '\0';
+    cbm_log_set_level(CBM_LOG_WARN);
+    cbm_log_set_sink(capture_host_clamp_log);
     cbm_index_policy_finalize(&policy, UINT64_C(2048) * CBM_INDEX_MIB_BYTES, 0);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
     ASSERT_EQ(policy.max_rss_bytes.value,
               (UINT64_C(2048) * CBM_INDEX_MIB_BYTES * UINT64_C(4)) / UINT64_C(5));
+    ASSERT_NOT_NULL(strstr(g_host_clamp_log, "index.policy.host_rss_clamp"));
+    ASSERT_NOT_NULL(strstr(g_host_clamp_log, "requested_bytes=4294967296"));
+    ASSERT_NOT_NULL(strstr(g_host_clamp_log, "applied_bytes=1717986918"));
 
     cbm_index_policy_init(&policy);
     ASSERT_TRUE(
         cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_MAX_RSS_MB, "512", error, sizeof(error)));
+    g_host_clamp_log[0] = '\0';
+    cbm_log_set_level(CBM_LOG_WARN);
+    cbm_log_set_sink(capture_host_clamp_log);
     cbm_index_policy_finalize(&policy, UINT64_C(2048) * CBM_INDEX_MIB_BYTES, 0);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
     ASSERT_EQ(policy.max_rss_bytes.value, UINT64_C(512) * CBM_INDEX_MIB_BYTES);
+    ASSERT_EQ(g_host_clamp_log[0], '\0');
     PASS();
 }
 

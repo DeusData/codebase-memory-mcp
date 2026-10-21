@@ -7,9 +7,13 @@ by default so existing large-repository workloads retain their current behavior.
 ## Resource profiles
 
 `index_resource_profile` accepts `off`, `balanced`, or `strict` and defaults to
-`off`. A profile supplies a baseline; each explicitly stored individual
-resource key then replaces its dimension. An explicit `off` disables only that
-dimension.
+`off`. A profile supplies a baseline. Each explicitly stored individual
+resource key then replaces its dimension, and an explicit `off` disables only
+that dimension. Charged memory is the exception: 80% of detected host memory
+is a hard ceiling. No individual key can raise `index_max_rss_mb` above it,
+including an explicit value set while the profile is `off`. When that ceiling
+lowers a configured value, the process logs `index.policy.host_rss_clamp` with
+`requested_bytes` and `applied_bytes`.
 
 | Dimension | `balanced` | `strict` |
 |---|---:|---:|
