@@ -80,6 +80,8 @@ fi
 printf '%s\n' "$changed" |
     bash "$ROOT/scripts/ci/select-lanes.sh" --codeql-scope c-cpp |
     while IFS= read -r path; do
+        # Native Windows Python writes CRLF; read removes only the LF.
+        path="${path%$'\r'}"
         entrypoints=()
         case "$path" in
         internal/cbm/grammar_*.c | internal/cbm/ts_runtime.c)
