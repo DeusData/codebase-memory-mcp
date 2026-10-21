@@ -288,7 +288,6 @@ TEST(invariant_discovery_fast_skip_dirs) {
         { "public" },
         { "third_party" },
         { "thirdparty" },
-        { "external" },
         { "migrations" },
         { "build" },  /* build is in FAST_SKIP_DIRS, not ALWAYS */
         { "bin" },
