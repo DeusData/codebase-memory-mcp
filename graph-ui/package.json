@@ -62,7 +62,7 @@
     "playwright": "1.62.1",
     "three-stdlib": "2.36.1",
     "typescript": "5.9.3",
-    "vite": "6.4.3",
+    "vite": "6.4.4",
     "vitest": "4.1.11"
   },
   "overrides": {
