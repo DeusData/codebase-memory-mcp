@@ -17,9 +17,12 @@
  *
  * Unresolved:
  *   missing    the path is not in the graph, but its directory is: the
- *              document names something that is not there (doc rot)
+ *              document names something that is not there (doc rot); or a
+ *              code file's member that the file does not define
  *   ambiguous  a file name alone that is not next to the document but exists
- *              elsewhere in the repository: the document does not say which
+ *              elsewhere in the repository: the document does not say which;
+ *              or a member name the file defines more than once, with no
+ *              owner to pick one
  * Not a reference to this repository at all (LOCAL: no edge, no row): a link
  * back into the same document; a path that is neither indexed nor of a type
  * the indexer reads (an image, an archive, an extensionless page); a path
@@ -478,12 +481,24 @@ static void mdr_file_defs(const mdr_index_t *x, const char *path, int *lo, int *
     *hi = e;
 }
 
+/* How a member lookup ended: found, or why not. */
+typedef enum {
+    MDR_MEMBER_FOUND = 0,
+    MDR_MEMBER_MISSING,   /* no definition of that name in the file */
+    MDR_MEMBER_AMBIGUOUS, /* several, and the owner does not pick one */
+} mdr_member_t;
+
 /* The code definition of file `path` that the range or the member names, or
  * NULL. Read from the index's definitions by file, never from DEFINES edges:
  * an incremental run's graph holds the edges of the files it re-extracts
- * only, while every node is there. */
+ * only, while every node is there. *member_result (when not NULL) says how a
+ * member lookup ended. */
 static const cbm_gbuf_node_t *mdr_segment(const mdr_index_t *x, const char *path, uint32_t first,
-                                          uint32_t last, const char *member) {
+                                          uint32_t last, const char *member,
+                                          mdr_member_t *member_result) {
+    if (member_result) {
+        *member_result = MDR_MEMBER_FOUND;
+    }
     int lo = 0;
     int hi = 0;
     mdr_file_defs(x, path, &lo, &hi);
@@ -516,6 +531,9 @@ static const cbm_gbuf_node_t *mdr_segment(const mdr_index_t *x, const char *path
     size_t owner_len;
     mdr_member_names(member, &name, &name_len, &owner, &owner_len);
     if (!name) {
+        if (member_result) {
+            *member_result = MDR_MEMBER_MISSING;
+        }
         return NULL;
     }
     const cbm_gbuf_node_t *hit = NULL;
@@ -537,7 +555,13 @@ static const cbm_gbuf_node_t *mdr_segment(const mdr_index_t *x, const char *path
     if (owned_hits == SKIP_ONE) {
         return owned;
     }
-    return owned_hits == 0 && hits == SKIP_ONE ? hit : NULL;
+    if (owned_hits == 0 && hits == SKIP_ONE) {
+        return hit;
+    }
+    if (member_result) {
+        *member_result = hits == 0 ? MDR_MEMBER_MISSING : MDR_MEMBER_AMBIGUOUS;
+    }
+    return NULL;
 }
 
 /* Is `path` of a file type the indexer reads? */
@@ -1151,9 +1175,21 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
                 out->kind = CBM_DOCLINK_LOCAL; /* a link into the same document */
                 return;
             }
-            const cbm_gbuf_node_t *seg = (r->first > 0 || r->member)
-                                             ? mdr_segment(x, t, r->first, r->last, r->member)
-                                             : NULL;
+            mdr_member_t member_result = MDR_MEMBER_FOUND;
+            const cbm_gbuf_node_t *seg =
+                (r->first > 0 || r->member)
+                    ? mdr_segment(x, t, r->first, r->last, r->member, &member_result)
+                    : NULL;
+            /* A named member that a code file does not define is no coarser
+             * link to the file: it is a stale or unclear reference. A
+             * document's own headings are not definitions, so members of
+             * other files keep the file edge. */
+            if (!seg && r->member && member_result != MDR_MEMBER_FOUND && mdr_code_file(t)) {
+                out->kind = CBM_DOCLINK_UNRESOLVED;
+                out->reason = member_result == MDR_MEMBER_AMBIGUOUS ? CBM_DOCLINK_REASON_AMBIGUOUS
+                                                                    : CBM_DOCLINK_REASON_MISSING;
+                return;
+            }
             mdr_edge(out, seg ? seg : file, r->first, r->last);
             return;
         }
@@ -1388,7 +1424,8 @@ static void mdr_resolve(const void *index, void *state, int run_file, const CBMD
 
 const cbm_gbuf_node_t *cbm_doclink_md_segment(const void *md_index, const char *path,
                                               uint32_t first, uint32_t last, const char *member) {
-    return md_index ? mdr_segment((const mdr_index_t *)md_index, path, first, last, member) : NULL;
+    return md_index ? mdr_segment((const mdr_index_t *)md_index, path, first, last, member, NULL)
+                    : NULL;
 }
 
 /* ── A region of a file's text (the field test's H8 bind_range) ─────── */
