@@ -892,14 +892,20 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * Service/route classification below still runs. Mirrors pass_parallel.c. */
     bool php_vendor_call = cbm_pipeline_php_vendor_call(php_vendor, result, call) ||
                            cbm_pipeline_lsp_external_receiver(lsp);
+    /* A Java call on a JDK/library type is never bound to a project method
+     * found by name (no tail match, no registry guess). MUST match
+     * pass_parallel.c. */
+    bool java_external = cbm_pipeline_java_external_target(lang, lsp);
     if (lsp) {
         bool exact_external_target = call->requires_lsp_resolution &&
                                      cbm_pipeline_kotlin_external_target(lang, lsp->callee_qn);
         const cbm_gbuf_node_t *target_node =
-            exact_external_target ? cbm_pipeline_lsp_target_node_strict(
-                                        ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail)
-                                  : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
-                                                                 lsp->callee_qn, allow_tail);
+            java_external ? cbm_pipeline_lsp_target_node_strict(ctx->gbuf, ctx->project_name,
+                                                                lsp->callee_qn, false)
+            : exact_external_target ? cbm_pipeline_lsp_target_node_strict(
+                                          ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail)
+                                    : cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name,
+                                                                   lsp->callee_qn, allow_tail);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
@@ -988,7 +994,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
-    if (!rust_external && !php_vendor_call) {
+    if (!rust_external && !php_vendor_call && !java_external) {
         /* Python LEGB fallback first (MUST match pass_parallel.c). */
         res =
             cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn, imp_keys,

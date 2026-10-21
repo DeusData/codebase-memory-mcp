@@ -3730,6 +3730,36 @@ TEST(parallel_rust_external_target_contract) {
     PASS();
 }
 
+/* Contract for cbm_pipeline_java_external_target: only a Java row the
+ * resolver marked lsp_external, naming a qualified member, is external. The
+ * end-to-end probes live in test_java_typed_calls.c. */
+TEST(parallel_java_external_target_contract) {
+    CBMResolvedCall rc = {0};
+    rc.callee_qn = "org.jooq.DSLContext.select";
+    rc.strategy = "lsp_external";
+    ASSERT_TRUE(cbm_pipeline_java_external_target(CBM_LANG_JAVA, &rc));
+    /* Every other strategy keeps the registry fallback. */
+    rc.strategy = "lsp_type_dispatch";
+    ASSERT_FALSE(cbm_pipeline_java_external_target(CBM_LANG_JAVA, &rc));
+    rc.strategy = "lsp_unresolved";
+    ASSERT_FALSE(cbm_pipeline_java_external_target(CBM_LANG_JAVA, &rc));
+    /* A bare name is no member of any type. */
+    rc.strategy = "lsp_external";
+    rc.callee_qn = "select";
+    ASSERT_FALSE(cbm_pipeline_java_external_target(CBM_LANG_JAVA, &rc));
+    /* Per-language: no other language is affected. */
+    rc.callee_qn = "org.jooq.DSLContext.select";
+    ASSERT_FALSE(cbm_pipeline_java_external_target(CBM_LANG_KOTLIN, &rc));
+    /* Defensive NULL inputs. */
+    ASSERT_FALSE(cbm_pipeline_java_external_target(CBM_LANG_JAVA, NULL));
+    rc.callee_qn = NULL;
+    ASSERT_FALSE(cbm_pipeline_java_external_target(CBM_LANG_JAVA, &rc));
+    rc.callee_qn = "org.jooq.DSLContext.select";
+    rc.strategy = NULL;
+    ASSERT_FALSE(cbm_pipeline_java_external_target(CBM_LANG_JAVA, &rc));
+    PASS();
+}
+
 /* Gate guard for the JVM-only unique-tail fallbacks (lsp_resolve.h).
  *
  * The tail fallbacks join LSP overrides across QN drift by unique
@@ -5587,6 +5617,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_rust_external_target_contract);
+    RUN_TEST(parallel_java_external_target_contract);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
