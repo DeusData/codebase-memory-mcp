@@ -89,8 +89,7 @@ bool cbm_mcp_index_attempt_transition(const char *project, const char *repo_path
 bool cbm_mcp_index_attempt_mark_watcher_change(const char *project, const char *attempt_id);
 cbm_index_attempt_read_status_t cbm_mcp_index_attempt_add_status(yyjson_mut_doc *document,
                                                                  yyjson_mut_val *root,
-                                                                 const char *project,
-                                                                 const char *current_root_path);
+                                                                 const char *project);
 bool cbm_mcp_index_attempt_remove(const char *project);
 void cbm_mcp_index_attempt_recover_abandoned(void);
 

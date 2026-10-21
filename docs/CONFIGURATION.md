@@ -148,12 +148,10 @@ timeout. See
 error-response details.
 
 After the first physical indexing attempt for a project, `index_status` adds
-`last_index_attempt` and `freshness`. Freshness is `fresh` only when a clean
-Git snapshot observed both before and after indexing still matches the current
-clean `HEAD`. A different clean `HEAD` is `stale`, while non-Git, dirty,
-changed-during-index, missing, or unreadable snapshots are `unknown`.
-`delete_project` also removes a matching attempt record when no database was
-published.
+`last_index_attempt`. It does not add a `freshness` string. A dirty tree is
+never treated as evidence of freshness or staleness, and checkout freshness is
+left to its own object. `delete_project` also removes a matching attempt
+record when no database was published.
 
 ## 3. UI Settings
 

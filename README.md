@@ -943,8 +943,8 @@ profile. `index_max_rss_mb` cannot exceed 80% of detected host memory: a higher
 explicit value is lowered to that ceiling and logged. Exceeding an effective
 limit fails the complete index attempt rather
 than publishing a partial graph, and an existing serving index is preserved.
-`index_status` reports the latest physical indexing attempt and Git-based
-freshness after the first recorded attempt. See
+`index_status` reports the latest physical indexing attempt after the first
+recorded attempt, and does not add a `freshness` string. See
 [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables

@@ -8004,8 +8004,7 @@ static void index_attempt_finish_response(const char *project, const char *repo_
 
 cbm_index_attempt_read_status_t cbm_mcp_index_attempt_add_status(yyjson_mut_doc *document,
                                                                  yyjson_mut_val *root,
-                                                                 const char *project,
-                                                                 const char *current_root_path) {
+                                                                 const char *project) {
     bool exists = false;
     yyjson_doc *attempt = index_attempt_read(project, &exists);
     if (!exists) {
@@ -8013,43 +8012,14 @@ cbm_index_attempt_read_status_t cbm_mcp_index_attempt_add_status(yyjson_mut_doc 
     }
     if (!attempt) {
         yyjson_mut_obj_add_null(document, root, "last_index_attempt");
-        yyjson_mut_obj_add_str(document, root, "freshness", "unknown");
         return CBM_INDEX_ATTEMPT_CORRUPT;
     }
     yyjson_val *attempt_root = yyjson_doc_get_root(attempt);
     yyjson_mut_val *copy = yyjson_val_mut_copy(document, attempt_root);
+    yyjson_doc_free(attempt);
     if (!copy || !yyjson_mut_obj_add_val(document, root, "last_index_attempt", copy)) {
-        yyjson_doc_free(attempt);
         return CBM_INDEX_ATTEMPT_CORRUPT;
     }
-
-    const char *freshness = "unknown";
-    yyjson_val *watcher_change = yyjson_obj_get(attempt_root, "watcher_observed_change");
-    yyjson_val *state = yyjson_obj_get(attempt_root, "state");
-    bool watcher_stale = watcher_change && yyjson_is_bool(watcher_change) &&
-                         yyjson_get_bool(watcher_change) && state && yyjson_is_str(state) &&
-                         strcmp(yyjson_get_str(state), "completed") != 0;
-    yyjson_val *available = yyjson_obj_get(attempt_root, "generation_snapshot_available");
-    yyjson_val *generation_commit = yyjson_obj_get(attempt_root, "generation_commit");
-    yyjson_val *generation_dirty = yyjson_obj_get(attempt_root, "generation_dirty");
-    if (watcher_stale) {
-        freshness = "stale";
-    } else if (available && yyjson_is_bool(available) && yyjson_get_bool(available) &&
-               generation_commit && yyjson_is_str(generation_commit) && generation_dirty &&
-               yyjson_is_bool(generation_dirty) && !yyjson_get_bool(generation_dirty) &&
-               current_root_path && current_root_path[0]) {
-        cbm_git_snapshot_t current = {0};
-        if (cbm_git_snapshot_read(current_root_path, &current) == 0 && current.available) {
-            if (!current.dirty) {
-                freshness = strcmp(current.head_sha, yyjson_get_str(generation_commit)) == 0
-                                ? "fresh"
-                                : "stale";
-            }
-        }
-        cbm_git_snapshot_free(&current);
-    }
-    yyjson_mut_obj_add_str(document, root, "freshness", freshness);
-    yyjson_doc_free(attempt);
     return CBM_INDEX_ATTEMPT_AVAILABLE;
 }
 
@@ -8169,7 +8139,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_val *attempt_root = attempt_document ? yyjson_mut_obj(attempt_document) : NULL;
         cbm_index_attempt_read_status_t attempt_status =
             attempt_root && project
-                ? cbm_mcp_index_attempt_add_status(attempt_document, attempt_root, project, NULL)
+                ? cbm_mcp_index_attempt_add_status(attempt_document, attempt_root, project)
                 : CBM_INDEX_ATTEMPT_NONE;
         if (attempt_status != CBM_INDEX_ATTEMPT_NONE) {
             yyjson_mut_doc_set_root(attempt_document, attempt_root);
@@ -8235,7 +8205,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
             if (verbose) {
                 add_git_context_json(doc, root, proj_info.root_path);
             }
-            (void)cbm_mcp_index_attempt_add_status(doc, root, project, proj_info.root_path);
+            (void)cbm_mcp_index_attempt_add_status(doc, root, project);
         }
         add_coverage_report(doc, root, store, project, have_proj_info ? proj_info.indexed_at : NULL,
                             coverage_samples);
