@@ -73,16 +73,22 @@ static int git_run(const char *dir, const char *args) {
 
 /* Create a minimal git repo at dir (init + empty commit so HEAD exists). */
 static int make_git_repo(const char *dir) {
-    if (th_mkdir_p(dir) != 0) return -1;
-    if (git_run(dir, "init -q") != 0) return -1;
-    if (git_run(dir, "config user.email test@example.com") != 0) return -1;
-    if (git_run(dir, "config user.name Test") != 0) return -1;
+    if (th_mkdir_p(dir) != 0)
+        return -1;
+    if (git_run(dir, "init -q") != 0)
+        return -1;
+    if (git_run(dir, "config user.email test@example.com") != 0)
+        return -1;
+    if (git_run(dir, "config user.name Test") != 0)
+        return -1;
     /* Create a file so HEAD points to a real commit. */
     char path[1024];
     snprintf(path, sizeof(path), "%s/.keep", dir);
     th_write_file(path, "");
-    if (git_run(dir, "add .keep") != 0) return -1;
-    if (git_run(dir, "commit -q -m init") != 0) return -1;
+    if (git_run(dir, "add .keep") != 0)
+        return -1;
+    if (git_run(dir, "commit -q -m init") != 0)
+        return -1;
     return 0;
 }
 #endif /* _WIN32 */
@@ -182,7 +188,8 @@ TEST(canonical_root_repo_root) {
     SKIP_PLATFORM("git-based canonical_root test not supported on Windows CI");
 #else
     char *tmp = th_mktempdir("cbm_gitctx");
-    if (!tmp) FAIL("th_mktempdir returned NULL");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL");
 
     if (make_git_repo(tmp) != 0) {
         th_rmtree(tmp);
@@ -223,7 +230,8 @@ TEST(canonical_root_subdir) {
     SKIP_PLATFORM("git-based canonical_root test not supported on Windows CI");
 #else
     char *tmp = th_mktempdir("cbm_gitctx");
-    if (!tmp) FAIL("th_mktempdir returned NULL");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL");
 
     if (make_git_repo(tmp) != 0) {
         th_rmtree(tmp);
@@ -282,13 +290,15 @@ TEST(canonical_root_linked_worktree) {
     /* th_mktempdir() returns a static buffer — copy before the second call. */
     char main_tmp[256];
     char *raw = th_mktempdir("cbm_main");
-    if (!raw) FAIL("th_mktempdir returned NULL");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
     strncpy(main_tmp, raw, sizeof(main_tmp) - 1);
     main_tmp[sizeof(main_tmp) - 1] = '\0';
 
     char wt_tmp[256];
     raw = th_mktempdir("cbm_worktree");
-    if (!raw) FAIL("th_mktempdir returned NULL");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
     strncpy(wt_tmp, raw, sizeof(wt_tmp) - 1);
     wt_tmp[sizeof(wt_tmp) - 1] = '\0';
 
@@ -466,10 +476,12 @@ TEST(git_branch_resolve_matches_full_context) {
 #else
     char plain[512];
     char *tmp = th_mktempdir("cbm_gitbranch_plain");
-    if (!tmp) FAIL("th_mktempdir returned NULL");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL");
     snprintf(plain, sizeof(plain), "%s", tmp);
     tmp = th_mktempdir("cbm_gitbranch");
-    if (!tmp) FAIL("th_mktempdir returned NULL");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL");
     if (make_git_repo(tmp) != 0) {
         th_rmtree(tmp);
         th_rmtree(plain);
@@ -495,6 +507,38 @@ TEST(git_branch_resolve_matches_full_context) {
 #endif /* _WIN32 */
 }
 
+TEST(git_snapshot_reports_head_and_dirty_state_read_only) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git snapshot test not supported on Windows CI");
+#else
+    char *tmp = th_mktempdir("cbm_git_snapshot");
+    ASSERT_NOT_NULL(tmp);
+    if (make_git_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    cbm_git_snapshot_t clean = {0};
+    ASSERT_EQ(cbm_git_snapshot_read(tmp, &clean), 0);
+    ASSERT_TRUE(clean.available);
+    ASSERT_NOT_NULL(clean.head_sha);
+    ASSERT_EQ(strlen(clean.head_sha), 40);
+    ASSERT_FALSE(clean.dirty);
+
+    ASSERT_EQ(th_write_file(TH_PATH(tmp, "untracked.c"), "int untracked;\n"), 0);
+    cbm_git_snapshot_t dirty = {0};
+    ASSERT_EQ(cbm_git_snapshot_read(tmp, &dirty), 0);
+    ASSERT_TRUE(dirty.available);
+    ASSERT_STR_EQ(dirty.head_sha, clean.head_sha);
+    ASSERT_TRUE(dirty.dirty);
+
+    cbm_git_snapshot_free(&dirty);
+    cbm_git_snapshot_free(&clean);
+    th_rmtree(tmp);
+    PASS();
+#endif
+}
+
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
@@ -505,4 +549,5 @@ SUITE(git_context) {
     RUN_TEST(canonical_root_linked_worktree);
     RUN_TEST(git_context_ignores_inherited_repo_env);
     RUN_TEST(githistory_ignores_inherited_repo_env);
+    RUN_TEST(git_snapshot_reports_head_and_dirty_state_read_only);
 }
