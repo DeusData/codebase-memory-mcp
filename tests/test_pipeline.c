@@ -765,6 +765,110 @@ TEST(pipeline_definitions_properties) {
     PASS();
 }
 
+/* Language gate: the HashUID pass only stamps nodes whose file belongs to the
+ * language the pass speaks (Java today). Before the gate, every OTHER
+ * language's Class/Interface/Enum node passed the type test (it carries no
+ * `javaTypeKind`) and was stamped with a Java identity — a Python class, a TS
+ * class, even the synthetic `<python-builtins>` nodes carried hashuids no
+ * TrackerV2 scanner would ever produce. Methods were already Java-only via
+ * the `hasBody` marker; this pins the type half of the gate. */
+TEST(pipeline_hashuid_language_gate_stamps_java_only) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char path[512];
+    FILE *f;
+
+    /* Java: class + method (identity expected). */
+    snprintf(path, sizeof(path), "%s/Sample.java", g_tmpdir);
+    f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write Sample.java");
+    }
+    fputs("package demo;\n"
+          "public class Sample {\n"
+          "    public String snapshot(int revision) { return \"\" + revision; }\n"
+          "}\n",
+          f);
+    fclose(f);
+
+    /* Python: class + method (wrong language — no identity, either half). */
+    snprintf(path, sizeof(path), "%s/helper.py", g_tmpdir);
+    f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write helper.py");
+    }
+    fputs("class Helper:\n"
+          "    def snapshot(self, revision):\n"
+          "        return revision\n",
+          f);
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_hashuid_gate.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Class half: every .java Class node carries the Java identity (type 20,
+     * language 2); every foreign Class node carries none. */
+    cbm_node_t *classes = NULL;
+    int class_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Class", &classes, &class_count),
+              CBM_STORE_OK);
+    int java_classes = 0;
+    int foreign_classes = 0;
+    for (int i = 0; i < class_count; i++) {
+        bool is_java = classes[i].file_path && strstr(classes[i].file_path, ".java") != NULL;
+        if (is_java) {
+            java_classes++;
+            ASSERT_NOT_NULL(classes[i].hashuid);
+            ASSERT_EQ(classes[i].type_id, 20);
+            ASSERT_EQ(classes[i].language_type_id, 2); /* Java */
+        } else {
+            foreign_classes++;
+            ASSERT_TRUE(classes[i].hashuid == NULL);
+            ASSERT_EQ(classes[i].language_type_id, 0);
+        }
+    }
+    ASSERT_GT(java_classes, 0);
+    ASSERT_GT(foreign_classes, 0);
+    cbm_store_free_nodes(classes, class_count);
+
+    /* Method half: the Java method is stamped, the Python method is not. */
+    cbm_node_t *methods = NULL;
+    int method_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Method", &methods, &method_count),
+              CBM_STORE_OK);
+    int java_methods = 0;
+    int foreign_methods = 0;
+    for (int i = 0; i < method_count; i++) {
+        bool is_java = methods[i].file_path && strstr(methods[i].file_path, ".java") != NULL;
+        if (is_java) {
+            java_methods++;
+            ASSERT_NOT_NULL(methods[i].hashuid);
+        } else {
+            foreign_methods++;
+            ASSERT_TRUE(methods[i].hashuid == NULL);
+        }
+    }
+    ASSERT_GT(java_methods, 0);
+    ASSERT_GT(foreign_methods, 0);
+    cbm_store_free_nodes(methods, method_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Node properties must remain VALID JSON even when a definition's serialized
  * properties exceed the fixed 2 KB build buffer. Found on the Linux kernel:
  * 135 nodes (50-param functions with struct-typed signatures) had properties
@@ -14748,6 +14852,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_definitions_function_nodes);
     RUN_TEST(pipeline_definitions_defines_edges);
     RUN_TEST(pipeline_definitions_properties);
+    RUN_TEST(pipeline_hashuid_language_gate_stamps_java_only);
     RUN_TEST(pipeline_def_props_valid_json_when_oversized);
     RUN_TEST(pipeline_edge_props_valid_json);
     /* Complexity propagation pass (Tier B) */

@@ -57,6 +57,7 @@
 
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "discover/discover.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
@@ -287,72 +288,11 @@ static char *hu_set_json_string(const char *old, const char *key, const char *va
     return neu;
 }
 
-/* Return a heap string: `old` with `"key":<int>` set. */
-static char *hu_set_json_int(const char *old, const char *key, int value) {
-    if (!old || !key) {
-        return NULL;
-    }
-    char val[CBM_SZ_32];
-    snprintf(val, sizeof(val), "%d", value);
-    size_t olen = strlen(old);
-    if (olen < 2 || old[olen - SKIP_ONE] != '}') {
-        return NULL;
-    }
-    char keybuf[CBM_SZ_64];
-    int kn = snprintf(keybuf, sizeof(keybuf), "\"%s\":", key);
-    if (kn <= 0 || (size_t)kn >= sizeof(keybuf)) {
-        return NULL;
-    }
-    const char *v = hu_find_value(old, keybuf);
-    if (v) {
-        const char *vend = hu_value_end(v);
-        if (!vend) {
-            return NULL;
-        }
-        size_t head = (size_t)(v - old);
-        size_t vlen = strlen(val);
-        size_t tail = strlen(vend);
-        char *neu = (char *)malloc(head + vlen + tail + SKIP_ONE);
-        if (!neu) {
-            return NULL;
-        }
-        memcpy(neu, old, head);
-        memcpy(neu + head, val, vlen);
-        memcpy(neu + head + vlen, vend, tail + SKIP_ONE);
-        return neu;
-    }
-    char frag[CBM_SZ_64];
-    int fn = snprintf(frag, sizeof(frag), "%s\"%s\":%s}", (olen == 2) ? "" : ",", key, val);
-    if (fn <= 0 || (size_t)fn >= sizeof(frag)) {
-        return NULL;
-    }
-    char *neu = (char *)malloc(olen - SKIP_ONE + (size_t)fn + SKIP_ONE);
-    if (!neu) {
-        return NULL;
-    }
-    memcpy(neu, old, olen - SKIP_ONE);
-    memcpy(neu + olen - SKIP_ONE, frag, (size_t)fn + SKIP_ONE);
-    return neu;
-}
-
 /* Apply a list of (key, value) updates to a node's properties, allocating each
  * intermediate string and freeing the previous one. Best effort: a failed step
  * leaves the node exactly as it was. */
 static bool hu_node_set_string(cbm_gbuf_node_t *node, const char *key, const char *value) {
     char *neu = hu_set_json_string(node->properties_json, key, value);
-    if (!neu) {
-        return false;
-    }
-    if (cbm_gbuf_node_set_properties_json(node, neu) != 0) {
-        free(neu);
-        return false;
-    }
-    free(neu);
-    return true;
-}
-
-static bool hu_node_set_int(cbm_gbuf_node_t *node, const char *key, int value) {
-    char *neu = hu_set_json_int(node->properties_json, key, value);
     if (!neu) {
         return false;
     }
@@ -376,6 +316,10 @@ typedef struct {
      * recognise that middle segment as a scope even though nothing in the qn
      * marks it as one. */
     CBMHashTable *member_scopes;
+    /* file_path → CBMLanguage (stored as `(void *)(intptr_t)(lang + 1)`), so a
+     * candidate's language is resolved once per file instead of once per node.
+     * Keys are owned copies, released with the table. */
+    CBMHashTable *file_languages;
     /* Set for the stamping phase only: the collected candidates and their
      * groups. NULL while collecting. */
     struct hu_build_s *build;
@@ -384,6 +328,10 @@ typedef struct {
      * the deliberate superset over TrackerV2 is visible in every index log. */
     uint64_t stamped_no_body;
     uint64_t skipped_not_tracker_type;
+    /* Candidates dropped because their file belongs to another language (or
+     * to an unresolvable path such as `<python-builtins>`); see the language
+     * gate below. */
+    uint64_t skipped_foreign_language;
     uint64_t failed;
 } hu_ctx_t;
 
@@ -645,6 +593,61 @@ static bool hu_build_push(hu_build_t *hb, hu_entry_t entry) {
     return true;
 }
 
+/* ── language gate ───────────────────────────────────────────────────
+ *
+ * An identity belongs to a declaration of the language the pass speaks. The
+ * graph carries no language column, so the pass cannot ask the node. The
+ * extraction language of a file is a pure function of its name — the SAME
+ * `cbm_language_for_filename()` discovery routed the file with
+ * (`src/discover/discover.c`), user-config extension overrides included — so
+ * the gate re-derives it from `file_path`, cached per file.
+ *
+ * A file that discovery identified only by shebang (an extensionless script)
+ * resolves to "unknown" here; that is acceptable, because no shebang-only
+ * file is Java. The same answer covers synthetic paths such as
+ * `<python-builtins>`, which must never carry a TrackerV2 identity.
+ */
+
+/* The language whose identity this pass issues. Java today. Extending the
+ * identity to more languages replaces this predicate with a per-language
+ * spec lookup (language_type_id, type ids, signature/condition rules); it
+ * does NOT widen this test in place. */
+static bool hu_language_has_identity(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA;
+}
+
+/* Basename of a repo-relative path: cbm_language_for_filename() matches
+ * filenames, so a dot in a directory name must not read as the extension. */
+static const char *hu_basename(const char *path) {
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    return base;
+}
+
+/* Cache values are `(void *)(intptr_t)(language + 1)`: a present entry is
+ * never NULL, and CBM_LANG_COUNT ("unknown") round-trips too. */
+static CBMLanguage hu_file_language(hu_ctx_t *hc, const char *file_path) {
+    if (!file_path || !file_path[0] || !hc->file_languages) {
+        return CBM_LANG_COUNT;
+    }
+    void *hit = cbm_ht_get(hc->file_languages, file_path);
+    if (hit) {
+        return (CBMLanguage)((intptr_t)hit - SKIP_ONE);
+    }
+    CBMLanguage lang = cbm_language_for_filename(hu_basename(file_path));
+    size_t len = strlen(file_path);
+    char *key = (char *)malloc(len + SKIP_ONE);
+    if (key) {
+        memcpy(key, file_path, len + SKIP_ONE);
+        cbm_ht_set(hc->file_languages, key, (void *)(intptr_t)(lang + SKIP_ONE));
+    }
+    return lang;
+}
+
 static void hu_collect_node(hu_ctx_t *hc, hu_build_t *hb, cbm_gbuf_node_t *node) {
     const char *label = node->label;
     const char *props = node->properties_json;
@@ -656,6 +659,15 @@ static void hu_collect_node(hu_ctx_t *hc, hu_build_t *hb, cbm_gbuf_node_t *node)
     }
     if (!node->name || !node->qualified_name || !props) {
         hc->failed++;
+        return;
+    }
+    /* Language gate. Without it, every other language's Class/Interface/Enum
+     * node passed the type test below (it carries no `javaTypeKind`) and was
+     * stamped with a Java identity — a Python class, a TS class, even the
+     * synthetic `<python-builtins>` nodes. Methods were already Java-only via
+     * the `hasBody` marker; this closes the type half. */
+    if (!hu_language_has_identity(hu_file_language(hc, node->file_path))) {
+        hc->skipped_foreign_language++;
         return;
     }
 
@@ -809,19 +821,23 @@ static bool hu_stamp_entry(hu_ctx_t *hc, hu_entry_t *entry, const char *fingerpr
     char hex[CBM_MD5_HEX_LEN + SKIP_ONE];
     cbm_md5_hex(input, strlen(input), hex);
 
-    /* The full input, the canonical signature and the fingerprint are kept
-     * beside the digest: they are what make a mismatch against TrackerV2
-     * diagnosable field by field instead of a 32-char dead end. Every write is
-     * attempted — a failure on one must not silently drop the others, or a node
-     * would end up half-identified and blame-free. */
-    bool ok = true;
-    ok &= hu_node_set_string(entry->node, "hashInput", input);
-    ok &= hu_node_set_string(entry->node, "hashuid", hex);
-    ok &= hu_node_set_string(entry->node, "canonicalSignature", entry->signature);
-    ok &= hu_node_set_string(entry->node, "logicalModule", entry->module);
-    ok &= hu_node_set_string(entry->node, "duplicateFingerprint", fingerprint);
-    ok &= hu_node_set_int(entry->node, "typeId", entry->type_id);
-    ok &= hu_node_set_int(entry->node, "languageTypeId", HU_JAVA_LANGUAGE_TYPE_ID);
+    /* `hashInput` stays a properties key: it is cbm's own diagnostic string
+     * rather than one of the nine TrackerV2 identity fields, and the
+     * alignment tooling needs it to name the first differing field instead of
+     * reporting a 32-char dead end.
+     *
+     * The identity itself is no longer spliced into the properties JSON. It
+     * goes onto the node as seven dedicated fields, which the store writes as
+     * real columns: `name` and `file_path` already are columns, so those nine
+     * cover TrackerV2's whole field list (name | signature | path | condition
+     * | logical_module | type_id | language_type_id | duplicate_fingerprint |
+     * hashuid). `condition` is unconditionally empty for Java, exactly as it
+     * is inside the hash input, but it is written anyway so the column mirrors
+     * the digest's decomposition field for field. */
+    bool ok = hu_node_set_string(entry->node, "hashInput", input);
+    ok &= cbm_gbuf_node_set_identity(entry->node, hex, entry->signature, "", entry->module,
+                                     fingerprint, entry->type_id,
+                                     HU_JAVA_LANGUAGE_TYPE_ID) == 0;
     return ok;
 }
 
@@ -942,9 +958,11 @@ void cbm_pipeline_pass_hashuid(cbm_pipeline_ctx_t *ctx) {
     memset(&hc, 0, sizeof(hc));
     hc.containers = cbm_ht_create(CBM_SZ_512);
     hc.member_scopes = cbm_ht_create(CBM_SZ_512);
-    if (!hc.containers || !hc.member_scopes) {
+    hc.file_languages = cbm_ht_create(CBM_SZ_512);
+    if (!hc.containers || !hc.member_scopes || !hc.file_languages) {
         cbm_ht_free(hc.containers);
         cbm_ht_free(hc.member_scopes);
+        cbm_ht_free(hc.file_languages);
         cbm_log_error("pass.hashuid", "msg", "container_index_alloc_failed");
         return;
     }
@@ -1034,10 +1052,12 @@ void cbm_pipeline_pass_hashuid(cbm_pipeline_ctx_t *ctx) {
 
     cbm_ht_foreach(hc.member_scopes, hu_free_key, NULL);
     cbm_ht_free(hc.member_scopes);
+    cbm_ht_foreach(hc.file_languages, hu_free_key, NULL);
+    cbm_ht_free(hc.file_languages);
     cbm_ht_free(hc.containers);
 
     cbm_log_info("pass.done", "pass", "hashuid", "stamped", hu_u64(hc.stamped), "no_body",
                  hu_u64(hc.stamped_no_body), "skipped_type", hu_u64(hc.skipped_not_tracker_type),
-                 "failed", hu_u64(hc.failed), "groups", hu_u64((uint64_t)hb.count),
-                 "no_decl_hash", hu_u64(hb.missing_hash));
+                 "skipped_lang", hu_u64(hc.skipped_foreign_language), "failed", hu_u64(hc.failed),
+                 "groups", hu_u64((uint64_t)hb.count), "no_decl_hash", hu_u64(hb.missing_hash));
 }

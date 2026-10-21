@@ -31,6 +31,22 @@ typedef struct {
     int start_line;
     int end_line;
     char *properties_json; /* heap-owned JSON string, "{}" default */
+    /* TrackerV2 Java identity (pass_hashuid). Migrated OUT of
+     * properties_json so the store can carry them as real columns instead of
+     * JSON keys. `name` and `file_path` are the remaining two of the nine
+     * TrackerV2 identity fields (name | signature | path | condition |
+     * logical_module | type_id | language_type_id | duplicate_fingerprint,
+     * plus the digest itself). NULL string / 0 int means "no identity"; that
+     * is the majority of nodes, since only Class/Interface/Enum/Method of a
+     * Java project are tracked. `condition` is always "" for Java (the hash
+     * input keeps the empty field, and so does the column). */
+    char *hashuid;               /* heap-owned 32-char lowercase hex MD5 */
+    char *canonical_signature;   /* heap-owned, e.g. "foo(int,String)" */
+    char *condition;             /* heap-owned, always "" for Java */
+    char *logical_module;        /* heap-owned container chain */
+    char *duplicate_fingerprint; /* heap-owned, non-empty only on collisions */
+    int64_t type_id;             /* 2 method, 3 ctor, 20 class, 22 enum, 23 itf */
+    int64_t language_type_id;    /* 2 for Java */
 } cbm_gbuf_node_t;
 
 typedef struct {
@@ -187,5 +203,14 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
  * than freeing node->properties_json themselves. Returns 0, or -1 on OOM
  * (the old value is kept). */
 int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json);
+
+/* Install the TrackerV2 identity on a node (pass_hashuid). Strings are copied
+ * through the buffer's allocator, so `node` owns them until it is freed;
+ * malformed input (NULL hashuid) clears the identity instead. Returns 0, or
+ * -1 when the node is NULL or an allocation failed. */
+int cbm_gbuf_node_set_identity(cbm_gbuf_node_t *node, const char *hashuid,
+                               const char *canonical_signature, const char *condition,
+                               const char *logical_module, const char *duplicate_fingerprint,
+                               int64_t type_id, int64_t language_type_id);
 
 #endif /* CBM_GRAPH_BUFFER_H */

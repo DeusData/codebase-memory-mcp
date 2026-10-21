@@ -341,6 +341,232 @@ TEST(store_node_find_by_file) {
     PASS();
 }
 
+/* ── HashUID lookups (the TrackerV2 identity, see pass_hashuid.c) ── */
+
+/* HashUID is the business key stamped onto Java Class/Interface/Enum/Method
+ * nodes. Three properties of the store side matter, and each fails in its own
+ * way:
+ *   1. a lookup returns exactly the node carrying the digest, scoped to its
+ *      project — idx_nodes_hashuid is unique PER PROJECT, not globally;
+ *   2. the unique index refuses a second node claiming the same identity
+ *      inside one project, which is what makes the digest a business key
+ *      rather than a decoration;
+ *   3. the CASE WHEN json_valid(...) guard keeps index creation and lookups
+ *      working on legacy rows whose properties JSON is malformed. A bare
+ *      json_extract() raises on those rows, so the guard is load-bearing (see
+ *      the index comment in create_user_indexes).
+ * The tests below pin each one instead of trusting the SQL. */
+
+static bool store_index_exists(cbm_store_t *s, const char *name) {
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    if (!db || sqlite3_prepare_v2(db,
+                                  "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1;",
+                                  -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+    bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+#define HASHUID_TEST_DIGEST "b9a50aa234cc33ce563eb182efdc8091"
+
+TEST(store_node_find_by_hashuid) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "left", "/tmp/left"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, "right", "/tmp/right"), CBM_STORE_OK);
+
+    /* The identity is columns now, not properties keys (index format v2). */
+    cbm_node_t tracked = {.project = "left",
+                          .label = "Method",
+                          .name = "snapshot",
+                          .qualified_name = "left.GitClient.snapshot",
+                          .file_path = "GitClient.java",
+                          .start_line = 12,
+                          .end_line = 30,
+                          .properties_json = "{}",
+                          .hashuid = HASHUID_TEST_DIGEST,
+                          .canonical_signature = "snapshot(int)",
+                          .condition = "",
+                          .logical_module = "GitClient",
+                          .duplicate_fingerprint = "",
+                          .type_id = 2,
+                          .language_type_id = 2};
+    cbm_node_t untracked = {.project = "left",
+                            .label = "Field",
+                            .name = "counter",
+                            .qualified_name = "left.GitClient.counter"};
+    cbm_node_t mirrored = {.project = "right",
+                           .label = "Method",
+                           .name = "snapshot",
+                           .qualified_name = "right.GitClient.snapshot",
+                           .properties_json = "{}",
+                           .hashuid = HASHUID_TEST_DIGEST,
+                           .canonical_signature = "snapshot(int)",
+                           .condition = "",
+                           .logical_module = "GitClient",
+                           .duplicate_fingerprint = "",
+                           .type_id = 2,
+                           .language_type_id = 2};
+    ASSERT_GT(cbm_store_upsert_node(s, &tracked), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &untracked), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &mirrored), 0);
+
+    cbm_node_t *nodes = NULL;
+    int count = -1;
+    int rc = cbm_store_find_nodes_by_hashuid(s, "left", HASHUID_TEST_DIGEST, &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "left.GitClient.snapshot");
+    ASSERT_STR_EQ(nodes[0].label, "Method");
+    ASSERT_STR_EQ(nodes[0].file_path, "GitClient.java");
+    ASSERT_EQ(nodes[0].start_line, 12);
+    ASSERT_EQ(nodes[0].end_line, 30);
+    /* The whole identity round-trips through the columns. */
+    ASSERT_STR_EQ(nodes[0].hashuid, HASHUID_TEST_DIGEST);
+    ASSERT_STR_EQ(nodes[0].canonical_signature, "snapshot(int)");
+    ASSERT_STR_EQ(nodes[0].condition, "");
+    ASSERT_STR_EQ(nodes[0].logical_module, "GitClient");
+    ASSERT_STR_EQ(nodes[0].duplicate_fingerprint, "");
+    ASSERT_EQ(nodes[0].type_id, 2);
+    ASSERT_EQ(nodes[0].language_type_id, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    /* The same digest in another project is a different identity. */
+    nodes = NULL;
+    rc = cbm_store_find_nodes_by_hashuid(s, "right", HASHUID_TEST_DIGEST, &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "right.GitClient.snapshot");
+    cbm_store_free_nodes(nodes, count);
+
+    /* An unknown digest is an empty result, never an error, and a node without
+     * a HashUID is not matchable. */
+    nodes = NULL;
+    rc = cbm_store_find_nodes_by_hashuid(s, "left", "00000000000000000000000000000000", &nodes,
+                                         &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_node_hashuid_unique_index_rejects_duplicate_identity) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+
+    cbm_node_t first = {.project = "p",
+                        .label = "Method",
+                        .name = "a",
+                        .qualified_name = "p.A.a",
+                        .properties_json = "{}",
+                        .hashuid = HASHUID_TEST_DIGEST,
+                        .type_id = 2,
+                        .language_type_id = 2};
+    cbm_node_t second = {.project = "p",
+                         .label = "Method",
+                         .name = "b",
+                         .qualified_name = "p.B.b",
+                         .properties_json = "{}",
+                         .hashuid = HASHUID_TEST_DIGEST,
+                         .type_id = 2,
+                         .language_type_id = 2};
+    ASSERT_GT(cbm_store_upsert_node(s, &first), 0);
+    /* A second declaration cannot claim a digest already in use. */
+    ASSERT_EQ(cbm_store_upsert_node(s, &second), CBM_STORE_ERR);
+
+    /* Re-upserting the same qualified_name updates in place. */
+    cbm_node_t updated = {.project = "p",
+                          .label = "Method",
+                          .name = "a",
+                          .qualified_name = "p.A.a",
+                          .file_path = "A.java",
+                          .properties_json = "{}",
+                          .hashuid = HASHUID_TEST_DIGEST,
+                          .type_id = 2,
+                          .language_type_id = 2};
+    ASSERT_GT(cbm_store_upsert_node(s, &updated), 0);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_hashuid(s, "p", HASHUID_TEST_DIGEST, &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].file_path, "A.java");
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_node_find_by_hashuid_tolerates_malformed_properties) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+
+    /* A row whose properties JSON does not parse. The lookup reads the hashuid
+     * COLUMN now, so this row must simply not match: nothing may parse it. The
+     * case used to be a live hazard because the WHERE clause called
+     * json_extract() on it. */
+    cbm_node_t broken = {.project = "p",
+                         .label = "Method",
+                         .name = "oops",
+                         .qualified_name = "p.Broken.oops",
+                         .properties_json = "{\"hashuid\": broken"};
+    ASSERT_GT(cbm_store_upsert_node(s, &broken), 0);
+
+    cbm_node_t good = {.project = "p",
+                       .label = "Method",
+                       .name = "a",
+                       .qualified_name = "p.A.a",
+                       .properties_json = "{}",
+                       .hashuid = HASHUID_TEST_DIGEST,
+                       .type_id = 2,
+                       .language_type_id = 2};
+    ASSERT_GT(cbm_store_upsert_node(s, &good), 0);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_hashuid(s, "p", HASHUID_TEST_DIGEST, &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "p.A.a");
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_hashuid_index_creation_survives_malformed_properties_row) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "p", "/tmp/p"), CBM_STORE_OK);
+
+    /* Reproduce a database whose index is absent while a row with malformed
+     * properties is already present. v2 indexes the hashuid COLUMN, so the
+     * malformed JSON is not inspected at all; the case is kept as a regression
+     * guard that an index build still cannot be derailed by a legacy row. */
+    ASSERT_EQ(cbm_store_exec(s, "DROP INDEX IF EXISTS idx_nodes_hashuid;"), CBM_STORE_OK);
+    cbm_node_t broken = {.project = "p",
+                         .label = "Method",
+                         .name = "oops",
+                         .qualified_name = "p.Broken.oops",
+                         .properties_json = "{\"hashuid\": broken"};
+    ASSERT_GT(cbm_store_upsert_node(s, &broken), 0);
+
+    ASSERT_EQ(cbm_store_create_indexes(s), CBM_STORE_OK);
+    ASSERT_TRUE(store_index_exists(s, "idx_nodes_hashuid"));
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -2388,6 +2614,10 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
     RUN_TEST(store_node_find_by_file);
+    RUN_TEST(store_node_find_by_hashuid);
+    RUN_TEST(store_node_hashuid_unique_index_rejects_duplicate_identity);
+    RUN_TEST(store_node_find_by_hashuid_tolerates_malformed_properties);
+    RUN_TEST(store_hashuid_index_creation_survives_malformed_properties_row);
     RUN_TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469);
     RUN_TEST(store_file_outline_fails_closed_on_text_budget_issue469);
     RUN_TEST(store_node_find_not_found);

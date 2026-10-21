@@ -5183,10 +5183,13 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         strcmp(ts_node_type(child), "function_signature_item") == 0) {
         def.is_abstract = true;
     }
-    /* Java: TrackerV2 only gives an identity to methods that DECLARE a body.
-     * Abstract methods, `native` methods and interface declarations carry no
-     * HashUID, so the verdict is recorded here (where the AST is still in
-     * hand) for pass_hashuid.c to read later. */
+    /* Java: TrackerV2 only gives an identity to methods that DECLARE a body,
+     * but pass_hashuid.c deliberately stamps body-less declarations too
+     * (interface / abstract / native methods are real, referencable
+     * entities). Only the KEY's presence is consulted there — the value rides
+     * along as `hasBody:false`, so a strict TrackerV2 comparison can put the
+     * superset aside with one filter. Recorded here, where the AST is still in
+     * hand. */
     if (ctx->language == CBM_LANG_JAVA) {
         def.has_body = !ts_node_is_null(ts_node_child_by_field_name(child, "body", 4));
         def.decl_content_hash = java_decl_content_hash(ctx, child);

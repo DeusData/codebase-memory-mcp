@@ -592,6 +592,21 @@ static const tool_def_t TOOLS[] = {
      "\"default\":\"tree\"}},\"additionalProperties\":false,"
      "\"required\":[\"project\",\"file_path\"]}"},
 
+    {"get_by_hashuid",
+     "Resolve a TrackerV2 HashUID (32 hex characters) to the Java declaration carrying it. The "
+     "identity is unique per project, so the answer is one node and never a list; an empty "
+     "answer reports found:false plus the two causes to check.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"hashuid\":{\"type\":\"string\",\"description\":\"32-character hexadecimal TrackerV2 "
+     "identity; see docs/JAVA-HASHUID.md.\"},"
+     "\"include_identity\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Also "
+      "return the whole identity block: canonical_signature (alias signature), condition, "
+      "logical_module, duplicate_fingerprint, type_id, language_type_id, path (alias of "
+      "file_path) plus hash_input and has_body. The column names match the TrackerV2 "
+      "identifier table, so a row can be compared field for field.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\"}},"
+     "\"required\":[\"project\",\"hashuid\"]}"},
+
     {"get_graph_schema",
      "Get node-label and edge-type counts. diagnostics=full also lists queryable properties.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
@@ -776,6 +791,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"trace_path", true, false, true, false},
     {"get_code_snippet", true, false, true, false},
     {"get_file_outline", false, true, true, false},
+    {"get_by_hashuid", true, false, true, false},
     {"get_graph_schema", true, false, true, false},
     {"compare_graphs", true, false, true, false},
     {"get_architecture", true, false, true, false},
@@ -843,12 +859,13 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
         "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
         "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
-        "search_code",      "list_projects",    "index_status",   "check_index_coverage",
-        "detect_changes",
+        "get_by_hashuid",   "search_code",      "list_projects",  "index_status",
+        "check_index_coverage", "detect_changes",
     };
     static const char *const scout_tools[] = {
-        "search_graph",     "trace_path",    "get_code_snippet", "get_file_outline",
-        "get_architecture", "list_projects", "index_status",     "check_index_coverage",
+        "search_graph",     "trace_path",     "get_code_snippet", "get_file_outline",
+        "get_by_hashuid",   "get_architecture", "list_projects",  "index_status",
+        "check_index_coverage",
     };
     if (!name) {
         return false;
@@ -4324,6 +4341,11 @@ static bool sg_field_is_core(const char *f) {
            strcmp(f, "label") == 0 || strcmp(f, "file") == 0 || strcmp(f, "file_path") == 0 ||
            strcmp(f, "path") == 0 || strcmp(f, "lines") == 0 || strcmp(f, "in") == 0 ||
            strcmp(f, "out") == 0;
+    /* The TrackerV2 identity columns are deliberately NOT listed here. This
+     * predicate answers "every result row already carries it", which is true of
+     * the core columns above and false of the identity block — only nodes of a
+     * full Java index have one. They are resolved from the node instead, by
+     * sg_identity_field() in both search emitters. */
 }
 
 /* Parse the `fields` argument (array of property names) into out[] as
@@ -4370,6 +4392,54 @@ static int sg_parse_fields(const char *args, const char *out[], int max_out, yyj
     }
     *out_owner = args_doc;
     return n;
+}
+
+enum { SG_ID_ABSENT = 0, SG_ID_TEXT, SG_ID_INT };
+
+/* Resolve a TrackerV2 identity field off the node's COLUMNS (index format v2;
+ * they are no longer keys in properties_json). `fields` is an arbitrary
+ * caller-supplied name, so this is a whitelist rather than a dynamic lookup.
+ *
+ * Returns SG_ID_ABSENT when the name is not an identity column OR when the node
+ * carries no identity at all — both mean "nothing to add here", and the caller
+ * then reports the field as missing exactly as it would for any other absent
+ * property. `type_id`/`language_type_id` are integers; the integer branch
+ * exists so they are emitted unquoted, matching how they were emitted when they
+ * lived in the JSON. */
+static int sg_identity_field(const cbm_node_t *n, const char *field, const char **text,
+                             long long *number) {
+    if (!n || !field || !n->hashuid) {
+        return SG_ID_ABSENT;
+    }
+    if (strcmp(field, "hashuid") == 0) {
+        *text = n->hashuid;
+        return SG_ID_TEXT;
+    }
+    if (strcmp(field, "canonical_signature") == 0) {
+        *text = n->canonical_signature ? n->canonical_signature : "";
+        return SG_ID_TEXT;
+    }
+    if (strcmp(field, "condition") == 0) {
+        *text = n->condition ? n->condition : "";
+        return SG_ID_TEXT;
+    }
+    if (strcmp(field, "logical_module") == 0) {
+        *text = n->logical_module ? n->logical_module : "";
+        return SG_ID_TEXT;
+    }
+    if (strcmp(field, "duplicate_fingerprint") == 0) {
+        *text = n->duplicate_fingerprint ? n->duplicate_fingerprint : "";
+        return SG_ID_TEXT;
+    }
+    if (strcmp(field, "type_id") == 0) {
+        *number = (long long)n->type_id;
+        return SG_ID_INT;
+    }
+    if (strcmp(field, "language_type_id") == 0) {
+        *number = (long long)n->language_type_id;
+        return SG_ID_INT;
+    }
+    return SG_ID_ABSENT;
 }
 
 /* Append a property as one compact-output cell. Compound values stay one
@@ -4716,6 +4786,21 @@ static void emit_search_results_grouped_tree(cbm_sb_t *sb, const cbm_search_outp
             yyjson_val *pr = pd ? yyjson_doc_get_root(pd) : NULL;
             for (int f = 0; f < nfields; f++) {
                 yyjson_val *v = (pr && yyjson_is_obj(pr)) ? yyjson_obj_get(pr, fields[f]) : NULL;
+                if (!v) {
+                    /* Not a properties key: the name may still be one of the
+                     * identity columns, which live on the node (format v2). */
+                    const char *text = NULL;
+                    long long number = 0;
+                    int kind = sg_identity_field(&sr->node, fields[f], &text, &number);
+                    if (kind == SG_ID_TEXT) {
+                        cbm_tree_cell_str(sb, text, false);
+                        continue;
+                    }
+                    if (kind == SG_ID_INT) {
+                        cbm_tree_cell_int(sb, number, false);
+                        continue;
+                    }
+                }
                 sg_toon_property_cell(sb, v);
             }
             if (pd) {
@@ -4869,6 +4954,21 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
             yyjson_val *pr = pd ? yyjson_doc_get_root(pd) : NULL;
             for (int f = 0; f < nfields; f++) {
                 yyjson_val *v = (pr && yyjson_is_obj(pr)) ? yyjson_obj_get(pr, fields[f]) : NULL;
+                if (!v) {
+                    /* Same column fallback as the TOON emitter: an identity
+                     * field is answered from the node, typed as before. */
+                    const char *text = NULL;
+                    long long number = 0;
+                    int kind = sg_identity_field(&sr->node, fields[f], &text, &number);
+                    if (kind == SG_ID_TEXT) {
+                        yyjson_mut_arr_add_strcpy(doc, row, text);
+                        continue;
+                    }
+                    if (kind == SG_ID_INT) {
+                        yyjson_mut_arr_add_int(doc, row, number);
+                        continue;
+                    }
+                }
                 yyjson_mut_val *copy =
                     (v && !yyjson_is_null(v)) ? yyjson_val_mut_copy(doc, v) : NULL;
                 if (copy) {
@@ -9647,12 +9747,8 @@ trace_output_ready:
 /* ── Helper: free heap fields of a stack-allocated node ────────── */
 
 static void free_node_contents(cbm_node_t *n) {
-    safe_str_free(&n->project);
-    safe_str_free(&n->label);
-    safe_str_free(&n->name);
-    safe_str_free(&n->qualified_name);
-    safe_str_free(&n->file_path);
-    safe_str_free(&n->properties_json);
+    /* Delegate to the store's freer so the identity columns cannot be missed. */
+    cbm_node_free_fields(n);
     memset(n, 0, sizeof(*n));
 }
 
@@ -12258,6 +12354,208 @@ static char *handle_get_file_outline(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── get_by_hashuid ───────────────────────────────────────────── */
+
+enum { MCP_HASHUID_HEX_CHARS = 32 };
+
+/* The TrackerV2 identity is 32 lowercase hex characters. Uppercase is accepted
+ * and re-canonicalized on purpose: the store holds lowercase, so a verbatim
+ * compare would turn a copy-pasted uppercase digest into a silent miss — the
+ * worst possible failure for a lookup tool. */
+static bool hashuid_is_hex32(const char *text) {
+    if (!text || strlen(text) != MCP_HASHUID_HEX_CHARS) {
+        return false;
+    }
+    for (const char *p = text; *p; p++) {
+        bool hex = (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') ||
+                   (*p >= 'A' && *p <= 'F');
+        if (!hex) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Copy the identity fields pass_hashuid.c stamped next to the digest. They are
+ * what makes a mismatch diagnosable: `hash_input` is the exact hashed string,
+ * so a caller can see which of the eight fields differs instead of guessing.
+ *
+ * v2: the identity lives in node columns, not in properties_json. The columns
+ * are therefore emitted unconditionally — the old code had to tolerate a
+ * missing JSON key, but a node that has a hashuid cannot be missing one of
+ * its own columns. Only the two properties-borne extras below are still parsed
+ * out of the JSON, and both come from the extractor rather than pass_hashuid:
+ * `hashInput` is cbm's own diagnostic string (not one of the nine identity
+ * fields), and `hasBody` is what separates a real declaration from the
+ * deliberate superset of body-less methods TrackerV2 would not know. */
+static void hashuid_add_identity(yyjson_mut_doc *doc, yyjson_mut_val *object,
+                                 const cbm_node_t *node) {
+    if (!doc || !object || !node || !node->hashuid || !node->hashuid[0]) {
+        return;
+    }
+    static const struct {
+        const char *column;
+        const char *out;
+    } string_fields[] = {
+        {"canonical_signature", "canonical_signature"},
+        {"condition", "condition"},
+        {"logical_module", "logical_module"},
+        {"duplicate_fingerprint", "duplicate_fingerprint"},
+    };
+    const char *values[] = {
+        node->canonical_signature,
+        node->condition,
+        node->logical_module,
+        node->duplicate_fingerprint,
+    };
+    for (size_t i = 0; i < sizeof(string_fields) / sizeof(string_fields[0]); i++) {
+        /* Present-but-empty is meaningful here (a top-level class has an empty
+         * signature; condition is always empty for Java), so an absent column
+         * is written as "" rather than dropped. */
+        yyjson_mut_obj_add_strcpy(doc, object, string_fields[i].out,
+                                  values[i] ? values[i] : "");
+    }
+    yyjson_mut_obj_add_int(doc, object, "type_id", node->type_id);
+    yyjson_mut_obj_add_int(doc, object, "language_type_id", node->language_type_id);
+    /* Aliases under the names TrackerV2's `identifier` table uses, so a row can
+     * be compared field for field without renaming anything by hand. */
+    yyjson_mut_obj_add_strcpy(doc, object, "signature",
+                              node->canonical_signature ? node->canonical_signature : "");
+    yyjson_mut_obj_add_strcpy(doc, object, "path", node->file_path ? node->file_path : "");
+
+    if (!node->properties_json || node->properties_json[0] != '{') {
+        return;
+    }
+    yyjson_doc *props = yyjson_read(node->properties_json, strlen(node->properties_json), 0);
+    if (!props) {
+        return;
+    }
+    yyjson_val *root = yyjson_doc_get_root(props);
+    if (root && yyjson_is_obj(root)) {
+        yyjson_val *hash_input = yyjson_obj_get(root, "hashInput");
+        if (hash_input && yyjson_is_str(hash_input)) {
+            yyjson_mut_obj_add_strcpy(doc, object, "hash_input", yyjson_get_str(hash_input));
+        }
+        yyjson_val *has_body = yyjson_obj_get(root, "hasBody");
+        if (has_body && yyjson_is_bool(has_body)) {
+            yyjson_mut_obj_add_bool(doc, object, "has_body", yyjson_get_bool(has_body));
+        }
+    }
+    yyjson_doc_free(props);
+}
+
+/* Resolve a TrackerV2 HashUID to the node carrying it. idx_nodes_hashuid is
+ * unique per project, so the answer is one node, never a list. The lookup is
+ * deliberately not an error when it finds nothing: identities exist only for
+ * Java Class/Interface/Enum/Method/Constructor nodes stamped by a full index,
+ * so "no node" is a real answer with two distinct causes, and the reply names
+ * both rather than returning a bare miss. */
+static char *handle_get_by_hashuid(cbm_mcp_server_t *srv, const char *args_json) {
+    const char *args_text = args_json ? args_json : "{}";
+    char *project = get_project_arg(args_text);
+    char *query = cbm_mcp_get_string_arg(args_text, "hashuid");
+    bool include_identity = cbm_mcp_get_bool_arg(args_text, "include_identity");
+
+    if (!project) {
+        free(query);
+        return cbm_mcp_text_result("project is required", true);
+    }
+    if (!query || !query[0]) {
+        free(query);
+        free(project);
+        return cbm_mcp_text_result("hashuid is required", true);
+    }
+    if (!hashuid_is_hex32(query)) {
+        free(query);
+        free(project);
+        return cbm_mcp_text_result(
+            "hashuid must be exactly 32 hexadecimal characters (the TrackerV2 identity)", true);
+    }
+
+    char hashuid[MCP_HASHUID_HEX_CHARS + 1];
+    for (size_t i = 0; i < MCP_HASHUID_HEX_CHARS; i++) {
+        char c = query[i];
+        hashuid[i] = (c >= 'A' && c <= 'F') ? (char)(c - 'A' + 'a') : c;
+    }
+    hashuid[MCP_HASHUID_HEX_CHARS] = '\0';
+    free(query);
+
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        char *error = build_project_list_error("project not found or not indexed");
+        char *result = cbm_mcp_text_result(error, true);
+        free(error);
+        free(project);
+        return result;
+    }
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_hashuid(store, project, hashuid, &nodes, &count);
+    if (rc != CBM_STORE_OK) {
+        /* A database written before the identity moved into columns still keeps
+         * the digest inside `properties`, so the column lookup cannot even
+         * prepare. That is a reindex, not a bug — say so instead of handing
+         * back a bare "query failed". */
+        const char *why = cbm_store_error(store);
+        if (why && strstr(why, "no such column")) {
+            char old_format[1024];
+            snprintf(old_format, sizeof(old_format),
+                     "this project was indexed by an older build: its identity is still stored "
+                     "inside `properties` (index format v1), so the hashuid column lookup cannot "
+                     "prepare. Re-index the project with this build and retry. (store said: %s)",
+                     why);
+            free(project);
+            return cbm_mcp_text_result(old_format, true);
+        }
+        free(project);
+        return cbm_mcp_text_result("get_by_hashuid query failed", true);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *object = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    yyjson_mut_obj_add_strcpy(doc, object, "hashuid", hashuid);
+    yyjson_mut_obj_add_strcpy(doc, object, "project", project);
+    yyjson_mut_obj_add_bool(doc, object, "found", count > 0);
+
+    if (count == 0) {
+        yyjson_mut_obj_add_str(
+            doc, object, "hint",
+            "no node in this project carries that HashUID; identities are stamped only by a "
+            "full Java index (Class, Interface, Enum, Method, Constructor) and never by the "
+            "incremental route, so check the digest and the index mode before assuming a bug");
+    } else {
+        const cbm_node_t *node = &nodes[0];
+        yyjson_mut_obj_add_strcpy(doc, object, "name", node->name ? node->name : "");
+        yyjson_mut_obj_add_strcpy(doc, object, "label", node->label ? node->label : "");
+        yyjson_mut_obj_add_strcpy(doc, object, "qualified_name",
+                                  node->qualified_name ? node->qualified_name : "");
+        yyjson_mut_obj_add_strcpy(doc, object, "file_path",
+                                  node->file_path ? node->file_path : "");
+        yyjson_mut_obj_add_int(doc, object, "start_line", node->start_line);
+        yyjson_mut_obj_add_int(doc, object, "end_line", node->end_line);
+        if (include_identity) {
+            hashuid_add_identity(doc, object, node);
+        }
+    }
+
+    char *payload = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    cbm_store_free_nodes(nodes, count);
+    free(project);
+    /* A payload can legitimately be NULL when the digest is unknown only if the
+     * allocator failed; mcp_result_from_json turns that into an error result. */
+    char *result = mcp_result_from_json(args_text, payload);
+    free(payload);
+    return result;
+}
+
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = get_project_arg(args);
@@ -13808,13 +14106,14 @@ static bool classify_grep_hit(grep_match_t *hit, cbm_node_t *file_nodes, int fil
 
 /* Free a file_nodes array returned from cbm_store_find_nodes_by_file. */
 static void free_file_nodes(cbm_node_t *nodes, int count) {
+    if (!nodes) {
+        return;
+    }
     for (int j = 0; j < count; j++) {
-        safe_str_free(&nodes[j].project);
-        safe_str_free(&nodes[j].label);
-        safe_str_free(&nodes[j].name);
-        safe_str_free(&nodes[j].qualified_name);
-        safe_str_free(&nodes[j].file_path);
-        safe_str_free(&nodes[j].properties_json);
+        /* ASan caught this hand-rolled list leaking one identity column per row
+         * ("1 byte in 1 object" — the empty `condition`) the moment the columns
+         * were added; call the shared freer instead of repeating the field set. */
+        cbm_node_free_fields(&nodes[j]);
     }
     free(nodes);
 }
@@ -17324,6 +17623,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "get_file_outline") == 0) {
         return handle_get_file_outline(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_by_hashuid") == 0) {
+        return handle_get_by_hashuid(srv, args_json);
     }
     if (strcmp(tool_name, "search_code") == 0) {
         return handle_search_code(srv, args_json);

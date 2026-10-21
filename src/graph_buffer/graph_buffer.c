@@ -401,6 +401,12 @@ static void free_node_strings(cbm_gbuf_node_t *n) {
     cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->name);
     cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->qualified_name);
     cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->properties_json);
+    /* TrackerV2 identity columns: owned exactly like properties_json. */
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->hashuid);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->canonical_signature);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->condition);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->logical_module);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, n->duplicate_fingerprint);
 }
 
 /* An edge owns no strings: type AND properties_json are interned (pool-owned;
@@ -972,6 +978,67 @@ int cbm_gbuf_node_set_properties_json(cbm_gbuf_node_t *node, const char *json) {
     }
     cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->properties_json);
     node->properties_json = copy;
+    return 0;
+}
+
+/* Copy `s` into the buffer's string pool, mapping NULL to NULL (unlike
+ * heap_strdup, which maps NULL to "{}" for properties). */
+static char *identity_strdup(const char *s) {
+    return s ? cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, s) : NULL;
+}
+
+int cbm_gbuf_node_set_identity(cbm_gbuf_node_t *node, const char *hashuid,
+                               const char *canonical_signature, const char *condition,
+                               const char *logical_module, const char *duplicate_fingerprint,
+                               int64_t type_id, int64_t language_type_id) {
+    if (!node) {
+        return GB_ERR;
+    }
+    /* A NULL digest clears the identity: that is how a re-run over a node whose
+     * declaration is no longer tracked drops a stale one instead of leaving it
+     * behind. */
+    if (!hashuid) {
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->hashuid);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->canonical_signature);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->condition);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->logical_module);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->duplicate_fingerprint);
+        node->hashuid = NULL;
+        node->canonical_signature = NULL;
+        node->condition = NULL;
+        node->logical_module = NULL;
+        node->duplicate_fingerprint = NULL;
+        node->type_id = 0;
+        node->language_type_id = 0;
+        return 0;
+    }
+    /* Allocate every string BEFORE releasing the old ones, so an OOM leaves
+     * the node exactly as it was (same contract as set_properties_json). */
+    char *h = identity_strdup(hashuid);
+    char *sig = identity_strdup(canonical_signature ? canonical_signature : "");
+    char *cond = identity_strdup(condition ? condition : "");
+    char *mod = identity_strdup(logical_module ? logical_module : "");
+    char *dup = identity_strdup(duplicate_fingerprint ? duplicate_fingerprint : "");
+    if (!h || !sig || !cond || !mod || !dup) {
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, h);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, sig);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, cond);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, mod);
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, dup);
+        return GB_ERR;
+    }
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->hashuid);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->canonical_signature);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->condition);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->logical_module);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, node->duplicate_fingerprint);
+    node->hashuid = h;
+    node->canonical_signature = sig;
+    node->condition = cond;
+    node->logical_module = mod;
+    node->duplicate_fingerprint = dup;
+    node->type_id = type_id;
+    node->language_type_id = language_type_id;
     return 0;
 }
 
@@ -1723,6 +1790,16 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
             .start_line = n->start_line,
             .end_line = n->end_line,
             .properties = props,
+            /* TrackerV2 identity: copied straight through to the columns.
+             * Borrowed from the gbuf node, which stays alive until the dump
+             * completes (same lifetime rule as `props` above). */
+            .hashuid = n->hashuid,
+            .canonical_signature = n->canonical_signature,
+            .condition = n->condition,
+            .logical_module = n->logical_module,
+            .duplicate_fingerprint = n->duplicate_fingerprint,
+            .type_id = n->type_id,
+            .language_type_id = n->language_type_id,
         };
         if (src) {
             src[idx] = n;

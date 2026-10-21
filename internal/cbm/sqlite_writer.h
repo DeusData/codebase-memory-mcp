@@ -15,6 +15,18 @@ typedef struct {
     int start_line;
     int end_line;
     const char *properties; // JSON string
+    // TrackerV2 Java identity columns, written as real columns (no longer as
+    // keys inside `properties`). NULL/0 = the node has no identity, which is
+    // the case for every label outside Class/Interface/Enum/Method and for
+    // every non-Java project. `name` + `file_path` above are the other two of
+    // the nine identity fields; `condition` is always "" for Java.
+    const char *hashuid;
+    const char *canonical_signature;
+    const char *condition;
+    const char *logical_module;
+    const char *duplicate_fingerprint;
+    int64_t type_id;
+    int64_t language_type_id;
 } CBMDumpNode;
 
 typedef struct {

@@ -23,7 +23,13 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_OK 0
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
-#define CBM_INDEX_FORMAT_VERSION 1
+/* v2: the TrackerV2 Java identity moved out of `properties` into real node
+ * columns (hashuid, canonical_signature, condition, logical_module,
+ * duplicate_fingerprint, type_id, language_type_id). A v1 database carries
+ * those values as JSON keys and has no such columns, so it is not readable by
+ * this build: the format bump routes it through the documented
+ * force-full-reindex path instead of silently returning empty columns. */
+#define CBM_INDEX_FORMAT_VERSION 2
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
@@ -44,6 +50,17 @@ typedef struct {
     int start_line;
     int end_line;
     const char *properties_json; /* JSON string, NULL → "{}" */
+    /* TrackerV2 Java identity columns (pass_hashuid). Real columns in `nodes`,
+     * no longer keys inside properties_json. NULL/0 = no identity, which is
+     * the majority of nodes. `name` and `file_path` above are two of the nine
+     * identity fields, so they are not duplicated here. */
+    const char *hashuid;
+    const char *canonical_signature;
+    const char *condition;
+    const char *logical_module;
+    const char *duplicate_fingerprint;
+    int64_t type_id;
+    int64_t language_type_id;
 } cbm_node_t;
 
 /* Compact declaration row returned by the bounded file-outline query. */
@@ -522,6 +539,14 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 /* Find nodes by file path. */
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
+
+/* Find nodes by TrackerV2 HashUID (Java Class/Interface/Enum/Method/Constructor
+ * nodes of a full index; see pass_hashuid.c). `hashuid` is the 32-character
+ * lowercase hex identity. idx_nodes_hashuid is unique per project, so `count`
+ * is 0 or 1 — but the result is returned as a node array so callers reuse
+ * cbm_store_free_nodes. Empty hash strings are a caller error, not a lookup. */
+int cbm_store_find_nodes_by_hashuid(cbm_store_t *s, const char *project, const char *hashuid,
+                                    cbm_node_t **out, int *count);
 
 /* Return a stable, paginated outline for one exact repository-relative file.
  * File/folder/container nodes are excluded. labels may be NULL when

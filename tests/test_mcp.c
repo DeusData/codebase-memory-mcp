@@ -1404,6 +1404,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"trace_path", true, false, true, false},
         {"get_code_snippet", true, false, true, false},
         {"get_file_outline", false, true, true, false},
+        {"get_by_hashuid", true, false, true, false},
         {"get_graph_schema", true, false, true, false},
         {"compare_graphs", true, false, true, false},
         {"get_architecture", true, false, true, false},
@@ -1987,8 +1988,8 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     static const char *const analysis_tools[] = {
         "search_graph",     "query_graph",      "trace_path",     "get_code_snippet",
         "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture",
-        "search_code",      "list_projects",    "index_status",   "check_index_coverage",
-        "detect_changes",
+        "get_by_hashuid",   "search_code",      "list_projects",  "index_status",
+        "check_index_coverage", "detect_changes",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
     for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {
@@ -2027,11 +2028,12 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
 
     resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/list\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_EQ(mcp_response_tool_count(resp), 8U);
+    ASSERT_EQ(mcp_response_tool_count(resp), 9U);
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "search_graph"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "trace_path"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_code_snippet"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_file_outline"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_by_hashuid"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_architecture"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "list_projects"));
     ASSERT_TRUE(mcp_response_has_exact_tool(resp, "index_status"));
@@ -2315,6 +2317,217 @@ TEST(tool_compare_graphs_registered_issue525) {
     ASSERT_NULL(strstr(resp, "unknown tool: compare_graphs"));
     free(resp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_by_hashuid_resolves_the_single_business_key_row) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "uid-project", "/tmp/uid-project"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "uid-project");
+
+    /* Identity is columns (index format v2); only the two fields the extractor
+     * owns — hashInput and hasBody — still ride in properties. */
+    static const char props[] =
+        "{\"hashInput\":\"snapshot|(int)|\",\"hasBody\":true}";
+    cbm_node_t tracked = {.project = "uid-project",
+                          .label = "Method",
+                          .name = "snapshot",
+                          .qualified_name = "uid-project.GitClient.snapshot",
+                          .file_path = "GitClient.java",
+                          .start_line = 12,
+                          .end_line = 30,
+                          .properties_json = props,
+                          .hashuid = "b9a50aa234cc33ce563eb182efdc8091",
+                          .canonical_signature = "snapshot(int)",
+                          .condition = "",
+                          .logical_module = "GitClient",
+                          .duplicate_fingerprint = "",
+                          .type_id = 2,
+                          .language_type_id = 2};
+    cbm_node_t plain = {.project = "uid-project",
+                        .label = "Field",
+                        .name = "counter",
+                        .qualified_name = "uid-project.GitClient.counter"};
+    ASSERT_GT(cbm_store_upsert_node(store, &tracked), 0);
+    ASSERT_GT(cbm_store_upsert_node(store, &plain), 0);
+
+    /* A hit returns one node plus the location needed to open it. The
+     * identity fields stay out unless asked for, so the default answer stays
+     * as small as the model needs. */
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_by_hashuid",
+        "{\"project\":\"uid-project\",\"hashuid\":\"b9a50aa234cc33ce563eb182efdc8091\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "uid-project.GitClient.snapshot"));
+    ASSERT_NOT_NULL(strstr(response, "GitClient.java"));
+    ASSERT_NOT_NULL(strstr(response, "found: true"));
+    ASSERT_NULL(strstr(response, "hash_input"));
+    free(response);
+
+    /* Uppercase is re-canonicalized instead of silently missing: the store
+     * holds lowercase, so a verbatim compare would answer "no such node" for a
+     * copy-pasted correct digest. */
+    response = cbm_mcp_handle_tool(
+        srv, "get_by_hashuid",
+        "{\"project\":\"uid-project\",\"hashuid\":\"B9A50AA234CC33CE563EB182EFDC8091\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "uid-project.GitClient.snapshot"));
+    free(response);
+
+    /* include_identity surfaces the hashed input, which is what lets a caller
+     * diagnose a mismatch field by field instead of guessing. */
+    response = cbm_mcp_handle_tool(
+        srv, "get_by_hashuid",
+        "{\"project\":\"uid-project\",\"hashuid\":\"b9a50aa234cc33ce563eb182efdc8091\","
+        "\"include_identity\":true}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "snapshot(int)"));
+    ASSERT_NOT_NULL(strstr(response, "snapshot|(int)|"));
+    ASSERT_NOT_NULL(strstr(response, "hash_input"));
+    free(response);
+
+    /* An unknown digest is a real answer, not an error, and it names both
+     * causes rather than leaving the caller to guess. */
+    response = cbm_mcp_handle_tool(
+        srv, "get_by_hashuid",
+        "{\"project\":\"uid-project\",\"hashuid\":\"00000000000000000000000000000000\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "found: false"));
+    ASSERT_NOT_NULL(strstr(response, "full Java index"));
+    free(response);
+
+    /* A malformed digest is a caller error, not a miss. */
+    response = cbm_mcp_handle_tool(
+        srv, "get_by_hashuid", "{\"project\":\"uid-project\",\"hashuid\":\"not-a-hash\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "32 hexadecimal characters"));
+    ASSERT_NOT_NULL(strstr(response, "isError"));
+    free(response);
+
+    /* project stays required, like every other tool. */
+    response = cbm_mcp_handle_tool(
+        srv, "get_by_hashuid", "{\"hashuid\":\"b9a50aa234cc33ce563eb182efdc8091\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "project is required"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+enum { E2E_HASHUID_HEX_CHARS = 32 };
+
+/* Read the digest pass_hashuid.c stamped onto a node. Since index format v2 it
+ * is the `hashuid` column, not a key inside properties. */
+static bool e2e_hashuid_of(const cbm_node_t *node, char *out, size_t out_size) {
+    if (!node || !node->hashuid || strlen(node->hashuid) != E2E_HASHUID_HEX_CHARS ||
+        strlen(node->hashuid) + 1U > out_size) {
+        return false;
+    }
+    snprintf(out, out_size, "%s", node->hashuid);
+    return true;
+}
+
+/* End-to-end through the real pipeline. A digest this test planted could agree
+ * with a planted lookup while both disagree with the scanner — which is
+ * exactly the failure the whole HashUID feature exists to prevent — so the
+ * digest here comes from an actual Java index run, and the call goes through
+ * the JSON-RPC surface rather than the handler directly. */
+TEST(tool_get_by_hashuid_resolves_a_pipeline_stamped_identity) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_hashuid_e2e_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    static const char java_source[] = "package demo;\n"
+                                      "public class Sample {\n"
+                                      "    private final String root;\n"
+                                      "    public Sample(String root) { this.root = root; }\n"
+                                      "    public String snapshot(int revision) {\n"
+                                      "        return root + revision;\n"
+                                      "    }\n"
+                                      "}\n";
+    ASSERT_EQ(th_write_file(TH_PATH(tmp, "src/demo/Sample.java"), java_source), 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/e2e.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *indexed = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(indexed);
+    cbm_node_t *methods = NULL;
+    int method_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(indexed, project, "Method", &methods, &method_count),
+              CBM_STORE_OK);
+
+    const cbm_node_t *tracked = NULL;
+    char stamped[E2E_HASHUID_HEX_CHARS + 1] = {0};
+    for (int i = 0; i < method_count; i++) {
+        if (!methods[i].name || strcmp(methods[i].name, "snapshot") != 0) {
+            continue;
+        }
+        if (e2e_hashuid_of(&methods[i], stamped, sizeof(stamped))) {
+            tracked = &methods[i];
+            break;
+        }
+    }
+    /* A method with a body must carry an identity; without this the rest of
+     * the test could pass on an empty graph. */
+    ASSERT_NOT_NULL(tracked);
+    ASSERT_EQ(strlen(stamped), (size_t)E2E_HASHUID_HEX_CHARS);
+    cbm_pipeline_free(pipeline);
+
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *server_store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(server_store);
+    ASSERT_EQ(cbm_store_upsert_project(server_store, "e2e-project", "/tmp/e2e-project"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "e2e-project");
+    cbm_node_t copy = {.project = "e2e-project",
+                       .label = tracked->label,
+                       .name = tracked->name,
+                       .qualified_name = tracked->qualified_name,
+                       .file_path = tracked->file_path,
+                       .start_line = tracked->start_line,
+                       .end_line = tracked->end_line,
+                       .properties_json = tracked->properties_json,
+                       /* The identity travels as columns, so the copy has to
+                        * carry them explicitly — upsert writes the struct. */
+                       .hashuid = tracked->hashuid,
+                       .canonical_signature = tracked->canonical_signature,
+                       .condition = tracked->condition,
+                       .logical_module = tracked->logical_module,
+                       .duplicate_fingerprint = tracked->duplicate_fingerprint,
+                       .type_id = tracked->type_id,
+                       .language_type_id = tracked->language_type_id};
+    ASSERT_GT(cbm_store_upsert_node(server_store, &copy), 0);
+
+    char request[768];
+    snprintf(request, sizeof(request),
+             "{\"jsonrpc\":\"2.0\",\"id\":901,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_by_hashuid\",\"arguments\":"
+             "{\"project\":\"e2e-project\",\"hashuid\":\"%s\",\"include_identity\":true}}}",
+             stamped);
+    char *resp = cbm_mcp_server_handle(srv, request);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":901"));
+    ASSERT_NOT_NULL(strstr(resp, tracked->qualified_name));
+    ASSERT_NOT_NULL(strstr(resp, "found: true"));
+    /* The identity block must survive the real stamped properties, not just
+     * the hand-written ones in the unit test. */
+    ASSERT_NOT_NULL(strstr(resp, "hash_input"));
+    ASSERT_NOT_NULL(strstr(resp, "canonical_signature"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_store_free_nodes(methods, method_count);
+    cbm_store_close(indexed);
+    th_rmtree(tmp);
     PASS();
 }
 
@@ -20347,6 +20560,8 @@ SUITE(mcp) {
     RUN_TEST(tool_compare_graphs_enforces_encoded_budget_issue525);
     RUN_TEST(tool_compare_graphs_validation_and_scan_cap_are_atomic_issue525);
     RUN_TEST(tool_compare_graphs_cancel_and_readonly_handles_release_issue525);
+    RUN_TEST(tool_get_by_hashuid_resolves_the_single_business_key_row);
+    RUN_TEST(tool_get_by_hashuid_resolves_a_pipeline_stamped_identity);
     RUN_TEST(tool_get_file_outline_returns_bounded_filtered_columnar_rows_issue469);
     RUN_TEST(tool_get_file_outline_validates_json_path_limit_and_cancel_issue469);
     RUN_TEST(tool_search_graph_basic);

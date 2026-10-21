@@ -23,20 +23,32 @@ and taking the MD5 of that UTF-8 string. cbm reproduces the bytes exactly, so
 the same declaration has the same identity on both sides and a node can be
 followed across tools and across revisions.
 
-Each tracked node carries:
+Each tracked node carries the identity in **dedicated node columns** (index
+format v2; before that they were keys inside `properties`):
 
-| Property | Meaning |
+| Column | Meaning |
 |---|---|
 | `hashuid` | 32-char lowercase hex MD5. The identity. |
-| `hashInput` | the exact hashed string, for field-by-field diagnosis |
-| `canonicalSignature` | `name(Type,Type)` — the signature half of the input |
-| `logicalModule` | TrackerV2's enclosing-container chain of simple names |
-| `duplicateFingerprint` | non-empty only for declarations sharing a key in one file |
-| `typeId` | `2` method, `3` constructor, `20` class, `22` enum, `23` interface |
-| `languageTypeId` | `2` for Java |
+| `canonical_signature` | `name(Type,Type)` — the signature half of the input |
+| `condition` | always empty for Java, but the column exists so the identity decomposes field for field |
+| `logical_module` | TrackerV2's enclosing-container chain of simple names |
+| `duplicate_fingerprint` | non-empty only for declarations sharing a key in one file |
+| `type_id` | `2` method, `3` constructor, `20` class, `22` enum, `23` interface |
+| `language_type_id` | `2` for Java |
 
-A unique expression index (`idx_nodes_hashuid`) enforces that no two nodes of a
-project share a `hashuid`.
+`name` and `file_path` — the other two of the eight hashed fields — are the
+node's own columns, so all nine values behind the digest are selectable without
+touching JSON. `hashInput` (the exact hashed string) stays a `properties` key:
+it is a cbm-only diagnostic, not one of the nine.
+
+Every one of the seven is NULL on a node without an identity, which is the
+majority of a Java graph. A unique index (`idx_nodes_hashuid`) over
+`(project, hashuid)` enforces that no two nodes of a project share a digest;
+NULLs are exempt, which is what lets the untracked majority coexist.
+
+The move from JSON keys to columns is an index-format bump: a v1 database has
+no such columns, so cbm rejects it at open and rebuilds the project on the next
+index run.
 
 ## Which nodes have it
 
@@ -86,18 +98,48 @@ graph) and are not an error: they are simply outside TrackerV2's model.
 
 ## How to query
 
+The dedicated MCP tool — prefer this over hand-writing a query:
+
+```
+get_by_hashuid(project, hashuid, include_identity?)
+```
+
+`hashuid` is the 32-character hexadecimal identity. Uppercase is accepted and
+re-canonicalized, because the store holds lowercase and a verbatim compare
+would turn a copy-pasted correct digest into a silent miss. The identity is
+unique per project, so the answer is one node and never a list.
+
+`include_identity: true` also returns the identity block:
+`canonical_signature`, `condition`, `logical_module`, `duplicate_fingerprint`,
+`type_id`, `language_type_id` (all read from the columns) plus `hash_input` and
+`has_body` (the two values that still live in `properties`). `hash_input` is the
+exact hashed string, which is the fastest way to see *which* of the eight fields
+differs when a digest does not line up with TrackerV2. Empty-but-present values
+are rendered as `-` by the compact emitter, so `condition` reads as `-` on every
+Java node.
+
+A miss is a result, not an error: it returns `found: false` with a hint, since
+identities are stamped by the full index path only and a project indexed
+through the closure-delta route legitimately has none.
+
 SQL over the graph database:
 
 ```sql
 SELECT name, qualified_name
 FROM nodes
 WHERE project = 'my-project'
-  AND json_extract(properties, '$.hashuid') = 'b9a50aa234cc33ce563eb182efdc8091';
+  AND hashuid = 'b9a50aa234cc33ce563eb182efdc8091';
 
 -- declarations that have no body (TrackerV2 would not know them)
 SELECT count(*) FROM nodes
-WHERE json_extract(properties, '$.hashuid') IS NOT NULL
+WHERE hashuid IS NOT NULL
   AND json_extract(properties, '$.hasBody') IS 0;
+
+-- the whole identity, decomposed exactly as TrackerV2 hashes it
+SELECT name, file_path, canonical_signature, condition, logical_module,
+       type_id, language_type_id, duplicate_fingerprint, hashuid
+FROM nodes
+WHERE project = 'my-project' AND hashuid IS NOT NULL;
 ```
 
 Cypher, through `query_graph`:
@@ -127,7 +169,13 @@ the two exceptions are the varargs cases above.
 
 ## Scope and limits
 
-- **Java only.** No other language has an identity.
+- **Java only.** No other language has an identity. The pass gates every
+  candidate on the file it was extracted from (`cbm_language_for_filename()`
+  over the node's `file_path`), so another language's `Class` / `Interface` /
+  `Enum` node — which carries no `javaTypeKind` and would otherwise pass the
+  type test — is left unstamped, as are synthetic paths such as
+  `<python-builtins>`. Methods were already Java-only via the `hasBody`
+  marker; the language gate covers the type half as well.
 - **Full index only.** The closure-delta incremental route does not stamp
   identities, because its buffer holds proxy nodes whose enclosing containers
   may be absent and a truncated `logical_module` would be silently wrong.

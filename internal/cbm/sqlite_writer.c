@@ -832,7 +832,14 @@ static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
 // --- Table record builders ---
 
 // Build a nodes table record: (id, project, label, name, qualified_name, file_path, start_line,
-// end_line, properties)
+// end_line, properties, hashuid, canonical_signature, condition, logical_module,
+// duplicate_fingerprint, type_id, language_type_id)
+//
+// The last seven are the TrackerV2 Java identity, stored as real columns. They
+// are NULL for every node outside the tracked set (File, Folder, Field,
+// Variable, ... and every non-Java node), so the "has an identity" test is
+// `hashuid IS NOT NULL`. `name` and `file_path` above are the other two of the
+// nine identity fields, which is why they are not duplicated here.
 static void fill_node_record(RecordBuilder *r, const CBMDumpNode *n) {
     rec_add_int(r, n->id);
     rec_add_text(r, n->project);
@@ -843,6 +850,26 @@ static void fill_node_record(RecordBuilder *r, const CBMDumpNode *n) {
     rec_add_int(r, n->start_line);
     rec_add_int(r, n->end_line);
     rec_add_text(r, n->properties ? n->properties : "{}");
+    if (!n->hashuid) {
+        /* One NULL per identity column; a shorter record would read back as
+         * NULL too, but writing them explicitly keeps the column count of the
+         * record equal to the table's, which is what the index builders and
+         * `PRAGMA integrity_check` expect. */
+        for (int i = 0; i < 7; i++) {
+            rec_add_null(r);
+        }
+        return;
+    }
+    rec_add_text(r, n->hashuid);
+    /* Empty-but-present values stay empty strings (serial type 13), NOT NULL:
+     * a top-level class has an empty canonical signature and an always-empty
+     * condition, and `json_extract`-based code used to see "" for both. */
+    rec_add_text(r, n->canonical_signature ? n->canonical_signature : "");
+    rec_add_text(r, n->condition ? n->condition : "");
+    rec_add_text(r, n->logical_module ? n->logical_module : "");
+    rec_add_text(r, n->duplicate_fingerprint ? n->duplicate_fingerprint : "");
+    rec_add_int(r, n->type_id);
+    rec_add_int(r, n->language_type_id);
 }
 
 // Build an edges table record: (id, project, source_id, target_id, type, properties)
@@ -2224,7 +2251,9 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname "
          "TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT "
          "'',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties "
-         "TEXT DEFAULT '{}',\n\t\tUNIQUE(project, qualified_name)\n\t)"},
+         "TEXT DEFAULT '{}',\n\t\thashuid TEXT,\n\t\tcanonical_signature TEXT,\n\t\tcondition "
+         "TEXT,\n\t\tlogical_module TEXT,\n\t\tduplicate_fingerprint TEXT,\n\t\ttype_id "
+         "INTEGER,\n\t\tlanguage_type_id INTEGER,\n\t\tUNIQUE(project, qualified_name)\n\t)"},
         {"index", "sqlite_autoindex_nodes_1", "nodes", autoindex_nodes_root, NULL},
         {"index", "idx_nodes_label", "nodes", idx_nodes_label_root,
          "CREATE INDEX idx_nodes_label ON nodes(project, label)"},

@@ -2280,6 +2280,17 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
         {"file_path", offsetof(cbm_node_t, file_path)},
         {"file", offsetof(cbm_node_t, file_path)},
         {"path", offsetof(cbm_node_t, file_path)},
+        /* TrackerV2 identity (v2): these used to live inside properties_json,
+         * which node_prop() parses below. They are columns now, so they must be
+         * named HERE — a property that is neither a column nor a JSON key
+         * returns a silent empty string, which is exactly the failure mode this
+         * table exists to prevent. `name` and `file_path` (the other two of the
+         * nine identity fields) are already listed above. */
+        {"hashuid", offsetof(cbm_node_t, hashuid)},
+        {"canonical_signature", offsetof(cbm_node_t, canonical_signature)},
+        {"condition", offsetof(cbm_node_t, condition)},
+        {"logical_module", offsetof(cbm_node_t, logical_module)},
+        {"duplicate_fingerprint", offsetof(cbm_node_t, duplicate_fingerprint)},
     };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         if (strcmp(prop, fields[i].key) == 0) {
@@ -2294,6 +2305,23 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
  * store may be NULL; only needed for virtual degree properties. */
 static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
 static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
+
+/* TrackerV2 identity INTEGER columns (v2). Rendered like start_line/end_line,
+ * with one difference that matters: a node without an identity reports nothing
+ * rather than a misleading "0", because 0 is not a real type_id. Returns true
+ * only when `prop` names one of these AND the node actually carries an
+ * identity; otherwise the caller falls through to its normal fallbacks. */
+static bool node_identity_int_prop(const cbm_node_t *n, const char *prop, char *out, size_t cap) {
+    if (!n || !prop || !n->hashuid || !n->hashuid[0]) {
+        return false;
+    }
+    bool is_type = strcmp(prop, "type_id") == 0;
+    if (!is_type && strcmp(prop, "language_type_id") != 0) {
+        return false;
+    }
+    snprintf(out, cap, "%lld", (long long)(is_type ? n->type_id : n->language_type_id));
+    return true;
+}
 
 static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
     if (!n || !prop) {
@@ -2320,6 +2348,9 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     }
     if (strcmp(prop, "end_line") == 0) {
         snprintf(out, CBM_SZ_512, "%d", n->end_line);
+        return out;
+    }
+    if (node_identity_int_prop(n, prop, out, CBM_SZ_512)) {
         return out;
     }
     /* Virtual computed properties: in_degree/out_degree via CALLS edges.
@@ -2363,6 +2394,8 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
                 res = out;
             } else if (strcmp(prop, "end_line") == 0) {
                 snprintf(out, CBM_SZ_512, "%d", full.end_line);
+                res = out;
+            } else if (node_identity_int_prop(&full, prop, out, CBM_SZ_512)) {
                 res = out;
             } else if (full.properties_json && full.properties_json[0] == '{') {
                 const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
@@ -2500,18 +2533,23 @@ static void node_deep_copy(cbm_node_t *dst, const cbm_node_t *src) {
     dst->qualified_name = heap_strdup(src->qualified_name);
     dst->file_path = heap_strdup(src->file_path);
     dst->properties_json = heap_strdup(src->properties_json);
+    /* Identity columns MUST be duplicated, not borrowed: node_fields_free()
+     * releases them, so a shallow-pointer copy would double-free against the
+     * node the store still owns. */
+    dst->hashuid = heap_strdup(src->hashuid);
+    dst->canonical_signature = heap_strdup(src->canonical_signature);
+    dst->condition = heap_strdup(src->condition);
+    dst->logical_module = heap_strdup(src->logical_module);
+    dst->duplicate_fingerprint = heap_strdup(src->duplicate_fingerprint);
 }
 
 static void node_fields_free(cbm_node_t *n) {
     if (!n) {
         return;
     }
-    safe_str_free(&n->project);
-    safe_str_free(&n->label);
-    safe_str_free(&n->name);
-    safe_str_free(&n->qualified_name);
-    safe_str_free(&n->file_path);
-    safe_str_free(&n->properties_json);
+    /* Delegate to the store's freer: a hand-rolled field list here silently
+     * leaked the identity columns the moment they were added. */
+    cbm_node_free_fields(n);
 }
 
 /* Deep copy an edge (binding owns the strings) */

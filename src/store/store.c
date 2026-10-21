@@ -27,6 +27,14 @@ enum {
     ST_COL_8 = 8,
     ST_COL_9 = 9,
     ST_COL_10 = 10,
+    /* TrackerV2 identity columns, appended after `properties` (v2). */
+    ST_COL_11 = 11,
+    ST_COL_12 = 12,
+    ST_COL_13 = 13,
+    ST_COL_14 = 14,
+    ST_COL_15 = 15,
+    ST_COL_16 = 16,
+    ST_COL_17 = 17,
     ST_FOUND = -1,
     ST_BUF_16 = 16,
     ST_BUF_64 = 64,
@@ -126,6 +134,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
     sqlite3_stmt *stmt_find_nodes_by_file;
+    sqlite3_stmt *stmt_find_nodes_by_hashuid;
     sqlite3_stmt *stmt_count_nodes;
     sqlite3_stmt *stmt_delete_nodes_by_project;
     sqlite3_stmt *stmt_delete_nodes_by_file;
@@ -255,6 +264,23 @@ static int init_schema(cbm_store_t *s) {
         "  start_line INTEGER DEFAULT 0,"
         "  end_line INTEGER DEFAULT 0,"
         "  properties TEXT DEFAULT '{}',"
+        /* TrackerV2 Java identity (pass_hashuid), formerly keys inside
+         * `properties`. Real columns so a plain SQL consumer can select them
+         * without json_extract. `name` + `file_path` above are the other two
+         * of the nine identity fields (name | signature | path | condition |
+         * logical_module | type_id | language_type_id | duplicate_fingerprint
+         * | hashuid). NULL in all seven = the node has no identity, which is
+         * the majority of nodes: only Class/Interface/Enum/Method of a Java
+         * project are tracked. `condition` is always empty for Java and is
+         * still stored, because the column mirrors the hash-input
+         * decomposition field for field. */
+        "  hashuid TEXT,"
+        "  canonical_signature TEXT,"
+        "  condition TEXT,"
+        "  logical_module TEXT,"
+        "  duplicate_fingerprint TEXT,"
+        "  type_id INTEGER,"
+        "  language_type_id INTEGER,"
         "  UNIQUE(project, qualified_name)"
         ");"
         /* local_name_gen (#768): IMPORTS edges carry one imported symbol's
@@ -363,6 +389,22 @@ static int init_schema(cbm_store_t *s) {
                                &probe, NULL) != SQLITE_OK) {
             cbm_log_warn("store.schema", "result", "incompatible", "missing",
                          "edges.local_name_gen");
+            return CBM_STORE_ERR;
+        }
+        sqlite3_finalize(probe);
+    }
+
+    /* Same treatment for the v2 identity columns. `CREATE TABLE IF NOT EXISTS`
+     * does not widen a table that already exists, so a v1 database keeps its
+     * nine values inside `properties` and has no hashuid column at all: every
+     * reader built on the column would return nothing. Fail the open so the
+     * pipeline takes its format-change path (CBM_INDEX_FORMAT_VERSION is
+     * bumped in lockstep) and rebuilds, which the operator has accepted. */
+    {
+        sqlite3_stmt *probe = NULL;
+        if (sqlite3_prepare_v2(s->db, "SELECT hashuid FROM nodes LIMIT 0;", CBM_NOT_FOUND, &probe,
+                               NULL) != SQLITE_OK) {
+            cbm_log_warn("store.schema", "result", "incompatible", "missing", "nodes.hashuid");
             return CBM_STORE_ERR;
         }
         sqlite3_finalize(probe);
@@ -512,16 +554,13 @@ static int create_user_indexes(cbm_store_t *s) {
          * lets the digest cover only Class/Interface/Enum/Method while every
          * other label — File, Folder, Field, Route, … — has none.
          *
-         * The json_valid() guard is not optional: json_extract aborts the whole
-         * CREATE INDEX on a row whose properties are malformed, and legacy
-         * databases contain such rows. The CASE form keeps the malformed rows
-         * out of the expression entirely (same shape as FTS_BODY_EXPR above);
-         * a bare "json_extract(...) IS NOT NULL" in a WHERE clause is NOT
-         * equivalent, and that is why the idx_nodes_entry_point expression
-         * index noted directly above was reverted. */
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_hashuid"
-        " ON nodes(project, CASE WHEN json_valid(properties)"
-        " THEN json_extract(properties,'$.hashuid') END);";
+         * v2: `hashuid` is a real column, so this is a plain column index. The
+         * previous json_extract(...) expression index — and the json_valid()
+         * guard it needed to survive malformed legacy rows — are gone with the
+         * JSON key. A v1 database is rejected by the schema probe in
+         * init_schema() long before this runs, so no malformed-properties row
+         * can reach an index build here. */
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_hashuid ON nodes(project, hashuid);";
     /* NOTE: a partial expression index on json_extract(properties,'$.is_entry_point')
      * was tried for arch_entry_points and REVERTED: json_extract in an index WHERE
      * aborts CREATE INDEX (and thus store open) on any row whose properties JSON is
@@ -1287,6 +1326,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
     finalize_stmt(&s->stmt_find_nodes_by_file);
+    finalize_stmt(&s->stmt_find_nodes_by_hashuid);
     finalize_stmt(&s->stmt_count_nodes);
     finalize_stmt(&s->stmt_delete_nodes_by_project);
     finalize_stmt(&s->stmt_delete_nodes_by_file);
@@ -2582,10 +2622,14 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_node,
                        "INSERT INTO nodes (project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties) "
-                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) "
+                       "start_line, end_line, properties, hashuid, canonical_signature, "
+                       "condition, logical_module, duplicate_fingerprint, type_id, "
+                       "language_type_id) "
+                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) "
                        "ON CONFLICT(project, qualified_name) DO UPDATE SET "
-                       "label=?2, name=?3, file_path=?5, start_line=?6, end_line=?7, properties=?8 "
+                       "label=?2, name=?3, file_path=?5, start_line=?6, end_line=?7, properties=?8, "
+                       "hashuid=?9, canonical_signature=?10, condition=?11, logical_module=?12, "
+                       "duplicate_fingerprint=?13, type_id=?14, language_type_id=?15 "
                        "RETURNING id;");
     if (!stmt) {
         return CBM_STORE_ERR;
@@ -2599,6 +2643,16 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
     sqlite3_bind_int(stmt, ST_COL_6, n->start_line);
     sqlite3_bind_int(stmt, ST_COL_7, n->end_line);
     bind_text(stmt, ST_COL_8, safe_props(n->properties_json));
+    /* Identity columns. All seven are NULL for a node without one, which is
+     * how the reader distinguishes "no identity" from an identity whose
+     * fingerprint/signature legitimately happens to be empty. */
+    bind_text(stmt, ST_COL_9, n->hashuid);
+    bind_text(stmt, ST_COL_10, n->canonical_signature);
+    bind_text(stmt, ST_COL_11, n->condition);
+    bind_text(stmt, ST_COL_12, n->logical_module);
+    bind_text(stmt, ST_COL_13, n->duplicate_fingerprint);
+    sqlite3_bind_int64(stmt, ST_COL_14, n->type_id);
+    sqlite3_bind_int64(stmt, ST_COL_15, n->language_type_id);
 
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
@@ -2622,13 +2676,24 @@ static void scan_node(sqlite3_stmt *stmt, cbm_node_t *n) {
     n->start_line = sqlite3_column_int(stmt, CBM_SZ_6);
     n->end_line = sqlite3_column_int(stmt, CBM_SZ_7);
     n->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
+    /* TrackerV2 identity (v2 columns). NULL for every node without one, which
+     * is the majority: heap_strdup(NULL) faithfully yields NULL, so callers
+     * test `hashuid != NULL` rather than an empty string. `condition` is the
+     * one column that is present-but-empty on identity-bearing nodes. */
+    n->hashuid = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_9));
+    n->canonical_signature = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_10));
+    n->condition = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_11));
+    n->logical_module = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_12));
+    n->duplicate_fingerprint = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_13));
+    n->type_id = sqlite3_column_int64(stmt, ST_COL_14);
+    n->language_type_id = sqlite3_column_int64(stmt, ST_COL_15);
 }
 
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_node_by_id,
                        "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes WHERE id = ?1;");
+                       "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes WHERE id = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -2652,7 +2717,7 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_node_by_qn,
                        "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes "
+                       "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                        "WHERE project = ?1 AND qualified_name = ?2;");
     if (!stmt) {
         return CBM_STORE_ERR;
@@ -2677,7 +2742,7 @@ int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *ou
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_node_by_qn_any,
                        "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes "
+                       "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                        "WHERE qualified_name = ?1 LIMIT 1;");
     if (!stmt) {
         return CBM_STORE_ERR;
@@ -2704,7 +2769,7 @@ int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_nodes_by_name_any,
                        "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes "
+                       "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                        "WHERE name = ?1;");
     if (!stmt) {
         *out = NULL;
@@ -2816,7 +2881,7 @@ int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, 
     }
     return find_nodes_generic(s, &s->stmt_find_nodes,
                               "SELECT id, project, label, name, qualified_name, file_path, "
-                              "start_line, end_line, properties FROM nodes "
+                              "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                               "WHERE project = ?1;",
                               project, NULL, out, count);
 }
@@ -2830,7 +2895,7 @@ int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char
     }
     return find_nodes_generic(s, &s->stmt_find_nodes_by_name,
                               "SELECT id, project, label, name, qualified_name, file_path, "
-                              "start_line, end_line, properties FROM nodes "
+                              "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                               "WHERE project = ?1 AND name = ?2;",
                               project, name, out, count);
 }
@@ -2844,7 +2909,7 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
     }
     return find_nodes_generic(s, &s->stmt_find_nodes_by_label,
                               "SELECT id, project, label, name, qualified_name, file_path, "
-                              "start_line, end_line, properties FROM nodes "
+                              "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                               "WHERE project = ?1 AND label = ?2;",
                               project, label, out, count);
 }
@@ -2858,9 +2923,29 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
     }
     return find_nodes_generic(s, &s->stmt_find_nodes_by_file,
                               "SELECT id, project, label, name, qualified_name, file_path, "
-                              "start_line, end_line, properties FROM nodes "
+                              "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                               "WHERE project = ?1 AND file_path = ?2;",
                               project, file_path, out, count);
+}
+
+int cbm_store_find_nodes_by_hashuid(cbm_store_t *s, const char *project, const char *hashuid,
+                                    cbm_node_t **out, int *count) {
+    if (!s) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+    /* v2: `hashuid` is a real column, so this is a plain indexed equality and
+     * the json_valid()/json_extract() CASE dance — needed only because
+     * json_extract raises on a malformed properties blob — is gone with the
+     * JSON key. idx_nodes_hashuid is UNIQUE(project, hashuid), so this is at
+     * most one row per project; the generic scan is reused anyway so the
+     * caller never depends on that for correctness. */
+    return find_nodes_generic(s, &s->stmt_find_nodes_by_hashuid,
+                              "SELECT id, project, label, name, qualified_name, file_path, "
+                              "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
+                              "WHERE project = ?1 AND hashuid = ?2;",
+                              project, hashuid, out, count);
 }
 
 typedef struct {
@@ -4345,7 +4430,7 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
     *out = NULL;
     *count = 0;
     const char *sql = "SELECT id, project, label, name, qualified_name, file_path, "
-                      "start_line, end_line, properties FROM nodes "
+                      "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                       "WHERE project = ?1 AND file_path = ?2 "
                       "AND label NOT IN ('Module', 'Package', 'File', 'Folder') "
                       "AND start_line <= ?4 AND end_line >= ?3 "
@@ -4405,10 +4490,10 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
 
     const char *sql_with_project =
         "SELECT id, project, label, name, qualified_name, file_path, "
-        "start_line, end_line, properties FROM nodes "
+        "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
         "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
     const char *sql_any = "SELECT id, project, label, name, qualified_name, file_path, "
-                          "start_line, end_line, properties FROM nodes "
+                          "start_line, end_line, properties, hashuid, canonical_signature, condition, logical_module, duplicate_fingerprint, type_id, language_type_id FROM nodes "
                           "WHERE (qualified_name LIKE ?1 OR qualified_name = ?2)";
 
     sqlite3_stmt *stmt = NULL;
@@ -5494,6 +5579,14 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     const char *select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
                               "n.file_path, n.start_line, n.end_line, n.properties, "
+                              /* The identity block sits exactly where scan_node()
+                               * expects it (columns 9..15). The degree columns
+                               * therefore come AFTER it — see the ST_COL_16/17
+                               * reads below. Putting them straight after
+                               * `properties` would make scan_node read an
+                               * in-degree as a HashUID. */
+                              "n.hashuid, n.canonical_signature, n.condition, n.logical_module, "
+                              "n.duplicate_fingerprint, n.type_id, n.language_type_id, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
                               "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
                               "'IMPLEMENTS')) AS in_deg, "
@@ -5580,8 +5673,9 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         }
         memset(&results[n], 0, sizeof(cbm_search_result_t));
         scan_node(main_stmt, &results[n].node);
-        results[n].in_degree = sqlite3_column_int(main_stmt, ST_COL_9);
-        results[n].out_degree = sqlite3_column_int(main_stmt, CBM_DECIMAL_BASE);
+        /* The degree columns are selected after the identity block. */
+        results[n].in_degree = sqlite3_column_int(main_stmt, ST_COL_16);
+        results[n].out_degree = sqlite3_column_int(main_stmt, ST_COL_17);
         n++;
     }
     if (scan_rc13 != SQLITE_DONE) { /* SCANCHK:13:main_stmt */
@@ -5607,12 +5701,7 @@ void cbm_store_search_free(cbm_search_output_t *out) {
     }
     for (int i = 0; i < out->count; i++) {
         cbm_search_result_t *r = &out->results[i];
-        safe_str_free(&r->node.project);
-        safe_str_free(&r->node.label);
-        safe_str_free(&r->node.name);
-        safe_str_free(&r->node.qualified_name);
-        safe_str_free(&r->node.file_path);
-        safe_str_free(&r->node.properties_json);
+        cbm_node_free_fields(&r->node);
         for (int j = 0; j < r->connected_count; j++) {
             safe_str_free(&r->connected_names[j]);
         }
@@ -5849,7 +5938,11 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "  LIMIT %d"
                  ")"
                  "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
-                 "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop, "
+                 "n.file_path, n.start_line, n.end_line, n.properties, "
+                 /* Identity block first (scan_node reads columns 9..15), then the
+                  * BFS hop — which is therefore column 16, not column 9. */
+                 "n.hashuid, n.canonical_signature, n.condition, n.logical_module, "
+                 "n.duplicate_fingerprint, n.type_id, n.language_type_id, bfs.hop, "
                  "(SELECT count(*) FROM bfs) "
                  "FROM bfs JOIN nodes n ON n.id = bfs.node_id "
                  "WHERE bfs.hop > 0 ORDER BY bfs.hop, n.id LIMIT %d;",
@@ -5869,9 +5962,13 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "  JOIN edges e ON %s"
                  "  WHERE e.type IN (%s) AND bfs.hop < %d"
                  ")"
-                 "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-                 "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
-                 "FROM bfs "
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+             "n.file_path, n.start_line, n.end_line, n.properties, "
+             /* Identity block first (scan_node reads columns 9..15), then
+              * MIN(hop) as column 16. */
+             "n.hashuid, n.canonical_signature, n.condition, n.logical_module, "
+             "n.duplicate_fingerprint, n.type_id, n.language_type_id, MIN(bfs.hop) AS hop "
+             "FROM bfs "
                  "JOIN nodes n ON n.id = bfs.node_id "
                  "WHERE bfs.hop > 0 "
                  "GROUP BY n.id "
@@ -5908,9 +6005,12 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
             visited = safe_realloc(visited, cap * sizeof(cbm_node_hop_t));
         }
         scan_node(stmt, &visited[n].node);
-        visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
+        /* hop follows the identity block in the SELECT list. */
+        visited[n].hop = sqlite3_column_int(stmt, ST_COL_16);
         if (trail) {
-            cte_rows = sqlite3_column_int(stmt, ST_COL_10);
+            /* The trail COUNT(*) is selected last: identity block (9..15),
+             * bfs.hop (16), count (17). */
+            cte_rows = sqlite3_column_int(stmt, ST_COL_17);
         }
         n++;
     }
@@ -6047,7 +6147,10 @@ int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
              "  WHERE e.type IN (%s) AND bfs.hop < %d"
              ")"
              "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-             "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
+             "n.file_path, n.start_line, n.end_line, n.properties, "
+             /* Identity block first, then MIN(hop) as column 16. */
+             "n.hashuid, n.canonical_signature, n.condition, n.logical_module, "
+             "n.duplicate_fingerprint, n.type_id, n.language_type_id, MIN(bfs.hop) AS hop "
              "FROM bfs "
              "JOIN nodes n ON n.id = bfs.node_id "
              /* hop > 0 excludes the anchors themselves; the NOT IN excludes a
@@ -6091,7 +6194,7 @@ int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
             visited = safe_realloc(visited, cap * sizeof(cbm_node_hop_t));
         }
         scan_node(stmt, &visited[n].node);
-        visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
+        visited[n].hop = sqlite3_column_int(stmt, ST_COL_16);
         n++;
     }
     bool aborted = (scan_rc16 != SQLITE_DONE && scan_rc16 != SQLITE_ROW);
@@ -6118,22 +6221,12 @@ void cbm_store_traverse_free(cbm_traverse_result_t *out) {
         return;
     }
     /* Free root */
-    safe_str_free(&out->root.project);
-    safe_str_free(&out->root.label);
-    safe_str_free(&out->root.name);
-    safe_str_free(&out->root.qualified_name);
-    safe_str_free(&out->root.file_path);
-    safe_str_free(&out->root.properties_json);
+    cbm_node_free_fields(&out->root);
 
     /* Free visited */
     for (int i = 0; i < out->visited_count; i++) {
         cbm_node_hop_t *h = &out->visited[i];
-        safe_str_free(&h->node.project);
-        safe_str_free(&h->node.label);
-        safe_str_free(&h->node.name);
-        safe_str_free(&h->node.qualified_name);
-        safe_str_free(&h->node.file_path);
-        safe_str_free(&h->node.properties_json);
+        cbm_node_free_fields(&h->node);
     }
     free(out->visited);
 
@@ -6477,7 +6570,14 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
     /* Node label property keys: base columns + distinct JSON property keys per label */
     if (with_props) {
         static const char *node_base_cols[] = {"name", "qualified_name", "file_path", "start_line",
-                                               "end_line"};
+                                               "end_line",
+                                               /* v2 identity columns: they are no longer JSON
+                                                * keys, so the json_each() scan below cannot see
+                                                * them — without this the schema tool would stop
+                                                * advertising attributes that are still queryable. */
+                                               "hashuid", "canonical_signature", "condition",
+                                               "logical_module", "duplicate_fingerprint", "type_id",
+                                               "language_type_id"};
         const char *prop_sql = "SELECT DISTINCT je.key "
                                "FROM nodes, json_each(nodes.properties) AS je "
                                "WHERE nodes.project = ?1 AND nodes.label = ?2 "
@@ -9863,6 +9963,12 @@ void cbm_node_free_fields(cbm_node_t *n) {
     safe_str_free(&n->qualified_name);
     safe_str_free(&n->file_path);
     safe_str_free(&n->properties_json);
+    /* Identity columns are heap-owned by the store exactly like file_path. */
+    safe_str_free(&n->hashuid);
+    safe_str_free(&n->canonical_signature);
+    safe_str_free(&n->condition);
+    safe_str_free(&n->logical_module);
+    safe_str_free(&n->duplicate_fingerprint);
 }
 
 void cbm_store_free_nodes(cbm_node_t *nodes, int count) {
