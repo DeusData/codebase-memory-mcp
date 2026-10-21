@@ -1183,6 +1183,50 @@ const char *cbm_service_pattern_route_method(const char *callee_name) {
     return NULL;
 }
 
+static bool mux_is_blank(char ch) {
+    return ch == ' ' || ch == '\t';
+}
+
+const char *cbm_service_pattern_mux_split(const char *pattern, char *method, size_t method_sz) {
+    if (method && method_sz > 0) {
+        method[0] = '\0';
+    }
+    if (!pattern || pattern[0] == '/') {
+        return NULL;
+    }
+    /* METHOD: Go cuts it at the first space or tab and trims the rest. */
+    const char *rest = pattern;
+    size_t method_len = 0;
+    while (pattern[method_len] >= 'A' && pattern[method_len] <= 'Z') {
+        method_len++;
+    }
+    if (method_len > 0 && mux_is_blank(pattern[method_len])) {
+        rest = pattern + method_len;
+        while (mux_is_blank(*rest)) {
+            rest++;
+        }
+    } else {
+        method_len = 0;
+    }
+    /* HOST: everything before the path's slash, with no blank or line break. */
+    const char *slash = rest;
+    while (*slash && *slash != '/' && !mux_is_blank(*slash) && *slash != '\n' && *slash != '\r') {
+        slash++;
+    }
+    if (*slash != '/' || (method_len == 0 && slash == rest)) {
+        return NULL;
+    }
+    if (method_len > 0 && method) {
+        if (method_len >= method_sz) {
+            method[0] = '\0';
+            return NULL;
+        }
+        memcpy(method, pattern, method_len);
+        method[method_len] = '\0';
+    }
+    return slash;
+}
+
 const char *cbm_service_pattern_broker(const char *resolved_qn) {
     if (!resolved_qn) {
         return NULL;

@@ -84,6 +84,17 @@ const char *cbm_service_pattern_http_method(const char *callee_name);
  * Returns NULL if not a known route registration method. */
 const char *cbm_service_pattern_route_method(const char *callee_name);
 
+/* Go 1.22+ net/http ServeMux pattern "[METHOD ][HOST]/[PATH]" (#2537):
+ * "POST /v1/x", "GET api.example.com/v1/x", "api.example.com/v1/x". Returns a
+ * pointer to PATH's leading slash inside `pattern`, or NULL when the pattern
+ * names neither a method nor a host before a slash (a plain "/v1/x" is NULL
+ * too: there is nothing to split). METHOD is a run of uppercase letters ended
+ * by spaces or tabs; it is copied to `method` (NUL-terminated, "" when the
+ * pattern names none) when `method` is non-NULL; a method that does not fit
+ * `method_sz` then makes the pattern NULL. The grammar is Go's: callers gate
+ * on the file language. */
+const char *cbm_service_pattern_mux_split(const char *pattern, char *method, size_t method_sz);
+
 /* Get the broker name for an async QN (e.g., "pubsub" from a Pub/Sub QN).
  * Returns NULL if not an async pattern. */
 const char *cbm_service_pattern_broker(const char *resolved_qn);
