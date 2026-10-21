@@ -1619,9 +1619,9 @@ TEST(index_supervisor_task_temp_limit_terminates_as_resource_failure) {
     index_supervisor_task_temp_fake_t fake = {.bytes = 2, .succeeds = true};
     cbm_index_supervisor_set_task_temp_hook_for_testing(index_supervisor_task_temp_fake, &fake);
     cbm_index_worker_handle_t *handle = NULL;
-    int start_rc =
-        cbm_index_worker_start_with_storage_policy("{\"__cbm_test_worker\":\"clean\"}", 0, &policy,
-                                                   db_path, false, NULL, NULL, NULL, NULL, &handle);
+    int start_rc = cbm_index_worker_start_with_storage_policy("{\"__cbm_test_worker\":\"clean\"}",
+                                                              0, &policy, db_path, false, NULL,
+                                                              NULL, NULL, NULL, 0, &handle);
     const cbm_index_worker_result_t *result = NULL;
     bool terminal = handle && index_supervisor_test_poll_terminal(
                                   handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
