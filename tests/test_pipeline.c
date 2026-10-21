@@ -9282,6 +9282,104 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
     PASS();
 }
 
+/* Issue #2297: a call through `import { foo as fooShared }` produced no CALLS
+ * edge, so trace_path(foo, inbound) missed the caller. End to end through the
+ * real pipeline: the renamed call, an app-local wrapper that shares the
+ * exported name, and a method on a renamed class import all reach the
+ * exported member, while the plain named import control keeps lsp_ts_import. */
+TEST(pipeline_ts_renamed_import_call_issue2297) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ts_2297_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/lib.ts",
+                    "export function fooUniqueQrs(x: number): number {\n"
+                    "  return x + 1;\n"
+                    "}\n"
+                    "export function buildHealthUniqueQrs(input: { a: number }): number {\n"
+                    "  return input.a;\n"
+                    "}\n"
+                    "export class ConnUniqueQrs {\n"
+                    "  pingUniqueQrs(): number {\n"
+                    "    return 1;\n"
+                    "  }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/plain.ts",
+                    "import { fooUniqueQrs } from './lib';\n"
+                    "export function callsPlain(): number {\n"
+                    "  return fooUniqueQrs(1);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/renamed.ts",
+                    "import { fooUniqueQrs as fooShared } from './lib';\n"
+                    "export function callsRenamed(): number {\n"
+                    "  return fooShared(1);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/wrapper.ts",
+                    "import { buildHealthUniqueQrs as buildShared } from './lib';\n"
+                    "export function buildHealthUniqueQrs(input: { a: number }): number {\n"
+                    "  return buildShared({ ...input });\n"
+                    "}\n");
+    write_temp_file(tmp, "src/klass.ts",
+                    "import { ConnUniqueQrs as Connection } from './lib';\n"
+                    "export function viaRenamedClass(): number {\n"
+                    "  return new Connection().pingUniqueQrs();\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ts_2297.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    bool plain =
+        cross_file_call_has_strategy(s, project, "callsPlain", "fooUniqueQrs", "lsp_ts_import");
+    bool renamed = cross_file_call_has_strategy(s, project, "callsRenamed", "fooUniqueQrs",
+                                                "lsp_import_alias");
+    char wrapper_qn[512];
+    char exported_qn[512];
+    snprintf(wrapper_qn, sizeof(wrapper_qn), "%s.src.wrapper.buildHealthUniqueQrs", project);
+    snprintf(exported_qn, sizeof(exported_qn), "%s.src.lib.buildHealthUniqueQrs", project);
+    cbm_node_t wrapper_node = {0};
+    cbm_node_t exported_node = {0};
+    bool wrapper = false;
+    bool recursive = false;
+    if (cbm_store_find_node_by_qn(s, project, wrapper_qn, &wrapper_node) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, exported_qn, &exported_node) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        cbm_store_find_edges_by_source_type(s, wrapper_node.id, "CALLS", &edges, &edge_count);
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i].target_id == exported_node.id && edges[i].properties_json &&
+                strstr(edges[i].properties_json, "lsp_import_alias"))
+                wrapper = true;
+            if (edges[i].target_id == wrapper_node.id)
+                recursive = true;
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_node_free_fields(&wrapper_node);
+    cbm_node_free_fields(&exported_node);
+    bool renamed_class = cross_file_call_has_strategy(s, project, "viaRenamedClass",
+                                                      "pingUniqueQrs", "lsp_ts_method");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(plain);
+    ASSERT_TRUE(renamed);
+    ASSERT_TRUE(wrapper);
+    ASSERT_FALSE(recursive);
+    ASSERT_TRUE(renamed_class);
+    PASS();
+}
+
 /* A query failure is distinct from a valid zero-edge result. */
 static int ts514_pipeline_count(cbm_store_t *store, const char *sql, const char **values,
                                 int value_count) {
@@ -27677,6 +27775,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916);
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
+    RUN_TEST(pipeline_ts_renamed_import_call_issue2297);
     RUN_TEST(pipeline_ts_param_property_injection_issue514);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_php_receiver_suppresses_weak_method_edge);
