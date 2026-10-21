@@ -14450,23 +14450,22 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
     /* Containment: a search result whose indexed path resolves outside the
      * project root (a `..` segment, or a symlink/junction that discovery
      * followed) must not be read back into the response. Same guard the
-     * snippet path already uses. */
-    if (!root_containment_check(containment, abs_path)) {
-        free(abs_path);
-        return;
-    }
-
-    /* #1750: the indexed [start,end] ranges only describe the file as it was
+     * snippet path already uses.
+     *
+     * #1750: the indexed [start,end] ranges only describe the file as it was
      * at index time. If the file changed on disk, attaching source/context
      * sliced with those ranges returns shifted text (or another function's
      * body), and the symbol attribution itself is untrustworthy. Flag the
      * drift and attach nothing. */
+    bool inside = root_containment_check(containment, abs_path);
     const char *freshness = r->freshness;
     bool drifted = freshness && (strcmp(freshness, "metadata_changed") == 0 ||
                                  strcmp(freshness, "missing") == 0);
-    if (drifted) {
-        yyjson_mut_obj_add_bool(doc, item, "source_drift", true);
-        yyjson_mut_obj_add_str(doc, item, "freshness", freshness);
+    if (!inside || drifted) {
+        if (inside) {
+            yyjson_mut_obj_add_bool(doc, item, "source_drift", true);
+            yyjson_mut_obj_add_str(doc, item, "freshness", freshness);
+        }
         free(abs_path);
         return;
     }
