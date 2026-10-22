@@ -1308,6 +1308,14 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             /* Both: a `.h` file is classified C++, and that is where C declares
              * the structs its `.c` files access. */
             pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Class");
+        } else if (files[fi].language == CBM_LANG_RUST) {
+            /* Rust structs also carry label "Struct" and emit one flat "Field"
+             * CBMDefinition per struct field (parent_class = owning struct QN,
+             * return_type = raw type text). Without the fold the Tier-2 cross
+             * registry registers zero fields, so every cross-file field access
+             * is untypable and its call falls to the textual name fallback —
+             * the `entry.session.push_daily` → trait-stub mis-bind class. */
+            pxc_fold_struct_fields(arena, fr, defs, file_start, idx, "Struct");
         }
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < fr->impl_traits.count; ii++) {
