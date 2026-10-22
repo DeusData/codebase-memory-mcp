@@ -12420,6 +12420,141 @@ TEST(search_code_output_limit_fails_closed_and_cleans_scan) {
     PASS();
 }
 
+/* #2634: the POSIX unscoped scan runs find/sort/grep as argv stages with no
+ * shell, so file names carrying shell metacharacters are plain operands, not
+ * command text. Pin that such files are discovered and scanned. */
+TEST(search_code_unscoped_argv_scans_metachar_filenames_issue2634) {
+#ifdef _WIN32
+    SKIP_PLATFORM("argv scan stages are POSIX-only");
+#else
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-argv-meta-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char hostile[CBM_SZ_1K];
+    snprintf(hostile, sizeof(hostile), "%s/we'ird ;na`me$.go", tmp);
+    ASSERT_EQ(th_write_file(hostile,
+                          "package main\n\nfunc HandleHostile2634() error {\n\treturn nil\n}\n"),
+              0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-argv-metachar";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"HandleHostile2634\","
+                                     "\"project\":\"search-argv-metachar\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "we'ird ;na`me$.go"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":1"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(th_rmtree(tmp), 0);
+    PASS();
+#endif
+}
+
+/* #2634: grep's exit 1 (no match in a chunk) is an ordinary empty result, not
+ * a scan failure — the same contract the retired xargs wrapper encoded. */
+TEST(search_code_unscoped_argv_no_match_is_success_issue2634) {
+#ifdef _WIN32
+    SKIP_PLATFORM("argv scan stages are POSIX-only");
+#else
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-argv-nomatch-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char src_path[CBM_SZ_1K];
+    snprintf(src_path, sizeof(src_path), "%s/handler.go", tmp);
+    ASSERT_EQ(th_write_file(src_path,
+                          "package main\n\nfunc HandlePresent2634() error {\n\treturn nil\n}\n"),
+              0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-argv-nomatch";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"NoSuchSymbol2634\","
+                                     "\"project\":\"search-argv-nomatch\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(th_rmtree(tmp), 0);
+    PASS();
+#endif
+}
+
+/* #2634: the unscoped file_pattern reaches find as a -name operand, so a
+ * non-matching extension is excluded from the scan without any shell glob. */
+TEST(search_code_unscoped_argv_honours_file_pattern_issue2634) {
+#ifdef _WIN32
+    SKIP_PLATFORM("argv scan stages are POSIX-only");
+#else
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-argv-glob-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char py[CBM_SZ_1K];
+    snprintf(py, sizeof(py), "%s/handler.py", tmp);
+    ASSERT_EQ(th_write_file(py, "def handle_python2634():\n    return 1\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-argv-glob";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(srv, "search_code",
+                                     "{\"pattern\":\"handle_python2634\","
+                                     "\"project\":\"search-argv-glob\","
+                                     "\"file_pattern\":\"*.go\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_TRUE(strstr(inner, "handler.py") == NULL);
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":0"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_code",
+                               "{\"pattern\":\"handle_python2634\","
+                               "\"project\":\"search-argv-glob\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "handler.py"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_grep_matches\":1"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(th_rmtree(tmp), 0);
+    PASS();
+#endif
+}
+
 TEST(search_code_scan_deadline_fails_closed_and_resets) {
     mcp_search_cache_t cache;
     ASSERT_TRUE(mcp_search_cache_open(&cache, "cbm-search-deadline"));
@@ -25224,6 +25359,9 @@ SUITE(mcp) {
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(search_code_unscoped_argv_scans_metachar_filenames_issue2634);
+    RUN_TEST(search_code_unscoped_argv_no_match_is_success_issue2634);
+    RUN_TEST(search_code_unscoped_argv_honours_file_pattern_issue2634);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
     RUN_TEST(search_code_scan_deadline_override_is_per_server);
