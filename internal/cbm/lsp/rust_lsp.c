@@ -787,6 +787,64 @@ static const char *resolve_path_to_type_qn(RustLSPContext *ctx, const char *path
     return qn; /* may not be registered yet but caller can still wrap as NAMED */
 }
 
+/* ── Registered-type short-name probe ────────────────────────────────
+ *
+ * A bare `type_identifier` reached through a braced `use` (`use
+ * alpha::{Entry, Session};`) resolves via the use map to a crate-rooted QN
+ * (`alpha.Entry`), which is not the registered form (`<project>.alpha.src.
+ * lib.Entry`); without a fallback the parsed type is unregistered, every
+ * member access on it returns "unknown", and the call falls to the registry's
+ * name-suffix fallback — the store_ffi.rs:120 class of mis-binding. The probe
+ * finds the UNIQUE registered type whose QN ends with `.<name>` (case-exact;
+ * Rust names are). Ambiguous (0 or ≥2) → NULL, caller keeps the old form.
+ *
+ * A per-file memo (owned by the RustLSPContext, arena-allocated, ≤48 names —
+ * typical files touch only a handful of cross-module type names) keeps the
+ * O(registry) scan from becoming O(types) per parse on large projects. */
+#define RUST_PROBE_MEMO_MAX 48
+
+static const char *rust_short_probe_type(RustLSPContext *ctx, const CBMTypeRegistry *reg,
+                                         const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    if (ctx) {
+        for (int i = 0; i < ctx->probe_count; i++) {
+            if (strcmp(ctx->probe_memo[i].name, name) == 0) {
+                return ctx->probe_memo[i].hit;
+            }
+        }
+    }
+    const char *hit = NULL;
+    bool ambiguous = false;
+    for (const CBMTypeRegistry *r = reg; r && !ambiguous; r = r->fallback) {
+        for (int i = 0; i < r->type_count; i++) {
+            const CBMRegisteredType *rt = &r->types[i];
+            if (!rt->qualified_name) {
+                continue;
+            }
+            const char *dot = strrchr(rt->qualified_name, '.');
+            if (dot && strcmp(dot + 1, name) == 0) {
+                if (hit && strcmp(hit, rt->qualified_name) != 0) {
+                    ambiguous = true;
+                    hit = NULL;
+                    break;
+                }
+                hit = rt->qualified_name;
+            }
+        }
+    }
+    if (ctx && !ctx->probe_memo && ctx->arena) {
+        ctx->probe_memo = (RustProbeEntry *)cbm_arena_alloc(
+            ctx->arena, (size_t)RUST_PROBE_MEMO_MAX * sizeof(RustProbeEntry));
+    }
+    if (ctx && ctx->probe_memo && ctx->probe_count < RUST_PROBE_MEMO_MAX) {
+        ctx->probe_memo[ctx->probe_count++] =
+            (RustProbeEntry){.name = name, .hit = ambiguous ? NULL : hit};
+    }
+    return ambiguous ? NULL : hit;
+}
+
 const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return cbm_type_unknown();
@@ -815,6 +873,16 @@ const CBMType *rust_parse_type_node(RustLSPContext *ctx, TSNode node) {
             return cbm_type_named(ctx->arena, ctx->self_type_qn);
         }
         const char *qn = rust_resolve_path_expr(ctx, name);
+        /* Verify the resolver's form is actually registered; a use-mapped
+         * crate-rooted form (`alpha.Entry`) frequently is not, while the
+         * short name has a unique registered type. Probing lifts those. */
+        if (!cbm_registry_lookup_type(ctx->registry, qn) &&
+            !cbm_registry_lookup_func(ctx->registry, qn)) {
+            const char *probed = rust_short_probe_type(ctx, ctx->registry, name);
+            if (probed) {
+                qn = probed;
+            }
+        }
         return cbm_type_named(ctx->arena, qn);
     }
 
@@ -6337,6 +6405,81 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                     rust_registered_type_add_embedded(arena, rt, rf.impl_trait_qn);
                 }
             }
+        }
+    }
+
+    /* ── Materialize struct fields from the folded field_defs ───────────
+     * pxc_fold_struct_fields (pass_lsp_cross.c) composes "name:type" pairs
+     * from the extractor's flat "Field" CBMDefinitions into the owning
+     * "Struct" def's field_defs string. rust_populate_cross_registry copied
+     * that string but never read it, so the Tier-2 cross registry registered
+     * zero fields: every cross-file field access (`self.session` where
+     * SessionHost lives in another file) was untypable, pushing those method
+     * calls to the textual fallback's suffix bucket. Parse and attach them
+     * here, after every type is registered (the type loop ran first), with a
+     * short-name probe for cross-module type texts (a field `session: Session`
+     * in spine_ffi/src/lib.rs spells a name registered in another module). */
+    for (int i = 0; i < def_count; i++) {
+        CBMRustLSPDef *d = &defs[i];
+        if (!d->field_defs || !d->field_defs[0] || !d->qualified_name || d->is_rust_impl_relation) {
+            continue;
+        }
+        int32_t tix = cbm_idxmemo_get(&type_idx, d->qualified_name);
+        if (tix < 0 || reg->types[tix].field_names) {
+            continue; /* not a registered type, or fields already materialized */
+        }
+        const char *def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
+        const char **names = NULL;
+        const CBMType **types = NULL;
+        int fc = 0;
+        const char *s = d->field_defs;
+        do {
+            const char *pipe = strchr(s, '|');
+            size_t seg_len = pipe ? (size_t)(pipe - s) : strlen(s);
+            char pair[512];
+            if (seg_len == 0 || seg_len >= sizeof(pair)) {
+                s = pipe ? pipe + 1 : NULL;
+                continue;
+            }
+            memcpy(pair, s, seg_len);
+            pair[seg_len] = '\0';
+            /* The name never contains ':' — split at the first ':'. */
+            char *colon = strchr(pair, ':');
+            if (colon && fc < 64) {
+                *colon = '\0';
+                const char *type_text = colon + 1;
+                const CBMType *ft = rust_parse_return_type_text(arena, type_text, def_mod);
+                if (ft && ft->kind == CBM_TYPE_NAMED &&
+                    !cbm_registry_lookup_type(reg, ft->data.named.qualified_name)) {
+                    /* Cross-module spelling: probe the SHORT name once (the
+                     * probe matches the last QN segment, so a fully qualified
+                     * text would never hit). */
+                    const char *qn_text = ft->data.named.qualified_name;
+                    const char *last_dot = qn_text ? strrchr(qn_text, '.') : NULL;
+                    const char *probed =
+                        rust_short_probe_type(NULL, reg, last_dot ? last_dot + 1 : qn_text);
+                    if (probed) {
+                        ft = cbm_type_named(arena, probed);
+                    }
+                }
+                if (fc == 0) {
+                    names = (const char **)cbm_arena_alloc(arena, 65 * sizeof(const char *));
+                    types = (const CBMType **)cbm_arena_alloc(arena, 65 * sizeof(const CBMType *));
+                    if (!names || !types) {
+                        break;
+                    }
+                }
+                names[fc] = cbm_arena_strdup(arena, pair);
+                types[fc] = ft;
+                fc++;
+            }
+            s = pipe ? pipe + 1 : NULL;
+        } while (s);
+        if (fc > 0) {
+            names[fc] = NULL;
+            types[fc] = NULL;
+            reg->types[tix].field_names = names;
+            reg->types[tix].field_types = types;
         }
     }
 
