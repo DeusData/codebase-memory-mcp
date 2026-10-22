@@ -467,13 +467,14 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
  * unit-tested in test_registry.c. */
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
 
-/* #1942: a bare (dot-less) Go reference can never denote a struct field —
- * field access is always a selector expression, and selector references
- * resolve on the LSP path. Drops a READS/WRITES/USAGE bind whose target is a
- * Field when the reference text carries no '.'. Go only: other OO languages
- * legitimately reference their own members bare inside method bodies. Pure;
- * unit-tested in test_registry.c. */
-bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
+/* #1942/#2666: a bare Go or C reference can never denote a struct field —
+ * field access is always a selector expression (or, in C, a designator), and
+ * the member half of one is recorded as is_member_access. Drops a
+ * READS/WRITES/USAGE bind whose target is a Field when the reference was not
+ * the member half of a selector. Go and C only: other OO languages (and C++,
+ * which every `.h` is parsed as) legitimately reference their own members
+ * bare inside method bodies. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_bare_field_ref(CBMLanguage lang, bool is_member_access, const char *target_label);
 
 /* What to do with a call whose registry resolution landed on a Field node.
  * Pure; unit-tested in test_registry.c. */

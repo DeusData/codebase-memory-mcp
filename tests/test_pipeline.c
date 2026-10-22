@@ -11055,6 +11055,93 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     PASS();
 }
 
+/* #2666: tests/test_main.c runs every suite through a macro,
+ * RUN_SELECTED_SUITE(mcp); the argument is a bare C identifier that names no
+ * declaration, and the registry fallback bound it to whichever struct member
+ * was called `mcp`. toggle() writes a bare name the extractor cannot see
+ * declared (a macro-made global, say) that a struct member also carries.
+ * state.c holds the genuine member uses that must keep their edges.
+ * pad_files pushes the run past MIN_FILES_FOR_PARALLEL for the parallel twin. */
+static void write_c_bare_field_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "include/suite.h",
+                    "typedef struct suite_state {\n"
+                    "    char mcp[64];\n"
+                    "    int count;\n"
+                    "    int enabled;\n"
+                    "} suite_state_t;\n");
+    write_temp_file(tmp, "tests/main.c",
+                    "#include \"suite.h\"\n"
+                    "#define RUN_SELECTED_SUITE(name) run_suite(#name)\n"
+                    "int run_suite(const char *name);\n"
+                    "int main(void) {\n"
+                    "    RUN_SELECTED_SUITE(mcp);\n"
+                    "    RUN_SELECTED_SUITE(count);\n"
+                    "    return 0;\n"
+                    "}\n"
+                    "void toggle(void) {\n"
+                    "    enabled = 1;\n"
+                    "}\n");
+    write_temp_file(tmp, "src/state.c",
+                    "#include \"suite.h\"\n"
+                    "int state_count(const suite_state_t *s) { return s->count; }\n"
+                    "void state_reset(suite_state_t *s) { s->enabled = 0; }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.c", i);
+        snprintf(body, sizeof(body), "int filler%d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int run_c_bare_field_case(const char *tmpl, int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", tmpl);
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_bare_field_fixture(tmp, pad_files);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_bare.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* The fields must exist for the probes to mean anything. */
+    ASSERT_GTE(fixture_node_count(s, project, "include/suite.h", "mcp", "Field"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "include/suite.h", "count", "Field"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "include/suite.h", "enabled", "Field"), 1);
+    /* Reproduce-first: RED before the fix — the macro arguments bind the
+     * same-named struct members, and the bare write binds `enabled`. */
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "main", "mcp", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "main", "count", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "toggle", "enabled", "WRITES"));
+    /* The member half of `s->count` / `s->enabled = 0` still binds the field. */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "state_count", "count", "USAGE"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "state_reset", "enabled", "WRITES"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_c_bare_ref_never_binds_field) {
+    /* Sequential path: resolve_usage_edges / resolve_rw_edges. */
+    return run_c_bare_field_case("/tmp/cbm_c_bare_XXXXXX", 0);
+}
+
+TEST(pipeline_c_bare_ref_never_binds_field_parallel) {
+    /* Parallel twin: resolve_file_usages / resolve_file_rw must consult the
+     * same predicate (#1928's lesson). */
+    return run_c_bare_field_case("/tmp/cbm_c_barep_XXXXXX", 52);
+}
+
 /* A C caller of a header function that shares its name with a struct member
  * elsewhere (kernel: include/linux/mm.h put_page beside the arm64
  * kvm_pgtable_mm_ops.put_page member). pad_files pushes the run past
@@ -28180,6 +28267,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
+    RUN_TEST(pipeline_c_bare_ref_never_binds_field);
+    RUN_TEST(pipeline_c_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_c_call_reaches_header_function_beside_field);
     RUN_TEST(pipeline_c_call_reaches_header_function_beside_field_parallel);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type);
