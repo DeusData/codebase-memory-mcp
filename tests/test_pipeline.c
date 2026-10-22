@@ -10470,6 +10470,101 @@ TEST(pipeline_go_multi_return_receiver_is_typed_parallel) {
     return go_multi_return_case(52);
 }
 
+/* #2033: an identity alias declared in one file is followed from another file
+ * of the same package. `type FeatureSet = bitmap` (featureset.go), the method
+ * `bitmap.Set` (bitmap.go) and the call `reqs.Set(3)` (framework.go) are three
+ * files, so the alias reaches the call only through the cross-file defs. The
+ * same-package decoy `other.Set` means the call cannot bind by name. Before the
+ * fix the call had no CALLS edge at all. pad_files > 0 forces the parallel
+ * resolver and its prebuilt registry. */
+static int go_crossfile_type_alias_case(int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_alias_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/fx\n\ngo 1.22\n");
+    write_temp_file(tmp, "fs/bitmap.go",
+                    "package fs\n"
+                    "\n"
+                    "type bitmap []uint64\n"
+                    "\n"
+                    "func (b bitmap) Set(i int) { b[i/64] |= 1 << (i % 64) }\n");
+    write_temp_file(tmp, "fs/featureset.go",
+                    "package fs\n"
+                    "\n"
+                    "type FeatureSet = bitmap\n");
+    write_temp_file(
+        tmp, "fs/framework.go",
+        "package fs\n"
+        "\n"
+        "type Framework struct{}\n"
+        "\n"
+        "func (f *Framework) NewFeatureSet() FeatureSet { return make(FeatureSet, 1) }\n"
+        "\n"
+        "func Use(f *Framework) {\n"
+        "\treqs := f.NewFeatureSet()\n"
+        "\treqs.Set(3)\n"
+        "}\n");
+    write_temp_file(tmp, "fs/other.go",
+                    "package fs\n"
+                    "\n"
+                    "type other struct{}\n"
+                    "\n"
+                    "func (o other) Set(i int) {}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler/filler%d.go", i);
+        snprintf(body, sizeof(body), "package filler\n\nfunc Filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *saved = NULL;
+    if (pad_files > 0) {
+        char *old_workers = getenv("CBM_WORKERS");
+        saved = old_workers ? strdup(old_workers) : NULL;
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_alias.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    if (pad_files > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+            free(saved);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(rc, 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    int right = named_edge_to_file_count(s, project, "CALLS", "Use", "Set", "fs/bitmap.go");
+    int decoy = named_edge_to_file_count(s, project, "CALLS", "Use", "Set", "fs/other.go");
+    bool typed = cross_file_call_has_strategy(s, project, "Use", "Set", "\"strategy\":\"lsp_");
+    if (right != 1 || decoy != 0 || !typed) {
+        printf("  Use -> Set: right=%d decoy=%d lsp=%d\n", right, decoy, typed);
+        FAIL("call through a cross-file type alias not bound to the aliased type's method");
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_crossfile_type_alias_method) {
+    return go_crossfile_type_alias_case(0);
+}
+
+TEST(pipeline_go_crossfile_type_alias_method_parallel) {
+    return go_crossfile_type_alias_case(52);
+}
+
 TEST(pipeline_go_rw_usage_never_cross_into_c) {
     /* #1928: USAGE and WRITES/READS resolve through the same short-name
      * registry as CALLS but never consulted the #725 cross-language guard.
@@ -25311,7 +25406,7 @@ TEST(pipeline_python_namespace_change_admission) {
     }
     int body = -9, signature = -9, alias = -9, order = -9;
     int empty = -9, literal = -9, unknown = -9, deletion = -9, transition = -9;
-    const char *non_python = "{\"v\":3,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
+    const char *non_python = "{\"v\":4,\"lang\":0,\"lsp\":[],\"reg\":[],\"py\":null}";
     if (complete) {
         body = cbm_lsp_surface_python_change(json[0], json[1]);
         signature = cbm_lsp_surface_python_change(json[0], json[2]);
@@ -25442,24 +25537,24 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
      * it re-extracts in full. */
     const char *bad[] = {
         "{\"v\":1,\"lsp\":[]}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[]}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":null}",
-        "{\"v\":3,\"lang\":1.0,\"lsp\":[],\"py\":null}",
-        "{\"v\":3,\"v\":3,\"lang\":0,\"lsp\":[],\"py\":null}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":4,\"lang\":1,\"lsp\":[]}",
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":null}",
+        "{\"v\":4,\"lang\":1.0,\"lsp\":[],\"py\":null}",
+        "{\"v\":4,\"v\":4,\"lang\":0,\"lsp\":[],\"py\":null}",
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":3,\"failure\":2,\"events\":[]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":1,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":99,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":[]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\\u0000suffix\",\"status\":2,"
         "\"failure\":0,\"events\":[]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":999,\"d\":0,\"s\":0,\"r\":0,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":8,\"d\":0,\"s\":1,\"r\":0,\"f\":0,\"l\":4294967296,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}",
@@ -25479,7 +25574,7 @@ TEST(pipeline_python_namespace_codec_rejects_non_authoritative_rows) {
         cbm_arena_destroy(&arena);
     }
     const char *unknown =
-        "{\"v\":3,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
+        "{\"v\":4,\"lang\":1,\"lsp\":[],\"reg\":[],\"py\":{\"v\":2,\"lang\":1,"
         "\"module\":\"p.m\",\"path\":\"m.py\",\"status\":2,\"failure\":0,\"events\":["
         "{\"k\":7,\"d\":0,\"s\":0,\"r\":7,\"f\":0,\"l\":0,"
         "\"n\":null,\"m\":null,\"i\":null,\"a\":[]}]}}";
@@ -25507,7 +25602,7 @@ TEST(pipeline_lsp_surface_large_object_array_decode) {
     const size_t capacity = (size_t)count * 192 + 64;
     char *json = malloc(capacity);
     ASSERT_NOT_NULL(json);
-    size_t used = (size_t)snprintf(json, capacity, "{\"v\":3,\"lang\":0,\"py\":null,\"lsp\":[");
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":4,\"lang\":0,\"py\":null,\"lsp\":[");
     for (int i = 0; i < count; i++) {
         int n = snprintf(json + used, capacity - used,
                          "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
@@ -25597,10 +25692,10 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
         ASSERT_TRUE(row_a->surface_sha && row_a->surface_sha[0]);
         if (round == 0) {
             snprintf(sha_baseline, sizeof(sha_baseline), "%s", row_a->surface_sha);
-            /* The row is the versioned codec envelope (codec version 3) with
+            /* The row is the versioned codec envelope (codec version 4) with
              * the def present. */
             snprintf(json_probe, sizeof(json_probe), "%.20s", row_a->defs_json);
-            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":3") != NULL);
+            ASSERT_TRUE(strstr(row_a->defs_json, "\"v\":4") != NULL);
             ASSERT_TRUE(strstr(row_a->defs_json, "surface_probe") != NULL);
         } else if (round == 1) {
             ASSERT_STR_EQ(row_a->surface_sha, sha_baseline);
@@ -28168,6 +28263,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed_parallel);
+    RUN_TEST(pipeline_go_crossfile_type_alias_method);
+    RUN_TEST(pipeline_go_crossfile_type_alias_method_parallel);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_rust_call_never_binds_another_language);
