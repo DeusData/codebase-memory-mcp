@@ -471,6 +471,27 @@ void cbm_daemon_runtime_set_containment_hook_for_testing(
  * in test time. UINT32_MAX restores the production constant; any other value
  * (0 = expire immediately) overrides. Process-global; reset it after use. */
 void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms);
+/* Connection-cap seams (flaky-ledger item 12). While held, the two bounded
+ * waits on a peer in the connection-cap path end only on that peer: a
+ * connection that has not sent its first frame keeps its worker slot until it
+ * closes (or the service stops) instead of until the request deadline, and an
+ * inline rejection's drain (Windows; a no-op on POSIX) lasts until the peer
+ * closes instead of 250 ms. A "slow hello" becomes a state the test releases,
+ * not a window it races. Process-global; reset it after use. */
+void cbm_daemon_runtime_hold_peer_waits_for_testing(bool hold);
+/* The four points that order a HELLO against an inline accept-loop rejection.
+ * The hook runs on the client thread for the CLIENT_* points and on the accept
+ * thread for the DAEMON_* points (never under the service mutex), so a test can
+ * pin either order: daemon answers after the HELLO is on the wire, or the
+ * daemon has answered and closed before the HELLO is sent. NULL removes it. */
+typedef enum {
+    CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_CONNECTED = 0, /* transport up, HELLO not sent */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_CLIENT_SENT,          /* HELLO send attempted */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTING,     /* inline rejection not yet written */
+    CBM_DAEMON_RUNTIME_HELLO_POINT_DAEMON_REJECTED,      /* inline rejection written + closed */
+} cbm_daemon_runtime_hello_point_t;
+typedef void (*cbm_daemon_runtime_hello_hook_t)(cbm_daemon_runtime_hello_point_t point);
+void cbm_daemon_runtime_set_hello_hook_for_testing(cbm_daemon_runtime_hello_hook_t hook);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */

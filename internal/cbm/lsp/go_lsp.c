@@ -1987,15 +1987,24 @@ static void process_function(GoLSPContext *ctx, TSNode func_node) {
     if (!func_name || !func_name[0])
         return;
 
-    // Enclosing-function QN must be the BARE package.Func form (no receiver
-    // type segment). The textual call events (extract_unified.c) source calls
-    // as package_qn.func_name — methods included — and the defs pass creates
-    // the graph Method node under the same QN, so any other form breaks the
-    // caller-QN join in cbm_pipeline_find_lsp_resolution and the LSP-resolved
-    // call silently falls back to the registry short-name resolver. The
-    // receiver type still reaches the registry via the def's parent_class /
-    // method->receiver_type; it just does not appear in the caller QN.
+    // Enclosing-function QN must be EXACTLY the QN the textual call events
+    // (extract_unified.c compute_func_qn) and the defs pass produce, or the
+    // caller-QN join in cbm_pipeline_find_lsp_resolution breaks and the
+    // LSP-resolved call silently falls back to the registry short-name
+    // resolver. Since #1909 receiver-qualified Go method QNs, that shared
+    // form is package_qn.ReceiverType.method for methods (the ONE-formula
+    // contract: cbm_go_receiver_type_name) and package_qn.func for functions.
     ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, func_name);
+    if (strcmp(ts_node_type(func_node), "method_declaration") == 0) {
+        TSNode recv = ts_node_child_by_field_name(func_node, "receiver", 8);
+        if (!ts_node_is_null(recv)) {
+            char *recv_type = cbm_go_receiver_type_name(ctx->arena, recv, ctx->source);
+            if (recv_type && recv_type[0]) {
+                ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s.%s", ctx->package_qn,
+                                                           recv_type, func_name);
+            }
+        }
+    }
 
     // Push function scope
     CBMScope *saved_scope = ctx->current_scope;
@@ -3224,7 +3233,7 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -3630,7 +3639,7 @@ void cbm_run_go_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);

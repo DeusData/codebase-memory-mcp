@@ -76,8 +76,26 @@ static _Atomic uint32_t runtime_ephemeral_linger_timeout_seam = UINT32_MAX;
 void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms) {
     atomic_store(&runtime_ephemeral_linger_timeout_seam, timeout_ms);
 }
+
+/* Connection-cap seams (flaky-ledger item 12): see runtime.h. */
+static atomic_bool runtime_hold_peer_waits_seam;
+void cbm_daemon_runtime_hold_peer_waits_for_testing(bool hold) {
+    atomic_store(&runtime_hold_peer_waits_seam, hold);
+}
+static _Atomic(cbm_daemon_runtime_hello_hook_t) runtime_hello_hook_seam;
+void cbm_daemon_runtime_set_hello_hook_for_testing(cbm_daemon_runtime_hello_hook_t hook) {
+    atomic_store(&runtime_hello_hook_seam, hook);
+}
+static void runtime_hello_point(cbm_daemon_runtime_hello_point_t point) {
+    cbm_daemon_runtime_hello_hook_t hook = atomic_load(&runtime_hello_hook_seam);
+    if (hook) {
+        hook(point);
+    }
+}
+#define RUNTIME_HELLO_POINT(point) runtime_hello_point(CBM_DAEMON_RUNTIME_HELLO_POINT_##point)
 #else
 static void runtime_note_peer_image_hash(void) {}
+#define RUNTIME_HELLO_POINT(point) ((void)0)
 #endif
 
 #ifdef _WIN32
@@ -1989,6 +2007,29 @@ static void runtime_worker_handle_activation_shutdown(cbm_daemon_runtime_worker_
     runtime_worker_finish(worker);
 }
 
+/* The first frame is due within the request deadline. Under the item-12 seam a
+ * connection that never sends one holds its slot until it closes; stop still
+ * interrupts the wait like any other worker receive. */
+static uint32_t runtime_first_frame_timeout_ms(const cbm_daemon_runtime_service_t *service) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&runtime_hold_peer_waits_seam)) {
+        return CBM_DAEMON_IPC_WAIT_FOREVER;
+    }
+#endif
+    return service->request_timeout_ms;
+}
+
+/* Under the same seam an inline rejection's drain ends only on the peer's
+ * close, never on the 250 ms bound (the drain only waits on Windows). */
+static uint32_t runtime_reject_drain_timeout_ms(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (atomic_load(&runtime_hold_peer_waits_seam)) {
+        return CBM_DAEMON_IPC_WAIT_FOREVER;
+    }
+#endif
+    return RUNTIME_REJECT_DRAIN_TIMEOUT_MS;
+}
+
 static void *runtime_connection_worker(void *opaque) {
     cbm_daemon_runtime_worker_t *worker = opaque;
     cbm_daemon_runtime_service_t *service = worker->service;
@@ -1998,7 +2039,7 @@ static void *runtime_connection_worker(void *opaque) {
     char requested_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
 
     int received = cbm_daemon_ipc_receive_frame_bounded(
-        worker->connection, service->request_timeout_ms,
+        worker->connection, runtime_first_frame_timeout_ms(service),
         CBM_DAEMON_ACTIVATION_SHUTDOWN_REQUEST_SIZE, &frame, &payload);
     if (received != 1 || frame.type != CBM_DAEMON_FRAME_REQUEST) {
         free(payload);
@@ -2274,14 +2315,19 @@ static cbm_daemon_runtime_worker_t *runtime_find_free_worker_locked(
     return NULL;
 }
 
+/* Answers WITHOUT reading the peer's HELLO, so on POSIX (where the drain is a
+ * no-op) the close can land before the peer has even sent it; the client reads
+ * this answer after its failed send (cbm_daemon_runtime_client_connect). */
 static void runtime_reject_inline(cbm_daemon_ipc_connection_t *connection, const char *message) {
     cbm_daemon_runtime_connect_result_t result;
     runtime_result_rejected(&result, message);
+    RUNTIME_HELLO_POINT(DAEMON_REJECTING);
     (void)runtime_send_hello_response(connection, &result);
     /* Same Windows named-pipe discard hazard as runtime_worker_finish: the
      * peer must get to read the rejection before the handle closes. */
-    cbm_daemon_ipc_connection_drain(connection, RUNTIME_REJECT_DRAIN_TIMEOUT_MS);
+    cbm_daemon_ipc_connection_drain(connection, runtime_reject_drain_timeout_ms());
     cbm_daemon_ipc_connection_close(connection);
+    RUNTIME_HELLO_POINT(DAEMON_REJECTED);
 }
 
 static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
@@ -3063,21 +3109,39 @@ cbm_daemon_runtime_client_t *cbm_daemon_runtime_client_connect(
         return NULL;
     }
     cbm_daemon_ipc_connection_t *connection = cbm_daemon_ipc_connect(endpoint, timeout_ms);
-    if (!connection || !cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
-                                                  CBM_DAEMON_RUNTIME_OP_HELLO, request,
-                                                  (uint32_t)sizeof(request))) {
-        cbm_daemon_ipc_connection_close(connection);
+    if (!connection) {
         return NULL;
     }
+    RUNTIME_HELLO_POINT(CLIENT_CONNECTED);
+    bool hello_sent =
+        cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST, CBM_DAEMON_RUNTIME_OP_HELLO,
+                                  request, (uint32_t)sizeof(request));
+    RUNTIME_HELLO_POINT(CLIENT_SENT);
     cbm_daemon_frame_t frame = {0};
     uint8_t *payload = NULL;
-    int received = cbm_daemon_ipc_receive_frame_bounded(
-        connection, timeout_ms, CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE, &frame, &payload);
+    /* A daemon at capacity or stopping answers from its accept loop without
+     * reading this HELLO and closes at once. When that close lands first, the
+     * send fails (EPIPE) with the whole answer already queued here: read it,
+     * or the caller gets a bare transport error and bootstrap classifies by
+     * lock state instead of by the daemon's own "capacity" / "stopping". */
+    int received =
+        hello_sent
+            ? cbm_daemon_ipc_receive_frame_bounded(
+                  connection, timeout_ms, CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE, &frame, &payload)
+            : cbm_daemon_ipc_receive_frame_after_failed_send(
+                  connection, timeout_ms, CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE, &frame, &payload);
     bool valid = received == 1 && frame.type == CBM_DAEMON_FRAME_RESPONSE &&
                  frame.flags == CBM_DAEMON_RUNTIME_OP_HELLO &&
                  frame.length == CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE &&
                  runtime_hello_response_decode(payload, result_out);
     free(payload);
+    if (!hello_sent && (!valid || result_out->status != CBM_DAEMON_RUNTIME_CONNECT_REJECTED)) {
+        /* Only a rejection can answer a HELLO the daemon never received;
+         * anything else stays the plain send failure it always was. */
+        memset(result_out, 0, sizeof(*result_out));
+        cbm_daemon_ipc_connection_close(connection);
+        return NULL;
+    }
     if (received != 1) {
         /* The kernel completed the pipe/socket connect, so a server process
          * exists, yet the HELLO went unanswered. Name that holder: a dead

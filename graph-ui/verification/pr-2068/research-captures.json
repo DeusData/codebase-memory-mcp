@@ -1,0 +1,51 @@
+{
+  "date": "2026-09-09",
+  "method": "Unmodified Playwright Chromium viewport screenshots",
+  "viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "screenshots": [
+    {
+      "file": "research-archify-overview.png",
+      "source": "https://tt-a1i.github.io/archify/gallery/artifacts/agent-tool-call.workflow.html",
+      "interaction": "Public authored example; opened overview. Not an extracted CBM flow.",
+      "sha256": "cc4a9598a5a36c7622d4d7005fa01a32b436b4ad9a93fd097b08c607c93e809a",
+      "bytes": 395053
+    },
+    {
+      "file": "research-archify-chapter.png",
+      "source": "https://tt-a1i.github.io/archify/gallery/artifacts/agent-tool-call.workflow.html",
+      "interaction": "Clicked happy-path guided chapter and waited for chapter counter 1 / 3.",
+      "sha256": "00ffad71ff365fbdfe696f1c3bde1645c1eb1ae0d61a80beb6a5a2ff3b04fafb",
+      "bytes": 456143
+    },
+    {
+      "file": "research-archify-route.png",
+      "source": "https://tt-a1i.github.io/archify/gallery/artifacts/agent-tool-call.workflow.html",
+      "interaction": "Clicked PATH, User, Tool Call. Observed six named nodes / five directed authored hops.",
+      "sha256": "338771f7ef0e7c091d36ef41685e78a1a3005b304641f6597fcff66a6175578e",
+      "bytes": 452382
+    },
+    {
+      "file": "research-gitnexus-entry.png",
+      "source": "https://gitnexus.vercel.app",
+      "interaction": "Public startup screen. It waits for a local GitNexus serve process at port 4747. No graph interaction tested.",
+      "sha256": "a7dfea24fe0d20a508c726e22b04f9487b7a59b80bcfe3e4a7b5bc04e15f2423",
+      "bytes": 89805
+    },
+    {
+      "file": "research-graphify-example-selected.png",
+      "source": "https://github.com/Graphify-Labs/graphify/blob/3f82bf7f837a07fb0f7668fbdbd5662801906942/worked/rsl-siege-manager/graph.html",
+      "interaction": "Opened the committed public HTML example locally; searched main.py and selected exact result. Inspector shows bot/app/main.py. No CBM/private repository data used.",
+      "sha256": "2c48b1d886d32149e80af0cfd8e3234c5a4853a0efe1e20dbdf88e9de1d1a1b2",
+      "bytes": 302115
+    }
+  ],
+  "limitations": [
+    "Archify captures depict an authored demonstration, not a verified runtime or code-derived flow.",
+    "GitNexus graph navigation inspected in source only; the public entry screen is not a graph demo.",
+    "Graphify capture is an existing repository example, not a newly generated export. The example uses an external unpkg vis-network asset.",
+    "Graphify example neighbor navigation failed with Unexpected end of input after the selected-file capture; the current exporter uses a different event-listener implementation."
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "atlas-sample",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Indexing fixture for CodeAtlas. Never built, installed or executed by the monorepo.",
+  "main": "src/server.ts",
+  "license": "UNLICENSED"
+}

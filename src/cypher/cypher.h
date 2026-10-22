@@ -334,7 +334,8 @@ typedef struct {
 } cbm_cypher_result_t;
 
 /* Execute a Cypher query against a store.
- * max_rows: limit on output rows (0 = use virtual ceiling of 100k).
+ * max_rows: limit on output rows; 0 or any value above the 100k ceiling uses
+ *   the ceiling.
  * project: project name filter (NULL = all projects).
  * Returns -1 on error (check out->error for message). */
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
@@ -353,6 +354,15 @@ void cbm_query_free(cbm_query_t *q);
  * subsequent queries on the calling thread. 0 = trip on the first hot-loop
  * check; a negative value restores the default budget. */
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Override only the deadline clock on this thread; NULL restores real time. */
+typedef uint64_t (*cbm_cypher_test_clock_fn)(void);
+void cbm_cypher_test_set_deadline_clock(cbm_cypher_test_clock_fn clock_fn);
+/* Start nodes per streamed execution chunk on this thread; 0 restores the
+ * default. INT_MAX runs the whole start set as one chunk (a single pass). */
+void cbm_cypher_test_set_stream_chunk(int start_nodes);
+#endif
 
 /* Worst-case binding slot count for a node cross-join. Computes the count in
  * size_t and rejects any that would not fit the int binding counter or would

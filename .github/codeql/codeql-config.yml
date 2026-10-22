@@ -1,0 +1,27 @@
+# CodeQL scope: the repository's first-party source.
+#
+# Read by .github/workflows/codeql.yml (every scan, full and PR) and by
+# scripts/ci/select-lanes.sh (which changed paths select which language's PR
+# scan). Keep the lists plain: one path prefix per line, no globs.
+#
+# paths / paths-ignore narrow what the INTERPRETED languages extract
+# (javascript-typescript, python, actions). For c-cpp they have no effect:
+# CodeQL extracts exactly what the traced build compiles. A PR's c-cpp scan
+# keeps vendored C out by compiling it before tracing starts (except vendored
+# files the PR changes); the full scan on main, the dry run and the release
+# traces everything, vendored C included.
+name: cbm first-party source
+paths:
+  - src
+  - internal
+  - graph-ui
+  - pkg
+  - scripts
+  - tests
+  - .github
+paths-ignore:
+  - internal/cbm/vendored
+  - graph-ui/vendor
+  - graph-ui/fixtures
+  - graph-ui/verification
+  - tests/fixtures

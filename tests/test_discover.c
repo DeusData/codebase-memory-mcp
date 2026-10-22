@@ -891,6 +891,76 @@ TEST(discover_gitignore_dir_excluded_issue234) {
     PASS();
 }
 
+static int disc_git(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=master %s",
+             dir, args);
+    return system(cmd);
+}
+
+static bool disc_has(const cbm_file_info_t *files, int count, const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel_path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A .gitignore never hides a file git tracks: git applies ignore rules to
+ * untracked paths only. cluster-api's nested `.gitignore` line `manager`,
+ * meant for a built binary, hid its tracked config/manager/ kustomization.
+ * Untracked ignored files stay out, also inside a directory that is entered
+ * only for its tracked content. */
+TEST(discover_gitignore_never_hides_tracked_files) {
+    char *base = th_mktempdir("cbm_disc_tracked");
+    ASSERT(base != NULL);
+    if (disc_git(base, "init -q") != 0) {
+        th_cleanup(base);
+        FAIL("git init failed");
+    }
+    th_write_file(TH_PATH(base, ".gitignore"), "manager\n*.gen.go\n");
+    th_write_file(TH_PATH(base, "main.go"), "package main\n\nfunc main() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/manager.go"), "package manager\n\nfunc Run() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/scratch.go"), "package manager\n\nfunc S() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/sub/deep.go"), "package sub\n\nfunc Deep() {}\n");
+    th_write_file(TH_PATH(base, "config/manager/tmp/build.go"), "package tmp\n\nfunc B() {}\n");
+    th_write_file(TH_PATH(base, "api/types.gen.go"), "package api\n\nfunc Gen() {}\n");
+    th_write_file(TH_PATH(base, "api/other.gen.go"), "package api\n\nfunc Other() {}\n");
+    int add_rc = disc_git(base, "add .gitignore main.go");
+    int force_rc = disc_git(base, "add -f config/manager/manager.go config/manager/sub/deep.go "
+                                  "api/types.gen.go");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    bool main_found = rc == 0 && disc_has(files, count, "main.go");
+    bool manager_found = rc == 0 && disc_has(files, count, "config/manager/manager.go");
+    bool deep_found = rc == 0 && disc_has(files, count, "config/manager/sub/deep.go");
+    bool gen_found = rc == 0 && disc_has(files, count, "api/types.gen.go");
+    bool scratch_found = rc == 0 && disc_has(files, count, "config/manager/scratch.go");
+    bool build_found = rc == 0 && disc_has(files, count, "config/manager/tmp/build.go");
+    bool other_found = rc == 0 && disc_has(files, count, "api/other.gen.go");
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+
+    ASSERT_EQ(add_rc, 0);
+    ASSERT_EQ(force_rc, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(main_found);
+    /* Tracked: kept although .gitignore matches them or a directory above. */
+    ASSERT_TRUE(manager_found);
+    ASSERT_TRUE(deep_found);
+    ASSERT_TRUE(gen_found);
+    /* Untracked and ignored: still out, also below the entered directory. */
+    ASSERT_FALSE(scratch_found);
+    ASSERT_FALSE(build_found);
+    ASSERT_FALSE(other_found);
+    PASS();
+}
+
 TEST(discover_max_file_size) {
     char *base = th_mktempdir("cbm_disc_size");
     ASSERT(base != NULL);
@@ -2052,6 +2122,34 @@ static CBMLanguage discover_lang_of(const cbm_file_info_t *files, int count, con
     return CBM_LANG_COUNT;
 }
 
+/* #1803: a symlink is skipped by policy on every walk. A bounded count must
+ * skip it too, not abort: aborting made auto-index admission refuse every
+ * repository containing any symlink ("unsafe_or_unavailable_path"), while
+ * an explicit index of the same tree succeeded. */
+TEST(discover_count_bounded_survives_a_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows: symlinks need admin / symlink() unavailable");
+#else
+    char *base = th_mktempdir("cbm_disc_link");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "sub/helper.go"), "package sub\n");
+    ASSERT_EQ(symlink("sub", TH_PATH(base, "linkdir")), 0);
+
+    cbm_discover_opts_t opts = {0};
+    int count = -1;
+    /* deadline 0 = no deadline: only the symlink can decide this count. */
+    cbm_discover_status_t status = cbm_discover_count_bounded(base, &opts, 50000, 0, &count);
+    ASSERT_EQ(status, CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 2);
+
+    th_cleanup(base);
+    PASS();
+#endif
+}
+
 /* Write raw bytes (may contain embedded NUL) to base/rel. Parent must exist. */
 static int write_bytes_file(const char *path, const void *data, size_t n) {
     FILE *f = cbm_fopen(path, "wb");
@@ -2382,6 +2480,7 @@ SUITE(discover) {
     RUN_TEST(discover_missing_global_excludes_is_noop);
     RUN_TEST(discover_cbmignore_negates_global_ignore);
     RUN_TEST(discover_gitignore_dir_excluded_issue234);
+    RUN_TEST(discover_gitignore_never_hides_tracked_files);
     RUN_TEST(discover_max_file_size);
     RUN_TEST(discover_null_path);
     RUN_TEST(discover_nonexistent_path);
@@ -2436,4 +2535,7 @@ SUITE(discover) {
     RUN_TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973);
     RUN_TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern);
     RUN_TEST(discover_nested_gitignore_three_levels_deeper_file_wins);
+
+    /* A symlink must not abort a bounded count (auto-index admission, #1803) */
+    RUN_TEST(discover_count_bounded_survives_a_symlink);
 }
