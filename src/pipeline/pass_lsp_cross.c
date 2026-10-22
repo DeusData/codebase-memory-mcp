@@ -16,6 +16,8 @@
 #include "pipeline/pass_lsp_cross.h"
 
 #include "pipeline/lsp_surface.h"
+#include "pipeline/pipeline.h"
+#include "cbm.h"
 #include "foundation/mem_core.h"
 #include "result_spill.h"
 #include "pipeline/pipeline_internal.h"
@@ -49,6 +51,7 @@
 enum {
     PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
     PXC_ITOA_BUF = 16,
+    PXC_HASH_SPARE = 1,
 };
 
 /* Format an int into a thread-local rotating buffer for log key=value emission.
@@ -1388,9 +1391,16 @@ static char *pxc_kotlin_import_from_metadata(const CBMFileResult *result, const 
  * non-aliased path. The shared Python registry must still materialize the
  * resulting exact QN before it earns CALL_REFERENCE. */
 static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
-                                 const char *local_name, const cbm_gbuf_node_t *target) {
-    if (!target || !target->qualified_name)
+                                 const char *project_name, const char *local_name,
+                                 const cbm_gbuf_node_t *target) {
+    if (!target || !target->qualified_name) {
         return NULL;
+    }
+    // IMPORTS targets a file node; receiver types use filename-stem modules.
+    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) && target->label &&
+        strcmp(target->label, "File") == 0 && target->file_path) {
+        return cbm_pipeline_fqn_module(project_name, target->file_path);
+    }
     if (lang == CBM_LANG_KOTLIN)
         return pxc_kotlin_import_from_metadata(result, local_name);
     if (lang != CBM_LANG_PYTHON)
@@ -1560,7 +1570,7 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         /* An annotation-only import (#1277) binds no CALLS name: it gets no value. */
         bool binds = include_type_only ||
                      cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local);
-        char *value = binds ? pxc_import_value_qn(lang, result, local, target) : NULL;
+        char *value = binds ? pxc_import_value_qn(lang, result, project_name, local, target) : NULL;
         if (!value) {
             free(local);
             continue;
@@ -2069,6 +2079,46 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
     return out;
 }
 
+/* Preserve a negative receiver-identity decision at the exact raw/preprocessed
+ * occurrence. Both sequential and fused-parallel CALLS passes already honor
+ * requires_lsp_resolution; unrelated unresolved calls keep their fallback. */
+static void pxc_require_unambiguous_receivers(CBMFileResult *result,
+                                              const CBMResolvedCallArray *out) {
+    CBMArena keys;
+    CBMHashTable *blocked = NULL;
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *r = &out->items[i];
+        if (!r->strategy || strcmp(r->strategy, "lsp_ambiguous_receiver") != 0 ||
+            r->kind != CBM_RESOLVED_INVOCATION || !r->caller_qn ||
+            r->site_end_byte <= r->site_start_byte) {
+            continue;
+        }
+        if (!blocked) {
+            pxc_scratch_take(PXC_SCRATCH_KEYS, &keys);
+            blocked = cbm_ht_create((uint32_t)(out->count + PXC_HASH_SPARE));
+        }
+        char *key = cbm_arena_sprintf(&keys, "%s:%u:%u:%u", r->caller_qn, r->site_start_byte,
+                                      r->site_end_byte, (unsigned)r->source_origin);
+        cbm_ht_set(blocked, key, blocked);
+    }
+    for (int i = 0; blocked && i < result->calls.count; i++) {
+        CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || call->site_end_byte <= call->site_start_byte) {
+            continue;
+        }
+        char *key =
+            cbm_arena_sprintf(&keys, "%s:%u:%u:%u", call->enclosing_func_qn, call->site_start_byte,
+                              call->site_end_byte, (unsigned)call->source_origin);
+        if (cbm_ht_get(blocked, key)) {
+            call->requires_lsp_resolution = true;
+        }
+    }
+    if (blocked) {
+        cbm_ht_free(blocked);
+        pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
+    }
+}
+
 /* Run cross-file LSP for a single file inside a scratch arena that gets
  * freed when the call returns. The LSP would otherwise allocate a fresh
  * type registry + stdlib + all project defs into the supplied arena, and
@@ -2105,14 +2155,11 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
     case CBM_LANG_CPP:
     case CBM_LANG_CUDA: {
         bool cpp_mode = (lang != CBM_LANG_C);
-        /* C/C++ cross LSP takes include_paths/include_ns_qns instead of
-         * imports — the existing pipeline doesn't carry C-style include
-         * resolution as a separate map, so pass NULL/0 and let the LSP
-         * fall back to its own #include scan. */
+        /* Use the same normalized include map as the prebuilt-registry path. */
         if (r->has_test_definition_owners) {
-            if (!cbm_run_c_lsp_cross_with_test_owners(&scratch, source, source_len, module_qn,
-                                                      cpp_mode, defs, def_count, NULL, NULL, 0,
-                                                      tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
+            if (!cbm_run_c_lsp_cross_with_test_owners(
+                    &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, imp_names,
+                    imp_qns, imp_count, tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
                 cbm_pipeline_test_owner_error(r);
                 pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
                 return; /* out may be partial: never append it */
@@ -2120,7 +2167,7 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         } else {
             CBMLSPStatus status =
                 cbm_run_c_lsp_cross_status(&scratch, source, source_len, module_qn, cpp_mode, defs,
-                                           def_count, NULL, NULL, 0, tree, &out);
+                                           def_count, imp_names, imp_qns, imp_count, tree, &out);
             if (status != CBM_LSP_COMPLETE)
                 cbm_c_lsp_record_failure(r, status);
         }
@@ -2163,6 +2210,9 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         break;
     }
 
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        pxc_require_unambiguous_receivers(r, &out);
+    }
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
@@ -2375,6 +2425,9 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         }
         if (used_prebuilt) {
+            if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+                pxc_require_unambiguous_receivers(result, &out);
+            }
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
         }
