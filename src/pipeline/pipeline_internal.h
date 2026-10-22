@@ -1646,7 +1646,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      (pass_ansible.c). An external Chart is keyed by its publisher URL.
  *      An index built before holds none of them, so it rebuilds once on
  *      upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
+/* v10: repeated ATX and Setext Markdown headings use parent-qualified Section
+ * names only when distinct parent chains separate them. Preserve unchanged bare names
+ * and disambiguate dotted-name collisions before resolving section references.
+ * Rebuild old indices so Section nodes, MENTIONS and diagram owners agree. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 10 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
