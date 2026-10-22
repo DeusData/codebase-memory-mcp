@@ -593,6 +593,8 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 
 </details>
 
+> **Contributor checks need a few extra tools.** `scripts/test.sh` requires `zip`, `python3`, and `curl`. `scripts/lint.sh` requires `cppcheck`, `clang-format`, and `clang-tidy`; `scripts/lint.sh --ci`, which is what CI runs, skips `clang-tidy`.
+
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
