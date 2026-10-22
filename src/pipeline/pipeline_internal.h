@@ -1655,8 +1655,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      a kube / k8s task DEPLOYS {via:ansible} the template it applies
  *      (pass_ansible.c). An external Chart is keyed by its publisher URL.
  *      An index built before holds none of them, so it rebuilds once on
- *      upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
+ *      upgrade.
+ *  10: a Next.js App Router route handler, the HTTP verb Function a route.ts
+ *      / route.js under app/ or src/app/ exports, carries the route_path its
+ *      directories name and HANDLES its Route (extract_nextjs.c). An index
+ *      built before has none of these Routes for its unchanged route files,
+ *      so it rebuilds once on upgrade. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 10 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

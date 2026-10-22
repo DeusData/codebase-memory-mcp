@@ -5622,6 +5622,177 @@ TEST(extract_ts_nestjs_controller_routes_issue1428) {
     PASS();
 }
 
+/* #759: the one definition named `name`; NULL for none or more than one. */
+static const CBMDefinition *nextjs_only_def(CBMFileResult *r, const char *name) {
+    const CBMDefinition *found = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            if (found) {
+                return NULL;
+            }
+            found = &r->defs.items[i];
+        }
+    }
+    return found;
+}
+
+/* #759: a Next.js App Router route file's exported HTTP verb handlers are the
+ * Functions extraction already makes for them, now carrying the route path of
+ * the file's directories -- `[id]` as `:id`, `[...slug]` as `*slug`, a
+ * `(group)` adding nothing -- and the verb as their method. A local
+ * declaration exported by name (`export { GET }`) is that same Function; no
+ * second definition appears. The 255-byte path is the longest that fits. */
+TEST(extract_nextjs_route_metadata_contract_issue759) {
+    char long_file[CBM_SZ_512];
+    char long_path[CBM_SZ_256];
+    char segment[CBM_SZ_256];
+    memset(segment, 'x', CBM_SZ_256 - PAIR_LEN);
+    segment[CBM_SZ_256 - PAIR_LEN] = '\0';
+    snprintf(long_file, sizeof(long_file), "app/%s/route.ts", segment);
+    snprintf(long_path, sizeof(long_path), "/%s", segment);
+    static const char verbs_src[] = "export async function GET() {}\n"
+                                    "export async function POST() {}\n"
+                                    "export function PUT() {}\n"
+                                    "export function PATCH() {}\n"
+                                    "export function DELETE() {}\n"
+                                    "export function HEAD() {}\n"
+                                    "export function OPTIONS() {}\n";
+    const struct {
+        const char *file;
+        const char *src;
+        const char *path;
+        const char *names[CBM_SZ_8];
+    } cases[] = {
+        {"src/app/api/users/[id]/route.ts",
+         "export function GET() { return 1; }\nexport const POST = async () => 2;\n",
+         "/api/users/:id",
+         {"GET", "POST"}},
+        {"app/api/verbs/route.ts",
+         verbs_src,
+         "/api/verbs",
+         {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}},
+        {"src/app/(public)/api/[org]/users/[id]/route.ts",
+         "export async function GET() { return 1; }\n",
+         "/api/:org/users/:id",
+         {"GET"}},
+        {"app/api/[...slug]/route.ts", "export function GET() {}\n", "/api/*slug", {"GET"}},
+        {"app/api/typed/route.ts",
+         "type Handler = () => Promise<number>;\nexport const GET: Handler = async () => 1;\n",
+         "/api/typed",
+         {"GET"}},
+        {"app/route.js", "export function GET() { return 1; }\n", "/", {"GET"}},
+        {"app/api/local/route.ts",
+         "function GET() { return 1; }\nconst POST = async () => 2;\nexport { GET, POST };\n",
+         "/api/local",
+         {"GET", "POST"}},
+        {long_file, "export function GET() {}\n", long_path, {"GET"}},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        CBMLanguage lang = strstr(cases[c].file, ".js") ? CBM_LANG_JAVASCRIPT : CBM_LANG_TYPESCRIPT;
+        CBMFileResult *r = extract(cases[c].src, lang, "t", cases[c].file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        int routed = 0;
+        for (int i = 0; i < r->defs.count; i++) {
+            routed += r->defs.items[i].route_path != NULL;
+        }
+        int want = 0;
+        for (; want < CBM_SZ_8 && cases[c].names[want]; want++) {
+            const CBMDefinition *d = nextjs_only_def(r, cases[c].names[want]);
+            ASSERT_NOT_NULL(d);
+            ASSERT_STR_EQ(d->label, "Function");
+            ASSERT_STR_EQ(d->file_path, cases[c].file);
+            ASSERT_NOT_NULL(d->route_path);
+            ASSERT_STR_EQ(d->route_path, cases[c].path);
+            ASSERT_STR_EQ(d->route_method, cases[c].names[want]);
+        }
+        ASSERT_EQ(routed, want);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* #759: nothing else routes. Not a route file, or a directory the route path
+ * cannot spell -- an optional catch-all, a private folder, a parallel slot,
+ * an intercepting route, a malformed bracket, a workspace package root, a path
+ * past 255 bytes. Not a runtime export of an HTTP verb Function of this file:
+ * an unexported, default, type-only or nested GET, a class method, a
+ * constant, a lower-case verb; and no handler is made up for a renamed,
+ * re-exported, wrapped or destructured export, or a `function` expression
+ * bound to a const: none of them has a Function of its own here. */
+TEST(extract_nextjs_rejects_nonroutes_issue759) {
+    char long_file[CBM_SZ_512];
+    char segment[CBM_SZ_256];
+    memset(segment, 'x', CBM_SZ_256 - SKIP_ONE);
+    segment[CBM_SZ_256 - SKIP_ONE] = '\0';
+    snprintf(long_file, sizeof(long_file), "app/%s/route.ts", segment);
+    const char *files[] = {
+        "pages/api/route.ts",
+        "app/api/page.ts",
+        "app/api/route.test.ts",
+        "app/api/view/route.tsx",
+        "app/api/view/route.jsx",
+        "app/api/module/route.mjs",
+        "app/_private/route.ts",
+        "src/app/api/_lib/route.ts",
+        "app/@modal/route.ts",
+        "app/(.)photo/route.ts",
+        "app/(..)(..)photo/route.ts",
+        "app/api/[[...opt]]/route.ts",
+        "app/api/[broken/route.ts",
+        "app/api/broken]/route.ts",
+        "app/api/[]/route.ts",
+        "app/api/[...]/route.ts",
+        "app/api/a[id]/route.ts",
+        "app/()/route.ts",
+        "apps/web/app/api/route.ts",
+        long_file,
+    };
+    const struct {
+        const char *file;
+        const char *src;
+    } sources[] = {
+        {"app/api/nonexports/route.ts", "function GET() {}\n"
+                                        "export default function POST() {}\n"
+                                        "function PUT() {}\n"
+                                        "export type { PUT };\n"
+                                        "function OPTIONS() {}\n"
+                                        "export { type OPTIONS };\n"
+                                        "export class Handlers { PATCH() {} }\n"
+                                        "export const DELETE = 42;\n"
+                                        "export function get() {}\n"
+                                        "export function helper() { function HEAD() {} }\n"},
+        {"app/api/bindings/route.ts", "const handler = async () => 1;\n"
+                                      "export { handler as GET };\n"
+                                      "export { POST } from './impl';\n"
+                                      "export const PUT = wrap(handler);\n"
+                                      "export const DELETE = function () {};\n"
+                                      "export const { PATCH } = handlers;\n"
+                                      "export const HEAD = handler as Handler;\n"
+                                      "export const OPTIONS = (async () => 1) satisfies Handler;\n"
+                                      "export * from './all';\n"},
+    };
+    const int file_count = (int)(sizeof(files) / sizeof(files[0]));
+    const int source_count = (int)(sizeof(sources) / sizeof(sources[0]));
+    for (int c = 0; c < file_count + source_count; c++) {
+        bool by_file = c < file_count;
+        const char *file = by_file ? files[c] : sources[c - file_count].file;
+        CBMFileResult *r =
+            extract(by_file ? "export function GET() {}\n" : sources[c - file_count].src,
+                    CBM_LANG_TYPESCRIPT, "t", file);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        if (by_file) {
+            ASSERT_NOT_NULL(nextjs_only_def(r, "GET"));
+        }
+        for (int i = 0; i < r->defs.count; i++) {
+            ASSERT_NULL(r->defs.items[i].route_path);
+        }
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 /* Return the file's Module definition (extraction pushes it first), or NULL. */
 static const CBMDefinition *find_module_def(CBMFileResult *r) {
     for (int i = 0; i < r->defs.count; i++) {
@@ -13434,6 +13605,8 @@ SUITE(extraction) {
     RUN_TEST(extract_java_jaxrs_empty_path_means_class_path);
     RUN_TEST(extract_java_spring_relative_string_not_route_path);
     RUN_TEST(extract_ts_nestjs_controller_routes_issue1428);
+    RUN_TEST(extract_nextjs_route_metadata_contract_issue759);
+    RUN_TEST(extract_nextjs_rejects_nonroutes_issue759);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
