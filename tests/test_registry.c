@@ -982,6 +982,132 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     PASS();
 }
 
+/* ── Issue #2605, PR B: receiver-field hint in the Rust suffix bucket ──
+ *
+ * `entry.session.push_daily()` reaches the resolver with a callee whose type
+ * segment names the receiver field's declared type. When import filtering
+ * cannot separate two same-named methods, the hint breaks the tie toward the
+ * method whose owning type IS that field type. It is a tie-break, never an
+ * admit: a callee without a field receiver keeps the pre-existing order, and
+ * only two Rust candidates are ever compared (a cross-language pick would
+ * still be dropped by the name-guess veto downstream). */
+
+#define RUST_HINT_SESSION_QN "proj.crates.spine.src.session.Session.push_daily"
+#define RUST_HINT_ANALYTIC_QN "proj.crates.spine.src.analytic.Analytic.push_daily"
+
+/* Register the two same-named methods; `reverse` flips insertion order, which
+ * must not change the verdict. */
+static void rust_hint_add_pair(cbm_registry_t *r, bool reverse) {
+    if (reverse) {
+        cbm_registry_add_lang(r, "push_daily", RUST_HINT_ANALYTIC_QN, "Method", CBM_LANG_RUST);
+        cbm_registry_add_lang(r, "push_daily", RUST_HINT_SESSION_QN, "Method", CBM_LANG_RUST);
+    } else {
+        cbm_registry_add_lang(r, "push_daily", RUST_HINT_SESSION_QN, "Method", CBM_LANG_RUST);
+        cbm_registry_add_lang(r, "push_daily", RUST_HINT_ANALYTIC_QN, "Method", CBM_LANG_RUST);
+    }
+}
+
+/* No import is reachable: both candidates score the same, and without the hint
+ * the lexicographically earlier trait stub (`analytic` < `session`) wins. The
+ * hint settles the tie without raising confidence — it overrides an absence of
+ * evidence, so the no-filter confidence stands (halved at count 2). */
+TEST(rust_field_receiver_hint_breaks_suffix_tie) {
+    cbm_registry_t *r = cbm_registry_new();
+    rust_hint_add_pair(r, /*reverse=*/false);
+
+    const char *keys[] = {"unrelated"};
+    const char *vals[] = {"proj.unrelated.lib"};
+    cbm_resolution_t res = cbm_registry_resolve(
+        r, "entry.session.push_daily", "proj.crates.spine_ffi.src.store_ffi", keys, vals, 1);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, RUST_HINT_SESSION_QN);
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_TRUE(res.confidence < 0.30); /* halved no-filter confidence */
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The decisive case from store_ffi.rs: the file imports the trait's module, so
+ * exactly ONE candidate is import-reachable and the old early return took it
+ * unconditionally. The receiver field must still win, at no-filter confidence. */
+TEST(rust_field_receiver_hint_overrides_import_reachable_single) {
+    cbm_registry_t *r = cbm_registry_new();
+    rust_hint_add_pair(r, /*reverse=*/false);
+
+    const char *keys[] = {"analytic"};
+    const char *vals[] = {"proj.crates.spine.src.analytic"};
+    cbm_resolution_t res = cbm_registry_resolve(
+        r, "entry.session.push_daily", "proj.crates.spine_ffi.src.store_ffi", keys, vals, 1);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.qualified_name, RUST_HINT_SESSION_QN);
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_TRUE(res.confidence < 0.30);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The tie-break is a pure function of the candidate set: registration order,
+ * and therefore graph build order, must not change the winner. */
+TEST(rust_field_receiver_hint_is_order_independent) {
+    cbm_registry_t *forward = cbm_registry_new();
+    cbm_registry_t *backward = cbm_registry_new();
+    rust_hint_add_pair(forward, /*reverse=*/false);
+    rust_hint_add_pair(backward, /*reverse=*/true);
+
+    cbm_resolution_t f = cbm_registry_resolve(forward, "entry.session.push_daily",
+                                              "proj.crates.spine_ffi.src.store_ffi", NULL, NULL, 0);
+    cbm_resolution_t b = cbm_registry_resolve(backward, "entry.session.push_daily",
+                                              "proj.crates.spine_ffi.src.store_ffi", NULL, NULL, 0);
+    ASSERT_STR_EQ(f.qualified_name, RUST_HINT_SESSION_QN);
+    ASSERT_STR_EQ(b.qualified_name, RUST_HINT_SESSION_QN);
+    ASSERT_TRUE(f.confidence == b.confidence);
+
+    /* Same pair through the import-reachable path. */
+    const char *keys[] = {"analytic"};
+    const char *vals[] = {"proj.crates.spine.src.analytic"};
+    cbm_resolution_t fi = cbm_registry_resolve(
+        forward, "entry.session.push_daily", "proj.crates.spine_ffi.src.store_ffi", keys, vals, 1);
+    cbm_resolution_t bi = cbm_registry_resolve(
+        backward, "entry.session.push_daily", "proj.crates.spine_ffi.src.store_ffi", keys, vals, 1);
+    ASSERT_STR_EQ(fi.qualified_name, RUST_HINT_SESSION_QN);
+    ASSERT_STR_EQ(bi.qualified_name, RUST_HINT_SESSION_QN);
+
+    cbm_registry_free(forward);
+    cbm_registry_free(backward);
+    PASS();
+}
+
+/* A call with no field receiver carries no hint: the pre-existing order
+ * stands (the stub still wins), so the change cannot shift unrelated calls. */
+TEST(rust_plain_call_without_field_hint_keeps_order) {
+    cbm_registry_t *r = cbm_registry_new();
+    rust_hint_add_pair(r, /*reverse=*/false);
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "push_daily", "proj.crates.spine_ffi.src.store_ffi", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, RUST_HINT_ANALYTIC_QN);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Rust gate: only a Rust candidate may be lifted by the hint. An unclassified
+ * (unknown-language) candidate with the matching type segment must not be. */
+TEST(rust_field_receiver_hint_is_rust_only) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_lang(r, "push_daily", RUST_HINT_ANALYTIC_QN, "Method", CBM_LANG_RUST);
+    cbm_registry_add(r, "push_daily", "proj.vendor.alpha.session.Session.push_daily", "Method");
+
+    cbm_resolution_t res = cbm_registry_resolve(
+        r, "entry.session.push_daily", "proj.crates.spine_ffi.src.store_ffi", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, RUST_HINT_ANALYTIC_QN);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 /* A call names something callable. When same-named candidates tie, a method
  * must not lose to a property or field that merely shares its name. Exposed
  * (Kotlin): `cities.selectAll().where { ... }` bound to the property
@@ -2566,6 +2692,12 @@ SUITE(registry) {
     RUN_TEST(same_module_vetoed_across_languages);
     RUN_TEST(cross_language_config_caller_drops_unique_name_too);
     RUN_TEST(registry_tie_break_is_independent_of_registration_order);
+    /* Issue #2605 PR B: receiver-field hint in the Rust suffix bucket */
+    RUN_TEST(rust_field_receiver_hint_breaks_suffix_tie);
+    RUN_TEST(rust_field_receiver_hint_overrides_import_reachable_single);
+    RUN_TEST(rust_field_receiver_hint_is_order_independent);
+    RUN_TEST(rust_plain_call_without_field_hint_keeps_order);
+    RUN_TEST(rust_field_receiver_hint_is_rust_only);
     RUN_TEST(registry_tie_prefers_callable_over_property);
     RUN_TEST(registry_tie_ignores_nesting_depth);
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
