@@ -7325,6 +7325,13 @@ static const char *get_cache_dir(const char *home_dir) {
     return cbm_resolve_cache_dir();
 }
 
+/* A per-project ADR sidecar ("<db>.adr.db") sits in the cache beside its index
+ * but is not itself an index — exclude it from listing/counting. */
+static bool cli_is_adr_sidecar(const char *name, size_t len) {
+    const size_t ext = sizeof(".adr.db") - 1;
+    return len >= ext && strcmp(name + len - ext, ".adr.db") == 0;
+}
+
 int cbm_list_indexes(const char *home_dir) {
     const char *cache_dir = get_cache_dir(home_dir);
     if (!cache_dir) {
@@ -7339,6 +7346,7 @@ int cbm_list_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
+        /* cbm_is_project_index_db already excludes the ".adr.db" sidecar. */
         if (cbm_is_project_index_db(ent->name)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
@@ -7362,9 +7370,18 @@ int cbm_remove_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        if (cbm_is_project_index_db(ent->name)) {
-            char path[CLI_BUF_1K];
-            snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
+        bool is_index = cbm_is_project_index_db(ent->name);
+        /* A "<db>.adr.db" ADR sidecar is excluded from cbm_is_project_index_db,
+         * but a full index wipe must still remove it (and any orphan whose index
+         * is already gone) — otherwise the next re-index of that name inherits a
+         * stale ADR. It appears as its own dirent, so remove it directly. */
+        bool is_adr = cli_is_adr_sidecar(ent->name, strlen(ent->name));
+        if (!is_index && !is_adr) {
+            continue;
+        }
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
+        if (is_index) {
             /* Also remove .db.tmp if present */
             char tmp_path[CLI_FIELD_1040];
             snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
@@ -7378,6 +7395,11 @@ int cbm_remove_indexes(const char *home_dir) {
              * its .db. Sidecars are not indexes, so count is unchanged. */
             cbm_remove_db_sidecars(path);
             cbm_remove_db_sidecars(tmp_path);
+        } else {
+            /* ADR sidecar: remove it and its own -wal/-shm/-journal; not an
+             * index, so count is unchanged. */
+            cbm_unlink(path);
+            cbm_remove_db_sidecars(path);
         }
     }
     cbm_closedir(d);
@@ -10604,7 +10626,8 @@ static int count_db_indexes(const char *home) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        if (cbm_is_project_index_db(ent->name)) {
+        if (cbm_is_project_index_db(ent->name) &&
+            !cli_is_adr_sidecar(ent->name, strlen(ent->name))) {
             count++;
         }
     }
