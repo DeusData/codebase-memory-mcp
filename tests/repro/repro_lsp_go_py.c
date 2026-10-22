@@ -64,8 +64,10 @@
  * PYTHON STRATEGY INVENTORY — every literal "lsp_..." emitted by py_lsp.c
  *   (grep '"lsp_' internal/cbm/lsp/py_lsp.c), with its keying site:
  *     lsp_direct                (py_lsp.c:1631)  module-local f()
- *     lsp_constructor           (py_lsp.c:1624)  ClassName() where the name is a
- *                                                NAMED type in scope
+ *     lsp_constructor           ClassName() with no user __init__ → the Class
+ *     lsp_constructor_init      ClassName() with a user __init__ (on the class
+ *                               or a declared base) → that __init__. The textual
+ *                               callee leaf stays the class name; reason joins it.
  *     lsp_method                (py_lsp.c:1731)  obj.method() on a NAMED-typed
  *                                                receiver (covers self.other())
  *     lsp_super                 (py_lsp.c:1693)  super().method() resolved on a
@@ -340,13 +342,24 @@ static const char kPyDirect[] =
     "def caller(v):\n"
     "    return helper(v)\n";
 
-/* lsp_constructor — ClassName() where the name is a NAMED type in scope
- * (py_lsp.c:1620-1624: cbm_scope_lookup yields a NAMED type → emit constructor
- * edge to the class QN). */
+/* lsp_constructor — ClassName() where the class has no user __init__.
+ * The edge stays on the Class node. A class that defines __init__ is
+ * lsp_constructor_init below; strstr would otherwise treat that strategy
+ * as a hit for "lsp_constructor". */
 static const char kPyConstructor[] =
     "class Widget:\n"
+    "    def label(self):\n"
+    "        return 1\n"
+    "def caller():\n"
+    "    return Widget()\n";
+
+/* lsp_constructor_init — ClassName() resolves to the user __init__
+ * (issue #1642). reason carries the class-name leaf so the pipeline join
+ * still matches the textual call. */
+static const char kPyConstructorInit[] =
+    "class Widget:\n"
     "    def __init__(self):\n"
-    "        pass\n"
+    "        self.ready = True\n"
     "def caller():\n"
     "    return Widget()\n";
 
@@ -538,6 +551,10 @@ TEST(repro_lsp_py_constructor) {
     return assert_lsp_strategy("main.py", kPyConstructor, "lsp_constructor");
 }
 
+TEST(repro_lsp_py_constructor_init) {
+    return assert_lsp_strategy("main.py", kPyConstructorInit, "lsp_constructor_init");
+}
+
 TEST(repro_lsp_py_method) {
     return assert_lsp_strategy("main.py", kPyMethod, "lsp_method");
 }
@@ -623,6 +640,7 @@ SUITE(repro_lsp_go_py) {
 
     RUN_TEST(repro_lsp_py_direct);
     RUN_TEST(repro_lsp_py_constructor);
+    RUN_TEST(repro_lsp_py_constructor_init);
     RUN_TEST(repro_lsp_py_method);
     RUN_TEST(repro_lsp_py_super);
     RUN_TEST(repro_lsp_py_super_init);
