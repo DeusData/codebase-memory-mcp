@@ -32,6 +32,7 @@ typedef enum {
     CBM_AGENT_CLIENT_PI,
     CBM_AGENT_CLIENT_SOURCEGRAPH_CODY,
     CBM_AGENT_CLIENT_OMP,
+    CBM_AGENT_CLIENT_AGENTTY,
     CBM_AGENT_CLIENT_COUNT
 } cbm_agent_client_id_t;
 
@@ -77,6 +78,8 @@ typedef struct {
     const char *roo_config_path;
     const char *cody_config_path;
     const char *omp_agent_dir;
+    /* $AGENTTY_MCP_CONFIG, already home-expanded by the caller; NULL = default. */
+    const char *agentty_mcp_config;
     bool is_windows;
     cbm_agent_probe_fn path_exists;
     cbm_agent_probe_fn command_exists;
