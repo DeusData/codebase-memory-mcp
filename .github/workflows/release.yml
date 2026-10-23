@@ -1,7 +1,8 @@
 # Release pipeline: lint → test → build → smoke/soak → draft → verify → publish
 #
-# Security (security-static + codeql-gate) starts immediately and runs in
-# parallel with lint/test/build/smoke/soak. It only blocks the final verify
+# Security (security-static + license-gate) and CodeQL (codeql.yml: full scan
+# of this commit + the open-alert check) start immediately and run in
+# parallel with lint/test/build/smoke/soak. They only block the final verify
 # step — everything else proceeds independently.
 name: Release
 
@@ -44,14 +45,23 @@ jobs:
   # ── Security (starts immediately, blocks only verify) ───────────
   security:
     uses: ./.github/workflows/_security.yml
-    # The called job requests security-events:read to count code-scanning
-    # alerts; a reusable workflow cannot request more than its caller grants,
-    # so withholding this here fails the whole run at startup.
+    # No job in _security.yml reads code scanning or the Actions API any more
+    # (the CodeQL gate moved to codeql.yml), so the token stays read-only.
     permissions:
       contents: read
-      security-events: read
-      actions: read
     secrets: inherit
+
+  # ── CodeQL (starts immediately, blocks only verify) ──────────────
+  # Full scan of this exact commit (every language, vendored C included) +
+  # the open-alert check. codeql.yml uploads results and reads the alerts:
+  # a called workflow cannot request more than its caller grants, so
+  # withholding either permission fails the whole run at startup.
+  codeql:
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
 
   # ── 0. Preflight: refuse malformed dispatch inputs ──────────────
   # The tag is inputs.version VERBATIM. A bare "0.10.7" publishes a release the
@@ -312,12 +322,12 @@ jobs:
           body: ${{ inputs.release_notes || '' }}
           generate_release_notes: ${{ inputs.release_notes == '' }}
 
-  # ── 7. Verify + Publish (requires security gate) ───────────────
+  # ── 7. Verify + Publish (requires the security and CodeQL gates) ─
   verify:
-    needs: [release-draft, security]
+    needs: [release-draft, security, codeql]
     # Explicit condition: a deliberately skipped test ancestor must not skip
     # the publish chain; the draft itself proves smoke and soak both succeeded.
-    if: ${{ !cancelled() && !failure() && needs.security.result == 'success' && needs.release-draft.result == 'success' }}
+    if: ${{ !cancelled() && !failure() && needs.security.result == 'success' && needs.codeql.result == 'success' && needs.release-draft.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

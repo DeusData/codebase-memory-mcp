@@ -1645,20 +1645,24 @@ static bool main_project_lock_manager_close(cbm_project_lock_manager_t **manager
 }
 
 static bool main_local_transition_close(cbm_daemon_ipc_local_transition_t **transition) {
-    uint64_t deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
+    uint64_t ceiling = main_deadline_after(MAIN_STARTUP_CONTENTION_CEILING_MS);
+    uint64_t error_deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
     while (transition && *transition) {
-        /* A failed release always RETAINS the transition and is retriable by
-         * contract: the Windows release transition must briefly try-hold the
-         * shared startup-v2/legacy gates, so concurrent one-shot teardowns
-         * legitimately collide and succeed on retry. Success consumes the
-         * transition; only never-finishing cleanup is a failure, and the
-         * deadline escalation below owns that. */
-        (void)cbm_daemon_ipc_local_transition_release(transition);
+        /* Windows teardown reacquires the startup-v2/legacy gates before
+         * releasing its participant claim. A live startup owner can hold them
+         * beyond the native cleanup deadline. Retain protection and use the
+         * acquisition backstop for contention; repeated native errors still
+         * get only the short cleanup deadline. Success consumes the handle. */
+        int status = cbm_daemon_ipc_local_transition_try_release(transition);
         if (*transition) {
-            if (cbm_now_ms() >= deadline) {
+            uint64_t now = cbm_now_ms();
+            if (now >= ceiling || (status < 0 && now >= error_deadline)) {
                 main_coordination_cleanup_fail_stop("local_transition_cleanup");
             }
-            cbm_usleep(1000);
+            if (status == 0) {
+                error_deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
+            }
+            cbm_usleep(status == 0 ? 10000 : 1000);
         }
     }
     return true;

@@ -1156,6 +1156,125 @@ TEST(tslsp_jsx_component_resolutions_join_exact_tag_sites) {
     PASS();
 }
 
+TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity) {
+    const char *source = "function Card(): JSX.Element { return <span/>; }\n"
+                         "const Direct = async () => <Card/>;\n"
+                         "export const Exported = async () => <Card/>;\n"
+                         "function Declared(): JSX.Element { return <Card/>; }\n";
+    const char *const declarations[] = {"const Direct", "export const Exported",
+                                        "function Declared"};
+    const char *const callers[] = {"test.main.Direct", "test.main.Exported", "test.main.Declared"};
+    CBMFileResult *r = extract_tsx(source);
+    const bool result_created = r != NULL;
+    bool exact_carrier[3] = {false};
+    bool exact_resolution[3] = {false};
+    bool resolved_invocation[3] = {false};
+    bool resolved_card_callee[3] = {false};
+    bool resolved_jsx_strategy[3] = {false};
+    int carrier_count[3] = {0};
+    int failed_cases = result_created ? 0 : 1;
+
+    if (!result_created)
+        printf("  JSX caller diagnostic: extraction failed\n");
+    if (r) {
+        for (int i = 0; i < 3; i++) {
+            const char *declaration = strstr(source, declarations[i]);
+            const char *site = declaration ? strstr(declaration, "<Card/>") : NULL;
+            if (!site) {
+                printf("  JSX caller diagnostic: source site missing for %s\n", callers[i]);
+                failed_cases++;
+                continue;
+            }
+            const uint32_t start = (uint32_t)(site - source);
+            const uint32_t end = start + (uint32_t)strlen("<Card/>");
+            const CBMCall *carrier = NULL;
+            for (int j = 0; j < r->calls.count; j++) {
+                const CBMCall *call = &r->calls.items[j];
+                if (call->callee_name && strcmp(call->callee_name, "Card") == 0 &&
+                    call->site_start_byte == start && call->site_end_byte == end) {
+                    carrier = call;
+                    carrier_count[i]++;
+                }
+            }
+
+            const CBMResolvedCall *resolved = carrier ? cbm_pipeline_find_lsp_resolution(
+                                                            &r->resolved_calls, carrier, false)
+                                                      : NULL;
+            exact_carrier[i] = carrier && carrier->enclosing_func_qn &&
+                               strcmp(carrier->enclosing_func_qn, callers[i]) == 0 &&
+                               carrier->site_start_byte == start && carrier->site_end_byte == end &&
+                               carrier->requires_lsp_resolution;
+            exact_resolution[i] = resolved && resolved->caller_qn &&
+                                  strcmp(resolved->caller_qn, callers[i]) == 0 &&
+                                  resolved->site_start_byte == start && resolved->site_end_byte == end;
+            resolved_invocation[i] = resolved && resolved->kind == CBM_RESOLVED_INVOCATION;
+            if (resolved && resolved->callee_qn) {
+                const size_t callee_len = strlen(resolved->callee_qn);
+                resolved_card_callee[i] = callee_len >= strlen(".Card") &&
+                                           strcmp(resolved->callee_qn + callee_len - strlen(".Card"),
+                                                  ".Card") == 0;
+            }
+            resolved_jsx_strategy[i] =
+                resolved && resolved->strategy && strcmp(resolved->strategy, "lsp_ts_jsx") == 0;
+            if (carrier_count[i] != 1 || !exact_carrier[i] || !exact_resolution[i] ||
+                !resolved_invocation[i] || !resolved_card_callee[i] || !resolved_jsx_strategy[i]) {
+                printf("  JSX caller diagnostic: expected=%s span=%u:%u carriers=%d caller=%s "
+                       "requires_lsp=%d resolution=%s resolution_span=%u:%u kind=%d callee=%s "
+                       "strategy=%s\n",
+                       callers[i], start, end, carrier_count[i],
+                       carrier && carrier->enclosing_func_qn ? carrier->enclosing_func_qn : "(null)",
+                       carrier ? carrier->requires_lsp_resolution : 0,
+                       resolved && resolved->caller_qn ? resolved->caller_qn : "(null)",
+                       resolved ? resolved->site_start_byte : 0, resolved ? resolved->site_end_byte : 0,
+                       resolved ? resolved->kind : -1,
+                       resolved && resolved->callee_qn ? resolved->callee_qn : "(null)",
+                       resolved && resolved->strategy ? resolved->strategy : "(null)");
+                failed_cases++;
+            }
+        }
+    }
+
+    cbm_free_result(r);
+    ASSERT_EQ(failed_cases, 0);
+    PASS();
+}
+
+/* An exported arrow const is a module definition, not a lexical local.  Bound
+ * into the module scope, it made the JSX resolver fail closed on `<Badge />`
+ * (the edge was lost: JSX carriers have no other resolver) and the exact
+ * same-module call path skip `formatLabel()`.  Both callers must resolve both
+ * targets exactly, whether the caller is a function or an arrow const. */
+static bool ts_resolved_with_strategy(const CBMFileResult *r, const char *caller,
+                                      const char *callee, const char *strategy) {
+    int idx = require_resolved(r, caller, callee);
+    const char *got = idx >= 0 ? r->resolved_calls.items[idx].strategy : NULL;
+    if (idx >= 0 && (!got || strcmp(got, strategy) != 0)) {
+        printf("  %s -> %s resolved by %s, expected %s\n", caller, callee, got ? got : "(null)",
+               strategy);
+    }
+    return got && strcmp(got, strategy) == 0;
+}
+
+TEST(tslsp_jsx_exported_arrow_component_resolves_in_same_module) {
+    CBMFileResult *r =
+        extract_tsx("export const Badge = () => <span/>;\n"
+                    "export const formatLabel = (s: string) => s.trim();\n"
+                    "export function FnUser() { formatLabel('a'); return <Badge/>; }\n"
+                    "export const ArrowUser = () => { formatLabel('b'); return <Badge/>; };\n");
+    ASSERT_NOT_NULL(r);
+    bool fn_jsx = ts_resolved_with_strategy(r, "main.FnUser", "main.Badge", "lsp_ts_jsx");
+    bool arrow_jsx = ts_resolved_with_strategy(r, "main.ArrowUser", "main.Badge", "lsp_ts_jsx");
+    bool fn_call = ts_resolved_with_strategy(r, "main.FnUser", "main.formatLabel", "lsp_ts_local");
+    bool arrow_call =
+        ts_resolved_with_strategy(r, "main.ArrowUser", "main.formatLabel", "lsp_ts_local");
+    cbm_free_result(r);
+    ASSERT_TRUE(fn_jsx);
+    ASSERT_TRUE(arrow_jsx);
+    ASSERT_TRUE(fn_call);
+    ASSERT_TRUE(arrow_call);
+    PASS();
+}
+
 /* A callable value named like a module component owns the JSX tag.  The LSP
  * pass must not confidently redirect it to the module function, and the
  * carrier must require semantic resolution so graph construction cannot do
@@ -4863,6 +4982,8 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_jsx_component_with_children);
     RUN_TEST(tslsp_jsx_import_requires_registered_component);
     RUN_TEST(tslsp_jsx_component_resolutions_join_exact_tag_sites);
+    RUN_TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity);
+    RUN_TEST(tslsp_jsx_exported_arrow_component_resolves_in_same_module);
     RUN_TEST(tslsp_jsx_local_tag_shadow_blocks_module_component);
     RUN_TEST(tslsp_jsx_intrinsic_skipped);
     RUN_TEST(tslsp_jsx_nested_component);

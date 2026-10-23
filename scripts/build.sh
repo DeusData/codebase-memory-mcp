@@ -32,6 +32,15 @@ Options:
   --with-ui       Build the web UI as a content-addressed sidecar (needs node).
   --version V     Stamp the version string (release venue passes the tag).
   --arch ARCH     Force target arch (arm64 | x86_64), e.g. under Rosetta.
+  --vendored-only Build only the third-party objects (make cbm-third-party)
+                  into a clean BUILD_DIR, no binary.
+  --reuse-vendored  Do NOT clean BUILD_DIR: build the binary on top of a
+                  --vendored-only run with the same arguments, compiling
+                  first-party code only. The pair exists for CodeQL's light
+                  PR scan (codeql.yml): the first runs before tracing starts.
+  --retrace-from F  With --reuse-vendored: F lists vendored paths (one per
+                  line) whose objects must be rebuilt anyway (make -W), so a
+                  vendored file the PR changes is compiled under tracing too.
   -h, --help      This text.
 
 Make passthrough (VAR=VAL, forwarded verbatim):
@@ -79,6 +88,8 @@ source "$ROOT/scripts/path-safety.sh"
 # containerized legs can build in their own directory instead of deleting and
 # clobbering the host's native build/c artifacts.
 WITH_UI=false
+PHASE=all
+RETRACE_FROM=""
 VERSION=""
 BUILD_DIR="build/c"
 EXTRA_MAKE_ARGS=()
@@ -94,7 +105,13 @@ for arg in "$@"; do
         --with-ui)
             WITH_UI=true
             ;;
-        --version)
+        --vendored-only)
+            PHASE=vendored
+            ;;
+        --reuse-vendored)
+            PHASE=reuse
+            ;;
+        --version|--retrace-from)
             prev_arg="$arg"
             continue
             ;;
@@ -122,6 +139,8 @@ for arg in "$@"; do
             # a usage error, not a silent make argument.
             if [[ "${prev_arg:-}" == "--version" ]]; then
                 VERSION="$arg"
+            elif [[ "${prev_arg:-}" == "--retrace-from" ]]; then
+                RETRACE_FROM="$arg"
             else
                 echo "build.sh: unexpected argument '$arg'. Please consult --help." >&2
                 exit 2
@@ -144,15 +163,47 @@ echo "  ui=$WITH_UI version=${VERSION:-dev}"
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
-# Step 1: Clean C build artifacts only (not node_modules — npm ci handles that)
-cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
+if [[ "$PHASE" != all ]] && $WITH_UI; then
+    echo "build.sh: --vendored-only / --reuse-vendored do not combine with --with-ui. Please consult --help." >&2
+    exit 2
+fi
+
+# --retrace-from: each listed path becomes `make -W <path>` (treated as changed
+# now -- the retrace helper supplies direct compilation entrypoints, so nested
+# includes do not depend on Makefile wildcard coverage; no timestamp race).
+RETRACE_ARGS=()
+if [[ -n "$RETRACE_FROM" ]]; then
+    if [[ "$PHASE" != reuse || ! -f "$RETRACE_FROM" ]]; then
+        echo "build.sh: --retrace-from needs --reuse-vendored and an existing list file. Please consult --help." >&2
+        exit 2
+    fi
+    while IFS= read -r retrace_path || [[ -n "$retrace_path" ]]; do
+        [[ -n "$retrace_path" ]] && RETRACE_ARGS+=(-W "$retrace_path")
+    done < "$RETRACE_FROM"
+fi
+
+# Step 1: Clean C build artifacts only (not node_modules — npm ci handles that).
+# --reuse-vendored keeps the third-party objects of the --vendored-only run.
+if [[ "$PHASE" == reuse ]]; then
+    if [[ ! -d "$BUILD_DIR" ]]; then
+        echo "build.sh: --reuse-vendored needs a --vendored-only run in $BUILD_DIR first." >&2
+        exit 2
+    fi
+else
+    cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
+fi
 
 # Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
-if $WITH_UI; then
+if [[ "$PHASE" == vendored ]]; then
+    make -j"$NPROC" -f Makefile.cbm cbm-third-party \
+        CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
+    echo "=== Third-party objects built in ${BUILD_DIR} (no binary) ==="
+    exit 0
+elif $WITH_UI; then
     make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 else
-    make -j"$NPROC" -f Makefile.cbm cbm \
+    make -j"$NPROC" -f Makefile.cbm cbm "${RETRACE_ARGS[@]+"${RETRACE_ARGS[@]}"}" \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 

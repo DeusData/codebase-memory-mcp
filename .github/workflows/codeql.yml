@@ -1,47 +1,194 @@
 name: CodeQL SAST
 
+# One analysis per language: c-cpp, javascript-typescript (graph-ui, pkg/npm),
+# python, actions. Scope: .github/codeql/codeql-config.yml (first-party source).
+#
+# FULL scan -- push to main, weekly, dry run, release: every language; c-cpp
+#   traces the whole production build, vendored C included.
+# PR scan -- pr.yml's `codeql` job (light: true), needed by ci-ok. One leg per
+#   language whose scope the PR changes (codeql-* lanes of
+#   scripts/ci/select-lanes.sh; an undeterminable diff or a change to the
+#   workflows, the build or the CodeQL machinery selects every language).
+#   Each leg analyses its language's WHOLE first-party scope, so cross-file
+#   data flow is kept; c-cpp compiles the vendored objects before tracing
+#   starts, except vendored files the PR changes. Diff-informed analysis then
+#   restricts the REPORTED alerts to the changed lines; what is extracted and
+#   analysed is never narrowed by the diff.
+# There is no pull_request trigger and no job anywhere that polls for a CodeQL
+# run: the former PR gate waited up to 150 min per PR for a full analysis and,
+# with ~30 PRs pushed at once, starved PR CI for hours.
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      light:
+        description: "PR-style c-cpp build (vendored objects compiled untraced) -- to time it"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      light:
+        description: "PR scan: vendored C compiled untraced except changed files; diff-informed results"
+        type: boolean
+        default: false
+      matrix:
+        description: 'The legs to run, {"include":[...]} (pr.yml: the selected codeql-* lanes); empty = every language'
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
-# One analysis per pull request and one per pushed branch. A newer push to main
-# cancels the analysis of an older main commit; only the newest commit's
-# results matter for main, and a merge-heavy day otherwise queues one 40-100
-# minute analysis per merge ahead of every pull request run.
-concurrency:
-  group: codeql-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    # CodeQL needs security-events: write to upload results; scoped to this job so
-    # the workflow's top-level token stays read-only (Scorecard TokenPermissions).
+    strategy:
+      fail-fast: false
+      # The same legs (and keys) everywhere, so a PR's analysis and main's
+      # share one code-scanning configuration per language.
+      matrix: ${{ fromJSON(inputs.matrix || '{"include":[{"language":"c-cpp","build-mode":"manual","lane":"codeql-cpp"},{"language":"javascript-typescript","build-mode":"none","lane":"codeql-js"},{"language":"python","build-mode":"none","lane":"codeql-py"},{"language":"actions","build-mode":"none","lane":"codeql-actions"}]}') }}
+    # Superseded runs are always cancelled: a newer push to main cancels the
+    # analysis of an older main commit (batched merges -> only the newest main
+    # commit is scanned), a newer push to a PR cancels that PR's scan. Every
+    # other trigger gets a group of its own and is never cancelled: a dry run
+    # or a release tests ONE commit, and two dispatched together must not
+    # cancel each other's gate. Per language, so legs never cancel each other.
+    # In a called workflow `github` is the CALLER's context: event_name is
+    # pull_request for pr.yml, github.workflow names the dry run or release.
+    concurrency:
+      group: codeql-${{ matrix.language }}-${{ github.event_name == 'push' && github.ref || github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    # CodeQL needs security-events: write to upload results (and read for the
+    # alert check); scoped to this job so the workflow's top-level token stays
+    # read-only (Scorecard TokenPermissions).
     permissions:
       security-events: write
       actions: read
       contents: read
+    env:
+      # One code-scanning configuration for every trigger. The action derives
+      # the key from the RUN's workflow file, which for a called workflow is
+      # the caller: pr.yml / dry-run.yml / release.yml would each open a
+      # configuration of their own, and on main an alert fixed by a later push
+      # would stay open in a stale one. The value is the key the push-to-main
+      # analysis has always used (the action documents this variable as
+      # settable for non-standard setups).
+      CODEQL_ACTION_ANALYSIS_KEY: .github/workflows/codeql.yml:analyze
+      # Diff-informed analysis: codeql-action v4.38.1 (CLI 2.27.0) reports a
+      # pull request's alerts only on its changed lines when the
+      # diff_informed_queries feature is on (default on; this variable forces
+      # it, src/feature-flags.ts). It applies only when the event payload is a
+      # pull request -- pr.yml's call -- and is inert on main, dry run, release.
+      CODEQL_ACTION_DIFF_INFORMED_QUERIES: ${{ inputs.light && 'true' || '' }}
+      # No compiler cache: a cache hit skips the compiler, and CodeQL extracts
+      # only what a traced compiler invocation actually compiles.
+      CBM_NO_CCACHE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR scan reads the merge commit's first parent (the base) to
+          # find the vendored files the PR changes.
+          fetch-depth: ${{ inputs.light && 2 || 1 }}
 
       - name: Install build dependencies
+        if: ${{ matrix.language == 'c-cpp' }}
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      # PR c-cpp: compile the third-party objects (tree-sitter grammars,
+      # sqlite, mimalloc, lz4, zstd, the tree-sitter runtime: ~1.3 GB of
+      # vendored C against ~45 MB first-party) BEFORE tracing starts, so the
+      # traced build below compiles first-party code only ...
+      - name: Build third-party objects (PR scan, untraced)
+        if: ${{ matrix.language == 'c-cpp' && inputs.light }}
+        run: scripts/build.sh --vendored-only
+
+      # ... except the vendored files this PR changes: those are rebuilt
+      # under tracing (an undeterminable diff leaves the list empty; the scan
+      # still covers all first-party C).
+      - name: Vendored files this PR changes (traced too)
+        if: ${{ matrix.language == 'c-cpp' && inputs.light }}
+        run: scripts/ci/codeql-retrace-vendored.sh "$RUNNER_TEMP/codeql-retrace.txt"
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
-          languages: c-cpp
-          build-mode: manual
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
 
-      - name: Build for CodeQL analysis
+      - name: Build for CodeQL analysis (full)
+        if: ${{ matrix.language == 'c-cpp' && !inputs.light }}
         run: scripts/build.sh
+
+      - name: Build for CodeQL analysis (PR scan, first-party + changed vendored)
+        if: ${{ matrix.language == 'c-cpp' && inputs.light }}
+        run: scripts/build.sh --reuse-vendored --retrace-from "$RUNNER_TEMP/codeql-retrace.txt"
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
-          category: "/language:c-cpp"
+          category: "/language:${{ matrix.language }}"
+
+      # Alert policy: the default branch carries ZERO open code-scanning
+      # alerts. Any open alert on the analysed ref fails this leg: on main the
+      # commit turns red and GitHub notifies whoever triggered the run; the
+      # dry run and the release cannot pass; a PR (refs/pull/<n>/merge: what
+      # its changed lines introduce) fails ci-ok. With a zero baseline "any
+      # open alert" is exactly "a new alert"; a dismissal (with a reason, in
+      # the Security tab) holds on every ref. Every leg checks after its own
+      # upload, so each language's alerts are seen by at least its own leg.
+      # Moved from _security.yml's former PR-CI codeql-gate job.
+      - name: Check for open code scanning alerts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALERT_REF: ${{ github.ref }}
+        run: |
+          # FAIL CLOSED. The previous form was `gh api ... 2>/dev/null || echo "0"`,
+          # which looks defensive and is the opposite. gh writes the API error
+          # BODY to stdout, so a 403 made ALERTS the string
+          #   {"message":"Resource not accessible by integration",...,"status":"403"}0
+          # every `[` comparison then failed as non-integer, the `if` took its
+          # false branch, and the step printed "CodeQL gate passed (0 alerts)"
+          # and exited 0. That is exactly how a security gate should NEVER fail:
+          # silently, in the direction of "everything is fine". An unreadable
+          # alert list is now an error, not a zero.
+          # NOTE: this runs in a command substitution, so it must `return`, not
+          # `exit` -- an `exit` here would only end the subshell and let the
+          # caller continue with an empty count, recreating the very bug this
+          # replaces. The callers below check the status explicitly.
+          count_open_alerts() {
+            local body status
+            body=$(gh api "repos/${{ github.repository }}/code-scanning/alerts?state=open&ref=$ALERT_REF" \
+                     --jq 'length' 2>/dev/null)
+            status=$?
+            if [ $status -ne 0 ]; then
+              echo "BLOCKED: cannot read code scanning alerts (gh exit $status)." >&2
+              echo "  Refusing to treat an unreadable alert list as zero." >&2
+              echo "  Most likely cause: the job lacks security-events:read." >&2
+              return 1
+            fi
+            case "$body" in
+              ''|*[!0-9]*)
+                echo "BLOCKED: alert count was not a number: ${body:-<empty>}" >&2
+                return 1
+                ;;
+            esac
+            printf '%s' "$body"
+          }
+          echo "Waiting 60s for alert API to settle..."
+          sleep 60
+          ALERTS=$(count_open_alerts) || exit 1
+          sleep 15
+          ALERTS2=$(count_open_alerts) || exit 1
+          [ "$ALERTS" -lt "$ALERTS2" ] && ALERTS=$ALERTS2
+          if [ "$ALERTS" -gt 0 ]; then
+            echo "::error title=Open code scanning alerts::$ALERTS open alert(s) on $ALERT_REF -- fix, or dismiss with a reason in the Security tab"
+            echo "BLOCKED: $ALERTS open alert(s)"
+            gh api "repos/${{ github.repository }}/code-scanning/alerts?state=open&ref=$ALERT_REF" \
+              --jq '.[] | "  #\(.number) [\(.rule.security_severity_level // .rule.severity)] \(.rule.id) — \(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)"' 2>/dev/null || true
+            exit 1
+          fi
+          echo "=== CodeQL gate passed (0 alerts) ==="
