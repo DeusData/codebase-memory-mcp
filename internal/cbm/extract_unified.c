@@ -324,6 +324,7 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
      * CBMWalkScope comment for the quadratic recompute this replaces. */
     f->prev_enclosing_func_qn = state->enclosing_func_qn;
     f->prev_enclosing_class_qn = state->enclosing_class_qn;
+    f->prev_enclosing_class_node = state->enclosing_class_node;
     f->prev_invocation_kind = state->invocation_kind;
     f->prev_callee_expr = state->callee_expr;
     f->prev_callee_leaf = state->callee_leaf;
@@ -337,6 +338,8 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
     case SCOPE_CLASS:
     case SCOPE_NAMESPACE:
         state->enclosing_class_qn = qn;
+        /* push_lexical_scope records the node; a node-less push has none. */
+        state->enclosing_class_node = (TSNode){0};
         break;
     case SCOPE_CALL:
         /* The invocation triple is applied by push_call_scope once the caller
@@ -363,6 +366,9 @@ static bool push_lexical_scope(WalkState *state, uint8_t walk_kind, uint32_t dep
     if (!push_scope(state, walk_kind, depth, qn)) {
         state->lexical_binding_tracking_failed = true;
         return false;
+    }
+    if (walk_kind == SCOPE_CLASS || walk_kind == SCOPE_NAMESPACE) {
+        state->enclosing_class_node = node;
     }
     state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id =
         add_lexical_scope(state, node, lexical_kind);
@@ -442,6 +448,7 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
         const CBMWalkScope *f = &state->scopes[--state->scope_top];
         state->enclosing_func_qn = f->prev_enclosing_func_qn;
         state->enclosing_class_qn = f->prev_enclosing_class_qn;
+        state->enclosing_class_node = f->prev_enclosing_class_node;
         state->invocation_kind = f->prev_invocation_kind;
         state->callee_expr = f->prev_callee_expr;
         state->callee_leaf = f->prev_callee_leaf;
@@ -2671,6 +2678,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
      * recompute_state call): module scope, nothing else active. */
     state.enclosing_func_qn = ctx->module_qn;
     state.enclosing_class_qn = NULL;
+    state.enclosing_class_node = (TSNode){0};
     state.invocation_kind = CBM_INVOCATION_NONE;
     state.callee_expr = (TSNode){0};
     state.callee_leaf = (TSNode){0};
