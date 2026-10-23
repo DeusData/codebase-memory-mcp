@@ -1,0 +1,168 @@
+# Fork release: build every platform, smoke-test, publish a GitHub release.
+#
+# release.yml is upstream's pipeline and publishes through accounts a fork does
+# not have (VirusTotal, npm, PyPI, MCP Registry). This workflow keeps exactly
+# what the installers need: the eight platform archives (+ MCPB bundles) and
+# checksums.txt on a NON-prerelease "latest" release, which is what
+#   install.sh / install.ps1 -> https://github.com/<repo>/releases/latest/download/...
+# resolve. GitHub never treats a prerelease as "latest", so every release made
+# here is a full release, including versions like v0.12.1-neo4j.1.
+#
+# Run: Actions -> Fork Release -> Run workflow (on main).
+name: Fork Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, v-prefixed (e.g. v0.12.1-neo4j.1)"
+        required: true
+        type: string
+      release_notes:
+        description: "Release notes (optional; generated from commits when empty)"
+        required: false
+        type: string
+      virustotal:
+        description: "VirusTotal-scan the binaries (needs the VIRUS_TOTAL_SCANNER_API_KEY secret)"
+        required: false
+        type: boolean
+        default: false
+      skip_smoke:
+        description: "Skip the smoke tests of the built binaries"
+        required: false
+        type: boolean
+        default: false
+      replace:
+        description: "Replace an existing release with the same version"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The installers fetch releases/latest/download/<archive>; the tag is the
+      # version verbatim, so a bare "0.12.1" would publish an unreachable tag.
+      - name: Enforce v-prefixed semver version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "version OK: $VERSION"
+          else
+            echo "::error::version must be v-prefixed semver (vX.Y.Z[-suffix]), got '$VERSION'"
+            exit 1
+          fi
+
+  build:
+    needs: [preflight]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ inputs.version }}
+      attest: false
+      scan_candidates: ${{ inputs.virustotal }}
+    secrets: inherit
+
+  smoke:
+    needs: [build]
+    if: ${{ !cancelled() && needs.build.result == 'success' && !inputs.skip_smoke }}
+    uses: ./.github/workflows/_smoke.yml
+    with:
+      broad_platforms: false
+
+  publish:
+    needs: [build, smoke]
+    # A skipped smoke is accepted only when it was skipped on request.
+    if: >-
+      ${{ !cancelled()
+      && needs.build.result == 'success'
+      && (needs.smoke.result == 'success'
+          || (inputs.skip_smoke && needs.smoke.result == 'skipped')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the packaged containers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+
+      - name: List artifacts and require every platform
+        working-directory: dist
+        run: |
+          ls -la
+          for target in linux-amd64 linux-arm64 linux-amd64-portable linux-arm64-portable \
+                        darwin-amd64 darwin-arm64; do
+            test -f "codebase-memory-mcp-$target.tar.gz" || { echo "::error::missing $target archive"; exit 1; }
+          done
+          for target in windows-amd64 windows-arm64; do
+            test -f "codebase-memory-mcp-$target.zip" || { echo "::error::missing $target archive"; exit 1; }
+          done
+
+      # install.sh / install.ps1 refuse any archive whose SHA-256 is not listed
+      # here, so this file is what makes the release installable.
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          sha256sum *.tar.gz *.zip *.mcpb > checksums.txt
+          cat checksums.txt
+
+      - name: Delete existing release
+        if: ${{ inputs.replace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: gh release delete "$VERSION" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+
+      # Tag the dispatched commit (the one the binaries were built from), not
+      # whatever main points at by now.
+      - name: Publish the release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          NOTES: ${{ inputs.release_notes }}
+        run: |
+          shopt -s nullglob
+          notes_args=(--generate-notes)
+          if [ -n "$NOTES" ]; then notes_args=(--notes "$NOTES"); fi
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --latest \
+            "${notes_args[@]}" \
+            *.tar.gz *.zip *.mcpb checksums.txt
+          {
+            echo "### Released $VERSION"
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/install.sh | bash"
+            echo '```'
+            echo '```powershell'
+            echo "Invoke-WebRequest -Uri https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/install.ps1 -OutFile install.ps1"
+            echo 'Unblock-File .\install.ps1'
+            echo 'PowerShell -ExecutionPolicy Bypass -File .\install.ps1'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

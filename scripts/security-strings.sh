@@ -115,6 +115,8 @@ echo "--- URL audit ---"
 ALLOWED_URLS=(
     "https://api.github.com/repos/DeusData/codebase-memory-mcp"
     "https://github.com/DeusData/codebase-memory-mcp"
+    # This fork's own repository (installers, update handoff, UI issue link).
+    "https://github.com/haiderRizvii/codebase-memory-mcp"
     # Our own org root and documentation site: the .mcpb bundle manifest carries
     # them as homepage/documentation fields, and the graph UI links the docs.
     "https://github.com/DeusData"

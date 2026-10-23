@@ -26,6 +26,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
+#include "neo4j/neo4j_sync.h"
 #include "store/store.h"
 #include "macro_table.h"
 #include "arena.h"
@@ -210,6 +211,12 @@ struct cbm_pipeline {
      * without consulting cbm_artifact_export_last_error() directly — that
      * global can still hold a PREVIOUS run's error. */
     char export_error[CBM_SZ_1K];
+
+    /* Neo4j mirror (index_repository graph_db). graph_cfg is heap-owned and
+     * holds the password; graph_disable returns the project to SQLite only. */
+    cbm_neo4j_config_t *graph_cfg;
+    bool graph_disable;
+    char graph_error[CBM_SZ_1K];
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -909,6 +916,30 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
+void cbm_pipeline_set_graph_backend(cbm_pipeline_t *p, const cbm_neo4j_config_t *cfg) {
+    if (!p || !cfg) {
+        return;
+    }
+    if (!p->graph_cfg) {
+        p->graph_cfg = malloc(sizeof(*p->graph_cfg));
+        if (!p->graph_cfg) {
+            return;
+        }
+    }
+    *p->graph_cfg = *cfg;
+    p->graph_disable = false;
+}
+
+void cbm_pipeline_disable_graph_backend(cbm_pipeline_t *p) {
+    if (p) {
+        p->graph_disable = true;
+    }
+}
+
+const char *cbm_pipeline_graph_error(const cbm_pipeline_t *p) {
+    return p ? p->graph_error : "";
+}
+
 void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->doc_candidates_choice =
@@ -1051,6 +1082,10 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p->repo_path);
     free(p->db_path);
     free(p->project_name);
+    if (p->graph_cfg) {
+        cbm_neo4j_config_wipe(p->graph_cfg);
+        free(p->graph_cfg);
+    }
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
@@ -4389,7 +4424,26 @@ static int seal_staging_db(const char *staging_path) {
     return rc;
 }
 
+/* Mirror the published generation into Neo4j when this run asked for it or
+ * the project is already Neo4j-backed. Runs on every publish route (full,
+ * incremental, live no-op) because all of them end in export_after_publish. */
+static int graph_backend_after_publish(cbm_pipeline_t *p, const char *final_path) {
+    CBM_PROF_START(t_graph);
+    int rc = cbm_neo4j_after_publish(final_path, p->project_name, p->graph_cfg, p->graph_disable,
+                                     p->graph_error, sizeof(p->graph_error));
+    CBM_PROF_END("persist", "7_graph_backend_sync", t_graph);
+    if (rc != 0) {
+        cbm_log_error("pipeline.err", "phase", "graph_backend_sync", "err", p->graph_error);
+        return CBM_PIPELINE_GRAPH_SYNC_FAILED;
+    }
+    return 0;
+}
+
 static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
+    int graph_rc = graph_backend_after_publish(p, final_path);
+    if (graph_rc != 0) {
+        return graph_rc;
+    }
     if (p->persistence) {
         CBM_PROF_START(t_art);
         int rc = cbm_artifact_export(final_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
@@ -4666,6 +4720,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     cbm_log_debug("pipeline.setup", "step", "stage");
     pipeline_release_test_config(p);
     p->export_error[0] = '\0';
+    p->graph_error[0] = '\0';
     char *final_path = resolve_db_path(p);
     if (!final_path || !ensure_db_parent(final_path)) {
         free(final_path);

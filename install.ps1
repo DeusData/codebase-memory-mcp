@@ -25,7 +25,7 @@ if ([Environment]::OSVersion.Version.Build -ge 20348 -and
 [Net.ServicePointManager]::SecurityProtocol = $CbmProtocols
 Add-Type -AssemblyName System.Net.Http
 
-$Repo = "DeusData/codebase-memory-mcp"
+$Repo = "haiderRizvii/codebase-memory-mcp"
 $InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
 $BinName = "codebase-memory-mcp.exe"
 $WindowsArchiveNames = @(

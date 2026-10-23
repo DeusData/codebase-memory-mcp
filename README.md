@@ -1,5 +1,13 @@
 # codebase-memory-mcp: local code intelligence for AI agents via MCP
 
+> **Fork notice.** This is [haiderRizvii/codebase-memory-mcp](https://github.com/haiderRizvii/codebase-memory-mcp), a fork of
+> [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) that adds a
+> [Neo4j graph backend](#neo4j-graph-backend) and [Docker-based graph builds](docker/graph/README.md).
+> The install commands below install **this fork**, and `codebase-memory-mcp update` keeps
+> updating from it. Releases are built by `.github/workflows/fork-release.yml`; unlike
+> upstream releases they are not VirusTotal-scanned unless that workflow's `virustotal`
+> option is used. The badges below describe the upstream project.
+
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/release.yml?branch=main&label=main%20CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/release.yml)
@@ -70,7 +78,7 @@ The high-resolution GIFs show CBM Lens Beta on 20 October 2026; the still images
 
 **Install the latest release** (macOS / Linux):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/haiderRizvii/codebase-memory-mcp/main/install.sh | bash
 ```
 
 The standard native release includes CBM Lens. Start it after installation with `codebase-memory-mcp daemon start --open --port=9749`. The [Nix packages](#nix-flake) and [source builds](#build-from-source) also offer builds without the UI.
@@ -78,7 +86,7 @@ The standard native release includes CBM Lens. Start it after installation with 
 **Windows** (PowerShell):
 ```powershell
 # 1. Download the installer
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/haiderRizvii/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
 
 # 2. (Optional but recommended) Inspect the script
 notepad install.ps1
@@ -108,7 +116,7 @@ Restart your coding agent. Say **"Index this project"**: done.
 <details>
 <summary>Manual install</summary>
 
-1. **Download** the archive for your platform from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest):
+1. **Download** the archive for your platform from the [latest release](https://github.com/haiderRizvii/codebase-memory-mcp/releases/latest):
    - `codebase-memory-mcp-<os>-<arch>.tar.gz` (macOS/Linux) or `.zip` (Windows)
 
 2. **Extract and install** (each archive includes `install.sh` or `install.ps1`):
@@ -438,6 +446,29 @@ Share a compressed graph snapshot so teammates can reuse an indexed baseline.
 
 The artifact provides a shared baseline while each developer keeps a local query database.
 
+## Neo4j Graph Backend
+
+Store a project's graph in Neo4j and have the graph tools read it from there.
+
+```bash
+codebase-memory-mcp cli index_repository --repo-path /path/to/repo \
+  --graph-db http://neo4j-host:7474 --graph-user neo4j --graph-password '***' \
+  [--graph-database neo4j]
+```
+
+- **Transport**: Neo4j's HTTP API (`http://host:7474`, or `https://host:7473` on Windows builds). `bolt://` and `neo4j://` URLs are refused with a hint to use the HTTP port. Neo4j 4.4 and 5.x, Community or Enterprise.
+- **Credentials**: flags win; otherwise `NEO4J_USER` (or `NEO4J_USERNAME`), `NEO4J_PASSWORD` and `NEO4J_DATABASE` are used, defaulting to user `neo4j` and database `neo4j`. Indexing fails fast, before any work starts, when Neo4j is unreachable or rejects the login.
+- **Password handling**: the password is never written to disk and is never put on the index worker's command line. The daemon that ran the index keeps it in memory for later reads. After a daemon restart, reads need `NEO4J_PASSWORD` in the environment of the MCP server (or of whichever session starts the daemon); see the note under Environment Variables.
+- **What lives where**: indexing still builds the local SQLite index, which serves incremental re-indexing, coverage, ADRs, full-text and semantic search. After every successful publish (a full index, an incremental update, or the watcher's auto-refresh), the graph is mirrored into Neo4j. The marker `<cache>/<project>.db.graph.json` (URL, user and database, no password) keeps later re-indexes syncing to the same target with no flags.
+- **Reads**: the graph primitives come from Neo4j. These are node lookups by id, qualified name, name, label and file, edge lookups, degrees, node/edge counts, and every BFS (shortest-path, multi-seed, and the trail expansion behind variable-length Cypher). That covers `query_graph`, `trace_path`, and the lookups inside `get_code_snippet`, `index_status` and `detect_changes`. Some reads still use the local copy, which holds exactly the same generation: QN-suffix and overload matching, `search_graph` (filters, BM25, semantic), `get_graph_schema`, `get_architecture`, the impact walk, and the UI.
+- **Consistency**: each sync writes a new generation, flips `(:CbmProject {name}).gen`, then deletes the old one, so readers never see a half-written graph. If Neo4j is down, rejects the login, or holds an older generation (a failed sync), reads fall back to the identical local copy. `index_status` reports `graph_backend.status` as `serving` or as `sqlite_fallback` with the reason.
+- **Native Cypher**: `query_graph` with `native: true` runs the query in Neo4j itself (read-only; write clauses and `CALL` are refused), with `$project`, `$db` and `$gen` bound:
+  ```cypher
+  MATCH (f:Function {db:$db, gen:$gen})-[:CALLS]->(g) RETURN f.name, count(g) AS fan_out ORDER BY fan_out DESC LIMIT 10
+  ```
+- **Model**: nodes are `(:CbmNode:<Label> {db, gen, project, id, label, name, qualified_name, file_path, start_line, end_line, properties_json, ...top-level scalar properties})`, and edges are `[:<TYPE> {id, type, properties_json, ...}]`.
+- **Turning it off**: `--graph-db sqlite` returns the project to local-only reads and leaves the Neo4j data in place. `delete_project` removes the project's graph from Neo4j as well.
+
 ## How It Works
 
 codebase-memory-mcp is a **structural analysis backend**: it builds and queries the knowledge graph. The backend does not require a generative model. It relies on your MCP client (Claude Code, or any MCP-compatible agent) to be the intelligence layer.
@@ -517,13 +548,13 @@ Every release includes `checksums.txt` with SHA-256 hashes. The executable is se
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/haiderRizvii/codebase-memory-mcp/main/scripts/setup.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
+irm https://raw.githubusercontent.com/haiderRizvii/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
 ```
 
 </details>
@@ -991,6 +1022,7 @@ is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 | `CBM_LOG_LEVEL` | role-aware | Set the minimum log level. Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and its supervised index workers default to `info` so lifecycle and liveness records remain available. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none`; or their numeric equivalents `0` to `4`. A physical worker retains INFO liveness records even under a stricter override because its private log drives the supervisor's no-progress timeout. Frontend messages go to that session's stderr; detached daemon events go to `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
 | `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1 to 256; invalid values are ignored with a warning. |
 | `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the derived default (`ram_fraction × total_RAM`, adjusted for available memory and daemon worker caps). Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`). |
+| `NEO4J_USER` / `NEO4J_PASSWORD` / `NEO4J_DATABASE` | `neo4j` / *(unset)* / `neo4j` | Fallback credentials for the [Neo4j graph backend](#neo4j-graph-backend) when `index_repository` is called without `graph_user` / `graph_password` / `graph_database`. `NEO4J_PASSWORD` is also what lets a restarted daemon read a Neo4j-backed project. |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0 to 1; set `0` to disable. Invalid values are ignored with a warning. |
 
 Environment used by daemon-owned components (such as diagnostics, daemon logging, and process-wide indexing resource limits) is captured from the first daemon-backed session that starts the daemon. Later sessions join that process and cannot replace those values. To change them, close all daemon-backed sessions, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running. Its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon; joining an already-running daemon, it inherits that daemon's already-captured values instead.

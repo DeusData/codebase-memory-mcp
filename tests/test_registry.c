@@ -1326,6 +1326,14 @@ TEST(call_onto_field_follows_language_and_shape) {
     /* The same language as the Field keeps its resolution too. */
     ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_GO, "s.fn", "Field", "pkg/s.go"),
               CBM_FIELD_CALL_KEEP);
+    /* Java has no callable fields: `lock.lock()` is ReentrantLock.lock, never
+     * the `lock` field, member call or bare. */
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_JAVA, "lock.lock", "Field", "src/Pool.java"),
+              CBM_FIELD_CALL_DROP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_JAVA, "lock", "Field", "src/Pool.java"),
+              CBM_FIELD_CALL_DROP);
+    ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_JAVA, "lock", "Method", "src/Pool.java"),
+              CBM_FIELD_CALL_KEEP);
     /* Not a Field target: not this rule's business. */
     ASSERT_EQ(cbm_call_onto_field_policy(CBM_LANG_BASH, "main", "Function", "src/main.c"),
               CBM_FIELD_CALL_KEEP);

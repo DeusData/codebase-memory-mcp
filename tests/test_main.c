@@ -1821,6 +1821,7 @@ extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
+extern void suite_neo4j(void);
 extern void suite_doclinks(void);
 extern void suite_doc_mentions(void);
 extern void suite_doc_mentions_cost(void);
@@ -2415,6 +2416,9 @@ int main(int argc, char **argv) {
 
     /* Config link */
     RUN_SELECTED_SUITE(configlink);
+
+    /* Neo4j graph backend */
+    RUN_SELECTED_SUITE(neo4j);
 
     /* Markdown file reference link */
     RUN_SELECTED_SUITE(doclinks);

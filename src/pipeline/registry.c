@@ -1308,12 +1308,19 @@ cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, cons
      *   - a C or C++ member call (`cb.close(ctx)`, `text.size()`): the type of
      *     the object decides which struct's member is called, never the
      *     member name alone. The C LSP publishes owners in both modes.
+     *   - any Java call: Java has no callable fields. `lock.lock()` invokes a
+     *     method of the field's type (ReentrantLock.lock), and a functional
+     *     field is invoked through its interface method (`f.apply(x)`), so a
+     *     Field is never what a Java call names.
      * A bare C++ call keeps its resolution (a method body reaches its own
      * members without a selector), and so does every other language. */
     if (!target_label || strcmp(target_label, "Field") != 0) {
         return CBM_FIELD_CALL_KEEP;
     }
     if (cbm_suppress_cross_language_ref(caller_lang, target_file_path)) {
+        return CBM_FIELD_CALL_DROP;
+    }
+    if (caller_lang == CBM_LANG_JAVA) {
         return CBM_FIELD_CALL_DROP;
     }
     if (caller_lang != CBM_LANG_C && caller_lang != CBM_LANG_CPP) {

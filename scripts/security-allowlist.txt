@@ -25,6 +25,14 @@ NETWORK:src/daemon/ipc.c:connect:1:unix:local_socket_connect:single sockaddr_un-
 NETWORK:src/main.c:socket:1:loopback-v4:main_daemon_ctl_ui_endpoint_ready:single AF_INET stream client for authenticated daemon UI readiness
 NETWORK:src/main.c:connect:1:loopback-v4:main_daemon_ctl_socket_connected:single sockaddr_in connect whose address is hardcoded to 127.0.0.1 and whose response must prove the daemon generation HMAC
 
+# ── Neo4j graph backend: the one outbound TCP client (opt-in) ──────────────
+# Connects only when the user passes index_repository graph_db (or a project
+# was indexed with it), to that URL's host:port. configured-tcp is pinned by
+# the source audit to src/neo4j/neo4j_http.c and to a getaddrinfo() walk over
+# the parsed graph_db host with a stream-socket hint.
+NETWORK:src/neo4j/neo4j_http.c:socket:1:configured-tcp:n4_connect:stream socket for one getaddrinfo() result of the user-configured graph_db host
+NETWORK:src/neo4j/neo4j_http.c:connect:1:configured-tcp:n4_connect:connect to that same resolved graph_db address (Neo4j HTTP API)
+
 # ── Reviewed count-bounded file writes: private or caller-selected paths ───
 # Format: WRITE:file:expected-count:justification
 WRITE:src/main.c:3:supervised worker response path; cache-scoped hook notice marker; test-seam-only browser-open marker at the caller-supplied test path
@@ -38,6 +46,7 @@ WRITE:src/mcp/test_impact_artifact.c:1:receipt staging file in the caller-select
 WRITE:src/mcp/test_impact_engine.c:1:merge-base configuration staged inside the engine's private working directory
 WRITE:src/mcp/test_impact_engine_artifact.c:1:reviewed coverage bytes copied into the newly-created output bundle
 WRITE:src/mcp/test_impact_git.c:1:bounded Git batch stdin staged in the private capture directory
+WRITE:src/neo4j/neo4j_sync.c:1:graph-backend marker <project>.db.graph.json (URL, user, database; never the password) staged as .tmp beside the project database in the cache directory, then atomically renamed
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
 src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
@@ -84,4 +93,5 @@ URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest:version chec
 URL:http://127.0.0.1:UI server binding (localhost only)
 URL:https://www.sqlite.org/c3ref/c_checkpoint_full.html:sqlite WAL checkpoint API doc reference (comment only, not a network call)
 URL:https://github.com/DeusData/codebase-memory-mcp:project repository self-reference in update/star notice (src/mcp/mcp.c)
+URL:https://github.com/haiderRizvii/codebase-memory-mcp/issues/new:fork issue link in the UI about panel (src/ui/http_server.c)
 URL:https://%s:GitHub blob-URL construction in src/ui/http_server.c cbm_ui_git_web_base — https-forces the repo web base for frontend deep-links (not a network call)

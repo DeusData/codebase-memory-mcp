@@ -44,6 +44,8 @@ permissions:
 jobs:
   # ── Security (starts immediately, blocks only verify) ───────────
   security:
+    # Upstream-only: forks release through fork-release.yml (see preflight).
+    if: ${{ github.repository == 'DeusData/codebase-memory-mcp' }}
     uses: ./.github/workflows/_security.yml
     # No job in _security.yml reads code scanning or the Actions API any more
     # (the CodeQL gate moved to codeql.yml), so the token stays read-only.
@@ -57,6 +59,7 @@ jobs:
   # a called workflow cannot request more than its caller grants, so
   # withholding either permission fails the whole run at startup.
   codeql:
+    if: ${{ github.repository == 'DeusData/codebase-memory-mcp' }}
     uses: ./.github/workflows/codeql.yml
     permissions:
       contents: read
@@ -72,6 +75,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # This pipeline publishes through upstream's VirusTotal, npm, PyPI and
+      # MCP Registry accounts, which a fork does not have. Stop at once with a
+      # pointer instead of failing hours later.
+      - name: Refuse to run outside the upstream repository
+        if: ${{ !(github.repository == 'DeusData/codebase-memory-mcp') }}
+        run: |
+          echo "::error::release.yml is upstream's pipeline. On this fork run the 'Fork Release' workflow (.github/workflows/fork-release.yml) instead."
+          exit 1
+
       - name: Enforce v-prefixed semver version input
         env:
           VERSION: ${{ inputs.version }}
@@ -160,6 +172,7 @@ jobs:
   # release-draft's needs: the report is evidence for the release notes, never
   # a publication gate.
   memwaste:
+    if: ${{ github.repository == 'DeusData/codebase-memory-mcp' }}
     uses: ./.github/workflows/_memwaste.yml
     with:
       mode: full

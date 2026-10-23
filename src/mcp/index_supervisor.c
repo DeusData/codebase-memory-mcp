@@ -10,7 +10,9 @@
 #include "foundation/log.h"
 #include "foundation/platform.h" /* cbm_safe_getenv, path normalization */
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
+#include "neo4j/neo4j_client.h"  /* graph_password hand-off */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
+#include "yyjson/yyjson.h"
 
 #include <limits.h>
 #include <errno.h>
@@ -739,6 +741,60 @@ size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes) {
     return memory_budget_bytes > SIZE_MAX - headroom ? SIZE_MAX : memory_budget_bytes + headroom;
 }
 
+/* Move index_repository's graph_password out of the worker's argv (visible in
+ * the process list) into a CBM_NEO4J_PASSWORD=... environment entry for that
+ * child only. The spawning process (the daemon serving later reads) also
+ * remembers the credential so it can open the project's Neo4j graph. Returns
+ * the args to pass (args_json itself when there is no password, otherwise a
+ * malloc'd copy in *owned_args) and fills env_entry (malloc'd, or NULL). */
+static const char *worker_split_graph_password(const char *args_json, char **owned_args,
+                                               char **env_entry) {
+    *owned_args = NULL;
+    *env_entry = NULL;
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    const char *pw = yyjson_get_str(yyjson_obj_get(root, "graph_password"));
+    if (!pw) {
+        yyjson_doc_free(doc);
+        return args_json;
+    }
+    const char *uri = yyjson_get_str(yyjson_obj_get(root, "graph_db"));
+    if (uri && uri[0]) {
+        cbm_neo4j_config_t cfg;
+        char err[CBM_SZ_256];
+        if (cbm_neo4j_config_resolve(uri, yyjson_get_str(yyjson_obj_get(root, "graph_user")), pw,
+                                     yyjson_get_str(yyjson_obj_get(root, "graph_database")), &cfg,
+                                     err, sizeof(err)) == 0) {
+            cbm_neo4j_config_remember(&cfg);
+        }
+        cbm_neo4j_config_wipe(&cfg);
+    }
+    size_t env_len = strlen(CBM_NEO4J_PASSWORD_ENV) + strlen(pw) + 2;
+    *env_entry = malloc(env_len);
+    if (*env_entry) {
+        (void)snprintf(*env_entry, env_len, "%s=%s", CBM_NEO4J_PASSWORD_ENV, pw);
+    }
+    yyjson_mut_doc *copy = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_doc_free(doc);
+    yyjson_mut_val *croot = copy ? yyjson_mut_doc_get_root(copy) : NULL;
+    while (croot && yyjson_mut_obj_get(croot, "graph_password")) {
+        (void)yyjson_mut_obj_remove_key(croot, "graph_password");
+    }
+    *owned_args = croot ? yyjson_mut_write(copy, 0, NULL) : NULL;
+    yyjson_mut_doc_free(copy);
+    return *owned_args ? *owned_args : args_json;
+}
+
+static void worker_free_secret(char *s) {
+    if (s) {
+        volatile char *p = s;
+        while (*p) {
+            *p++ = 0;
+        }
+        free(s);
+    }
+}
+
 int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_bytes,
                                     bool single_thread, const char *marker_file,
                                     const char *quarantine_file, cbm_proc_log_cb log_callback,
@@ -799,7 +855,9 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     argv[argc++] = CBM_INDEX_WORKER_BUILD_ARG;
     argv[argc++] = build_fingerprint;
     argv[argc++] = "index_repository";
-    argv[argc++] = args_json;
+    char *owned_args = NULL;
+    char *password_env = NULL;
+    argv[argc++] = worker_split_graph_password(args_json, &owned_args, &password_env);
     argv[argc++] = "--response-out";
     argv[argc++] = handle->response_path;
     char memory_budget_text[CBM_SZ_32];
@@ -833,7 +891,14 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     options.quiet_timeout_ms = worker_quiet_timeout_ms();
     options.memory_limit_bytes = cbm_index_worker_job_memory_limit(memory_budget_bytes);
     options.delete_log_on_exit = false;
-    if (cbm_subprocess_spawn(&options, &handle->process) != 0) {
+    const char *env_overrides[2] = {password_env, NULL};
+    if (password_env) {
+        options.env_overrides = env_overrides;
+    }
+    int spawn_rc = cbm_subprocess_spawn(&options, &handle->process);
+    free(owned_args);
+    worker_free_secret(password_env);
+    if (spawn_rc != 0) {
         (void)cbm_unlink(handle->response_path);
         (void)cbm_unlink(handle->log_path);
         free(handle);

@@ -379,6 +379,54 @@ void cbm_store_compare_test_cancel_after(int successful_checks);
 void cbm_store_compare_test_cancel_from_progress(bool enabled);
 #endif
 
+/* ── Remote graph backend ───────────────────────────────────────── */
+
+/* A remote backend (Neo4j) can answer the graph read primitives below in
+ * place of the SQLite nodes/edges tables. The SQLite file stays open as the
+ * sidecar for everything else (file hashes, coverage, ADRs, FTS, vectors,
+ * schema/architecture aggregates). Every op returns CBM_STORE_* codes and
+ * allocates results exactly like its SQLite counterpart. */
+typedef enum {
+    CBM_REMOTE_NODES_ALL = 0, /* arg unused; ordered by file_path, id */
+    CBM_REMOTE_NODES_BY_NAME, /* exact name */
+    CBM_REMOTE_NODES_BY_LABEL,
+    CBM_REMOTE_NODES_BY_FILE,
+} cbm_remote_node_query_t;
+
+typedef enum {
+    CBM_REMOTE_COUNT_NODES = 0,
+    CBM_REMOTE_COUNT_EDGES,
+    CBM_REMOTE_COUNT_EDGES_BY_TYPE, /* arg = type */
+} cbm_remote_count_t;
+
+typedef struct cbm_store_remote_ops {
+    void (*close)(void *ctx);
+    const char *(*error)(void *ctx);
+    int (*find_node_by_id)(void *ctx, int64_t id, cbm_node_t *out);
+    int (*find_node_by_qn)(void *ctx, const char *project, const char *qn, cbm_node_t *out);
+    int (*find_nodes)(void *ctx, cbm_remote_node_query_t kind, const char *project, const char *arg,
+                      cbm_node_t **out, int *count);
+    /* by_target: edges INTO node_id; type NULL = any type. */
+    int (*find_edges)(void *ctx, int64_t node_id, bool by_target, const char *type,
+                      cbm_edge_t **out, int *count);
+    int (*find_edges_by_type)(void *ctx, const char *project, const char *type, cbm_edge_t **out,
+                              int *count);
+    int (*count)(void *ctx, cbm_remote_count_t kind, const char *project, const char *arg);
+    /* type NULL/"" = all types. */
+    int (*degrees)(void *ctx, const int64_t *ids, int id_count, const char *type, int *in,
+                   int *out);
+    /* Same contract as cbm_store_bfs (seed_count 1, trail, max_edges) and
+     * cbm_store_bfs_multi (multi == true: no root, seeds excluded). */
+    int (*bfs)(void *ctx, const int64_t *seeds, int seed_count, bool multi, const char *direction,
+               const char **edge_types, int edge_type_count, int max_depth, int max_results,
+               bool trail, int max_edges, cbm_traverse_result_t *out, bool *truncated);
+} cbm_store_remote_ops_t;
+
+/* Route this store's graph reads to a remote backend. The store owns ctx
+ * from now on and releases it with ops->close in cbm_store_close. */
+void cbm_store_attach_remote(cbm_store_t *s, const cbm_store_remote_ops_t *ops, void *ctx);
+bool cbm_store_is_remote(const cbm_store_t *s);
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 /* Open an in-memory database (for testing). */

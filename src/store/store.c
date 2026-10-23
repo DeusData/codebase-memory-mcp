@@ -148,6 +148,11 @@ struct cbm_store {
     cbm_graph_mem_t *graph_mem;
     cbm_graph_mem_types_t graph_mem_degree_mask; /* search's in_deg/out_deg types */
 
+    /* Remote graph backend (cbm_store_attach_remote): graph read primitives
+     * are answered by remote_ops; the SQLite db stays the sidecar. */
+    const cbm_store_remote_ops_t *remote_ops;
+    void *remote_ctx;
+
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
     sqlite3_stmt *stmt_find_node_by_id;
@@ -193,6 +198,30 @@ static void store_set_error(cbm_store_t *s, const char *msg) {
 
 static void store_set_error_sqlite(cbm_store_t *s, const char *prefix) {
     snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(s->db));
+}
+
+/* Pass a remote op's status through, recording its error text. */
+static int remote_status(cbm_store_t *s, int rc) {
+    if (rc == CBM_STORE_ERR && s->remote_ops->error) {
+        const char *msg = s->remote_ops->error(s->remote_ctx);
+        snprintf(s->errbuf, sizeof(s->errbuf), "remote graph: %s", msg ? msg : "error");
+    }
+    return rc;
+}
+
+void cbm_store_attach_remote(cbm_store_t *s, const cbm_store_remote_ops_t *ops, void *ctx) {
+    if (!s || !ops) {
+        return;
+    }
+    if (s->remote_ops) {
+        s->remote_ops->close(s->remote_ctx);
+    }
+    s->remote_ops = ops;
+    s->remote_ctx = ctx;
+}
+
+bool cbm_store_is_remote(const cbm_store_t *s) {
+    return s && s->remote_ops;
 }
 
 static int exec_sql(cbm_store_t *s, const char *sql) {
@@ -1441,6 +1470,11 @@ void cbm_store_close(cbm_store_t *s) {
         return;
     }
     cbm_store_read_batch_end(s);
+    if (s->remote_ops) {
+        s->remote_ops->close(s->remote_ctx);
+        s->remote_ops = NULL;
+        s->remote_ctx = NULL;
+    }
 
     /* Checkpoint WAL before close to prevent orphan WAL accumulation.
      * Best-effort — silently skips if concurrent reader holds a lock. */
@@ -3140,6 +3174,9 @@ static const char st_find_node_by_id_sql[] =
     "start_line, end_line, properties FROM nodes WHERE id = ?1;";
 
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
+    if (s && s->remote_ops) {
+        return remote_status(s, s->remote_ops->find_node_by_id(s->remote_ctx, id, out));
+    }
     sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_find_node_by_id, st_find_node_by_id_sql);
     if (!stmt) {
         return CBM_STORE_ERR;
@@ -3158,6 +3195,9 @@ int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
 
 int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *qn,
                               cbm_node_t *out) {
+    if (s && s->remote_ops) {
+        return remote_status(s, s->remote_ops->find_node_by_qn(s->remote_ctx, project, qn, out));
+    }
     if (!s || !s->db) {
         return CBM_STORE_ERR;
     }
@@ -3321,6 +3361,10 @@ static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
 }
 
 int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_ALL,
+                                                          project, NULL, out, count));
+    }
     if (!s) {
         *out = NULL;
         *count = 0;
@@ -3335,6 +3379,10 @@ int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, 
 
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_NAME,
+                                                          project, name, out, count));
+    }
     if (!s) {
         *out = NULL;
         *count = 0;
@@ -3349,6 +3397,10 @@ int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char
 
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                   cbm_node_t **out, int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_LABEL,
+                                                          project, label, out, count));
+    }
     if (!s) {
         *out = NULL;
         *count = 0;
@@ -3363,6 +3415,10 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_FILE,
+                                                          project, file_path, out, count));
+    }
     if (!s) {
         *out = NULL;
         *count = 0;
@@ -3480,7 +3536,9 @@ cbm_store_node_scan_t *cbm_store_node_scan_open(cbm_store_t *s, const char *proj
         return NULL;
     }
     scan->phase = label ? NODE_SCAN_LABEL : NODE_SCAN_NULL_FILE; /* NULL file_path rows first */
-    if (label) {
+    if (s->remote_ops) {
+        scan->paged = false; /* the remote backend answers the eager query */
+    } else if (label) {
         scan->paged =
             node_scan_plan_is(s, NODE_SCAN_COLS "WHERE project = ?1 AND label = ?2;",
                               "SEARCH nodes USING INDEX idx_nodes_label (project=? AND label=?)");
@@ -3879,6 +3937,9 @@ int cbm_store_get_file_outline(cbm_store_t *s, const char *project, const char *
 }
 
 int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
+    if (s && s->remote_ops) {
+        return s->remote_ops->count(s->remote_ctx, CBM_REMOTE_COUNT_NODES, project, NULL);
+    }
     if (!s || !s->db) {
         return 0;
     }
@@ -4159,6 +4220,10 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
 
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out,
                                    int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(
+            s, s->remote_ops->find_edges(s->remote_ctx, source_id, false, NULL, out, count));
+    }
     bind_id_t b = {source_id};
     return find_edges_generic(s, &s->stmt_find_edges_by_source,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -4168,6 +4233,10 @@ int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t
 
 int cbm_store_find_edges_by_target(cbm_store_t *s, int64_t target_id, cbm_edge_t **out,
                                    int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(
+            s, s->remote_ops->find_edges(s->remote_ctx, target_id, true, NULL, out, count));
+    }
     bind_id_t b = {target_id};
     return find_edges_generic(s, &s->stmt_find_edges_by_target,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -4177,6 +4246,10 @@ int cbm_store_find_edges_by_target(cbm_store_t *s, int64_t target_id, cbm_edge_t
 
 int cbm_store_find_edges_by_source_type(cbm_store_t *s, int64_t source_id, const char *type,
                                         cbm_edge_t **out, int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(
+            s, s->remote_ops->find_edges(s->remote_ctx, source_id, false, type, out, count));
+    }
     bind_id_type_t b = {source_id, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_source_type,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -4186,6 +4259,10 @@ int cbm_store_find_edges_by_source_type(cbm_store_t *s, int64_t source_id, const
 
 int cbm_store_find_edges_by_target_type(cbm_store_t *s, int64_t target_id, const char *type,
                                         cbm_edge_t **out, int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(
+            s, s->remote_ops->find_edges(s->remote_ctx, target_id, true, type, out, count));
+    }
     bind_id_type_t b = {target_id, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_target_type,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -4195,6 +4272,10 @@ int cbm_store_find_edges_by_target_type(cbm_store_t *s, int64_t target_id, const
 
 int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char *type,
                                  cbm_edge_t **out, int *count) {
+    if (s && s->remote_ops) {
+        return remote_status(
+            s, s->remote_ops->find_edges_by_type(s->remote_ctx, project, type, out, count));
+    }
     bind_proj_type_t b = {project, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_type,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -4203,6 +4284,9 @@ int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char
 }
 
 int cbm_store_count_edges(cbm_store_t *s, const char *project) {
+    if (s && s->remote_ops) {
+        return s->remote_ops->count(s->remote_ctx, CBM_REMOTE_COUNT_EDGES, project, NULL);
+    }
     if (!s || !s->db) {
         return 0;
     }
@@ -4225,6 +4309,9 @@ int cbm_store_count_edges(cbm_store_t *s, const char *project) {
 }
 
 int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
+    if (s && s->remote_ops) {
+        return s->remote_ops->count(s->remote_ctx, CBM_REMOTE_COUNT_EDGES_BY_TYPE, project, type);
+    }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_count_edges_by_type,
                        "SELECT COUNT(*) FROM edges WHERE project = ?1 AND type = ?2;");
@@ -5956,6 +6043,12 @@ int cbm_store_find_nodes_by_qn_base(cbm_store_t *s, const char *project, const c
 /* ── NodeDegree ────────────────────────────────────────────────── */
 
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg) {
+    if (s && s->remote_ops && in_deg && out_deg) {
+        *in_deg = 0;
+        *out_deg = 0;
+        (void)s->remote_ops->degrees(s->remote_ctx, &node_id, SKIP_ONE, "CALLS", in_deg, out_deg);
+        return;
+    }
     if (!s) {
         if (in_deg)
             *in_deg = 0;
@@ -6199,6 +6292,12 @@ static int count_degrees_direction(cbm_store_t *s, const int64_t *node_ids, int 
 
 int cbm_store_batch_count_degrees(cbm_store_t *s, const int64_t *node_ids, int id_count,
                                   const char *edge_type, int *out_in, int *out_out) {
+    if (s && s->remote_ops && node_ids && id_count > 0 && out_in && out_out) {
+        memset(out_in, 0, (size_t)id_count * sizeof(int));
+        memset(out_out, 0, (size_t)id_count * sizeof(int));
+        return remote_status(s, s->remote_ops->degrees(s->remote_ctx, node_ids, id_count, edge_type,
+                                                       out_in, out_out));
+    }
     if (!s || !node_ids || id_count <= 0 || !out_in || !out_out) {
         return CBM_STORE_ERR;
     }
@@ -7831,6 +7930,12 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
     if (max_results < 0) {
         max_results = 0;
     }
+    if (s && s->remote_ops) {
+        return remote_status(s,
+                             s->remote_ops->bfs(s->remote_ctx, &start_id, SKIP_ONE, false,
+                                                direction, edge_types, edge_type_count, max_depth,
+                                                max_results, trail, max_edges, out, NULL));
+    }
 
     cbm_node_t root = {0};
     int rc = cbm_store_find_node_by_id(s, start_id, &root);
@@ -7946,6 +8051,12 @@ int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
     }
     if (!s || !s->db || !seed_ids || seed_count <= 0) {
         return CBM_STORE_ERR;
+    }
+    if (s->remote_ops) {
+        return remote_status(s, s->remote_ops->bfs(s->remote_ctx, seed_ids, seed_count, true,
+                                                   direction, edge_types, edge_type_count,
+                                                   max_depth, max_results < 0 ? 0 : max_results,
+                                                   false, 0, out, truncated));
     }
 
     if (sqlite3_exec(s->db,

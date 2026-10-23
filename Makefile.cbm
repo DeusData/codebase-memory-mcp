@@ -184,7 +184,7 @@ ifeq ($(IS_MINGW),yes)
 # two Windows builds of identical source are never byte-identical and every
 # release is a brand-new file to a reputation system. Same motivation as the
 # mimalloc __DATE__ patch; ELF and Mach-O have no equivalent field to clear.
-WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -lbcrypt -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
+WIN32_LIBS := -lws2_32 -lwinhttp -lpsapi -lshell32 -ladvapi32 -lbcrypt -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -454,6 +454,9 @@ STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_proj
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
 
+# Neo4j graph backend (HTTP API client, sync, remote store reads)
+NEO4J_SRCS = src/neo4j/neo4j_http.c src/neo4j/neo4j_client.c src/neo4j/neo4j_sync.c src/neo4j/neo4j_store.c
+
 # MCP server module (new)
 MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c src/mcp/architecture_jobs.c \
 	src/mcp/test_impact.c src/mcp/test_impact_diff.c src/mcp/test_impact_classify.c src/mcp/test_impact_source.c src/mcp/test_impact_seed.c src/mcp/test_impact_engine.c src/mcp/test_impact_engine_snapshot.c src/mcp/test_impact_engine_reach.c src/mcp/test_impact_engine_artifact.c src/mcp/test_impact_cli.c src/mcp/test_impact_artifact.c src/mcp/test_impact_changes.c src/mcp/test_impact_origins.c src/mcp/test_impact_coverage.c src/mcp/test_impact_config.c src/mcp/test_impact_select.c src/mcp/test_impact_policy.c src/mcp/test_impact_git.c src/mcp/test_impact_inventory.c src/mcp/test_impact_inventory_input.c src/mcp/test_impact_tree.c src/mcp/test_impact_tree_audit.c src/mcp/test_impact_tree_read.c src/mcp/test_impact_tree_batch.c src/mcp/test_impact_tree_digest.c src/mcp/test_impact_tree_names.c src/mcp/test_impact_tree_plan.c src/mcp/test_impact_tree_posix.c src/mcp/test_impact_tree_posix_acl.c src/mcp/test_impact_tree_posix_io.c src/mcp/test_impact_tree_util.c src/mcp/test_impact_tree_windows.c src/mcp/test_impact_tree_windows_acl.c src/mcp/test_impact_tree_windows_io.c \
@@ -689,7 +692,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(MEMWASTE_SRCS) $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(MEMWASTE_SRCS) $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(NEO4J_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -754,7 +757,8 @@ TEST_STORE_SRCS = \
     tests/test_store_bulk.c \
     tests/test_store_pragmas.c \
     tests/test_store_checkpoint.c \
-    tests/test_dump_verify_io.c
+    tests/test_dump_verify_io.c \
+    tests/test_neo4j.c
 
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c
@@ -1392,7 +1396,7 @@ SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
 SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
-LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) \
+LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(NEO4J_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) \
             $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
             $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
             $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)

@@ -56,6 +56,12 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
+/* Mark a tool reply as answered from the local index although its project is
+ * Neo4j-backed (graph_backend sqlite_fallback): appends a text notice to
+ * content and a graph_backend object to structuredContent. Takes ownership of
+ * result; returns it unchanged when it is not an MCP tool-result object. */
+char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason);
+
 /* Attach a notice to a complete MCP tool result: a JSON-object payload gains a
  * "notice" key (content text and structuredContent stay in step), a text
  * payload gains a trailing paragraph. Takes

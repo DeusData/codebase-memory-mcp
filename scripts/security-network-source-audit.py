@@ -189,6 +189,36 @@ CONNECT_LOOPBACK = (
 )
 
 
+# configured-tcp: the one outbound TCP client, the Neo4j graph backend
+# (src/neo4j/neo4j_http.c). It connects only when the user configures a
+# graph_db URL, to exactly that URL's host and port, so the allowance is
+# pinned to that file and to a getaddrinfo() walk over the parsed URL host:
+# both calls must take their arguments from that result list, and the hints
+# must ask for a stream socket.
+CONFIGURED_TCP_FILES = ("src/neo4j/neo4j_http.c",)
+SOCKET_CONFIGURED_TCP = (
+    r"socket\s*\(\s*ai\s*->\s*ai_family\s*,\s*ai\s*->\s*ai_socktype\s*,"
+    r"\s*ai\s*->\s*ai_protocol\s*\)"
+)
+CONNECT_CONFIGURED_TCP = (
+    r"connect\s*\(\s*s\s*,\s*ai\s*->\s*ai_addr\s*,\s*\(\s*int\s*\)\s*"
+    r"ai\s*->\s*ai_addrlen\s*\)"
+)
+
+
+def _configured_tcp_witness(masked: str, call: Call, scope: FunctionRange) -> bool:
+    before = masked[scope.body_start + 1 : call.start]
+    witness = re.compile(
+        r"\bhints\s*\.\s*ai_socktype\s*=\s*SOCK_STREAM\s*;.*?"
+        r"\bgetaddrinfo\s*\(\s*h\s*->\s*url\s*\.\s*host\s*,\s*port_s\s*,\s*"
+        r"&\s*hints\s*,\s*&\s*res\s*\).*?"
+        r"\bfor\s*\(\s*struct\s+addrinfo\s*\*\s*ai\s*=\s*res\s*;\s*ai\s*;\s*"
+        r"ai\s*=\s*ai\s*->\s*ai_next\s*\)",
+        re.DOTALL,
+    )
+    return witness.search(before) is not None
+
+
 def _loopback_connect_witness(masked: str, call: Call, scope: FunctionRange) -> bool:
     body = masked[scope.body_start + 1 : scope.body_end - 1]
     call_offset = call.start - scope.body_start - 1
@@ -225,6 +255,17 @@ def _semantic_ok(masked: str, calls: Sequence[Call], allowance: Allowance) -> bo
         header = masked[max(0, scope.body_start - 512) : scope.body_start]
         return (
             re.search(r"const\s+struct\s+sockaddr_un\s*\*\s*address", header) is not None
+        )
+    if allowance.transport == "configured-tcp":
+        if allowance.file not in CONFIGURED_TCP_FILES or len(calls) != 1:
+            return False
+        pattern = {"socket": SOCKET_CONFIGURED_TCP, "connect": CONNECT_CONFIGURED_TCP}.get(
+            allowance.function
+        )
+        return (
+            pattern is not None
+            and _fullmatch(pattern, calls[0])
+            and _configured_tcp_witness(masked, calls[0], scopes[0])
         )
     if allowance.transport == "loopback-v4" and allowance.function == "socket":
         return all(_fullmatch(SOCKET_LOOPBACK, call) for call in calls)
@@ -424,9 +465,59 @@ static bool endpoint(void) {
     )
 
 
+def _self_test_configured_tcp() -> None:
+    client = r'''
+static int n4_connect(cbm_neo4j_http_t *h, char *err, size_t err_sz) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(h->url.host, port_s, &hints, &res) != 0 || !res) {
+        return -1;
+    }
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) {
+            break;
+        }
+    }
+    return 0;
+}
+'''
+
+    def allowance(function: str, file: str = "src/neo4j/neo4j_http.c") -> Allowance:
+        return Allowance(file, function, 1, "configured-tcp", "n4_connect", "self-test")
+
+    def ok(source: str, function: str, file: str = "src/neo4j/neo4j_http.c") -> bool:
+        masked = _mask_non_code(source)
+        calls = [call for call in _scan_calls(masked) if call.name == function]
+        return _semantic_ok(masked, calls, allowance(function, file))
+
+    _require(ok(client, "socket"), "configured-tcp socket witness was rejected")
+    _require(ok(client, "connect"), "configured-tcp connect witness was rejected")
+    _require(
+        not ok(client, "connect", "src/mcp/mcp.c"),
+        "configured-tcp was accepted outside the Neo4j client",
+    )
+    _require(
+        not ok(client.replace("getaddrinfo(h->url.host", "getaddrinfo(other_host"), "connect"),
+        "configured-tcp accepted a host that is not the configured URL host",
+    )
+    _require(
+        not ok(client.replace("SOCK_STREAM", "SOCK_DGRAM"), "socket"),
+        "configured-tcp accepted a non-stream socket",
+    )
+    _require(
+        not ok(client.replace("connect(s, ai->ai_addr", "connect(s, other_addr"), "connect"),
+        "configured-tcp accepted an address outside the resolved list",
+    )
+
+
 def main(argv: Sequence[str]) -> int:
     try:
         _self_test()
+        _self_test_configured_tcp()
     except SelfTestFailure as error:
         print(f"BLOCKED: network source audit self-test failed: {error}", file=sys.stderr)
         return 1

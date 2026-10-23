@@ -26,6 +26,7 @@
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
+typedef struct cbm_neo4j_config cbm_neo4j_config_t;
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -53,6 +54,19 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
+
+/* Mirror the published graph into Neo4j after this run (index_repository
+ * graph_db). The config, including the password, is copied. Without a call,
+ * a project already marked Neo4j-backed keeps syncing with its recorded
+ * target. */
+void cbm_pipeline_set_graph_backend(cbm_pipeline_t *p, const cbm_neo4j_config_t *cfg);
+
+/* Return the project to plain SQLite (index_repository graph_db "sqlite"):
+ * the Neo4j marker is removed after the run; Neo4j data is left untouched. */
+void cbm_pipeline_disable_graph_backend(cbm_pipeline_t *p);
+
+/* Neo4j sync failure of the last cbm_pipeline_run, or "". */
+const char *cbm_pipeline_graph_error(const cbm_pipeline_t *p);
 
 /* Apply a validated discovery resource policy. The value is copied. */
 void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
@@ -99,6 +113,9 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
 #define CBM_PIPELINE_ABORT_OVER_BUDGET (-5)
 /* Opt-in discovery/resource policy breach: fail the attempt, keep serving DB. */
 #define CBM_PIPELINE_RESOURCE_LIMIT (-6)
+/* The SQLite generation was published, but the explicitly requested Neo4j
+ * mirror failed (cbm_pipeline_graph_error names why). */
+#define CBM_PIPELINE_GRAPH_SYNC_FAILED (-7)
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
