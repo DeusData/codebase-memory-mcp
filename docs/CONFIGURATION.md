@@ -10,6 +10,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
 | UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
+| Latest indexing attempt | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/status/<project>.json` | JSON | Owner-private, atomically replaced status used by `index_status`. |
 | Daemon operation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/cbm-daemon.log` | Structured log | Durable daemon lifecycle, watcher/indexing, UI, resource, and error events. |
 | Admission conflict log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/daemon-conflicts.ndjson` | NDJSON | Exact-build, ABI, and canonical-cache conflicts. |
 | Activation log | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/logs/activation-events.ndjson` | NDJSON | Install/update/uninstall activation progress and outcomes. |
@@ -91,8 +92,13 @@ Current keys:
 | `doc_candidates` | `auto` | Score documentation sections against code to store doc↔code candidates (the possible targets of a section, and the sections that may describe a function or file, each with a judged probability). Unset (`auto`), the index mode decides: on for `full` indexes (the default mode), off for `moderate` and `fast`. Set `true` or `false` to choose for every mode; `config reset doc_candidates` returns to `auto`. The scoring grows with sections × functions: under a second up to ~100k functions, ~15 s at ~400k, ~3 minutes on the Linux kernel. Off stores no candidates and leaves the rest of the graph unchanged; on in `fast` mode stores candidates without adding `fast`'s skipped `SIMILAR_TO` / `SEMANTICALLY_RELATED` edges. `index_repository` also takes `doc_candidates` for a single index, which wins over this setting. Applies from the next index. |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Only an open MCP session's own project is ever watched; `index_status` reports the current state in its `watch` object. |
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
+| `index_resource_profile` | `off` | Composed index resource baseline: `off`, `balanced`, or `strict`. 80% of detected host memory is a hard ceiling on `index_max_rss_mb`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
+| `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
+| `index_max_duration_seconds` | `off` | Optional maximum wall-clock duration in seconds for the whole index request, including crash/hang recovery (`1..86400`). |
+| `index_cache_max_mb` | `off` | Optional maximum projected cache size in MiB after publication. |
+| `index_min_free_disk_mb` | `off` | Optional minimum free MiB reserved on the cache filesystem while indexing. |
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
@@ -126,13 +132,31 @@ has not run yet).
 > `auto_index` still runs, and `index_repository` stays available for manual
 > reindexing.
 
-The two `index_max_*` settings are independent and disabled by default. They
-apply to explicit indexing, automatic indexing, and watcher re-indexing, but not
-to `cross-repo-intelligence`, which does not scan repository source files.
-Equality is allowed; exceeding either setting fails the complete index request
-and preserves any previously serving database. See
+The profile and all six individual resource settings are disabled by default.
+An individual stored value replaces its profile dimension; storing `off`
+disables only that dimension. Profile-only limits also bound traversed
+directories, directory entries, depth, discovery time, final database size,
+staging size, and task temporary size. Effective limits apply to explicit
+indexing, automatic indexing, and watcher re-indexing,
+but not to `cross-repo-intelligence`, which does not scan or publish repository
+source indexes. Equality is allowed; exceeding a setting fails the complete
+index request and preserves any previously serving database. Worker RSS covers
+descendants and is not the same as the internal `CBM_MEM_BUDGET_MB` allocation
+budget. Total duration is independent of the existing 15-minute no-log-progress
+timeout. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
+
+After the first physical indexing attempt for a project, `index_status` adds
+`last_index_attempt`. It does not add a `freshness` string. A dirty tree is
+never treated as evidence of freshness or staleness, and checkout freshness is
+left to its own object. `delete_project` also removes a matching attempt
+record when no database was published.
+
+While the recorded attempt is `failed` or `cancelled`, the graph-answering
+tools also attach a `last_index_attempt_failed` notice. It says the last
+rebuild failed and that the published graph may be missing later changes; it
+does not claim the graph is stale. A completed rebuild clears it.
 
 ## 3. UI Settings
 

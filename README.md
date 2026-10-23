@@ -971,14 +971,29 @@ codebase-memory-mcp config set auto_watch false          # don't register backgr
 codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
+codebase-memory-mcp config set index_resource_profile balanced # opt-in composed resource limits
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp config set index_max_rss_mb 8192     # optional worker-tree charged-memory limit
+codebase-memory-mcp config set index_max_duration_seconds 3600 # optional per-request duration
+codebase-memory-mcp config set index_cache_max_mb 32768  # optional projected cache-size limit
+codebase-memory-mcp config set index_min_free_disk_mb 4096 # optional free-space reserve
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
-The two `index_max_*` settings default to `off`. Exceeding one fails the complete
-index attempt rather than publishing a partial graph; an existing serving index
-is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
+`index_resource_profile` defaults to `off` and accepts `off`, `balanced`, or
+`strict`. The six individual resource settings also default to `off`; an
+explicit value, including `off`, replaces that dimension of a selected
+profile. `index_max_rss_mb` cannot exceed 80% of detected host memory: a higher
+explicit value is lowered to that ceiling and logged. Exceeding an effective
+limit fails the complete index attempt rather
+than publishing a partial graph, and an existing serving index is preserved.
+`index_status` reports the latest physical indexing attempt after the first
+recorded attempt, and does not add a `freshness` string. While that attempt is
+failed or cancelled, the graph-answering tools attach a
+`last_index_attempt_failed` notice so a rebuild that failed in the background
+cannot go unnoticed. The notice does not claim the graph is stale. See
+[Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables
 
