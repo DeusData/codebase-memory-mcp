@@ -249,7 +249,7 @@ jobs:
       # too keeps red iterations warm.
       - name: Shard manifest (completeness proof)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: shard-manifest-${{ matrix.os }}-${{ matrix.cc }}-${{ strategy.job-index }}
           path: build/c/test-logs/shard-manifest.txt
@@ -270,7 +270,7 @@ jobs:
       # directory, and a second error would only bury the first.
       - name: Failing suite logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: suite-logs-${{ matrix.os }}-${{ matrix.cc }}-${{ strategy.job-index }}
           path: build/c/test-logs/failed/
@@ -400,7 +400,7 @@ jobs:
       # not end green, only when the job failed.
       - name: Failing suite logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: suite-logs-diag
           path: build/c/test-logs/failed/
@@ -498,7 +498,7 @@ jobs:
       # not end green, only when the job failed.
       - name: Failing suite logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: suite-logs-lsan-macos
           path: build/c/test-logs/failed/
@@ -662,7 +662,7 @@ jobs:
 
       - name: Shard manifest (completeness proof)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: shard-manifest-${{ matrix.os }}-${{ matrix.msystem }}-${{ strategy.job-index }}
           path: build/c/test-logs/shard-manifest.txt
@@ -677,7 +677,7 @@ jobs:
       # not end green, only when the job failed.
       - name: Failing suite logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: suite-logs-${{ matrix.os }}-${{ matrix.msystem }}-${{ strategy.job-index }}
           path: build/c/test-logs/failed/

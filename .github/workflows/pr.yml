@@ -77,7 +77,7 @@ jobs:
         run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact" --gate "$RUNNER_TEMP/test-selection"
       - name: Upload the selection
         if: ${{ steps.select.outputs.selection == 'narrowed' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-selection
           path: ${{ runner.temp }}/test-selection
@@ -87,7 +87,7 @@ jobs:
       # for the vetoes, never read by a test leg.
       - name: Upload the vetoed selection
         if: ${{ !cancelled() && steps.select.outcome != 'skipped' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-selection-vetoed
           path: ${{ runner.temp }}/test-impact/selection-vetoed.json
@@ -338,7 +338,7 @@ jobs:
         run: scripts/ci/test-impact-select.sh --binary build/c/codebase-memory-mcp --out "$RUNNER_TEMP/test-impact"
       - name: Upload the prediction
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-impact-prediction
           path: |
