@@ -51,7 +51,7 @@ jobs:
         run: python3 scripts/memwaste-ratchet.py --out "$RUNNER_TEMP/memwaste-event" --venue ${{ inputs.mode }}-linux
       - name: Upload report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memwaste-event-linux-${{ inputs.mode }}
           path: |
@@ -80,7 +80,7 @@ jobs:
             --out "$RUNNER_TEMP/memwaste-scaling" | tee "$RUNNER_TEMP/memwaste-scaling/report.txt"
       - name: Upload report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memwaste-scaling-linux-${{ inputs.mode }}
           path: ${{ runner.temp }}/memwaste-scaling/report.txt
@@ -105,7 +105,7 @@ jobs:
             --out "$RUNNER_TEMP/memwaste-access" | tee "$RUNNER_TEMP/memwaste-access/report.txt"
       - name: Upload report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memwaste-access-linux-${{ inputs.mode }}
           path: |
@@ -132,7 +132,7 @@ jobs:
         run: python3 scripts/memwaste-ratchet.py --out "$RUNNER_TEMP/memwaste-event" --venue full-macos
       - name: Upload report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memwaste-event-macos-${{ inputs.mode }}
           path: |
@@ -174,7 +174,7 @@ jobs:
         run: python3 scripts/memwaste-ratchet.py --out "$(cygpath -u "$RUNNER_TEMP")/memwaste-event" --venue full-windows
       - name: Upload report
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: memwaste-event-windows-${{ inputs.mode }}
           path: |

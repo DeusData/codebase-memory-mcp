@@ -105,7 +105,7 @@ jobs:
             release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/unstripped/*
             release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}/THIRD_PARTY_NOTICES.md
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-candidates-${{ matrix.goos }}-${{ matrix.goarch }}
           path: release-candidates/${{ matrix.goos }}-${{ matrix.goarch }}
@@ -163,7 +163,7 @@ jobs:
             release-candidates/windows-amd64/unstripped/*
             release-candidates/windows-amd64/THIRD_PARTY_NOTICES.md
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-candidates-windows-amd64
           path: release-candidates/windows-amd64
@@ -225,7 +225,7 @@ jobs:
             release-candidates/windows-arm64/unstripped/*
             release-candidates/windows-arm64/THIRD_PARTY_NOTICES.md
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-candidates-windows-arm64
           path: release-candidates/windows-arm64
@@ -288,7 +288,7 @@ jobs:
             release-candidates/linux-${{ matrix.arch }}-portable/unstripped/*
             release-candidates/linux-${{ matrix.arch }}-portable/THIRD_PARTY_NOTICES.md
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-candidates-linux-${{ matrix.arch }}-portable
           path: release-candidates/linux-${{ matrix.arch }}-portable
@@ -442,7 +442,7 @@ jobs:
 
       - name: Preserve candidate selection evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-selection-evidence
           path: selection-evidence
@@ -451,56 +451,56 @@ jobs:
       # Keep the established artifact names so the reusable smoke workflow and
       # all callers consume only the selected, byte-verified containers.
       - name: Upload linux-amd64 containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-linux-amd64
           path: release-containers/linux-amd64/*
           if-no-files-found: error
 
       - name: Upload linux-arm64 containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-linux-arm64
           path: release-containers/linux-arm64/*
           if-no-files-found: error
 
       - name: Upload linux-amd64-portable containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-linux-amd64-portable
           path: release-containers/linux-amd64-portable/*
           if-no-files-found: error
 
       - name: Upload linux-arm64-portable containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-linux-arm64-portable
           path: release-containers/linux-arm64-portable/*
           if-no-files-found: error
 
       - name: Upload darwin-amd64 containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-darwin-amd64
           path: release-containers/darwin-amd64/*
           if-no-files-found: error
 
       - name: Upload darwin-arm64 containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-darwin-arm64
           path: release-containers/darwin-arm64/*
           if-no-files-found: error
 
       - name: Upload windows-amd64 containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-windows-amd64
           path: release-containers/windows-amd64/*
           if-no-files-found: error
 
       - name: Upload windows-arm64 containers
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-windows-arm64
           path: release-containers/windows-arm64/*
