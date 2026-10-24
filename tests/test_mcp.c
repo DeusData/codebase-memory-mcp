@@ -4943,10 +4943,10 @@ TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent) {
     free(floor_inner);
     free(floor_response);
 
-    /* Multi-keyword min-cosine ranking must not depend on how deep a page asks
-     * the first-keyword prefilter to materialize. Fifteen first-keyword-heavy
-     * decoys put the genuinely balanced result just beyond the initial 5x
-     * window; every small page must still equal the corresponding full ranks. */
+    /* Multi-keyword ranking must not depend on how deep a page asks for
+     * results. Fifteen first-keyword-heavy decoys put the genuinely balanced
+     * result just beyond the old 5x prefilter window; every small page must
+     * still equal the corresponding full ranks. */
     const char *stable_project = "semantic-page-stability";
     const char *first_token = "semantic-rank-first";
     const char *second_token = "semantic-rank-second";
@@ -5118,9 +5118,16 @@ TEST(tool_search_graph_semantic_store_error_fails_closed) {
     ASSERT_NOT_NULL(strstr(response, "moderate/full index"));
     free(response);
 
-    /* The table exists and holds a vector, but scoring fails mid-scan. */
+    /* The table exists and holds a vector, but scoring fails mid-scan.  The
+     * query word is known to token_vectors, so the vector scan does run. */
     ASSERT_EQ(cbm_store_exec(store, "CREATE TABLE node_vectors(node_id INTEGER PRIMARY KEY,"
-                                    "project TEXT NOT NULL,vector BLOB NOT NULL);"),
+                                    "project TEXT NOT NULL,vector BLOB NOT NULL);"
+                                    "CREATE TABLE token_vectors(id INTEGER PRIMARY KEY,"
+                                    "project TEXT NOT NULL,token TEXT NOT NULL,"
+                                    "vector BLOB NOT NULL,idf INTEGER NOT NULL);"),
+              CBM_STORE_OK);
+    ASSERT_EQ(mcp_test_insert_semantic_vector(store, "token_vectors", project, 0,
+                                              "semantic-error-token", 127, 0),
               CBM_STORE_OK);
     ASSERT_EQ(mcp_test_insert_semantic_vector(store, "node_vectors", project, id, NULL, 127, 0),
               CBM_STORE_OK);
@@ -5149,6 +5156,149 @@ TEST(tool_search_graph_semantic_store_error_fails_closed) {
     ASSERT_NOT_NULL(response);
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
     ASSERT_NULL(strstr(response, "semantic_error_probe"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static int64_t mcp_test_hybrid_node(cbm_store_t *store, const char *project, const char *label,
+                                    const char *name, const char *file_path, int line) {
+    char qn[128];
+    snprintf(qn, sizeof(qn), "hybrid.%s", name);
+    cbm_node_t node = {.project = project,
+                       .label = label,
+                       .name = name,
+                       .qualified_name = qn,
+                       .file_path = file_path,
+                       .start_line = line,
+                       .end_line = line};
+    return cbm_store_upsert_node(store, &node);
+}
+
+static int mcp_test_semantic_row_of(yyjson_val *rows, const char *qn) {
+    size_t idx = 0;
+    size_t max = 0;
+    yyjson_val *row = NULL;
+    yyjson_arr_foreach(rows, idx, max, row) {
+        const char *row_qn = yyjson_get_str(yyjson_arr_get(row, 0));
+        if (row_qn && strcmp(row_qn, qn) == 0) {
+            return (int)idx;
+        }
+    }
+    return -1;
+}
+
+static yyjson_doc *mcp_test_hybrid_query(cbm_mcp_server_t *srv, const char *keywords,
+                                         char **out_response, char **out_inner,
+                                         yyjson_val **out_rows) {
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"semantic-hybrid\",\"semantic_query\":%s,"
+             "\"semantic_limit\":10,\"format\":\"json\"}",
+             keywords);
+    yyjson_doc *doc = mcp_test_semantic_page(srv, args, out_response, out_inner);
+    yyjson_val *semantic = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "semantic") : NULL;
+    *out_rows = semantic ? yyjson_obj_get(semantic, "rows") : NULL;
+    return doc;
+}
+
+/* semantic_query fuses BM25 with the RI vectors: a sentence resolves through
+ * its known words, tests rank after production code unless the query is
+ * about tests, nodes without a vector are still reachable lexically, and an
+ * all-unknown query returns nothing instead of a noise-ranked universe. */
+TEST(tool_search_graph_semantic_hybrid_ranking) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "semantic-hybrid";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/semantic-hybrid"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "CREATE TABLE node_vectors(node_id INTEGER PRIMARY KEY,"
+                             "project TEXT NOT NULL,vector BLOB NOT NULL);"
+                             "CREATE TABLE token_vectors(id INTEGER PRIMARY KEY,"
+                             "project TEXT NOT NULL,token TEXT NOT NULL,vector BLOB NOT NULL,"
+                             "idf INTEGER NOT NULL);"),
+              CBM_STORE_OK);
+    ASSERT_EQ(mcp_test_insert_semantic_vector(store, "token_vectors", project, 0, "lock", 127, 0),
+              CBM_STORE_OK);
+    ASSERT_EQ(
+        mcp_test_insert_semantic_vector(store, "token_vectors", project, 0, "release", 0, 127),
+        CBM_STORE_OK);
+
+    /* The test twin is inserted first so it would win every id tie-break. */
+    int64_t test_id = mcp_test_hybrid_node(store, project, "Function", "test_advisory_lock_release",
+                                           "tests/test_lock.c", 1);
+    int64_t prod_id =
+        mcp_test_hybrid_node(store, project, "Function", "advisory_lock_release", "src/lock.c", 2);
+    int64_t widget_id =
+        mcp_test_hybrid_node(store, project, "Function", "render_widget", "src/widget.c", 3);
+    ASSERT_GT(mcp_test_hybrid_node(store, project, "Struct", "lock_owner_record", "src/lock.h", 4),
+              0);
+    ASSERT_GT(test_id, 0);
+    ASSERT_GT(prod_id, 0);
+    ASSERT_GT(widget_id, 0);
+    ASSERT_EQ(
+        mcp_test_insert_semantic_vector(store, "node_vectors", project, test_id, NULL, 127, 127),
+        CBM_STORE_OK);
+    ASSERT_EQ(
+        mcp_test_insert_semantic_vector(store, "node_vectors", project, prod_id, NULL, 127, 127),
+        CBM_STORE_OK);
+    ASSERT_EQ(
+        mcp_test_insert_semantic_vector(store, "node_vectors", project, widget_id, NULL, 0, 0),
+        CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_fts_rebuild(store, project, 0), CBM_STORE_OK);
+
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_val *rows = NULL;
+
+    /* A sentence: "the" is a stopword, "advisory" is unknown to the vectors,
+     * "release" and "lock" are known. */
+    yyjson_doc *doc =
+        mcp_test_hybrid_query(srv, "[\"release the advisory lock\"]", &response, &inner, &rows);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(yyjson_arr_get(rows, 0), 0)),
+                  "hybrid.advisory_lock_release");
+    int test_row = mcp_test_semantic_row_of(rows, "hybrid.test_advisory_lock_release");
+    ASSERT_GT(test_row, 0);
+    ASSERT_TRUE(yyjson_get_real(yyjson_arr_get(yyjson_arr_get(rows, (size_t)test_row), 3)) < 0.0);
+    double prev = yyjson_get_real(yyjson_arr_get(yyjson_arr_get(rows, 0), 3));
+    for (size_t i = 1; i < yyjson_arr_size(rows); i++) {
+        double score = yyjson_get_real(yyjson_arr_get(yyjson_arr_get(rows, i), 3));
+        ASSERT_TRUE(score <= prev);
+        prev = score;
+    }
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    /* A query about tests keeps tests in place. */
+    doc = mcp_test_hybrid_query(srv, "[\"test\",\"advisory\",\"lock\",\"release\"]", &response,
+                                &inner, &rows);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(yyjson_arr_get(rows, 0), 0)),
+                  "hybrid.test_advisory_lock_release");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    /* A type with no vector at all is still reachable through the lexical channel. */
+    doc = mcp_test_hybrid_query(srv, "[\"lock owner record\"]", &response, &inner, &rows);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_TRUE(mcp_test_semantic_row_of(rows, "hybrid.lock_owner_record") >= 0);
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    /* Nothing known to either channel: no rows, not a noise-ranked universe. */
+    doc = mcp_test_hybrid_query(srv, "[\"zzqxv\"]", &response, &inner, &rows);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_EQ(yyjson_arr_size(rows), 0);
+    yyjson_doc_free(doc);
+    free(inner);
     free(response);
 
     cbm_mcp_server_free(srv);
@@ -25117,6 +25267,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);
     RUN_TEST(tool_search_graph_semantic_query_rejects_non_string_elements);
     RUN_TEST(tool_search_graph_semantic_store_error_fails_closed);
+    RUN_TEST(tool_search_graph_semantic_hybrid_ranking);
     RUN_TEST(tool_search_graph_budget_preserves_long_values_and_continuation);
     RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);

@@ -101,9 +101,6 @@ enum {
 #include "foundation/mem_core.h" /* cbm_alloc: pattern buffers */
 #include "foundation/str_util.h"
 
-#define XXH_INLINE_ALL
-#include "xxhash/xxhash.h"
-
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12092,54 +12089,247 @@ void cbm_store_free_vector_results(cbm_vector_result_t *results, int count) {
     free(results);
 }
 
-/* Per-keyword scoring: score each keyword independently against each node
- * vector, then combine using min(cosine_k) across keywords.  This ensures
- * ALL keywords must be relevant, not just the average. */
+/* ── Hybrid semantic search ──────────────────────────────────────────
+ *
+ * semantic_query ranks the callable/type universe by fusing two channels
+ * with Reciprocal Rank Fusion (Cormack, Clarke & Büttcher 2009):
+ *
+ *   - lexical: BM25 over nodes_fts (identifier columns + docstring body) with
+ *     the same column weights and label tiers as search_graph's query mode,
+ *     query stopwords removed and an exact-name tier per keyword;
+ *   - vector: cosine between each node's RI vector and ONE query vector, the
+ *     IDF-weighted sum of the known token vectors of the query.  A keyword is
+ *     looked up whole first, then split into index-style words, so both
+ *     ["lock"] and ["release the advisory lock"] resolve.  Words the index
+ *     never saw contribute nothing — they used to contribute a random vector,
+ *     which ranked the whole universe by noise.
+ *
+ * Weights were tuned on an 81-query natural-language retrieval set over this
+ * repository: RI node vectors are strongly collapsed (mean cosine to their
+ * centroid ~0.98), so the lexical channel carries most of the signal and the
+ * vectors mostly re-order near-ties.  Test symbols are demoted below every
+ * non-test symbol unless the query itself asks about tests.
+ *
+ * Every candidate is scored before anything is cut, so the ranking is a pure
+ * function of (query, index) and independent of `limit` — semantic_offset
+ * pagination depends on every top-K being a prefix of every larger top-K. */
 enum {
     VS_VEC_DIM = 768,
-    VS_SPARSE_NNZE = 8,
-    VS_RI_SEED = 0x52494E44,
-    VS_MAX_KW = 32,
     VS_STR_BUF = 16,
+    VS_MAX_WORDS = 64,   /* query words kept per channel */
+    VS_WORD_MAX = 64,    /* bytes per query word, NUL included */
+    VS_MATCH_BUF = 2048, /* FTS5 MATCH expression */
+    VS_LEX_INNER = 2000, /* FTS5 candidates scored before project/label filter */
+    VS_LEX_WINDOW = 50,  /* lexical ranks that enter the fusion */
+    VS_NAME_BUF = 256,
+    VS_TEST_PREFIX_LEN = 4, /* strlen("test") */
 };
 
-/* Try to look up an enriched int8 vector for `token` in the token_vectors
- * table.  On success, writes the de-quantized float representation to
- * `out` and returns true. */
-static bool vs_load_enriched_vector(cbm_store_t *s, const char *project, const char *token,
-                                    float *out) {
-    sqlite3_stmt *tv_stmt = NULL;
-    const char *tv_sql = "SELECT vector, idf FROM token_vectors"
-                         " WHERE project = ?1 AND token = ?2 LIMIT 1";
-    if (sqlite3_prepare_v2(s->db, tv_sql, SQLITE_AUTO_LEN, &tv_stmt, NULL) != SQLITE_OK) {
-        return false;
-    }
-    bool found = false;
-    sqlite3_bind_text(tv_stmt, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
-    sqlite3_bind_text(tv_stmt, ST_COL_2, token, SQLITE_AUTO_LEN, SQLITE_STATIC);
-    if (sqlite3_step(tv_stmt) == SQLITE_ROW) {
-        const int8_t *vec = (const int8_t *)sqlite3_value_blob(sqlite3_column_value(tv_stmt, 0));
-        int vec_len = sqlite3_column_bytes(tv_stmt, 0);
-        if (vec && vec_len == VS_VEC_DIM) {
-            for (int d = 0; d < VS_VEC_DIM; d++) {
-                out[d] = (float)vec[d] / CBM_STORE_INT8_MAX;
-            }
-            found = true;
-        }
-    }
-    sqlite3_finalize(tv_stmt);
-    return found;
+/* RRF: k = 60 is the standard constant; lexical outweighs the RI vectors 5:1
+ * (best R@10 and MRR on the eval set for both keyword and sentence queries). */
+static const double VS_RRF_K = 60.0;
+static const double VS_RRF_W_LEXICAL = 5.0;
+static const double VS_RRF_W_VECTOR = 1.0;
+/* A fused score is below (W_LEXICAL + W_VECTOR) / (K + 1) < 1, so subtracting
+ * 1 orders every demoted test symbol after every non-test symbol while the
+ * reported score stays monotone with the returned order. */
+static const double VS_TEST_DEMOTION = 1.0;
+/* Mirrors search_graph's BM25 tiers (mcp.c): exact name, then label. */
+static const double VS_EXACT_NAME_BOOST = 30.0;
+static const double VS_EXACT_NAME_CI_BOOST = 20.0;
+static const double VS_CALLABLE_TIER = 10.0;
+static const double VS_TYPE_TIER = 5.0;
+
+static const char *const vs_stopwords[] = {
+    "a",    "an",  "the",    "of",   "to",  "for",   "in",    "on",    "and",   "or",
+    "so",   "is",  "are",    "be",   "by",  "with",  "from",  "into",  "that",  "this",
+    "it",   "its", "as",     "at",   "how", "what",  "which", "when",  "where", "whether",
+    "only", "can", "cannot", "does", "do",  "using", "use",   "given", "like",  NULL,
+};
+
+static const char *const vs_test_words[] = {"test", "tests", "testing", "unittest",
+                                            "spec", "specs", NULL};
+
+static const char *const vs_test_dirs[] = {"test",      "tests", "testing", "testdata",
+                                           "__tests__", "spec",  "specs",   NULL};
+
+static bool vs_is_upper(char c) {
+    return c >= 'A' && c <= 'Z';
 }
 
-/* Sparse-random-index fallback for tokens not present in the enriched table. */
-static void vs_fill_sparse_random(const char *token, float *out) {
-    uint64_t seed = XXH3_64bits(token, strlen(token));
-    for (int i = 0; i < VS_SPARSE_NNZE; i++) {
-        uint64_t h = XXH3_64bits_withSeed(&i, sizeof(i), seed + VS_RI_SEED);
-        int pos = (int)(h % VS_VEC_DIM);
-        float sign = (h & SKIP_ONE) ? CBM_STORE_UNIT_POS_F : -CBM_STORE_UNIT_POS_F;
-        out[pos] += sign;
+static bool vs_is_lower(char c) {
+    return c >= 'a' && c <= 'z';
+}
+
+static bool vs_is_alnum(char c) {
+    return vs_is_upper(c) || vs_is_lower(c) || (c >= '0' && c <= '9');
+}
+
+static char vs_to_lower(char c) {
+    return vs_is_upper(c) ? (char)(c - 'A' + 'a') : c;
+}
+
+static bool vs_ascii_ieq_n(const char *a, size_t len, const char *lit) {
+    size_t i = 0;
+    for (; i < len && lit[i]; i++) {
+        if (vs_to_lower(a[i]) != vs_to_lower(lit[i])) {
+            return false;
+        }
     }
+    return i == len && lit[i] == '\0';
+}
+
+static bool vs_in_list(const char *word, size_t len, const char *const *list) {
+    for (int i = 0; list[i]; i++) {
+        if (vs_ascii_ieq_n(word, len, list[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    char words[VS_MAX_WORDS][VS_WORD_MAX];
+    int count;
+} vs_words_t;
+
+/* Add one lowercased, de-duplicated, non-stopword word. */
+static void vs_words_add(vs_words_t *w, const char *src, size_t len) {
+    if (len == 0 || len >= VS_WORD_MAX || w->count >= VS_MAX_WORDS ||
+        vs_in_list(src, len, vs_stopwords)) {
+        return;
+    }
+    char buf[VS_WORD_MAX];
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = vs_to_lower(src[i]);
+    }
+    buf[len] = '\0';
+    for (int i = 0; i < w->count; i++) {
+        if (strcmp(w->words[i], buf) == 0) {
+            return;
+        }
+    }
+    memcpy(w->words[w->count++], buf, len + SKIP_ONE);
+}
+
+/* Identifier runs for the lexical channel. `_` stays inside the run: FTS5
+ * accepts it in a bareword and its tokenizer splits on it itself. */
+static void vs_lexical_words(const char *text, vs_words_t *out) {
+    const char *p = text;
+    while (*p) {
+        while (*p && !vs_is_alnum(*p) && *p != '_') {
+            p++;
+        }
+        const char *start = p;
+        bool has_alnum = false;
+        while (*p && (vs_is_alnum(*p) || *p == '_')) {
+            has_alnum = has_alnum || vs_is_alnum(*p);
+            p++;
+        }
+        if (has_alnum) {
+            vs_words_add(out, start, (size_t)(p - start));
+        }
+    }
+}
+
+/* Index-style words for the vector channel: delimiters and camelCase
+ * boundaries split (HTTPServer -> http, server), as the indexer does. */
+static void vs_vector_words(const char *text, vs_words_t *out) {
+    size_t start = 0;
+    bool in_word = false;
+    for (size_t i = 0;; i++) {
+        char c = text[i];
+        bool alnum = c != '\0' && vs_is_alnum(c);
+        bool camel = alnum && in_word && vs_is_upper(c) &&
+                     (vs_is_lower(text[i - SKIP_ONE]) ||
+                      (vs_is_upper(text[i - SKIP_ONE]) && vs_is_lower(text[i + SKIP_ONE])));
+        if (in_word && (!alnum || camel)) {
+            vs_words_add(out, text + start, i - start);
+            in_word = false;
+        }
+        if (alnum && !in_word) {
+            start = i;
+            in_word = true;
+        }
+        if (c == '\0') {
+            break;
+        }
+    }
+}
+
+static bool vs_query_mentions_tests(const vs_words_t *words) {
+    for (int i = 0; i < words->count; i++) {
+        if (vs_in_list(words->words[i], strlen(words->words[i]), vs_test_words)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Case-sensitive suffix on a stem that must be longer than the suffix, so
+ * FooTest matches but a file literally named Test does not. */
+static bool vs_stem_ends_with(const char *stem, size_t stem_len, const char *suffix) {
+    size_t n = strlen(suffix);
+    return stem_len > n && strncmp(stem + stem_len - n, suffix, n) == 0;
+}
+
+/* foo_test.go, test_foo.py, foo.test.ts, foo.spec.js, FooTest.java, ... */
+static bool vs_is_test_basename(const char *base, size_t len) {
+    char lower[VS_NAME_BUF];
+    size_t n = len < sizeof(lower) - SKIP_ONE ? len : sizeof(lower) - SKIP_ONE;
+    for (size_t i = 0; i < n; i++) {
+        lower[i] = vs_to_lower(base[i]);
+    }
+    lower[n] = '\0';
+    if (strncmp(lower, "test_", strlen("test_")) == 0 ||
+        strncmp(lower, "test.", strlen("test.")) == 0 ||
+        strncmp(lower, "tests.", strlen("tests.")) == 0 || strstr(lower, "_test.") ||
+        strstr(lower, "_tests.") || strstr(lower, ".test.") || strstr(lower, ".spec.") ||
+        strstr(lower, "_spec.")) {
+        return true;
+    }
+    const char *dot = memchr(base, '.', len);
+    size_t stem = dot ? (size_t)(dot - base) : len;
+    return vs_stem_ends_with(base, stem, "Test") || vs_stem_ends_with(base, stem, "Tests");
+}
+
+static bool vs_is_test_path(const char *fp) {
+    if (!fp) {
+        return false;
+    }
+    const char *seg = fp;
+    for (const char *p = fp;; p++) {
+        if (*p == '/' || *p == '\\' || *p == '\0') {
+            size_t len = (size_t)(p - seg);
+            if (*p == '\0') {
+                return vs_is_test_basename(seg, len);
+            }
+            if (vs_in_list(seg, len, vs_test_dirs)) {
+                return true;
+            }
+            seg = p + SKIP_ONE;
+        }
+    }
+}
+
+/* test_foo / TEST_FOO, Go TestFoo, JUnit testFoo, and test-only hooks that
+ * live in production files (foo_for_test, foo_set_for_testing). */
+static bool vs_is_test_name(const char *name) {
+    if (!name) {
+        return false;
+    }
+    if (strstr(name, "_for_test")) {
+        return true;
+    }
+    if (!vs_ascii_ieq_n(name, VS_TEST_PREFIX_LEN, "test")) {
+        return false;
+    }
+    char next = name[VS_TEST_PREFIX_LEN];
+    return next == '_' || vs_is_upper(next);
+}
+
+static bool vs_is_test_symbol(const char *name, const char *file_path) {
+    return vs_is_test_path(file_path) || vs_is_test_name(name);
 }
 
 /* Clamp one float into the int8 representable range. */
@@ -12154,8 +12344,7 @@ static int8_t vs_clamp_int8(float v) {
 }
 
 /* Normalize + int8 quantize a float vector.  Returns false if the vector is
- * effectively zero (magnitude below epsilon), in which case `dst` is left in
- * an indeterminate state and the caller should skip this keyword. */
+ * effectively zero (magnitude below epsilon). */
 static bool vs_normalize_and_quantize(const float *src, int8_t *dst) {
     float mag = 0.0F;
     for (int d = 0; d < VS_VEC_DIM; d++) {
@@ -12172,110 +12361,379 @@ static bool vs_normalize_and_quantize(const float *src, int8_t *dst) {
     return true;
 }
 
-/* Build int8 query vectors for each keyword.  Returns the number of
- * successfully built vectors (may be less than keyword_count when some
- * keywords produce zero-magnitude vectors). */
-static int vs_build_keyword_vectors(cbm_store_t *s, const char *project, const char **keywords,
-                                    int keyword_count, int8_t (*kw_vecs)[VS_VEC_DIM]) {
-    int actual_kw = 0;
-    for (int k = 0; k < keyword_count && actual_kw < VS_MAX_KW; k++) {
+/* Add idf * token_vector(token) into `acc`.  Returns true when the token is
+ * present in token_vectors with a well-formed vector. */
+static bool vs_accumulate_token(sqlite3_stmt *lookup, const char *token, float *acc) {
+    sqlite3_reset(lookup);
+    sqlite3_bind_text(lookup, ST_COL_2, token, SQLITE_AUTO_LEN, SQLITE_STATIC);
+    bool found = false;
+    if (sqlite3_step(lookup) == SQLITE_ROW) {
+        const int8_t *vec = (const int8_t *)sqlite3_column_blob(lookup, 0);
+        int vec_len = sqlite3_column_bytes(lookup, 0);
+        double idf = sqlite3_column_double(lookup, ST_COL_1);
+        if (vec && vec_len == VS_VEC_DIM) {
+            float weight = idf > 0.0 ? (float)idf : CBM_STORE_UNIT_POS_F;
+            for (int d = 0; d < VS_VEC_DIM; d++) {
+                acc[d] += weight * (float)vec[d];
+            }
+            found = true;
+        }
+    }
+    sqlite3_reset(lookup);
+    return found;
+}
+
+/* Compose the single query vector.  Returns false when no keyword or word is
+ * known to the index (or the store has no token_vectors table): the vector
+ * channel then sits out and the lexical channel ranks alone. */
+static bool vs_build_query_vector(cbm_store_t *s, const char *project, const char **keywords,
+                                  int keyword_count, int8_t *out) {
+    sqlite3_stmt *lookup = NULL;
+    const char *sql = "SELECT vector, idf FROM token_vectors"
+                      " WHERE project = ?1 AND token = ?2 LIMIT 1";
+    if (sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &lookup, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(lookup, SKIP_ONE, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
+    float acc[VS_VEC_DIM];
+    memset(acc, 0, sizeof(acc));
+    int found = 0;
+    for (int k = 0; k < keyword_count; k++) {
         if (!keywords[k] || !keywords[k][0]) {
             continue;
         }
-        float kw_f[VS_VEC_DIM];
-        memset(kw_f, 0, sizeof(kw_f));
-        if (!vs_load_enriched_vector(s, project, keywords[k], kw_f)) {
-            vs_fill_sparse_random(keywords[k], kw_f);
+        if (vs_accumulate_token(lookup, keywords[k], acc)) {
+            found++;
+            continue;
         }
-        if (vs_normalize_and_quantize(kw_f, kw_vecs[actual_kw])) {
-            actual_kw++;
+        vs_words_t words;
+        words.count = 0;
+        vs_vector_words(keywords[k], &words);
+        for (int w = 0; w < words.count; w++) {
+            if (vs_accumulate_token(lookup, words.words[w], acc)) {
+                found++;
+            }
         }
     }
-    return actual_kw;
+    sqlite3_finalize(lookup);
+    return found > 0 && vs_normalize_and_quantize(acc, out);
 }
 
-/* L2 norm of every quantized keyword vector, computed once per search
- * instead of once per (node, keyword) pair inside the scoring loop. */
-static void vs_keyword_norms(const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw, double *kw_norms) {
-    for (int k = 0; k < actual_kw; k++) {
-        int32_t ma = 0;
-        for (int d = 0; d < VS_VEC_DIM; d++) {
-            ma += (int32_t)kw_vecs[k][d] * (int32_t)kw_vecs[k][d];
-        }
-        kw_norms[k] = sqrt((double)ma);
+typedef struct {
+    int64_t node_id;
+    double score;
+    bool is_test;
+} vs_cand_t;
+
+static int vs_cand_score_cmp(const void *lhs, const void *rhs) {
+    const vs_cand_t *a = lhs;
+    const vs_cand_t *b = rhs;
+    if (a->score > b->score) {
+        return -1;
     }
+    if (a->score < b->score) {
+        return 1;
+    }
+    return (a->node_id > b->node_id) - (a->node_id < b->node_id);
 }
 
-/* Compute the per-keyword min cosine score between a node's int8 vector and
- * each of the query vectors.  `kw_norms[k]` is the precomputed L2 norm of
- * kw_vecs[k]; the node norm is computed once per node.  The integer sums are
- * exact, so factoring the norms out of the pair loop leaves every score
- * bit-identical to the fused form.  Returns 0.0 if the node vector is
- * unavailable or mis-sized. */
-static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
-                                  const int8_t (*kw_vecs)[VS_VEC_DIM], const double *kw_norms,
-                                  int actual_kw) {
-    if (!node_vec || node_vec_len != VS_VEC_DIM) {
-        return 0.0;
-    }
-    int32_t mb = 0;
-    for (int d = 0; d < VS_VEC_DIM; d++) {
-        mb += (int32_t)node_vec[d] * (int32_t)node_vec[d];
-    }
-    double node_norm = sqrt((double)mb);
-    double min_score = CBM_STORE_UNIT_POS_D;
-    for (int k = 0; k < actual_kw; k++) {
-        int32_t dot = 0;
-        for (int d = 0; d < VS_VEC_DIM; d++) {
-            dot += (int32_t)kw_vecs[k][d] * (int32_t)node_vec[d];
-        }
-        double denom = kw_norms[k] * node_norm;
-        double cos_k = denom > CBM_STORE_DENOM_EPS_D ? (double)dot / denom : 0.0;
-        if (cos_k < min_score) {
-            min_score = cos_k;
-        }
-    }
-    return min_score;
+static int vs_cand_id_cmp(const void *lhs, const void *rhs) {
+    const vs_cand_t *a = lhs;
+    const vs_cand_t *b = rhs;
+    return (a->node_id > b->node_id) - (a->node_id < b->node_id);
 }
 
-/* Append one candidate row read from the scan statement into `*results`,
- * growing the array geometrically on demand.  Returns CBM_STORE_OK, or
- * CBM_STORE_ERR on allocation failure — in which case `*results` still owns
- * exactly `*count` complete rows (a row is only counted once every string
- * copy succeeded), so the caller's usual free path stays valid. */
-static int vs_append_result(cbm_vector_result_t **results, int *count, int *cap, sqlite3_stmt *stmt,
-                            const int8_t (*kw_vecs)[VS_VEC_DIM], const double *kw_norms,
-                            int actual_kw) {
+/* Lexical hits reuse vs_cand_t with score = boosted BM25 (lower is better). */
+static int vs_lex_rank_cmp(const void *lhs, const void *rhs) {
+    const vs_cand_t *a = lhs;
+    const vs_cand_t *b = rhs;
+    if (a->score < b->score) {
+        return -1;
+    }
+    if (a->score > b->score) {
+        return 1;
+    }
+    return (a->node_id > b->node_id) - (a->node_id < b->node_id);
+}
+
+static int vs_cand_push(vs_cand_t **arr, int *count, int *cap, vs_cand_t cand) {
     if (*count >= *cap) {
         int nc = *cap < CBM_SZ_16 ? CBM_SZ_16 : *cap * ST_COL_2;
-        cbm_vector_result_t *grown = realloc(*results, (size_t)nc * sizeof(cbm_vector_result_t));
+        vs_cand_t *grown = realloc(*arr, (size_t)nc * sizeof(vs_cand_t));
         if (!grown) {
             return CBM_STORE_ERR;
         }
-        *results = grown;
+        *arr = grown;
         *cap = nc;
     }
-    cbm_vector_result_t *row = &(*results)[*count];
-    row->node_id = sqlite3_column_int64(stmt, 0);
-    const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
-    const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_2);
-    const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_3);
-    const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_4);
-    row->name = strdup(name ? name : "");
-    row->qualified_name = strdup(qn ? qn : "");
-    row->file_path = strdup(fp ? fp : "");
-    row->label = strdup(label ? label : "");
-    if (!row->name || !row->qualified_name || !row->file_path || !row->label) {
-        free(row->name);
-        free(row->qualified_name);
-        free(row->file_path);
-        free(row->label);
+    (*arr)[(*count)++] = cand;
+    return CBM_STORE_OK;
+}
+
+/* Join lexical words as an FTS5 OR query.  Words are lowercase, so FTS5's
+ * uppercase-only operators (OR/AND/NOT/NEAR) can never be injected. */
+static int vs_build_match(const vs_words_t *words, char *out, size_t out_size) {
+    size_t pos = 0;
+    int emitted = 0;
+    out[0] = '\0';
+    for (int i = 0; i < words->count; i++) {
+        const char *sep = emitted > 0 ? " OR " : "";
+        size_t sep_len = strlen(sep);
+        size_t len = strlen(words->words[i]);
+        if (pos + sep_len + len + SKIP_ONE > out_size) {
+            break;
+        }
+        memcpy(out + pos, sep, sep_len);
+        pos += sep_len;
+        memcpy(out + pos, words->words[i], len);
+        pos += len;
+        out[pos] = '\0';
+        emitted++;
+    }
+    return emitted;
+}
+
+/* Exact-name tier.  A lone keyword is the whole query (the CLI's query-mode
+ * rule); among several, only identifier-shaped keywords qualify — a plain
+ * word like `get` or `key` would otherwise lift every same-named helper. */
+static bool vs_looks_like_identifier(const char *kw) {
+    for (int i = 0; kw[i]; i++) {
+        if (kw[i] == '_' || (i > 0 && vs_is_lower(kw[i - SKIP_ONE]) && vs_is_upper(kw[i]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static double vs_exact_name_boost(const char *name, const char **keywords, int keyword_count) {
+    double boost = 0.0;
+    for (int k = 0; k < keyword_count; k++) {
+        if (!keywords[k] || !keywords[k][0] ||
+            (keyword_count > 1 && !vs_looks_like_identifier(keywords[k]))) {
+            continue;
+        }
+        if (strcmp(name, keywords[k]) == 0) {
+            return VS_EXACT_NAME_BOOST;
+        }
+        if (vs_ascii_ieq_n(name, strlen(name), keywords[k])) {
+            boost = VS_EXACT_NAME_CI_BOOST;
+        }
+    }
+    return boost;
+}
+
+/* Top VS_LEX_WINDOW lexical hits in rank order.  A store without nodes_fts
+ * (FTS5 unavailable) has no lexical channel: CBM_STORE_OK with zero hits.
+ * A MATCH scan that fails mid-way is CBM_STORE_ERR. */
+static int vs_lexical_search(cbm_store_t *s, const char *project, const vs_words_t *words,
+                             const char **keywords, int keyword_count, vs_cand_t **out,
+                             int *out_count) {
+    *out = NULL;
+    *out_count = 0;
+    char match[VS_MATCH_BUF];
+    if (vs_build_match(words, match, sizeof(match)) == 0) {
+        return CBM_STORE_OK;
+    }
+    const char *sql = "SELECT n.id, n.name, n.file_path,"
+                      "       fts.base_rank - CASE WHEN n.label IN (" CBM_SQL_CALLABLE_LABELS ")"
+                      "                       THEN ?4 ELSE ?5 END"
+                      " FROM (SELECT rowid, bm25(nodes_fts, 1.0, 1.0, 1.0, 1.0, 0.3) AS base_rank"
+                      "       FROM nodes_fts WHERE nodes_fts MATCH ?1"
+                      "       ORDER BY base_rank, rowid LIMIT ?3) fts"
+                      " JOIN nodes n ON n.id = fts.rowid"
+                      " WHERE n.project = ?2"
+                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK;
+    }
+    sqlite3_bind_text(stmt, SKIP_ONE, match, SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, ST_COL_3, VS_LEX_INNER);
+    sqlite3_bind_double(stmt, ST_COL_4, VS_CALLABLE_TIER);
+    sqlite3_bind_double(stmt, ST_COL_5, VS_TYPE_TIER);
+
+    vs_cand_t *hits = NULL;
+    int count = 0;
+    int cap = 0;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_2);
+        vs_cand_t hit = {
+            .node_id = sqlite3_column_int64(stmt, 0),
+            .score = sqlite3_column_double(stmt, ST_COL_3) -
+                     vs_exact_name_boost(name ? name : "", keywords, keyword_count),
+            .is_test = vs_is_test_symbol(name, fp),
+        };
+        if (vs_cand_push(&hits, &count, &cap, hit) != CBM_STORE_OK) {
+            step_rc = SQLITE_NOMEM;
+            break;
+        }
+    }
+    if (step_rc != SQLITE_DONE) {
+        char rc_buf[VS_STR_BUF];
+        snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
+        cbm_log_warn("vector_search.lexical_error", "rc", rc_buf, "msg", sqlite3_errmsg(s->db));
+        sqlite3_finalize(stmt);
+        free(hits);
         return CBM_STORE_ERR;
     }
-    const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_6);
-    int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_6);
-    row->score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, kw_norms, actual_kw);
-    (*count)++;
+    sqlite3_finalize(stmt);
+    if (count > 1) {
+        qsort(hits, (size_t)count, sizeof(*hits), vs_lex_rank_cmp);
+    }
+    *out = hits;
+    *out_count = count < VS_LEX_WINDOW ? count : VS_LEX_WINDOW;
+    return CBM_STORE_OK;
+}
+
+/* Cosine of every callable/type node vector against the query vector, via
+ * the cbm_cosine_i8 SQL function. */
+static int vs_vector_scan(cbm_store_t *s, const char *project, const int8_t *qvec, vs_cand_t **out,
+                          int *out_count) {
+    *out = NULL;
+    *out_count = 0;
+    const char *sql = "SELECT v.node_id, cbm_cosine_i8(v.vector, ?1), n.name, n.file_path"
+                      " FROM node_vectors v"
+                      " INNER JOIN nodes n ON n.id = v.node_id"
+                      " WHERE v.project = ?2"
+                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        (void)fprintf(stderr, "vector_search: %s\n", sqlite3_errmsg(s->db));
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_blob(stmt, SKIP_ONE, qvec, VS_VEC_DIM, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
+
+    vs_cand_t *cands = NULL;
+    int count = 0;
+    int cap = 0;
+    int step_rc;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        vs_cand_t cand = {
+            .node_id = sqlite3_column_int64(stmt, 0),
+            .score = sqlite3_column_double(stmt, SKIP_ONE),
+            .is_test = vs_is_test_symbol((const char *)sqlite3_column_text(stmt, ST_COL_2),
+                                         (const char *)sqlite3_column_text(stmt, ST_COL_3)),
+        };
+        if (vs_cand_push(&cands, &count, &cap, cand) != CBM_STORE_OK) {
+            step_rc = SQLITE_NOMEM;
+            break;
+        }
+    }
+    if (step_rc != SQLITE_DONE) {
+        char rc_buf[VS_STR_BUF];
+        snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
+        cbm_log_warn("vector_search.step_error", "rc", rc_buf, "msg", sqlite3_errmsg(s->db));
+        sqlite3_finalize(stmt);
+        free(cands);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    *out = cands;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
+/* RRF-fuse the vector candidates (any order, score = cosine) with the ranked
+ * lexical window, demote tests, and sort into the final order.  On success
+ * *cands_io holds *out_total fused candidates (score = fused score). */
+static int vs_fuse(vs_cand_t **cands_io, int nvec, const vs_cand_t *lex, int nlex,
+                   bool demote_tests, int *out_total) {
+    vs_cand_t *cands = *cands_io;
+    if (nlex > 0) {
+        vs_cand_t *grown = realloc(cands, (size_t)(nvec + nlex) * sizeof(*cands));
+        if (!grown) {
+            return CBM_STORE_ERR;
+        }
+        cands = grown;
+        *cands_io = cands;
+    }
+    if (nvec > 1) {
+        qsort(cands, (size_t)nvec, sizeof(*cands), vs_cand_score_cmp);
+    }
+    for (int i = 0; i < nvec; i++) {
+        cands[i].score = VS_RRF_W_VECTOR / (VS_RRF_K + (double)(i + SKIP_ONE));
+    }
+    if (nvec > 1) {
+        qsort(cands, (size_t)nvec, sizeof(*cands), vs_cand_id_cmp);
+    }
+    int total = nvec;
+    for (int j = 0; j < nlex; j++) {
+        double contribution = VS_RRF_W_LEXICAL / (VS_RRF_K + (double)(j + SKIP_ONE));
+        vs_cand_t key = {.node_id = lex[j].node_id};
+        vs_cand_t *hit =
+            nvec > 0 ? bsearch(&key, cands, (size_t)nvec, sizeof(*cands), vs_cand_id_cmp) : NULL;
+        if (hit) {
+            hit->score += contribution;
+        } else {
+            cands[total] = lex[j];
+            cands[total].score = contribution;
+            total++;
+        }
+    }
+    if (demote_tests) {
+        for (int i = 0; i < total; i++) {
+            if (cands[i].is_test) {
+                cands[i].score -= VS_TEST_DEMOTION;
+            }
+        }
+    }
+    if (total > 1) {
+        qsort(cands, (size_t)total, sizeof(*cands), vs_cand_score_cmp);
+    }
+    *out_total = total;
+    return CBM_STORE_OK;
+}
+
+static char *vs_column_strdup(sqlite3_stmt *stmt, int col) {
+    const char *text = (const char *)sqlite3_column_text(stmt, col);
+    return strdup(text ? text : "");
+}
+
+/* Load display fields for the first `count` ranked candidates. */
+static int vs_materialize(cbm_store_t *s, const vs_cand_t *cands, int count,
+                          cbm_vector_result_t **out) {
+    *out = NULL;
+    cbm_vector_result_t *results = calloc((size_t)count, sizeof(*results));
+    if (!results) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT name, qualified_name, file_path, label FROM nodes WHERE id = ?1";
+    if (sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        (void)fprintf(stderr, "vector_search: %s\n", sqlite3_errmsg(s->db));
+        free(results);
+        return CBM_STORE_ERR;
+    }
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < count; i++) {
+        sqlite3_reset(stmt);
+        sqlite3_bind_int64(stmt, SKIP_ONE, cands[i].node_id);
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        cbm_vector_result_t *row = &results[i];
+        row->node_id = cands[i].node_id;
+        row->score = cands[i].score;
+        row->name = vs_column_strdup(stmt, 0);
+        row->qualified_name = vs_column_strdup(stmt, ST_COL_1);
+        row->file_path = vs_column_strdup(stmt, ST_COL_2);
+        row->label = vs_column_strdup(stmt, ST_COL_3);
+        if (!row->name || !row->qualified_name || !row->file_path || !row->label) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_free_vector_results(results, count);
+        return rc;
+    }
+    *out = results;
     return CBM_STORE_OK;
 }
 
@@ -12303,18 +12761,6 @@ static int vs_probe_node_vectors_table(cbm_store_t *s) {
     return CBM_STORE_ERR;
 }
 
-static int vs_ranked_result_cmp(const void *lhs, const void *rhs) {
-    const cbm_vector_result_t *a = lhs;
-    const cbm_vector_result_t *b = rhs;
-    if (a->score > b->score) {
-        return -1;
-    }
-    if (a->score < b->score) {
-        return 1;
-    }
-    return (a->node_id > b->node_id) - (a->node_id < b->node_id);
-}
-
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count) {
@@ -12329,110 +12775,64 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return probe_rc;
     }
 
-    int8_t kw_vecs[VS_MAX_KW][VS_VEC_DIM];
-    int actual_kw = vs_build_keyword_vectors(s, project, keywords, keyword_count, kw_vecs);
-    if (actual_kw == 0) {
-        return CBM_STORE_OK;
+    vs_words_t lex_words;
+    vs_words_t intent_words;
+    lex_words.count = 0;
+    intent_words.count = 0;
+    for (int k = 0; k < keyword_count; k++) {
+        if (keywords[k]) {
+            vs_lexical_words(keywords[k], &lex_words);
+            vs_vector_words(keywords[k], &intent_words);
+        }
     }
-    double kw_norms[VS_MAX_KW];
-    vs_keyword_norms(kw_vecs, actual_kw, kw_norms);
+    bool demote_tests = !vs_query_mentions_tests(&intent_words);
 
-    /* Use the first keyword for a cheap candidate ordering, then score each
-     * materialized candidate by min-cosine across every keyword. */
-    const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label,"
-                      "       cbm_cosine_i8(v.vector, ?1) as score, v.vector"
-                      " FROM node_vectors v"
-                      " INNER JOIN nodes n ON n.id = v.node_id"
-                      " WHERE v.project = ?2"
-                      " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")"
-                      " ORDER BY score DESC, n.id ASC"
-                      " LIMIT ?3";
-
-    sqlite3_stmt *stmt = NULL;
-    int prep_rc = sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL);
-    if (prep_rc != SQLITE_OK) {
-        (void)fprintf(stderr, "vector_search: %s\n", sqlite3_errmsg(s->db));
+    vs_cand_t *lex = NULL;
+    int nlex = 0;
+    if (vs_lexical_search(s, project, &lex_words, keywords, keyword_count, &lex, &nlex) !=
+        CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
 
-    /* A fixed 5x prefilter is normally ample, but it is not a proof: a later
-     * candidate can have a lower first-keyword score and a much higher
-     * all-keyword min-score. Expand until either the scan is exhausted or the
-     * Kth final score is strictly above the best possible omitted score. This
-     * makes top-K prefixes identical for every requested K, which semantic
-     * offset pagination requires. */
-    int requested_limit = limit > 0 ? limit : CBM_SZ_16;
-    int fetch_limit = requested_limit > INT_MAX / ST_COL_5 ? INT_MAX : requested_limit * ST_COL_5;
-    sqlite3_bind_blob(stmt, SKIP_ONE, kw_vecs[0], VS_VEC_DIM, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
-
-    cbm_vector_result_t *results = NULL;
-    int count = 0;
-    for (;;) {
-        int cap = 0;
-        int step_rc;
-        double omitted_score_ceiling = 0.0;
-        sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
-        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            omitted_score_ceiling = sqlite3_column_double(stmt, ST_COL_5);
-            if (vs_append_result(&results, &count, &cap, stmt, kw_vecs, kw_norms, actual_kw) !=
-                CBM_STORE_OK) {
-                step_rc = SQLITE_NOMEM;
-                break;
-            }
-        }
-        if (step_rc != SQLITE_DONE) {
-            char rc_buf[VS_STR_BUF];
-            snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
-            cbm_log_warn("vector_search.step_error", "rc", rc_buf, "msg", sqlite3_errmsg(s->db));
-            cbm_store_free_vector_results(results, count);
-            sqlite3_finalize(stmt);
-            return CBM_STORE_ERR;
-        }
-
-        if (count > 1) {
-            qsort(results, (size_t)count, sizeof(*results), vs_ranked_result_cmp);
-        }
-        bool scan_exhausted = count < fetch_limit;
-        bool top_k_certified = scan_exhausted || count < requested_limit ||
-                               results[requested_limit - 1].score > omitted_score_ceiling;
-        if (top_k_certified || fetch_limit == INT_MAX) {
-            break;
-        }
-
-        cbm_store_free_vector_results(results, count);
-        results = NULL;
-        count = 0;
-        fetch_limit = fetch_limit > INT_MAX / ST_COL_2 ? INT_MAX : fetch_limit * ST_COL_2;
-        sqlite3_reset(stmt);
+    int8_t qvec[VS_VEC_DIM];
+    vs_cand_t *cands = NULL;
+    int nvec = 0;
+    if (vs_build_query_vector(s, project, keywords, keyword_count, qvec) &&
+        vs_vector_scan(s, project, qvec, &cands, &nvec) != CBM_STORE_OK) {
+        free(lex);
+        return CBM_STORE_ERR;
     }
+
+    int total = 0;
+    int fuse_rc = vs_fuse(&cands, nvec, lex, nlex, demote_tests, &total);
+    free(lex);
+    if (fuse_rc != CBM_STORE_OK) {
+        free(cands);
+        return CBM_STORE_ERR;
+    }
+
+    int requested_limit = limit > 0 ? limit : CBM_SZ_16;
+    int keep = total < requested_limit ? total : requested_limit;
+    cbm_vector_result_t *results = NULL;
+    if (keep > 0 && vs_materialize(s, cands, keep, &results) != CBM_STORE_OK) {
+        free(cands);
+        return CBM_STORE_ERR;
+    }
+    free(cands);
 
     {
-        char kw_buf[VS_STR_BUF];
-        char fl_buf[VS_STR_BUF];
+        char vec_buf[VS_STR_BUF];
+        char lex_buf[VS_STR_BUF];
         char cnt_buf[VS_STR_BUF];
-        snprintf(kw_buf, sizeof(kw_buf), "%d", actual_kw);
-        snprintf(fl_buf, sizeof(fl_buf), "%d", fetch_limit);
-        snprintf(cnt_buf, sizeof(cnt_buf), "%d", count);
-        cbm_log_info("vector_search.done", "kw_count", kw_buf, "fetch_limit", fl_buf, "candidates",
+        snprintf(vec_buf, sizeof(vec_buf), "%d", nvec);
+        snprintf(lex_buf, sizeof(lex_buf), "%d", nlex);
+        snprintf(cnt_buf, sizeof(cnt_buf), "%d", total);
+        cbm_log_info("vector_search.done", "vector", vec_buf, "lexical", lex_buf, "candidates",
                      cnt_buf);
-    }
-    sqlite3_finalize(stmt);
-
-    /* Trim to requested limit */
-    int final_limit = requested_limit;
-    if (count > final_limit) {
-        for (int i = final_limit; i < count; i++) {
-            free(results[i].name);
-            free(results[i].qualified_name);
-            free(results[i].file_path);
-            free(results[i].label);
-        }
-        count = final_limit;
     }
 
     *out = results;
-    *out_count = count;
+    *out_count = keep;
     return CBM_STORE_OK;
 }
 
