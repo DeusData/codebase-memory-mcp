@@ -39,6 +39,25 @@
 
 int cbm_gitignore_match_result(const cbm_gitignore_t *gi, const char *rel_path, bool is_dir);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static cbm_discover_now_ms_fn g_discover_now_ms;
+static void *g_discover_now_ms_context;
+
+void cbm_discover_set_now_ms_for_testing(cbm_discover_now_ms_fn now_ms, void *context) {
+    g_discover_now_ms = now_ms;
+    g_discover_now_ms_context = context;
+}
+#endif
+
+static uint64_t discover_now_ms(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_discover_now_ms) {
+        return g_discover_now_ms(g_discover_now_ms_context);
+    }
+#endif
+    return cbm_now_ms();
+}
+
 /* ── Hardcoded always-skip directories ──────────────────────────── */
 
 static const char *ALWAYS_SKIP_DIRS[] = {
@@ -471,6 +490,9 @@ typedef struct {
     uint64_t deadline_ms;
     const cbm_index_resource_policy_t *resource_policy;
     cbm_index_resource_violation_t *resource_violation;
+    uint64_t resource_started_ms;
+    uint64_t directories;
+    uint64_t entries;
     uint64_t source_files;
     uint64_t source_bytes;
     bool count_only;
@@ -514,8 +536,20 @@ static bool file_list_should_stop(file_list_t *fl) {
     if (!fl) {
         return true;
     }
-    if (!fl->failed && fl->deadline_ms != 0 && cbm_now_ms() >= fl->deadline_ms) {
+    bool needs_now = fl->deadline_ms != 0 ||
+                     (fl->resource_policy && fl->resource_policy->discovery_deadline_ms.enabled);
+    uint64_t now = needs_now ? discover_now_ms() : 0;
+    if (!fl->failed && fl->deadline_ms != 0 && now >= fl->deadline_ms) {
         fl->failed = true;
+    }
+    if (!fl->failed && fl->resource_policy && fl->resource_policy->discovery_deadline_ms.enabled) {
+        uint64_t elapsed =
+            now >= fl->resource_started_ms ? now - fl->resource_started_ms : UINT64_C(0);
+        uint64_t limit = fl->resource_policy->discovery_deadline_ms.value;
+        if (elapsed > limit) {
+            file_list_resource_violation(fl, CBM_INDEX_RESOURCE_DISCOVERY_DURATION_MS, elapsed,
+                                         limit);
+        }
     }
     return fl->failed || fl->limit_exceeded;
 }
@@ -1112,6 +1146,7 @@ typedef struct {
     const gitignore_link_t *ignore_chain; /* deepest .gitignore governing this dir */
     sphinx_suffixes_t sphinx;             /* the documentation set's extra reST suffixes */
     bool git_ignored; /* ignored by git's rules, entered only for its tracked content */
+    uint64_t depth;
 } walk_frame_t;
 /* Initial capacity only — the stack grows on demand. A single directory can
  * hold more pending sibling frames than any fixed cap (dotnet/runtime has 855
@@ -1171,6 +1206,7 @@ static void walk_push_subdir(walk_stack_t *ws, const char *abs_path, const char 
     slot->ignore_chain = parent->ignore_chain;
     slot->sphinx = parent->sphinx;
     slot->git_ignored = git_ignored;
+    slot->depth = parent->depth == UINT64_MAX ? UINT64_MAX : parent->depth + 1U;
     ws->top++;
 }
 
@@ -1179,6 +1215,18 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
                                    const cbm_gitignore_t *global_gi,
                                    const cbm_gitignore_t *cbmignore, walk_stack_t *ws,
                                    file_list_t *out) {
+    if (out->resource_policy && out->resource_policy->max_entries.enabled) {
+        uint64_t limit = out->resource_policy->max_entries.value;
+        if (out->entries >= limit) {
+            uint64_t observed = out->entries == UINT64_MAX ? UINT64_MAX : out->entries + 1U;
+            file_list_resource_violation(out, CBM_INDEX_RESOURCE_ENTRIES, observed, limit);
+            return;
+        }
+    }
+    if (out->entries < UINT64_MAX) {
+        out->entries++;
+    }
+
     char abs_path[CBM_SZ_4K];
     char rel_path[CBM_SZ_4K];
     int absolute_length = snprintf(abs_path, sizeof(abs_path), "%s/%s", frame->dir, entry->name);
@@ -1223,6 +1271,24 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         }
         if (verdict == DIR_KEEP ||
             (verdict == DIR_GIT_IGNORED && tracked_has_dir(out->tracked, rel_path))) {
+            uint64_t child_depth = frame->depth == UINT64_MAX ? UINT64_MAX : frame->depth + 1U;
+            if (out->resource_policy && out->resource_policy->max_depth.enabled &&
+                child_depth > out->resource_policy->max_depth.value) {
+                file_list_resource_violation(out, CBM_INDEX_RESOURCE_DEPTH, child_depth,
+                                             out->resource_policy->max_depth.value);
+                return;
+            }
+            if (out->resource_policy && out->resource_policy->max_directories.enabled &&
+                out->directories >= out->resource_policy->max_directories.value) {
+                uint64_t observed =
+                    out->directories == UINT64_MAX ? UINT64_MAX : out->directories + 1U;
+                file_list_resource_violation(out, CBM_INDEX_RESOURCE_DIRECTORIES, observed,
+                                             out->resource_policy->max_directories.value);
+                return;
+            }
+            if (out->directories < UINT64_MAX) {
+                out->directories++;
+            }
             walk_push_subdir(ws, abs_path, rel_path, frame, verdict == DIR_GIT_IGNORED, out);
         } else {
             /* Record the excluded subtree root so callers can report it (#411). */
@@ -1302,6 +1368,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
             return;
         }
     }
+    ws.frames[0].depth = 0;
     ws.top++;
 
     while (ws.top > 0 && !file_list_should_stop(out)) {
@@ -1849,6 +1916,11 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         .deadline_ms = count_only ? deadline_ms : 0,
         .resource_policy = opts ? opts->resource_policy : NULL,
         .resource_violation = opts ? opts->resource_violation : NULL,
+        .resource_started_ms =
+            opts && opts->resource_policy && opts->resource_policy->discovery_deadline_ms.enabled
+                ? discover_now_ms()
+                : 0,
+        .directories = 1,
         .count_only = count_only,
         .collect_excluded = !count_only && excluded_out != NULL,
         .collect_ignored = !count_only && ignored_out != NULL,
@@ -1858,8 +1930,14 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         tracked_load(&tracked, repo_path);
         fl.tracked = &tracked;
     }
+    if (fl.resource_policy && fl.resource_policy->max_directories.enabled &&
+        fl.resource_policy->max_directories.value < 1U) {
+        file_list_resource_violation(&fl, CBM_INDEX_RESOURCE_DIRECTORIES, 1,
+                                     fl.resource_policy->max_directories.value);
+    }
     walk_cache_dir_snapshot();
     walk_dir(repo_path, "", opts, gitignore, ancestors.chain, global_gi, cbmignore, &fl);
+    (void)file_list_should_stop(&fl);
 
     /* Cleanup */
     tracked_free(&tracked);
