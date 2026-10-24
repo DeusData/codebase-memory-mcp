@@ -2905,6 +2905,100 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
     PASS();
 }
 
+/* #2121, the issue's own two files: C# spells its built-in types as lower-case
+ * keywords, so `int.TryParse(...)` calls the BCL, never the project's only
+ * TryParse. The LSP's answer (System.Int32.TryParse) has no graph node, so the
+ * call falls through to the registry, whose receiver chain check used to skip
+ * every lower-case root. Both resolvers must refuse the name guess (also for
+ * the C# 9 `nint`), and a real call to the project type must still bind. */
+TEST(parallel_csharp_keyword_receiver_no_name_guess_issue2121) {
+    static const char decoys_src[] =
+        "namespace Contoso.App;\n"
+        "\n"
+        "public class TsidNode\n"
+        "{\n"
+        "    public static bool TryParse(string text, out TsidNode n)\n"
+        "    {\n"
+        "        n = null;\n"
+        "        return false;\n"
+        "    }\n"
+        "}\n";
+    static const char demo_src[] = "using Microsoft.Extensions.Options;\n"
+                                   "\n"
+                                   "namespace Contoso.App;\n"
+                                   "\n"
+                                   "public class Demo\n"
+                                   "{\n"
+                                   "    public string M(string input)\n"
+                                   "    {\n"
+                                   "        _ = int.TryParse(input, out _);\n"
+                                   "        _ = nint.TryParse(input, out _);\n"
+                                   "        return input;\n"
+                                   "    }\n"
+                                   "\n"
+                                   "    public string Control(string input)\n"
+                                   "    {\n"
+                                   "        _ = TsidNode.TryParse(input, out _);\n"
+                                   "        return input;\n"
+                                   "    }\n"
+                                   "}\n";
+    const char *project = "cbm_cs_2121";
+    static const char *rels[] = {"src/Decoys.cs", "src/Demo.cs"};
+    const char *srcs[] = {decoys_src, demo_src};
+    enum { N_FILES = 2 };
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_2121_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write #2121 fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *tsid = "cbm_cs_2121.src.Decoys.TsidNode.TryParse";
+    bool ok[2][4];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        /* The negative below must not pass because a node went missing. */
+        ok[g][0] = cbm_gbuf_find_by_qn(gb, tsid) != NULL;
+        ok[g][1] = find_unique_callable_node_by_tail(gb, "Demo.M") != NULL;
+        ok[g][2] = !has_edge_from_callable_to_qn(gb, "Demo.M", tsid, "CALLS");
+        ok[g][3] = has_edge_from_callable_to_qn(gb, "Demo.Control", tsid, "CALLS");
+        for (int k = 0; k < 4; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  #2121 diagnostic %s: target=%d caller=%d no_keyword_guess=%d control=%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
+}
+
 /* External Kotlin protocol targets must not borrow a project method merely
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
@@ -5573,6 +5667,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_typescript_import_namespace_exact_parity);
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
     RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
+    RUN_TEST(parallel_csharp_keyword_receiver_no_name_guess_issue2121);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);
