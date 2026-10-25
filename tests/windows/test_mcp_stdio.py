@@ -18,8 +18,10 @@ def main():
         print("SETUP FAIL: CBM_TEST_BINARY is required", file=sys.stderr)
         return 2
 
-    with tempfile.TemporaryDirectory(prefix="cbm-mcp-stdio-") as cache:
-        runtime = cache + "-runtime"
+    with tempfile.TemporaryDirectory(prefix="cbm-mcp-stdio-") as work:
+        cache = os.path.join(work, "cache")
+        runtime = os.path.join(work, "runtime")
+        os.makedirs(cache)
         os.makedirs(runtime)
         server = McpServer(binary, cache_dir=cache, extra_env={"CBM_RUNTIME_DIR": runtime})
         try:
