@@ -7,6 +7,7 @@
 #include "../src/foundation/compat_regex.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/compat_thread.h"
+#include "../src/foundation/mem_core.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
@@ -895,6 +896,52 @@ TEST(platform_env_long_refuses_what_it_cannot_read) {
     PASS();
 }
 
+/* cbm_env_dup (#221) gives the same environment view as cbm_safe_getenv: an
+ * installed settings resolver answers first, a handled NULL masks the
+ * variable, and an unhandled name falls through to the process environment. */
+static bool platform_env_dup_test_resolver(const char *name, const char **value) {
+    if (strcmp(name, "CBM_TEST_ENV_DUP_RESOLVED") == 0) {
+        *value = "from-settings";
+        return true;
+    }
+    if (strcmp(name, "CBM_TEST_ENV_DUP_MASKED") == 0) {
+        *value = NULL;
+        return true;
+    }
+    return false;
+}
+
+TEST(platform_env_dup_honours_the_settings_resolver) {
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_RESOLVED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_MASKED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_NATIVE", "from-environment", 1), 0);
+
+    cbm_set_environment_resolver(platform_env_dup_test_resolver);
+    char *resolved = cbm_env_dup("CBM_TEST_ENV_DUP_RESOLVED");
+    char *masked = cbm_env_dup("CBM_TEST_ENV_DUP_MASKED");
+    char *native = cbm_env_dup("CBM_TEST_ENV_DUP_NATIVE");
+    char safe[64];
+    const char *safe_value = cbm_safe_getenv("CBM_TEST_ENV_DUP_RESOLVED", safe, sizeof(safe), NULL);
+    cbm_set_environment_resolver(NULL);
+
+    bool safe_ok = safe_value && strcmp(safe_value, "from-settings") == 0;
+    bool resolved_ok = resolved && strcmp(resolved, "from-settings") == 0;
+    bool masked_ok = masked == NULL;
+    bool native_ok = native && strcmp(native, "from-environment") == 0;
+    cbm_free(CBM_MEM_CLASS_OTHER, resolved);
+    cbm_free(CBM_MEM_CLASS_OTHER, masked);
+    cbm_free(CBM_MEM_CLASS_OTHER, native);
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_RESOLVED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_MASKED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_NATIVE");
+
+    ASSERT_TRUE(safe_ok);
+    ASSERT_TRUE(resolved_ok);
+    ASSERT_TRUE(masked_ok);
+    ASSERT_TRUE(native_ok);
+    PASS();
+}
+
 #ifdef _WIN32
 /* cbm_safe_getenv reads Windows' wide environment as UTF-8. Its matching
  * setter must update that same wide environment; _putenv_s alone interprets
@@ -1420,6 +1467,7 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_unset);
     RUN_TEST(platform_env_long_reads_a_clean_number);
     RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
+    RUN_TEST(platform_env_dup_honours_the_settings_resolver);
     RUN_TEST(platform_system_info);
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
