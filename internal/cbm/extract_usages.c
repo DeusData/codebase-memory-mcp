@@ -1668,6 +1668,15 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
     if (strcmp(kind, "identifier") != 0 && strcmp(kind, "simple_identifier") != 0) {
         return (TSNode){0};
     }
+    /* Receiverless ::name remains an explicit callable-reference candidate
+     * inside nested control bodies, where it need not be the walk's current
+     * callee. Keep the identifier span; only semantic proof may upgrade it. */
+    if (ctx->language == CBM_LANG_KOTLIN && !ts_node_is_null(parent) &&
+        strcmp(ts_node_type(parent), "callable_reference") == 0 &&
+        ts_node_named_child_count(parent) == 1 &&
+        ts_node_eq(ts_node_named_child(parent, 0), node)) {
+        return node;
+    }
     /* Kotlin: a navigation member read (`obj.member`, and `value::member`,
      * which the vendored grammar also parses as navigation) is a candidate at
      * the member occurrence, so a receiver-typed LSP row can claim it instead

@@ -6,6 +6,114 @@ static bool syntax(const char *const *kinds) {
     return kinds && kinds[0];
 }
 
+/* Positive rows are audited producer subsets, independent of parser syntax.
+ * Unlisted languages and relations keep the explicit unsupported default. */
+#define EDGE(name) (1u << CBM_RESOLVE_EDGE_##name)
+#define CALLABLE_EDGES (EDGE(CALLS) | EDGE(CALL_REFERENCE))
+#define C_EDGES (EDGE(IMPORTS) | CALLABLE_EDGES | EDGE(USAGE) | EDGE(READS) | EDGE(WRITES))
+#define SOURCE_EDGES (EDGE(IMPORTS) | CALLABLE_EDGES | EDGE(USAGE))
+#define TYPED_EDGES (EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USES_TYPE))
+typedef struct {
+    CBMLanguage language;
+    unsigned supported;
+    const char *imports;
+} edge_row_t;
+static const edge_row_t edge_rows[] = {
+    {CBM_LANG_GO, SOURCE_EDGES,
+     "Exact project package paths with configured roots; unresolved external packages abstain."},
+    {CBM_LANG_C, C_EDGES,
+     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+    {CBM_LANG_CPP, C_EDGES,
+     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+    {CBM_LANG_CUDA, C_EDGES,
+     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+    {CBM_LANG_OBJC, EDGE(IMPORTS),
+     "Literal include paths and configured search roots only; no semantic proof bridge "
+     "advertised."},
+    {CBM_LANG_JAVASCRIPT, SOURCE_EDGES,
+     "Exact relative modules and configured package roots; runtime module paths abstain."},
+    {CBM_LANG_TYPESCRIPT, SOURCE_EDGES,
+     "Exact relative modules and configured package roots; runtime module paths abstain."},
+    {CBM_LANG_TSX, SOURCE_EDGES,
+     "Exact relative modules and configured package roots; runtime module paths abstain."},
+    {CBM_LANG_ARKTS, SOURCE_EDGES,
+     "Source JavaScript-style imports only; containing-language typed dispatch is unsupported."},
+    {CBM_LANG_PYTHON, SOURCE_EDGES | EDGE(USES_TYPE),
+     "Static project imports and bounded reexports; dynamic imports and unknown package roots "
+     "abstain."},
+    {CBM_LANG_JAVA, EDGE(IMPORTS) | CALLABLE_EDGES,
+     "Exact declared package members; incomplete or competing namespace candidates abstain."},
+    {CBM_LANG_KOTLIN, TYPED_EDGES | EDGE(CALL_REFERENCE),
+     "Exact declared packages and aliases; incomplete or competing namespace candidates abstain."},
+    {CBM_LANG_CSHARP, TYPED_EDGES,
+     "Exact declared namespace members; unproved aliases and competing candidates abstain."},
+    {CBM_LANG_PHP, TYPED_EDGES,
+     "Declared namespaces, Composer PSR-4 and literal includes; dynamic paths abstain."},
+    {CBM_LANG_RUST, TYPED_EDGES,
+     "Explicit crate/module trees and use paths; macros, attributes and unknown roots abstain."},
+    {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
+     "Direct URI imports with prefix and show/hide bindings; parts and reexports are unsupported."},
+    {CBM_LANG_LUA, EDGE(CALLS), NULL},
+    {CBM_LANG_SCALA, EDGE(IMPORTS),
+     "Exact declared namespace members only; no semantic binding proof bridge advertised."},
+    {CBM_LANG_KUSTOMIZE, EDGE(IMPORTS),
+     "Literal relative resource paths only; transformed or generated resources are unsupported."},
+};
+#undef TYPED_EDGES
+#undef SOURCE_EDGES
+#undef C_EDGES
+#undef CALLABLE_EDGES
+#undef EDGE
+
+static void edge_capabilities(cbm_resolve_capabilities_t *out) {
+    static const char *const names[CBM_RESOLVE_EDGE_COUNT] = {
+        "IMPORTS", "CALLS", "CALL_REFERENCE", "USAGE", "READS", "WRITES", "USES_TYPE"};
+    static const char *const unavailable[CBM_RESOLVE_EDGE_COUNT] = {
+        "No audited dependency-path subset is advertised; missing imports are a resolver quality "
+        "gap.",
+        "No admitted invocation subset is advertised; missing calls are a resolver quality gap.",
+        "No admitted callable-reference subset is advertised; syntax alone cannot prove a "
+        "callable.",
+        "No admitted declaration-usage subset is advertised; matching spelling cannot prove "
+        "identity.",
+        "No admitted read-target subset is advertised; read syntax cannot prove declaration "
+        "identity.",
+        "No admitted write-target subset is advertised; assignment syntax cannot prove declaration "
+        "identity.",
+        "No admitted type-reference subset is advertised; type spelling cannot prove declaration "
+        "identity."};
+    for (int i = 0; i < CBM_RESOLVE_EDGE_COUNT; i++)
+        out->edges[i] =
+            (cbm_resolve_edge_capability_t){.relation = names[i],
+                                            .availability = CBM_RESOLVE_EDGE_UNSUPPORTED,
+                                            .limitation = unavailable[i]};
+    for (size_t row = 0; row < sizeof(edge_rows) / sizeof(edge_rows[0]); row++) {
+        const edge_row_t *entry = &edge_rows[row];
+        if (entry->language != out->language)
+            continue;
+        for (int i = 0; i < CBM_RESOLVE_EDGE_COUNT; i++) {
+            if (!(entry->supported & (1u << i)))
+                continue;
+            out->edges[i].availability = CBM_RESOLVE_EDGE_SUPPORTED_SUBSET;
+            out->edges[i].limitation =
+                i == CBM_RESOLVE_EDGE_IMPORTS ? entry->imports : out->limitation;
+        }
+        break;
+    }
+    if (out->language == CBM_LANG_C || out->language == CBM_LANG_CPP ||
+        out->language == CBM_LANG_CUDA) {
+        const char *fields =
+            "Exact field identifier with a proved owner; unknown receiver, ambiguous "
+            "inheritance and unmodelled effects abstain.";
+        out->edges[CBM_RESOLVE_EDGE_READS].limitation = fields;
+        out->edges[CBM_RESOLVE_EDGE_WRITES].limitation = fields;
+    }
+    if (out->language == CBM_LANG_GO)
+        out->edges[CBM_RESOLVE_EDGE_WRITES].limitation =
+            "No admitted Go field/write bridge; assignment extraction remains a resolver quality "
+            "gap.";
+}
+
 bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *out) {
     if (!out || language < 0 || language >= CBM_LANG_COUNT)
         return false;
@@ -56,8 +164,9 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
-        out->limitation = "Explicit imports and bounded reexports; ordinary declared receivers and "
-                          "aliases; dynamic/decorated/inherited lookup abstains.";
+        out->limitation =
+            "Explicit imports and bounded reexports; ordinary declared receivers and "
+            "aliases; dynamic/inherited lookup and decorated callable identity abstain.";
         break;
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
@@ -110,5 +219,20 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
     default:
         break;
     }
+    edge_capabilities(out);
     return true;
+}
+
+bool cbm_resolve_edge_capability(CBMLanguage language, const char *relation,
+                                 cbm_resolve_edge_capability_t *out) {
+    cbm_resolve_capabilities_t capabilities;
+    if (!out || !relation || !cbm_resolve_capabilities(language, &capabilities))
+        return false;
+    for (int i = 0; i < CBM_RESOLVE_EDGE_COUNT; i++) {
+        if (strcmp(relation, capabilities.edges[i].relation) == 0) {
+            *out = capabilities.edges[i];
+            return true;
+        }
+    }
+    return false;
 }

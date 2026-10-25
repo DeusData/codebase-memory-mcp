@@ -1,6 +1,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "resolve/types.h"
+#include <string.h>
 
 static cbm_resolve_result_t type_proof(const char *target) {
     return (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_UNIQUE,
@@ -309,7 +310,138 @@ TEST(resolver_type_annotation_extraction_retains_reference_span) {
     PASS();
 }
 
+TEST(resolver_type_adapted_snapshot_cannot_hide_revocation_or_map_reinitialization) {
+    for (int reinitialize = 0; reinitialize < 2; reinitialize++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMScope *scope = cbm_scope_push(&arena, NULL);
+        CBMResolveTypeMap map;
+        cbm_resolve_types_init(&map, &arena, 0);
+        cbm_resolve_result_t proof = type_proof("project.Widget");
+        const CBMType *type = cbm_type_named(&arena, proof.target);
+        ASSERT(cbm_resolve_types_declare(&map, scope, "item", 1, type, CBM_RESOLVE_TYPE_ANNOTATION,
+                                         &proof));
+        cbm_resolve_type_fact_t cached = cbm_resolve_types_lookup(&map, scope, "item", 2);
+        cached.binding = NULL;
+        if (reinitialize) {
+            cbm_resolve_types_init(&map, &arena, 0);
+            ASSERT(cbm_resolve_types_declare(&map, scope, "item", 1, type,
+                                             CBM_RESOLVE_TYPE_ANNOTATION, &proof));
+        } else {
+            proof.analysis = CBM_RESOLVE_ANALYSIS_LIMITED;
+            ASSERT(cbm_resolve_types_observe(&map, scope, "item", 3, type,
+                                             CBM_RESOLVE_TYPE_OBSERVED_BINDING, &proof));
+        }
+        ASSERT(cbm_scope_lookup(scope, "item") == type);
+        ASSERT_EQ(cbm_resolve_types_join(&map, &cached, 1, 4).status, CBM_RESOLVE_TYPE_STALE);
+        cbm_arena_destroy(&arena);
+    }
+    PASS();
+}
+
+TEST(resolver_type_cached_copy_survives_table_growth_and_source_reassignment) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMScope *scope = cbm_scope_push(&arena, NULL);
+    CBMResolveTypeMap map;
+    cbm_resolve_types_init(&map, &arena, 0);
+    cbm_resolve_result_t proof = type_proof("project.Widget");
+    const CBMType *type = cbm_type_named(&arena, proof.target);
+    ASSERT(cbm_resolve_types_declare(&map, scope, "item", 1, type, CBM_RESOLVE_TYPE_ANNOTATION,
+                                     &proof));
+    ASSERT(cbm_resolve_types_copy(&map, scope, "copy", scope, "item", 2, true));
+    cbm_resolve_type_fact_t cached = cbm_resolve_types_lookup(&map, scope, "copy", 3);
+    for (int i = 0; i < 64; i++) {
+        const char *name = cbm_arena_sprintf(&arena, "other_%d", i);
+        ASSERT_NOT_NULL(name);
+        ASSERT(cbm_resolve_types_declare(&map, scope, name, 4, type, CBM_RESOLVE_TYPE_ANNOTATION,
+                                         &proof));
+    }
+    ASSERT(cbm_resolve_types_invalidate(&map, scope, "item", 5, CBM_RESOLVE_TYPE_UNKNOWN));
+    ASSERT_EQ(cbm_resolve_types_join(&map, &cached, 1, 6).status, CBM_RESOLVE_TYPE_KNOWN);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(resolver_type_copy_and_join_preserve_actual_support_dag) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMScope *scope = cbm_scope_push(&arena, NULL);
+    CBMResolveTypeMap map;
+    cbm_resolve_types_init(&map, &arena, 0);
+    char content[] = "captured-source";
+    cbm_resolve_proof_source_t source = {.module = "project.module",
+                                         .content_identity = content,
+                                         .configuration_identity = "config-v1"};
+    ASSERT(cbm_resolve_types_set_context(&map, &source));
+    content[0] = 'X';
+    const CBMType *type = cbm_type_named(&arena, "project.Widget");
+    cbm_resolve_result_t evidence = type_proof("project.Widget");
+    ASSERT(cbm_resolve_types_declare(&map, scope, "first", 10, type, CBM_RESOLVE_TYPE_ANNOTATION,
+                                     &evidence));
+    ASSERT(cbm_resolve_types_declare(&map, scope, "second", 20, type, CBM_RESOLVE_TYPE_CONSTRUCTOR,
+                                     &evidence));
+    cbm_resolve_type_fact_t arms[] = {cbm_resolve_types_lookup(&map, scope, "first", 30),
+                                      cbm_resolve_types_lookup(&map, scope, "second", 30)};
+    ASSERT_NOT_NULL(arms[0].evidence.proof);
+    ASSERT_NOT_NULL(arms[1].evidence.proof);
+    ASSERT(arms[0].evidence.proof != arms[1].evidence.proof);
+    ASSERT_EQ(arms[0].evidence.proof->value.kind, CBM_PROOF_TYPE_BIND);
+    ASSERT_EQ(arms[0].evidence.proof->value.premises[0]->value.kind, CBM_PROOF_ADAPTER_TYPE);
+    ASSERT_STR_EQ(arms[0].evidence.proof->value.source.content_identity, "captured-source");
+    ASSERT(cbm_resolve_types_copy(&map, scope, "copied", scope, "first", 30, true));
+    cbm_resolve_type_fact_t copied = cbm_resolve_types_lookup(&map, scope, "copied", 30);
+    ASSERT_EQ(copied.evidence.proof->value.kind, CBM_PROOF_TYPE_COPY);
+    ASSERT_EQ(copied.evidence.proof->value.premise_count, 1);
+    ASSERT(copied.evidence.proof->value.premises[0] == arms[0].evidence.proof);
+    cbm_resolve_type_fact_t joined = cbm_resolve_types_join(&map, arms, 2, 40);
+    ASSERT_EQ(joined.status, CBM_RESOLVE_TYPE_KNOWN);
+    ASSERT_EQ(joined.evidence.proof->value.kind, CBM_PROOF_TYPE_JOIN);
+    ASSERT_EQ(joined.evidence.proof->value.premise_count, 2);
+    ASSERT(joined.evidence.proof != arms[0].evidence.proof);
+    cbm_resolve_type_fact_t reversed[] = {arms[1], arms[0]};
+    ASSERT(cbm_resolve_types_join(&map, reversed, 2, 40).evidence.proof == joined.evidence.proof);
+    ASSERT(cbm_resolve_types_invalidate(&map, scope, "second", 50, CBM_RESOLVE_TYPE_UNKNOWN));
+    cbm_resolve_type_fact_t failed = cbm_resolve_types_join(&map, arms, 2, 60);
+    ASSERT_EQ(failed.status, CBM_RESOLVE_TYPE_STALE);
+    ASSERT(failed.evidence.proof == NULL);
+    ASSERT(cbm_resolve_types_lookup(&map, scope, "second", 60).evidence.proof == NULL);
+    ASSERT_EQ(cbm_resolve_types_fact_status(&joined), CBM_RESOLVE_TYPE_KNOWN);
+    ASSERT(!cbm_resolve_types_set_context(&map, &source));
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(resolver_type_equal_offset_shadow_bindings_have_distinct_identities) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMScope *outer = cbm_scope_push(&arena, NULL);
+    CBMScope *inner = cbm_scope_push(&arena, outer);
+    CBMResolveTypeMap map;
+    cbm_resolve_types_init(&map, &arena, 0);
+    const CBMType *type = cbm_type_named(&arena, "project.Widget");
+    cbm_resolve_result_t evidence = type_proof("project.Widget");
+    ASSERT(cbm_resolve_types_declare(&map, outer, "same", 0, type, CBM_RESOLVE_TYPE_ANNOTATION,
+                                     &evidence));
+    ASSERT(cbm_resolve_types_declare(&map, inner, "same", 0, type, CBM_RESOLVE_TYPE_ANNOTATION,
+                                     &evidence));
+    cbm_resolve_type_fact_t a = cbm_resolve_types_lookup(&map, outer, "same", 0);
+    cbm_resolve_type_fact_t b = cbm_resolve_types_lookup(&map, inner, "same", 0);
+    ASSERT_NOT_NULL(a.evidence.proof);
+    ASSERT_NOT_NULL(b.evidence.proof);
+    ASSERT(a.evidence.proof != b.evidence.proof);
+    ASSERT(strcmp(a.evidence.proof->value.key.binding_identity,
+                  b.evidence.proof->value.key.binding_identity) != 0);
+    ASSERT(a.evidence.proof->value.source.content_identity == NULL);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 SUITE(resolver_types) {
+    RUN_TEST(resolver_type_copy_and_join_preserve_actual_support_dag);
+    RUN_TEST(resolver_type_equal_offset_shadow_bindings_have_distinct_identities);
+    RUN_TEST(resolver_type_adapted_snapshot_cannot_hide_revocation_or_map_reinitialization);
+    RUN_TEST(resolver_type_cached_copy_survives_table_growth_and_source_reassignment);
     RUN_TEST(resolver_type_exact_annotation_and_copy);
     RUN_TEST(resolver_type_unknown_shadow_blocks_parent);
     RUN_TEST(resolver_type_unknown_assignment_versions_and_clears_callable);

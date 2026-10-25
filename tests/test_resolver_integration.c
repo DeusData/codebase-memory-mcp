@@ -220,6 +220,62 @@ static bool import_golden(cbm_store_t *store) {
                             "target='resolver-integration.lib.target'") == 1;
 }
 
+TEST(resolver_integration_python_relative_imports_keep_exact_targets) {
+    const char *sources[] = {
+        ("from .lib import target as execute\ndef caller():\n    return execute()\n"),
+        ("from ..lib import target as execute\ndef caller():\n    return execute()\n"),
+        ("from .lib import target as execute\ndef caller(execute):\n    return execute()\n"),
+        ("from .lib import target as execute\ndef caller():\n    execute = other\n    return "
+         "execute()\n"),
+        ("from ...lib import target as execute\ndef caller():\n    return execute()\n"),
+    };
+    size_t source_count = sizeof(sources) / sizeof(sources[0]);
+    for (size_t run = 0; run <= source_count; run++) {
+        /* Repeat the first real package through the >50-file worker path.
+         * The tiny independent padding functions add no imports or calls. */
+        bool parallel = run == source_count;
+        size_t i = parallel ? 0 : run;
+        resolver_fixture_t fixture;
+        ASSERT(fixture_init(&fixture, "pass\n", false, parallel ? 50 : 0));
+        ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "pkg/sub"), 0755));
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, "pkg/__init__.py"), ""), 0);
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, "pkg/sub/__init__.py"), ""), 0);
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, "pkg/lib.py"), TARGET_SOURCE), 0);
+        const char *relative = i == 1 ? "pkg/sub/main.py" : "pkg/main.py";
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, relative), sources[i]), 0);
+        ASSERT_EQ(run_fixture(&fixture, fixture.database, parallel), 0);
+        cbm_store_t *store = cbm_store_open_path_existing(fixture.database);
+        ASSERT_NOT_NULL(store);
+        const char *caller =
+            i == 1 ? RESOLVER_PROJECT ".pkg.sub.main.caller" : RESOLVER_PROJECT ".pkg.main.caller";
+        int genuine = count_edge(store, caller, RESOLVER_PROJECT ".pkg.lib.target", "CALLS");
+        int decoy = count_edge(store, caller, RESOLVER_PROJECT ".decoy.target", "CALLS") +
+                    count_edge(store, caller, RESOLVER_PROJECT ".decoy.execute", "CALLS");
+        /* SHA-256 of the independently known empty source. A missing cache
+         * result or placeholder summary must not pass as a captured file. */
+        int empty_summaries =
+            count_sql(store, "SELECT count(*) FROM resolver_file_summaries "
+                             "WHERE project='resolver-integration' "
+                             "AND file_path IN ('pkg/__init__.py','pkg/sub/__init__.py') "
+                             "AND complete=1 AND raw_length=0 "
+                             "AND raw_content_identity="
+                             "'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' "
+                             "AND length(module)>0 AND length(configuration_identity)=64 "
+                             "AND length(extracted_summary)=64");
+        if (genuine != (i < 2 ? 1 : 0) || decoy != 0 || empty_summaries != 2)
+            fprintf(stderr,
+                    "  [relative-import] case=%zu parallel=%d genuine=%d expected=%d "
+                    "decoy=%d empty_summaries=%d\n",
+                    i, parallel, genuine, i < 2 ? 1 : 0, decoy, empty_summaries);
+        cbm_store_close(store);
+        th_rmtree(fixture.root);
+        ASSERT_EQ(genuine, i < 2 ? 1 : 0);
+        ASSERT_EQ(decoy, 0);
+        ASSERT_EQ(empty_summaries, 2);
+    }
+    PASS();
+}
+
 TEST(resolver_integration_python_named_alias_sequential) {
     resolver_fixture_t fixture;
     ASSERT(fixture_init(&fixture, IMPORT_SOURCE, true, 0));
@@ -346,8 +402,183 @@ TEST(resolver_integration_added_module_rebuild_matches_fresh_and_noop_preserves_
     PASS();
 }
 
+typedef struct {
+    bool setup_ok;
+    int run_rc;
+    bool forced_full;
+    int summary_rc;
+    bool present;
+    bool golden;
+    bool rows_equal;
+    bool digest_equal;
+} generation_refresh_result_t;
+
+static generation_refresh_result_t generation_refresh_case(const char *invalidate) {
+    generation_refresh_result_t result = {.run_rc = -1, .summary_rc = CBM_STORE_ERR};
+    resolver_fixture_t fixture;
+    if (!fixture_init(&fixture, IMPORT_SOURCE, true, 0))
+        return result;
+    if (run_fixture(&fixture, fixture.database, false) != 0) {
+        th_rmtree(fixture.root);
+        return result;
+    }
+    cbm_store_t *store = cbm_store_open_path_existing(fixture.database);
+    char *expected_rows = store ? occurrence_listing(store) : NULL;
+    unsigned char expected_digest[32];
+    cbm_resolve_counts_t counts;
+    bool present = false;
+    result.setup_ok =
+        store && expected_rows && import_golden(store) &&
+        cbm_store_graph_content_digest(store, RESOLVER_PROJECT, expected_digest) == CBM_STORE_OK;
+    if (result.setup_ok) {
+        /* Simulate stale/missing resolver metadata without changing any source.
+         * Missing graph and outcome rows make a marker-only repair insufficient. */
+        sqlite3 *db = cbm_store_get_db(store);
+        result.setup_ok =
+            sqlite3_exec(db, invalidate, NULL, NULL, NULL) == SQLITE_OK &&
+            sqlite3_exec(db,
+                         "DELETE FROM resolver_occurrences WHERE project='" RESOLVER_PROJECT
+                         "';DELETE FROM edges WHERE project='" RESOLVER_PROJECT
+                         "' AND type IN ('CALLS','USAGE');",
+                         NULL, NULL, NULL) == SQLITE_OK &&
+            cbm_store_resolver_summary(store, RESOLVER_PROJECT, &counts, &present) ==
+                CBM_STORE_OK &&
+            !present && cbm_store_seal_for_atomic_publish(store) == CBM_STORE_OK;
+    }
+    if (store)
+        cbm_store_close(store);
+    if (result.setup_ok) {
+        result.run_rc = run_fixture(&fixture, fixture.database, false);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        result.forced_full =
+            cbm_pipeline_incremental_test_last_route() == CBM_INCREMENTAL_ROUTE_FORCED_FULL;
+#else
+        result.forced_full = true; /* Production builds still check restored graph and outcomes. */
+#endif
+        store = cbm_store_open_path_existing(fixture.database);
+        if (store) {
+            unsigned char actual_digest[32];
+            char *actual_rows = occurrence_listing(store);
+            result.summary_rc =
+                cbm_store_resolver_summary(store, RESOLVER_PROJECT, &counts, &result.present);
+            result.golden = import_golden(store);
+            result.rows_equal = actual_rows && strcmp(expected_rows, actual_rows) == 0;
+            result.digest_equal =
+                cbm_store_graph_content_digest(store, RESOLVER_PROJECT, actual_digest) ==
+                    CBM_STORE_OK &&
+                memcmp(expected_digest, actual_digest, sizeof(expected_digest)) == 0;
+            free(actual_rows);
+            cbm_store_close(store);
+        }
+    }
+    free(expected_rows);
+    th_rmtree(fixture.root);
+    return result;
+}
+
+TEST(resolver_integration_old_rules_version_rebuilds_unchanged_source) {
+    generation_refresh_result_t result =
+        generation_refresh_case("UPDATE resolver_generations SET rules_version=rules_version-1 "
+                                "WHERE project='" RESOLVER_PROJECT "';");
+    ASSERT(result.setup_ok);
+    ASSERT_EQ(result.run_rc, 0);
+    ASSERT(result.forced_full);
+    ASSERT_EQ(result.summary_rc, CBM_STORE_OK);
+    ASSERT(result.present);
+    ASSERT(result.golden);
+    ASSERT(result.rows_equal);
+    ASSERT(result.digest_equal);
+    PASS();
+}
+
+TEST(resolver_integration_missing_generation_rebuilds_unchanged_source) {
+    generation_refresh_result_t result =
+        generation_refresh_case("DROP TABLE resolver_generations;");
+    ASSERT(result.setup_ok);
+    ASSERT_EQ(result.run_rc, 0);
+    ASSERT(result.forced_full);
+    ASSERT_EQ(result.summary_rc, CBM_STORE_OK);
+    ASSERT(result.present);
+    ASSERT(result.golden);
+    ASSERT(result.rows_equal);
+    ASSERT(result.digest_equal);
+    PASS();
+}
+
+static bool write_export_chain(const resolver_fixture_t *fixture, bool module_alias) {
+    for (int i = 0; i < 48; i++) {
+        char name[64], source[128];
+        snprintf(name, sizeof(name), "link_%03d.py", i);
+        if (i == 47)
+            snprintf(source, sizeof(source), "%s",
+                     module_alias ? "import lib as alias\n" : "from lib import target\n");
+        else
+            snprintf(source, sizeof(source), "from link_%03d import %s\n", i + 1,
+                     module_alias ? "alias" : "target");
+        if (th_write_file(TH_PATH(fixture->repo, name), source) != 0)
+            return false;
+    }
+    return true;
+}
+
+TEST(resolver_integration_long_export_chain_stabilizes_before_parallel_emission) {
+    static const char source[] = "from link_000 import target as execute\n\n"
+                                 "def caller():\n    return execute()\n\n"
+                                 "def reference():\n    return execute\n";
+    resolver_fixture_t fixture;
+    /* 55 files exercise parallel emission as well as a chain beyond the old 32-hop cap. */
+    ASSERT(fixture_init(&fixture, source, true, 4));
+    ASSERT(write_export_chain(&fixture, false));
+    ASSERT_EQ(run_fixture(&fixture, fixture.database, false), 0);
+    ASSERT_EQ(run_fixture(&fixture, fixture.fresh_database, true), 0);
+    cbm_store_t *sequential = cbm_store_open_path_existing(fixture.database);
+    cbm_store_t *parallel = cbm_store_open_path_existing(fixture.fresh_database);
+    ASSERT_NOT_NULL(sequential);
+    ASSERT_NOT_NULL(parallel);
+    bool seq_golden = import_golden(sequential), par_golden = import_golden(parallel);
+    char *seq_rows = occurrence_listing(sequential), *par_rows = occurrence_listing(parallel);
+    bool equal = seq_rows && par_rows && strcmp(seq_rows, par_rows) == 0;
+    free(seq_rows);
+    free(par_rows);
+    cbm_store_close(sequential);
+    cbm_store_close(parallel);
+    th_rmtree(fixture.root);
+    ASSERT(seq_golden);
+    ASSERT(par_golden);
+    ASSERT(equal);
+    PASS();
+}
+
+TEST(resolver_integration_long_module_alias_chain_preserves_exact_suffix) {
+    static const char source[] = "from link_000 import alias as bridge\n\n"
+                                 "def caller():\n    bridge.target()\n    bridge.target.extra()\n";
+    resolver_fixture_t fixture;
+    ASSERT(fixture_init(&fixture, source, true, 0));
+    ASSERT(write_export_chain(&fixture, true));
+    ASSERT_EQ(run_fixture(&fixture, fixture.database, false), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(fixture.database);
+    ASSERT_NOT_NULL(store);
+    int exact =
+        count_edge(store, RESOLVER_PROJECT ".main.caller", RESOLVER_PROJECT ".lib.target", "CALLS");
+    int calls = cbm_store_count_edges_by_type(store, RESOLVER_PROJECT, "CALLS");
+    int emitted =
+        count_sql(store, "SELECT count(*) FROM resolver_occurrences WHERE file_path='main.py' "
+                         "AND relation='CALLS' AND emitted=1");
+    cbm_store_close(store);
+    th_rmtree(fixture.root);
+    ASSERT_EQ(exact, 1);
+    ASSERT_EQ(calls, 1);
+    ASSERT_EQ(emitted, 1);
+    PASS();
+}
+
 SUITE(resolver_integration) {
+    RUN_TEST(resolver_integration_long_export_chain_stabilizes_before_parallel_emission);
+    RUN_TEST(resolver_integration_long_module_alias_chain_preserves_exact_suffix);
+    RUN_TEST(resolver_integration_old_rules_version_rebuilds_unchanged_source);
+    RUN_TEST(resolver_integration_missing_generation_rebuilds_unchanged_source);
     RUN_TEST(resolver_integration_python_named_alias_sequential);
+    RUN_TEST(resolver_integration_python_relative_imports_keep_exact_targets);
     RUN_TEST(resolver_integration_python_named_alias_parallel_matches_sequential);
     RUN_TEST(resolver_integration_missing_import_keeps_two_unresolved_occurrences);
     RUN_TEST(resolver_integration_added_module_rebuild_matches_fresh_and_noop_preserves_metadata);

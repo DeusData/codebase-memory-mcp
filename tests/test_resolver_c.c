@@ -40,12 +40,26 @@ TEST(resolver_c_visible_functions_and_callable_values_have_proof) {
     const char *source = "#include \"lib.h\"\nvoid work(void); void sink(void (*fp)(void));\n"
                          "void run(void) { work(); imported(); sink(work); "
                          "void (*alias)(void) = &work; alias(); sink(alias); }\n";
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.work", .short_name = "work", .label = "Function"},
-        {.qualified_name = "test.main.sink", .short_name = "sink", .label = "Function"},
-        {.qualified_name = "test.lib.imported", .short_name = "imported", .label = "Function"},
-        {.qualified_name = "other.work", .short_name = "work", .label = "Function"},
-        {.qualified_name = "other.imported", .short_name = "imported", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
+                         .declaration_identity = "fixture:test.main.work",
+                         .short_name = "work",
+                         .label = "Function"},
+                        {.qualified_name = "test.main.sink",
+                         .declaration_identity = "fixture:test.main.sink",
+                         .short_name = "sink",
+                         .label = "Function"},
+                        {.qualified_name = "test.lib.imported",
+                         .declaration_identity = "fixture:test.lib.imported",
+                         .short_name = "imported",
+                         .label = "Function"},
+                        {.qualified_name = "other.work",
+                         .declaration_identity = "fixture:other.work",
+                         .short_name = "work",
+                         .label = "Function"},
+                        {.qualified_name = "other.imported",
+                         .declaration_identity = "fixture:other.imported",
+                         .short_name = "imported",
+                         .label = "Function"}};
     const char *paths[] = {"lib.h"}, *modules[] = {"test.lib"};
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -65,9 +79,14 @@ TEST(resolver_c_later_declarations_and_includes_are_not_visible) {
     const char *source = "void early(void) { later(); imported(); }\n"
                          "void later(void);\n#include \"lib.h\"\n"
                          "void late(void) { later(); imported(); }\n";
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.later", .short_name = "later", .label = "Function"},
-        {.qualified_name = "test.lib.imported", .short_name = "imported", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.later",
+                         .declaration_identity = "fixture:test.main.later",
+                         .short_name = "later",
+                         .label = "Function"},
+                        {.qualified_name = "test.lib.imported",
+                         .declaration_identity = "fixture:test.lib.imported",
+                         .short_name = "imported",
+                         .label = "Function"}};
     const char *paths[] = {"lib.h"}, *modules[] = {"test.lib"};
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -89,10 +108,18 @@ TEST(resolver_c_later_declarations_and_includes_are_not_visible) {
 TEST(resolver_c_unknown_shadow_and_include_conflicts_abstain) {
     const char *source = "#include \"one.h\"\n#include \"two.h\"\n"
                          "void target(void); void run(Missing target) { target(); clash(); }\n";
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.target", .short_name = "target", .label = "Function"},
-        {.qualified_name = "test.one.clash", .short_name = "clash", .label = "Function"},
-        {.qualified_name = "test.two.clash", .short_name = "clash", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.target",
+                         .declaration_identity = "fixture:7:test.main.target",
+                         .short_name = "target",
+                         .label = "Function"},
+                        {.qualified_name = "test.one.clash",
+                         .declaration_identity = "fixture:8:test.one.clash",
+                         .short_name = "clash",
+                         .label = "Function"},
+                        {.qualified_name = "test.two.clash",
+                         .declaration_identity = "fixture:9:test.two.clash",
+                         .short_name = "clash",
+                         .label = "Function"}};
     const char *paths[] = {"one.h", "two.h"}, *modules[] = {"test.one", "test.two"};
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -108,9 +135,14 @@ TEST(resolver_c_unknown_shadow_and_include_conflicts_abstain) {
 }
 
 TEST(resolver_cpp_namespaces_and_using_require_unique_declarations) {
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.one.target", .short_name = "target", .label = "Function"},
-        {.qualified_name = "test.main.two.target", .short_name = "target", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.one.target",
+                         .declaration_identity = "fixture:test.main.one.target",
+                         .short_name = "target",
+                         .label = "Function"},
+                        {.qualified_name = "test.main.two.target",
+                         .declaration_identity = "fixture:test.main.two.target",
+                         .short_name = "target",
+                         .label = "Function"}};
     const char *source = "namespace one { void target(); void local() { target(); } }\n"
                          "namespace two { void target(); }\n"
                          "void qualified() { one::target(); }\n"
@@ -129,18 +161,20 @@ TEST(resolver_cpp_namespaces_and_using_require_unique_declarations) {
 }
 
 TEST(resolver_cpp_overloads_and_unmodelled_adl_abstain) {
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.target",
-         .short_name = "target",
-         .label = "Function",
-         .sig = "(int)",
-         .declaration_identity = "target-int"},
-        {.qualified_name = "test.main.target",
-         .short_name = "target",
-         .label = "Function",
-         .sig = "(double)",
-         .declaration_identity = "target-double"},
-        {.qualified_name = "test.main.single", .short_name = "single", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.target",
+                         .short_name = "target",
+                         .label = "Function",
+                         .sig = "(int)",
+                         .declaration_identity = "target-int"},
+                        {.qualified_name = "test.main.target",
+                         .short_name = "target",
+                         .label = "Function",
+                         .sig = "(double)",
+                         .declaration_identity = "target-double"},
+                        {.qualified_name = "test.main.single",
+                         .declaration_identity = "fixture:14:test.main.single",
+                         .short_name = "single",
+                         .label = "Function"}};
     const char *source = "void target(int); void target(double); void single(Missing);\n"
                          "void run(Missing value) { target(1); consume(target); single(value); }";
     CBMArena arena;
@@ -161,7 +195,10 @@ TEST(resolver_c_callable_mutations_and_escapes_clear_identity) {
                          "void (*third)(void) = work; mutate(&third); third();\n"
                          "void (*loop)(void) = work; while (cond) { loop(); loop = dynamic; }\n"
                          "void (*fake)(void) = (void (*)(void))lookup(\"work\"); fake(); }";
-    CBMLSPDef def = {.qualified_name = "test.main.work", .short_name = "work", .label = "Function"};
+    CBMLSPDef def = {.qualified_name = "test.main.work",
+                     .declaration_identity = "fixture:15:test.main.work",
+                     .short_name = "work",
+                     .label = "Function"};
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
@@ -304,7 +341,63 @@ TEST(resolver_cpp_direct_member_requires_source_class_and_visibility) {
     PASS();
 }
 
+TEST(resolver_cpp_written_header_type_requires_complete_visible_domain) {
+    static const char library[] = "struct Engine { void work() {} };\n";
+    const char *sources[] = {
+        "#include \"engine.h\"\nvoid run(Engine value) { value.work(); }\n",
+        "void run(Engine value) { value.work(); }\n#include \"engine.h\"\n",
+        "#include \"engine.h\"\n#include \"other.h\"\n"
+        "void run(Engine value) { value.work(); }\n",
+        "#include \"engine.h\"\nvoid run(Missing::Engine value) { value.work(); }\n",
+        "struct Engine {};\n#include \"engine.h\"\n"
+        "void run(Engine value) { value.work(); }\n"};
+    const char *paths[] = {"engine.h", "other.h"};
+    const char *modules[] = {"test.engine", "test.other"};
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMLSPDef defs[] = {{.qualified_name = "test.engine.Engine",
+                             .graph_qualified_name = "test.engine.Engine",
+                             .short_name = "Engine",
+                             .label = "Class",
+                             .source_start_line = 1,
+                             .declaration_identity = "engine:0"},
+                            {.qualified_name = "test.engine.Engine.work",
+                             .graph_qualified_name = "test.engine.Engine.work",
+                             .short_name = "work",
+                             .label = "Method",
+                             .source_start_line = 1,
+                             .receiver_type = "test.engine.Engine",
+                             .declaration_identity = "engine:1"},
+                            /* A memberless, unaudited namesake still competes. */
+                            {.qualified_name = "test.other.Engine",
+                             .graph_qualified_name = "test.other.Engine",
+                             .short_name = "Engine",
+                             .label = "Class",
+                             .source_start_line = 1,
+                             .declaration_identity = "other:0"},
+                            {.qualified_name = "test.main.Engine",
+                             .graph_qualified_name = "test.main.Engine",
+                             .short_name = "Engine",
+                             .label = "Class",
+                             .source_start_line = 1,
+                             .declaration_identity = "local:0"}};
+        ASSERT(cbm_c_collect_source_facts(&arena, library, (int)strlen(library), "test.engine",
+                                          defs, 3));
+        CBMResolvedCallArray rows = {0};
+        c_cross(&arena, sources[i], true, defs, i == 4 ? 4 : 3, paths, modules, i == 2 ? 2 : 1,
+                &rows);
+        int exact = c_proven_count(&rows, "test.engine.Engine.work");
+        int all = c_proven_count(&rows, NULL);
+        cbm_arena_destroy(&arena);
+        ASSERT_EQ(exact, i == 0 ? 1 : 0);
+        ASSERT_EQ(all, exact);
+    }
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_cpp_written_header_type_requires_complete_visible_domain);
     RUN_TEST(resolver_cpp_direct_member_requires_source_class_and_visibility);
     RUN_TEST(resolver_c_configured_owners_preserve_exact_body_calls);
     RUN_TEST(resolver_c_visible_functions_and_callable_values_have_proof);

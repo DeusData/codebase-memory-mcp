@@ -2,6 +2,7 @@
 #include "cbm.h"
 #include "resolve/binding.h"
 #include "resolve/policy.h"
+#include "resolve/proof.h"
 
 static cbm_resolve_result_t local_candidate(CBMArena *arena, const CBMFileResult *result,
                                             const char *name) {
@@ -150,6 +151,45 @@ TEST(resolver_binding_python_import_needs_independent_export_proof) {
     ASSERT(cbm_resolve_admit(&resolved));
     cbm_arena_destroy(&arena);
     cbm_free_result(result);
+    PASS();
+}
+
+TEST(resolver_binding_python_relative_import_preserves_local_authority) {
+    const char *sources[] = {
+        ("from .library import helper as execute\ndef caller():\n    return execute()\n"),
+        ("from ..library import helper as execute\ndef caller():\n    return execute()\n"),
+        ("from .library import helper as execute\ndef caller(execute):\n    return execute()\n"),
+        ("from .library import helper as execute\ndef caller():\n    execute = other\n    return "
+         "execute()\n"),
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        const char *source = sources[i];
+        CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
+                                                 "test", "package/binding.py", 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, result, CBM_LANG_PYTHON, source, strlen(source));
+        const CBMCall *call = find_call(result, "execute");
+        ASSERT_NOT_NULL(call);
+        cbm_resolve_result_t candidate = local_candidate(&arena, result, "helper");
+        candidate.rule = CBM_RESOLVE_RULE_IMPORT_BINDING;
+        candidate.target = "test.library.helper";
+        candidate.facts |= CBM_RESOLVE_FACT_IMPORT_BOUND;
+        /* Structural syntax support alone does not establish the imported target. */
+        cbm_resolve_result_t unresolved = validate_call(index, call, candidate);
+        ASSERT(!cbm_resolve_admit(&unresolved));
+        candidate.facts |= CBM_RESOLVE_FACT_LOOKUP_COMPLETE;
+        cbm_resolve_result_t resolved = validate_call(index, call, candidate);
+        ASSERT_EQ(cbm_resolve_admit(&resolved), i < 2);
+        if (i < 2) {
+            ASSERT_STR_EQ(resolved.target, "test.library.helper");
+            ASSERT(resolved.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT);
+        }
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+    }
     PASS();
 }
 
@@ -430,7 +470,192 @@ TEST(resolver_binding_python_explicit_binding_after_wildcard) {
     PASS();
 }
 
+TEST(resolver_binding_python_defaults_and_annotations_use_enclosing_namespace) {
+    const char *source = "def target():\n    return 1\n"
+                         "class C:\n    def target():\n        return 2\n"
+                         "    def method(value: target() = target()) -> target():\n"
+                         "        target()\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                             "binding.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, result, CBM_LANG_PYTHON, source, strlen(source));
+    uint32_t body = (uint32_t)(strstr(source, "        target()") - source);
+    int headers = 0, bodies = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (strcmp(call->callee_name, "target"))
+            continue;
+        bool header = call->site_start_byte < body;
+        cbm_resolve_result_t correct = validate_call(
+            index, call, local_candidate(&arena, result, header ? "C.target" : "target"));
+        cbm_resolve_result_t wrong = validate_call(
+            index, call, local_candidate(&arena, result, header ? "target" : "C.target"));
+        ASSERT(cbm_resolve_admit(&correct));
+        ASSERT_FALSE(cbm_resolve_admit(&wrong));
+        if (header)
+            headers++;
+        else
+            bodies++;
+    }
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    ASSERT_EQ(headers, 3);
+    ASSERT_EQ(bodies, 1);
+    PASS();
+}
+
+TEST(resolver_binding_python_self_default_is_unbound_but_body_recurses) {
+    const char *source = "def target(value=target()):\n    return target()\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                             "binding.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, result, CBM_LANG_PYTHON, source, strlen(source));
+    uint32_t body = (uint32_t)(strstr(source, "    return") - source);
+    int rejected = 0, recursive = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (strcmp(call->callee_name, "target"))
+            continue;
+        cbm_resolve_result_t proof =
+            validate_call(index, call, local_candidate(&arena, result, "target"));
+        if (call->site_start_byte < body) {
+            ASSERT_FALSE(cbm_resolve_admit(&proof));
+            ASSERT_STR_EQ(proof.reason, "binding_declaration_not_yet_bound");
+            rejected++;
+        } else {
+            ASSERT(cbm_resolve_admit(&proof));
+            recursive++;
+        }
+    }
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    ASSERT_EQ(rejected, 1);
+    ASSERT_EQ(recursive, 1);
+    PASS();
+}
+
+TEST(resolver_binding_python_default_reads_outer_name_before_parameter_shadow) {
+    const char *sources[] = {
+        "def target():\n    return 1\ndef caller(target=target()):\n    return target()\n",
+        "def target():\n    return 1\ncallback = lambda target=target(): target()\n"};
+    for (size_t example = 0; example < sizeof(sources) / sizeof(sources[0]); example++) {
+        const char *source = sources[example];
+        CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
+                                                 "test", "binding.py", 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, result, CBM_LANG_PYTHON, source, strlen(source));
+        uint32_t default_at =
+            (uint32_t)(strstr(source, "target=target()") - source + strlen("target="));
+        int defaults = 0, shadows = 0;
+        for (int i = 0; i < result->calls.count; i++) {
+            const CBMCall *call = &result->calls.items[i];
+            if (strcmp(call->callee_name, "target"))
+                continue;
+            cbm_resolve_result_t proof =
+                validate_call(index, call, local_candidate(&arena, result, "target"));
+            if (call->site_start_byte == default_at) {
+                ASSERT(cbm_resolve_admit(&proof));
+                defaults++;
+            } else {
+                ASSERT_FALSE(cbm_resolve_admit(&proof));
+                shadows++;
+            }
+        }
+        cbm_arena_destroy(&arena);
+        cbm_free_result(result);
+        ASSERT_EQ(defaults, 1);
+        ASSERT_EQ(shadows, 1);
+    }
+    PASS();
+}
+
+TEST(resolver_binding_python_package_symbol_scope_preserves_file_identity) {
+    const char *source = "def target():\n    return 1\ndef caller():\n    return target()\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                             "pkg/__init__.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    ASSERT_STR_EQ(result->module_qn, "test.pkg.__init__");
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, result, CBM_LANG_PYTHON, source, strlen(source));
+    const CBMCall *call = find_call(result, "target");
+    ASSERT_NOT_NULL(call);
+    cbm_resolve_result_t proof = cbm_resolve_binding_local(
+        index, call->callee_name, call->site_start_byte, call->site_end_byte, call->source_origin);
+    ASSERT(cbm_resolve_admit(&proof));
+    ASSERT_STR_EQ(proof.target, "test.pkg.target");
+    ASSERT(cbm_resolve_binding_export(index, "test.pkg.target"));
+    ASSERT_FALSE(cbm_resolve_binding_export(index, "test.pkg.__init__.target"));
+    ASSERT_STR_EQ(result->module_qn, "test.pkg.__init__");
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(resolver_binding_local_result_carries_captured_source_proof) {
+    const char *source = "def helper():\n    return 1\ndef caller():\n    return helper()\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                             "binding.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, result, CBM_LANG_PYTHON, source, strlen(source));
+    const CBMCall *call = find_call(result, "helper");
+    ASSERT_NOT_NULL(call);
+    cbm_resolve_result_t resolved =
+        validate_call(index, call, local_candidate(&arena, result, "helper"));
+    ASSERT(cbm_resolve_admit(&resolved));
+    ASSERT_NOT_NULL(resolved.proof);
+    const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(resolved.proof);
+    ASSERT_STR_EQ(proof->source.content_identity, result->source_content_id[0]);
+    ASSERT_STR_EQ(proof->source.configuration_identity, result->source_configuration_id);
+    ASSERT(proof->premise_count >= 3);
+    ASSERT_EQ(proof->key.start_byte, call->site_start_byte);
+    ASSERT_EQ(proof->key.end_byte, call->site_end_byte);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(resolver_binding_missing_captured_source_remains_unknown) {
+    const char *source = "def helper():\n    return 1\ndef caller():\n    return helper()\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                             "binding.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    result->source_content_id[0][0] = '\0';
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, result, CBM_LANG_PYTHON, source, strlen(source));
+    const CBMCall *call = find_call(result, "helper");
+    ASSERT_NOT_NULL(call);
+    cbm_resolve_result_t resolved =
+        validate_call(index, call, local_candidate(&arena, result, "helper"));
+    ASSERT(!cbm_resolve_admit(&resolved));
+    ASSERT_EQ(resolved.analysis, CBM_RESOLVE_ANALYSIS_UNKNOWN);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    PASS();
+}
+
 SUITE(resolver_binding) {
+    RUN_TEST(resolver_binding_local_result_carries_captured_source_proof);
+    RUN_TEST(resolver_binding_missing_captured_source_remains_unknown);
+    RUN_TEST(resolver_binding_python_defaults_and_annotations_use_enclosing_namespace);
+    RUN_TEST(resolver_binding_python_self_default_is_unbound_but_body_recurses);
+    RUN_TEST(resolver_binding_python_default_reads_outer_name_before_parameter_shadow);
+    RUN_TEST(resolver_binding_python_package_symbol_scope_preserves_file_identity);
     RUN_TEST(resolver_binding_python_explicit_binding_after_wildcard);
     RUN_TEST(resolver_binding_python_lambda_parameters_have_their_own_scope);
     RUN_TEST(resolver_binding_python_assignment_values_do_not_create_shadow_bindings);
@@ -443,6 +668,7 @@ SUITE(resolver_binding) {
     RUN_TEST(resolver_binding_python_assignment_and_duplicate_definitions_abstain);
     RUN_TEST(resolver_binding_dynamic_namespace_and_unknown_syntax_abstain);
     RUN_TEST(resolver_binding_python_import_needs_independent_export_proof);
+    RUN_TEST(resolver_binding_python_relative_import_preserves_local_authority);
     RUN_TEST(resolver_binding_exact_occurrence_and_origin_required);
     RUN_TEST(resolver_binding_lua_local_function_and_shadow);
     RUN_TEST(resolver_binding_unsupported_language_is_explicit);

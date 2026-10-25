@@ -6,6 +6,7 @@
 #include "foundation/mem_events.h" // waste sanitizer: the bound allocators bypass every observer
 #include "foundation/log.h"        // cbm_log_warn -- extract.lsp.skipped
 #include "cbm.h"
+#include "foundation/sha256.h"
 #include "arena.h"   // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "doclink.h" // cbm_doclinks_extract: doc-comment references + doc-link scope
 #include "helpers.h"
@@ -3616,6 +3617,55 @@ int cbm_test_enclosing_sweep_mismatches(const CBMFileResult *result) {
 }
 #endif
 
+bool cbm_result_source_matches(const CBMFileResult *result, const char *source, size_t length,
+                               CBMSourceOrigin origin) {
+    if (!result || !source || origin < CBM_SOURCE_ORIGIN_RAW ||
+        origin > CBM_SOURCE_ORIGIN_PREPROCESSED || !result->source_content_id[origin][0] ||
+        result->source_content_length[origin] != length)
+        return false;
+    char identity[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(source, length, identity);
+    return strcmp(identity, result->source_content_id[origin]) == 0;
+}
+
+/* Preserve preprocessing option order and boundaries. This configuration ID
+ * supplements the actual expanded-byte identity; neither is a raw-file hash. */
+static void cbm_source_config_part(cbm_sha256_ctx *hash, const char *text) {
+    uint64_t length = text ? strlen(text) : 0;
+    unsigned char size[8];
+    for (unsigned i = 0; i < sizeof(size); i++)
+        size[i] = (unsigned char)(length >> (i * 8));
+    cbm_sha256_update(hash, size, sizeof(size));
+    if (length)
+        cbm_sha256_update(hash, text, (size_t)length);
+}
+
+static void cbm_source_config_id(CBMFileResult *result, CBMLanguage language, const char **defines,
+                                 const char **paths) {
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
+    cbm_source_config_part(&hash, "cbm-source-transform-v1");
+    unsigned char lang[4];
+    for (unsigned i = 0; i < sizeof(lang); i++)
+        lang[i] = (unsigned char)((uint32_t)language >> (i * 8));
+    cbm_sha256_update(&hash, lang, sizeof(lang));
+    for (size_t i = 0; defines && defines[i]; i++) {
+        cbm_source_config_part(&hash, "define");
+        cbm_source_config_part(&hash, defines[i]);
+    }
+    cbm_source_config_part(&hash, "include-paths");
+    for (size_t i = 0; paths && paths[i]; i++)
+        cbm_source_config_part(&hash, paths[i]);
+    unsigned char digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&hash, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        result->source_configuration_id[i * 2] = hex[digest[i] >> 4];
+        result->source_configuration_id[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    result->source_configuration_id[CBM_SHA256_HEX_LEN] = '\0';
+}
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -3630,12 +3680,21 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return NULL;
     }
 
+    if (source && source_len >= 0) {
+        cbm_sha256_hex(source, (size_t)source_len,
+                       result->source_content_id[CBM_SOURCE_ORIGIN_RAW]);
+        result->source_content_length[CBM_SOURCE_ORIGIN_RAW] = (uint64_t)source_len;
+        cbm_source_config_id(result, language, extra_defines, include_paths);
+    }
+
     result->py_namespace.version = CBM_PY_NAMESPACE_FACTS_VERSION;
     result->py_namespace.language = language;
     result->py_namespace.status =
         language == CBM_LANG_PYTHON ? CBM_PY_NS_NOT_CAPTURED : CBM_PY_NS_NOT_APPLICABLE;
     cbm_work_arena_take(&result->arena);
     CBMArena *a = &result->arena;
+    result->source_project = project ? cbm_arena_strdup(a, project) : NULL;
+    result->source_file = rel_path ? cbm_arena_strdup(a, rel_path) : NULL;
     if (!cbm_test_declarations_validate(result, test_declarations)) {
         return result;
     }
@@ -4036,6 +4095,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                     ts_parser_parse_with_options(pp_parser, NULL, pp_ts_input, pp_opts);
                 if (pp_tree) {
                     TSNode pp_root = ts_tree_root_node(pp_tree);
+                    cbm_sha256_hex(expanded, (size_t)expanded_len,
+                                   result->source_content_id[CBM_SOURCE_ORIGIN_PREPROCESSED]);
+                    result->source_content_length[CBM_SOURCE_ORIGIN_PREPROCESSED] =
+                        (uint64_t)expanded_len;
 
                     // Build context for expanded source — extract only calls via unified extractor
                     CBMExtractCtx pp_ctx = {
@@ -4075,7 +4138,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                         result->type_refs.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
                     }
                     for (int i = typeassigns_before; i < result->type_assigns.count; i++) {
-                        result->type_assigns.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                        result->type_assigns.items[i].source_origin =
+                            CBM_SOURCE_ORIGIN_PREPROCESSED;
                     }
 
                     // Also run LSP on expanded source for additional type-resolved

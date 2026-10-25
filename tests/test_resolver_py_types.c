@@ -4,14 +4,15 @@
 #include "resolve/binding.h"
 #include "resolve/policy.h"
 static const char PY_SERVICE[] = "class Service:\n    def go(self):\n        pass\n";
-static int py_type_rows(const char *source, const char *library, int duplicate,
-                        CBMResolvedKind kind) {
+static int py_type_rows_for_paths(const char *source, const char *library, int duplicate,
+                                  CBMResolvedKind kind, const char *library_path,
+                                  const char *source_path, const char *expected_site) {
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMFileResult *lib = cbm_extract_file(library, (int)strlen(library), CBM_LANG_PYTHON, "p",
-                                          "lib.py", 0, NULL, NULL);
+                                          library_path, 0, NULL, NULL);
     CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "p",
-                                           "main.py", 0, NULL, NULL);
+                                           source_path, 0, NULL, NULL);
     CBMLSPDef defs[3] = {{.qualified_name = "p.lib.Service",
                           .graph_qualified_name = "p.lib.Service",
                           .short_name = "Service",
@@ -29,14 +30,25 @@ static int py_type_rows(const char *source, const char *library, int duplicate,
                           .declaration_identity = "lib:1",
                           .def_module_qn = "p.lib",
                           .lang = CBM_LANG_PYTHON}};
+    /* Keep source spans/decorators exact for decorated-library fixtures. */
+    for (int i = 0; lib && i < lib->defs.count; i++) {
+        const CBMDefinition *definition = &lib->defs.items[i];
+        for (int d = 0; d < 2; d++) {
+            if (definition->qualified_name &&
+                !strcmp(definition->qualified_name, defs[d].qualified_name)) {
+                defs[d].source_start_line = definition->start_line;
+                defs[d].decorators = definition->decorators;
+            }
+        }
+    }
     cbm_resolve_binding_index_t *bindings =
         lib ? cbm_resolve_binding_build(&arena, lib, CBM_LANG_PYTHON, library, strlen(library))
             : NULL;
     defs[0].export_binding_proven =
         (cbm_resolve_binding_export_kind(bindings, defs[0].qualified_name) &
          CBM_RESOLVE_EXPORT_TYPE) != 0;
-    bool facts =
-        cbm_py_collect_source_facts(&arena, library, (int)strlen(library), "p.lib", defs, 2);
+    bool facts = cbm_py_collect_source_facts(&arena, library, (int)strlen(library),
+                                             lib ? lib->module_qn : NULL, defs, 2);
     int count = 2;
     if (duplicate) {
         defs[2] = defs[duplicate == 1 ? 0 : 1];
@@ -59,14 +71,55 @@ static int py_type_rows(const char *source, const char *library, int duplicate,
                                       .facts = row->evidence.facts,
                                       .target = row->callee_qn,
                                       .candidate_count = 1};
+        bool matching_site =
+            !expected_site ||
+            (row->site_end_byte <= strlen(source) && row->site_start_byte < row->site_end_byte &&
+             row->site_end_byte - row->site_start_byte == strlen(expected_site) &&
+             !strncmp(source + row->site_start_byte, expected_site, strlen(expected_site)));
         if (row->kind == kind && cbm_resolve_admit(&proof) &&
-            row->site_end_byte > row->site_start_byte)
+            row->site_end_byte > row->site_start_byte && matching_site)
             found++;
     }
     cbm_free_result(lib);
     cbm_free_result(file);
     cbm_arena_destroy(&arena);
     return found;
+}
+static int py_type_rows(const char *source, const char *library, int duplicate,
+                        CBMResolvedKind kind) {
+    return py_type_rows_for_paths(source, library, duplicate, kind, "lib.py", "main.py", NULL);
+}
+TEST(resolver_python_parenthesized_reference_matches_exact_argument_site) {
+    const char *source = "from lib import Service as Svc\ndef accept(callback):\n    pass\n"
+                         "def run(value: Svc):\n    accept(((value.go)))\n    value.go()\n";
+    ASSERT_EQ(py_type_rows_for_paths(source, PY_SERVICE, 0, CBM_RESOLVED_CALL_REFERENCE, "lib.py",
+                                     "main.py", "((value.go))"),
+              1);
+    ASSERT_EQ(py_type_rows(source, PY_SERVICE, 0, CBM_RESOLVED_INVOCATION), 1);
+    const char *unknown = "from lib import Service as Svc\ndef run(value: Svc):\n"
+                          "    unknown((value.go))\n    value.go()\n";
+    ASSERT_EQ(py_type_rows_for_paths(unknown, PY_SERVICE, 0, CBM_RESOLVED_CALL_REFERENCE, "lib.py",
+                                     "main.py", "(value.go)"),
+              1);
+    ASSERT_EQ(py_type_rows(unknown, PY_SERVICE, 0, CBM_RESOLVED_INVOCATION), 0);
+    const char *composite = "from lib import Service as Svc\ndef run(value: Svc):\n"
+                            "    unknown((value.go, other))\n";
+    ASSERT_EQ(py_type_rows(composite, PY_SERVICE, 0, CBM_RESOLVED_CALL_REFERENCE), 0);
+    PASS();
+}
+TEST(resolver_python_package_declarations_and_effects_use_symbol_scope) {
+    const char *source = "from vendor import *\nfrom lib import Service as Svc\n"
+                         "def constant(value):\n    return value + 1\n"
+                         "def run():\n    value=Svc()\n    constant(1)\n    value.go()\n";
+    ASSERT_EQ(py_type_rows_for_paths(source, PY_SERVICE, 0, CBM_RESOLVED_INVOCATION,
+                                     "lib/__init__.py", "main/__init__.py", "value.go()"),
+              1);
+    const char *shadow = "from lib import Service as Svc\nfrom vendor import *\n"
+                         "def run():\n    value=Svc()\n    value.go()\n";
+    ASSERT_EQ(py_type_rows_for_paths(shadow, PY_SERVICE, 0, CBM_RESOLVED_INVOCATION,
+                                     "lib/__init__.py", "main/__init__.py", NULL),
+              0);
+    PASS();
 }
 TEST(resolver_python_declared_receiver_alias_and_reference) {
     const char *source = "from lib import Service as Svc\ndef run(value: Svc):\n    value.go()\n   "
@@ -184,7 +237,35 @@ TEST(resolver_python_argument_references_precede_unknown_call_effects) {
     PASS();
 }
 
+TEST(resolver_python_decorated_values_do_not_donate_callable_identity) {
+    const char *libraries[] = {
+        "class Service:\n    @property\n    def go(self):\n        return 42\n",
+        "def replace(function):\n    return 42\nclass Service:\n"
+        "    @replace\n    def go(self):\n        pass\n"};
+    const char *source = "from lib import Service as Svc\ndef run(value: Svc):\n"
+                         "    callback=value.go\n    value.go()\n";
+    for (size_t i = 0; i < sizeof(libraries) / sizeof(libraries[0]); i++) {
+        ASSERT_EQ(py_type_rows(source, libraries[i], 0, CBM_RESOLVED_INVOCATION), 0);
+        ASSERT_EQ(py_type_rows(source, libraries[i], 0, CBM_RESOLVED_CALL_REFERENCE), 0);
+    }
+    PASS();
+}
+
+TEST(resolver_python_value_domain_does_not_widen_callable_class_domain) {
+    const char *library = "class Service:\n    def go(self):\n        pass\n"
+                          "    @property\n    def value(self):\n        return 42\n";
+    const char *source = "from lib import Service as Svc\ndef run(value: Svc):\n"
+                         "    callback=value.go\n    value.go()\n";
+    ASSERT_EQ(py_type_rows(source, library, 0, CBM_RESOLVED_INVOCATION), 0);
+    ASSERT_EQ(py_type_rows(source, library, 0, CBM_RESOLVED_CALL_REFERENCE), 0);
+    PASS();
+}
+
 SUITE(resolver_py_types) {
+    RUN_TEST(resolver_python_value_domain_does_not_widen_callable_class_domain);
+    RUN_TEST(resolver_python_decorated_values_do_not_donate_callable_identity);
+    RUN_TEST(resolver_python_parenthesized_reference_matches_exact_argument_site);
+    RUN_TEST(resolver_python_package_declarations_and_effects_use_symbol_scope);
     RUN_TEST(resolver_python_argument_references_precede_unknown_call_effects);
     RUN_TEST(resolver_python_constructor_types_propagate_to_aliases);
     RUN_TEST(resolver_python_class_instance_rebinding_does_not_prove_method);

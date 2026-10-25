@@ -5,7 +5,7 @@
 
 /* Bump when binding or admission semantics change; persisted resolver facts
  * from a different version must be rebuilt, never silently reclassified. */
-#define CBM_RESOLVER_RULES_VERSION 1
+#define CBM_RESOLVER_RULES_VERSION 2
 
 typedef enum {
     CBM_RESOLVE_BINDING_UNRESOLVED = 0,
@@ -23,7 +23,9 @@ typedef enum {
     CBM_RESOLVE_ANALYSIS_UNSUPPORTED = 0,
     CBM_RESOLVE_ANALYSIS_COMPLETE,
     CBM_RESOLVE_ANALYSIS_LIMITED,
-    CBM_RESOLVE_ANALYSIS_FAILED
+    CBM_RESOLVE_ANALYSIS_FAILED,
+    CBM_RESOLVE_ANALYSIS_PENDING,
+    CBM_RESOLVE_ANALYSIS_UNKNOWN
 } cbm_resolve_analysis_t;
 
 typedef enum {
@@ -56,12 +58,15 @@ enum {
     CBM_RESOLVE_FACT_CLASS_CALLABLE = 1u << 10
 };
 
-/* Pointer-free evidence carried by language adapters. The occurrence join
+typedef struct cbm_resolve_proof cbm_resolve_proof_t;
+
+/* Evidence carried by language adapters. The occurrence join
  * establishes unique binding and the graph projection supplies the target. */
 typedef struct {
     cbm_resolve_analysis_t analysis;
     cbm_resolve_rule_t rule;
     uint32_t facts;
+    const cbm_resolve_proof_t *proof;
 } cbm_resolve_evidence_t;
 
 /* Borrowed strings; the provider owns their lifetime. Outcomes also exist
@@ -76,6 +81,7 @@ typedef struct {
     const char *target;
     uint32_t candidate_count;
     const char *reason;
+    const cbm_resolve_proof_t *proof;
 } cbm_resolve_result_t;
 
 #endif

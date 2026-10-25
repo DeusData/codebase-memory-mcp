@@ -190,9 +190,205 @@ TEST(resolver_kotlin_pipeline_preserves_exact_crossfile_target) {
     PASS();
 }
 
+/* The oracle counts every outgoing controlled callable edge from Main.kt,
+ * including accidental decoy targets. It does not infer success from strategy
+ * names or from the resolver's own candidate counters. */
+static bool kotlin_pipeline_counts_project(const char *project, const char *main_source,
+                                           const char *library, const char *extra, int *calls,
+                                           int *references) {
+    const char *root = th_mktempdir("cbm_kotlin_binding");
+    if (!root)
+        return false;
+    char repo[768], database[768];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    bool files =
+        cbm_mkdir_p(repo, 0755) && th_write_file(TH_PATH(repo, "Main.kt"), main_source) == 0 &&
+        th_write_file(TH_PATH(repo, "Library.kt"), library) == 0 &&
+        th_write_file(TH_PATH(repo, "Decoy.kt"), "package unrelated\nfun handler() {}\nfun "
+                                                 "consume(value: Int) {}\n") == 0 &&
+        (!extra || th_write_file(TH_PATH(repo, "Extra.kt"), extra) == 0);
+    cbm_pipeline_t *pipeline = files ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+    int rc = pipeline && cbm_pipeline_set_project_name(pipeline, project)
+                 ? cbm_pipeline_run(pipeline)
+                 : -1;
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = rc == 0 ? cbm_store_open_path_existing(database) : NULL;
+    sqlite3_stmt *statement = NULL;
+    bool ok = store &&
+              sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "SELECT COALESCE(sum(e.type='CALLS'),0), "
+                                 "COALESCE(sum(e.type='CALL_REFERENCE'),0) "
+                                 "FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                 "WHERE s.file_path='Main.kt' "
+                                 "AND e.type IN ('CALLS','CALL_REFERENCE')",
+                                 -1, &statement, NULL) == SQLITE_OK &&
+              sqlite3_step(statement) == SQLITE_ROW;
+    if (ok) {
+        *calls = sqlite3_column_int(statement, 0);
+        *references = sqlite3_column_int(statement, 1);
+    }
+    sqlite3_finalize(statement);
+    if (store)
+        cbm_store_close(store);
+    th_cleanup(root);
+    return ok;
+}
+
+static bool kotlin_pipeline_counts(const char *main_source, const char *library, const char *extra,
+                                   int *calls, int *references) {
+    return kotlin_pipeline_counts_project("kotlin-binding", main_source, library, extra, calls,
+                                          references);
+}
+
+TEST(resolver_kotlin_branch_reference_preserves_exact_candidate) {
+    const char *sources[] = {
+        "fun main() { if (true) { val callback = ::handler; accept(callback); callback() } }\n",
+        "fun main() { if (true) { val callback = handler; accept(callback); callback() } }\n"};
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        const char *source = sources[i];
+        uint32_t start = (uint32_t)(strstr(source, "handler") - source);
+        CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_KOTLIN, "p",
+                                               "Main.kt", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        int matches = 0;
+        bool exact = false;
+        for (int u = 0; u < file->usages.count; u++) {
+            const CBMUsage *usage = &file->usages.items[u];
+            if (!usage->ref_name || strcmp(usage->ref_name, "handler"))
+                continue;
+            matches++;
+            exact = usage->site_start_byte == start && usage->site_end_byte == start + 7 &&
+                    usage->enclosing_func_qn && usage->kind == CBM_USAGE_VALUE &&
+                    usage->may_be_call_reference == (i == 0);
+        }
+        cbm_free_result(file);
+        ASSERT_EQ(matches, 1);
+        ASSERT(exact);
+    }
+    PASS();
+}
+
+TEST(resolver_kotlin_default_package_callable_values_keep_exact_identity) {
+    const char *library = "fun handler() {}\nfun accept(callback: () -> Unit) {}\n";
+    const char *sources[] = {"val callback = ::handler\nfun main() { "
+                             "accept(callback); callback(); handler() }\n",
+                             "fun main() { val callback = ::handler; "
+                             "accept(callback); callback(); handler() }\n",
+                             "fun main() { accept(::handler); handler() }\n"};
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        int calls = -1, references = -1;
+        ASSERT(kotlin_pipeline_counts(sources[i], library, NULL, &calls, &references));
+        ASSERT_EQ(calls, 2);
+        ASSERT_EQ(references, 1);
+    }
+    PASS();
+}
+
+TEST(resolver_kotlin_callable_shadows_writes_and_competitors_abstain) {
+    const char *library = "fun handler() {}\nfun accept(callback: () -> Unit) {}\n";
+    int calls = -1, references = -1;
+    ASSERT(kotlin_pipeline_counts("val callback = ::handler\nfun main(callback: "
+                                  "() -> Unit) { accept(callback) }\n",
+                                  library, NULL, &calls, &references));
+    ASSERT_EQ(calls, 1);
+    ASSERT_EQ(references, 0);
+    ASSERT(kotlin_pipeline_counts("fun main() { var callback = ::handler; callback "
+                                  "= unknown; callback(); accept(callback) }\n",
+                                  library, NULL, &calls, &references));
+    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(references, 1);
+    ASSERT(kotlin_pipeline_counts("fun main() { if (true) { val callback = "
+                                  "::handler; accept(callback); callback() } }\n",
+                                  library, NULL, &calls, &references));
+    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(references, 1);
+    ASSERT(kotlin_pipeline_counts(
+        "val callback = ::handler\nfun main() { callback(); accept(callback) }\n", library,
+        "fun handler(value: Int) {}\n", &calls, &references));
+    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(references, 0);
+    ASSERT(kotlin_pipeline_counts("val callback = ::handler\nfun main() { callback() }\n", library,
+                                  "val callback = ::handler\n", &calls, &references));
+    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(references, 0);
+    PASS();
+}
+
+TEST(resolver_kotlin_fixed_arguments_preserve_name_ambiguity_and_type_shadows) {
+    const char *library = "fun consume(value: Int) {}\n";
+    int calls = -1, references = -1;
+    ASSERT(
+        kotlin_pipeline_counts("fun main() { consume(1) }\n", library, NULL, &calls, &references));
+    ASSERT_EQ(calls, 1);
+    const char *negatives[] = {"fun main() { consume() }\n", "fun main() { consume(unknown) }\n",
+                               "fun main() { consume(\"text\") }\n",
+                               "fun main() { consume(2147483648) }\n"};
+    for (size_t i = 0; i < sizeof(negatives) / sizeof(negatives[0]); i++) {
+        ASSERT(kotlin_pipeline_counts(negatives[i], library, NULL, &calls, &references));
+        ASSERT_EQ(calls, 0);
+        ASSERT_EQ(references, 0);
+    }
+    const char *competitors[] = {"fun consume() {}\n",       "fun <T> consume(value: T) {}\n",
+                                 "val consume = unknown\n",  "class Int {}\n",
+                                 "typealias Int = String\n", "object Int {}\n"};
+    for (size_t i = 0; i < sizeof(competitors) / sizeof(competitors[0]); i++) {
+        ASSERT(kotlin_pipeline_counts("fun main() { consume(1) }\n", library, competitors[i],
+                                      &calls, &references));
+        ASSERT_EQ(calls, 0);
+    }
+    ASSERT(kotlin_pipeline_counts("fun main() { consume(1) }\n",
+                                  "import other.Int\nfun consume(value: Int) {}\n", NULL, &calls,
+                                  &references));
+    ASSERT_EQ(calls, 0);
+    PASS();
+}
+
+TEST(resolver_kotlin_import_domain_keeps_path_and_package_competitors) {
+    const char *caller = "package client\nimport api.Library\nfun main() { Library() }\n";
+    int calls = -1, references = -1;
+    /* Project + Library.kt makes the file-module key api.Library, exactly
+     * equal to the imported callable spelling. The other package declaration
+     * must still participate before the zero-argument overload is chosen. */
+    ASSERT(kotlin_pipeline_counts_project("api", caller, "package api\nfun Library() {}\n",
+                                          "package api\nfun Library(value: Int) {}\n", &calls,
+                                          &references));
+    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(references, 0);
+    /* A same-spelled file in another declared package cannot starve the
+     * actual semantic import target in Extra.kt. */
+    ASSERT(kotlin_pipeline_counts_project("api", caller, "package unrelated\nfun Library() {}\n",
+                                          "package api\nfun Library() {}\n", &calls, &references));
+    ASSERT_EQ(calls, 1);
+    ASSERT_EQ(references, 0);
+    PASS();
+}
+
+TEST(resolver_kotlin_imported_signature_keeps_type_shadow_competitors) {
+    const char *caller = "package client\nimport api.Library\nfun main() { Library(1) }\n";
+    int calls = -1, references = -1;
+    ASSERT(kotlin_pipeline_counts_project("api", caller,
+                                          "package api\nfun Library(value: Int) {}\n",
+                                          "package api\nclass Int {}\n", &calls, &references));
+    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(references, 0);
+    ASSERT(kotlin_pipeline_counts_project("api", caller,
+                                          "package api\nfun Library(value: kotlin.Int) {}\n",
+                                          "package kotlin\nclass Int {}\n", &calls, &references));
+    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(references, 0);
+    PASS();
+}
+
 SUITE(resolver_kotlin) {
+    RUN_TEST(resolver_kotlin_branch_reference_preserves_exact_candidate);
     RUN_TEST(resolver_kotlin_import_alias_receiver_and_free_function);
     RUN_TEST(resolver_kotlin_shadowed_and_unknown_receiver_abstain);
     RUN_TEST(resolver_kotlin_private_inherited_and_competing_declarations_abstain);
     RUN_TEST(resolver_kotlin_pipeline_preserves_exact_crossfile_target);
+    RUN_TEST(resolver_kotlin_default_package_callable_values_keep_exact_identity);
+    RUN_TEST(resolver_kotlin_callable_shadows_writes_and_competitors_abstain);
+    RUN_TEST(resolver_kotlin_fixed_arguments_preserve_name_ambiguity_and_type_shadows);
+    RUN_TEST(resolver_kotlin_import_domain_keeps_path_and_package_competitors);
+    RUN_TEST(resolver_kotlin_imported_signature_keeps_type_shadow_competitors);
 }

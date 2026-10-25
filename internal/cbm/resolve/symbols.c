@@ -1,6 +1,7 @@
 #include "symbols.h"
 #include "policy.h"
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define SYMBOL_DEFAULT_WORK_LIMIT UINT64_C(16384)
@@ -20,6 +21,11 @@ typedef struct {
     const CBMTypeRegistry *chosen_owner;
     const CBMRegisteredFunc *chosen;
     cbm_resolve_method_candidate_t chosen_proof;
+    cbm_resolve_proof_pool_t *pool;
+    cbm_resolve_proof_source_t source;
+    cbm_resolve_proof_key_t lookup_key;
+    const cbm_resolve_proof_t **supports;
+    size_t support_count, support_capacity;
 } symbol_lookup_t;
 
 static bool symbol_fail(symbol_lookup_t *lookup, cbm_resolve_analysis_t analysis,
@@ -45,6 +51,143 @@ static void symbol_incomplete(symbol_lookup_t *lookup, const char *reason) {
     }
 }
 
+static bool symbol_support(symbol_lookup_t *lookup, const cbm_resolve_proof_t *proof) {
+    if (!proof || proof->value.outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE) {
+        cbm_resolve_analysis_t failure = lookup->pool->failure;
+        return symbol_fail(
+            lookup,
+            failure == CBM_RESOLVE_ANALYSIS_COMPLETE ? CBM_RESOLVE_ANALYSIS_UNSUPPORTED : failure,
+            "symbol_support_incomplete");
+    }
+    if (lookup->support_count >= lookup->pool->premise_limit)
+        return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_LIMITED, "symbol_support_limit");
+    if (lookup->support_count == lookup->support_capacity) {
+        size_t capacity = lookup->support_capacity ? lookup->support_capacity * 2 : 8;
+        if (capacity < lookup->support_capacity || capacity > SIZE_MAX / sizeof(*lookup->supports))
+            return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED, "symbol_support_allocation");
+        const cbm_resolve_proof_t **supports =
+            realloc(lookup->supports, capacity * sizeof(*supports));
+        if (!supports)
+            return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED, "symbol_support_allocation");
+        lookup->supports = supports;
+        lookup->support_capacity = capacity;
+    }
+    lookup->supports[lookup->support_count++] = proof;
+    return true;
+}
+
+static bool symbol_proof_begin(symbol_lookup_t *lookup) {
+    const cbm_resolve_method_query_t *query = lookup->query;
+    const cbm_resolve_type_fact_t *receiver = lookup->function ? NULL : query->receiver;
+    lookup->pool = query->proof_pool ? query->proof_pool : receiver ? receiver->proof_pool : NULL;
+    if (!lookup->pool)
+        return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                           "symbol_proof_context_missing");
+    const cbm_resolve_proof_t *input =
+        receiver ? receiver->evidence.proof : query->function_binding.proof;
+    if (query->proof_source)
+        lookup->source = *query->proof_source;
+    else if (input)
+        lookup->source = input->value.source;
+    lookup->lookup_key = (cbm_resolve_proof_key_t){
+        .lookup_domain = query->lookup_domain ? query->lookup_domain
+                         : lookup->function   ? query->function_qn
+                                              : query->receiver_qn,
+        .lookup_key = lookup->function ? query->function_qn : query->method_name,
+        .flags = query->adapter_facts};
+    cbm_resolve_result_t audit = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                  .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                  .reason = "adapter_direct_lookup_domain"};
+    cbm_resolve_proof_key_t key = lookup->lookup_key;
+    key.detail = "adapter_direct_lookup_domain";
+    if (!symbol_support(lookup, cbm_resolve_proof_leaf(lookup->pool, CBM_PROOF_ADAPTER_DOMAIN,
+                                                       &lookup->source, &key, &audit)))
+        return false;
+    if (!input) {
+        key.detail = receiver ? "adapter_receiver_type" : "adapter_function_binding";
+        if (receiver) {
+            key.type_identity = query->receiver_qn;
+            key.origin = (uint32_t)receiver->origin;
+            input = cbm_resolve_proof_leaf(lookup->pool, CBM_PROOF_ADAPTER_TYPE, &lookup->source,
+                                           &key, &receiver->evidence);
+        } else {
+            audit.rule = query->function_binding.rule;
+            audit.facts = query->function_binding.facts;
+            audit.reason = key.detail;
+            input = cbm_resolve_proof_leaf(lookup->pool, CBM_PROOF_ADAPTER_DOMAIN, &lookup->source,
+                                           &key, &audit);
+        }
+    }
+    return symbol_support(lookup, input);
+}
+
+/* Capture the classifier's actual decision while visiting the candidate. This
+ * is an explicit adapter attestation, not a fabricated parsed signature proof.
+ * Arity and registry traversal are checked by this resolver before closure. */
+static bool symbol_candidate_support(symbol_lookup_t *lookup, const CBMRegisteredFunc *candidate,
+                                     const cbm_resolve_method_candidate_t *decision,
+                                     int parameter_count, bool arity_checked, bool arity_matches) {
+    const char *detail = cbm_arena_sprintf(
+        lookup->pool->arena,
+        "exposed=%u;applicable=%u;domain=%u;graph_exact=%u;declaration_exact=%u;arguments=%d;min_"
+        "params=%d;max_params=%d;arity_checked=%u;arity_matches=%u;flags=%u;signature=%s",
+        (unsigned)decision->exposed, (unsigned)decision->applicable, (unsigned)decision->domain,
+        (unsigned)decision->graph_target_exact, (unsigned)decision->declaration_identity_exact,
+        lookup->query->argument_count, candidate->min_params, parameter_count,
+        (unsigned)arity_checked, (unsigned)arity_matches, (unsigned)candidate->flags,
+        candidate->sig ? candidate->sig : "");
+    if (!detail)
+        return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED, "symbol_support_allocation");
+    cbm_resolve_proof_key_t key = lookup->lookup_key;
+    key.binding_identity = candidate->qualified_name;
+    key.declaration_identity =
+        decision->declaration_identity_exact ? decision->declaration_identity : NULL;
+    key.detail = detail;
+    cbm_resolve_result_t outcome = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                    .domain = decision->domain,
+                                    .target = decision->graph_target,
+                                    .reason = "adapter_candidate_classification"};
+    return symbol_support(lookup, cbm_resolve_proof_leaf(lookup->pool, CBM_PROOF_ADAPTER_DOMAIN,
+                                                         &lookup->source, &key, &outcome));
+}
+
+static bool symbol_proof_finish(symbol_lookup_t *lookup) {
+    cbm_resolve_result_t *result = &lookup->output.result;
+    if (!lookup->chosen_proof.declaration_identity_exact ||
+        !lookup->chosen_proof.declaration_identity || !*lookup->chosen_proof.declaration_identity)
+        return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                           "symbol_declaration_identity_unproven");
+    cbm_resolve_proof_key_t key = lookup->lookup_key;
+    key.declaration_identity = lookup->chosen_proof.declaration_identity;
+    key.binding_identity = lookup->chosen_proof.graph_target;
+    key.detail = "selected_registered_declaration";
+    cbm_resolve_result_t declaration = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                        .domain = lookup->chosen_proof.domain,
+                                        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                        .facts = CBM_RESOLVE_FACT_EXACT_TARGET,
+                                        .target = lookup->chosen_proof.graph_target,
+                                        .candidate_count = 1,
+                                        .reason = "adapter_registered_declaration_identity"};
+    /* The registry supplies an exact declaration identity, not its source
+     * snapshot. Generation sealing maps this identity to captured target
+     * content; the querying file's content must not impersonate that file. */
+    if (!symbol_support(lookup,
+                        cbm_resolve_proof_leaf(lookup->pool, CBM_PROOF_REGISTERED_DECLARATION, NULL,
+                                               &key, &declaration)))
+        return false;
+    key.detail = "complete_finalized_registry_lookup";
+    result->proof =
+        cbm_resolve_proof_derive(lookup->pool, CBM_PROOF_REGISTRY_LOOKUP, &lookup->source, &key,
+                                 result, lookup->supports, lookup->support_count, true);
+    if (!result->proof || result->proof->value.outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE)
+        return symbol_fail(lookup,
+                           lookup->pool->failure == CBM_RESOLVE_ANALYSIS_COMPLETE
+                               ? CBM_RESOLVE_ANALYSIS_UNSUPPORTED
+                               : lookup->pool->failure,
+                           "symbol_proof_incomplete");
+    return true;
+}
+
 static bool method_receiver_proven(symbol_lookup_t *lookup) {
     const cbm_resolve_method_query_t *query = lookup->query;
     const cbm_resolve_type_fact_t *receiver = query->receiver;
@@ -57,7 +200,14 @@ static bool method_receiver_proven(symbol_lookup_t *lookup) {
         !(receiver->evidence.facts & CBM_RESOLVE_FACT_TYPE_BOUND)) {
         return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "method_receiver_unproven");
     }
-    if (receiver->binding && receiver->binding->type != receiver->type) {
+    cbm_resolve_type_status_t current = cbm_resolve_types_fact_status(receiver);
+    if (current != CBM_RESOLVE_TYPE_KNOWN) {
+        if (current == CBM_RESOLVE_TYPE_LIMITED)
+            return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_LIMITED,
+                               "method_receiver_type_work_limit");
+        if (current == CBM_RESOLVE_TYPE_FAILED)
+            return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED,
+                               "method_receiver_type_map_failed");
         return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "method_receiver_stale");
     }
     lookup->output.result.rule = CBM_RESOLVE_RULE_TYPE_MEMBER;
@@ -133,7 +283,7 @@ static bool symbol_query_proven(symbol_lookup_t *lookup) {
         return false;
     }
     lookup->output.result.domain = CBM_RESOLVE_DOMAIN_PROJECT;
-    return symbol_arguments(lookup);
+    return symbol_arguments(lookup) && symbol_proof_begin(lookup);
 }
 
 static bool symbol_index_ready(symbol_lookup_t *lookup, const CBMTypeRegistry *registry) {
@@ -157,8 +307,9 @@ static bool symbol_index_ready(symbol_lookup_t *lookup, const CBMTypeRegistry *r
     return true;
 }
 
-static bool symbol_arity(symbol_lookup_t *lookup, const CBMRegisteredFunc *candidate,
-                         bool *matches) {
+static bool symbol_arity(symbol_lookup_t *lookup, const CBMRegisteredFunc *candidate, bool *matches,
+                         int *parameter_count) {
+    *parameter_count = -1;
     *matches = lookup->name_identity;
     if (lookup->name_identity) {
         return true;
@@ -183,6 +334,7 @@ static bool symbol_arity(symbol_lookup_t *lookup, const CBMRegisteredFunc *candi
         symbol_incomplete(lookup, "symbol_signature_incomplete");
         return true;
     }
+    *parameter_count = count;
     *matches = lookup->query->argument_count >= candidate->min_params &&
                lookup->query->argument_count <= count;
     return true;
@@ -222,15 +374,16 @@ static bool symbol_candidate(symbol_lookup_t *lookup, const CBMTypeRegistry *own
                              const CBMRegisteredFunc *candidate) {
     cbm_resolve_method_candidate_t proof =
         lookup->query->classify(lookup->query, owner, candidate, lookup->query->context);
-    if (proof.exposed == CBM_RESOLVE_METHOD_NO) {
-        return true;
-    }
     if (proof.exposed != CBM_RESOLVE_METHOD_YES) {
-        symbol_incomplete(lookup, "symbol_exposure_unknown");
-        return true;
+        if (proof.exposed != CBM_RESOLVE_METHOD_NO)
+            symbol_incomplete(lookup, "symbol_exposure_unknown");
+        return symbol_candidate_support(lookup, candidate, &proof, -1, false, false);
     }
     bool matches = false;
-    if (!symbol_arity(lookup, candidate, &matches)) {
+    int parameter_count = -1;
+    if (!symbol_arity(lookup, candidate, &matches, &parameter_count) ||
+        !symbol_candidate_support(lookup, candidate, &proof, parameter_count,
+                                  !lookup->name_identity && parameter_count >= 0, matches)) {
         return false;
     }
     if (!matches) {
@@ -401,7 +554,12 @@ static cbm_resolve_method_result_t symbol_finish(symbol_lookup_t *lookup) {
         result->target = lookup->chosen_proof.graph_target;
         result->reason =
             lookup->function ? "exact_function_binding" : "exact_direct_method_binding";
-        if (cbm_resolve_admit(result)) {
+        if (!symbol_proof_finish(lookup)) {
+            result->binding = CBM_RESOLVE_BINDING_UNRESOLVED;
+            result->facts = 0;
+            result->target = NULL;
+            result->proof = NULL;
+        } else if (cbm_resolve_admit(result)) {
             lookup->output.owner = lookup->chosen_owner;
             lookup->output.method = lookup->chosen;
         }
@@ -416,10 +574,10 @@ static cbm_resolve_method_result_t symbol_resolve(const cbm_resolve_method_query
         .limit = query && query->work_limit ? query->work_limit : SYMBOL_DEFAULT_WORK_LIMIT,
         .function = function,
         .name_identity = query && (query->adapter_facts & CBM_RESOLVE_METHOD_NAME_IDENTITY)};
-    if (!symbol_query_proven(&lookup) || !symbol_registries(&lookup)) {
-        return lookup.output;
-    }
-    return symbol_finish(&lookup);
+    if (symbol_query_proven(&lookup) && symbol_registries(&lookup))
+        (void)symbol_finish(&lookup);
+    free(lookup.supports);
+    return lookup.output;
 }
 
 cbm_resolve_method_result_t cbm_resolve_method(const cbm_resolve_method_query_t *query) {

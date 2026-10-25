@@ -1,3 +1,4 @@
+#include "proof_bridge.h"
 #include "py_proof.h"
 #include "../callable_sig.h"
 #include "../resolve/binding.h"
@@ -19,6 +20,15 @@ typedef struct {
     pyp_decl_t *defs;
     size_t count, capacity;
 } pyp_source_t;
+/* Package file identity retains .__init__, while Python declarations live
+ * in the package namespace. Keep proof keys in the same symbol scope as the
+ * extractor and registry; an allocation failure cannot fall back to file QNs. */
+static const char *pyp_symbol_scope(CBMArena *arena, const char *module) {
+    if (!module)
+        return NULL;
+    size_t length = cbm_fqn_symbol_scope_len(module);
+    return module[length] ? cbm_arena_strndup(arena, module, length) : module;
+}
 static bool pyp_is(TSNode node, const char *kind) {
     return !ts_node_is_null(node) && !strcmp(ts_node_type(node), kind);
 }
@@ -91,6 +101,7 @@ static void pyp_class_facts(pyp_source_t *source, TSNode node, const char *modul
     if (!qn || ts_node_is_null(body))
         return;
     bool complete = ts_node_is_null(bases) || ts_node_named_child_count(bases) == 0;
+    bool value_complete = complete;
     bool default_constructor = true;
     size_t first = source->count;
     pyp_add(source, qn, node,
@@ -104,12 +115,22 @@ static void pyp_class_facts(pyp_source_t *source, TSNode node, const char *modul
     if (ts_tree_cursor_goto_first_child(&cursor))
         do {
             TSNode child = ts_tree_cursor_current_node(&cursor);
+            bool decorated = pyp_is(child, "decorated_definition");
+            if (decorated) {
+                /* Decorator output is still bound by this declaration, but
+                 * its callable identity is not the original function. */
+                complete = false;
+                if (!pyp_members_stable(source, child, 0))
+                    value_complete = false;
+                child = pyp_field(child, "definition");
+            }
             if (pyp_is(child, "function_definition")) {
                 const char *method = pyp_text(source, pyp_field(child, "name"));
                 if (!method || cbm_ht_get(names, method) || !strcmp(method, "__getattribute__") ||
                     !strcmp(method, "__getattr__") || !strcmp(method, "__new__") ||
                     !strcmp(method, "__setattr__") || !strcmp(method, "__delattr__")) {
                     complete = false;
+                    value_complete = false;
                     continue;
                 }
                 cbm_ht_set(names, method, (void *)1);
@@ -117,27 +138,38 @@ static void pyp_class_facts(pyp_source_t *source, TSNode node, const char *modul
                     source->failed = true;
                     break;
                 }
-                if (!pyp_members_stable(source, pyp_field(child, "body"), 0))
+                if (!pyp_members_stable(source, pyp_field(child, "body"), 0)) {
                     complete = false;
+                    value_complete = false;
+                }
+                /* Defaults and annotations are evaluated while defining the
+                 * class too. Unknown calls cannot establish a value domain. */
+                if (!pyp_members_stable(source, child, 0))
+                    value_complete = false;
                 TSNode parameters = pyp_field(child, "parameters");
                 uint32_t flags = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC;
                 /* The first supported method form has only its ordinary bound
                  * receiver. Decorated and richer signatures remain unproved. */
-                if (!ts_node_is_null(parameters) && ts_node_named_child_count(parameters) == 1 &&
+                if (!decorated && !ts_node_is_null(parameters) &&
+                    ts_node_named_child_count(parameters) == 1 &&
                     pyp_is(ts_node_named_child(parameters, 0), "identifier"))
                     flags |= CBM_SOURCE_DECL_FIXED_ARITY;
                 if (!strcmp(method, "__init__") && !(flags & CBM_SOURCE_DECL_FIXED_ARITY))
                     default_constructor = false;
                 pyp_add(source, cbm_arena_sprintf(source->arena, "%s.%s", qn, method), child,
                         flags);
-            } else if (ts_node_is_named(child) && !pyp_is(child, "pass_statement") &&
-                       !pyp_is(child, "comment"))
+            } else if (decorated || (ts_node_is_named(child) && !pyp_is(child, "pass_statement") &&
+                                     !pyp_is(child, "comment"))) {
                 complete = false;
+                value_complete = false;
+            }
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
     cbm_ht_free(names);
     if (complete && first < source->count)
         source->defs[first].flags |= CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
+    if (value_complete && first < source->count)
+        source->defs[first].flags |= CBM_SOURCE_CLASS_VALUE_DOMAIN_COMPLETE;
     if (complete && default_constructor && first < source->count)
         source->defs[first].flags |= CBM_SOURCE_CLASS_ZERO_ARGUMENT_CONSTRUCTOR;
 }
@@ -153,6 +185,9 @@ bool cbm_py_collect_source_facts(CBMArena *arena, const char *source, int length
     for (int i = 0; i < count; i++)
         defs[i].source_flags = 0;
     if (!arena || !source || length <= 0 || !module)
+        return false;
+    module = pyp_symbol_scope(arena, module);
+    if (!module)
         return false;
     TSParser *parser = ts_parser_new();
     extern const TSLanguage *tree_sitter_python(void);
@@ -205,6 +240,7 @@ typedef struct {
     pyp_source_t source;
     const CBMTypeRegistry *registry;
     const CBMFileResult *file;
+    const char *symbol_scope;
     CBMResolvedCallArray *out;
     cbm_resolve_binding_index_t *bindings;
     CBMResolveTypeMap types;
@@ -227,7 +263,26 @@ static bool pyp_put(pyp_context_t *context, CBMHashTable *table, const char *nam
     cbm_ht_set(table, key, value);
     return cbm_ht_get(table, key) == value;
 }
-static const CBMRegisteredType *pyp_type(pyp_context_t *context, const char *name, TSNode site) {
+static const CBMRegisteredType *pyp_registered_type(pyp_context_t *context, const char *target,
+                                                    bool imported, uint32_t domain) {
+    CBMTypeQNIter iterator;
+    cbm_registry_types_with_qn(context->registry, target, &iterator);
+    const CBMRegisteredType *chosen = NULL, *candidate;
+    const uint32_t required = CBM_SOURCE_DECL_KNOWN | domain;
+    while ((candidate = cbm_type_qn_next(&iterator, NULL))) {
+        if (!candidate->project_source || (imported && !candidate->export_binding_proven) ||
+            !candidate->declaration_identity || !candidate->graph_qualified_name ||
+            (candidate->source_flags & required) != required)
+            return NULL;
+        if (chosen && (strcmp(chosen->declaration_identity, candidate->declaration_identity) ||
+                       strcmp(chosen->graph_qualified_name, candidate->graph_qualified_name)))
+            return NULL;
+        chosen = candidate;
+    }
+    return iterator.complete ? chosen : NULL;
+}
+static const CBMRegisteredType *pyp_type(pyp_context_t *context, const char *name, TSNode site,
+                                         uint32_t domain) {
     if (!name || ts_node_is_null(site))
         return NULL;
     cbm_resolve_result_t local =
@@ -256,33 +311,17 @@ static const CBMRegisteredType *pyp_type(pyp_context_t *context, const char *nam
         if (!cbm_resolve_admit(&proof))
             return NULL;
     }
-    CBMTypeQNIter iterator;
-    cbm_registry_types_with_qn(context->registry, target, &iterator);
-    const CBMRegisteredType *chosen = NULL, *candidate;
-    const uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
-    while ((candidate = cbm_type_qn_next(&iterator, NULL))) {
-        if (!candidate->project_source || (imported && !candidate->export_binding_proven) ||
-            !candidate->declaration_identity || !candidate->graph_qualified_name ||
-            (candidate->source_flags & required) != required)
-            return NULL;
-        if (chosen && (strcmp(chosen->declaration_identity, candidate->declaration_identity) ||
-                       strcmp(chosen->graph_qualified_name, candidate->graph_qualified_name)))
-            return NULL;
-        chosen = candidate;
-    }
-    return iterator.complete ? chosen : NULL;
+    return pyp_registered_type(context, target, imported, domain);
 }
-static cbm_resolve_result_t pyp_type_evidence(const CBMRegisteredType *type) {
-    return (cbm_resolve_result_t){
-        .binding = CBM_RESOLVE_BINDING_UNIQUE,
-        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
-        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                 CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-        .target = type->graph_qualified_name,
-        .candidate_count = 1,
-        .reason = "python_source_declared_type"};
+static cbm_resolve_result_t pyp_type_evidence(pyp_context_t *context, const CBMRegisteredType *type,
+                                              TSNode site) {
+    if (!type)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
+    return cbm_lsp_proof_type_lookup(
+        &context->types, pyp_text(&context->source, site), site, "py_proof-type-name-domain",
+        type->qualified_name, type->declaration_identity,
+        type->graph_qualified_name ? type->graph_qualified_name : type->qualified_name,
+        type->source_flags, "py_proof-complete-source-type-lookup");
 }
 
 static const CBMRegisteredType *pyp_constructor(pyp_context_t *context, TSNode node) {
@@ -292,14 +331,43 @@ static const CBMRegisteredType *pyp_constructor(pyp_context_t *context, TSNode n
     if (!pyp_is(name, "identifier") || ts_node_is_null(args) || ts_node_named_child_count(args))
         return NULL;
     const char *spelling = pyp_text(&context->source, name);
-    const CBMRegisteredType *type = pyp_type(context, spelling, node);
+    const CBMRegisteredType *type =
+        pyp_type(context, spelling, node, CBM_SOURCE_CLASS_DOMAIN_COMPLETE);
     if (!type || !(type->source_flags & CBM_SOURCE_CLASS_ZERO_ARGUMENT_CONSTRUCTOR))
         return NULL;
     return type;
 }
+static const char *pyp_occurrence_spelling(pyp_context_t *context, TSNode site,
+                                           CBMResolvedKind kind) {
+    TSNode expression = site;
+    if (kind == CBM_RESOLVED_INVOCATION)
+        expression = pyp_field(site, "function");
+    for (unsigned depth = 0; depth < 128 && pyp_is(expression, "parenthesized_expression");
+         depth++) {
+        if (ts_node_named_child_count(expression) != 1)
+            return NULL;
+        expression = ts_node_named_child(expression, 0);
+    }
+    if (pyp_is(expression, "attribute")) {
+        const char *receiver = pyp_text(&context->source, pyp_field(expression, "object"));
+        const char *member = pyp_text(&context->source, pyp_field(expression, "attribute"));
+        return receiver && member
+                   ? cbm_arena_sprintf(context->source.arena, "%s.%s", receiver, member)
+                   : NULL;
+    }
+    return pyp_text(&context->source, expression);
+}
 static void pyp_emit(pyp_context_t *context, const char *caller, TSNode site, CBMResolvedKind kind,
                      cbm_resolve_result_t proof) {
     if (!caller || !cbm_resolve_admit(&proof))
+        return;
+    const char *relation = kind == CBM_RESOLVED_INVOCATION       ? "CALLS"
+                           : kind == CBM_RESOLVED_CALL_REFERENCE ? "CALL_REFERENCE"
+                           : kind == CBM_RESOLVED_TYPE_REFERENCE ? "USES_TYPE"
+                                                                 : "USAGE";
+    const char *spelling = pyp_occurrence_spelling(context, site, kind);
+    proof = cbm_lsp_proof_occurrence(&context->types, proof, site, caller, spelling, relation);
+    if (!cbm_resolve_admit(&proof))
         return;
     CBMResolvedCall row = {.caller_qn = caller,
                            .callee_qn = proof.target,
@@ -309,7 +377,10 @@ static void pyp_emit(pyp_context_t *context, const char *caller, TSNode site, CB
                            .site_start_byte = ts_node_start_byte(site),
                            .site_end_byte = ts_node_end_byte(site),
                            .source_origin = CBM_SOURCE_ORIGIN_RAW,
-                           .evidence = {proof.analysis, proof.rule, proof.facts}};
+                           .evidence = {.analysis = proof.analysis,
+                                        .rule = proof.rule,
+                                        .facts = proof.facts,
+                                        .proof = proof.proof}};
     cbm_resolvedcall_push(context->out, context->source.arena, row);
 }
 static cbm_resolve_method_candidate_t pyp_candidate(const cbm_resolve_method_query_t *query,
@@ -336,7 +407,30 @@ static cbm_resolve_method_candidate_t pyp_candidate(const cbm_resolve_method_que
     proof.declaration_identity_exact = proof.declaration_identity != NULL;
     return proof;
 }
-static cbm_resolve_result_t pyp_member(pyp_context_t *context, TSNode attribute, CBMScope *scope) {
+static cbm_resolve_method_candidate_t pyp_value_candidate(const cbm_resolve_method_query_t *query,
+                                                          const CBMTypeRegistry *owner,
+                                                          const CBMRegisteredFunc *candidate,
+                                                          void *opaque) {
+    (void)query;
+    (void)owner;
+    (void)opaque;
+    cbm_resolve_method_candidate_t proof = {.exposed = CBM_RESOLVE_METHOD_YES};
+    const uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC;
+    if ((candidate->source_flags & required) != required ||
+        !(candidate->flags & CBM_FUNC_FLAG_PROJECT_SOURCE) ||
+        (candidate->flags & CBM_FUNC_FLAG_AMBIGUOUS_BINDING) || !candidate->decorator_qns ||
+        !candidate->decorator_qns[0])
+        return proof;
+    proof.applicable = CBM_RESOLVE_METHOD_YES;
+    proof.domain = CBM_RESOLVE_DOMAIN_PROJECT;
+    proof.graph_target = candidate->graph_qualified_name;
+    proof.graph_target_exact = proof.graph_target != NULL;
+    proof.declaration_identity = candidate->declaration_identity;
+    proof.declaration_identity_exact = proof.declaration_identity != NULL;
+    return proof;
+}
+static cbm_resolve_result_t pyp_member(pyp_context_t *context, TSNode attribute, CBMScope *scope,
+                                       bool value_binding) {
     cbm_resolve_result_t missing = {.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
                                     .reason = "python_member_unproven"};
     TSNode receiver = pyp_field(attribute, "object"), member = pyp_field(attribute, "attribute");
@@ -348,15 +442,22 @@ static cbm_resolve_result_t pyp_member(pyp_context_t *context, TSNode attribute,
         cbm_resolve_types_lookup(&context->types, scope, variable, ts_node_start_byte(attribute));
     if (fact.status != CBM_RESOLVE_TYPE_KNOWN || !fact.type || fact.type->kind != CBM_TYPE_NAMED)
         return missing;
-    cbm_resolve_method_query_t query = {.registry = context->registry,
-                                        .receiver = &fact,
-                                        .receiver_qn = fact.type->data.named.qualified_name,
-                                        .method_name = name,
-                                        .argument_count = 0,
-                                        .adapter_facts = CBM_RESOLVE_METHOD_DIRECT_DOMAIN_COMPLETE |
-                                                         CBM_RESOLVE_METHOD_OCCURRENCE_EXACT |
-                                                         CBM_RESOLVE_METHOD_NAME_IDENTITY,
-                                        .classify = pyp_candidate};
+    uint32_t domain =
+        value_binding ? CBM_SOURCE_CLASS_VALUE_DOMAIN_COMPLETE : CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
+    if (!pyp_registered_type(context, fact.type->data.named.qualified_name, false, domain))
+        return missing;
+    cbm_resolve_method_query_t query = {
+        .proof_pool = &context->types.proofs,
+        .proof_source = &context->types.proof_source,
+        .lookup_domain = fact.type->data.named.qualified_name,
+        .registry = context->registry,
+        .receiver = &fact,
+        .receiver_qn = fact.type->data.named.qualified_name,
+        .method_name = name,
+        .argument_count = 0,
+        .adapter_facts = CBM_RESOLVE_METHOD_DIRECT_DOMAIN_COMPLETE |
+                         CBM_RESOLVE_METHOD_OCCURRENCE_EXACT | CBM_RESOLVE_METHOD_NAME_IDENTITY,
+        .classify = value_binding ? pyp_value_candidate : pyp_candidate};
     return cbm_resolve_method(&query).result;
 }
 static bool pyp_read_syntax(const char *kind) {
@@ -446,7 +547,7 @@ static void pyp_record_effect(pyp_context_t *context, TSNode function) {
     TSNode params = pyp_field(function, "parameters"), body = pyp_field(function, "body");
     const char *name = pyp_text(&context->source, pyp_field(function, "name"));
     const char *qn =
-        name ? cbm_arena_sprintf(context->source.arena, "%s.%s", context->file->module_qn, name)
+        name ? cbm_arena_sprintf(context->source.arena, "%s.%s", context->symbol_scope, name)
              : NULL;
     if (!qn || ts_node_is_null(params) || ts_node_is_null(body))
         return;
@@ -503,6 +604,22 @@ static bool pyp_readonly_call(pyp_context_t *context, TSNode call) {
     }
     return true;
 }
+/* Extraction keys a parenthesized direct argument to its outer wrapper.
+ * Parentheses preserve the value identity, but composite expressions do not.
+ * Keep this bounded by the same nesting limit as the source audit. */
+static TSNode pyp_reference_site(TSNode attribute) {
+    TSNode site = attribute, parent = ts_node_parent(site);
+    for (unsigned depth = 0; depth < 128 && pyp_is(parent, "parenthesized_expression"); depth++) {
+        if (ts_node_named_child_count(parent) != 1 ||
+            !ts_node_eq(ts_node_named_child(parent, 0), site))
+            return attribute;
+        site = parent;
+        parent = ts_node_parent(site);
+    }
+    if (pyp_is(parent, "keyword_argument") && ts_node_eq(pyp_field(parent, "value"), site))
+        parent = ts_node_parent(parent);
+    return pyp_is(parent, "argument_list") ? site : attribute;
+}
 static void pyp_expression(pyp_context_t *context, TSNode node, const char *caller, CBMScope *scope,
                            unsigned depth) {
     if (!pyp_budget(&context->source, depth))
@@ -512,9 +629,14 @@ static void pyp_expression(pyp_context_t *context, TSNode node, const char *call
         cbm_resolve_result_t proof = {0};
         if (pyp_is(callee, "attribute") && !ts_node_is_null(arguments) &&
             !ts_node_named_child_count(arguments)) {
-            proof = pyp_member(context, callee, scope);
+            proof = pyp_member(context, callee, scope, false);
             pyp_emit(context, caller, node, CBM_RESOLVED_INVOCATION, proof);
         }
+        /* Attribute lookup of the callee precedes its arguments and can run
+         * an unproved descriptor, unlike a plain lexical callee lookup. */
+        if (pyp_is(callee, "attribute") && !cbm_resolve_admit(&proof))
+            cbm_resolve_types_invalidate_visible(&context->types, scope, ts_node_end_byte(callee),
+                                                 CBM_RESOLVE_TYPE_UNSUPPORTED);
         /* Argument expressions are evaluated before the callee's effects. */
         if (!ts_node_is_null(arguments))
             pyp_expression(context, arguments, caller, scope, depth + 1);
@@ -525,8 +647,19 @@ static void pyp_expression(pyp_context_t *context, TSNode node, const char *call
         return;
     }
     if (pyp_is(node, "attribute")) {
-        pyp_emit(context, caller, node, CBM_RESOLVED_CALL_REFERENCE,
-                 pyp_member(context, node, scope));
+        cbm_resolve_result_t proof = pyp_member(context, node, scope, false);
+        if (cbm_resolve_admit(&proof)) {
+            pyp_emit(context, caller, pyp_reference_site(node), CBM_RESOLVED_CALL_REFERENCE, proof);
+        } else {
+            proof = pyp_member(context, node, scope, true);
+            pyp_emit(context, caller, pyp_reference_site(node), CBM_RESOLVED_VALUE_REFERENCE,
+                     proof);
+            /* A property or unproved attribute can execute code on read.
+             * An exact binding at this occurrence does not establish the
+             * effects needed to preserve later receiver facts. */
+            cbm_resolve_types_invalidate_visible(&context->types, scope, ts_node_end_byte(node),
+                                                 CBM_RESOLVE_TYPE_UNSUPPORTED);
+        }
         return;
     }
     TSTreeCursor cursor = ts_tree_cursor_new(node);
@@ -551,7 +684,8 @@ static void pyp_statements(pyp_context_t *context, TSNode body, const char *call
                     pyp_expression(context, right, caller, scope, 0);
                     const CBMRegisteredType *constructed = pyp_constructor(context, right);
                     if (constructed) {
-                        cbm_resolve_result_t proof = pyp_type_evidence(constructed);
+                        cbm_resolve_result_t proof =
+                            pyp_type_evidence(context, constructed, pyp_field(right, "function"));
                         (void)cbm_resolve_types_declare(
                             &context->types, scope, name, ts_node_end_byte(expression),
                             cbm_type_named(context->source.arena, constructed->qualified_name),
@@ -606,10 +740,11 @@ static void pyp_function(pyp_context_t *context, TSNode node) {
                 continue;
             const char *variable = pyp_text(&context->source, name_node);
             const CBMRegisteredType *type =
-                pyp_type(context, pyp_text(&context->source, type_node), type_node);
+                pyp_type(context, pyp_text(&context->source, type_node), type_node,
+                         CBM_SOURCE_CLASS_VALUE_DOMAIN_COMPLETE);
             if (!variable || !type)
                 continue;
-            cbm_resolve_result_t proof = pyp_type_evidence(type);
+            cbm_resolve_result_t proof = pyp_type_evidence(context, type, type_node);
             if (cbm_resolve_types_declare(
                     &context->types, scope, variable, ts_node_start_byte(parameter),
                     cbm_type_named(context->source.arena, type->qualified_name),
@@ -642,6 +777,7 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
                                         .failed = ts_node_has_error(root)},
                              .registry = registry,
                              .file = file,
+                             .symbol_scope = pyp_symbol_scope(arena, file->module_qn),
                              .out = out};
     context.bindings =
         cbm_resolve_binding_build(arena, file, CBM_LANG_PYTHON, source, (size_t)length);
@@ -649,8 +785,13 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
     context.callers = cbm_ht_create(16);
     context.effects = cbm_ht_create(16);
     cbm_resolve_types_init(&context.types, arena, 0);
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
+    if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
+        context.source.failed = true;
     int first = out->count;
-    if (context.imports && context.callers && context.effects && context.bindings) {
+    if (context.imports && context.callers && context.effects && context.bindings &&
+        context.symbol_scope) {
         for (int i = 0; i < import_count; i++)
             if (import_names && import_names[i] && import_qns && import_qns[i])
                 if (!pyp_put(&context, context.imports, import_names[i], import_qns[i]))

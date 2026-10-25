@@ -1,3 +1,4 @@
+#include "proof_bridge.h"
 #include "rust_proof.h"
 #include "../callable_sig.h"
 #include "../resolve/binding.h"
@@ -234,21 +235,41 @@ static const CBMRegisteredType *rsp_type(rsp_context_t *context, const char *nam
     }
     return iterator.complete ? chosen : NULL;
 }
-static cbm_resolve_result_t rsp_type_evidence(const CBMRegisteredType *type) {
-    return (cbm_resolve_result_t){
-        .binding = CBM_RESOLVE_BINDING_UNIQUE,
-        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
-        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                 CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-        .target = type->graph_qualified_name,
-        .candidate_count = 1,
-        .reason = "rust_source_declared_type"};
+static cbm_resolve_result_t rsp_type_evidence(rsp_context_t *context, const CBMRegisteredType *type,
+                                              TSNode site) {
+    if (!type)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
+    return cbm_lsp_proof_type_lookup(
+        &context->types, rsp_text(&context->source, site), site, "rust_proof-type-name-domain",
+        type->qualified_name, type->declaration_identity,
+        type->graph_qualified_name ? type->graph_qualified_name : type->qualified_name,
+        type->source_flags, "rust_proof-complete-source-type-lookup");
+}
+static const char *rsp_occurrence_spelling(rsp_context_t *context, TSNode site,
+                                           CBMResolvedKind kind) {
+    TSNode expression = site;
+    if (kind == CBM_RESOLVED_INVOCATION)
+        expression = rsp_field(site, "function");
+    if (rsp_is(expression, "field_expression")) {
+        const char *receiver = rsp_text(&context->source, rsp_field(expression, "value"));
+        const char *member = rsp_text(&context->source, rsp_field(expression, "field"));
+        return receiver && member
+                   ? cbm_arena_sprintf(context->source.arena, "%s.%s", receiver, member)
+                   : NULL;
+    }
+    return rsp_text(&context->source, expression);
 }
 static void rsp_emit(rsp_context_t *context, const char *caller, TSNode site, CBMResolvedKind kind,
                      cbm_resolve_result_t proof) {
     if (!caller || !cbm_resolve_admit(&proof))
+        return;
+    const char *relation = kind == CBM_RESOLVED_INVOCATION       ? "CALLS"
+                           : kind == CBM_RESOLVED_CALL_REFERENCE ? "CALL_REFERENCE"
+                           : kind == CBM_RESOLVED_TYPE_REFERENCE ? "USES_TYPE"
+                                                                 : "USAGE";
+    const char *spelling = rsp_occurrence_spelling(context, site, kind);
+    proof = cbm_lsp_proof_occurrence(&context->types, proof, site, caller, spelling, relation);
+    if (!cbm_resolve_admit(&proof))
         return;
     CBMResolvedCall row = {.caller_qn = caller,
                            .callee_qn = proof.target,
@@ -258,7 +279,10 @@ static void rsp_emit(rsp_context_t *context, const char *caller, TSNode site, CB
                            .site_start_byte = ts_node_start_byte(site),
                            .site_end_byte = ts_node_end_byte(site),
                            .source_origin = CBM_SOURCE_ORIGIN_RAW,
-                           .evidence = {proof.analysis, proof.rule, proof.facts}};
+                           .evidence = {.analysis = proof.analysis,
+                                        .rule = proof.rule,
+                                        .facts = proof.facts,
+                                        .proof = proof.proof}};
     cbm_resolvedcall_push(context->out, context->source.arena, row);
 }
 static cbm_resolve_method_candidate_t rsp_candidate(const cbm_resolve_method_query_t *query,
@@ -296,7 +320,10 @@ static cbm_resolve_result_t rsp_member(rsp_context_t *context, TSNode attribute,
         cbm_resolve_types_lookup(&context->types, scope, variable, ts_node_start_byte(attribute));
     if (fact.status != CBM_RESOLVE_TYPE_KNOWN || !fact.type || fact.type->kind != CBM_TYPE_NAMED)
         return missing;
-    cbm_resolve_method_query_t query = {.registry = context->registry,
+    cbm_resolve_method_query_t query = {.proof_pool = &context->types.proofs,
+                                        .proof_source = &context->types.proof_source,
+                                        .lookup_domain = fact.type->data.named.qualified_name,
+                                        .registry = context->registry,
                                         .receiver = &fact,
                                         .receiver_qn = fact.type->data.named.qualified_name,
                                         .method_name = name,
@@ -453,7 +480,7 @@ static void rsp_function(rsp_context_t *context, TSNode node) {
                 rsp_type(context, rsp_text(&context->source, type_node));
             if (!variable || !type)
                 continue;
-            cbm_resolve_result_t proof = rsp_type_evidence(type);
+            cbm_resolve_result_t proof = rsp_type_evidence(context, type, type_node);
             if (cbm_resolve_types_declare(
                     &context->types, scope, variable, ts_node_start_byte(parameter),
                     cbm_type_named(context->source.arena, type->qualified_name),
@@ -492,6 +519,10 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
     context.imports = cbm_ht_create(16);
     context.callers = cbm_ht_create(16);
     cbm_resolve_types_init(&context.types, arena, 0);
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
+    if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
+        context.source.failed = true;
     int first = out->count;
     if (context.imports && context.callers && context.bindings) {
         for (int i = 0; i < import_count; i++)

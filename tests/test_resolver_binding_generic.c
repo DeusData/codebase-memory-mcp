@@ -11,6 +11,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+    bool occurrence, source_audit, mislabeled;
+} dart_presence_t;
+
+static bool dart_presence_observation(const cbm_resolve_proof_t *proof, void *context) {
+    dart_presence_t *seen = context;
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(proof);
+    if (!view->key.lookup_domain || !view->key.detail)
+        return true;
+    bool occurrence = !strcmp(view->key.lookup_domain, "source_occurrences") &&
+                      !strcmp(view->key.detail, "exact_occurrence_observed");
+    bool audit = !strcmp(view->key.lookup_domain, "source_binding_audit") &&
+                 view->outcome.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE;
+    seen->occurrence |= occurrence;
+    seen->source_audit |= audit;
+    if (occurrence || audit)
+        seen->mislabeled |=
+            view->outcome.binding != CBM_RESOLVE_BINDING_UNIQUE || !view->outcome.target;
+    return true;
+}
+
 TEST(resolver_binding_dart_source_namespace_and_privacy) {
     const char *source = "int target() => 1;\nint _private() => 2;\n"
                          "void caller() { target(); }\n";
@@ -37,6 +58,11 @@ TEST(resolver_binding_dart_source_namespace_and_privacy) {
     cbm_resolve_result_t proof = cbm_resolve_binding_validate(index, "target", start, start + 8,
                                                               CBM_SOURCE_ORIGIN_RAW, candidate);
     ASSERT(cbm_resolve_admit(&proof));
+    dart_presence_t seen = {0};
+    ASSERT(cbm_resolve_proof_visit(proof.proof, 128, dart_presence_observation, &seen));
+    ASSERT(seen.occurrence);
+    ASSERT(seen.source_audit);
+    ASSERT(!seen.mislabeled);
     cbm_arena_destroy(&arena);
     cbm_free_result(result);
     PASS();
@@ -164,7 +190,8 @@ static int generic_edges(cbm_store_t *store, const char *target, const char *rel
 
 /* Real extraction, import resolution and shared namespace indexing. Each
  * fixture has a same-name unrelated declaration and one labelled call site. */
-static bool dart_pipeline_golden(const dart_golden_t *golden, int padding) {
+static bool dart_pipeline_observations(const dart_golden_t *golden, int padding,
+                                       const char *assertion_sql) {
     const char *tmp = th_mktempdir("cbm_dart_binding");
     if (!tmp)
         return false;
@@ -208,10 +235,64 @@ static bool dart_pipeline_golden(const dart_golden_t *golden, int padding) {
                      "SELECT count(*) FROM resolver_occurrences WHERE "
                      "project='resolver-generic' AND file_path='main.dart' AND relation='CALLS' "
                      "AND scope='resolver-generic.main.caller' AND emitted=0") == 1;
+        if (assertion_sql)
+            ok = ok && generic_count(store, assertion_sql) == 1;
         cbm_store_close(store);
     }
     th_rmtree(root);
     return ok;
+}
+
+static bool dart_pipeline_golden(const dart_golden_t *golden, int padding) {
+    return dart_pipeline_observations(golden, padding, NULL);
+}
+
+/* Reachability makes these persisted facts actual occurrence dependencies,
+ * rather than unrelated lookup rows elsewhere in the indexed project. */
+#define DART_REACHABLE_LOOKUPS                                                           \
+    "WITH RECURSIVE reachable(fact) AS ("                                                \
+    "SELECT proof FROM resolver_occurrence_evidence WHERE project='resolver-generic' "   \
+    "UNION SELECT s.premise FROM resolver_supports s JOIN reachable r ON s.fact=r.fact " \
+    "WHERE s.project='resolver-generic') "                                               \
+    "SELECT count(*)>0 FROM resolver_lookups l JOIN resolver_facts f "                   \
+    "ON f.project=l.project AND f.id=l.fact JOIN reachable r ON r.fact=l.fact "          \
+    "WHERE l.project='resolver-generic' "
+
+TEST(resolver_binding_dart_closed_missing_member_has_imported_source_proof) {
+    const dart_golden_t fixture = {
+        "import 'lib.dart';\nimport 'other.dart';\nvoid caller() { target(); }\n",
+        "int unrelated() => 2;\n", GENERIC_PROJECT ".lib.target", true};
+    ASSERT(dart_pipeline_observations(&fixture, 0,
+                                      DART_REACHABLE_LOOKUPS
+                                      "AND f.source_file='other.dart' "
+                                      "AND l.domain='resolver-generic.other' AND l.key='target' "
+                                      "AND l.status='closed_negative'"));
+    PASS();
+}
+
+TEST(resolver_binding_dart_visibility_excludes_unrelated_open_import) {
+    const dart_golden_t fixture = {
+        "import 'lib.dart';\nimport 'missing.dart' as excluded;\n"
+        "import 'decoy.dart' hide target;\nvoid caller() { target(); }\n",
+        NULL, GENERIC_PROJECT ".lib.target", true};
+    ASSERT(dart_pipeline_observations(&fixture, 0,
+                                      DART_REACHABLE_LOOKUPS
+                                      "AND f.source_file='main.dart' "
+                                      "AND l.domain='dart.import_visibility' "
+                                      "AND l.key='1:missing.dart:target' AND l.status='positive'"));
+    PASS();
+}
+
+TEST(resolver_binding_dart_unsupported_competitor_keeps_source_observation) {
+    const dart_golden_t fixture = {
+        "import 'lib.dart';\nimport 'other.dart';\nvoid caller() { target(); }\n",
+        "var target = 2;\n", GENERIC_PROJECT ".lib.target", false};
+    ASSERT(dart_pipeline_observations(&fixture, 0,
+                                      DART_REACHABLE_LOOKUPS
+                                      "AND f.source_file='other.dart' "
+                                      "AND l.domain='resolver-generic.other' AND l.key='target' "
+                                      "AND l.status='positive'"));
+    PASS();
 }
 
 TEST(resolver_binding_dart_cross_file_exact_namespace_and_decoy) {
@@ -266,6 +347,9 @@ TEST(resolver_binding_dart_cross_file_shadows_and_reassignment) {
 }
 
 SUITE(resolver_binding_generic) {
+    RUN_TEST(resolver_binding_dart_closed_missing_member_has_imported_source_proof);
+    RUN_TEST(resolver_binding_dart_visibility_excludes_unrelated_open_import);
+    RUN_TEST(resolver_binding_dart_unsupported_competitor_keeps_source_observation);
     RUN_TEST(resolver_binding_rust_exact_names_and_blockers);
     RUN_TEST(resolver_binding_dart_source_namespace_and_privacy);
     RUN_TEST(resolver_binding_dart_import_source_combinators);

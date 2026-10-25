@@ -729,9 +729,10 @@ TEST(tslsp_nocrash_megasource) {
 /* ── Category 11: generics (deeper) ─────────────────────────────────────────── */
 
 TEST(tslsp_await_generic_call_issue2210) {
-    CBMFileResult *r = extract_ts("function parseJsonBody<T>(): T { return null as T; }\n"
-                                  "async function plain() { return await parseJsonBody(); }\n"
-                                  "async function generic() { return await parseJsonBody<string>(); }\n");
+    CBMFileResult *r =
+        extract_ts("function parseJsonBody<T>(): T { return null as T; }\n"
+                   "async function plain() { return await parseJsonBody(); }\n"
+                   "async function generic() { return await parseJsonBody<string>(); }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_TRUE(find_resolved(r, "plain", "parseJsonBody") >= 0);
     ASSERT_TRUE(find_resolved(r, "generic", "parseJsonBody") >= 0);
@@ -1197,22 +1198,22 @@ TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity) {
                 }
             }
 
-            const CBMResolvedCall *resolved = carrier ? cbm_pipeline_find_lsp_resolution(
-                                                            &r->resolved_calls, carrier, false)
-                                                      : NULL;
+            const CBMResolvedCall *resolved =
+                carrier ? cbm_pipeline_find_lsp_resolution(&r->resolved_calls, carrier, false)
+                        : NULL;
             exact_carrier[i] = carrier && carrier->enclosing_func_qn &&
                                strcmp(carrier->enclosing_func_qn, callers[i]) == 0 &&
                                carrier->site_start_byte == start && carrier->site_end_byte == end &&
                                carrier->requires_lsp_resolution;
-            exact_resolution[i] = resolved && resolved->caller_qn &&
-                                  strcmp(resolved->caller_qn, callers[i]) == 0 &&
-                                  resolved->site_start_byte == start && resolved->site_end_byte == end;
+            exact_resolution[i] =
+                resolved && resolved->caller_qn && strcmp(resolved->caller_qn, callers[i]) == 0 &&
+                resolved->site_start_byte == start && resolved->site_end_byte == end;
             resolved_invocation[i] = resolved && resolved->kind == CBM_RESOLVED_INVOCATION;
             if (resolved && resolved->callee_qn) {
                 const size_t callee_len = strlen(resolved->callee_qn);
-                resolved_card_callee[i] = callee_len >= strlen(".Card") &&
-                                           strcmp(resolved->callee_qn + callee_len - strlen(".Card"),
-                                                  ".Card") == 0;
+                resolved_card_callee[i] =
+                    callee_len >= strlen(".Card") &&
+                    strcmp(resolved->callee_qn + callee_len - strlen(".Card"), ".Card") == 0;
             }
             resolved_jsx_strategy[i] =
                 resolved && resolved->strategy && strcmp(resolved->strategy, "lsp_ts_jsx") == 0;
@@ -1222,11 +1223,12 @@ TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity) {
                        "requires_lsp=%d resolution=%s resolution_span=%u:%u kind=%d callee=%s "
                        "strategy=%s\n",
                        callers[i], start, end, carrier_count[i],
-                       carrier && carrier->enclosing_func_qn ? carrier->enclosing_func_qn : "(null)",
+                       carrier && carrier->enclosing_func_qn ? carrier->enclosing_func_qn
+                                                             : "(null)",
                        carrier ? carrier->requires_lsp_resolution : 0,
                        resolved && resolved->caller_qn ? resolved->caller_qn : "(null)",
-                       resolved ? resolved->site_start_byte : 0, resolved ? resolved->site_end_byte : 0,
-                       resolved ? resolved->kind : -1,
+                       resolved ? resolved->site_start_byte : 0,
+                       resolved ? resolved->site_end_byte : 0, resolved ? resolved->kind : -1,
                        resolved && resolved->callee_qn ? resolved->callee_qn : "(null)",
                        resolved && resolved->strategy ? resolved->strategy : "(null)");
                 failed_cases++;
@@ -2089,6 +2091,25 @@ static int ts514_resolved_count(const CBMResolvedCallArray *resolved, const CBMC
     return count;
 }
 
+/* The direct receiver control now uses the shared proof adapter; its
+ * diagnostic strategy name is not part of the binding contract. */
+static int ts514_proved_count(const CBMResolvedCallArray *resolved, const CBMCall *call,
+                              const char *target) {
+    if (!call)
+        return -1;
+    int count = 0;
+    for (int i = 0; i < resolved->count; i++) {
+        const CBMResolvedCall *row = &resolved->items[i];
+        const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(row->evidence.proof);
+        if (row->kind == CBM_RESOLVED_INVOCATION &&
+            cbm_pipeline_invocation_site_rank(row, call) == 2 && row->callee_qn &&
+            strcmp(row->callee_qn, target) == 0 && proof && cbm_resolve_admit(&proof->outcome) &&
+            strcmp(proof->outcome.target, target) == 0)
+            count++;
+    }
+    return count;
+}
+
 static int ts514_definition_count(const CBMFileResult *r, const char *qn) {
     int count = 0;
     for (int i = 0; r && i < r->defs.count; i++) {
@@ -2110,8 +2131,7 @@ TEST(tslsp_class_constructor_param_property) {
     const CBMCall *field =
         ts514_call_site(r, source, "b.tool.fire()", "test.main.throughBox", "b.tool.fire");
     int target = ts514_definition_count(r, "test.main.Tool.fire");
-    int positive =
-        ts514_resolved_count(&r->resolved_calls, direct, "test.main.Tool.fire", "lsp_ts_method");
+    int positive = ts514_proved_count(&r->resolved_calls, direct, "test.main.Tool.fire");
     int property =
         ts514_resolved_count(&r->resolved_calls, field, "test.main.Tool.fire", "lsp_ts_method");
     cbm_free_result(r);
@@ -2532,8 +2552,7 @@ TEST(tslsp_field_new_initializer_issue514) {
     int tool = ts514_definition_count(r, "test.main.Tool.fire");
     int base = ts514_definition_count(r, "test.main.Base.run");
     int derived = ts514_definition_count(r, "test.main.Derived.run");
-    int control =
-        ts514_resolved_count(&r->resolved_calls, direct, "test.main.Tool.fire", "lsp_ts_method");
+    int control = ts514_proved_count(&r->resolved_calls, direct, "test.main.Tool.fire");
     int inferred =
         ts514_resolved_count(&r->resolved_calls, fresh, "test.main.Tool.fire", "lsp_ts_method");
     int declared =

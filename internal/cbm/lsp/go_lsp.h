@@ -121,6 +121,7 @@ typedef struct {
     uint32_t source_start_line;
     uint32_t source_flags;
     const CBMType *source_return_type; /* Parsed, source-audited annotation only. */
+    const CBMType *source_signature;   /* Audited syntax; type names may be unresolved. */
 } CBMLSPDef;
 
 bool cbm_go_collect_source_facts(CBMArena *, const char *, int, const char *, CBMLSPDef *, int);
@@ -184,5 +185,18 @@ typedef struct {
 // Uses per-file arenas internally; results are copied to the output arena.
 void cbm_batch_go_lsp_cross(CBMArena *arena, CBMBatchGoLSPFile *files, int file_count,
                             CBMResolvedCallArray *out);
+
+void cbm_run_go_lsp_cross_with_registry_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    CBMTypeRegistry *reg, const char **import_names, const char **import_qns, int import_count,
+    TSTree *cached_tree, CBMResolvedCallArray *out,
+    const cbm_resolve_proof_source_t *source_context);
+
+void cbm_run_go_lsp_cross_with_source(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, CBMLSPDef *defs, int def_count,
+                                      const char **import_names, const char **import_qns,
+                                      int import_count, TSTree *cached_tree,
+                                      CBMResolvedCallArray *out,
+                                      const cbm_resolve_proof_source_t *source_context);
 
 #endif // CBM_LSP_GO_LSP_H

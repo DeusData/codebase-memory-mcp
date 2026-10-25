@@ -2,6 +2,8 @@
 #include "pipeline/shared_resolver.h"
 #include "graph_buffer/graph_buffer.h"
 #include "resolve/policy.h"
+#include "resolve/proof.h"
+#include "resolve/snapshot.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +24,44 @@ static bool add_result(cbm_gbuf_t *graph, cbm_registry_t *registry, CBMFileResul
         cbm_registry_add(registry, def->name, def->qualified_name, def->label);
     }
     return ok;
+}
+
+/* Synthetic adapter reports still need an explicit proof backed by this
+ * fixture's captured source. This is a coarse adapter attestation, including
+ * deliberately conflicting reports; it does not invent parsed predecessors. */
+static bool attest_semantic_row(CBMFileResult *result, CBMResolvedCall *row, const CBMCall *call) {
+    if (!call || row->kind != CBM_RESOLVED_INVOCATION ||
+        row->site_start_byte != call->site_start_byte ||
+        row->site_end_byte != call->site_end_byte || row->source_origin != call->source_origin ||
+        strcmp(row->caller_qn, call->enclosing_func_qn))
+        return false;
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_proof_pool_init(&pool, &result->arena, 0, 0, 0);
+    cbm_resolve_proof_source_t source =
+        cbm_result_proof_source(result, row->source_origin, row->caller_qn);
+    cbm_resolve_proof_key_t key = {.lookup_domain = row->caller_qn,
+                                   .lookup_key = call->callee_name,
+                                   .binding_identity = row->callee_qn,
+                                   .lookup_closed = true,
+                                   .declaration_identity = row->callee_qn,
+                                   .start_byte = row->site_start_byte,
+                                   .end_byte = row->site_end_byte,
+                                   .origin = row->source_origin,
+                                   .detail = "CALLS"};
+    cbm_resolve_result_t outcome = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                    .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                    .analysis = row->evidence.analysis,
+                                    .rule = row->evidence.rule,
+                                    .facts = row->evidence.facts,
+                                    .target = row->callee_qn,
+                                    .candidate_count = 1};
+    const cbm_resolve_proof_t *audit =
+        cbm_resolve_proof_leaf(&pool, CBM_PROOF_ADAPTER_DOMAIN, &source, &key, &outcome);
+    if (!audit)
+        return false;
+    row->evidence.proof = cbm_resolve_proof_derive(&pool, CBM_PROOF_REGISTRY_LOOKUP, &source, &key,
+                                                   &outcome, &audit, 1, true);
+    return row->evidence.proof != NULL;
 }
 
 static int emitted_target(const cbm_gbuf_t *graph, const char *relation, const char *target) {
@@ -60,6 +100,8 @@ TEST(resolver_pipeline_c_declaration_evidence_survives_extraction) {
                                  .module_qn = result->module_qn,
                                  .language = CBM_LANG_C};
     ASSERT(cbm_shared_resolver_file(shared, &input));
+    ASSERT(cbm_gbuf_resolutions_own_shared(graph));
+    ASSERT(cbm_shared_resolver_project(graph));
     int emitted = emitted_target(graph, "CALLS", "proj.main.target");
     if (emitted != 1) {
         for (int i = 0; i < result->resolved_calls.count; i++) {
@@ -129,6 +171,7 @@ TEST(resolver_pipeline_import_proof_resolves_call_and_value_without_namesake) {
     ASSERT_NOT_NULL(caller);
     ASSERT_NOT_NULL(decoy);
     ASSERT(cbm_gbuf_insert_edge(graph, caller->id, decoy->id, "CALLS", "{}"));
+    ASSERT(cbm_gbuf_resolutions_own_shared(graph));
     ASSERT(cbm_shared_resolver_project(graph));
     ASSERT_EQ(cbm_gbuf_edge_count_by_type(graph, "CALLS"), 1);
     ASSERT(cbm_shared_resolver_project(graph));
@@ -176,7 +219,9 @@ TEST(resolver_pipeline_missing_import_records_quality_gap_without_local_substitu
         if (strcmp(records[r].relation, "CALLS") == 0 &&
             strcmp(records[r].spelling, "target") == 0) {
             ASSERT_FALSE(records[r].emitted);
-            ASSERT_STR_EQ(records[r].result.reason, "import_target_unresolved");
+            /* This fixture intentionally supplies no shared namespace snapshot.
+             * Absence of that resolver is distinct from a closed missing target. */
+            ASSERT_STR_EQ(records[r].result.reason, "python_import_namespace_unavailable");
             misses++;
         }
     }
@@ -305,9 +350,11 @@ static int resolver_pipeline_identity_collision(bool source_collision) {
         .site_start_byte = call->site_start_byte,
         .site_end_byte = call->site_end_byte,
         .source_origin = call->source_origin,
-        .evidence = {CBM_RESOLVE_ANALYSIS_COMPLETE, CBM_RESOLVE_RULE_LANGUAGE_BINDING,
-                     CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                         CBM_RESOLVE_FACT_LANGUAGE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT}};
+        .evidence = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                     .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+                     .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                              CBM_RESOLVE_FACT_LANGUAGE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT}};
+    ASSERT(attest_semantic_row(cache[1], &semantic, call));
     cbm_resolvedcall_push(&cache[1]->resolved_calls, &cache[1]->arena, semantic);
     cbm_file_info_t files[] = {
         {.path = "/tmp/library.py", .rel_path = "library.py", .language = CBM_LANG_PYTHON},
@@ -347,7 +394,207 @@ TEST(resolver_pipeline_source_identity_cannot_cross_graph_collision) {
     return resolver_pipeline_identity_collision(true);
 }
 
+static int resolver_pipeline_duplicate_semantics(int example, bool reverse) {
+    const char *source = "void target(void) {}\nvoid decoy(void) {}\n"
+                         "void caller(void) { target(); }\n";
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_C, "proj", "main.c", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    ASSERT_EQ(result->calls.count, 1);
+    const CBMCall *call = &result->calls.items[0];
+    CBMResolvedCall rows[2] = {
+        {.caller_qn = call->enclosing_func_qn,
+         .callee_qn = "proj.main.target",
+         .site_start_byte = call->site_start_byte,
+         .site_end_byte = call->site_end_byte,
+         .source_origin = call->source_origin,
+         .kind = CBM_RESOLVED_INVOCATION,
+         .evidence = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                      .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+                      .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                               CBM_RESOLVE_FACT_LANGUAGE_BOUND |
+                               CBM_RESOLVE_FACT_OCCURRENCE_EXACT}}};
+    rows[1] = rows[0];
+    if (example == 0)
+        rows[1].evidence.facts &= ~CBM_RESOLVE_FACT_LANGUAGE_BOUND;
+    else if (example == 1)
+        rows[1].evidence.facts &= ~CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
+    else if (example == 2)
+        rows[1].callee_qn = "proj.main.decoy";
+    else {
+        rows[1].evidence.rule = CBM_RESOLVE_RULE_SCOPE_BINDING;
+        rows[1].evidence.facts &= ~CBM_RESOLVE_FACT_LANGUAGE_BOUND;
+        rows[1].evidence.facts |= CBM_RESOLVE_FACT_SCOPE_BOUND;
+    }
+    ASSERT(attest_semantic_row(result, &rows[0], call));
+    ASSERT(attest_semantic_row(result, &rows[1], call));
+    result->resolved_calls.count = 0;
+    cbm_resolvedcall_push(&result->resolved_calls, &result->arena, rows[reverse ? 1 : 0]);
+    cbm_resolvedcall_push(&result->resolved_calls, &result->arena, rows[reverse ? 0 : 1]);
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(graph);
+    ASSERT_NOT_NULL(registry);
+    ASSERT(add_result(graph, registry, result, "main.c", source));
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "proj", .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+    cbm_file_info_t file = {.path = "/tmp/main.c", .rel_path = "main.c", .language = CBM_LANG_C};
+    cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+    ASSERT_NOT_NULL(shared);
+    cbm_resolver_file_t input = {.ctx = &ctx,
+                                 .registry = registry,
+                                 .graph = graph,
+                                 .output = graph,
+                                 .result = result,
+                                 .rel_path = "main.c",
+                                 .module_qn = result->module_qn,
+                                 .language = CBM_LANG_C};
+    ASSERT(cbm_shared_resolver_file(shared, &input));
+    ASSERT(cbm_gbuf_resolutions_own_shared(graph));
+    ASSERT(cbm_shared_resolver_project(graph));
+    ASSERT_EQ(emitted_target(graph, "CALLS", "proj.main.target"), example == 2 ? 0 : 1);
+    ASSERT_EQ(emitted_target(graph, "CALLS", "proj.main.decoy"), 0);
+    size_t count = 0;
+    const cbm_resolve_record_t *records = cbm_gbuf_resolutions(graph, &count);
+    int calls = 0;
+    for (size_t i = 0; i < count; i++) {
+        const cbm_resolve_record_t *record = &records[i];
+        if (strcmp(record->relation, "CALLS"))
+            continue;
+        calls++;
+        if (example == 2) {
+            ASSERT_FALSE(record->emitted);
+            ASSERT_EQ(record->result.binding, CBM_RESOLVE_BINDING_AMBIGUOUS);
+            ASSERT_STR_EQ(record->result.reason, "conflicting_semantic_targets");
+        } else {
+            ASSERT(record->emitted);
+            ASSERT_EQ(record->result.rule, example == 3 ? CBM_RESOLVE_RULE_SCOPE_BINDING
+                                                        : CBM_RESOLVE_RULE_LANGUAGE_BINDING);
+        }
+    }
+    cbm_shared_resolver_free(shared);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    cbm_free_result(result);
+    ASSERT_EQ(calls, 1);
+    PASS();
+}
+
+TEST(resolver_pipeline_duplicate_semantics_are_order_independent) {
+    for (int example = 0; example < 4; example++)
+        for (int reverse = 0; reverse < 2; reverse++)
+            ASSERT_EQ(resolver_pipeline_duplicate_semantics(example, reverse != 0), 0);
+    PASS();
+}
+
+TEST(resolver_pipeline_python_default_keeps_class_target_and_body_keeps_module_target) {
+    const char *source = "def target():\n    return 1\n"
+                         "class C:\n    def target():\n        return 2\n"
+                         "    def method(value=target()):\n        target()\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "proj",
+                                             "main.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    /* Exercise the shared source-binding path independently of hybrid rows. */
+    result->resolved_calls.count = 0;
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(graph);
+    ASSERT_NOT_NULL(registry);
+    ASSERT(add_result(graph, registry, result, "main.py", source));
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "proj", .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+    cbm_file_info_t file = {
+        .path = "/tmp/main.py", .rel_path = "main.py", .language = CBM_LANG_PYTHON};
+    cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+    ASSERT_NOT_NULL(shared);
+    cbm_resolver_file_t input = {.ctx = &ctx,
+                                 .registry = registry,
+                                 .graph = graph,
+                                 .output = graph,
+                                 .result = result,
+                                 .rel_path = "main.py",
+                                 .module_qn = result->module_qn,
+                                 .language = CBM_LANG_PYTHON};
+    ASSERT(cbm_shared_resolver_file(shared, &input));
+    uint32_t body = (uint32_t)(strstr(source, "        target()") - source);
+    size_t count = 0;
+    const cbm_resolve_record_t *records = cbm_gbuf_resolutions(graph, &count);
+    int calls = 0;
+    for (size_t i = 0; i < count; i++) {
+        const cbm_resolve_record_t *record = &records[i];
+        if (strcmp(record->relation, "CALLS") || strcmp(record->spelling, "target"))
+            continue;
+        ASSERT(record->emitted);
+        ASSERT_STR_EQ(record->result.target,
+                      record->start_byte < body ? "proj.main.C.target" : "proj.main.target");
+        calls++;
+    }
+    ASSERT(cbm_gbuf_resolutions_own_shared(graph));
+    ASSERT(cbm_shared_resolver_project(graph));
+    ASSERT_EQ(emitted_target(graph, "CALLS", "proj.main.C.target"), 1);
+    ASSERT_EQ(emitted_target(graph, "CALLS", "proj.main.target"), 1);
+    cbm_shared_resolver_free(shared);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    cbm_free_result(result);
+    ASSERT_EQ(calls, 2);
+    PASS();
+}
+
+TEST(resolver_pipeline_changed_source_cannot_reuse_old_occurrence_proof) {
+    const char *source = "void target(void) {}\nvoid caller(void) { target(); }\n";
+    const char *changed = "void decoy_(void) {}\nvoid caller(void) { decoy_(); }\n";
+    ASSERT_EQ(strlen(source), strlen(changed));
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_C, "proj", "main.c", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(graph);
+    ASSERT_NOT_NULL(registry);
+    ASSERT(add_result(graph, registry, result, "main.c", source));
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "proj", .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+    cbm_file_info_t file = {.path = "/tmp/main.c", .rel_path = "main.c", .language = CBM_LANG_C};
+    cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+    ASSERT_NOT_NULL(shared);
+    cbm_resolver_file_t input = {.ctx = &ctx,
+                                 .registry = registry,
+                                 .graph = graph,
+                                 .output = graph,
+                                 .result = result,
+                                 .rel_path = "main.c",
+                                 .module_qn = result->module_qn,
+                                 .language = CBM_LANG_C,
+                                 .source = changed,
+                                 .source_len = strlen(changed)};
+    ASSERT(cbm_shared_resolver_file(shared, &input));
+    ASSERT(cbm_gbuf_resolutions_own_shared(graph));
+    ASSERT(cbm_shared_resolver_project(graph));
+    int emitted = emitted_target(graph, "CALLS", "proj.main.target");
+    size_t count = 0;
+    const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(graph, &count);
+    int failed = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!strcmp(rows[i].relation, "CALLS") && !strcmp(rows[i].spelling, "target")) {
+            ASSERT_FALSE(rows[i].emitted);
+            ASSERT_STR_EQ(rows[i].result.reason, "source_snapshot_mismatch");
+            failed++;
+        }
+    }
+    cbm_shared_resolver_free(shared);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    cbm_free_result(result);
+    ASSERT_EQ(emitted, 0);
+    ASSERT_EQ(failed, 1);
+    PASS();
+}
+
 SUITE(resolver_pipeline) {
+    RUN_TEST(resolver_pipeline_changed_source_cannot_reuse_old_occurrence_proof);
+    RUN_TEST(resolver_pipeline_duplicate_semantics_are_order_independent);
+    RUN_TEST(resolver_pipeline_python_default_keeps_class_target_and_body_keeps_module_target);
     RUN_TEST(resolver_pipeline_c_declaration_evidence_survives_extraction);
     RUN_TEST(resolver_pipeline_source_identity_cannot_cross_graph_collision);
     RUN_TEST(resolver_pipeline_semantic_proof_cannot_cross_graph_identity_collision);

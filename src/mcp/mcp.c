@@ -7403,6 +7403,8 @@ static bool add_resolver_miss(const cbm_resolve_record_t *row, void *context) {
     const char *analysis = row->result.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE  ? "complete"
                            : row->result.analysis == CBM_RESOLVE_ANALYSIS_LIMITED ? "limited"
                            : row->result.analysis == CBM_RESOLVE_ANALYSIS_FAILED  ? "failed"
+                           : row->result.analysis == CBM_RESOLVE_ANALYSIS_PENDING ? "pending"
+                           : row->result.analysis == CBM_RESOLVE_ANALYSIS_UNKNOWN ? "unknown"
                                                                                   : "unsupported";
     const char *domain = row->result.domain == CBM_RESOLVE_DOMAIN_PROJECT    ? "project"
                          : row->result.domain == CBM_RESOLVE_DOMAIN_EXTERNAL ? "external"

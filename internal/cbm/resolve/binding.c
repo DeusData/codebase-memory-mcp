@@ -26,11 +26,18 @@ typedef struct {
     uint32_t scope;
 } binding_name_t;
 
+typedef struct binding_pending_declaration {
+    const char *name;
+    uint32_t scope;
+    const struct binding_pending_declaration *parent;
+} binding_pending_declaration_t;
+
 typedef struct {
     const char *name;
     uint32_t start;
     uint32_t end;
     uint32_t scope;
+    const binding_pending_declaration_t *pending;
 } binding_site_t;
 
 typedef struct {
@@ -39,8 +46,18 @@ typedef struct {
     bool class_scope;
 } binding_scope_t;
 
+typedef struct {
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_lookup_context_t context;
+    const char *name;
+    uint32_t start, end;
+    CBMSourceOrigin origin;
+    const cbm_resolve_proof_t *proof;
+} binding_observation_t;
+
 struct cbm_resolve_binding_index {
     CBMArena *arena;
+    binding_observation_t *observation;
     const CBMFileResult *result;
     CBMLanguage language;
     const char *source;
@@ -57,6 +74,7 @@ struct cbm_resolve_binding_index {
     binding_scope_t *scopes;
     size_t scope_count, scope_capacity;
     uint32_t current_scope;
+    const binding_pending_declaration_t *current_pending;
     uint32_t python_wildcard_barrier;
     cbm_resolve_source_import_t *imports;
     size_t import_count, import_capacity;
@@ -143,8 +161,11 @@ static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNod
         return;
     }
     index->sites = sites;
-    sites[index->site_count++] = (binding_site_t){name, ts_node_start_byte(node),
-                                                  ts_node_end_byte(node), index->current_scope};
+    sites[index->site_count++] = (binding_site_t){.name = name,
+                                                  .start = ts_node_start_byte(node),
+                                                  .end = ts_node_end_byte(node),
+                                                  .scope = index->current_scope,
+                                                  .pending = index->current_pending};
 }
 
 static bool listed(const char *kind, const char *const *list) {
@@ -238,6 +259,8 @@ static bool supported_node(CBMLanguage language, const char *kind) {
                                          "type",
                                          "import_statement",
                                          "import_from_statement",
+                                         "relative_import",
+                                         "import_prefix",
                                          "wildcard_import",
                                          "dotted_name",
                                          "aliased_import",
@@ -402,7 +425,48 @@ typedef struct {
     bool type_only;
     bool conditional;
     uint32_t scope;
+    uint32_t header_scope;
+    const binding_pending_declaration_t *pending;
 } binding_walk_t;
+
+/* Function defaults/annotations and class bases execute in the enclosing
+ * namespace. Parameter names still bind in the body scope. Keep declarations
+ * under construction unavailable to these eager reads, including a class
+ * name while its methods' defaults are being evaluated. */
+static binding_walk_t python_child_context(const char *parent, const char *field_name,
+                                           binding_walk_t state) {
+    if (!parent || !field_name)
+        return state;
+    bool function = !strcmp(parent, "function_definition") || !strcmp(parent, "lambda");
+    if (function && !strcmp(field_name, "body")) {
+        state.pending = NULL;
+    } else if ((function && !strcmp(field_name, "return_type")) ||
+               (!strcmp(parent, "class_definition") && !strcmp(field_name, "superclasses")) ||
+               ((!strcmp(parent, "default_parameter") ||
+                 !strcmp(parent, "typed_default_parameter")) &&
+                !strcmp(field_name, "value")) ||
+               ((!strcmp(parent, "typed_parameter") ||
+                 !strcmp(parent, "typed_default_parameter")) &&
+                !strcmp(field_name, "type"))) {
+        state.scope = state.header_scope;
+    }
+    return state;
+}
+
+static const binding_pending_declaration_t *python_pending_declaration(
+    cbm_resolve_binding_index_t *index, TSNode node, uint32_t scope,
+    const binding_pending_declaration_t *parent) {
+    if (kind_is(node, "lambda"))
+        return parent;
+    const char *name = node_text(index, field(node, "name"));
+    binding_pending_declaration_t *pending = cbm_arena_alloc(index->arena, sizeof(*pending));
+    if (!name || !pending) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "python_declaration_allocation");
+        return parent;
+    }
+    *pending = (binding_pending_declaration_t){name, scope, parent};
+    return pending;
+}
 
 static uint32_t python_child_scope(cbm_resolve_binding_index_t *index, TSNode node, uint32_t parent,
                                    bool class_scope) {
@@ -1075,8 +1139,10 @@ static void note_dart_call(cbm_resolve_binding_index_t *index, TSNode node) {
     if (!sites)
         return;
     index->sites = sites;
-    sites[index->site_count++] =
-        (binding_site_t){name, ts_node_start_byte(callee), ts_node_end_byte(node), 0};
+    sites[index->site_count++] = (binding_site_t){.name = name,
+                                                  .start = ts_node_start_byte(callee),
+                                                  .end = ts_node_end_byte(node),
+                                                  .scope = 0};
 }
 
 static binding_walk_t note_dart_node(cbm_resolve_binding_index_t *index, TSNode node,
@@ -1335,7 +1401,9 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
     const char *kind = ts_node_type(node);
     binding_walk_t state = inherited;
     if (index->language == CBM_LANG_PYTHON) {
-        index->current_scope = inherited.scope;
+        state = python_child_context(parent_kind, field_name, state);
+        index->current_scope = state.scope;
+        index->current_pending = state.pending;
         if (!strcmp(kind, "global_statement") || !strcmp(kind, "nonlocal_statement")) {
             fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "python_namespace_write_unproven");
             return state;
@@ -1390,10 +1458,14 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
     if (index->language == CBM_LANG_PYTHON &&
         (!strcmp(kind, "function_definition") || !strcmp(kind, "class_definition") ||
          !strcmp(kind, "lambda"))) {
+        uint32_t enclosing_scope = state.scope;
+        state.pending = python_pending_declaration(index, node, enclosing_scope, state.pending);
         state.scope =
-            python_child_scope(index, node, inherited.scope, !strcmp(kind, "class_definition"));
+            python_child_scope(index, node, enclosing_scope, !strcmp(kind, "class_definition"));
+        state.header_scope = enclosing_scope;
         state.conditional = false;
         index->current_scope = state.scope;
+        index->current_pending = state.pending;
     }
     /* Annotation expressions read names; they do not bind the names inside
      * the type. The parameter name itself remains a shadowing declaration. */
@@ -1522,6 +1594,84 @@ static void walk_tree(cbm_resolve_binding_index_t *index, TSNode root) {
     ts_tree_cursor_delete(&cursor);
 }
 
+bool cbm_resolve_binding_set_identity(cbm_resolve_binding_index_t *index, const char *project,
+                                      const char *file) {
+    if (!index || !index->observation)
+        return false;
+    cbm_resolve_proof_source_t source = index->observation->context.source;
+    source.project = project;
+    source.file = file;
+    bool ok = cbm_resolve_lookup_context_init(&index->observation->context,
+                                              &index->observation->pool, source);
+    if (ok)
+        index->observation->context.source =
+            cbm_resolve_proof_view(index->observation->context.source_fact)->source;
+    return ok;
+}
+
+cbm_resolve_lookup_context_t *cbm_resolve_binding_lookup_context(
+    const cbm_resolve_binding_index_t *index) {
+    return index && index->observation ? &index->observation->context : NULL;
+}
+
+const cbm_resolve_proof_t *cbm_resolve_binding_site_proof(const cbm_resolve_binding_index_t *index,
+                                                          const char *name, uint32_t start,
+                                                          uint32_t end, CBMSourceOrigin origin) {
+    const binding_observation_t *value = index ? index->observation : NULL;
+    return value && name && value->name && !strcmp(value->name, name) && value->start == start &&
+                   value->end == end && value->origin == origin
+               ? value->proof
+               : NULL;
+}
+
+static void binding_query_begin(const cbm_resolve_binding_index_t *index,
+                                cbm_resolve_lookup_t *query, const char *name, uint32_t start,
+                                uint32_t end, CBMSourceOrigin origin) {
+    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(index);
+    cbm_resolve_lookup_begin(query, context, "source_lexical_binding", name, start, end, origin);
+    if (context)
+        (void)cbm_resolve_lookup_observe(
+            query, "source_binding_audit", name,
+            index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE ? index->reason : NULL,
+            index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE ? CBM_RESOLVE_BINDING_UNIQUE
+                                                             : CBM_RESOLVE_BINDING_UNRESOLVED,
+            index->analysis, 0, index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE, index->reason);
+}
+
+static cbm_resolve_result_t binding_query_finish(const cbm_resolve_binding_index_t *index,
+                                                 cbm_resolve_lookup_t *query,
+                                                 cbm_resolve_result_t result) {
+    if (!index || !index->observation)
+        return result;
+    binding_observation_t *site = index->observation;
+    site->name =
+        query->key.lookup_key ? cbm_arena_strdup(index->arena, query->key.lookup_key) : NULL;
+    site->start = query->key.start_byte;
+    site->end = query->key.end_byte;
+    site->origin = (CBMSourceOrigin)query->key.origin;
+    cbm_resolve_result_t local = result;
+    /* This is the target checked against the exact lexical binding above,
+     * separate from a reusable exported semantic root retained in result. */
+    query->key.binding_identity = local.target;
+    site->proof = cbm_resolve_lookup_finish(query, CBM_PROOF_REGISTRY_LOOKUP, local);
+    if (!site->proof) {
+        result.analysis = site->pool.failure == CBM_RESOLVE_ANALYSIS_LIMITED
+                              ? CBM_RESOLVE_ANALYSIS_LIMITED
+                              : CBM_RESOLVE_ANALYSIS_FAILED;
+        result.facts = 0;
+        result.reason = "source_binding_proof_unavailable";
+    } else if (cbm_resolve_proof_view(site->proof)->outcome.analysis !=
+               CBM_RESOLVE_ANALYSIS_COMPLETE) {
+        result.analysis = cbm_resolve_proof_view(site->proof)->outcome.analysis;
+        result.facts &= ~CBM_RESOLVE_FACT_LOOKUP_COMPLETE;
+    }
+    /* Shared import roots stay in their owner pool. The coordinator consumes
+     * this independent local site root alongside that original root. */
+    if (!result.proof)
+        result.proof = site->proof;
+    return result;
+}
+
 cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
                                                        CBMLanguage language, const char *source,
                                                        size_t source_len) {
@@ -1536,6 +1686,24 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
                                            .source_len = source_len,
                                            .analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
                                            .reason = "unsupported_binding_language"};
+    index->observation = cbm_arena_calloc(arena, sizeof(*index->observation));
+    if (!index->observation)
+        return NULL;
+    cbm_resolve_proof_pool_init(&index->observation->pool, arena, 0, 0, 0);
+    cbm_resolve_proof_source_t captured = {
+        .module = result ? result->module_qn : NULL,
+        .scope = result ? result->module_qn : NULL,
+        .content_identity = result ? result->source_content_id[CBM_SOURCE_ORIGIN_RAW] : NULL,
+        .configuration_identity = result ? result->source_configuration_id : NULL,
+        .source_origin = CBM_SOURCE_ORIGIN_RAW};
+    if (!cbm_resolve_lookup_context_init(&index->observation->context, &index->observation->pool,
+                                         captured))
+        return NULL;
+    if (result && result->source_content_id[CBM_SOURCE_ORIGIN_RAW][0] &&
+        !cbm_result_source_matches(result, source, source_len, CBM_SOURCE_ORIGIN_RAW)) {
+        index->reason = "binding_source_snapshot_mismatch";
+        return index;
+    }
     if (language != CBM_LANG_PYTHON && language != CBM_LANG_LUA && language != CBM_LANG_DART &&
         language != CBM_LANG_RUST && !javascript_language(language)) {
         if (language == CBM_LANG_SWIFT)
@@ -1569,8 +1737,17 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
             index->scopes =
                 grow_array(index, NULL, 0, &index->scope_capacity, sizeof(*index->scopes));
             if (index->scopes) {
-                index->scopes[0] = (binding_scope_t){result->module_qn, 0, false};
-                index->scope_count = 1;
+                const char *scope = result->module_qn;
+                size_t symbol_scope_len = cbm_fqn_symbol_scope_len(scope);
+                if (symbol_scope_len != strlen(scope))
+                    scope = cbm_arena_strndup(arena, scope, symbol_scope_len);
+                if (!scope) {
+                    fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED,
+                               "python_symbol_scope_allocation");
+                } else {
+                    index->scopes[0] = (binding_scope_t){scope, 0, false};
+                    index->scope_count = 1;
+                }
             }
         }
         if (index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE)
@@ -1630,10 +1807,23 @@ static const binding_name_t *find_name(const cbm_resolve_binding_index_t *index,
 }
 
 static const binding_name_t *find_lexical_name(const cbm_resolve_binding_index_t *index,
-                                               const char *name, size_t length, uint32_t scope) {
+                                               const char *name, size_t length, uint32_t scope,
+                                               cbm_resolve_lookup_t *query) {
     for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
         bool present;
         const binding_name_t *found = find_scoped_name(index, name, length, scope, &present);
+        const char *domain = scope < index->scope_count ? index->scopes[scope].qualified_name
+                                                        : index->result->module_qn;
+        const char *key = cbm_arena_strndup(index->arena, name, length);
+        (void)cbm_resolve_lookup_observe(
+            query, domain, key, found ? (found->target ? found->target : key) : NULL,
+            present && !found ? CBM_RESOLVE_BINDING_AMBIGUOUS
+            : found           ? CBM_RESOLVE_BINDING_UNIQUE
+                              : CBM_RESOLVE_BINDING_UNRESOLVED,
+            CBM_RESOLVE_ANALYSIS_COMPLETE, found ? found->flags : 0, true,
+            !present ? "lexical_scope_key_absent"
+            : !found ? "lexical_scope_key_ambiguous"
+                     : "lexical_scope_key_observed");
         if (present || !scope)
             return found;
         if (scope >= index->scope_count)
@@ -1647,6 +1837,8 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
                                                   const char *name, uint32_t start, uint32_t end,
                                                   CBMSourceOrigin origin,
                                                   cbm_resolve_result_t candidate) {
+    cbm_resolve_lookup_t query;
+    binding_query_begin(index, &query, name, start, end, origin);
     uint32_t prior_facts = candidate.facts;
     candidate.facts &= ~CBM_RESOLVE_FACT_LOOKUP_COMPLETE;
     candidate.analysis = index && index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE
@@ -1657,18 +1849,24 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
         origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !candidate.target ||
         candidate.binding != CBM_RESOLVE_BINDING_UNIQUE || candidate.candidate_count != 1 ||
         !(prior_facts & CBM_RESOLVE_FACT_EXACT_TARGET)) {
-        return candidate;
+        return binding_query_finish(index, &query, candidate);
     }
     binding_site_t site = {.name = name, .start = start, .end = end};
     const binding_site_t *located =
         bsearch(&site, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    (void)cbm_resolve_lookup_observe(
+        &query, "source_occurrences", name, located ? name : NULL,
+        located ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+        located ? "exact_occurrence_observed" : "exact_occurrence_absent");
     if (!located) {
         candidate.reason = "binding_occurrence_missing";
-        return candidate;
+        return binding_query_finish(index, &query, candidate);
     }
     const char *dot = strchr(name, '.');
     size_t root_length = dot ? (size_t)(dot - name) : strlen(name);
-    const binding_name_t *binding = find_lexical_name(index, name, root_length, located->scope);
+    const binding_name_t *binding =
+        find_lexical_name(index, name, root_length, located->scope, &query);
     bool dart_import = index->language == CBM_LANG_DART && !dot && !binding &&
                        !cbm_resolve_binding_name_present(index, name) &&
                        candidate.rule == CBM_RESOLVE_RULE_IMPORT_BINDING &&
@@ -1676,7 +1874,14 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
                        (prior_facts & CBM_RESOLVE_FACT_LOOKUP_COMPLETE);
     if (!dart_import && (!binding || (binding->flags & BINDING_BLOCKED) || start < binding->at)) {
         candidate.reason = "binding_shadowed_or_unavailable";
-        return candidate;
+        return binding_query_finish(index, &query, candidate);
+    }
+    for (const binding_pending_declaration_t *pending = located->pending; binding && pending;
+         pending = pending->parent) {
+        if (binding->scope == pending->scope && !strcmp(binding->name, pending->name)) {
+            candidate.reason = "binding_declaration_not_yet_bound";
+            return binding_query_finish(index, &query, candidate);
+        }
     }
     if (dart_import) {
         candidate.facts |= CBM_RESOLVE_FACT_SCOPE_BOUND;
@@ -1690,7 +1895,7 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
         candidate.facts |= CBM_RESOLVE_FACT_SCOPE_BOUND;
     } else {
         candidate.reason = "binding_target_or_export_unproven";
-        return candidate;
+        return binding_query_finish(index, &query, candidate);
     }
     if (index->language == CBM_LANG_PYTHON && candidate.rule == CBM_RESOLVE_RULE_SCOPE_BINDING &&
         (binding->flags & BINDING_TYPE_DECLARATION) && (binding->flags & BINDING_VALUE_TYPE))
@@ -1698,25 +1903,32 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
     candidate.facts |= CBM_RESOLVE_FACT_LOOKUP_COMPLETE | CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
     candidate.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
     candidate.reason = "exact_lexical_binding";
-    return candidate;
+    return binding_query_finish(index, &query, candidate);
 }
 
 cbm_resolve_result_t cbm_resolve_binding_local(const cbm_resolve_binding_index_t *index,
                                                const char *name, uint32_t start, uint32_t end,
                                                CBMSourceOrigin origin) {
+    cbm_resolve_lookup_t query;
+    binding_query_begin(index, &query, name, start, end, origin);
     cbm_resolve_result_t result = {.reason = "local_binding_unavailable"};
     if (!index || index->language != CBM_LANG_PYTHON ||
         index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name || strchr(name, '.') ||
         origin != CBM_SOURCE_ORIGIN_RAW || end <= start)
-        return result;
+        return binding_query_finish(index, &query, result);
     binding_site_t site = {.name = name, .start = start, .end = end};
     const binding_site_t *located =
         bsearch(&site, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    (void)cbm_resolve_lookup_observe(
+        &query, "source_occurrences", name, located ? name : NULL,
+        located ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+        located ? "exact_occurrence_observed" : "exact_occurrence_absent");
     const binding_name_t *binding =
-        located ? find_lexical_name(index, name, strlen(name), located->scope) : NULL;
+        located ? find_lexical_name(index, name, strlen(name), located->scope, &query) : NULL;
     if (!binding || !binding->target || (binding->flags & BINDING_BLOCKED) ||
         !(binding->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE)))
-        return result;
+        return binding_query_finish(index, &query, result);
     result.binding = CBM_RESOLVE_BINDING_UNIQUE;
     result.domain = CBM_RESOLVE_DOMAIN_PROJECT;
     result.rule = CBM_RESOLVE_RULE_SCOPE_BINDING;

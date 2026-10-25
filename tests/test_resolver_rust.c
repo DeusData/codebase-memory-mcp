@@ -116,8 +116,8 @@ typedef struct {
     const char *path, *text;
 } rust_proof_file_t;
 
-static int rust_proof_edges(const rust_proof_file_t *files, size_t count, const char *target,
-                            const char *name, const char *label) {
+static int rust_proof_count(const rust_proof_file_t *files, size_t count, const char *sql,
+                            const char *target, const char *name, const char *label) {
     const char *root = th_mktempdir("cbm_rust_proof");
     if (!root)
         return -1;
@@ -136,15 +136,10 @@ static int rust_proof_edges(const rust_proof_file_t *files, size_t count, const 
     sqlite3_stmt *statement = NULL;
     int edges = -1;
     if (store &&
-        sqlite3_prepare_v2(
-            cbm_store_get_db(store),
-            "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-            "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.file_path='src/main.rs' "
-            "AND t.file_path=?1 AND t.name=?2 AND t.label=?3",
-            -1, &statement, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, target, -1, SQLITE_STATIC);
-        sqlite3_bind_text(statement, 2, name, -1, SQLITE_STATIC);
-        sqlite3_bind_text(statement, 3, label, -1, SQLITE_STATIC);
+        sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) == SQLITE_OK) {
+        const char *parameters[] = {target, name, label};
+        for (int i = 0; i < sqlite3_bind_parameter_count(statement); i++)
+            sqlite3_bind_text(statement, i + 1, parameters[i], -1, SQLITE_STATIC);
         if (sqlite3_step(statement) == SQLITE_ROW)
             edges = sqlite3_column_int(statement, 0);
     }
@@ -153,6 +148,38 @@ static int rust_proof_edges(const rust_proof_file_t *files, size_t count, const 
         cbm_store_close(store);
     th_cleanup(root);
     return edges;
+}
+
+static int rust_proof_edges(const rust_proof_file_t *files, size_t count, const char *target,
+                            const char *name, const char *label) {
+    return rust_proof_count(
+        files, count,
+        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.file_path='src/main.rs' "
+        "AND t.file_path=?1 AND t.name=?2 AND t.label=?3",
+        target, name, label);
+}
+
+/* Check the exact symbol the import donated, before a language resolver can
+ * conceal incorrect binding evidence by rejecting a later call. */
+static int rust_proof_bindings(const rust_proof_file_t *files, size_t count, const char *target,
+                               const char *name, const char *label) {
+    return rust_proof_count(
+        files, count,
+        "SELECT count(*) FROM nodes s, json_each(s.properties, '$.rust_import_bindings') b "
+        "JOIN nodes t ON t.qualified_name=json_extract(b.value, '$.target') "
+        "WHERE s.label='File' AND s.file_path='src/main.rs' "
+        "AND t.file_path=?1 AND t.name=?2 AND t.label=?3",
+        target, name, label);
+}
+
+static int rust_proof_imports(const rust_proof_file_t *files, size_t count, const char *target) {
+    return rust_proof_count(files, count,
+                            "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                            "JOIN nodes t ON t.id=e.target_id WHERE e.type='IMPORTS' "
+                            "AND s.label='File' AND s.file_path='src/main.rs' "
+                            "AND t.label='File' AND t.file_path=?1",
+                            target, NULL, NULL);
 }
 
 TEST(resolver_rust_import_alias_preserves_binding_name) {
@@ -181,7 +208,69 @@ TEST(resolver_rust_pipeline_keeps_exact_method_and_rejects_module_alias) {
     ASSERT_EQ(rust_proof_edges(module, 2, "src/service.rs", "go", "Method"), 0);
     PASS();
 }
+TEST(resolver_rust_declared_module_and_use_keep_exact_target) {
+    const rust_proof_file_t files[] = {{"src/actual.rs", "pub fn target() {}\n"},
+                                       {"src/decoy.rs", "pub fn target() {}\n"},
+                                       {"src/main.rs",
+                                        "mod actual;\nuse crate::actual::target;\n"
+                                        "fn caller() { target(); }\nfn main() {}\n"}};
+    ASSERT(rust_proof_imports(files, 3, "src/actual.rs") > 0);
+    ASSERT_EQ(rust_proof_imports(files, 3, "src/decoy.rs"), 0);
+    ASSERT_EQ(rust_proof_bindings(files, 3, "src/actual.rs", "target", "Function"), 1);
+    ASSERT_EQ(rust_proof_bindings(files, 3, "src/decoy.rs", "target", "Function"), 0);
+    ASSERT_EQ(rust_proof_edges(files, 3, "src/actual.rs", "target", "Function"), 1);
+    ASSERT_EQ(rust_proof_edges(files, 3, "src/decoy.rs", "target", "Function"), 0);
+    PASS();
+}
+
+TEST(resolver_rust_inline_module_does_not_bind_top_level_namesake) {
+    const char *sources[] = {"pub struct Service;\n"
+                             "mod inner { pub struct Service; }\n"
+                             "use crate::inner::Service as Svc;\n"
+                             "fn consume(value: &Svc) {}\nfn main() {}\n",
+                             "pub struct Service;\n"
+                             "mod inner { pub struct Service; use self::Service as Svc;\n"
+                             "pub fn consume(value: &Svc) {} }\nfn main() {}\n"};
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        const rust_proof_file_t files[] = {{"src/main.rs", sources[i]}};
+        int bindings = rust_proof_count(
+            files, 1,
+            "SELECT count(*) FROM nodes s, json_each(s.properties, '$.rust_import_bindings') b "
+            "JOIN nodes t ON t.qualified_name=json_extract(b.value, '$.target') "
+            "WHERE s.label='File' AND s.file_path='src/main.rs' AND t.start_line=1 "
+            "AND t.file_path=?1 AND t.name=?2 AND t.label=?3",
+            "src/main.rs", "Service", "Struct");
+        if (bindings)
+            fprintf(stderr, "Rust inline import binding %zu: %d\n", i, bindings);
+        ASSERT_EQ(bindings, 0);
+    }
+    PASS();
+}
+
+TEST(resolver_rust_attributes_and_macros_do_not_donate_import_binding) {
+    const char *libraries[] = {"#[cfg(feature=\"alternate\")]\npub fn target() {}\n",
+                               "#![cfg(feature=\"alternate\")]\npub fn target() {}\n",
+                               "#[transform]\npub fn target() {}\n",
+                               "macro_rules! influence { () => {} }\npub fn target() {}\n",
+                               "influence!();\npub fn target() {}\n"};
+    for (size_t i = 0; i < sizeof(libraries) / sizeof(libraries[0]); i++) {
+        const rust_proof_file_t files[] = {{"src/actual.rs", libraries[i]},
+                                           {"src/main.rs",
+                                            "mod actual;\nuse crate::actual::target;\n"
+                                            "fn caller() { target(); }\nfn main() {}\n"}};
+        int bindings = rust_proof_bindings(files, 2, "src/actual.rs", "target", "Function");
+        if (bindings)
+            fprintf(stderr, "Rust unsupported import binding %zu: %d\n", i, bindings);
+        ASSERT_EQ(bindings, 0);
+        ASSERT_EQ(rust_proof_edges(files, 2, "src/actual.rs", "target", "Function"), 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
+    RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
+    RUN_TEST(resolver_rust_inline_module_does_not_bind_top_level_namesake);
+    RUN_TEST(resolver_rust_attributes_and_macros_do_not_donate_import_binding);
     RUN_TEST(resolver_rust_import_alias_preserves_binding_name);
     RUN_TEST(resolver_rust_shared_reference_and_alias);
     RUN_TEST(resolver_rust_receiver_shadow_and_unsupported_flow_abstain);

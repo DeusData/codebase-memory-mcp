@@ -30,6 +30,8 @@ enum {
 #include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
 #include "store/store.h"
 #include "sqlite_writer.h"
+#include "resolve/proof.h"
+#include "resolve/policy.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
@@ -121,6 +123,12 @@ struct cbm_gbuf {
     size_t resolution_count;
     size_t resolution_capacity;
     bool resolution_failed;
+    CBMArena proof_arena;
+    cbm_resolve_proof_pool_t proof_pool;
+    cbm_resolve_proof_clone_session_t proof_session;
+    bool proof_session_active;
+    CBM_DYN_ARRAY(cbm_resolve_file_t) resolver_files;
+    CBM_DYN_ARRAY(cbm_resolve_summary_t) resolver_summaries;
 
     /* Edge dedup index: "srcID:tgtID:type" → cbm_gbuf_edge_t* */
     edge_key_map_t edge_by_key; /* dedup: 128-bit key hash -> edge */
@@ -172,6 +180,29 @@ static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
     return copy;
 }
 
+bool cbm_gbuf_resolution_begin(cbm_gbuf_t *gb) {
+    if (!gb || gb->resolution_failed || gb->proof_session_active)
+        return false;
+    gb->proof_session_active = cbm_resolve_proof_clone_begin(&gb->proof_session, &gb->proof_pool);
+    if (!gb->proof_session_active)
+        gb->resolution_failed = true;
+    return gb->proof_session_active;
+}
+
+void cbm_gbuf_resolution_end(cbm_gbuf_t *gb) {
+    if (gb && gb->proof_session_active) {
+        cbm_resolve_proof_clone_end(&gb->proof_session);
+        gb->proof_session_active = false;
+    }
+}
+
+static const cbm_resolve_proof_t *gb_copy_proof(cbm_gbuf_t *gb, const cbm_resolve_proof_t *proof) {
+    if (!proof)
+        return NULL;
+    return gb->proof_session_active ? cbm_resolve_proof_clone_root(&gb->proof_session, proof)
+                                    : cbm_resolve_proof_clone(&gb->proof_pool, proof);
+}
+
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record) {
     if (!gb || !record || gb->resolution_failed)
         return false;
@@ -190,6 +221,23 @@ bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *reco
         gb->resolution_capacity = next;
     }
     cbm_resolve_record_t row = *record;
+    if (!row.proof_borrowed && row.result.proof) {
+        row.result.proof = gb_copy_proof(gb, row.result.proof);
+        if (!row.result.proof) {
+            gb->resolution_failed = true;
+            return false;
+        }
+    }
+    if (row.binding_proof) {
+        row.binding_proof = gb_copy_proof(gb, row.binding_proof);
+        if (!row.binding_proof) {
+            gb->resolution_failed = true;
+            return false;
+        }
+    }
+    row.content_identity = gb_intern(gb, record->content_identity ? record->content_identity : "");
+    row.configuration_identity =
+        gb_intern(gb, record->configuration_identity ? record->configuration_identity : "");
     row.file_path = gb_intern(gb, record->file_path ? record->file_path : "");
     row.scope = gb_intern(gb, record->scope ? record->scope : "");
     row.relation = gb_intern(gb, record->relation ? record->relation : "");
@@ -198,7 +246,8 @@ bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *reco
     row.result.target = gb_intern(gb, record->result.target ? record->result.target : "");
     row.result.reason = gb_intern(gb, record->result.reason ? record->result.reason : "");
     if (!row.file_path || !row.scope || !row.relation || !row.spelling || !row.result.target ||
-        !row.result.reason || !row.properties_json) {
+        !row.result.reason || !row.properties_json || !row.content_identity ||
+        !row.configuration_identity) {
         gb->resolution_failed = true;
         return false;
     }
@@ -214,6 +263,156 @@ const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *c
 
 bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb) {
     return gb && !gb->resolution_failed;
+}
+
+bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb) {
+    if (!cbm_gbuf_resolution_begin(gb))
+        return false;
+    bool ok = true;
+    for (size_t i = 0; ok && i < gb->resolution_count; i++) {
+        cbm_resolve_record_t *row = &gb->resolutions[i];
+        if (!row->proof_borrowed)
+            continue;
+        row->result.proof = gb_copy_proof(gb, row->result.proof);
+        row->proof_borrowed = false;
+        ok = row->result.proof != NULL;
+    }
+    for (int i = 0; ok && i < gb->resolver_summaries.count; i++) {
+        cbm_resolve_summary_t *row = &gb->resolver_summaries.items[i];
+        if (!row->proof_borrowed)
+            continue;
+        row->result.proof = gb_copy_proof(gb, row->result.proof);
+        row->proof_borrowed = false;
+        ok = row->result.proof != NULL;
+    }
+    cbm_gbuf_resolution_end(gb);
+    /* The long shared ancestors are now interned once. Each occurrence adds
+     * one constant-size join with its local source binding validation. */
+    for (size_t i = 0; ok && i < gb->resolution_count; i++) {
+        cbm_resolve_record_t *row = &gb->resolutions[i];
+        if (!row->result.proof)
+            continue;
+        /* Replaying the coordinator does not add another envelope or change
+         * an already owned, admitted occurrence in this project. */
+        if (cbm_resolve_record_admit(row) && row->result.proof->value.source.project &&
+            !strcmp(row->result.proof->value.source.project, gb->project))
+            continue;
+        const cbm_resolve_proof_t *premises[] = {row->result.proof, row->binding_proof};
+        cbm_resolve_proof_source_t source = {.project = gb->project,
+                                             .file = row->file_path,
+                                             .scope = row->scope,
+                                             .content_identity = row->content_identity,
+                                             .configuration_identity = row->configuration_identity,
+                                             .source_origin = row->source_origin};
+        cbm_resolve_proof_key_t key = {.lookup_domain = row->scope,
+                                       .lookup_key = row->spelling,
+                                       .start_byte = row->start_byte,
+                                       .end_byte = row->end_byte,
+                                       .origin = row->source_origin,
+                                       .binding_identity = row->result.target,
+                                       .detail = row->relation};
+        cbm_resolve_result_t outcome = row->result;
+        outcome.proof = NULL;
+        uint32_t supported = premises[0]->value.outcome.facts;
+        if (row->binding_proof)
+            supported |= row->binding_proof->value.outcome.facts;
+        uint32_t required = outcome.facts;
+        const cbm_resolve_proof_view_t *binding = cbm_resolve_proof_view(row->binding_proof);
+        /* An incomplete local root must retain its own UNKNOWN/LIMITED/FAILED
+         * status through derive. A complete root must connect this exact site
+         * and role to the selected semantic target. Without one, the hybrid
+         * producer's root itself must provide that complete attestation. */
+        bool site_matches =
+            binding ? binding->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+                          cbm_resolve_record_site_proof(row, row->binding_proof, gb->project)
+                    : cbm_resolve_record_site_proof(row, row->result.proof, gb->project);
+        /* Validate the semantic root before replacing it with the occurrence
+         * envelope. Local binding evidence may supply scope/import facts, but
+         * cannot change the root's selected target, domain or uniqueness. */
+        if (row->emitted &&
+            (!cbm_resolve_record_candidate(row) ||
+             premises[0]->value.outcome.candidate_count != outcome.candidate_count)) {
+            outcome.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED;
+            outcome.facts = 0;
+            outcome.reason = "proof_outcome_conflict";
+        } else if (row->emitted && !site_matches) {
+            outcome.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED;
+            outcome.facts = 0;
+            outcome.reason = "proof_site_conflict";
+        } else if (row->emitted && (supported & required) != required) {
+            outcome.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED;
+            outcome.facts = 0;
+            outcome.reason = "proof_authority_incomplete";
+        }
+        row->result.proof =
+            cbm_resolve_proof_derive(&gb->proof_pool, CBM_PROOF_OCCURRENCE_BINDING, &source, &key,
+                                     &outcome, premises, row->binding_proof ? 2 : 1, true);
+        ok = row->result.proof != NULL;
+        if (ok && row->emitted && !cbm_resolve_record_admit(row)) {
+            row->result.analysis = row->result.proof->value.outcome.analysis;
+            row->result.facts = 0;
+            row->result.reason = "proof_inputs_incomplete";
+            row->emitted = false;
+        }
+    }
+    gb->resolution_failed |= !ok;
+    return ok;
+}
+
+bool cbm_gbuf_record_resolver_file(cbm_gbuf_t *gb, const cbm_resolve_file_t *file) {
+    if (!gb || !file || gb->resolution_failed)
+        return false;
+    cbm_resolve_file_t row = *file;
+#define INTERN_FILE(field)                                     \
+    row.field = gb_intern(gb, file->field ? file->field : ""); \
+    if (!row.field) {                                          \
+        gb->resolution_failed = true;                          \
+        return false;                                          \
+    }
+    INTERN_FILE(file_path)
+    INTERN_FILE(module)
+    INTERN_FILE(raw_content_identity)
+    INTERN_FILE(preprocessed_content_identity)
+    INTERN_FILE(configuration_identity)
+    INTERN_FILE(extracted_summary)
+#undef INTERN_FILE
+    int before = gb->resolver_files.count;
+    cbm_da_push(&gb->resolver_files, row);
+    gb->resolution_failed |= gb->resolver_files.count != before + 1;
+    return !gb->resolution_failed;
+}
+
+const cbm_resolve_file_t *cbm_gbuf_resolver_files(const cbm_gbuf_t *gb, size_t *count) {
+    if (count)
+        *count = gb ? (size_t)gb->resolver_files.count : 0;
+    return gb ? gb->resolver_files.items : NULL;
+}
+
+bool cbm_gbuf_record_resolver_summary(cbm_gbuf_t *gb, const cbm_resolve_summary_t *summary) {
+    if (!gb || !summary || gb->resolution_failed)
+        return false;
+    cbm_resolve_summary_t row = *summary;
+    row.file_path = gb_intern(gb, row.file_path ? row.file_path : "");
+    row.key = gb_intern(gb, row.key ? row.key : "");
+    row.result.target = gb_intern(gb, row.result.target ? row.result.target : "");
+    row.result.reason = gb_intern(gb, row.result.reason ? row.result.reason : "");
+    if (row.result.proof && !row.proof_borrowed)
+        row.result.proof = gb_copy_proof(gb, row.result.proof);
+    if (!row.file_path || !row.key || !row.result.target || !row.result.reason ||
+        (summary->result.proof && !row.result.proof)) {
+        gb->resolution_failed = true;
+        return false;
+    }
+    int before = gb->resolver_summaries.count;
+    cbm_da_push(&gb->resolver_summaries, row);
+    gb->resolution_failed |= gb->resolver_summaries.count != before + 1;
+    return !gb->resolution_failed;
+}
+
+const cbm_resolve_summary_t *cbm_gbuf_resolver_summaries(const cbm_gbuf_t *gb, size_t *count) {
+    if (count)
+        *count = gb ? (size_t)gb->resolver_summaries.count : 0;
+    return gb ? gb->resolver_summaries.items : NULL;
 }
 
 static void make_id_key(char *buf, size_t bufsz, int64_t id) {
@@ -667,6 +866,9 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->root_path = cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, root_path ? root_path : "");
     gb->next_id = SKIP_ONE;
     gb->shared_ids = NULL;
+    cbm_arena_init(&gb->proof_arena);
+    cbm_resolve_proof_pool_init(&gb->proof_pool, &gb->proof_arena, 16u * 1024u * 1024u,
+                                64u * 1024u * 1024u, UINT64_C(4294967296));
 
     gb->node_by_qn = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
     gb->by_id = NULL;
@@ -732,6 +934,10 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
     }
+    cbm_gbuf_resolution_end(gb);
+    cbm_arena_destroy(&gb->proof_arena);
+    cbm_da_free(&gb->resolver_files);
+    cbm_da_free(&gb->resolver_summaries);
     free(gb->resolutions);
     if (gb->variant_spans) {
         cbm_ht_foreach(gb->variant_spans, gb_free_span_vec, NULL);
@@ -2240,10 +2446,18 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     }
     if (src->resolution_failed)
         dst->resolution_failed = true;
-    for (size_t i = 0; i < src->resolution_count; i++) {
-        if (!cbm_gbuf_record_resolution(dst, &src->resolutions[i]))
-            return CBM_NOT_FOUND;
-    }
+    if (!cbm_gbuf_resolution_begin(dst))
+        return CBM_NOT_FOUND;
+    bool resolver_ok = true;
+    for (size_t i = 0; resolver_ok && i < src->resolution_count; i++)
+        resolver_ok = cbm_gbuf_record_resolution(dst, &src->resolutions[i]);
+    for (int i = 0; resolver_ok && i < src->resolver_files.count; i++)
+        resolver_ok = cbm_gbuf_record_resolver_file(dst, &src->resolver_files.items[i]);
+    for (int i = 0; resolver_ok && i < src->resolver_summaries.count; i++)
+        resolver_ok = cbm_gbuf_record_resolver_summary(dst, &src->resolver_summaries.items[i]);
+    cbm_gbuf_resolution_end(dst);
+    if (!resolver_ok)
+        return CBM_NOT_FOUND;
     if (src->nodes.count == 0 && src->edges.count == 0) {
         return 0;
     }

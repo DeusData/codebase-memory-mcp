@@ -249,6 +249,13 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+#include "resolve/lookup.h"
+cbm_resolution_t cbm_registry_resolve_observed(const cbm_registry_t *, const char *name,
+                                               const char *module, const char **keys,
+                                               const char **values, int count, CBMLanguage,
+                                               const char *scope, bool invocation,
+                                               cbm_resolve_lookup_context_t *);
+
 /* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
@@ -901,6 +908,11 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
                                                      const char *const *namespaces,
                                                      const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
+/* Enrich the map with source-audited Rust module trees and configured C/C++
+ * include roots. A false result leaves a partial map which the caller must
+ * discard; it must never become a completed lookup domain. */
+bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                       int count, CBMFileResult **cache, CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,

@@ -1,4 +1,5 @@
 #include "store_resolver.h"
+#include "store_resolver_evidence.h"
 #include "resolve/policy.h"
 
 #include <sqlite3.h>
@@ -63,6 +64,14 @@ static bool resolver_bind_row(sqlite3_stmt *stmt, const char *project,
 
 int cbm_store_resolver_replace(cbm_store_t *store, const char *project,
                                const cbm_resolve_record_t *rows, size_t count) {
+    return cbm_store_resolver_replace_generation(store, project, rows, count, NULL, 0, NULL, 0);
+}
+
+int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *project,
+                                          const cbm_resolve_record_t *rows, size_t count,
+                                          const cbm_resolve_file_t *files, size_t file_count,
+                                          const cbm_resolve_summary_t *summaries,
+                                          size_t summary_count) {
     if (!store || !project || (!rows && count))
         return CBM_STORE_ERR;
     sqlite3 *db = cbm_store_get_db(store);
@@ -106,6 +115,9 @@ int cbm_store_resolver_replace(cbm_store_t *store, const char *project,
     }
     sqlite3_finalize(stmt);
     stmt = NULL;
+    if (ok)
+        ok = cbm_store_resolver_evidence(db, project, rows, count, files, file_count, summaries,
+                                         summary_count);
     if (ok)
         ok = sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO resolver_generations VALUES(?,?)", -1,
                                 &stmt, NULL) == SQLITE_OK;

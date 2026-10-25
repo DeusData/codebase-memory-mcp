@@ -30,6 +30,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/platform.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "resolve/lookup.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -2108,11 +2109,15 @@ static const char *import_binding(const char *prefix, const char **keys, const c
 static cbm_resolution_t registry_resolve_binding(const cbm_registry_t *r, const char *name,
                                                  const char *module, const char **keys,
                                                  const char **values, int count, size_t scope_len,
-                                                 bool skip_members) {
+                                                 bool skip_members, cbm_resolve_lookup_t *query) {
     size_t length = strlen(name);
     char prefix[CBM_SZ_1K];
-    if (length == 0 || length >= sizeof(prefix))
+    if (length == 0 || length >= sizeof(prefix)) {
+        (void)cbm_resolve_lookup_observe(
+            query, "registry.strict_binding", name, NULL, CBM_RESOLVE_BINDING_UNRESOLVED,
+            CBM_RESOLVE_ANALYSIS_UNSUPPORTED, 0, false, "unsupported_binding_name");
         return unresolved_binding("unsupported_binding_name");
+    }
     memcpy(prefix, name, length + 1);
     const char *separator = NULL;
     size_t separator_len = 1;
@@ -2123,6 +2128,17 @@ static cbm_resolution_t registry_resolve_binding(const cbm_registry_t *r, const 
     for (size_t cut = length;;) {
         prefix[cut] = '\0';
         imported = import_binding(prefix, keys, values, count);
+        (void)cbm_resolve_lookup_observe(
+            query, "registry.import_bindings", prefix,
+            imported && imported != ambiguous_import && imported[0] ? imported : NULL,
+            imported == ambiguous_import ? CBM_RESOLVE_BINDING_AMBIGUOUS
+            : imported && imported[0]    ? CBM_RESOLVE_BINDING_UNIQUE
+                                         : CBM_RESOLVE_BINDING_UNRESOLVED,
+            CBM_RESOLVE_ANALYSIS_COMPLETE, 0, imported != ambiguous_import,
+            !imported                      ? "import_key_absent"
+            : imported == ambiguous_import ? "import_key_ambiguous"
+            : imported[0]                  ? "import_key_target_observed"
+                                           : "import_key_blocked");
         if (imported) {
             separator = cut == length ? NULL : name + cut;
             separator_len = separator && *separator == ':' ? 2 : 1;
@@ -2153,11 +2169,22 @@ static cbm_resolution_t registry_resolve_binding(const cbm_registry_t *r, const 
     if (imported) {
         if (!imported[0])
             return unresolved_binding("import_target_unresolved");
-        if (!separator)
+        if (!separator) {
             target = cbm_ht_get_key(r->exact, imported);
+            (void)cbm_resolve_lookup_observe(query, "registry.exact", imported, target,
+                                             target ? CBM_RESOLVE_BINDING_UNIQUE
+                                                    : CBM_RESOLVE_BINDING_UNRESOLVED,
+                                             CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+                                             target ? "exact_key_observed" : "exact_key_absent");
+        }
         if (!target) {
             const char *member = separator ? separator + separator_len : prefix;
             target = same_module_candidate(r, imported, strlen(imported), member);
+            (void)cbm_resolve_lookup_observe(
+                query, imported, member, target,
+                target ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+                CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+                target ? "exact_module_member_observed" : "exact_module_member_absent");
         }
         if (!target)
             return unresolved_binding("import_member_unresolved");
@@ -2165,6 +2192,14 @@ static cbm_resolution_t registry_resolve_binding(const cbm_registry_t *r, const 
                               CBM_RESOLVE_RULE_IMPORT_BINDING, CBM_RESOLVE_FACT_IMPORT_BOUND);
     }
     target = same_module_candidate(r, module, scope_len, name);
+    const char *domain = query && query->context && module
+                             ? cbm_arena_strndup(query->context->pool->arena, module, scope_len)
+                             : module;
+    (void)cbm_resolve_lookup_observe(
+        query, domain, name, target,
+        target ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+        target ? "exact_module_member_observed" : "exact_module_member_absent");
     if (!target)
         return unresolved_binding("binding_not_found");
     const char *label = cbm_ht_get(r->exact, target);
@@ -2192,7 +2227,7 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
 
     cbm_resolution_t res =
         registry_resolve_binding(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                 import_map_count, scope_len, skip_members);
+                                 import_map_count, scope_len, skip_members, NULL);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -2444,8 +2479,11 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
  * same-QN function of a package __init__.py is never an enclosing scope.
  * Empty unless such a local exists. Uncached: the answer depends on the
  * caller, not only on the name. */
-cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
-                                              const char *scope_qn, const char *module_qn) {
+static cbm_resolution_t registry_resolve_lexical_observed(const cbm_registry_t *r,
+                                                          const char *callee_name,
+                                                          const char *scope_qn,
+                                                          const char *module_qn,
+                                                          cbm_resolve_lookup_t *query) {
     char scope[CBM_SZ_512];
     char candidate[CBM_SZ_512];
     size_t len = scope_qn ? strlen(scope_qn) : 0;
@@ -2457,6 +2495,10 @@ cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const cha
     memcpy(scope, scope_qn, len + SKIP_ONE);
     while (strlen(scope) > floor) {
         const char *label = cbm_ht_get(r->exact, scope);
+        (void)cbm_resolve_lookup_observe(
+            query, "registry.lexical_scopes", scope, label ? scope : NULL,
+            label ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+            CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true, label ? label : "enclosing_scope_absent");
         if (!label) {
             break;
         }
@@ -2464,6 +2506,12 @@ cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const cha
             int n = snprintf(candidate, sizeof(candidate), "%s.%s", scope, callee_name);
             const char *stored_key =
                 n > 0 && (size_t)n < sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
+            if (n > 0 && (size_t)n < sizeof(candidate))
+                (void)cbm_resolve_lookup_observe(
+                    query, "registry.exact", candidate, stored_key,
+                    stored_key ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+                    CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+                    stored_key ? "lexical_declaration_observed" : "lexical_declaration_absent");
             if (stored_key) {
                 return binding_result(stored_key, "lexical_scope", CONF_LEXICAL_SCOPE,
                                       CBM_RESOLVE_RULE_SCOPE_BINDING, CBM_RESOLVE_FACT_SCOPE_BOUND);
@@ -2476,6 +2524,63 @@ cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const cha
         *dot = '\0';
     }
     return empty_result();
+}
+
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn, const char *module_qn) {
+    return registry_resolve_lexical_observed(r, callee_name, scope_qn, module_qn, NULL);
+}
+
+/* Source-aware consumers capture actual strict-lookup observations. This
+ * bypasses the legacy result cache whose entries have no source context. */
+cbm_resolution_t cbm_registry_resolve_observed(const cbm_registry_t *r, const char *name,
+                                               const char *module, const char **keys,
+                                               const char **values, int count, CBMLanguage language,
+                                               const char *scope, bool invocation,
+                                               cbm_resolve_lookup_context_t *context) {
+    cbm_resolve_lookup_t query;
+    cbm_resolve_lookup_begin(&query, context, "registry.strict_binding", name, 0, 0,
+                             context ? context->source.source_origin : 0);
+    cbm_resolution_t result = empty_result();
+    if (!r || !name || !name[0]) {
+        (void)cbm_resolve_lookup_observe(
+            &query, "registry.strict_binding", name, NULL, CBM_RESOLVE_BINDING_UNRESOLVED,
+            CBM_RESOLVE_ANALYSIS_UNKNOWN, 0, false, "registry_lookup_input_missing");
+    } else {
+        if (invocation && language == CBM_LANG_PYTHON)
+            result = registry_resolve_lexical_observed(r, name, scope, module, &query);
+        if (!result.qualified_name) {
+            bool skip_members =
+                invocation && language == CBM_LANG_C && !strchr(name, '.') && !strstr(name, "->");
+            result =
+                registry_resolve_binding(r, name, module, keys, values, count,
+                                         lang_scope_len(module, language), skip_members, &query);
+        }
+        if (result.qualified_name &&
+            cbm_label_is_relation(cbm_registry_label_of(r, result.qualified_name))) {
+            (void)cbm_resolve_lookup_observe(&query, "registry.labels", result.qualified_name,
+                                             result.qualified_name, CBM_RESOLVE_BINDING_UNIQUE,
+                                             CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+                                             "relation_target_excluded");
+            result = empty_result();
+        }
+    }
+    cbm_resolve_result_t symbolic = result.proof;
+    /* Exact table observations do not claim language lookup completeness. The
+     * source binding adapter still decides that independently at the site. */
+    symbolic.analysis =
+        result.qualified_name || result.proof.binding == CBM_RESOLVE_BINDING_AMBIGUOUS
+            ? CBM_RESOLVE_ANALYSIS_COMPLETE
+            : CBM_RESOLVE_ANALYSIS_UNKNOWN;
+    result.proof.proof = cbm_resolve_lookup_finish(&query, CBM_PROOF_REGISTRY_LOOKUP, symbolic);
+    if (context && !result.proof.proof) {
+        result.proof.analysis = context->pool->failure == CBM_RESOLVE_ANALYSIS_LIMITED
+                                    ? CBM_RESOLVE_ANALYSIS_LIMITED
+                                    : CBM_RESOLVE_ANALYSIS_FAILED;
+        result.proof.facts = 0;
+        result.proof.reason = "registry_lookup_proof_unavailable";
+    }
+    return result;
 }
 
 /* The registry step both call resolvers (pass_calls.c, pass_parallel.c) run

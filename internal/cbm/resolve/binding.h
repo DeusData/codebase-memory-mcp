@@ -3,6 +3,7 @@
 
 #include "../cbm.h"
 #include "model.h"
+#include "lookup.h"
 
 typedef struct cbm_resolve_binding_index cbm_resolve_binding_index_t;
 
@@ -17,6 +18,18 @@ typedef struct cbm_resolve_binding_index cbm_resolve_binding_index_t;
 cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
                                                        CBMLanguage language, const char *source,
                                                        size_t source_len);
+
+/* Set exact caller identity without re-reading or hashing source. Captured
+ * content/configuration IDs already came from result at build. */
+bool cbm_resolve_binding_set_identity(cbm_resolve_binding_index_t *, const char *project,
+                                      const char *file);
+cbm_resolve_lookup_context_t *cbm_resolve_binding_lookup_context(
+    const cbm_resolve_binding_index_t *);
+/* Separate local validation root. Never incorporates/clones an incoming shared
+ * import proof. The accessor returns only the matching last audited site. */
+const cbm_resolve_proof_t *cbm_resolve_binding_site_proof(const cbm_resolve_binding_index_t *,
+                                                          const char *name, uint32_t start,
+                                                          uint32_t end, CBMSourceOrigin origin);
 
 /* O(log n) site/name queries. Candidate identity must already be exact.
  * Local definitions are checked against the source declaration. Imported

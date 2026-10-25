@@ -265,10 +265,12 @@ static char *read_file(const char *path, int *out_len, long *out_size,
     if (out_size) {
         *out_size = size;
     }
-    if (size <= 0) {
+    /* A zero-byte source is a complete, captured file, not a missing result.
+     * Empty package files must remain in resolver generation summaries. */
+    if (size < 0) {
         (void)fclose(f);
         if (out_status) {
-            *out_status = CBM_READ_EMPTY;
+            *out_status = CBM_READ_OPEN_FAIL;
         }
         return NULL;
     }
@@ -1974,6 +1976,13 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         cbm_free(CBM_MEM_CLASS_OTHER, namespaces);
     }
     free(rels);
+    /* This coordinator owns the context while it is built, including spilled
+     * source results. Workers only consume the completed binding snapshots. */
+    if (namespace_map &&
+        !cbm_pipeline_import_context_build(ctx, files, file_count, result_cache, namespace_map)) {
+        cbm_pipeline_namespace_map_free(namespace_map);
+        namespace_map = NULL;
+    }
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {

@@ -40,7 +40,10 @@ enum {
     CBM_SOURCE_CLASS_DOMAIN_COMPLETE = 1u << 6,
     CBM_SOURCE_DECL_FIXED_ARITY = 1u << 7,
     CBM_SOURCE_DECL_TOP_LEVEL = 1u << 8,
-    CBM_SOURCE_CLASS_ZERO_ARGUMENT_CONSTRUCTOR = 1u << 9
+    CBM_SOURCE_CLASS_ZERO_ARGUMENT_CONSTRUCTOR = 1u << 9,
+    /* Complete source member-binding domain, including shadowing/effects.
+     * This does not establish the callable identity of any member value. */
+    CBM_SOURCE_CLASS_VALUE_DOMAIN_COMPLETE = 1u << 10
 };
 
 // Registered function/method with full type signature.
@@ -68,6 +71,11 @@ typedef struct {
     const char *graph_qualified_name; /* original canonical source graph identity, if different */
     uint32_t source_flags;
     const CBMType *source_return_type; /* Borrowed immutable source annotation. */
+    /* Audited syntax facts, separate from heuristic/materialized signatures.
+     * Unqualified source names retain their spelling until the language
+     * adapter proves the declaration's type-name lookup domain. */
+    const CBMType *source_signature;
+    const char *source_namespace;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.

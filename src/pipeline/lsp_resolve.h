@@ -27,7 +27,9 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "pipeline/pipeline.h" /* cbm_registry_unique_field_qn, cbm_resolution_t */
-#include "service_patterns.h"  /* cbm_service_pattern_match for cbm_pipeline_service_name */
+#include "resolve/policy.h"
+#include "resolve/proof.h"
+#include "service_patterns.h" /* cbm_service_pattern_match for cbm_pipeline_service_name */
 
 #include <ctype.h>
 #include <stdio.h>
@@ -400,6 +402,21 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
     if (site_rank == 2 && call->requires_lsp_resolution && resolved->strategy &&
         strcmp(resolved->strategy, "lsp_destructor") == 0) {
         return true;
+    }
+
+    /* A proved local callable can name a different target than its source
+     * variable. Join its exact occurrence and spelling using the actual proof;
+     * diagnostic strategy labels do not establish this binding. */
+    if (site_rank == 2 && resolved->reason && strcmp(resolved->reason, call->callee_name) == 0 &&
+        resolved->evidence.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE &&
+        resolved->evidence.rule == CBM_RESOLVE_RULE_CALLABLE_BINDING &&
+        (resolved->evidence.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT)) {
+        const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(resolved->evidence.proof);
+        if (proof && proof->predecessors_closed && cbm_resolve_admit(&proof->outcome) &&
+            proof->outcome.rule == resolved->evidence.rule &&
+            proof->outcome.facts == resolved->evidence.facts &&
+            strcmp(proof->outcome.target, resolved->callee_qn) == 0)
+            return true;
     }
 
     /* Indirect resolvers retain the textual source leaf in reason. */

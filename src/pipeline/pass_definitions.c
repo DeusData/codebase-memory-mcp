@@ -67,10 +67,12 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         *out_size = size;
     }
 
-    if (size <= 0) {
+    /* A zero-byte source is a complete, captured file, not a missing result.
+     * Empty package files must remain in resolver generation summaries. */
+    if (size < 0) {
         (void)fclose(f);
         if (out_status) {
-            *out_status = CBM_READ_EMPTY;
+            *out_status = CBM_READ_OPEN_FAIL;
         }
         return NULL;
     }
@@ -1142,6 +1144,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         CBMHashTable *namespace_map =
             cbm_pipeline_namespace_map_build(ctx->project_name, local_cache, rels, file_count);
         free(rels);
+        /* Build complete language import domains before any dependency or
+         * symbol binding is projected. Partial context cannot lend proof. */
+        if (namespace_map && !cbm_pipeline_import_context_build(ctx, files, file_count, local_cache,
+                                                                namespace_map)) {
+            cbm_pipeline_namespace_map_free(namespace_map);
+            namespace_map = NULL;
+        }
         for (int i = 0; i < file_count; i++) {
             if (cbm_pipeline_check_cancel(ctx)) {
                 break;

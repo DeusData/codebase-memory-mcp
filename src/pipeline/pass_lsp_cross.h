@@ -249,4 +249,11 @@ void cbm_pxc_dispatch_file_with_php_bindings(
     CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
     const CBMPHPImportBindings *bindings);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Exercise the production append/supersede ownership boundary with exact
+ * synthetic proof DAGs; no parser or allocation timing is involved. */
+void cbm_pxc_append_resolutions_for_test(CBMArena *arena, CBMResolvedCallArray *destination,
+                                         const CBMResolvedCallArray *source);
+#endif
+
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

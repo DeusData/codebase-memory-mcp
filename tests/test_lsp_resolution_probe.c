@@ -1,92 +1,48 @@
 /*
- * test_lsp_resolution_probe.c — Aggressive per-scenario LSP type-resolution probe.
+ * test_lsp_resolution_probe.c — End-to-end cross-file resolution probes.
  *
- * REPRODUCE-FIRST — green cases are permanent regression guards; red cases are
- * reproduction tests for bugs the call-graph-count check missed.  Do NOT
- * register this suite in test_main.c (a separate agent owns that file).
+ * This suite is registered in test_main.c and runs the full index pipeline.
+ * The hybrid engines cover Go, C/C++ (including CUDA), Python, JavaScript,
+ * TypeScript/TSX, PHP, Rust, Java, Kotlin and C#. Engine wiring alone does not
+ * establish that a particular syntax form has an admissible semantic proof.
  *
- * ════════════════════════════════════════════════════════════════════════════
- * WHAT THIS FILE PROBES
- * ──────────────────────
- * The hybrid LSP TYPE-RESOLUTION PASS (pass_lsp_cross.c / cbm_run_X_lsp_cross)
- * is wired for: Go, C, C++, CUDA, Python, JavaScript, TypeScript, TSX, PHP.
- * It is NOT wired (cbm_pxc_has_cross_lsp returns false) for:
- *   - Rust   — cbm_run_rust_lsp_cross EXISTS in rust_lsp.c but is never called
- *   - C#     — cbm_run_cs_lsp_cross EXISTS in cs_lsp.c but is never called
- *   - Java   — cbm_run_java_lsp_cross EXISTS in java_lsp.h but is never called
- *   - Kotlin — NO cross-file LSP function; uses per-file cbm_run_kotlin_lsp only
+ * The shared resolver publishes an edge only when the occurrence, source
+ * binding, lookup domain and exact target are proven. Legacy name matches,
+ * confidence scores and strategy labels are not authority. A false positive
+ * is a correctness bug; a missing genuine edge is a resolver quality issue
+ * that remains counted even when extraction or materialization is missing.
  *
- * All four missing-wiring cases fall through to the generic name-based resolver
- * (pass_calls.c).  That resolver IS project-wide, so plain same-package function
- * calls still resolve.  What it CANNOT resolve are type-dispatch scenarios where
- * receiver-type knowledge is required (method dispatch, constructor, static call,
- * chained call, inherited method, generics, field-type-hint).
+ * Scenarios, where applicable:
+ *   S1 — cross-file function call
+ *   S2 — method dispatch through a known receiver
+ *   S3 — constructor or instantiation
+ *   S4 — static or class-qualified call
+ *   S5 — chained call through a return type
+ *   S6 — inherited, embedded or trait-selected method
+ *   S7 — generic, template or callable-alias use
+ *   S8 — member call through a declared field type
  *
- * The 8 probe scenarios (applied to each of the 9 hybrid-LSP languages where
- * applicable):
- *   S1 — cross-file plain function call   (already covered by test_edge_structural.c
- *          for CALLS presence; here we add more flavours and double as sanity guards)
- *   S2 — method dispatch via receiver type (obj.method() with known type)
- *   S3 — constructor / instantiation      (new T() / T{} / T() → CALLS/USAGE to type)
- *   S4 — static / class-method call       (T.staticM() / T::staticM())
- *   S5 — chained call                     (a.b().c() — second call resolved via first
- *          return type)
- *   S6 — inherited-method call            (subclass instance calls base-class method)
- *   S7 — generic/templated call           (call through parameterized type)
- *   S8 — field-type-hint                  (this.field.method() where field has declared type)
+ * Every independently labelled occurrence remains in the quality denominator.
+ * Supported positive controls gate recovery; audited missing cases carry
+ * individual WHY and TRIED entries. Wrong emitted identities always fail.
+ * Both persisted occurrences and their graph projections are checked.
+ * Failed probes print persisted
+ * resolver outcomes before deleting their temporary graph databases.
  *
- * ════════════════════════════════════════════════════════════════════════════
- * EXPECTED GREEN / RED REASONING
- * ──────────────────────────────
- * Languages with lsp_cross WIRED (Go, C, C++, Python, TypeScript, PHP):
- *   S1 (cross-file call): GREEN — generic resolver handles it; lsp_cross adds confidence.
- *   S2 (method dispatch): GREEN (Go/Python/TS/PHP have full type inference).
- *   S3 (constructor):     GREEN for most; PHP new T() GREEN, C malloc pattern different.
- *   S4 (static call):     GREEN for Go (pkg.Func), TS (Class.static), Python N/A.
- *   S5 (chained):         GREEN for Go/TS/Python where return-type inference works.
- *   S6 (inherited):       GREEN when inheritance chain is in same index.
- *   S7 (generic):         GREEN for Go generics (1.18+) / TS generics with known type arg.
- *   S8 (field type hint): GREEN for Go/TS/Python where field types are declared.
- *
- * Languages WITHOUT lsp_cross (Rust, Java, Kotlin, C#):
- *   S1 (plain cross-file): GREEN — the generic name-based resolver handles it.
- *   S2 (method dispatch):  RED  — receiver type unknown without lsp_cross; resolver
- *                                  falls through to name-based (may still find it if
- *                                  the method name is unique; in ambiguous cases: RED).
- *   S3 (constructor):      RED  — type-instantiation CALLS from new T() needs type
- *                                  awareness; name-based resolver misses it.
- *   S4 (static call):      RED  — qualified T.Method() — name resolver finds "Method"
- *                                  but can't verify it belongs to T without type info.
- *   S5 (chained):          RED  — intermediate return type unknown → second call lost.
- *   S6 (inherited):        RED  — base-method call from subclass needs lsp_cross to
- *                                  resolve upward through the inheritance chain.
- *   S7 (generic):          RED  — parameterized type erased without lsp_cross.
- *   S8 (field type hint):  RED  — field-declared type unknown → this.field.method() lost.
- *
- * CAVEAT: "RED" means the specific TYPE-RESOLVED CALLS edge that lsp_cross would
- * produce.  For scenarios where the callee name is unambiguous in the project and the
- * generic resolver finds it, the CALLS count may still be >=1 — we assert >= 1 for
- * GREEN and diagnose (but don't require 0) for RED scenarios that may be partially
- * covered by the name-based resolver.  Each RED test asserts the CORRECT outcome
- * (calls >= 1) and will fail / stay RED until lsp_cross is wired for that language.
- *
- * ════════════════════════════════════════════════════════════════════════════
- * HARNESS
- * ────────
- * Mirrors test_edge_structural.c — self-contained static helpers with a LRP_
- * prefix to avoid link conflicts.
- *
- * SUITE(lsp_resolution_probe) registers all RUN_TEST groups but is NOT wired
- * into test_main.c.  The harness infrastructure (tf_pass_count etc.) is
- * declared extern — they live in test_main.c when linked into the full runner.
+ * Harness helpers use the LRP_ prefix to avoid link conflicts with other
+ * suites. The test runner supplies the shared framework counters.
  */
 
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "cbm.h"
+#include "callable_sig.h"
+#include "preprocessor.h"
+#include <foundation/sha256.h>
 #include <mcp/mcp.h>
 #include <store/store.h>
+#include <sqlite3.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 
@@ -164,7 +120,7 @@ static cbm_store_t *lrp_index(LRP_Proj *lp, const LRP_File *files, int nfiles) {
             cbm_mkdir_p(path, 0755);
             *slash = '/';
         }
-        FILE *f = fopen(path, "wb");
+        FILE *f = cbm_fopen(path, "wb");
         if (!f)
             return NULL;
         fputs(files[i].content, f);
@@ -191,19 +147,55 @@ static void lrp_cleanup(LRP_Proj *lp, cbm_store_t *store) {
     unlink(shm);
 }
 
-/* Returns USAGE edge count (-1 on DB failure). */
-static int lrp_usage(LRP_Proj *lp, const LRP_File *files, int nfiles) {
-    cbm_store_t *store = lrp_index(lp, files, nfiles);
-    int n = store ? cbm_store_count_edges_by_type(store, lp->project, "USAGE") : -1;
-    lrp_cleanup(lp, store);
-    return n;
-}
+static void lrp_diag(cbm_store_t *store, const char *project, const char *scenario);
 
 /* Diagnostic: dump edge histogram to stderr on failure. */
 static const char *LRP_ALL_EDGE_TYPES[] = {
     "CALLS",      "CALL_REFERENCE", "DEFINES",    "DEFINES_METHOD", "IMPORTS",    "INHERITS",
     "IMPLEMENTS", "USAGE",          "DECORATES",  "HANDLES",        "HTTP_CALLS", "ASYNC_CALLS",
     "OVERRIDE",   "TESTS",          "TESTS_FILE", "DATA_FLOWS",     NULL};
+
+/* Failed probes retain exact admission diagnostics before their temporary DB is
+ * deleted. Bound the output and report omitted rows rather than silently truncating. */
+static void lrp_diag_resolver(cbm_store_t *store, const char *project, const char *scenario) {
+    const char *sql =
+        "SELECT r.file_path,r.start_byte,r.end_byte,r.spelling,r.relation,r.binding,r.domain,"
+        "r.analysis,r.target,r.reason,r.emitted,COALESCE(e.proof,0),"
+        "COALESCE(e.source_binding_proof,0) FROM resolver_occurrences r LEFT JOIN "
+        "resolver_occurrence_evidence e ON e.project=r.project AND e.ordinal=r.ordinal "
+        "WHERE r.project=? ORDER BY r.file_path,r.start_byte,r.end_byte,r.relation,r.ordinal "
+        "LIMIT 33";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        fprintf(stderr, "    [LRP] %s resolver diagnostics unavailable\n", scenario);
+        sqlite3_finalize(stmt);
+        return;
+    }
+    int rows = 0;
+    int step;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (rows++ == 32) {
+            fprintf(stderr, "    [LRP] %s resolver diagnostics truncated after 32 rows\n",
+                    scenario);
+            break;
+        }
+        fprintf(
+            stderr,
+            "    [LRP] %s resolver %s:%d-%d spelling=%s relation=%s binding=%d "
+            "domain=%d analysis=%d target=%s reason=%s emitted=%d proof=%lld binding_proof=%lld\n",
+            scenario, (const char *)sqlite3_column_text(stmt, 0), sqlite3_column_int(stmt, 1),
+            sqlite3_column_int(stmt, 2), (const char *)sqlite3_column_text(stmt, 3),
+            (const char *)sqlite3_column_text(stmt, 4), sqlite3_column_int(stmt, 5),
+            sqlite3_column_int(stmt, 6), sqlite3_column_int(stmt, 7),
+            (const char *)sqlite3_column_text(stmt, 8), (const char *)sqlite3_column_text(stmt, 9),
+            sqlite3_column_int(stmt, 10), (long long)sqlite3_column_int64(stmt, 11),
+            (long long)sqlite3_column_int64(stmt, 12));
+    }
+    if (!rows || (step != SQLITE_DONE && step != SQLITE_ROW))
+        fprintf(stderr, "    [LRP] %s resolver rows=%d step=%d\n", scenario, rows, step);
+    sqlite3_finalize(stmt);
+}
 
 static void lrp_diag(cbm_store_t *store, const char *project, const char *scenario) {
     if (!store) {
@@ -220,112 +212,1358 @@ static void lrp_diag(cbm_store_t *store, const char *project, const char *scenar
         }
     }
     fprintf(stderr, "    [LRP] %s edges=[%s]\n", scenario, line[0] ? line : "(none)");
+    lrp_diag_resolver(store, project, scenario);
 }
 
-/* Count CALLS edges whose resolution strategy starts with `prefix`.
- *
- * The S6 inheritance scenarios need more than "an edge exists": a fixture
- * small enough to have exactly one same-named method can be satisfied by a
- * weak short-name guess that happens to be right, which is precisely the
- * class of edge the receiver-aware guard (#592/#606) removes. Asserting an
- * `lsp_*` strategy is what distinguishes inheritance RESOLUTION from a lucky
- * coincidence. Returns -1 when the edges cannot be read at all. */
-static int lrp_count_calls_with_strategy(cbm_store_t *store, const char *project,
-                                         const char *prefix) {
-    if (!store) {
-        return -1;
+typedef struct {
+    const char *scenario;
+    const char *file;
+    const char *caller;
+    const char *occurrence;
+    unsigned occurrence_index;
+    const char *target_file;
+    const char *target;
+    const char *relation;
+    int declaration_line;
+    const char *declaration_text;
+    bool required;
+    bool forbidden;
+    const char *quality_issue;
+    const char *tried;
+} LRP_Golden;
+
+static const LRP_Golden LRP_GOLDEN[] = {
+    {"lrp_java_s1_crossfile_call", "Main.java", "Main.run", "Util.square(n)", 0, "Util.java",
+     "Util.square", "CALLS", 4, "    static int square(int x) { return x * x; }", false, false,
+     "Same-package class/method visibility is not proved: java_proof_member/java_proof_candidate "
+     "require public. Nonempty int argument applicability is also unsupported at java_lsp.c:839.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s2_method_dispatch", "Runner.java", "Runner.run", "c.inc()", 0, "Counter.java",
+     "Counter.inc", "CALLS", 5, "    public void inc() { n++; }", false, false,
+     "Typed local Counter receiver exists in source, but package-private Counter fails the "
+     "public-only owner audit in java_proof_member; same-package visibility needs explicit "
+     "support.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s2_method_dispatch", "Runner.java", "Runner.run", "c.value()", 0, "Counter.java",
+     "Counter.value", "CALLS", 6, "    public int value() { return n; }", false, false,
+     "Typed local Counter receiver exists in source, but package-private Counter fails the "
+     "public-only owner audit in java_proof_member; same-package visibility needs explicit "
+     "support.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s3_constructor", "Factory.java", "Factory.make", "new Widget(name)", 0,
+     "Widget.java", "Widget.Widget", "CALLS", 5,
+     "    public Widget(String name) { this.name = name; }", false, false,
+     "Explicit Widget(String) constructor exists, but the semantic constructor route is absent; "
+     "generic Class target is correctly rejected as noncallable. Constructor "
+     "overload/applicability and package visibility need proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s4_static_method", "App.java", "App.run", "MathUtil.clamp(n, 0, 100)", 0,
+     "MathUtil.java", "MathUtil.clamp", "CALLS", 4,
+     "    public static int clamp(int v, int lo, int hi) {", false, false,
+     "Same-package MathUtil is package-private; primitive argument conversion/applicability proof "
+     "is missing for the three arguments.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder().add(1)", 0, "Builder.java",
+     "Builder.add", "CALLS", 8, "    public Builder add(int x) { items.add(x); return this; }",
+     false, false,
+     "Fluent construction/return type is not represented by the strict map; java_proof_member "
+     "accepts only identifier receivers. Nonempty add arguments and package-private owner need "
+     "separate proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder().add(1).add(2)", 0,
+     "Builder.java", "Builder.add", "CALLS", 8,
+     "    public Builder add(int x) { items.add(x); return this; }", false, false,
+     "Fluent construction/return type is not represented by the strict map; java_proof_member "
+     "accepts only identifier receivers. Nonempty add arguments and package-private owner need "
+     "separate proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder().add(1).add(2).build()", 0,
+     "Builder.java", "Builder.build", "CALLS", 9,
+     "    public List<Integer> build() { return items; }", false, false,
+     "Fluent construction/return type is not represented by the strict map; java_proof_member "
+     "accepts only identifier receivers. Nonempty add arguments and package-private owner need "
+     "separate proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s6_inherited_method", "Dog.java", "Dog.run", "describe()", 0, "Animal.java",
+     "Animal.describe", "CALLS", 4, "    public String describe() { return \"animal\"; }", false,
+     false,
+     "Bare inherited invocation requires enclosing receiver and complete superclass lookup; "
+     "java_proof_member requires identifier receiver and rejects non-Object inheritance.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s7_generic", "App.java", "App.run", "Util.first(xs)", 0, "Util.java", "Util.first",
+     "CALLS", 6, "    public static <T> T first(List<T> list) {", false, false,
+     "Package-private Util plus generic method substitution and List<String> argument "
+     "applicability are unsupported; java_proof_candidate excludes type parameters.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_java_s8_field_type_hint", "Service.java", "Service.run", "logger.log(msg)", 0,
+     "Logger.java", "Logger.log", "CALLS", 4,
+     "    public void log(String msg) { System.out.println(msg); }", false, false,
+     "The strict map lacks class-field receiver provenance; Logger is package-private and nonempty "
+     "String argument applicability is unsupported.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s1_crossfile_call", "Main.cs", "Main.Run", "Util.Square(n)", 0, "Util.cs",
+     "Util.Square", "CALLS", 3, "        public static int Square(int x) { return x * x; }", false,
+     false,
+     "Default-internal Util needs assembly-domain access proof; csp_namespace_type requires public "
+     "and csp_call accepts zero arguments only.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s2_method_dispatch", "Runner.cs", "Runner.Run", "c.Inc()", 0, "Counter.cs",
+     "Counter.Inc", "CALLS", 4, "        public void Inc() { n++; }", false, false,
+     "new Counter() receiver provenance is not added to the strict map; object_creation_expression "
+     "fails csp_audit and internal Counter/fields also fail the restricted class domain.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s2_method_dispatch", "Runner.cs", "Runner.Run", "c.Value()", 0, "Counter.cs",
+     "Counter.Value", "CALLS", 5, "        public int Value() { return n; }", false, false,
+     "new Counter() receiver provenance is not added to the strict map; object_creation_expression "
+     "fails csp_audit and internal Counter/fields also fail the restricted class domain.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s3_constructor", "Factory.cs", "Factory.Make", "new Widget(name)", 0, "Widget.cs",
+     "Widget.Widget", "CALLS", 4, "        public Widget(string name) { Name = name; }", false,
+     false,
+     "Source-declared Widget(string) exists, but csp_calls handles invocation_expression only; "
+     "constructor identity, assembly accessibility and argument applicability require proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s4_static_method", "App.cs", "AppEntry.Run", "MathHelper.Clamp(n, 0, 100)", 0,
+     "MathHelper.cs", "MathHelper.Clamp", "CALLS", 3,
+     "        public static int Clamp(int v, int lo, int hi) {", false, false,
+     "Internal class access and three-argument applicability are outside "
+     "csp_namespace_type/csp_call supported domains.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder().Add(1)", 0, "Builder.cs",
+     "Builder.Add", "CALLS", 5, "        public Builder Add(int x) { items.Add(x); return this; }",
+     false, false,
+     "Constructor/return type propagation and non-identifier fluent receivers are unsupported; "
+     "object_creation_expression fails body audit and Add has a nonempty argument list.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder().Add(1).Add(2)", 0, "Builder.cs",
+     "Builder.Add", "CALLS", 5, "        public Builder Add(int x) { items.Add(x); return this; }",
+     false, false,
+     "Constructor/return type propagation and non-identifier fluent receivers are unsupported; "
+     "object_creation_expression fails body audit and Add has a nonempty argument list.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder().Add(1).Add(2).Build()", 0,
+     "Builder.cs", "Builder.Build", "CALLS", 6,
+     "        public List<int> Build() { return items; }", false, false,
+     "Constructor/return type propagation and non-identifier fluent receivers are unsupported; "
+     "object_creation_expression fails body audit and Add has a nonempty argument list.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s6_inherited_method", "Child.cs", "Child.Run", "Describe()", 0, "Base.cs",
+     "Base.Describe", "CALLS", 3, "        public virtual string Describe() { return \"base\"; }",
+     false, false,
+     "Static declaration is Base.Describe, not a guessed override; csp_call requires explicit "
+     "member access and csp_simple_class does not audit inherited domains.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s7_generic", "App.cs", "AppEntry.Run", "Container.First(xs)", 0, "Container.cs",
+     "Container.First", "CALLS", 4, "        public static T First<T>(List<T> xs) {", false, false,
+     "Generic method/type inference, internal assembly access and argument applicability are "
+     "absent; csp_candidate excludes generic and nonzero-parameter candidates.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_csharp_s8_field_type_hint", "Service.cs", "Service.Run", "logger.Log(msg)", 0,
+     "Logger.cs", "Logger.Log", "CALLS", 3, "        public void Log(string msg) { }", false, false,
+     "Field receiver provenance is missing; csp_function only establishes annotated parameter "
+     "facts and the nonempty argument needs applicability proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s1_crossfile_call", "main.php", "run", "triple($n)", 0, "util.php", "triple", "CALLS",
+     2, "function triple($x) { return $x * 3; }", false, false,
+     "Literal require IMPORTS is proved, but php_proof_calls never resolves "
+     "function_call_expression. Needs executed-include-to-global-function binding proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s2_method_dispatch", "main.php", "run", "$c->inc()", 0, "Counter.php", "Counter.inc",
+     "CALLS", 4, "    public function inc() { $this->n++; }", false, false,
+     "Strict receiver facts come only from named parameter annotations; new Counter() assignment "
+     "and required-file class visibility are not proved.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s2_method_dispatch", "main.php", "run", "$c->value()", 0, "Counter.php",
+     "Counter.value", "CALLS", 5, "    public function value() { return $this->n; }", false, false,
+     "Strict receiver facts come only from named parameter annotations; new Counter() assignment "
+     "and required-file class visibility are not proved.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s3_constructor", "factory.php", "make", "new Widget($name)", 0, "Widget.php",
+     "Widget.__construct", "CALLS", 4,
+     "    public function __construct($name) { $this->name = $name; }", false, false,
+     "Explicit __construct exists, but object_creation_expression has no strict proof emission "
+     "path; include visibility and argument applicability also need evidence.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s4_static_method", "app.php", "run", "Config::version()", 0, "Config.php",
+     "Config.version", "CALLS", 3, "    public static function version() { return '1.0'; }", false,
+     false,
+     "Zero-argument static syntax is supported, but php_proof_indexes/definition lookup only "
+     "accept explicit local import bindings; require-only class namespace exposure is absent.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s5_chained", "main.php", "run", "(new Builder())->add(1)", 0, "Builder.php",
+     "Builder.add", "CALLS", 4,
+     "    public function add($x) { $this->items[] = $x; return $this; }", false, false,
+     "Required-file class identity, constructed receiver/return type propagation, nested receiver "
+     "and add argument facts are outside php_proof_call.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s5_chained", "main.php", "run", "(new Builder())->add(1)->add(2)", 0, "Builder.php",
+     "Builder.add", "CALLS", 4,
+     "    public function add($x) { $this->items[] = $x; return $this; }", false, false,
+     "Required-file class identity, constructed receiver/return type propagation, nested receiver "
+     "and add argument facts are outside php_proof_call.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s5_chained", "main.php", "run", "(new Builder())->add(1)->add(2)->build()", 0,
+     "Builder.php", "Builder.build", "CALLS", 5,
+     "    public function build() { return $this->items; }", false, false,
+     "Required-file class identity, constructed receiver/return type propagation, nested receiver "
+     "and add argument facts are outside php_proof_call.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s6_inherited_method", "Child.php", "Child.run", "$this->describe()", 0, "Base.php",
+     "Base.describe", "CALLS", 3, "    public function describe() { return 'base'; }", false, false,
+     "Requires proven this-type plus complete inherited-member lookup; the strict bridge binds "
+     "annotated parameters only and has no inheritance proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s7_interface_call", "Service.php", "Service.run", "$this->logger->log($msg)", 0,
+     "LoggerInterface.php", "LoggerInterface.log", "CALLS", 3, "    public function log($msg);",
+     false, false,
+     "Static declaration is LoggerInterface.log. Constructor parameter-to-property provenance and "
+     "nested receiver/nonempty arguments are not proved; FileLogger.log must never substitute by "
+     "implementation guess.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_php_s8_field_type_hint", "Notifier.php", "Notifier.notify",
+     "$this->mailer->send($to, $msg)", 0, "Mailer.php", "Mailer.send", "CALLS", 3,
+     "    public function send($to, $body) { return true; }", false, false,
+     "Constructor parameter-to-property provenance and nested receiver/nonempty arguments are "
+     "unsupported; docblock text alone is not typed binding proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s1_crossfile_call", "main.rs", "run", "lib::square(n)", 0, "lib.rs", "square",
+     "CALLS", 1, "pub fn square(x: i32) -> i32 { x * x }", false, false,
+     "Module-qualified free function is excluded by rsp_audit, which accepts zero-argument "
+     "field_expression calls only; no module-to-free-function proof bridge.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s2_method_dispatch", "runner.rs", "run", "c.inc()", 0, "counter.rs", "Counter.inc",
+     "CALLS", 5, "    pub fn inc(&mut self) { self.n += 1; }", false, false,
+     "Parameter &mut counter::Counter is outside immutable simple imported type reference facts; "
+     "mutable receiver and qualified path need proof. inc additionally requires &mut self source "
+     "facts.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s2_method_dispatch", "runner.rs", "run", "c.value()", 0, "counter.rs",
+     "Counter.value", "CALLS", 6, "    pub fn value(&self) -> i32 { self.n }", false, false,
+     "Parameter &mut counter::Counter is outside immutable simple imported type reference facts; "
+     "mutable receiver and qualified path need proof. inc additionally requires &mut self source "
+     "facts.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s3_constructor", "main.rs", "run", "point::Point::new(3.0, 4.0)", 0, "point.rs",
+     "Point.new", "CALLS", 4, "    pub fn new(x: f64, y: f64) -> Self { Point { x, y } }", false,
+     false,
+     "Source-declared associated function new is genuine CALLS, but scoped/associated calls and "
+     "nonempty arguments are excluded by rsp_audit; no guessed language constructor target.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s3_constructor", "main.rs", "run", "p.dist()", 0, "point.rs", "Point.dist", "CALLS",
+     5, "    pub fn dist(&self) -> f64 { (self.x * self.x + self.y * self.y).sqrt() }", false,
+     false,
+     "Result of Point::new is not a strict receiver fact; construction-result/return type "
+     "propagation is missing.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s4_static_method", "app.rs", "run", "config::Config::default()", 0, "config.rs",
+     "Config.default", "CALLS", 4, "    pub fn default() -> Self { Config { debug: false } }",
+     false, false,
+     "Zero-argument associated function still uses scoped identifier, which rsp_audit excludes; "
+     "requires exact module/type namespace proof.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s4_static_method", "app.rs", "run", "cfg.is_debug()", 0, "config.rs",
+     "Config.is_debug", "CALLS", 5, "    pub fn is_debug(&self) -> bool { self.debug }", false,
+     false,
+     "Strict receiver map does not propagate the Config return type from associated default().",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s5_chained", "main.rs", "run", "builder::Builder::new()", 0, "builder.rs",
+     "Builder.new", "CALLS", 4, "    pub fn new() -> Self { Builder { items: vec![] } }", false,
+     false,
+     "Associated new, owned-self methods, fluent return types and nonempty add arguments are "
+     "outside the immutable &self zero-argument member bridge.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s5_chained", "main.rs", "run", "builder::Builder::new().add(1)", 0, "builder.rs",
+     "Builder.add", "CALLS", 5,
+     "    pub fn add(mut self, x: i32) -> Self { self.items.push(x); self }", false, false,
+     "Associated new, owned-self methods, fluent return types and nonempty add arguments are "
+     "outside the immutable &self zero-argument member bridge.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s5_chained", "main.rs", "run", "builder::Builder::new().add(1).add(2)", 0,
+     "builder.rs", "Builder.add", "CALLS", 5,
+     "    pub fn add(mut self, x: i32) -> Self { self.items.push(x); self }", false, false,
+     "Associated new, owned-self methods, fluent return types and nonempty add arguments are "
+     "outside the immutable &self zero-argument member bridge.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s5_chained", "main.rs", "run", "builder::Builder::new().add(1).add(2).build()", 0,
+     "builder.rs", "Builder.build", "CALLS", 6, "    pub fn build(self) -> Vec<i32> { self.items }",
+     false, false,
+     "Associated new, owned-self methods, fluent return types and nonempty add arguments are "
+     "outside the immutable &self zero-argument member bridge.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s6_trait_method", "main.rs", "run", "d.show()", 0, "dog.rs", "Dog.show", "CALLS", 4,
+     "    fn show(&self) -> String { self.name.clone() }", false, false,
+     "Corrected fixture imports Display and supplies exact impl Display for Dog. Static receiver "
+     "&Dog selects that source impl declaration, but rsp_impl_facts excludes trait implementations "
+     "and rsp_function excludes qualified dog::Dog annotation.",
+     "Reviewed corrected main module/import topology and explicit impl declaration; old invalid "
+     "dog.rs mod display fixture is not used. Source bridge still excludes trait impl facts."},
+    {"lrp_rust_s7_generic", "main.rs", "run", "algo::max_of(x, y)", 0, "algo.rs", "max_of", "CALLS",
+     1, "pub fn max_of<T: PartialOrd>(a: T, b: T) -> T {", false, false,
+     "Scoped free function plus generic constraint/substitution and argument type proof are "
+     "absent; no bare-name fallback is admissible.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_s8_field_call", "service.rs", "Service.run", "self.logger.log(msg)", 0, "logger.rs",
+     "Logger.log", "CALLS", 4, "    pub fn log(&self, msg: &str) { let _ = msg; }", false, false,
+     "Field receiver and nonempty argument provenance are absent; rsp_member accepts identifier "
+     "receivers and rsp_impl_facts only zero-explicit-argument &self methods.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_crossfile_macro_hidden_call_carrier", "main.rs", "visible", "lib::render()", 0,
+     "lib.rs", "render", "CALLS", 1, "pub fn render() -> &'static str { \"ok\" }", false, false,
+     "Ordinary scoped free-function bridge is absent even with zero arguments; this independent "
+     "visible-call control must remain a genuine quality item.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_rust_crossfile_macro_hidden_call_carrier", "main.rs", "hidden", "lib::render()", 1,
+     "lib.rs", "render", "CALLS", 1, "pub fn render() -> &'static str { \"ok\" }", false, false,
+     "Macro token-tree call needs exact expanded occurrence/source-origin and module-function "
+     "proof; synthetic carrier existence alone cannot authorize an edge.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_python_crossfile_dunder_carrier", "main.py", "combine", "left + right", 0, "alpha.py",
+     "Alpha.__add__", "CALLS", 2, "    def __add__(self, other):", false, false,
+     "Strict Python proof bridge lacks operator-dispatch proof for the synthetic __add__ carrier; "
+     "relative-import binding repair is prerequisite but not sufficient. Annotation-based static "
+     "declaration must not be replaced by a name-only target.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_go_usage_struct_literal", "main.go", "Make", "Config", 1, "types.go", "Config", "USAGE",
+     3, "type Config struct{ Port int }", false, false,
+     "Composite literal type usage is genuine, but generic Go binding validation is unsupported "
+     "and the strict Go bridge does not publish the struct-literal type occurrence.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_ts_usage_type_param", "main.ts", "run", "Config", 1, "types.ts", "Config", "USAGE", 1,
+     "export interface Config { timeout: number; }", false, false,
+     "Source annotation occurrence is not recorded by generic binding audit; Source audit "
+     "exact import "
+     "candidate was rejected with binding_occurrence_missing. The independent source span must "
+     "target Config, not the wrapper : Config.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_ts_usage_import_type_with_decoy", "main.ts", "choose", "Config", 1, "a/types.ts",
+     "Config", "USAGE", 1, "export interface Config { selected: number; }", false, false,
+     "Exact import-type annotation identity is genuine but binding audit omits the type "
+     "occurrence. Must preserve ./a/types namespace identity and reject same-name b/types.ts "
+     "decoy.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_tsx_usage_import_type_with_decoy", "main.tsx", "choose", "Config", 1, "a/types.ts",
+     "Config", "USAGE", 1, "export interface Config { selected: number; }", false, false,
+     "Exact import-type annotation identity is genuine but binding audit omits the type "
+     "occurrence. Must preserve ./a/types namespace identity and reject same-name b/types.ts "
+     "decoy.",
+     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
+     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_python_usage_instantiation", "main.py", "create", "User(name)", 0, "model.py", "User",
+     "CALLS", 1, "class User:", true, false,
+     "Existing explicit Python Class-call contract requires exact imported User and CLASS_CALLABLE "
+     "evidence. Relative-import syntax audit repair should retain this control; do not redirect to "
+     "__init__.",
+     "Source audit missed due to missing relative_import/import_prefix grammar capability; "
+     "The relative-import source proof guard must retain this exact "
+     "constructor/Class-call regression required."},
+    {"lrp_java_s2_method_dispatch", "Runner.java", "Runner.run", "new Counter()", 0, "Counter.java",
+     NULL, "CALLS", 0, NULL, false, false,
+     "Java supplies a default constructor, but no source constructor declaration exists and "
+     "projection must not redirect its call to the Class.",
+     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
+     "this semantic invocation from the denominator. A stable implicit declaration identity is "
+     "needed before an exact graph suffix can be asserted."},
+    {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder()", 0, "Builder.java", NULL,
+     "CALLS", 0, NULL, false, false,
+     "Java default Builder constructor has no materialized source declaration; this missing "
+     "constructor identity must remain visible independently of the fluent method misses.",
+     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
+     "this semantic invocation from the denominator. A stable implicit declaration identity is "
+     "needed before an exact graph suffix can be asserted."},
+    {"lrp_java_s8_field_type_hint", "Service.java", NULL, "new Logger()", 0, "Logger.java", NULL,
+     "CALLS", 0, NULL, false, false,
+     "Implicit constructor invocation occurs in a field initializer, with neither source-declared "
+     "constructor target nor source-declared initializer callable owner. Needs stable semantic "
+     "identities for both; do not attach to Service.run.",
+     "Inspected exact source initializer and absent constructor declaration; no fabricated scope "
+     "or Class target."},
+    {"lrp_csharp_s2_method_dispatch", "Runner.cs", "Runner.Run", "new Counter()", 0, "Counter.cs",
+     NULL, "CALLS", 0, NULL, false, false,
+     "C# default constructor has no source declaration; needs materialized implicit target "
+     "identity before an exact CALLS target can exist.",
+     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
+     "this semantic invocation from the denominator. A stable implicit declaration identity is "
+     "needed before an exact graph suffix can be asserted."},
+    {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder()", 0, "Builder.cs", NULL,
+     "CALLS", 0, NULL, false, false,
+     "C# default Builder constructor lacks an explicit source declaration and stable synthetic "
+     "graph identity.",
+     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
+     "this semantic invocation from the denominator. A stable implicit declaration identity is "
+     "needed before an exact graph suffix can be asserted."},
+    {"lrp_csharp_s8_field_type_hint", "Service.cs", NULL, "new Logger()", 0, "Logger.cs", NULL,
+     "CALLS", 0, NULL, false, false,
+     "Implicit constructor call appears in a field initializer. Both initializer owner and default "
+     "constructor target need stable semantic identities; it must not be attributed to "
+     "Service.Run.",
+     "Source fixture inspection, no guessed owner/target."},
+    {"lrp_python_s1_crossfile_call", "main.py", "run", "triple(n)", 0, "util.py", "triple", "CALLS",
+     1, "def triple(x):", true, false, NULL, NULL},
+    {"lrp_python_s2_method_dispatch", "main.py", "run", "Counter()", 0, "counter.py", "Counter",
+     "CALLS", 1, "class Counter:", false, false,
+     "Explicit initializer effects and constructor applicability lack a complete Class-call proof.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s2_method_dispatch", "main.py", "run", "c.inc()", 0, "counter.py", "Counter.inc",
+     "CALLS", 5, "    def inc(self):", false, false,
+     "Receiver construction is not established by the strict map; class mutation audit "
+     "conservatively rejects attribute writes, including n.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s2_method_dispatch", "main.py", "run", "c.value()", 0, "counter.py",
+     "Counter.value", "CALLS", 8, "    def value(self):", false, false,
+     "Receiver construction is not established by the strict map; class mutation audit "
+     "conservatively rejects attribute writes, including n.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s3_constructor", "main.py", "make", "Widget(name)", 0, "widget.py", "Widget",
+     "CALLS", 1, "class Widget:", false, false,
+     "Class-call authority for the explicit initializer and its nonempty argument list is "
+     "unsupported; do not substitute an init method by name.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s4_class_method", "main.py", "run", "Factory.version()", 0, "factory.py",
+     "Factory.version", "CALLS", 7, "    def version():", false, false,
+     "Decorated descriptor identity and class receiver binding are not established by the source "
+     "proof adapter.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s5_chained", "main.py", "make", "Builder()", 0, "builder.py", "Builder", "CALLS",
+     1, "class Builder:", false, false,
+     "Constructor, field mutation effects, nonempty arguments and fluent return propagation lack "
+     "complete source derivations.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s5_chained", "main.py", "make", "Builder().add(1)", 0, "builder.py", "Builder.add",
+     "CALLS", 5, "    def add(self, x):", false, false,
+     "Constructor, field mutation effects, nonempty arguments and fluent return propagation lack "
+     "complete source derivations.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s5_chained", "main.py", "make", "Builder().add(1).add(2)", 0, "builder.py",
+     "Builder.add", "CALLS", 5, "    def add(self, x):", false, false,
+     "Constructor, field mutation effects, nonempty arguments and fluent return propagation lack "
+     "complete source derivations.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s5_chained", "main.py", "make", "Builder().add(1).add(2).build()", 0, "builder.py",
+     "Builder.build", "CALLS", 9, "    def build(self):", false, false,
+     "Constructor, field mutation effects, nonempty arguments and fluent return propagation lack "
+     "complete source derivations.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s6b_annotated_param", "child.py", "run", "c.describe()", 0, "base.py",
+     "Base.describe", "CALLS", 2, "    def describe(self):", false, false,
+     "Inherited member lookup requires a complete MRO and receiver provenance; aggregate INHERITS "
+     "edges are not proof inputs.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s6b_self_attr", "child.py", "Child.go", "self.describe()", 0, "base.py",
+     "Base.describe", "CALLS", 2, "    def describe(self):", false, false,
+     "Inherited member lookup requires a complete MRO and receiver provenance; aggregate INHERITS "
+     "edges are not proof inputs.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s6b_constructor", "child.py", "run", "Child().describe()", 0, "base.py",
+     "Base.describe", "CALLS", 2, "    def describe(self):", false, false,
+     "Inherited member lookup requires a complete MRO and receiver provenance; aggregate INHERITS "
+     "edges are not proof inputs.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s7_annotated_call", "service.py", "Service.get", "self.repo.find(id)", 0,
+     "repo.py", "Repo.find", "CALLS", 2, "    def find(self, id: int) -> str:", false, false,
+     "Parameter-to-property assignment and nested field receiver type are not represented by the "
+     "strict map; method argument applicability is also unsupported.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s8_field_type_hint", "service.py", "Service.__init__", "Logger()", 0, "logger.py",
+     "Logger", "CALLS", 1, "class Logger:", false, false,
+     "Imported class construction needs the supported callable-class binding to survive "
+     "source-relative export validation; requires the declared parameter provenance and "
+     "source-relative export proof.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_python_s8_field_type_hint", "service.py", "Service.run", "self.logger.log(msg)", 0,
+     "logger.py", "Logger.log", "CALLS", 2, "    def log(self, msg: str) -> None:", false, false,
+     "Annotated field provenance, nested receiver identity and nonempty argument applicability are "
+     "not established.",
+     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
+     "confidence "
+     "matches "
+     "cannot supply the missing source facts."},
+    {"lrp_c_s1_crossfile_call", "main.c", "run", "add(x, 1)", 0, "main.c", "add", "CALLS", 1,
+     "int add(int a, int b);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s2_funcptr_in_struct", "main.c", "run", "make_ops()", 0, "main.c", "make_ops", "CALLS",
+     2, "Ops make_ops(void);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s3_constructor", "main.c", "make_buf", "buf_new(n)", 0, "main.c", "buf_new", "CALLS", 2,
+     "Buf *buf_new(int cap);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s4_static_local", "main.c", "run", "exported(n)", 0, "main.c", "exported", "CALLS", 1,
+     "int exported(int x);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s5_chained_deref", "main.c", "run", "node_val(head->next)", 0, "main.c", "node_val",
+     "CALLS", 2, "int node_val(const Node *n);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s6_base_method", "circle.c", "run", "shape_color(&c->base)", 0, "circle.c",
+     "shape_color", "CALLS", 3, "int shape_color(const Shape *s);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s7_generic_callback", "sort.c", "my_sort", "int_cmp(&arr[0], &arr[1])", 0, "sort.c",
+     "int_cmp", "CALLS", 2, "int int_cmp(const void *a, const void *b);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s8_field_call", "service.c", "run", "log_msg(&svc->logger, m)", 0, "service.c",
+     "log_msg", "CALLS", 3, "void log_msg(const Logger *l, const char *msg);", false, false,
+     "The visible prototype is a source declaration, but C extraction registers only function "
+     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
+     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
+     "effective linkage/signature.",
+     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
+     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
+     "resolver_c "
+     "source-prototype unit controls inject declaration identities and therefore do not test "
+     "materialization."},
+    {"lrp_c_s2_funcptr_in_struct", "main.c", "run", "o.compute(n)", 0, "ops.c", "double_it",
+     "CALLS", 3, "static int double_it(int x) { return x * 2; }", false, false,
+     "Requires proving make_ops linkage to this implementation, its returned struct field "
+     "assignment, and preservation of that callable value at the caller. A field type alone does "
+     "not identify double_it.",
+     "c_callable_proof accepts identifiers/qualified names and tracked local function pointers, "
+     "not returned function-pointer fields. Source audit recorded o.compute "
+     "binding_not_found; its factory "
+     "call could mask this separate miss."},
+    {"lrp_c_s4_static_local", "util.c", "exported", "helper(x)", 0, "util.c", "helper", "CALLS", 1,
+     "static int helper(int x) { return x + 1; }", true, false, NULL,
+     "Source-visible same-TU function and exact lexical domain are supported; this local edge "
+     "explains the old aggregate floor passing."},
+    {"lrp_c_s4_static_local", "main.c", "run", "exported(n)", 0, "util.c", "helper", "CALLS", 1,
+     "static int helper(int x) { return x + 1; }", false, true,
+     "Static helper belongs to util.c; no source binding from main.run selects it.",
+     "Old test asserted only the total CALLS count and did not enforce this negative."},
+    {"lrp_c_s7_generic_callback", "sort.c", "my_sort", "fn(&arr[0], &arr[1])", 0, "sort.c",
+     "int_cmp", "CALLS", 2, "int int_cmp(const void *a, const void *b);", false, false,
+     "The immutable local pointer assignment selects the visible int_cmp prototype, whose "
+     "declaration is not materialized. The callback occurrence must be accounted independently of "
+     "the direct call.",
+     "Source audit persisted the direct int_cmp call and value occurrence but no fn CALLS "
+     "row. "
+     "c_callable_proof can track exact local pointer targets once their declarations exist."},
+    {"lrp_cpp_s1_crossfile_call", "main.cpp", "run", "square(n)", 0, "main.cpp", "square", "CALLS",
+     1, "int square(int x);", false, false,
+     "C++ prototype wrapper has no extracted function name/node. Separately, c_proof_call_domain "
+     "excludes identifier argument n even though it is declared int; the current no-ADL rule only "
+     "accepts literals. Definition linkage remains unproved.",
+     "Reviewed extract_defs.c resolve_func_name_c_family, c_lsp.c c_proof_call_domain and Prior "
+     "source audit "
+     "binding_not_found."},
+    {"lrp_cpp_s2_method_dispatch", "main.cpp", "run", "c.inc()", 0, "counter.hpp", "Counter.inc",
+     "CALLS", 5, "    void inc() { n++; }", true, false, NULL,
+     "Corrected header fixture uses the existing direct zero-argument member subset; "
+     "resolver_cpp_direct_member_requires_source_class_and_visibility and "
+     "resolver_cpp_written_header_type_requires_complete_visible_domain are positive controls. "
+     "The direct-member proof controls define the required supported subset."},
+    {"lrp_cpp_s2_method_dispatch", "main.cpp", "run", "c.val()", 0, "counter.hpp", "Counter.val",
+     "CALLS", 6, "    int val() const { return n; }", true, false, NULL,
+     "Corrected header fixture uses the existing direct zero-argument member subset; "
+     "resolver_cpp_direct_member_requires_source_class_and_visibility and "
+     "resolver_cpp_written_header_type_requires_complete_visible_domain are positive controls. "
+     "The direct-member proof controls define the required supported subset."},
+    {"lrp_cpp_s2_method_dispatch", "main.cpp", "run", "Counter c;", 0, "counter.hpp",
+     "Counter.Counter", "CALLS", 4, "    Counter() : n(0) {}", false, false,
+     "Default-initialization invokes the explicit Counter constructor, but ordinary variable "
+     "declaration constructor occurrences are not extracted/proven.",
+     "Corrected incomplete-type fixture; audit found no constructor producer rule. inc/val must "
+     "not satisfy this separate occurrence."},
+    {"lrp_cpp_s3_constructor", "main.cpp", "run", "Widget w(n);", 0, "widget.hpp", "Widget.Widget",
+     "CALLS", 4, "    Widget(int id) : id(id) {}", false, false,
+     "Direct-initialization requires an extracted constructor occurrence and constructor "
+     "overload/applicability proof.",
+     "Source audit had no Widget constructor CALLS carrier; corrected one-header fixture "
+     "retains the same "
+     "direct-initialization syntax."},
+    {"lrp_cpp_s3_constructor", "main.cpp", "run", "w.get_id()", 0, "widget.hpp", "Widget.get_id",
+     "CALLS", 5, "    int get_id() const { return id; }", true, false, NULL,
+     "Known declared local Widget receiver and public zero-argument header method match the "
+     "existing proven direct-member subset; constructor absence cannot waive this getter."},
+    {"lrp_cpp_s4_static_method", "main.cpp", "run", "Registry::count()", 0, "registry.hpp",
+     "Registry.count", "CALLS", 3, "    static int count() { return 42; }", false, false,
+     "Qualified static-member lookup needs class ownership/staticness proof. Free-function lookup "
+     "excludes receiver methods; the direct member bridge only handles field-expression calls.",
+     "Reviewed symbols.c function candidate receiver exclusion and c_lsp.c c_proof_direct_method; "
+     "corrected the ODR-invalid fixture without changing the call."},
+    {"lrp_cpp_s5_chained", "main.cpp", "run", "Builder()", 0, "builder.hpp", NULL, "CALLS", 0, NULL,
+     false, false,
+     "The implicit default constructor has no materialized callable declaration or constructor "
+     "binding proof. A class node is not automatically a callable target.",
+     "Header correction makes the class definition visible; current member bridge has no "
+     "constructor contract."},
+    {"lrp_cpp_s5_chained", "main.cpp", "run", "Builder().add(1)", 0, "builder.hpp", "Builder.add",
+     "CALLS", 3, "    Builder& add(int x) { (void)x; return *this; }", false, false,
+     "Constructor-result receiver provenance and one-argument member applicability are unsupported "
+     "by the direct zero-argument identifier-receiver bridge.",
+     "c_proof_direct_method requires identifier receiver and zero arguments; this preserved chain "
+     "violates both requirements."},
+    {"lrp_cpp_s5_chained", "main.cpp", "run", "Builder().add(1).build()", 0, "builder.hpp",
+     "Builder.build", "CALLS", 4, "    int build() { return 1; }", false, false,
+     "Requires the exact Builder& return fact from the selected add method and propagation through "
+     "the chained receiver.",
+     "c_proof_direct_method accepts only identifier receivers; old aggregate floor could be "
+     "satisfied by another call."},
+    {"lrp_cpp_s6_virtual_inherited", "circle.cpp", "Circle.run", "Shape::area()", 0, "shape.hpp",
+     "Shape.area", "CALLS", 3, "    virtual int area() const { return 0; }", false, false,
+     "Explicit base qualification selects Shape.area and suppresses virtual dispatch. "
+     "Class-context qualified binding and base-declaration lookup lack proof.",
+     "c_proof_name_lookup rejects enclosing_class_qn; c_proof_direct_class excludes inherited "
+     "domains. Corrected header retains explicit Shape::area; Circle.area is a forbidden "
+     "substitute."},
+    {"lrp_cpp_s7_template", "main.cpp", "run", "clamp(n, 0, 100)", 0, "algo.hpp", "clamp", "CALLS",
+     2, "T clamp(T v, T lo, T hi) {", false, false,
+     "Template declaration identity, argument deduction/applicability, and builtin argument "
+     "evidence to close ADL are missing.",
+     "c_proof_collect skips template domains; c_proof_classify rejects type_param_names; "
+     "c_proof_call_domain rejects identifier n. Template definition is now visible via header."},
+    {"lrp_cpp_s8_field_call", "service.cpp", "Service.run", "logger.log(m)", 0, "logger.hpp",
+     "Logger.log", "CALLS", 3, "    void log(const char *msg) { (void)msg; }", false, false,
+     "Requires implicit logger field type provenance and nonzero-argument method applicability.",
+     "c_proof_direct_method only supports zero-argument identifier receiver calls with an existing "
+     "type-map fact; field initializer/inference cannot supply authority."},
+    {"lrp_go_s1_crossfile_call", "main.go", "Run", "Double(n)", 0, "util.go", "Double", "CALLS", 3,
+     "func Double(x int) int { return x * 2 }", true, false, NULL,
+     "Exact same-package free-function binding and captured occurrence promotion are supported; "
+     "Source audit scenario passed."},
+    {"lrp_go_s2_method_dispatch", "runner.go", "Run", "c.Inc()", 0, "counter.go", "Inc", "CALLS", 5,
+     "func (c *Counter) Inc() { c.n++ }", true, false, NULL,
+     "Explicit *Counter parameter and direct method-set declaration identity are supported. Graph "
+     "Go method QNs are flat; target file + method name identifies this fixture declaration."},
+    {"lrp_go_s2_method_dispatch", "runner.go", "Run", "c.Value()", 0, "counter.go", "Value",
+     "CALLS", 7, "func (c *Counter) Value() int { return c.n }", true, false, NULL,
+     "Explicit *Counter parameter and direct method-set declaration identity are supported. Graph "
+     "Go method QNs are flat; target file + method name identifies this fixture declaration."},
+    {"lrp_go_s3_constructor", "main.go", "Make", "NewCounter(n)", 0, "counter.go", "NewCounter",
+     "CALLS", 5, "func NewCounter(start int) *Counter {", true, false, NULL,
+     "Ordinary same-package free-function call; Counter literal is a type/value use, not an "
+     "additional CALLS edge."},
+    {"lrp_go_s4_static_call", "main.go", "Run", "math.Square(n)", 0, "math/ops.go", "Square",
+     "CALLS", 3, "func Square(x int) int { return x * x }", true, false, NULL,
+     "Fixture now declares module example.com/probe and imports its exact math package path. Exact "
+     "package binding is supported; Source audit still failed, so this remains an "
+     "integration defect "
+     "rather than an allowed miss."},
+    {"lrp_go_stdlib_import_does_not_bind_local_directory", "main.go", "Run", "math.Square(n)", 0,
+     "math/ops.go", "Square", "CALLS", 3, "func Square(x int) int { return x * x }", false, true,
+     "Standard-library math does not contain Square and cannot bind the local project directory.",
+     "Corrected positive has a declared module path; paired negative must retain zero exact local "
+     "Square edges."},
+    {"lrp_go_s5_chained_call", "main.go", "Make", "NewBuilder()", 0, "builder.go", "NewBuilder",
+     "CALLS", 5, "func NewBuilder() *Builder { return &Builder{} }", true, false, NULL,
+     "Same-package source function and declared *Builder return are supported."},
+    {"lrp_go_s5_chained_call", "main.go", "Make", "NewBuilder().Add(\"x\")", 0, "builder.go", "Add",
+     "CALLS", 7, "func (b *Builder) Add(s string) *Builder {", true, false, NULL,
+     "go_return_fact can select free NewBuilder and prove its written *Builder return; direct Add "
+     "method lookup is supported."},
+    {"lrp_go_s5_chained_call", "main.go", "Make", "NewBuilder().Add(\"x\").Build()", 0,
+     "builder.go", "Build", "CALLS", 12, "func (b *Builder) Build() []string { return b.items }",
+     false, false,
+     "Method-return provenance is missing: go_return_fact re-queries Add through the free-function "
+     "resolver, which excludes receiver methods, so its *Builder return cannot establish the next "
+     "receiver.",
+     "Read go_return_fact and symbols function-candidate exclusion. Source audit scenario "
+     "green only "
+     "establishes its aggregate floor, not this outer Build occurrence."},
+    {"lrp_go_s6_inherited_method", "dog.go", "Run", "d.Speak()", 0, "animal.go", "Speak", "CALLS",
+     5, "func (a *Animal) Speak() string { return a.Name }", false, false,
+     "Promoted embedded-method selection needs a complete depth/ambiguity lookup proof.",
+     "go_callable_proof returns no proof when no direct method exists and embedded_types is "
+     "nonempty. Legacy promotion remains diagnostic only; Source audit missed this call."},
+    {"lrp_go_s7_generic_call", "main.go", "Double", "Map(xs, func(x int) int { return x * 2 })", 0,
+     "util.go", "Map", "CALLS", 3, "func Map[T, U any](xs []T, fn func(T) U) []U {", true, false,
+     NULL,
+     "Named same-package generic function identity is supported without selecting an overload. The "
+     "fn(x) inside Map is a dynamic callback and cannot substitute for this outer source "
+     "occurrence."},
+    {"lrp_go_s8_field_type_hint", "service.go", "Get", "s.repo.Find(id)", 0, "repo.go", "Find",
+     "CALLS", 5, "func (r *Repo) Find(id int) string { return \"\" }", false, false,
+     "The receiver is a selector expression requiring field-type provenance; go_receiver_fact does "
+     "not support that shape.",
+     "Reviewed go_receiver_fact_inner supported identifier/call/composite cases and existing "
+     "field-chain quality accounting; Source audit missed s.repo.Find."},
+    {"lrp_ts_s1_crossfile_call", "main.ts", "run", "format(s)", 0, "util.ts", "format", "CALLS", 1,
+     "export function format(s: string): string { return s.trim(); }", true, false, NULL,
+     "Explicit named import/export source binding is supported. util.format calling external "
+     "s.trim cannot substitute."},
+    {"lrp_ts_s2_method_dispatch", "main.ts", "run", "c.inc()", 0, "counter.ts", "Counter.inc",
+     "CALLS", 3, "    inc(): void { this.n++; }", true, false, NULL,
+     "TS receiver_type supports const identifier initialized by new imported Counter; no "
+     "inheritance or competing declaration. Existing direct-method proof tests are positive "
+     "controls."},
+    {"lrp_ts_s2_method_dispatch", "main.ts", "run", "c.value()", 0, "counter.ts", "Counter.value",
+     "CALLS", 4, "    value(): number { return this.n; }", true, false, NULL,
+     "TS receiver_type supports const identifier initialized by new imported Counter; no "
+     "inheritance or competing declaration. Existing direct-method proof tests are positive "
+     "controls."},
+    {"lrp_ts_s2_method_dispatch", "main.ts", "run", "new Counter()", 0, "counter.ts", NULL, "CALLS",
+     0, NULL, false, false,
+     "Implicit constructor has no materialized callable declaration/constructor proof. The "
+     "new-expression type fact used by later member calls does not prove constructor invocation.",
+     "TS proof bridge handles member calls and method references, not new-expression publication."},
+    {"lrp_ts_s3_constructor", "main.ts", "make", "new Widget(name)", 0, "widget.ts",
+     "Widget.constructor", "CALLS", 2, "    constructor(public name: string) {}", false, false,
+     "new_expression has a call carrier but no constructor-target semantic proof.",
+     "Source audit recorded callable/class target rejection; explicit Widget.constructor is "
+     "present and "
+     "cannot be replaced with unrelated Widget.label."},
+    {"lrp_ts_s4_static_method", "main.ts", "run", "Factory.version()", 0, "factory.ts",
+     "Factory.version", "CALLS", 2, "    static version(): string { return '1.0'; }", false, false,
+     "Imported class value is not a proven instance receiver; static class-member selection needs "
+     "an audited owner/staticness rule.",
+     "TS receiver_type requires this or a lexical identifier with annotation/new-expression "
+     "initializer; the import identifier Factory does not supply that binding."},
+    {"lrp_ts_s4_static_method", "factory.ts", "Factory.create", "new Factory()", 0, "factory.ts",
+     NULL, "CALLS", 0, NULL, false, false,
+     "Implicit Factory constructor has no materialized callable declaration or constructor proof.",
+     "The old global floor could be satisfied by this unrelated factory body call after a "
+     "constructor implementation; it must never satisfy run->version."},
+    {"lrp_ts_s5_chained", "main.ts", "run", "new Builder()", 0, "builder.ts", NULL, "CALLS", 0,
+     NULL, false, false,
+     "Implicit Builder constructor is not materialized/proven as a callable declaration.",
+     "TS producer supports declared direct methods only; constructor binding remains separate."},
+    {"lrp_ts_s5_chained", "main.ts", "run", "new Builder().add(1)", 0, "builder.ts", "Builder.add",
+     "CALLS", 3, "    add(x: number): Builder { this.items.push(x); return this; }", false, false,
+     "Chained receiver requires constructor/selected-method return facts; current receiver_type "
+     "accepts only this or a lexical identifier, not call/new-expression receivers.",
+     "Reviewed ts_proof.c receiver_type and cbm_ts_proof_method. Count each add occurrence "
+     "independently even though graph edges may deduplicate by source/target."},
+    {"lrp_ts_s5_chained", "main.ts", "run", "new Builder().add(1).add(2)", 0, "builder.ts",
+     "Builder.add", "CALLS", 3, "    add(x: number): Builder { this.items.push(x); return this; }",
+     false, false,
+     "Chained receiver requires constructor/selected-method return facts; current receiver_type "
+     "accepts only this or a lexical identifier, not call/new-expression receivers.",
+     "Reviewed ts_proof.c receiver_type and cbm_ts_proof_method. Count each add occurrence "
+     "independently even though graph edges may deduplicate by source/target."},
+    {"lrp_ts_s5_chained", "main.ts", "run", "new Builder().add(1).add(2).build()", 0, "builder.ts",
+     "Builder.build", "CALLS", 4, "    build(): number[] { return this.items; }", false, false,
+     "Chained receiver requires constructor/selected-method return facts; current receiver_type "
+     "accepts only this or a lexical identifier, not call/new-expression receivers.",
+     "Reviewed ts_proof.c receiver_type and cbm_ts_proof_method. Count each add occurrence "
+     "independently even though graph edges may deduplicate by source/target."},
+    {"lrp_ts_s6_inherited_method", "child.ts", "run", "c.describe()", 0, "base.ts", "Base.describe",
+     "CALLS", 2, "    describe(): string { return 'base'; }", false, false,
+     "Complete inherited lookup proof is absent even though the inheritance edge and legacy lookup "
+     "may exist.",
+     "cbm_ts_proof_method explicitly rejects owners with embedded_types. The historical lsp_ts "
+     "strategy assertion is obsolete after centralized projection and cannot establish proof."},
+    {"lrp_ts_s7_generic", "main.ts", "run", "maxOf(a, b, (x, y) => x - y)", 0, "algo.ts", "maxOf",
+     "CALLS", 1, "export function maxOf<T>(a: T, b: T, cmp: (x: T, y: T) => number): T {", true,
+     false, NULL,
+     "Explicit imported exported function binding is supported; the internal dynamic cmp(a,b) call "
+     "is not this occurrence."},
+    {"lrp_ts_s8_field_type_hint", "service.ts", "Service.run", "this.logger.log(msg)", 0,
+     "logger.ts", "Logger.log", "CALLS", 2, "    log(msg: string): void { console.log(msg); }",
+     false, false,
+     "Nested field receiver needs proved declared field type and ownership; current receiver_type "
+     "rejects member-expression receivers.",
+     "Reviewed ts_proof.c receiver_type. Constructor and external console.log edges must not "
+     "satisfy this occurrence."},
+    {"lrp_ts_s8_field_type_hint", "service.ts", "Service.constructor", "new Logger()", 0,
+     "logger.ts", NULL, "CALLS", 0, NULL, false, false,
+     "Implicit Logger constructor is a genuine separate invocation, without materialized callable "
+     "identity/constructor proof.",
+     "Class type existence does not grant CLASS_CALLABLE authority for TypeScript."},
+    {"lrp_kotlin_s1_crossfile_call", "Main.kt", "run", "double(n)", 0, "Util.kt", "double", "CALLS",
+     1, "fun double(x: Int): Int = x * 2", true, false, NULL,
+     "Same-package top-level identity and fixed positional builtin Int applicability are "
+     "supported; Source audit passed."},
+    {"lrp_kotlin_s2_method_dispatch", "Runner.kt", "run", "c.inc()", 0, "Counter.kt", "Counter.inc",
+     "CALLS", 3, "    fun inc() { n++ }", false, false,
+     "Counter contains property n. kt_proof_class_fact treats every non-function class-body "
+     "declaration as an incomplete direct member domain; typed receiver alone is insufficient.",
+     "Reviewed kt_proof_class_fact and direct parameter-type call path; zero-argument method-only "
+     "classes have positive controls, but this property-bearing fixture does not."},
+    {"lrp_kotlin_s2_method_dispatch", "Runner.kt", "run", "c.value()", 0, "Counter.kt",
+     "Counter.value", "CALLS", 4, "    fun value(): Int = n", false, false,
+     "Counter contains property n. kt_proof_class_fact treats every non-function class-body "
+     "declaration as an incomplete direct member domain; typed receiver alone is insufficient.",
+     "Reviewed kt_proof_class_fact and direct parameter-type call path; zero-argument method-only "
+     "classes have positive controls, but this property-bearing fixture does not."},
+    {"lrp_kotlin_s3_constructor", "Main.kt", "make", "Widget(name)", 0, "Widget.kt", NULL, "CALLS",
+     0, NULL, false, false,
+     "The primary constructor is the class header; no independent callable graph identity or "
+     "Kotlin class-call contract is established. Constructor syntax cannot be promoted by class "
+     "name alone.",
+     "kt_proof_function_identity rejects names with type declarations; kt_proof_class_fact also "
+     "leaves primary-constructor classes incomplete."},
+    {"lrp_kotlin_s4_companion_static", "App.kt", "run", "Config.default()", 0, "Config.kt", NULL,
+     "CALLS", 0, NULL, false, false,
+     "Anonymous companion ownership/materialization and class-to-companion dispatch lack proof.",
+     "kt_proof_call navigation requires a typed lexical receiver; kt_proof_walk does not walk "
+     "companion-object declarations. No exact graph QN is invented."},
+    {"lrp_kotlin_s4_companion_static", "Config.kt", "Config.Companion.default", "Config(false)", 0,
+     "Config.kt", NULL, "CALLS", 0, NULL, false, false,
+     "Primary constructor call within the companion is a separate genuine site; no callable "
+     "materialization/constructor contract.",
+     "No Kotlin class-call rule; absence of companion graph scope must remain counted."},
+    {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder()", 0, "Builder.kt", NULL, "CALLS", 0,
+     NULL, false, false, "Implicit primary constructor is not materialized/proven as a callable.",
+     "Bare function resolution rejects class names; there is no separate constructor producer."},
+    {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder().add(1)", 0, "Builder.kt", "Builder.add",
+     "CALLS", 3, "    fun add(x: Int): Builder { items.add(x); return this }", false, false,
+     "Requires chained constructor/return-type provenance. Navigation proof accepts a simple "
+     "lexical receiver only; Builder property items also makes class domain incomplete.",
+     "Reviewed kt_proof_call receiver shape and kt_proof_class_fact. Each add occurrence remains a "
+     "separate denominator item."},
+    {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder().add(1).add(2)", 0, "Builder.kt",
+     "Builder.add", "CALLS", 3, "    fun add(x: Int): Builder { items.add(x); return this }", false,
+     false,
+     "Requires chained constructor/return-type provenance. Navigation proof accepts a simple "
+     "lexical receiver only; Builder property items also makes class domain incomplete.",
+     "Reviewed kt_proof_call receiver shape and kt_proof_class_fact. Each add occurrence remains a "
+     "separate denominator item."},
+    {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder().add(1).add(2).build()", 0, "Builder.kt",
+     "Builder.build", "CALLS", 4, "    fun build(): List<Int> = items.toList()", false, false,
+     "Requires chained constructor/return-type provenance. Navigation proof accepts a simple "
+     "lexical receiver only; Builder property items also makes class domain incomplete.",
+     "Reviewed kt_proof_call receiver shape and kt_proof_class_fact. Each add occurrence remains a "
+     "separate denominator item."},
+    {"lrp_kotlin_s6_inherited_method", "Child.kt", "Child.run", "describe()", 0, "Base.kt",
+     "Base.describe", "CALLS", 2, "    open fun describe(): String = \"base\"", false, false,
+     "Implicit-this inherited member lookup lacks proof; class-context bare calls are disabled and "
+     "delegation/base domains remain incomplete.",
+     "kt_proof_function sets bare_calls=false for members; kt_proof_class_fact rejects "
+     "delegation_specifiers. The parent constructor call Base() cannot satisfy describe()."},
+    {"lrp_kotlin_s6_inherited_method", "Child.kt", "Child", "Base()", 0, "Base.kt", NULL, "CALLS",
+     0, NULL, false, false,
+     "Implicit base-constructor invocation in the class header lacks callable materialization and "
+     "an initializer scope contract.",
+     "The proof walker processes function bodies, not constructor delegation as a CALLS producer."},
+    {"lrp_kotlin_s7_generic", "Main.kt", "run", "maxOf(a, b)", 0, "Algo.kt", "maxOf", "CALLS", 1,
+     "fun <T : Comparable<T>> maxOf(a: T, b: T): T = if (a > b) a else b", false, false,
+     "Generic declaration/source-signature applicability is unsupported; candidate classifier "
+     "rejects type_param_names.",
+     "Reviewed kt_proof_candidate, kt_proof_function generic rejection and scalar-only signature "
+     "bridge. Unique short name is not authority."},
+    {"lrp_kotlin_s8_field_type_hint", "Service.kt", "Service.run", "logger.log(msg)", 0,
+     "Logger.kt", "Logger.log", "CALLS", 2, "    fun log(msg: String): Unit { println(msg) }",
+     false, false,
+     "Property initializer Logger() does not donate a proven receiver identity to member body; "
+     "current type map populates declared parameters and callable vals, not class field "
+     "constructor inference.",
+     "Reviewed kt_proof_function parameter map and kt_proof_call navigation; constructor and "
+     "println calls cannot satisfy this method occurrence."},
+    {"lrp_kotlin_s8_field_type_hint", "Service.kt", "Service", "Logger()", 0, "Logger.kt", NULL,
+     "CALLS", 0, NULL, false, false,
+     "Property-initializer constructor invocation lacks callable materialization and initializer "
+     "scope contract.",
+     "kt_proof_walk does not publish constructor calls from class property initializers; no Kotlin "
+     "class-call authority."},
+    {"lrp_python_s6b_constructor", "child.py", "run", "Child()", 0, "child.py", "Child", "CALLS", 4,
+     "class Child(Base):", false, false,
+     "Inherited Python construction requires complete MRO and class-call authority before the "
+     "constructor result can supply the following method receiver.",
+     "Exact constructed S6b fixture has a separate Child() occurrence; outer describe() evidence "
+     "cannot substitute. Existing proof rejects inherited class domains."},
+};
+
+/* Callable signatures are normalized by the same QN format contract as nodes;
+ * file and source declaration line disambiguate overloads independently. Go's
+ * receiver owner is not a QN component: its flat method suffix is intentional. */
+static bool lrp_qn_has_declaration(const char *actual, const char *suffix) {
+    if (!actual || !suffix)
+        return false;
+    size_t length = cbm_qn_callable_base_len(actual), wanted = strlen(suffix);
+    return (length == wanted && !memcmp(actual, suffix, wanted)) ||
+           (length > wanted && actual[length - wanted - 1] == '.' &&
+            !memcmp(actual + length - wanted, suffix, wanted));
+}
+
+static const char *lrp_fixture(const LRP_File *files, int count, const char *name) {
+    for (int i = 0; i < count; i++)
+        if (!strcmp(files[i].name, name))
+            return files[i].content;
+    return NULL;
+}
+
+static bool lrp_golden_site(const LRP_File *files, int count, const LRP_Golden *g, uint32_t *start,
+                            uint32_t *end, int *line) {
+    const char *source = lrp_fixture(files, count, g->file);
+    if (!source || !g->occurrence || !g->occurrence[0])
+        return false;
+    const char *site = source;
+    for (unsigned i = 0; i <= g->occurrence_index; i++) {
+        site = strstr(site, g->occurrence);
+        if (!site)
+            return false;
+        if (i != g->occurrence_index)
+            site++;
     }
-    cbm_edge_t *edges = NULL;
-    int n = 0;
-    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &n) != CBM_STORE_OK) {
-        return -1;
+    *start = (uint32_t)(site - source);
+    *end = *start + (uint32_t)strlen(g->occurrence);
+    *line = 1;
+    for (const char *p = source; p < site; p++)
+        *line += *p == '\n';
+    return true;
+}
+
+static bool lrp_declaration_source(const LRP_File *files, int count, const LRP_Golden *g) {
+    if (!g->declaration_line || !g->declaration_text)
+        return true; /* Explicit identity gap, or suffix-only source oracle. */
+    const char *source = lrp_fixture(files, count, g->target_file);
+    if (!source)
+        return false;
+    for (int line = 1; line < g->declaration_line; line++) {
+        source = strchr(source, '\n');
+        if (!source)
+            return false;
+        source++;
     }
-    char needle[64];
-    snprintf(needle, sizeof(needle), "\"strategy\":\"%s", prefix);
-    int hits = 0;
-    for (int i = 0; i < n; i++) {
-        if (edges[i].properties_json && strstr(edges[i].properties_json, needle)) {
-            hits++;
+    size_t length = strcspn(source, "\n");
+    return strlen(g->declaration_text) == length && !memcmp(source, g->declaration_text, length);
+}
+
+static bool lrp_target_matches(const LRP_Golden *g, const char *target_file, const char *target,
+                               int first, int last) {
+    return g->target && target_file && !strcmp(target_file, g->target_file) &&
+           lrp_qn_has_declaration(target, g->target) &&
+           (!g->declaration_line || (first <= g->declaration_line && last >= g->declaration_line));
+}
+
+/* Rows are handwritten semantic expectations transcribed from fixture source,
+ * not selected from resolver output. Missing extraction/identity still enters
+ * the denominator. Every tolerated miss carries its own WHY and TRIED. */
+enum { LRP_GOLDEN_COUNT = sizeof(LRP_GOLDEN) / sizeof(LRP_GOLDEN[0]) };
+typedef struct {
+    const char *scenario;
+    bool recovered[LRP_GOLDEN_COUNT], pp_valid[LRP_GOLDEN_COUNT];
+    uint32_t pp_starts[LRP_GOLDEN_COUNT], pp_ends[LRP_GOLDEN_COUNT];
+    uint32_t starts[LRP_GOLDEN_COUNT], ends[LRP_GOLDEN_COUNT];
+    int lines[LRP_GOLDEN_COUNT];
+    int genuine, false_positives, projection_errors;
+} LRP_Check;
+
+static bool lrp_prepare_oracle(LRP_Check *check, const LRP_File *files, int nfiles) {
+    bool ok = true;
+    int selected = 0;
+    for (size_t i = 0; i < LRP_GOLDEN_COUNT; i++) {
+        const LRP_Golden *g = &LRP_GOLDEN[i];
+        if (strcmp(g->scenario, check->scenario))
+            continue;
+        selected++;
+        check->genuine += !g->forbidden;
+        if (!lrp_golden_site(files, nfiles, g, &check->starts[i], &check->ends[i],
+                             &check->lines[i]) ||
+            !lrp_declaration_source(files, nfiles, g) ||
+            (!g->required && (!g->quality_issue || !g->tried))) {
+            fprintf(stderr, "    [LRP] %s invalid independent oracle at %s:%s\n", check->scenario,
+                    g->file, g->occurrence);
+            ok = false;
         }
     }
-    cbm_store_free_edges(edges, n);
-    return hits;
+    return ok && selected;
 }
 
-/* Index + assert CALLS >= floor; on failure emit diagnostics.
- * expect_green=true: ASSERT_TRUE (green guard).
- * expect_green=false: still asserts CALLS>=1 (the correct outcome), so RED
- *   until the bug is fixed — same pattern as test_edge_structural.c. */
-static int lrp_assert_calls(const LRP_File *files, int nfiles, int min_calls, const char *scenario,
-                            int expect_green) {
-    LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, files, nfiles);
-    int got = store ? cbm_store_count_edges_by_type(store, lp.project, "CALLS") : -1;
-    if (got < min_calls) {
-        fprintf(stderr, "  [LRP] %s FAIL calls=%d expected>=%d %s\n", scenario, got, min_calls,
-                expect_green ? "(GREEN regression)" : "(RED reproduction)");
-        lrp_diag(store, lp.project, scenario);
-    } else if (!expect_green) {
-        /* Unexpectedly passing — the lsp_cross wiring may have been added. */
-        fprintf(stderr,
-                "  [LRP] %s UNEXPECTED PASS calls=%d "
-                "(lsp_cross may now be wired — promote to GREEN)\n",
-                scenario, got);
+/* The indexer's sequential and parallel extractors both pass the relative
+ * filename and NULL defines/include paths. Use that same canonical transform,
+ * not resolver output, to locate our independently labelled raw occurrence.
+ * Snapshot equality makes a future extraction-config change fail explicitly. */
+static bool lrp_source_snapshot(cbm_store_t *store, const char *project, const LRP_File *file,
+                                const CBMPreprocessedSource *pp) {
+    const char *sql = "SELECT raw_content_identity,raw_length,preprocessed_content_identity,"
+                      "preprocessed_length FROM resolver_file_summaries "
+                      "WHERE project=?1 AND file_path=?2";
+    sqlite3_stmt *stmt = NULL;
+    bool ok = sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) == SQLITE_OK &&
+              sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+              sqlite3_bind_text(stmt, 2, file->name, -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    char raw_hash[CBM_SHA256_HEX_LEN + 1], expanded_hash[CBM_SHA256_HEX_LEN + 1] = {0};
+    size_t raw_length = strlen(file->content), expanded_length = pp ? strlen(pp->source) : 0;
+    cbm_sha256_hex(file->content, raw_length, raw_hash);
+    if (pp)
+        cbm_sha256_hex(pp->source, expanded_length, expanded_hash);
+    if (ok && sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *raw = (const char *)sqlite3_column_text(stmt, 0);
+        const char *expanded = (const char *)sqlite3_column_text(stmt, 2);
+        ok = raw && expanded && !strcmp(raw, raw_hash) && !strcmp(expanded, expanded_hash) &&
+             sqlite3_column_int64(stmt, 1) == (sqlite3_int64)raw_length &&
+             sqlite3_column_int64(stmt, 3) == (sqlite3_int64)expanded_length &&
+             sqlite3_step(stmt) == SQLITE_DONE;
+    } else {
+        ok = false;
     }
-    lrp_cleanup(&lp, store);
-    return got >= min_calls;
+    sqlite3_finalize(stmt);
+    if (!ok)
+        fprintf(stderr, "    [LRP] ORACLE_CONFIG_MISMATCH %s raw/expanded snapshot differs\n",
+                file->name);
+    return ok;
 }
 
-/* Count one exact CALLS relationship by unique source/target node names.
- * Returning -1 distinguishes a malformed fixture or DB failure from a genuine
- * missing edge. This prevents broad CALLS totals (including macro/stdlib edges)
- * from masking a missing source-specific relationship. */
-static int lrp_exact_edge_by_name(cbm_store_t *store, const char *project, const char *edge_type,
-                                  const char *source_name, const char *target_name) {
-    if (!store || !project || !edge_type || !source_name || !target_name) {
-        return -1;
-    }
-
-    cbm_node_t *sources = NULL;
-    cbm_node_t *targets = NULL;
-    int source_count = 0;
-    int target_count = 0;
-    if (cbm_store_find_nodes_by_name(store, project, source_name, &sources, &source_count) !=
-            CBM_STORE_OK ||
-        cbm_store_find_nodes_by_name(store, project, target_name, &targets, &target_count) !=
-            CBM_STORE_OK ||
-        source_count != 1 || target_count != 1) {
-        cbm_store_free_nodes(sources, source_count);
-        cbm_store_free_nodes(targets, target_count);
-        return -1;
-    }
-
-    int64_t source_id = sources[0].id;
-    int64_t target_id = targets[0].id;
-    cbm_store_free_nodes(sources, source_count);
-    cbm_store_free_nodes(targets, target_count);
-
-    cbm_edge_t *edges = NULL;
-    int edge_count = 0;
-    if (cbm_store_find_edges_by_source_type(store, source_id, edge_type, &edges, &edge_count) !=
-        CBM_STORE_OK) {
-        cbm_store_free_edges(edges, edge_count);
-        return -1;
-    }
-
+static bool lrp_map_expanded(LRP_Check *check, size_t index, const CBMPreprocessedSource *pp) {
+    const LRP_Golden *g = &LRP_GOLDEN[index];
+    size_t length = strlen(g->occurrence);
+    const char *site = pp->source;
     int matches = 0;
-    for (int i = 0; i < edge_count; i++) {
-        if (edges[i].target_id == target_id) {
+    while ((site = strstr(site, g->occurrence)) != NULL) {
+        int first = 1, last = 1;
+        for (const char *p = pp->source; p < site; p++)
+            first += *p == '\n';
+        last = first;
+        for (size_t i = 0; i < length; i++)
+            last += site[i] == '\n';
+        int raw_last = check->lines[index] + last - first;
+        bool owned = first <= pp->expanded_line_count && last <= pp->expanded_line_count;
+        for (int line = first; owned && line <= last; line++)
+            owned = pp->belongs_to_main_file[line] &&
+                    pp->original_line_by_expanded_line[line] ==
+                        (uint32_t)(check->lines[index] + line - first);
+        if (owned && pp->original_line_by_expanded_line[last] == (uint32_t)raw_last) {
+            check->pp_starts[index] = (uint32_t)(site - pp->source);
+            check->pp_ends[index] = check->pp_starts[index] + (uint32_t)length;
             matches++;
         }
+        site++;
     }
-    cbm_store_free_edges(edges, edge_count);
-    return matches;
+    if (matches != 1) {
+        fprintf(stderr, "    [LRP] %s ORACLE_EXPANDED_SITE %s:%d text=%s matches=%d\n",
+                check->scenario, g->file, check->lines[index], g->occurrence, matches);
+        return false;
+    }
+    check->pp_valid[index] = true;
+    return true;
 }
 
-static int lrp_exact_calls_by_name(cbm_store_t *store, const char *project, const char *source_name,
-                                   const char *target_name) {
-    return lrp_exact_edge_by_name(store, project, "CALLS", source_name, target_name);
+static bool lrp_prepare_expanded(cbm_store_t *store, const char *project, LRP_Check *check,
+                                 const LRP_File *files, int nfiles) {
+    bool ok = true;
+    for (int f = 0; f < nfiles; f++) {
+        const char *ext = strrchr(files[f].name, '.');
+        bool cpp = ext && (!strcmp(ext, ".cpp") || !strcmp(ext, ".hpp"));
+        if (!cpp && (!ext || strcmp(ext, ".c")))
+            continue;
+        bool selected = false;
+        for (size_t i = 0; i < LRP_GOLDEN_COUNT; i++)
+            selected |= !strcmp(LRP_GOLDEN[i].scenario, check->scenario) &&
+                        !strcmp(LRP_GOLDEN[i].file, files[f].name);
+        if (!selected)
+            continue;
+        CBMPreprocessedSource *pp = cbm_preprocess_with_map(
+            files[f].content, (int)strlen(files[f].content), files[f].name, NULL, NULL, cpp);
+        bool snapshot_ok = lrp_source_snapshot(store, project, &files[f], pp);
+        ok = snapshot_ok && ok;
+        for (size_t i = 0; snapshot_ok && pp && i < LRP_GOLDEN_COUNT; i++)
+            if (!strcmp(LRP_GOLDEN[i].scenario, check->scenario) &&
+                !strcmp(LRP_GOLDEN[i].file, files[f].name))
+                ok = lrp_map_expanded(check, i, pp) && ok;
+        cbm_preprocessed_source_free(pp);
+    }
+    return ok;
+}
+
+static bool lrp_same_site(const LRP_Check *check, size_t i, uint32_t start, uint32_t end,
+                          int origin) {
+    if (origin == CBM_SOURCE_ORIGIN_RAW)
+        return check->starts[i] == start && check->ends[i] == end;
+    return origin == CBM_SOURCE_ORIGIN_PREPROCESSED && check->pp_valid[i] &&
+           check->pp_starts[i] == start && check->pp_ends[i] == end;
+}
+
+/* Do not prefilter by the expected span, scope or role: a shifted/rebound
+ * occurrence must fail rather than become a tolerated missing edge. */
+static bool lrp_match_occurrence(LRP_Check *check, sqlite3_stmt *stmt) {
+    const char *scenario = check->scenario;
+    bool ok = true;
+    const char *file = (const char *)sqlite3_column_text(stmt, 0);
+    const char *scope = (const char *)sqlite3_column_text(stmt, 1);
+    const char *relation = (const char *)sqlite3_column_text(stmt, 2);
+    uint32_t start = (uint32_t)sqlite3_column_int64(stmt, 3);
+    uint32_t end = (uint32_t)sqlite3_column_int64(stmt, 4);
+    const char *target = (const char *)sqlite3_column_text(stmt, 6);
+    const char *target_file = (const char *)sqlite3_column_text(stmt, 7);
+    const char *source_file = (const char *)sqlite3_column_text(stmt, 10);
+    bool covered = false, matched = false;
+    for (size_t i = 0; i < LRP_GOLDEN_COUNT; i++) {
+        const LRP_Golden *g = &LRP_GOLDEN[i];
+        if (strcmp(g->scenario, scenario) || strcmp(g->file, file))
+            continue;
+        bool same_site = lrp_same_site(check, i, start, end, sqlite3_column_int(stmt, 5));
+        if (!strcmp(g->relation, relation) || same_site ||
+            (!strcmp(g->relation, "CALLS") && !strcmp(relation, "CALL_REFERENCE")))
+            covered = true;
+        if (!same_site || strcmp(g->relation, relation))
+            continue;
+        bool identity = source_file && !strcmp(source_file, g->file) &&
+                        lrp_qn_has_declaration(scope, g->caller) &&
+                        sqlite3_column_int(stmt, 11) <= check->lines[i] &&
+                        sqlite3_column_int(stmt, 12) >= check->lines[i] &&
+                        lrp_target_matches(g, target_file, target, sqlite3_column_int(stmt, 8),
+                                           sqlite3_column_int(stmt, 9));
+        if (identity && g->forbidden) {
+            fprintf(stderr, "    [LRP] %s forbidden target %s -> %s\n", scenario, scope, target);
+            ok = false;
+        }
+        if (identity && !g->forbidden && sqlite3_column_int(stmt, 13)) {
+            check->recovered[i] = true;
+            matched = true;
+        }
+    }
+    if (covered && !matched) {
+        check->false_positives++;
+        fprintf(stderr, "    [LRP] %s FALSE_POSITIVE_OR_PROJECTION %s:%u-%u %s %s -> %s\n",
+                scenario, file, start, end, relation, scope, target);
+        ok = false;
+    }
+    return ok;
+}
+
+/* A deduplicated edge needs at least one exact admitted golden occurrence. */
+static bool lrp_match_projection(LRP_Check *check, sqlite3_stmt *stmt) {
+    const char *scenario = check->scenario;
+    bool ok = true;
+    const char *file = (const char *)sqlite3_column_text(stmt, 0);
+    const char *scope = (const char *)sqlite3_column_text(stmt, 1);
+    const char *target_file = (const char *)sqlite3_column_text(stmt, 2);
+    const char *target = (const char *)sqlite3_column_text(stmt, 3);
+    const char *relation = (const char *)sqlite3_column_text(stmt, 4);
+    bool covered = false, matched = false;
+    for (size_t i = 0; i < LRP_GOLDEN_COUNT; i++) {
+        const LRP_Golden *g = &LRP_GOLDEN[i];
+        if (strcmp(g->scenario, scenario) || strcmp(g->file, file))
+            continue;
+        if (!strcmp(g->relation, relation) ||
+            (!strcmp(g->relation, "CALLS") && !strcmp(relation, "CALL_REFERENCE")))
+            covered = true;
+        if (strcmp(g->relation, relation))
+            continue;
+        bool identity = lrp_qn_has_declaration(scope, g->caller) &&
+                        lrp_target_matches(g, target_file, target, sqlite3_column_int(stmt, 5),
+                                           sqlite3_column_int(stmt, 6));
+        if (identity && g->forbidden)
+            ok = false;
+        if (identity && !g->forbidden && check->recovered[i] && sqlite3_column_int(stmt, 7))
+            matched = true;
+    }
+    if (covered && !matched) {
+        check->projection_errors++;
+        fprintf(stderr, "    [LRP] %s UNATTESTED_GRAPH_EDGE %s %s -> %s\n", scenario, relation,
+                scope, target);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool lrp_query_oracle(cbm_store_t *store, const char *project, LRP_Check *check,
+                             const char *sql, bool projection) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    bool ok = true;
+    int step;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        bool row_ok =
+            projection ? lrp_match_projection(check, stmt) : lrp_match_occurrence(check, stmt);
+        ok = row_ok && ok;
+    }
+    ok = ok && step == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+static bool lrp_report_oracle(const LRP_Check *check) {
+    bool ok = true;
+    int found = 0;
+    for (size_t i = 0; i < LRP_GOLDEN_COUNT; i++) {
+        const LRP_Golden *g = &LRP_GOLDEN[i];
+        if (strcmp(g->scenario, check->scenario) || g->forbidden)
+            continue;
+        found += check->recovered[i];
+        if (!check->recovered[i]) {
+            fprintf(stderr, "    [LRP] %s QUALITY_MISS %s:%u-%u %s -> %s:%s; WHY=%s; TRIED=%s\n",
+                    check->scenario, g->file, check->starts[i], check->ends[i], g->relation,
+                    g->target_file, g->target ? g->target : "<unmaterialized identity>",
+                    g->quality_issue ? g->quality_issue : "required supported relationship",
+                    g->tried ? g->tried : "exact source occurrence and graph projection");
+            if (g->required)
+                ok = false;
+        }
+    }
+    fprintf(stderr,
+            "    [LRP] %s QUALITY genuine=%d admitted=%d missing=%d false_positive=%d "
+            "projection_errors=%d\n",
+            check->scenario, check->genuine, found, check->genuine - found, check->false_positives,
+            check->projection_errors);
+    return ok;
+}
+
+static bool lrp_check_oracle(cbm_store_t *store, const char *project, const LRP_File *files,
+                             int nfiles, const char *scenario) {
+    LRP_Check check = {.scenario = scenario};
+    if (!store || !lrp_prepare_oracle(&check, files, nfiles) ||
+        !lrp_prepare_expanded(store, project, &check, files, nfiles))
+        return false;
+    const char *occurrences =
+        "SELECT r.file_path,r.scope,r.relation,r.start_byte,r.end_byte,r.source_origin,"
+        "r.target,t.file_path,t.start_line,t.end_line,s.file_path,s.start_line,s.end_line,"
+        "EXISTS(SELECT 1 FROM edges e WHERE e.project=r.project AND e.source_id=s.id "
+        "AND e.target_id=t.id AND e.type=r.relation) "
+        "FROM resolver_occurrences r LEFT JOIN nodes s ON s.project=r.project "
+        "AND s.qualified_name=r.scope LEFT JOIN nodes t ON t.project=r.project "
+        "AND t.qualified_name=r.target WHERE r.project=?1 AND r.emitted=1";
+    const char *projections =
+        "SELECT s.file_path,s.qualified_name,t.file_path,t.qualified_name,e.type,"
+        "t.start_line,t.end_line,EXISTS(SELECT 1 FROM resolver_occurrences r "
+        "WHERE r.project=e.project AND r.emitted=1 AND r.scope=s.qualified_name "
+        "AND r.target=t.qualified_name AND r.relation=e.type) "
+        "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.project=?1";
+    bool ok = lrp_query_oracle(store, project, &check, occurrences, false);
+    ok = lrp_query_oracle(store, project, &check, projections, true) && ok;
+    return lrp_report_oracle(&check) && ok;
+}
+
+static bool lrp_assert_golden(const LRP_File *files, int nfiles, const char *scenario) {
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, nfiles);
+    bool ok = lrp_check_oracle(store, lp.project, files, nfiles, scenario);
+    if (!ok)
+        lrp_diag(store, lp.project, scenario);
+    lrp_cleanup(&lp, store);
+    return ok;
 }
 
 static int lrp_exact_edge_by_qn_suffix(cbm_store_t *store, const char *project,
@@ -363,20 +1601,14 @@ static int lrp_exact_edge_by_qn_suffix(cbm_store_t *store, const char *project,
     return matches;
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 1: GO (lsp_cross WIRED) ──────────────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * Go has the most mature lsp_cross. All 8 scenarios are expected GREEN.
- * S1–S4 are same-package fixtures so the registry has full visibility.
- * S5–S8 use two files to exercise cross-file type propagation.
- */
+/* Group 1: GO. Per-occurrence source oracle probes. */
 
 /* S1 — Go cross-file plain function call. */
 TEST(lrp_go_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"util.go", "package app\n\nfunc Double(x int) int { return x * 2 }\n"},
         {"main.go", "package app\n\nfunc Run(n int) int { return Double(n) }\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S1/crossfile_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s1_crossfile_call"));
     PASS();
 }
 
@@ -390,36 +1622,44 @@ TEST(lrp_go_s2_method_dispatch) {
                                                 "func (c *Counter) Value() int { return c.n }\n"},
                                  {"runner.go", "package app\n\nfunc Run(c *Counter) int {\n"
                                                "    c.Inc()\n    return c.Value()\n}\n"}};
-    /* GREEN: Go lsp_cross resolves *Counter receiver → Inc and Value methods. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S2/method_dispatch", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s2_method_dispatch"));
     PASS();
 }
 
 /* S3 — Go constructor / struct literal instantiation. */
 TEST(lrp_go_s3_constructor) {
-    /* NewCounter() is a constructor-style function.  The caller creates a Counter
-     * literal and calls NewCounter.  Both the struct literal usage and the function
-     * call should produce CALLS edges. */
+    /* NewCounter() is an ordinary function call. Its struct literal is a
+     * separate type usage, covered by the dedicated usage probe. */
     static const LRP_File f[] = {
         {"counter.go",
          "package app\n\ntype Counter struct{ start int }\n\n"
          "func NewCounter(start int) *Counter {\n    return &Counter{start: start}\n}\n"},
         {"main.go", "package app\n\nfunc Make(n int) *Counter {\n    return NewCounter(n)\n}\n"}};
-    /* GREEN: NewCounter is a top-level function; generic + lsp_cross both see it. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S3/constructor", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s3_constructor"));
     PASS();
 }
 
-/* S4 — Go package-qualified static call (pkg.Func). */
+/* S4 — Go package-qualified call through the declared project module path. */
 TEST(lrp_go_s4_static_call) {
-    /* Go's equivalent of a static call: importing another package and calling
-     * a top-level function via the package alias. */
     static const LRP_File f[] = {
+        {"go.mod", "module example.com/probe\n\ngo 1.22\n"},
+        {"math/ops.go", "package math\n\nfunc Square(x int) int { return x * x }\n"},
+        {"main.go", "package main\n\nimport \"example.com/probe/math\"\n\n"
+                    "func Run(n int) int { return math.Square(n) }\n"}};
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s4_static_call"));
+    PASS();
+}
+
+/* An import of standard-library math cannot resolve to a same-named project
+ * directory. Square is intentionally absent from the actual imported package. */
+TEST(lrp_go_stdlib_import_does_not_bind_local_directory) {
+    static const LRP_File f[] = {
+        {"go.mod", "module example.com/probe\n\ngo 1.22\n"},
         {"math/ops.go", "package math\n\nfunc Square(x int) int { return x * x }\n"},
         {"main.go", "package main\n\nimport \"math\"\n\n"
                     "func Run(n int) int { return math.Square(n) }\n"}};
-    /* GREEN: lsp_cross maps import alias "math" → package QN, resolves math.Square. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S4/static_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])),
+                                  "lrp_go_stdlib_import_does_not_bind_local_directory"));
     PASS();
 }
 
@@ -435,9 +1675,7 @@ TEST(lrp_go_s5_chained_call) {
                                   "func (b *Builder) Build() []string { return b.items }\n"},
                                  {"main.go", "package app\n\nfunc Make() []string {\n"
                                              "    return NewBuilder().Add(\"x\").Build()\n}\n"}};
-    /* GREEN: lsp_cross infers *Builder from NewBuilder() return type, then
-     * resolves Add() → *Builder, then resolves Build(). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S5/chained_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s5_chained_call"));
     PASS();
 }
 
@@ -449,9 +1687,8 @@ TEST(lrp_go_s6_inherited_method) {
                                   "func (a *Animal) Speak() string { return a.Name }\n"},
                                  {"dog.go", "package zoo\n\ntype Dog struct{ Animal }\n\n"
                                             "func Run(d *Dog) string { return d.Speak() }\n"}};
-    /* GREEN: Go lsp_cross handles embedded-struct field promotion; Speak() is
-     * resolved to Animal.Speak via the embedded Animal field. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S6/inherited_method", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s6_inherited_method"));
     PASS();
 }
 
@@ -465,9 +1702,7 @@ TEST(lrp_go_s7_generic_call) {
          "    for i, x := range xs {\n        out[i] = fn(x)\n    }\n    return out\n}\n"},
         {"main.go", "package app\n\nfunc Double(xs []int) []int {\n"
                     "    return Map(xs, func(x int) int { return x * 2 })\n}\n"}};
-    /* GREEN: Map is a top-level generic function; both generic + lsp_cross resolvers
-     * find it by name regardless of the type parameter instantiation. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S7/generic_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s7_generic_call"));
     PASS();
 }
 
@@ -479,24 +1714,18 @@ TEST(lrp_go_s8_field_type_hint) {
                     "func (r *Repo) Find(id int) string { return \"\" }\n"},
         {"service.go", "package app\n\ntype Service struct{ repo *Repo }\n\n"
                        "func (s *Service) Get(id int) string { return s.repo.Find(id) }\n"}};
-    /* GREEN: lsp_cross sees s.repo field of type *Repo, resolves repo.Find. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "go/S8/field_type_hint", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_s8_field_type_hint"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 2: C (lsp_cross WIRED) ───────────────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * C has lsp_cross via cbm_run_c_lsp_cross.  Function-pointer dispatch,
- * struct-field calls, and pointer-to-function calls are the risky paths.
- */
+/* Group 2: C. Per-occurrence source oracle probes. */
 
 /* S1 — C cross-file plain function call. */
 TEST(lrp_c_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"util.c", "int add(int a, int b) { return a + b; }\n"},
         {"main.c", "int add(int a, int b);\n\nint run(int x) { return add(x, 1); }\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "c/S1/crossfile_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s1_crossfile_call"));
     PASS();
 }
 
@@ -512,9 +1741,8 @@ TEST(lrp_c_s2_funcptr_in_struct) {
         {"main.c", "typedef struct { int (*compute)(int); } Ops;\n"
                    "Ops make_ops(void);\n\n"
                    "int run(int n) {\n    Ops o = make_ops();\n    return o.compute(n);\n}\n"}};
-    /* Uncertain: C lsp_cross may not track function-pointer fields through a
-     * cross-file struct.  Assert the CORRECT outcome; RED if unresolved. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "c/S2/funcptr_in_struct", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s2_funcptr_in_struct"));
     PASS();
 }
 
@@ -528,8 +1756,7 @@ TEST(lrp_c_s3_constructor) {
                                  {"main.c", "typedef struct { int cap; int *data; } Buf;\n"
                                             "Buf *buf_new(int cap);\n\n"
                                             "Buf *make_buf(int n) { return buf_new(n); }\n"}};
-    /* GREEN: buf_new is a plain function; both resolvers find it. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "c/S3/constructor", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s3_constructor"));
     PASS();
 }
 
@@ -543,15 +1770,7 @@ TEST(lrp_c_s4_static_local) {
         {"util.c", "static int helper(int x) { return x + 1; }\n\n"
                    "int exported(int x) { return helper(x); }\n"},
         {"main.c", "int exported(int x);\n\nint run(int n) { return exported(n); }\n"}};
-    /* The CALLS edge run -> exported should exist.
-     * The CALLS edge anything -> helper (static) should NOT span files.
-     * We check that at least 1 CALLS edge resolves (run -> exported). */
-    LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, f, 2);
-    int calls = store ? cbm_store_count_edges_by_type(store, lp.project, "CALLS") : -1;
-    lrp_cleanup(&lp, store);
-    /* GREEN guard: exported() is a public function; run->exported resolves. */
-    ASSERT_TRUE(calls >= 1);
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s4_static_local"));
     PASS();
 }
 
@@ -563,8 +1782,7 @@ TEST(lrp_c_s5_chained_deref) {
         {"main.c", "typedef struct Node { int val; struct Node *next; } Node;\n"
                    "int node_val(const Node *n);\n\n"
                    "int run(Node *head) { return node_val(head->next); }\n"}};
-    /* GREEN: node_val is a plain function; run->node_val resolves regardless. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "c/S5/chained_deref", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s5_chained_deref"));
     PASS();
 }
 
@@ -577,8 +1795,7 @@ TEST(lrp_c_s6_base_method) {
                      "typedef struct { Shape base; float radius; } Circle;\n"
                      "int shape_color(const Shape *s);\n\n"
                      "int run(Circle *c) { return shape_color(&c->base); }\n"}};
-    /* GREEN: shape_color is a plain function; run->shape_color resolves. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "c/S6/base_method", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s6_base_method"));
     PASS();
 }
 
@@ -598,7 +1815,7 @@ TEST(lrp_c_s7_generic_callback) {
                                             "    CmpFn fn = int_cmp;\n"
                                             "    int direct = int_cmp(&arr[0], &arr[1]);\n"
                                             "    return direct + fn(&arr[0], &arr[1]);\n}\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "c/S7/generic_callback", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s7_generic_callback"));
     PASS();
 }
 
@@ -611,152 +1828,114 @@ TEST(lrp_c_s8_field_call) {
                       "typedef struct { Logger logger; int id; } Service;\n"
                       "void log_msg(const Logger *l, const char *msg);\n\n"
                       "void run(Service *svc, const char *m) { log_msg(&svc->logger, m); }\n"}};
-    /* GREEN: log_msg is a plain function; run->log_msg resolves. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "c/S8/field_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_c_s8_field_call"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 3: C++ (lsp_cross WIRED) ──────────────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * C++ uses the same c_lsp_cross with cpp_mode=true.  Virtual dispatch,
- * templates, and namespace-qualified calls are the interesting paths.
- */
+/* Group 3: C++. Per-occurrence source oracle probes. */
 
 /* S1 — C++ cross-file plain function call. */
 TEST(lrp_cpp_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"util.cpp", "int square(int x) { return x * x; }\n"},
         {"main.cpp", "int square(int x);\n\nint run(int n) { return square(n); }\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S1/crossfile_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s1_crossfile_call"));
     PASS();
 }
 
 /* S2 — C++ method dispatch on object (non-virtual). */
 TEST(lrp_cpp_s2_method_dispatch) {
     static const LRP_File f[] = {
-        {"counter.cpp", "class Counter {\npublic:\n"
+        {"counter.hpp", "class Counter {\npublic:\n"
                         "    int n;\n    Counter() : n(0) {}\n"
                         "    void inc() { n++; }\n    int val() const { return n; }\n};\n"},
-        {"main.cpp", "class Counter;\n\n"
+        {"main.cpp", "#include \"counter.hpp\"\n\n"
                      "int run() {\n    Counter c;\n    c.inc();\n    return c.val();\n}\n"}};
-    /* Uncertain: forward-declaring a class without definition may limit lsp_cross
-     * type inference.  Assert the correct outcome. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S2/method_dispatch", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s2_method_dispatch"));
     PASS();
 }
 
 /* S3 — C++ constructor call. */
 TEST(lrp_cpp_s3_constructor) {
     static const LRP_File f[] = {
-        {"widget.cpp", "class Widget {\npublic:\n    int id;\n"
+        {"widget.hpp", "class Widget {\npublic:\n    int id;\n"
                        "    Widget(int id) : id(id) {}\n"
                        "    int get_id() const { return id; }\n};\n"},
-        {"main.cpp", "class Widget { public: Widget(int); int get_id() const; };\n\n"
+        {"main.cpp", "#include \"widget.hpp\"\n\n"
                      "int run(int n) {\n    Widget w(n);\n    return w.get_id();\n}\n"}};
-    /* GREEN: Widget(n) constructor call + get_id() method call. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S3/constructor", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s3_constructor"));
     PASS();
 }
 
 /* S4 — C++ static method call (Class::method). */
 TEST(lrp_cpp_s4_static_method) {
-    static const LRP_File f[] = {{"registry.cpp", "class Registry {\npublic:\n"
+    static const LRP_File f[] = {{"registry.hpp", "class Registry {\npublic:\n"
                                                   "    static int count() { return 42; }\n};\n"},
-                                 {"main.cpp", "class Registry { public: static int count(); };\n\n"
+                                 {"main.cpp", "#include \"registry.hpp\"\n\n"
                                               "int run() { return Registry::count(); }\n"}};
-    /* REAL BUG: a C++ static qualified call `Registry::count()` is not resolved to
-     * a CALLS edge by the C/C++ lsp_cross (cpp_mode) — diagnostics show calls=0 with
-     * the Registry method present (DEFINES_METHOD=1).  The `Class::method()` static
-     * scope-resolution form is not handled by the C++ resolver in
-     * internal/cbm/lsp (cbm_run_c_lsp_cross, cpp path). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S4/static_method", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s4_static_method"));
     PASS();
 }
 
 /* S5 — C++ chained method call. */
 TEST(lrp_cpp_s5_chained) {
-    static const LRP_File f[] = {
-        {"builder.cpp", "class Builder {\npublic:\n"
-                        "    Builder& add(int x) { (void)x; return *this; }\n"
-                        "    int build() { return 1; }\n};\n"},
-        {"main.cpp", "class Builder { public: Builder& add(int); int build(); };\n\n"
-                     "int run() { return Builder().add(1).build(); }\n"}};
-    /* GREEN: Builder() + add() + build() chain; lsp_cross resolves return types. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S5/chained", 1));
+    static const LRP_File f[] = {{"builder.hpp",
+                                  "class Builder {\npublic:\n"
+                                  "    Builder& add(int x) { (void)x; return *this; }\n"
+                                  "    int build() { return 1; }\n};\n"},
+                                 {"main.cpp", "#include \"builder.hpp\"\n\n"
+                                              "int run() { return Builder().add(1).build(); }\n"}};
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s5_chained"));
     PASS();
 }
 
 /* S6 — C++ virtual inherited method call. */
 TEST(lrp_cpp_s6_virtual_inherited) {
     static const LRP_File f[] = {
-        {"shape.cpp", "class Shape {\npublic:\n    virtual int area() const { return 0; }\n};\n"},
-        {"circle.cpp", "class Shape { public: virtual int area() const; };\n\n"
+        {"shape.hpp", "class Shape {\npublic:\n    virtual int area() const { return 0; }\n};\n"},
+        {"circle.cpp", "#include \"shape.hpp\"\n\n"
                        "class Circle : public Shape {\npublic:\n"
                        "    int r;\n    Circle(int r) : r(r) {}\n"
                        "    int area() const override { return r * r * 3; }\n"
                        "    int run() const { return Shape::area(); }\n};\n"}};
-    /* REAL BUG: the explicit base call `Shape::area()` from Circle::run() is not
-     * resolved to a CALLS edge (diagnostics: calls=0, INHERITS=1 present).  Same
-     * class as cpp/S4 — the C++ lsp_cross does not resolve `Base::method()`
-     * scope-qualified calls (internal/cbm/lsp, cbm_run_c_lsp_cross cpp path). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S6/virtual_inherited", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s6_virtual_inherited"));
     PASS();
 }
 
 /* S7 — C++ template function call. */
 TEST(lrp_cpp_s7_template) {
     static const LRP_File f[] = {
-        {"algo.cpp", "template<typename T>\nT clamp(T v, T lo, T hi) {\n"
+        {"algo.hpp", "template<typename T>\nT clamp(T v, T lo, T hi) {\n"
                      "    if (v < lo) return lo;\n    if (v > hi) return hi;\n    return v;\n}\n"},
-        {"main.cpp", "template<typename T> T clamp(T v, T lo, T hi);\n\n"
+        {"main.cpp", "#include \"algo.hpp\"\n\n"
                      "int run(int n) { return clamp(n, 0, 100); }\n"}};
-    /* Uncertain: template functions require instantiation to resolve precisely.
-     * The name-based resolver may find clamp regardless; assert CALLS >= 1. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S7/template", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s7_template"));
     PASS();
 }
 
 /* S8 — C++ member field method call. */
 TEST(lrp_cpp_s8_field_call) {
     static const LRP_File f[] = {
-        {"logger.cpp",
+        {"logger.hpp",
          "class Logger {\npublic:\n    void log(const char *msg) { (void)msg; }\n};\n"},
-        {"service.cpp", "class Logger { public: void log(const char *); };\n\n"
+        {"service.cpp", "#include \"logger.hpp\"\n\n"
                         "class Service {\n    Logger logger;\npublic:\n"
                         "    void run(const char *m) { logger.log(m); }\n};\n"}};
-    /* Uncertain: logger.log() — lsp_cross must see logger's type (Logger) from
-     * the Service class definition in the same file.  Assert CALLS >= 1. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "cpp/S8/field_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_cpp_s8_field_call"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 4: RUST (lsp_cross NOT WIRED) ────────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * cbm_run_rust_lsp_cross EXISTS in rust_lsp.c but cbm_pxc_has_cross_lsp
- * returns false for CBM_LANG_RUST — the pass is NEVER called by the
- * pipeline.  The generic name-based resolver handles S1 (plain call).
- * S2–S8 require type information and are expected RED (assert the correct
- * outcome; they FAIL until cbm_pxc_has_cross_lsp is updated to include Rust).
- *
- * ROOT CAUSE: pass_lsp_cross.c cbm_pxc_has_cross_lsp() switch missing
- *   CBM_LANG_RUST case.
- * FIX LOCATION: src/pipeline/pass_lsp_cross.c line ~280.
- */
+/* Group 4: RUST. Per-occurrence source oracle probes. */
 
-/* S1 — Rust cross-file plain function call.
- * REAL BUG (the known cross-LSP dispatch gap — keep RED): `lib::square(n)` does
- * NOT resolve → calls=0.  cbm_registry_resolve (src/pipeline/registry.c:638)
- * splits the callee name on '.', not Rust's '::', so the prefix is the whole
- * "lib::square" and never matches registered QN project.lib.square; and Rust
- * lsp_cross is not wired (pass_lsp_cross.c:cbm_pxc_has_cross_lsp lacks
- * CBM_LANG_RUST).  Fix either the '::' split or wire Rust lsp_cross. */
+/* S1 — Rust module-qualified source function call. */
 TEST(lrp_rust_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"lib.rs", "pub fn square(x: i32) -> i32 { x * x }\n"},
         {"main.rs", "mod lib;\n\nfn run(n: i32) -> i32 { lib::square(n) }\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S1/crossfile_call", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s1_crossfile_call"));
     PASS();
 }
 
@@ -773,11 +1952,8 @@ TEST(lrp_rust_s2_method_dispatch) {
                                  {"runner.rs",
                                   "mod counter;\n\nfn run(c: &mut counter::Counter) -> i32 {\n"
                                   "    c.inc();\n    c.value()\n}\n"}};
-    /* RED (expected to fail): lsp_cross not wired for Rust → method dispatch
-     * through typed receiver not resolved by the generic resolver.
-     * Root cause: cbm_pxc_has_cross_lsp returns false for CBM_LANG_RUST.
-     * This test asserts the CORRECT outcome: calls >= 1. FAILS until fixed. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S2/method_dispatch", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s2_method_dispatch"));
     PASS();
 }
 
@@ -790,11 +1966,7 @@ TEST(lrp_rust_s3_constructor) {
          "    pub fn dist(&self) -> f64 { (self.x * self.x + self.y * self.y).sqrt() }\n}\n"},
         {"main.rs", "mod point;\n\nfn run() -> f64 {\n"
                     "    let p = point::Point::new(3.0, 4.0);\n    p.dist()\n}\n"}};
-    /* RED: Point::new is a qualified associated function; the name resolver may find
-     * "new" generically, but Point::new in context requires lsp_cross.
-     * p.dist() requires receiver type Point — lsp_cross needed.
-     * Assert CALLS >= 1 (correct outcome). Fails until lsp_cross wired for Rust. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S3/constructor", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s3_constructor"));
     PASS();
 }
 
@@ -806,9 +1978,7 @@ TEST(lrp_rust_s4_static_method) {
                       "    pub fn is_debug(&self) -> bool { self.debug }\n}\n"},
         {"app.rs", "mod config;\n\nfn run() -> bool {\n"
                    "    let cfg = config::Config::default();\n    cfg.is_debug()\n}\n"}};
-    /* RED: Config::default() is an associated (static-like) function.
-     * Without lsp_cross the receiver of is_debug() is unknown. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S4/static_method", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s4_static_method"));
     PASS();
 }
 
@@ -822,9 +1992,7 @@ TEST(lrp_rust_s5_chained) {
                        "    pub fn build(self) -> Vec<i32> { self.items }\n}\n"},
         {"main.rs", "mod builder;\n\nfn run() -> Vec<i32> {\n"
                     "    builder::Builder::new().add(1).add(2).build()\n}\n"}};
-    /* RED: the chain new() → add() → add() → build() requires lsp_cross to track
-     * that each add() returns Self (Builder), which is needed to resolve build(). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S5/chained", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s5_chained"));
     PASS();
 }
 
@@ -834,13 +2002,12 @@ TEST(lrp_rust_s6_trait_method) {
      * run() in main.rs calls d.show() on a Dog where show() comes from the trait. */
     static const LRP_File f[] = {
         {"display.rs", "pub trait Display {\n    fn show(&self) -> String;\n}\n"},
-        {"dog.rs", "mod display;\n\npub struct Dog { pub name: String }\n\n"
-                   "impl display::Display for Dog {\n"
+        {"dog.rs", "pub struct Dog { pub name: String }\n\n"
+                   "impl crate::display::Display for Dog {\n"
                    "    fn show(&self) -> String { self.name.clone() }\n}\n"},
-        {"main.rs", "mod dog;\n\nfn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
-    /* RED: d.show() on &Dog requires knowing Dog implements Display and that
-     * show() maps to Dog's impl — needs lsp_cross + trait resolution. */
-    ASSERT_TRUE(lrp_assert_calls(f, 3, 1, "rust/S6/trait_method", 0));
+        {"main.rs", "mod display;\nmod dog;\nuse crate::display::Display;\n\n"
+                    "fn run(d: &dog::Dog) -> String {\n    d.show()\n}\n"}};
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s6_trait_method"));
     PASS();
 }
 
@@ -850,13 +2017,7 @@ TEST(lrp_rust_s7_generic) {
         {"algo.rs", "pub fn max_of<T: PartialOrd>(a: T, b: T) -> T {\n"
                     "    if a > b { a } else { b }\n}\n"},
         {"main.rs", "mod algo;\n\nfn run(x: i32, y: i32) -> i32 {\n    algo::max_of(x, y)\n}\n"}};
-    /* REAL BUG (same root cause as rust/S1): a Rust `::`-qualified cross-file path
-     * `algo::max_of(...)` is not resolved → calls=0.  cbm_registry_resolve
-     * (src/pipeline/registry.c:638) splits the callee on '.', not '::', so the
-     * prefix becomes the whole "algo::max_of" and never matches the registered QN
-     * (project.algo.max_of); Rust lsp_cross is also not wired
-     * (pass_lsp_cross.c:cbm_pxc_has_cross_lsp lacks CBM_LANG_RUST). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S7/generic", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s7_generic"));
     PASS();
 }
 
@@ -868,10 +2029,7 @@ TEST(lrp_rust_s8_field_call) {
         {"service.rs", "mod logger;\n\npub struct Service { pub logger: logger::Logger }\n\n"
                        "impl Service {\n"
                        "    pub fn run(&self, msg: &str) { self.logger.log(msg); }\n}\n"}};
-    /* RED: self.logger.log() — lsp_cross must see that self.logger is of type
-     * logger::Logger and resolve log() to Logger::log.
-     * Without lsp_cross the receiver type is unknown. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "rust/S8/field_call", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_rust_s8_field_call"));
     PASS();
 }
 
@@ -885,38 +2043,20 @@ TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
         {"main.rs", "mod lib;\n\n"
                     "pub fn visible() -> &'static str { lib::render() }\n\n"
                     "pub fn hidden() -> String { format!(\"{}\", lib::render()) }\n"}};
-
-    LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, f, 2);
-    int visible_to_render = lrp_exact_calls_by_name(store, lp.project, "visible", "render");
-    int hidden_to_render = lrp_exact_calls_by_name(store, lp.project, "hidden", "render");
-    if (visible_to_render != 1 || hidden_to_render != 1) {
-        fprintf(stderr,
-                "  [LRP] rust/macro_hidden_carrier visible->render=%d "
-                "hidden->render=%d (expected 1 each)\n",
-                visible_to_render, hidden_to_render);
-        lrp_diag(store, lp.project, "rust/macro_hidden_carrier");
-    }
-    lrp_cleanup(&lp, store);
-
-    ASSERT_EQ(visible_to_render, 1); /* ordinary-call control */
-    ASSERT_EQ(hidden_to_render, 1);  /* synthetic carrier regression guard */
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])),
+                                  "lrp_rust_crossfile_macro_hidden_call_carrier"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 5: PYTHON (lsp_cross WIRED) ──────────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * Python has cbm_run_py_lsp_cross.  Type inference is limited by duck
- * typing, but explicit type annotations (PEP 484) help the LSP.
- */
+/* Group 5: PYTHON. Per-occurrence source oracle probes. */
 
 /* S1 — Python cross-file plain function call. */
 TEST(lrp_python_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"util.py", "def triple(x):\n    return x * 3\n"},
         {"main.py", "from .util import triple\n\n\ndef run(n):\n    return triple(n)\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S1/crossfile_call", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_s1_crossfile_call"));
     PASS();
 }
 
@@ -929,9 +2069,8 @@ TEST(lrp_python_s2_method_dispatch) {
                        "    def value(self):\n        return self.n\n"},
         {"main.py", "from .counter import Counter\n\n\n"
                     "def run():\n    c = Counter()\n    c.inc()\n    return c.value()\n"}};
-    /* GREEN: py_lsp_cross tracks c = Counter() → type Counter; resolves c.inc()
-     * and c.value() to Counter.inc / Counter.value. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S2/method_dispatch", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_s2_method_dispatch"));
     PASS();
 }
 
@@ -941,9 +2080,7 @@ TEST(lrp_python_s3_constructor) {
         {"widget.py", "class Widget:\n    def __init__(self, name):\n        self.name = name\n\n"
                       "    def label(self):\n        return self.name\n"},
         {"main.py", "from .widget import Widget\n\n\ndef make(name):\n    return Widget(name)\n"}};
-    /* GREEN: Widget(name) is a constructor call; py_lsp_cross sees Widget type from
-     * the import and creates a CALLS edge make -> Widget.__init__. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S3/constructor", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_s3_constructor"));
     PASS();
 }
 
@@ -955,8 +2092,8 @@ TEST(lrp_python_s4_class_method) {
                        "    @staticmethod\n    def version():\n        return '1.0'\n"},
         {"main.py", "from .factory import Factory\n\n\ndef run():\n"
                     "    v = Factory.version()\n    return v\n"}};
-    /* GREEN: Factory.version() is a static method call; lsp_cross resolves it. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S4/class_method", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_s4_class_method"));
     PASS();
 }
 
@@ -969,9 +2106,7 @@ TEST(lrp_python_s5_chained) {
          "    def build(self):\n        return list(self.items)\n"},
         {"main.py", "from .builder import Builder\n\n\ndef make():\n"
                     "    return Builder().add(1).add(2).build()\n"}};
-    /* GREEN: Builder() returns Builder; add() returns self (Builder); build()
-     * resolves via return-type chain.  py_lsp_cross handles self-returning methods. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S5/chained", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_s5_chained"));
     PASS();
 }
 
@@ -1013,24 +2148,7 @@ TEST(lrp_python_s6_inherited_method) {
     PASS();
 }
 
-/* S6b — Python inherited method call through a receiver whose type IS known.
- *
- * S6 above is deliberately kept as-is, but it cannot demonstrate inheritance
- * resolution: its `def run(c)` parameter carries no annotation, so nothing in
- * the program says `c` is a Child. Whatever binds c.describe() there is a
- * guess about a name, not a fact about a type — which is why it resolves via
- * unique_name and why the Python weak-member guard (#1324) is expected to take
- * it to zero.
- *
- * This row supplies the receiver type three ways — annotated parameter, `self`
- * inside the subclass, and a constructor result — so `Base.describe` is
- * reachable ONLY by crossing the file boundary that `class Child(Base)`
- * declares. Before cbm_pxc_collect_all_defs resolved base spellings to project
- * QNs, py_lsp_cross received "Base" and looked it up as a qualified name, found
- * nothing (Base lives in base.py), and all three fell through to unique_name at
- * confidence 0.75. Asserting the lsp_* strategy is what separates the two
- * outcomes: a short-name guess and a resolved inherited member produce the same
- * edge COUNT here, and only the strategy tells them apart. */
+/* S6b — Exact inherited calls for annotated, self and constructed receivers. */
 TEST(lrp_python_s6b_inherited_method_typed_receiver) {
     static const LRP_File annotated[] = {
         {"base.py", "class Base:\n    def describe(self):\n        return 'base'\n"},
@@ -1046,24 +2164,19 @@ TEST(lrp_python_s6b_inherited_method_typed_receiver) {
         {"child.py", "from .base import Base\n\n\nclass Child(Base):\n    pass\n\n\n"
                      "def run():\n    return Child().describe()\n"}};
     const LRP_File *shapes[3] = {annotated, self_attr, constructed};
-    const char *names[3] = {"annotated_param", "self_attr", "constructor"};
-
+    const char *names[3] = {"lrp_python_s6b_annotated_param", "lrp_python_s6b_self_attr",
+                            "lrp_python_s6b_constructor"};
     for (int k = 0; k < 3; k++) {
         LRP_Proj lp;
         cbm_store_t *store = lrp_index(&lp, shapes[k], 2);
         ASSERT_NOT_NULL(store);
         int inherits = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
-        int lsp_calls = lrp_count_calls_with_strategy(store, lp.project, "lsp_");
-        if (inherits < 1 || lsp_calls < 1) {
-            fprintf(stderr, "  [LRP] python/S6b/%s FAIL inherits=%d lsp_calls=%d\n", names[k],
-                    inherits, lsp_calls);
+        bool ok = lrp_check_oracle(store, lp.project, shapes[k], 2, names[k]);
+        if (!ok || inherits < 1)
             lrp_diag(store, lp.project, names[k]);
-        }
         lrp_cleanup(&lp, store);
-        /* INHERITS proves the cross-file base really was resolved; the lsp_
-         * strategy proves the CALL rode that relation instead of guessing. */
         ASSERT_TRUE(inherits >= 1);
-        ASSERT_TRUE(lsp_calls >= 1);
+        ASSERT_TRUE(ok);
     }
     PASS();
 }
@@ -1075,9 +2188,8 @@ TEST(lrp_python_s7_annotated_call) {
         {"service.py", "from .repo import Repo\n\n\nclass Service:\n"
                        "    def __init__(self, repo: Repo):\n        self.repo = repo\n\n"
                        "    def get(self, id: int) -> str:\n        return self.repo.find(id)\n"}};
-    /* GREEN: self.repo is annotated as Repo; py_lsp_cross reads the annotation
-     * and resolves self.repo.find() to Repo.find. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S7/annotated_call", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_s7_annotated_call"));
     PASS();
 }
 
@@ -1089,9 +2201,8 @@ TEST(lrp_python_s8_field_type_hint) {
         {"service.py", "from .logger import Logger\n\n\nclass Service:\n"
                        "    def __init__(self):\n        self.logger: Logger = Logger()\n\n"
                        "    def run(self, msg: str):\n        self.logger.log(msg)\n"}};
-    /* GREEN: self.logger is annotated as Logger; py_lsp_cross resolves
-     * self.logger.log() to Logger.log. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S8/field_type_hint", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_s8_field_type_hint"));
     PASS();
 }
 
@@ -1106,29 +2217,12 @@ TEST(lrp_python_crossfile_dunder_carrier) {
                                  {"main.py", "from .alpha import Alpha\n\n"
                                              "def combine(left: Alpha, right: Alpha):\n"
                                              "    return left + right\n"}};
-
-    LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, f, 2);
-    int combine_to_add = lrp_exact_calls_by_name(store, lp.project, "combine", "__add__");
-    if (combine_to_add != 1) {
-        fprintf(stderr,
-                "  [LRP] python/crossfile_dunder_carrier combine->__add__=%d "
-                "(expected 1)\n",
-                combine_to_add);
-        lrp_diag(store, lp.project, "python/crossfile_dunder_carrier");
-    }
-    lrp_cleanup(&lp, store);
-
-    ASSERT_EQ(combine_to_add, 1);
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])),
+                                  "lrp_python_crossfile_dunder_carrier"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 6: TYPESCRIPT (lsp_cross WIRED) ───────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * TypeScript has cbm_run_ts_lsp_cross.  Static types make S2–S8 more
- * tractable than Python.
- */
+/* Group 6: TYPESCRIPT. Per-occurrence source oracle probes. */
 
 /* S1 — TypeScript cross-file plain function call. */
 TEST(lrp_ts_s1_crossfile_call) {
@@ -1136,7 +2230,7 @@ TEST(lrp_ts_s1_crossfile_call) {
         {"util.ts", "export function format(s: string): string { return s.trim(); }\n"},
         {"main.ts", "import { format } from './util';\n\n"
                     "export function run(s: string): string { return format(s); }\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "ts/S1/crossfile_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s1_crossfile_call"));
     PASS();
 }
 
@@ -1149,8 +2243,7 @@ TEST(lrp_ts_s2_method_dispatch) {
         {"main.ts", "import { Counter } from './counter';\n\n"
                     "export function run(): number {\n"
                     "    const c = new Counter();\n    c.inc();\n    return c.value();\n}\n"}};
-    /* GREEN: ts_lsp_cross resolves c: Counter → inc() and value(). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "ts/S2/method_dispatch", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s2_method_dispatch"));
     PASS();
 }
 
@@ -1162,13 +2255,7 @@ TEST(lrp_ts_s3_constructor) {
         {"main.ts",
          "import { Widget } from './widget';\n\n"
          "export function make(name: string): Widget {\n    return new Widget(name);\n}\n"}};
-    /* REAL BUG: `new Widget(name)` is extracted (new_expression IS in js_call_types)
-     * but produces NO CALLS edge — diagnostics show calls=0 with the Widget
-     * constructor present (DEFINES_METHOD=2, IMPORTS=1).  The TS resolver does not
-     * link a `new T()` instantiation to the class/constructor node (cf. Python S3,
-     * which DOES route Widget(name) → __init__ and passes).  Compare the WIRED
-     * Python constructor path in internal/cbm/lsp vs the TS new_expression path. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "ts/S3/constructor", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s3_constructor"));
     PASS();
 }
 
@@ -1179,9 +2266,7 @@ TEST(lrp_ts_s4_static_method) {
                        "    static create(): Factory { return new Factory(); }\n}\n"},
         {"main.ts", "import { Factory } from './factory';\n\n"
                     "export function run(): string { return Factory.version(); }\n"}};
-    /* GREEN: Factory.version() is a static method; ts_lsp_cross resolves it via
-     * the imported Factory class. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "ts/S4/static_method", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s4_static_method"));
     PASS();
 }
 
@@ -1194,9 +2279,7 @@ TEST(lrp_ts_s5_chained) {
         {"main.ts", "import { Builder } from './builder';\n\n"
                     "export function run(): number[] {\n"
                     "    return new Builder().add(1).add(2).build();\n}\n"}};
-    /* GREEN: ts_lsp_cross infers Builder from new Builder(), add() returns Builder,
-     * build() resolves through the chain. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "ts/S5/chained", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s5_chained"));
     PASS();
 }
 
@@ -1208,38 +2291,8 @@ TEST(lrp_ts_s6_inherited_method) {
          "import { Base } from './base';\n\n"
          "export class Child extends Base {\n    extra(): string { return 'child'; }\n}\n\n"
          "export function run(c: Child): string { return c.describe(); }\n"}};
-    /* GREEN: c.describe() resolves through `Child extends Base` across files.
-     *
-     * This scenario was RED for as long as ts_lsp_cross received the base class
-     * as its SOURCE SPELLING ("Base") while ts_lookup_member fed embedded_types
-     * straight into cbm_registry_lookup_type as a QN — so a base declared in
-     * ANOTHER file never matched, the receiver stayed unresolved, and the only
-     * call in the fixture died in the weak textual cascade. Its predecessor
-     * "pass" came from a unique_name registry fallback ("describe" is unique
-     * here, so a weak short-name guess happened to be right); the receiver-aware
-     * guard (#592/#606) correctly suppressed that, which is why the tripwire
-     * asserted exactly zero.
-     *
-     * cbm_pxc_collect_all_defs now resolves each base spelling to a project QN
-     * through the import map + project registry — the same inputs pass_semantic
-     * uses for its INHERITS edge — so `Child extends Base` is a cross-file fact
-     * the TS LSP can walk. Asserting the lsp_ts_* strategy is the whole point:
-     * it proves the edge came from inheritance RESOLUTION and not from another
-     * lucky short-name guess. Keep BOTH assertions — calls>=1 alone would go
-     * green again for the wrong reason if the guard ever regressed. */
-    LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, f, 2);
-    ASSERT_NOT_NULL(store);
-    int calls = cbm_store_count_edges_by_type(store, lp.project, "CALLS");
-    int lsp_calls = lrp_count_calls_with_strategy(store, lp.project, "lsp_ts");
-    if (calls < 1 || lsp_calls < 1) {
-        fprintf(stderr, "  [LRP] ts/S6/inherited_method FAIL calls=%d lsp_ts_calls=%d\n", calls,
-                lsp_calls);
-        lrp_diag(store, lp.project, "ts/S6/inherited_method");
-    }
-    lrp_cleanup(&lp, store);
-    ASSERT_TRUE(calls >= 1);
-    ASSERT_TRUE(lsp_calls >= 1);
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s6_inherited_method"));
     PASS();
 }
 
@@ -1251,9 +2304,7 @@ TEST(lrp_ts_s7_generic) {
         {"main.ts", "import { maxOf } from './algo';\n\n"
                     "export function run(a: number, b: number): number {\n"
                     "    return maxOf(a, b, (x, y) => x - y);\n}\n"}};
-    /* GREEN: maxOf is a named import; ts_lsp_cross resolves it regardless of
-     * type parameter instantiation. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "ts/S7/generic", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s7_generic"));
     PASS();
 }
 
@@ -1266,23 +2317,11 @@ TEST(lrp_ts_s8_field_type_hint) {
                        "export class Service {\n    private logger: Logger;\n"
                        "    constructor() { this.logger = new Logger(); }\n"
                        "    run(msg: string): void { this.logger.log(msg); }\n}\n"}};
-    /* GREEN: this.logger is typed as Logger; ts_lsp_cross sees the field type
-     * and resolves this.logger.log() to Logger.log. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "ts/S8/field_type_hint", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_s8_field_type_hint"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 7: JAVA (lsp_cross NOT WIRED) ─────────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * cbm_run_java_lsp_cross EXISTS (java_lsp.h) but cbm_pxc_has_cross_lsp
- * returns false for CBM_LANG_JAVA.
- * S1 (plain call via Util.method()): GREEN via name-based resolver.
- * S2–S8: RED until cbm_pxc_has_cross_lsp is updated.
- *
- * ROOT CAUSE: pass_lsp_cross.c cbm_pxc_has_cross_lsp() missing CBM_LANG_JAVA.
- * FIX LOCATION: src/pipeline/pass_lsp_cross.c line ~280.
- */
+/* Group 7: JAVA. Per-occurrence source oracle probes. */
 
 /* S1 — Java cross-file plain method call (same package). */
 TEST(lrp_java_s1_crossfile_call) {
@@ -1291,8 +2330,8 @@ TEST(lrp_java_s1_crossfile_call) {
          "package app;\n\nclass Util {\n    static int square(int x) { return x * x; }\n}\n"},
         {"Main.java",
          "package app;\n\nclass Main {\n    int run(int n) { return Util.square(n); }\n}\n"}};
-    /* GREEN: Util.square is resolved by the name-based resolver (class.method name match). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S1/crossfile_call", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s1_crossfile_call"));
     PASS();
 }
 
@@ -1305,11 +2344,8 @@ TEST(lrp_java_s2_method_dispatch) {
         {"Runner.java", "package app;\n\nclass Runner {\n"
                         "    public int run() {\n        Counter c = new Counter();\n"
                         "        c.inc();\n        return c.value();\n    }\n}\n"}};
-    /* RED: c.inc() / c.value() on Counter — without java_lsp_cross the
-     * receiver type (Counter) is not known; the name-based resolver may find
-     * "inc" and "value" by name, but won't guarantee the correct attribution.
-     * Assert the correct outcome (CALLS >= 1). Fails until lsp_cross wired. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S2/method_dispatch", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s2_method_dispatch"));
     PASS();
 }
 
@@ -1321,13 +2357,7 @@ TEST(lrp_java_s3_constructor) {
                         "    public String label() { return name; }\n}\n"},
         {"Factory.java", "package app;\n\nclass Factory {\n"
                          "    public Widget make(String name) { return new Widget(name); }\n}\n"}};
-    /* REAL BUG: `new Widget(name)` yields NO CALLS edge (diagnostics: calls=0,
-     * DEFINES_METHOD=3 present).  ROOT CAUSE: java_call_types (lang_specs.c) is
-     * {"method_invocation"} only — it does NOT include
-     * "object_creation_expression", so a Java `new T()` is never even extracted as
-     * a call.  Add object_creation_expression to java_call_types (+ route to the
-     * constructor) to fix. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S3/constructor", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s3_constructor"));
     PASS();
 }
 
@@ -1339,9 +2369,7 @@ TEST(lrp_java_s4_static_method) {
                           "        return v < lo ? lo : v > hi ? hi : v;\n    }\n}\n"},
         {"App.java", "package app;\n\nclass App {\n"
                      "    public int run(int n) { return MathUtil.clamp(n, 0, 100); }\n}\n"}};
-    /* Uncertain: MathUtil.clamp — the name resolver may find "clamp" via name match.
-     * Assert CALLS >= 1; may be GREEN even without lsp_cross if name is unique. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S4/static_method", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s4_static_method"));
     PASS();
 }
 
@@ -1355,9 +2383,7 @@ TEST(lrp_java_s5_chained) {
         {"Main.java", "package app;\n\nimport java.util.List;\n\n"
                       "class Main {\n    public List<Integer> run() {\n"
                       "        return new Builder().add(1).add(2).build();\n    }\n}\n"}};
-    /* RED: chained calls new Builder().add(1).add(2).build() require type tracking.
-     * Without lsp_cross the intermediate types are unknown. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S5/chained", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s5_chained"));
     PASS();
 }
 
@@ -1368,9 +2394,8 @@ TEST(lrp_java_s6_inherited_method) {
                                  {"Dog.java",
                                   "package zoo;\n\nclass Dog extends Animal {\n"
                                   "    public String run() { return describe(); }\n}\n"}};
-    /* Uncertain: describe() in Dog.run() — the name-based resolver may find it
-     * if "describe" is unique in the project.  Assert CALLS >= 1. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S6/inherited_method", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s6_inherited_method"));
     PASS();
 }
 
@@ -1384,8 +2409,7 @@ TEST(lrp_java_s7_generic) {
                      "class App {\n    public String run() {\n"
                      "        List<String> xs = new ArrayList<>();\n"
                      "        xs.add(\"hello\");\n        return Util.first(xs);\n    }\n}\n"}};
-    /* Uncertain: Util.first is a generic static; name resolver may find it. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S7/generic", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s7_generic"));
     PASS();
 }
 
@@ -1397,23 +2421,12 @@ TEST(lrp_java_s8_field_type_hint) {
         {"Service.java",
          "package app;\n\nclass Service {\n    private Logger logger = new Logger();\n"
          "    public void run(String msg) { logger.log(msg); }\n}\n"}};
-    /* RED: logger.log() — without lsp_cross the receiver type Logger is not
-     * tracked from the field declaration across to the call site. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "java/S8/field_type_hint", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_java_s8_field_type_hint"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 8: KOTLIN (lsp_cross NOT IMPLEMENTED) ─────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * Kotlin has cbm_run_kotlin_lsp (per-file) but NO cbm_run_kotlin_lsp_cross.
- * The generic name-based resolver covers S1.  S2–S8 are RED.
- *
- * ROOT CAUSE: No cross-file LSP function exists for Kotlin; the per-file
- * cbm_run_kotlin_lsp is never invoked with cross-file project-wide defs.
- * FIX LOCATION: internal/cbm/lsp/kotlin_lsp.c — add cbm_run_kotlin_lsp_cross,
- * then wire it in pass_lsp_cross.c.
- */
+/* Group 8: KOTLIN. Per-occurrence source oracle probes. */
 
 /* S1 — Kotlin cross-file plain function call.
  * REAL BUG (the known Kotlin cross-LSP gap — keep RED): even a bare top-level
@@ -1424,7 +2437,8 @@ TEST(lrp_java_s8_field_type_hint) {
 TEST(lrp_kotlin_s1_crossfile_call) {
     static const LRP_File f[] = {{"Util.kt", "fun double(x: Int): Int = x * 2\n"},
                                  {"Main.kt", "fun run(n: Int): Int = double(n)\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S1/crossfile_call", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s1_crossfile_call"));
     PASS();
 }
 
@@ -1434,9 +2448,8 @@ TEST(lrp_kotlin_s2_method_dispatch) {
         {"Counter.kt", "class Counter {\n    private var n = 0\n"
                        "    fun inc() { n++ }\n    fun value(): Int = n\n}\n"},
         {"Runner.kt", "fun run(c: Counter): Int {\n    c.inc()\n    return c.value()\n}\n"}};
-    /* RED: c.inc() / c.value() require knowing c: Counter and resolving
-     * methods through the class definition in Counter.kt. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S2/method_dispatch", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s2_method_dispatch"));
     PASS();
 }
 
@@ -1445,9 +2458,7 @@ TEST(lrp_kotlin_s3_constructor) {
     static const LRP_File f[] = {
         {"Widget.kt", "class Widget(val name: String) {\n    fun label(): String = name\n}\n"},
         {"Main.kt", "fun make(name: String): Widget = Widget(name)\n"}};
-    /* RED: Widget(name) is a constructor call; without cross-file LSP the type
-     * Widget from Widget.kt is not in the per-file resolver scope. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S3/constructor", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s3_constructor"));
     PASS();
 }
 
@@ -1458,9 +2469,8 @@ TEST(lrp_kotlin_s4_companion_static) {
          "class Config(val debug: Boolean) {\n"
          "    companion object {\n        fun default(): Config = Config(false)\n    }\n}\n"},
         {"App.kt", "fun run(): Config = Config.default()\n"}};
-    /* RED: Config.default() is a companion-object call; requires cross-file type
-     * knowledge of Config and its companion object. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S4/companion_static", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s4_companion_static"));
     PASS();
 }
 
@@ -1471,8 +2481,7 @@ TEST(lrp_kotlin_s5_chained) {
                        "    fun add(x: Int): Builder { items.add(x); return this }\n"
                        "    fun build(): List<Int> = items.toList()\n}\n"},
         {"Main.kt", "fun run(): List<Int> = Builder().add(1).add(2).build()\n"}};
-    /* RED: Builder() → add() → build() chain requires type tracking across files. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S5/chained", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s5_chained"));
     PASS();
 }
 
@@ -1481,9 +2490,8 @@ TEST(lrp_kotlin_s6_inherited_method) {
     static const LRP_File f[] = {
         {"Base.kt", "open class Base {\n    open fun describe(): String = \"base\"\n}\n"},
         {"Child.kt", "class Child : Base() {\n    fun run(): String = describe()\n}\n"}};
-    /* RED: describe() in Child.run() requires knowing Child extends Base.
-     * Kotlin extraction bug (`:` supertype not parsed) compounds this. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S6/inherited_method", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s6_inherited_method"));
     PASS();
 }
 
@@ -1492,9 +2500,7 @@ TEST(lrp_kotlin_s7_generic) {
     static const LRP_File f[] = {
         {"Algo.kt", "fun <T : Comparable<T>> maxOf(a: T, b: T): T = if (a > b) a else b\n"},
         {"Main.kt", "fun run(a: Int, b: Int): Int = maxOf(a, b)\n"}};
-    /* Uncertain: maxOf is a top-level generic function; name resolver may find
-     * it.  Assert CALLS >= 1; may be GREEN via name resolver. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S7/generic", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s7_generic"));
     PASS();
 }
 
@@ -1504,24 +2510,12 @@ TEST(lrp_kotlin_s8_field_type_hint) {
         {"Logger.kt", "class Logger {\n    fun log(msg: String): Unit { println(msg) }\n}\n"},
         {"Service.kt", "class Service {\n    private val logger = Logger()\n"
                        "    fun run(msg: String) { logger.log(msg) }\n}\n"}};
-    /* RED: logger.log() — without cross-file LSP the type of logger (Logger)
-     * is not known; name resolver may find "log" by name alone. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "kotlin/S8/field_type_hint", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_kotlin_s8_field_type_hint"));
     PASS();
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 9: C# (lsp_cross NOT WIRED) ───────────────────────────────
- * ══════════════════════════════════════════════════════════════════════
- * cbm_run_cs_lsp_cross EXISTS (cs_lsp.c) and the CBMCrossLspRegistries
- * struct even has a `cs` field — but cbm_pxc_has_cross_lsp returns false
- * for CBM_LANG_CSHARP.  The cross-LSP pass is never invoked for C# files.
- *
- * ROOT CAUSE: pass_lsp_cross.c cbm_pxc_has_cross_lsp() missing CBM_LANG_CSHARP.
- * FIX LOCATION: src/pipeline/pass_lsp_cross.c line ~280.
- * NOTE: CBMCrossLspRegistries.cs is already defined and cbm_pxc_registry_for_lang
- * handles CSHARP — so the fix is a 1-line addition to cbm_pxc_has_cross_lsp().
- */
+/* Group 9: C#. Per-occurrence source oracle probes. */
 
 /* S1 — C# cross-file plain static call. */
 TEST(lrp_csharp_s1_crossfile_call) {
@@ -1530,8 +2524,8 @@ TEST(lrp_csharp_s1_crossfile_call) {
                     "        public static int Square(int x) { return x * x; }\n    }\n}\n"},
         {"Main.cs", "namespace App {\n    class Main {\n"
                     "        public int Run(int n) { return Util.Square(n); }\n    }\n}\n"}};
-    /* GREEN: Util.Square found by name-based resolver (class.method pattern). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S1/crossfile_call", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s1_crossfile_call"));
     PASS();
 }
 
@@ -1545,9 +2539,8 @@ TEST(lrp_csharp_s2_method_dispatch) {
          "namespace App {\n    class Runner {\n"
          "        public int Run() {\n            var c = new Counter();\n"
          "            c.Inc();\n            return c.Value();\n        }\n    }\n}\n"}};
-    /* RED: c.Inc() / c.Value() on Counter — without cs_lsp_cross the receiver
-     * type Counter is not tracked from new Counter() to the call site. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S2/method_dispatch", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s2_method_dispatch"));
     PASS();
 }
 
@@ -1560,13 +2553,7 @@ TEST(lrp_csharp_s3_constructor) {
         {"Factory.cs",
          "namespace App {\n    class Factory {\n"
          "        public Widget Make(string name) { return new Widget(name); }\n    }\n}\n"}};
-    /* REAL BUG: `new Widget(name)` yields NO CALLS edge (diagnostics: calls=0,
-     * DEFINES_METHOD=3 present).  ROOT CAUSE: cs_call_types (lang_specs.c) is
-     * {"invocation_expression"} only — it omits "object_creation_expression", so a
-     * C# `new T()` is never extracted as a call.  (All other C# scenarios
-     * S2/S4–S8 unexpectedly PASS, confirming C# resolution itself works; only the
-     * constructor extraction is missing.) */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S3/constructor", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s3_constructor"));
     PASS();
 }
 
@@ -1580,8 +2567,8 @@ TEST(lrp_csharp_s4_static_method) {
         {"App.cs",
          "namespace App {\n    class AppEntry {\n"
          "        public int Run(int n) { return MathHelper.Clamp(n, 0, 100); }\n    }\n}\n"}};
-    /* Uncertain: MathHelper.Clamp — name resolver may find "Clamp" if unique. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S4/static_method", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s4_static_method"));
     PASS();
 }
 
@@ -1596,8 +2583,7 @@ TEST(lrp_csharp_s5_chained) {
          "namespace App {\n    using System.Collections.Generic;\n"
          "    class Main {\n        public List<int> Run() {\n"
          "            return new Builder().Add(1).Add(2).Build();\n        }\n    }\n}\n"}};
-    /* RED: chained calls new Builder().Add(1).Add(2).Build() — type tracking needed. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S5/chained", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s5_chained"));
     PASS();
 }
 
@@ -1608,8 +2594,8 @@ TEST(lrp_csharp_s6_inherited_method) {
                     "        public virtual string Describe() { return \"base\"; }\n    }\n}\n"},
         {"Child.cs", "namespace App {\n    class Child : Base {\n"
                      "        public string Run() { return Describe(); }\n    }\n}\n"}};
-    /* Uncertain: Describe() in Child.Run() — name resolver may find it if unique. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S6/inherited_method", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s6_inherited_method"));
     PASS();
 }
 
@@ -1626,8 +2612,7 @@ TEST(lrp_csharp_s7_generic) {
                    "        public string Run() {\n"
                    "            var xs = new List<string> { \"hello\" };\n"
                    "            return Container.First(xs);\n        }\n    }\n}\n"}};
-    /* Uncertain: Container.First is a static generic method. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S7/generic", 0));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s7_generic"));
     PASS();
 }
 
@@ -1639,9 +2624,8 @@ TEST(lrp_csharp_s8_field_type_hint) {
         {"Service.cs", "namespace App {\n    class Service {\n"
                        "        private Logger logger = new Logger();\n"
                        "        public void Run(string msg) { logger.Log(msg); }\n    }\n}\n"}};
-    /* RED: logger.Log() — without cs_lsp_cross the receiver type Logger is not
-     * tracked from the field declaration. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "csharp/S8/field_type_hint", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_csharp_s8_field_type_hint"));
     PASS();
 }
 
@@ -1657,7 +2641,7 @@ TEST(lrp_php_s1_crossfile_call) {
     static const LRP_File f[] = {
         {"util.php", "<?php\nfunction triple($x) { return $x * 3; }\n"},
         {"main.php", "<?php\nrequire_once 'util.php';\nfunction run($n) { return triple($n); }\n"}};
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "php/S1/crossfile_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s1_crossfile_call"));
     PASS();
 }
 
@@ -1670,9 +2654,8 @@ TEST(lrp_php_s2_method_dispatch) {
                                  {"main.php", "<?php\nrequire_once 'Counter.php';\n"
                                               "function run() {\n    $c = new Counter();\n"
                                               "    $c->inc();\n    return $c->value();\n}\n"}};
-    /* GREEN: php_lsp_cross tracks $c = new Counter() → type Counter;
-     * resolves $c->inc() / $c->value(). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "php/S2/method_dispatch", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s2_method_dispatch"));
     PASS();
 }
 
@@ -1684,14 +2667,7 @@ TEST(lrp_php_s3_constructor) {
                        "    public function label() { return $this->name; }\n}\n"},
         {"factory.php", "<?php\nrequire_once 'Widget.php';\n"
                         "function make($name) { return new Widget($name); }\n"}};
-    /* REAL BUG: `new Widget($name)` yields NO CALLS edge (diagnostics: calls=0,
-     * DEFINES_METHOD=2 present).  ROOT CAUSE: php_call_types (lang_specs.c) is
-     * {member_call_expression, scoped_call_expression, function_call_expression,
-     * nullsafe_member_call_expression} — it omits "object_creation_expression",
-     * so a PHP `new T()` is never extracted as a call.  (php/S2 method-dispatch via
-     * `new Counter()` + $c->inc() passes because the METHOD calls resolve; only the
-     * constructor invocation itself is unmodeled.) */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "php/S3/constructor", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s3_constructor"));
     PASS();
 }
 
@@ -1702,8 +2678,7 @@ TEST(lrp_php_s4_static_method) {
          "<?php\nclass Config {\n    public static function version() { return '1.0'; }\n}\n"},
         {"app.php", "<?php\nrequire_once 'Config.php';\n"
                     "function run() { return Config::version(); }\n"}};
-    /* GREEN: Config::version() — php_lsp_cross resolves static method call. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "php/S4/static_method", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s4_static_method"));
     PASS();
 }
 
@@ -1715,9 +2690,7 @@ TEST(lrp_php_s5_chained) {
                         "    public function build() { return $this->items; }\n}\n"},
         {"main.php", "<?php\nrequire_once 'Builder.php';\n"
                      "function run() { return (new Builder())->add(1)->add(2)->build(); }\n"}};
-    /* GREEN: (new Builder())->add()->add()->build() — php_lsp_cross tracks
-     * self-returning methods (return $this). */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "php/S5/chained", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s5_chained"));
     PASS();
 }
 
@@ -1727,10 +2700,8 @@ TEST(lrp_php_s6_inherited_method) {
         {"Base.php", "<?php\nclass Base {\n    public function describe() { return 'base'; }\n}\n"},
         {"Child.php", "<?php\nrequire_once 'Base.php';\nclass Child extends Base {\n"
                       "    public function run() { return $this->describe(); }\n}\n"}};
-    /* Uncertain: $this->describe() in Child::run() — php_lsp_cross must see
-     * Child extends Base.  PHP extraction bug (base_classes not populated)
-     * may block this end-to-end.  Assert CALLS >= 1. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "php/S6/inherited_method", 0));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s6_inherited_method"));
     PASS();
 }
 
@@ -1748,9 +2719,7 @@ TEST(lrp_php_s7_interface_call) {
                         "    public function __construct(LoggerInterface $logger) {\n"
                         "        $this->logger = $logger;\n    }\n"
                         "    public function run($msg) { $this->logger->log($msg); }\n}\n"}};
-    /* GREEN: $this->logger is type-hinted as LoggerInterface; php_lsp_cross
-     * resolves $this->logger->log() to LoggerInterface::log. */
-    ASSERT_TRUE(lrp_assert_calls(f, 3, 1, "php/S7/interface_call", 1));
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s7_interface_call"));
     PASS();
 }
 
@@ -1765,9 +2734,8 @@ TEST(lrp_php_s8_field_type_hint) {
                          "        $this->mailer = $mailer;\n    }\n"
                          "    public function notify($to, $msg) {\n"
                          "        $this->mailer->send($to, $msg);\n    }\n}\n"}};
-    /* GREEN: $this->mailer is type-hinted as Mailer in constructor parameter;
-     * php_lsp_cross resolves $this->mailer->send() to Mailer::send. */
-    ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "php/S8/field_type_hint", 1));
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_php_s8_field_type_hint"));
     PASS();
 }
 
@@ -1783,13 +2751,8 @@ TEST(lrp_go_usage_struct_literal) {
     static const LRP_File f[] = {
         {"types.go", "package app\n\ntype Config struct{ Port int }\n"},
         {"main.go", "package app\n\nfunc Make() Config { return Config{Port: 8080} }\n"}};
-    LRP_Proj lp;
-    int n = lrp_usage(&lp, f, 2);
-    /* GREEN: USAGE edge from Make to Config type (struct literal). */
-    if (n < 1) {
-        fprintf(stderr, "  [LRP] go/USAGE/struct_literal n=%d expected>=1\n", n);
-    }
-    ASSERT_TRUE(n >= 1);
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_go_usage_struct_literal"));
     PASS();
 }
 
@@ -1799,11 +2762,7 @@ TEST(lrp_ts_usage_type_param) {
         {"types.ts", "export interface Config { timeout: number; }\n"},
         {"main.ts", "import { Config } from './types';\n\n"
                     "export function run(cfg: Config): number { return cfg.timeout; }\n"}};
-    LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, f, 2);
-    int exact = store ? lrp_exact_edge_by_name(store, lp.project, "USAGE", "run", "Config") : -1;
-    lrp_cleanup(&lp, store);
-    ASSERT_EQ(exact, 1);
+    ASSERT_TRUE(lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_ts_usage_type_param"));
     PASS();
 }
 
@@ -1816,14 +2775,17 @@ static int lrp_ts_imported_type_with_decoy(const char *main_filename) {
     };
     LRP_Proj lp;
     cbm_store_t *store = lrp_index(&lp, files, 3);
-    int exact = store ? lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE", "main.choose",
-                                                    "a.types.Config")
-                      : -1;
+    const char *scenario = !strcmp(main_filename, "main.tsx")
+                               ? "lrp_tsx_usage_import_type_with_decoy"
+                               : "lrp_ts_usage_import_type_with_decoy";
+    bool ok = lrp_check_oracle(store, lp.project, files, 3, scenario);
     int decoy = store ? lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE", "main.choose",
                                                     "b.types.Config")
                       : -1;
+    if (!ok || decoy != 0)
+        lrp_diag(store, lp.project, main_filename);
     lrp_cleanup(&lp, store);
-    return exact == 1 && decoy == 0;
+    return ok && decoy == 0;
 }
 
 /* A duplicate type name must not let unique-name fallback hide import identity. */
@@ -1842,11 +2804,8 @@ TEST(lrp_python_usage_instantiation) {
     static const LRP_File f[] = {
         {"model.py", "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py", "from .model import User\n\n\ndef create(name):\n    return User(name)\n"}};
-    LRP_Proj lp;
-    cbm_store_t *store = lrp_index(&lp, f, 2);
-    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
-    lrp_cleanup(&lp, store);
-    ASSERT_EQ(exact, 1);
+    ASSERT_TRUE(
+        lrp_assert_golden(f, (int)(sizeof(f) / sizeof(f[0])), "lrp_python_usage_instantiation"));
     PASS();
 }
 
@@ -1856,17 +2815,18 @@ TEST(lrp_python_usage_instantiation) {
 
 SUITE(lsp_resolution_probe) {
 
-    /* ── Go (lsp_cross WIRED) — all 8 scenarios GREEN ── */
+    /* Go source oracle probes. */
     RUN_TEST(lrp_go_s1_crossfile_call);
     RUN_TEST(lrp_go_s2_method_dispatch);
     RUN_TEST(lrp_go_s3_constructor);
     RUN_TEST(lrp_go_s4_static_call);
+    RUN_TEST(lrp_go_stdlib_import_does_not_bind_local_directory);
     RUN_TEST(lrp_go_s5_chained_call);
     RUN_TEST(lrp_go_s6_inherited_method);
     RUN_TEST(lrp_go_s7_generic_call);
     RUN_TEST(lrp_go_s8_field_type_hint);
 
-    /* ── C (lsp_cross WIRED) — S1/S3/S5–S8 GREEN, S2/S4/S7 uncertain ── */
+    /* C source oracle probes. */
     RUN_TEST(lrp_c_s1_crossfile_call);
     RUN_TEST(lrp_c_s2_funcptr_in_struct);
     RUN_TEST(lrp_c_s3_constructor);
@@ -1876,7 +2836,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_c_s7_generic_callback);
     RUN_TEST(lrp_c_s8_field_call);
 
-    /* ── C++ (lsp_cross WIRED) — GREEN expected; virtual/template uncertain ── */
+    /* C++ source oracle probes. */
     RUN_TEST(lrp_cpp_s1_crossfile_call);
     RUN_TEST(lrp_cpp_s2_method_dispatch);
     RUN_TEST(lrp_cpp_s3_constructor);
@@ -1886,7 +2846,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_cpp_s7_template);
     RUN_TEST(lrp_cpp_s8_field_call);
 
-    /* ── Rust (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
+    /* Rust source oracle probes. */
     RUN_TEST(lrp_rust_s1_crossfile_call);
     RUN_TEST(lrp_rust_s2_method_dispatch);
     RUN_TEST(lrp_rust_s3_constructor);
@@ -1897,8 +2857,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_rust_s8_field_call);
     RUN_TEST(lrp_rust_crossfile_macro_hidden_call_carrier);
 
-    /* ── Python (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 suppressed by the
-     * weak-member guard (#1276), asserted == 0 until py_lsp_cross inherits ── */
+    /* Python source oracle probes. */
     RUN_TEST(lrp_python_s1_crossfile_call);
     RUN_TEST(lrp_python_s2_method_dispatch);
     RUN_TEST(lrp_python_s3_constructor);
@@ -1910,7 +2869,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_python_s8_field_type_hint);
     RUN_TEST(lrp_python_crossfile_dunder_carrier);
 
-    /* ── TypeScript (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 uncertain ── */
+    /* TypeScript source oracle probes. */
     RUN_TEST(lrp_ts_s1_crossfile_call);
     RUN_TEST(lrp_ts_s2_method_dispatch);
     RUN_TEST(lrp_ts_s3_constructor);
@@ -1920,7 +2879,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_s7_generic);
     RUN_TEST(lrp_ts_s8_field_type_hint);
 
-    /* ── Java (lsp_cross NOT WIRED) — S1 GREEN, S2–S8 RED reproductions ── */
+    /* Java source oracle probes. */
     RUN_TEST(lrp_java_s1_crossfile_call);
     RUN_TEST(lrp_java_s2_method_dispatch);
     RUN_TEST(lrp_java_s3_constructor);
@@ -1930,7 +2889,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_java_s7_generic);
     RUN_TEST(lrp_java_s8_field_type_hint);
 
-    /* ── Kotlin (no cross-file LSP) — S1 GREEN, S2–S8 RED reproductions ── */
+    /* Kotlin source oracle probes. */
     RUN_TEST(lrp_kotlin_s1_crossfile_call);
     RUN_TEST(lrp_kotlin_s2_method_dispatch);
     RUN_TEST(lrp_kotlin_s3_constructor);
@@ -1940,8 +2899,8 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_kotlin_s7_generic);
     RUN_TEST(lrp_kotlin_s8_field_type_hint);
 
-    /* ── C# (lsp_cross NOT WIRED — but cbm_run_cs_lsp_cross EXISTS) ── */
-    /* S1 GREEN, S2–S8 RED reproductions */
+    /* C# source oracle probes. */
+    /* Per-occurrence required controls and audited quality gaps. */
     RUN_TEST(lrp_csharp_s1_crossfile_call);
     RUN_TEST(lrp_csharp_s2_method_dispatch);
     RUN_TEST(lrp_csharp_s3_constructor);
@@ -1951,7 +2910,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_csharp_s7_generic);
     RUN_TEST(lrp_csharp_s8_field_type_hint);
 
-    /* ── PHP (lsp_cross WIRED) — S1–S5 GREEN; S6 uncertain; S7,S8 GREEN ── */
+    /* PHP source oracle probes. */
     RUN_TEST(lrp_php_s1_crossfile_call);
     RUN_TEST(lrp_php_s2_method_dispatch);
     RUN_TEST(lrp_php_s3_constructor);

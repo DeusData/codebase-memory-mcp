@@ -26,6 +26,15 @@ typedef struct cbm_store cbm_store_t;
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record);
 const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *count);
 bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb);
+/* Begin/end bound memo lifetime to immutable source arenas (one file or merged
+ * worker buffer). Borrowed shared roots are sealed together before teardown. */
+bool cbm_gbuf_resolution_begin(cbm_gbuf_t *gb);
+void cbm_gbuf_resolution_end(cbm_gbuf_t *gb);
+bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb);
+bool cbm_gbuf_record_resolver_file(cbm_gbuf_t *gb, const cbm_resolve_file_t *file);
+const cbm_resolve_file_t *cbm_gbuf_resolver_files(const cbm_gbuf_t *gb, size_t *count);
+bool cbm_gbuf_record_resolver_summary(cbm_gbuf_t *gb, const cbm_resolve_summary_t *summary);
+const cbm_resolve_summary_t *cbm_gbuf_resolver_summaries(const cbm_gbuf_t *gb, size_t *count);
 
 /* ── Node / Edge structs (owned by the buffer) ───────────────────── */
 

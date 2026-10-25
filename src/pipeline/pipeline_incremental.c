@@ -3833,8 +3833,24 @@ static bool incr_doc_links_current(cbm_store_t *store, const char *project) {
     return current;
 }
 
+/* Rules can change independently of the semantic manifest or coverage version.
+ * Read only the project marker; counting every occurrence would make an unchanged
+ * repository's no-op proportional to the size of its resolver output. */
+static bool incr_resolver_current(cbm_store_t *store, const char *project) {
+    sqlite3_stmt *statement = NULL;
+    bool current =
+        sqlite3_prepare_v2(cbm_store_get_db(store),
+                           "SELECT rules_version FROM resolver_generations WHERE project=?", -1,
+                           &statement, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW &&
+        sqlite3_column_int(statement, 0) == CBM_RESOLVER_RULES_VERSION &&
+        sqlite3_step(statement) == SQLITE_DONE;
+    return sqlite3_finalize(statement) == SQLITE_OK && current;
+}
+
 /* The exact no-op test: the stored generation's metadata is current for this
- * mode, its doc-link layer is usable, and its recorded semantic manifest
+ * mode and resolver rules, its doc-link layer is usable, and its recorded semantic manifest
  * equals the baseline byte for byte. Read-only. The two out flags report the
  * halves the staged route also needs for its own routing. */
 static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
@@ -3846,7 +3862,8 @@ static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const c
     const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
     bool metadata_current =
         meta_rc == CBM_STORE_OK && meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
-        meta.hash_records_complete && meta.index_mode && strcmp(meta.index_mode, mode_name) == 0;
+        meta.hash_records_complete && meta.index_mode && strcmp(meta.index_mode, mode_name) == 0 &&
+        incr_resolver_current(store, project);
     /* A generation whose doc-link layer is missing or failed is not
      * current even with identical inputs: index_status tells the user to
      * re-run, and the re-run has to rebuild. */

@@ -5371,8 +5371,7 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
     if (!d->qualified_name || !d->short_name || !d->label) {
         return;
     }
-    if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
-        strcmp(d->label, "Enum") == 0 || strcmp(d->label, "Type") == 0) {
+    if (cbm_label_is_type_like(d->label)) {
         CBMRegisteredType rt;
         memset(&rt, 0, sizeof(rt));
         rt.qualified_name = d->qualified_name;
@@ -5432,20 +5431,57 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         rf.declaration_identity = d->declaration_identity;
         rf.graph_qualified_name = d->graph_qualified_name;
         rf.source_flags = d->source_flags;
+        rf.source_signature = d->source_signature;
+        rf.source_namespace = d->namespace_name;
+        rf.source_return_type = d->source_return_type;
         rf.sig = d->sig;
         /* receiver_type distinguishes a top-level fun (NULL) from a method
          * (set) — the sole-definer fallback only matches top-level funs. */
         rf.receiver_type = d->receiver_type;
         rf.signature = kt_cross_func_sig_with_return(arena, d);
         cbm_registry_add_func(reg, rf);
+        /* Storage QNs include the file in the default package. Language
+         * lookup uses the declared package, while the target/occurrence
+         * identity remains the original materialized declaration. */
+        if ((d->source_flags & CBM_SOURCE_DECL_TOP_LEVEL) && d->namespace_name &&
+            !d->receiver_type) {
+            const char *semantic = d->namespace_name[0]
+                                       ? kt_join_dot(arena, d->namespace_name, d->short_name)
+                                       : d->short_name;
+            if (semantic && strcmp(semantic, rf.qualified_name)) {
+                rf.graph_qualified_name =
+                    d->graph_qualified_name
+                        ? d->graph_qualified_name
+                        : cbm_arena_sprintf(arena, "%s%s", d->qualified_name, d->sig ? d->sig : "");
+                rf.qualified_name = semantic;
+                cbm_registry_add_func(reg, rf);
+            }
+        }
     } else if (strcmp(d->label, "Variable") == 0 || strcmp(d->label, "Constant") == 0) {
         /* A property can be a callable value. Retain it as an unknown
          * competitor so name lookup cannot silently skip that branch. */
         CBMRegisteredFunc blocker = {.qualified_name = d->qualified_name,
                                      .short_name = d->short_name,
                                      .receiver_type = d->receiver_type,
-                                     .min_params = -1};
+                                     .min_params = -1,
+                                     .flags = CBM_FUNC_FLAG_PROJECT_SOURCE,
+                                     .declaration_identity = d->declaration_identity,
+                                     .graph_qualified_name = d->graph_qualified_name,
+                                     .source_flags = d->source_flags,
+                                     .source_namespace = d->namespace_name};
         cbm_registry_add_func(reg, blocker);
+        if ((d->source_flags & CBM_SOURCE_DECL_TOP_LEVEL) && d->namespace_name &&
+            !d->receiver_type) {
+            const char *semantic = d->namespace_name[0]
+                                       ? kt_join_dot(arena, d->namespace_name, d->short_name)
+                                       : d->short_name;
+            if (semantic && strcmp(semantic, blocker.qualified_name)) {
+                blocker.graph_qualified_name =
+                    d->graph_qualified_name ? d->graph_qualified_name : d->qualified_name;
+                blocker.qualified_name = semantic;
+                cbm_registry_add_func(reg, blocker);
+            }
+        }
     }
 }
 

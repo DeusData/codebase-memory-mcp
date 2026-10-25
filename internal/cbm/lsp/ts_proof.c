@@ -1,3 +1,4 @@
+#include "proof_bridge.h"
 #include "ts_proof.h"
 #include "../helpers.h"
 #include "../resolve/policy.h"
@@ -142,7 +143,9 @@ static int binding_compare(const void *left, const void *right) {
 void cbm_ts_proof_prepare(TSLSPContext *ctx, TSNode root) {
     if (!ctx || !ctx->arena || ts_node_is_null(root))
         return;
+    cbm_resolve_proof_source_t source_context = ctx->proven_types.proof_source;
     cbm_resolve_types_init(&ctx->proven_types, ctx->arena, 0);
+    (void)cbm_lsp_proof_context(&ctx->proven_types, &source_context, ctx->module_qn);
     ctx->proof_audit = cbm_arena_calloc(ctx->arena, sizeof(*ctx->proof_audit));
     if (!ctx->proof_audit)
         return;
@@ -370,22 +373,21 @@ cbm_resolve_method_result_t cbm_ts_proof_method(TSLSPContext *ctx, TSNode receiv
     if (!observed || observed->kind != CBM_TYPE_NAMED || !observed->data.named.qualified_name ||
         strcmp(observed->data.named.qualified_name, owner->qualified_name) != 0)
         return missing;
-    cbm_resolve_result_t evidence = {
-        .binding = CBM_RESOLVE_BINDING_UNIQUE,
-        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
-        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                 CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-        .target = owner->qualified_name,
-        .candidate_count = 1,
-        .reason = "ts_source_declared_receiver"};
+    cbm_resolve_result_t evidence = cbm_lsp_proof_type_lookup(
+        &ctx->proven_types, binding, receiver, "typescript-source-receiver-type",
+        owner->qualified_name, owner->declaration_identity,
+        owner->graph_qualified_name ? owner->graph_qualified_name : owner->qualified_name,
+        owner->source_flags,
+        "complete-binding-audit;exact-annotation-or-constructor;observed-type-agrees");
     if (!cbm_resolve_types_observe(&ctx->proven_types, ctx->current_scope, binding, at, observed,
                                    CBM_RESOLVE_TYPE_OBSERVED_BINDING, &evidence))
         return missing;
     cbm_resolve_type_fact_t fact =
         cbm_resolve_types_lookup(&ctx->proven_types, ctx->current_scope, binding, at);
-    cbm_resolve_method_query_t query = {.registry = ctx->registry,
+    cbm_resolve_method_query_t query = {.proof_pool = &ctx->proven_types.proofs,
+                                        .proof_source = &ctx->proven_types.proof_source,
+                                        .lookup_domain = owner->qualified_name,
+                                        .registry = ctx->registry,
                                         .receiver = &fact,
                                         .receiver_qn = owner->qualified_name,
                                         .method_name = name,

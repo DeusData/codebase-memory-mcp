@@ -2,6 +2,7 @@
 #include "cbm.h"
 #include "lsp/go_lsp.h"
 #include "resolve/policy.h"
+#include "resolve/proof.h"
 
 static bool go_row_admitted(const CBMResolvedCall *row) {
     cbm_resolve_result_t proof = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
@@ -34,12 +35,26 @@ TEST(resolver_go_scoped_calls_and_callable_values_have_proof) {
     const char *source = "package main\nimport lib \"pkg/lib\"\n"
                          "func run() { work(); lib.Export(); sink(work); "
                          "alias := work; alias(); sink(alias) }\n";
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.work", .short_name = "work", .label = "Function"},
-        {.qualified_name = "test.main.sink", .short_name = "sink", .label = "Function"},
-        {.qualified_name = "pkg/lib.Export", .short_name = "Export", .label = "Function"},
-        {.qualified_name = "other.work", .short_name = "work", .label = "Function"},
-        {.qualified_name = "other.Export", .short_name = "Export", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
+                         .short_name = "work",
+                         .label = "Function",
+                         .declaration_identity = "scoped:1"},
+                        {.qualified_name = "test.main.sink",
+                         .short_name = "sink",
+                         .label = "Function",
+                         .declaration_identity = "scoped:2"},
+                        {.qualified_name = "pkg/lib.Export",
+                         .short_name = "Export",
+                         .label = "Function",
+                         .declaration_identity = "scoped:3"},
+                        {.qualified_name = "other.work",
+                         .short_name = "work",
+                         .label = "Function",
+                         .declaration_identity = "scoped:4"},
+                        {.qualified_name = "other.Export",
+                         .short_name = "Export",
+                         .label = "Function",
+                         .declaration_identity = "scoped:5"}};
     const char *names[] = {"lib"}, *qns[] = {"pkg/lib"};
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -56,9 +71,14 @@ TEST(resolver_go_scoped_calls_and_callable_values_have_proof) {
 }
 
 TEST(resolver_go_import_shadow_and_alias_conflict_abstain) {
-    CBMLSPDef defs[] = {
-        {.qualified_name = "pkg/one.Export", .short_name = "Export", .label = "Function"},
-        {.qualified_name = "pkg/two.Export", .short_name = "Export", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "pkg/one.Export",
+                         .short_name = "Export",
+                         .label = "Function",
+                         .declaration_identity = "imports:1"},
+                        {.qualified_name = "pkg/two.Export",
+                         .short_name = "Export",
+                         .label = "Function",
+                         .declaration_identity = "imports:2"}};
     const char *names[] = {"lib", "lib"}, *qns[] = {"pkg/one", "pkg/two"};
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -69,7 +89,12 @@ TEST(resolver_go_import_shadow_and_alias_conflict_abstain) {
              &conflict);
     int shadow_count = go_proven_count(&shadow, NULL);
     int conflict_count = go_proven_count(&conflict, NULL);
+    CBMResolvedCallArray control = {0};
+    go_cross(&arena, "package main\nimport lib \"pkg/one\"\nfunc run() { lib.Export() }\n", defs, 2,
+             names, qns, 1, &control);
+    int positive = go_proven_count(&control, "pkg/one.Export");
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(positive, 1);
     ASSERT_EQ(shadow_count, 0);
     ASSERT_EQ(conflict_count, 0);
     PASS();
@@ -78,25 +103,35 @@ TEST(resolver_go_import_shadow_and_alias_conflict_abstain) {
 TEST(resolver_go_declared_methods_keep_interface_declaration_target) {
     const char *source = "package main\nfunc run(c Conn, r Reader) { c.Query(); r.Read(); "
                          "sink(c.Query); bound := c.Query; bound() }\n";
-    CBMLSPDef defs[] = {{.qualified_name = "test.main.Conn", .short_name = "Conn", .label = "Type"},
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.Conn",
+                         .short_name = "Conn",
+                         .label = "Type",
+                         .declaration_identity = "methods:1"},
                         {.qualified_name = "test.main.Conn.Query",
                          .short_name = "Query",
                          .label = "Method",
-                         .receiver_type = "test.main.Conn"},
+                         .receiver_type = "test.main.Conn",
+                         .declaration_identity = "methods:2"},
                         {.qualified_name = "test.main.Reader",
                          .short_name = "Reader",
                          .label = "Interface",
                          .is_interface = true,
-                         .method_names_str = "Read"},
+                         .method_names_str = "Read",
+                         .declaration_identity = "methods:3"},
                         {.qualified_name = "test.main.Reader.Read",
                          .short_name = "Read",
                          .label = "Method",
-                         .receiver_type = "test.main.Reader"},
-                        {.qualified_name = "test.main.Impl", .short_name = "Impl", .label = "Type"},
+                         .receiver_type = "test.main.Reader",
+                         .declaration_identity = "methods:4"},
+                        {.qualified_name = "test.main.Impl",
+                         .short_name = "Impl",
+                         .label = "Type",
+                         .declaration_identity = "methods:5"},
                         {.qualified_name = "test.main.Impl.Read",
                          .short_name = "Read",
                          .label = "Method",
-                         .receiver_type = "test.main.Impl"}};
+                         .receiver_type = "test.main.Impl",
+                         .declaration_identity = "methods:6"}};
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
@@ -114,26 +149,42 @@ TEST(resolver_go_declared_methods_keep_interface_declaration_target) {
 TEST(resolver_go_promoted_or_unknown_receiver_does_not_guess) {
     const char *source =
         "package main\nfunc run(c C, unknown Missing) { c.Close(); unknown.Close() }\n";
-    CBMLSPDef defs[] = {{.qualified_name = "test.main.A", .short_name = "A", .label = "Type"},
-                        {.qualified_name = "test.main.B", .short_name = "B", .label = "Type"},
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.A",
+                         .short_name = "A",
+                         .label = "Type",
+                         .declaration_identity = "promoted:1"},
+                        {.qualified_name = "test.main.B",
+                         .short_name = "B",
+                         .label = "Type",
+                         .declaration_identity = "promoted:2"},
                         {.qualified_name = "test.main.C",
                          .short_name = "C",
                          .label = "Type",
-                         .embedded_types = "test.main.A|test.main.B"},
+                         .embedded_types = "test.main.A|test.main.B",
+                         .declaration_identity = "promoted:3"},
                         {.qualified_name = "test.main.A.Close",
                          .short_name = "Close",
                          .label = "Method",
-                         .receiver_type = "test.main.A"},
+                         .receiver_type = "test.main.A",
+                         .declaration_identity = "promoted:4"},
                         {.qualified_name = "test.main.B.Close",
                          .short_name = "Close",
                          .label = "Method",
-                         .receiver_type = "test.main.B"}};
+                         .receiver_type = "test.main.B",
+                         .declaration_identity = "promoted:5"}};
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 5, NULL, NULL, 0, &out);
     int count = go_proven_count(&out, NULL);
+    CBMResolvedCallArray control = {0};
+    go_cross(&arena, "package main\nfunc run(a A, b B) { a.Close(); b.Close() }\n", defs, 5, NULL,
+             NULL, 0, &control);
+    int direct_a = go_proven_count(&control, "test.main.A.Close");
+    int direct_b = go_proven_count(&control, "test.main.B.Close");
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(direct_a, 1);
+    ASSERT_EQ(direct_b, 1);
     ASSERT_EQ(count, 0);
     PASS();
 }
@@ -142,14 +193,23 @@ TEST(resolver_go_alias_reassignment_and_branch_join_clear_identity) {
     const char *source = "package main\nfunc run(dynamic func(), cond bool) { "
                          "alias := work; { alias = dynamic }; alias(); "
                          "other := work; if cond { other = dynamic }; other() }\n";
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.work", .short_name = "work", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
+                         .short_name = "work",
+                         .label = "Function",
+                         .declaration_identity = "alias:1"}};
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 1, NULL, NULL, 0, &out);
     int count = go_proven_count(&out, "test.main.work");
+    CBMResolvedCallArray control = {0};
+    go_cross(&arena,
+             "package main\nfunc run() { alias := work; alias(); "
+             "other := work; other() }\n",
+             defs, 1, NULL, NULL, 0, &control);
+    int positive = go_proven_count(&control, "test.main.work");
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(positive, 2);
     ASSERT_EQ(count, 0);
     PASS();
 }
@@ -162,7 +222,9 @@ TEST(resolver_go_fast_crossfile_requires_ast_binding_evidence) {
     CBMLSPDef def = {.qualified_name =
                          cbm_arena_sprintf(&result->arena, "%s.work", result->module_qn),
                      .short_name = "work",
-                     .label = "Function"};
+                     .label = "Function",
+                     .lang = CBM_LANG_GO,
+                     .declaration_identity = "fast-cross:work"};
     CBMTypeRegistry *reg = cbm_go_build_cross_registry(&result->arena, &def, 1);
     ASSERT_NOT_NULL(reg);
     CBMResolvedCall fake = {.caller_qn = "test.main.decoy",
@@ -187,6 +249,109 @@ TEST(resolver_go_fast_crossfile_requires_ast_binding_evidence) {
     PASS();
 }
 
+/* Only the metadata carrier is changed: every variant retains the same
+ * genuine AST capture and target, including its complete source snapshot. */
+TEST(resolver_go_fast_crossfile_rejects_pending_metadata_changes) {
+    const char *source = "package main\nfunc run() { work() }\n";
+    int admitted[4] = {0};
+    for (int mutation = 0; mutation < 4; mutation++) {
+        CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_GO, "test",
+                                                 "main.go", 0, NULL, NULL);
+        ASSERT_NOT_NULL(result);
+        CBMLSPDef def = {.qualified_name =
+                             cbm_arena_sprintf(&result->arena, "%s.work", result->module_qn),
+                         .short_name = "work",
+                         .label = "Function",
+                         .lang = CBM_LANG_GO,
+                         .declaration_identity = "pending-metadata:work"};
+        CBMTypeRegistry *reg = cbm_go_build_cross_registry(&result->arena, &def, 1);
+        ASSERT_NOT_NULL(reg);
+        CBMResolvedCall *pending = NULL;
+        int pending_count = 0;
+        for (int i = 0; i < result->resolved_calls.count; i++) {
+            CBMResolvedCall *row = &result->resolved_calls.items[i];
+            if (row->evidence.analysis == CBM_RESOLVE_ANALYSIS_LIMITED && row->callee_qn &&
+                !strcmp(row->callee_qn, def.qualified_name)) {
+                pending = row;
+                pending_count++;
+            }
+        }
+        ASSERT_EQ(pending_count, 1);
+        ASSERT_NOT_NULL(pending);
+        const cbm_resolve_proof_view_t *capture = cbm_resolve_proof_view(pending->evidence.proof);
+        ASSERT_NOT_NULL(capture);
+        ASSERT_EQ(capture->kind, CBM_PROOF_NAMED_JOIN);
+        ASSERT_EQ(capture->outcome.analysis, CBM_RESOLVE_ANALYSIS_COMPLETE);
+        ASSERT_EQ(pending->evidence.rule, CBM_RESOLVE_RULE_SCOPE_BINDING);
+        ASSERT_EQ(pending->evidence.facts,
+                  CBM_RESOLVE_FACT_SCOPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT);
+        if (mutation == 1)
+            pending->evidence.rule = CBM_RESOLVE_RULE_IMPORT_BINDING;
+        else if (mutation == 2)
+            pending->evidence.facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
+        else if (mutation == 3) {
+            pending->evidence.rule = CBM_RESOLVE_RULE_CALLABLE_BINDING;
+            pending->evidence.facts =
+                CBM_RESOLVE_FACT_CALLABLE_TYPED | CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
+        }
+        cbm_go_fast_resolve_qualified_calls(result, reg, NULL, NULL, 0);
+        admitted[mutation] = go_proven_count(&result->resolved_calls, def.qualified_name);
+        cbm_free_result(result);
+    }
+    ASSERT_EQ(admitted[0], 1);
+    ASSERT_EQ(admitted[1], 0);
+    ASSERT_EQ(admitted[2], 0);
+    ASSERT_EQ(admitted[3], 0);
+    PASS();
+}
+
+/* A pending method has complete receiver authority, but the registry has not
+ * supplied its declaration yet. Its capture must retain that distinct proof. */
+TEST(resolver_go_fast_crossfile_preserves_pending_receiver_proof) {
+    const char *source = "package main\ntype Conn struct{}\n"
+                         "func run(c Conn) { c.Query() }\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_GO, "test",
+                                             "main.go", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    const char *owner = cbm_arena_sprintf(&result->arena, "%s.Conn", result->module_qn);
+    const char *target = cbm_arena_sprintf(&result->arena, "%s.Query", owner);
+    CBMLSPDef defs[] = {{.qualified_name = owner,
+                         .short_name = "Conn",
+                         .label = "Type",
+                         .lang = CBM_LANG_GO,
+                         .declaration_identity = "pending-receiver:Conn"},
+                        {.qualified_name = target,
+                         .short_name = "Query",
+                         .label = "Method",
+                         .lang = CBM_LANG_GO,
+                         .receiver_type = owner,
+                         .declaration_identity = "pending-receiver:Query"}};
+    CBMTypeRegistry *reg = cbm_go_build_cross_registry(&result->arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    const CBMResolvedCall *pending = NULL;
+    int pending_count = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *row = &result->resolved_calls.items[i];
+        if (row->evidence.analysis == CBM_RESOLVE_ANALYSIS_LIMITED && row->callee_qn &&
+            !strcmp(row->callee_qn, target)) {
+            pending = row;
+            pending_count++;
+        }
+    }
+    ASSERT_EQ(pending_count, 1);
+    ASSERT_NOT_NULL(pending);
+    const cbm_resolve_proof_view_t *capture = cbm_resolve_proof_view(pending->evidence.proof);
+    ASSERT_NOT_NULL(capture);
+    ASSERT_EQ(pending->evidence.rule, CBM_RESOLVE_RULE_TYPE_MEMBER);
+    ASSERT_EQ(capture->outcome.rule, CBM_RESOLVE_RULE_DECLARED_TYPE);
+    ASSERT(capture->outcome.facts & CBM_RESOLVE_FACT_TYPE_BOUND);
+    cbm_go_fast_resolve_qualified_calls(result, reg, NULL, NULL, 0);
+    int admitted = go_proven_count(&result->resolved_calls, target);
+    cbm_free_result(result);
+    ASSERT_EQ(admitted, 1);
+    PASS();
+}
+
 TEST(resolver_go_duplicate_declarations_never_choose_first) {
     const char *source = "package main\nfunc run(c Conn) { work(); c.Query() }\n";
     CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
@@ -197,7 +362,10 @@ TEST(resolver_go_duplicate_declarations_never_choose_first) {
                          .short_name = "work",
                          .label = "Function",
                          .declaration_identity = "file2:work"},
-                        {.qualified_name = "test.main.Conn", .short_name = "Conn", .label = "Type"},
+                        {.qualified_name = "test.main.Conn",
+                         .short_name = "Conn",
+                         .label = "Type",
+                         .declaration_identity = "duplicates:1"},
                         {.qualified_name = "test.main.Conn.Query",
                          .short_name = "Query",
                          .label = "Method",
@@ -213,7 +381,14 @@ TEST(resolver_go_duplicate_declarations_never_choose_first) {
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 5, NULL, NULL, 0, &out);
     int count = go_proven_count(&out, NULL);
+    CBMLSPDef unique[] = {defs[0], defs[2], defs[3]};
+    CBMResolvedCallArray control = {0};
+    go_cross(&arena, source, unique, 3, NULL, NULL, 0, &control);
+    int unique_work = go_proven_count(&control, "test.main.work");
+    int unique_method = go_proven_count(&control, "test.main.Conn.Query");
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(unique_work, 1);
+    ASSERT_EQ(unique_method, 1);
     ASSERT_EQ(count, 0);
     PASS();
 }
@@ -231,30 +406,45 @@ TEST(resolver_go_duplicate_receiver_type_never_chooses_first) {
                         {.qualified_name = "test.main.Conn.Query",
                          .short_name = "Query",
                          .label = "Method",
-                         .receiver_type = "test.main.Conn"}};
+                         .receiver_type = "test.main.Conn",
+                         .declaration_identity = "receiver:1"}};
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 3, NULL, NULL, 0, &out);
     int count = go_proven_count(&out, NULL);
+    CBMLSPDef unique[] = {defs[0], defs[2]};
+    CBMResolvedCallArray control = {0};
+    go_cross(&arena, source, unique, 2, NULL, NULL, 0, &control);
+    int positive = go_proven_count(&control, "test.main.Conn.Query");
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(positive, 1);
     ASSERT_EQ(count, 0);
     PASS();
 }
 TEST(resolver_go_generic_type_parameter_never_binds_project_namesake) {
     const char *source =
         "package main\nfunc run[Conn interface{ Query() }](c Conn) { c.Query() }\n";
-    CBMLSPDef defs[] = {{.qualified_name = "test.main.Conn", .short_name = "Conn", .label = "Type"},
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.Conn",
+                         .short_name = "Conn",
+                         .label = "Type",
+                         .declaration_identity = "generic:1"},
                         {.qualified_name = "test.main.Conn.Query",
                          .short_name = "Query",
                          .label = "Method",
-                         .receiver_type = "test.main.Conn"}};
+                         .receiver_type = "test.main.Conn",
+                         .declaration_identity = "generic:2"}};
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 2, NULL, NULL, 0, &out);
     int count = go_proven_count(&out, "test.main.Conn.Query");
+    CBMResolvedCallArray control = {0};
+    go_cross(&arena, "package main\nfunc run(c Conn) { c.Query() }\n", defs, 2, NULL, NULL, 0,
+             &control);
+    int positive = go_proven_count(&control, "test.main.Conn.Query");
     cbm_arena_destroy(&arena);
+    ASSERT_EQ(positive, 1);
     ASSERT_EQ(count, 0);
     PASS();
 }
@@ -337,9 +527,14 @@ TEST(resolver_go_composite_value_leaves_require_exact_scope) {
         "package main\nfunc run(flag bool) { sink(map[bool]func(){true: work}[flag]) }\n",
         "package main\nfunc run(flag bool, work func()) { sink(map[bool]func(){true: work}[flag]) "
         "}\n"};
-    CBMLSPDef defs[] = {
-        {.qualified_name = "test.main.work", .short_name = "work", .label = "Function"},
-        {.qualified_name = "test.main.sink", .short_name = "sink", .label = "Function"}};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
+                         .short_name = "work",
+                         .label = "Function",
+                         .declaration_identity = "composite:1"},
+                        {.qualified_name = "test.main.sink",
+                         .short_name = "sink",
+                         .label = "Function",
+                         .declaration_identity = "composite:2"}};
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
         CBMArena arena;
         cbm_arena_init(&arena);
@@ -364,5 +559,7 @@ SUITE(resolver_go) {
     RUN_TEST(resolver_go_promoted_or_unknown_receiver_does_not_guess);
     RUN_TEST(resolver_go_alias_reassignment_and_branch_join_clear_identity);
     RUN_TEST(resolver_go_fast_crossfile_requires_ast_binding_evidence);
+    RUN_TEST(resolver_go_fast_crossfile_rejects_pending_metadata_changes);
+    RUN_TEST(resolver_go_fast_crossfile_preserves_pending_receiver_proof);
     RUN_TEST(resolver_go_duplicate_declarations_never_choose_first);
 }

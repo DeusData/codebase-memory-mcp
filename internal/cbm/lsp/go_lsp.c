@@ -1,3 +1,4 @@
+#include "proof_bridge.h"
 #include "go_lsp.h"
 #include "lsp_node_iter.h"
 #include "../../../src/foundation/hash_table.h"
@@ -51,6 +52,8 @@ void go_lsp_init(GoLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL); // root scope
     cbm_resolve_types_init(&ctx->proven_types, arena, 0);
+    (void)cbm_lsp_proof_standalone_context(&ctx->proven_types, source, source_len, package_qn,
+                                           CBM_SOURCE_ORIGIN_RAW);
 
     {
         const char *debug_env = getenv("CBM_LSP_DEBUG");
@@ -1129,16 +1132,14 @@ static const char *go_declared_type_qn(GoLSPContext *ctx, TSNode node) {
     return type ? type->qualified_name : NULL;
 }
 
-static cbm_resolve_result_t go_type_proof(const char *qn) {
-    return (cbm_resolve_result_t){
-        .binding = CBM_RESOLVE_BINDING_UNIQUE,
-        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
-        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                 CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-        .target = qn,
-        .candidate_count = 1};
+static cbm_resolve_result_t go_type_proof(GoLSPContext *ctx, const char *qn, TSNode site) {
+    const CBMRegisteredType *type = qn ? go_proven_type(ctx, qn) : NULL;
+    if (!type)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
+    return cbm_lsp_proof_type_lookup(&ctx->proven_types, lsp_node_text(ctx, site), site,
+                                     "go-package-type-domain", type->qualified_name,
+                                     type->declaration_identity, type->graph_qualified_name,
+                                     type->source_flags, "go-exact-package-type-lookup");
 }
 
 static void go_observe_declared_type(GoLSPContext *ctx, const char *name, const CBMType *type,
@@ -1147,7 +1148,7 @@ static void go_observe_declared_type(GoLSPContext *ctx, const char *name, const 
     const CBMType *base = go_named_base(type);
     if (!qn || !base || strcmp(qn, base->data.named.qualified_name))
         return;
-    cbm_resolve_result_t proof = go_type_proof(qn);
+    cbm_resolve_result_t proof = go_type_proof(ctx, qn, written_type);
     cbm_resolve_types_observe(&ctx->proven_types, ctx->current_scope, name, at, type,
                               CBM_RESOLVE_TYPE_ANNOTATION, &proof);
 }
@@ -1195,7 +1196,8 @@ static cbm_resolve_type_fact_t go_receiver_fact_inner(GoLSPContext *ctx, TSNode 
             cbm_resolve_type_fact_t fact = {.type = cbm_type_named(ctx->arena, qn),
                                             .status = CBM_RESOLVE_TYPE_KNOWN,
                                             .origin = CBM_RESOLVE_TYPE_CONSTRUCTOR,
-                                            .evidence = go_type_proof(qn)};
+                                            .proof_pool = &ctx->proven_types.proofs,
+                                            .evidence = go_type_proof(ctx, qn, written)};
             return fact;
         }
     }
@@ -1225,11 +1227,32 @@ static cbm_resolve_method_candidate_t go_classify_callable(const cbm_resolve_met
 }
 
 static cbm_resolve_result_t go_scoped_candidate(GoLSPContext *ctx, const char *qn,
-                                                cbm_resolve_rule_t rule, uint32_t facts) {
+                                                cbm_resolve_rule_t rule, uint32_t facts,
+                                                const cbm_resolve_proof_t *source_proof,
+                                                TSNode site) {
     cbm_resolve_evidence_t binding = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
                                       .rule = rule,
-                                      .facts = facts | CBM_RESOLVE_FACT_OCCURRENCE_EXACT};
+                                      .facts = facts | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+                                      .proof = source_proof};
+    if (!binding.proof) {
+        cbm_resolve_proof_key_t key = {
+            .lookup_domain = "go-source-name-binding",
+            .lookup_key = qn,
+            .binding_identity = qn,
+            .start_byte = ts_node_is_null(site) ? 0 : ts_node_start_byte(site),
+            .end_byte = ts_node_is_null(site) ? 0 : ts_node_end_byte(site),
+            .detail = "audited-scope-import-or-callable-binding"};
+        cbm_resolve_result_t audit = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                      .rule = rule,
+                                      .facts = binding.facts,
+                                      .reason = key.detail};
+        binding.proof = cbm_resolve_proof_leaf(&ctx->proven_types.proofs, CBM_PROOF_ADAPTER_DOMAIN,
+                                               &ctx->proven_types.proof_source, &key, &audit);
+    }
     cbm_resolve_function_query_t query = {
+        .proof_pool = &ctx->proven_types.proofs,
+        .proof_source = &ctx->proven_types.proof_source,
+        .lookup_domain = qn,
         .registry = ctx->registry,
         .function_qn = qn,
         .function_binding = binding,
@@ -1250,24 +1273,30 @@ static cbm_resolve_result_t go_scoped_candidate(GoLSPContext *ctx, const char *q
                                       .rule = rule,
                                       .facts = binding.facts,
                                       .target = qn,
-                                      .reason = "declaration_not_in_registry"};
+                                      .reason = "declaration_not_in_registry",
+                                      .proof = binding.proof};
     }
     return resolved.result;
 }
 
-static cbm_resolve_result_t go_bound_callable(GoLSPContext *ctx, const char *target) {
+static cbm_resolve_result_t go_bound_callable(GoLSPContext *ctx, const char *target, TSNode site) {
     const CBMRegisteredFunc *candidate = cbm_registry_lookup_func(ctx->registry, target);
     if (!candidate || !candidate->receiver_type)
         return go_scoped_candidate(ctx, target, CBM_RESOLVE_RULE_CALLABLE_BINDING,
-                                   CBM_RESOLVE_FACT_CALLABLE_TYPED);
+                                   CBM_RESOLVE_FACT_CALLABLE_TYPED, NULL, site);
     /* The binding was installed only from go_exact_callable_target. A bound
      * method value captures the selected declaration; it need not guess its
      * receiver again when copied or invoked through the alias. */
-    cbm_resolve_type_fact_t receiver = {.type =
-                                            cbm_type_named(ctx->arena, candidate->receiver_type),
-                                        .status = CBM_RESOLVE_TYPE_KNOWN,
-                                        .evidence = go_type_proof(candidate->receiver_type)};
-    cbm_resolve_method_query_t query = {.registry = ctx->registry,
+    cbm_resolve_type_fact_t receiver = {
+        .type = cbm_type_named(ctx->arena, candidate->receiver_type),
+        .status = CBM_RESOLVE_TYPE_KNOWN,
+        .origin = CBM_RESOLVE_TYPE_OBSERVED_BINDING,
+        .proof_pool = &ctx->proven_types.proofs,
+        .evidence = go_type_proof(ctx, candidate->receiver_type, site)};
+    cbm_resolve_method_query_t query = {.proof_pool = &ctx->proven_types.proofs,
+                                        .proof_source = &ctx->proven_types.proof_source,
+                                        .lookup_domain = candidate->receiver_type,
+                                        .registry = ctx->registry,
                                         .receiver = &receiver,
                                         .receiver_qn = candidate->receiver_type,
                                         .method_name = candidate->short_name,
@@ -1281,6 +1310,9 @@ static cbm_resolve_result_t go_bound_callable(GoLSPContext *ctx, const char *tar
     if (cbm_resolve_admit(&result)) {
         result.rule = CBM_RESOLVE_RULE_CALLABLE_BINDING;
         result.facts |= CBM_RESOLVE_FACT_CALLABLE_TYPED;
+        result = cbm_lsp_proof_rule(&ctx->proven_types, result, site, "go-lexical-callable-binding",
+                                    lsp_node_text(ctx, site),
+                                    "nearest-binding-retains-source-proven-method-identity", NULL);
     }
     return result;
 }
@@ -1298,11 +1330,11 @@ static cbm_resolve_result_t go_callable_proof(GoLSPContext *ctx, TSNode node) {
             return none;
         const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
         if (binding) {
-            return binding->callable_qn ? go_bound_callable(ctx, binding->callable_qn) : none;
+            return binding->callable_qn ? go_bound_callable(ctx, binding->callable_qn, node) : none;
         }
         const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, name);
         return go_scoped_candidate(ctx, qn, CBM_RESOLVE_RULE_SCOPE_BINDING,
-                                   CBM_RESOLVE_FACT_SCOPE_BOUND);
+                                   CBM_RESOLVE_FACT_SCOPE_BOUND, NULL, node);
     }
     if (strcmp(kind, "selector_expression"))
         return none;
@@ -1320,7 +1352,7 @@ static cbm_resolve_result_t go_callable_proof(GoLSPContext *ctx, TSNode node) {
                 return none;
             return go_scoped_candidate(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", package, member),
                                        CBM_RESOLVE_RULE_IMPORT_BINDING,
-                                       CBM_RESOLVE_FACT_IMPORT_BOUND);
+                                       CBM_RESOLVE_FACT_IMPORT_BOUND, NULL, node);
         }
     }
     cbm_resolve_type_fact_t fact = go_receiver_fact(ctx, operand);
@@ -1345,9 +1377,13 @@ static cbm_resolve_result_t go_callable_proof(GoLSPContext *ctx, TSNode node) {
             .rule = CBM_RESOLVE_RULE_TYPE_MEMBER,
             .facts = CBM_RESOLVE_FACT_RECEIVER_TYPED | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
             .target = cbm_arena_sprintf(ctx->arena, "%s.%s", owner, member),
-            .reason = "method_not_found"};
+            .reason = "method_not_found",
+            .proof = fact.evidence.proof};
     }
-    cbm_resolve_method_query_t query = {.registry = ctx->registry,
+    cbm_resolve_method_query_t query = {.proof_pool = &ctx->proven_types.proofs,
+                                        .proof_source = &ctx->proven_types.proof_source,
+                                        .lookup_domain = owner,
+                                        .registry = ctx->registry,
                                         .receiver = &fact,
                                         .receiver_qn = owner,
                                         .method_name = member,
@@ -1371,9 +1407,15 @@ static cbm_resolve_type_fact_t go_return_fact(GoLSPContext *ctx, TSNode node) {
     const char *base =
         cbm_arena_strndup(ctx->arena, call.target, cbm_qn_callable_base_len(call.target));
     cbm_resolve_function_query_t query = {
+        .proof_pool = &ctx->proven_types.proofs,
+        .proof_source = &ctx->proven_types.proof_source,
+        .lookup_domain = base,
         .registry = ctx->registry,
         .function_qn = base,
-        .function_binding = {call.analysis, call.rule, call.facts},
+        .function_binding = {.analysis = call.analysis,
+                             .rule = call.rule,
+                             .facts = call.facts,
+                             .proof = call.proof},
         .argument_count = -1,
         .adapter_facts = CBM_RESOLVE_METHOD_DIRECT_DOMAIN_COMPLETE |
                          CBM_RESOLVE_METHOD_OCCURRENCE_EXACT | CBM_RESOLVE_METHOD_NAME_IDENTITY,
@@ -1389,10 +1431,16 @@ static cbm_resolve_type_fact_t go_return_fact(GoLSPContext *ctx, TSNode node) {
         type ? go_proven_type(ctx, type->data.named.qualified_name) : NULL;
     if (!declaration || declaration->alias_of)
         return unknown;
-    return (cbm_resolve_type_fact_t){.type = type,
-                                     .status = CBM_RESOLVE_TYPE_KNOWN,
-                                     .origin = CBM_RESOLVE_TYPE_RETURN,
-                                     .evidence = go_type_proof(declaration->qualified_name)};
+    cbm_resolve_result_t returned = go_type_proof(ctx, declaration->qualified_name, node);
+    returned = cbm_lsp_proof_rule(
+        &ctx->proven_types, returned, node, "go-source-return-type", function->declaration_identity,
+        "unique-callable;source-return-annotation;exact-package-type", selected.result.proof);
+    return (cbm_resolve_type_fact_t){
+        .type = type,
+        .status = cbm_resolve_admit(&returned) ? CBM_RESOLVE_TYPE_KNOWN : CBM_RESOLVE_TYPE_UNKNOWN,
+        .origin = CBM_RESOLVE_TYPE_RETURN,
+        .proof_pool = &ctx->proven_types.proofs,
+        .evidence = returned};
 }
 
 /* Resolve only source forms that prove one callable identity.  This is
@@ -1717,12 +1765,169 @@ static void go_emit_resolved_kind(GoLSPContext *ctx, const char *callee_qn, cons
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
+/* Match the extraction carrier's bounded selector-chain normalization while
+ * preserving the complete call-expression span as the occurrence identity. */
+static const char *go_occurrence_call_spelling(GoLSPContext *ctx, TSNode call) {
+    TSNode function = ts_node_child_by_field_name(call, "function", 8);
+    if (ts_node_is_null(function))
+        return NULL;
+    if (strcmp(ts_node_type(function), "selector_expression"))
+        return lsp_node_text(ctx, function);
+    TSNode operand = ts_node_child_by_field_name(function, "operand", 7);
+    TSNode field = ts_node_child_by_field_name(function, "field", 5);
+    if (ts_node_is_null(operand) || ts_node_is_null(field) ||
+        strcmp(ts_node_type(operand), "call_expression"))
+        return lsp_node_text(ctx, function);
+    const char *method = lsp_node_text(ctx, field);
+    for (int depth = 0; depth < 4; depth++) {
+        TSNode inner = ts_node_child_by_field_name(operand, "function", 8);
+        if (ts_node_is_null(inner))
+            break;
+        if (!strcmp(ts_node_type(inner), "selector_expression")) {
+            TSNode next = ts_node_child_by_field_name(inner, "operand", 7);
+            if (!ts_node_is_null(next) && !strcmp(ts_node_type(next), "call_expression")) {
+                operand = next;
+                continue;
+            }
+        }
+        const char *base = lsp_node_text(ctx, inner);
+        return base && method ? cbm_arena_sprintf(ctx->arena, "%s.%s", base, method) : method;
+    }
+    return method;
+}
+
+/* A pending target is not a complete semantic result. Capture only its
+ * already-proven source/receiver facts and the actual AST occurrence so the
+ * metadata-only pass can later combine them with an independently resolved
+ * declaration. The row itself remains LIMITED. */
+static const cbm_resolve_proof_t *go_pending_occurrence(GoLSPContext *ctx,
+                                                        const cbm_resolve_result_t *candidate,
+                                                        TSNode site, const char *spelling,
+                                                        const char *relation) {
+    const cbm_resolve_proof_view_t *prior = cbm_resolve_proof_view(candidate->proof);
+    if (!prior || prior->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+        !prior->predecessors_closed || !candidate->target || !spelling || !spelling[0] ||
+        !ctx->enclosing_func_qn || ts_node_is_null(site))
+        return NULL;
+    cbm_resolve_proof_source_t source = ctx->proven_types.proof_source;
+    source.scope = ctx->enclosing_func_qn;
+    cbm_resolve_proof_key_t key = {.lookup_domain = source.scope,
+                                   .lookup_key = spelling,
+                                   .binding_identity = candidate->target,
+                                   .start_byte = ts_node_start_byte(site),
+                                   .end_byte = ts_node_end_byte(site),
+                                   .origin = source.source_origin,
+                                   .flags = candidate->facts,
+                                   .detail = relation};
+    /* Retain the producer's pending metadata separately from the reusable
+     * semantic root: a method candidate carries a declared receiver proof,
+     * whose rule and facts intentionally differ from the pending call. */
+    cbm_resolve_result_t audit = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                  .rule = candidate->rule,
+                                  .facts = CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+                                  .reason = "go_pending_ast_occurrence"};
+    const cbm_resolve_proof_t *premises[] = {
+        candidate->proof, cbm_resolve_proof_leaf(&ctx->proven_types.proofs, CBM_PROOF_SOURCE_FACT,
+                                                 &source, &key, &audit)};
+    return cbm_resolve_proof_derive(&ctx->proven_types.proofs, CBM_PROOF_NAMED_JOIN, &source, &key,
+                                    &prior->outcome, premises, 2, true);
+}
+
+static bool go_occurrence_source_equal(const cbm_resolve_proof_source_t *a,
+                                       const cbm_resolve_proof_source_t *b) {
+    const char *left[] = {
+        a->project, a->file, a->module, a->scope, a->content_identity, a->configuration_identity};
+    const char *right[] = {
+        b->project, b->file, b->module, b->scope, b->content_identity, b->configuration_identity};
+    for (size_t i = 0; i < sizeof(left) / sizeof(left[0]); i++)
+        if ((left[i] == NULL) != (right[i] == NULL) || (left[i] && strcmp(left[i], right[i])))
+            return false;
+    return a->source_origin == b->source_origin;
+}
+
+/* Both coordinates and roles must come from the earlier AST capture. A legacy
+ * row's numeric span or strategy is never sufficient occurrence authority. */
+static const cbm_resolve_proof_view_t *go_pending_site(const CBMResolvedCall *row) {
+    const cbm_resolve_proof_view_t *capture = cbm_resolve_proof_view(row->evidence.proof);
+    if (!capture || capture->kind != CBM_PROOF_NAMED_JOIN || !capture->predecessors_closed ||
+        capture->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || capture->premise_count != 2 ||
+        !capture->source.scope || !capture->key.lookup_domain || !capture->key.lookup_key ||
+        !capture->key.lookup_key[0] || !capture->key.binding_identity || !capture->key.detail ||
+        strcmp(capture->source.scope, row->caller_qn) ||
+        strcmp(capture->key.lookup_domain, row->caller_qn) ||
+        strcmp(capture->key.binding_identity, row->callee_qn) ||
+        capture->key.start_byte != row->site_start_byte ||
+        capture->key.end_byte != row->site_end_byte ||
+        capture->key.origin != (uint32_t)row->source_origin ||
+        capture->key.flags != row->evidence.facts)
+        return NULL;
+    const char *relation = row->kind == CBM_RESOLVED_INVOCATION ? "CALLS" : "CALL_REFERENCE";
+    if (strcmp(capture->key.detail, relation) &&
+        !(row->kind == CBM_RESOLVED_CALL_REFERENCE && !strcmp(capture->key.detail, "USAGE")))
+        return NULL;
+    /* Premises are structurally sorted, so locate the captured AST leaf. */
+    for (size_t i = 0; i < capture->premise_count; i++) {
+        const cbm_resolve_proof_view_t *leaf = cbm_resolve_proof_view(capture->premises[i]);
+        if (leaf && leaf->kind == CBM_PROOF_SOURCE_FACT && leaf->outcome.reason &&
+            !strcmp(leaf->outcome.reason, "go_pending_ast_occurrence") &&
+            leaf->outcome.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE &&
+            leaf->outcome.rule == row->evidence.rule &&
+            (leaf->outcome.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT) &&
+            go_occurrence_source_equal(&leaf->source, &capture->source) &&
+            leaf->key.binding_identity &&
+            !strcmp(leaf->key.binding_identity, capture->key.binding_identity) &&
+            leaf->key.lookup_domain &&
+            !strcmp(leaf->key.lookup_domain, capture->key.lookup_domain) && leaf->key.lookup_key &&
+            !strcmp(leaf->key.lookup_key, capture->key.lookup_key) && leaf->key.detail &&
+            !strcmp(leaf->key.detail, capture->key.detail) &&
+            leaf->key.start_byte == capture->key.start_byte &&
+            leaf->key.end_byte == capture->key.end_byte &&
+            leaf->key.origin == capture->key.origin && leaf->key.flags == capture->key.flags)
+            return capture;
+    }
+    return NULL;
+}
+
 static bool go_emit_proven(GoLSPContext *ctx, const cbm_resolve_result_t *proof,
                            const char *source_name, CBMResolvedKind kind, TSNode site) {
     bool accepted = cbm_resolve_admit(proof);
     if (!proof->target || (!accepted && proof->analysis != CBM_RESOLVE_ANALYSIS_LIMITED) ||
         !ctx->resolved_calls || !ctx->enclosing_func_qn || ts_node_is_null(site))
         return false;
+    const char *relation = kind == CBM_RESOLVED_INVOCATION ? "CALLS" : "CALL_REFERENCE";
+    if (kind == CBM_RESOLVED_CALL_REFERENCE) {
+        TSNode parent = ts_node_parent(site);
+        const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+        if (!strcmp(parent_kind, "literal_element") || !strcmp(parent_kind, "keyed_element") ||
+            !strcmp(parent_kind, "binary_expression") || !strcmp(parent_kind, "unary_expression"))
+            relation = "USAGE";
+    }
+    if (kind == CBM_RESOLVED_INVOCATION) {
+        source_name = go_occurrence_call_spelling(ctx, site);
+    } else if (kind == CBM_RESOLVED_CALL_REFERENCE) {
+        for (int depth = 0; depth < 32 && !strcmp(ts_node_type(site), "parenthesized_expression") &&
+                            ts_node_named_child_count(site) == 1;
+             depth++)
+            site = ts_node_named_child(site, 0);
+        if (!strcmp(ts_node_type(site), "selector_expression")) {
+            TSNode leaf = ts_node_child_by_field_name(site, "field", 5);
+            if (!ts_node_is_null(leaf))
+                site = leaf;
+        }
+        source_name = lsp_node_text(ctx, site);
+    }
+    cbm_resolve_result_t occurrence = *proof;
+    if (accepted) {
+        occurrence = cbm_lsp_proof_occurrence(&ctx->proven_types, occurrence, site,
+                                              ctx->enclosing_func_qn, source_name, relation);
+        if (!cbm_resolve_admit(&occurrence))
+            return false;
+    } else {
+        occurrence.proof = go_pending_occurrence(ctx, proof, site, source_name, relation);
+        if (!occurrence.proof)
+            return false;
+    }
+    proof = &occurrence;
     const char *strategy = proof->rule == CBM_RESOLVE_RULE_TYPE_MEMBER        ? "lsp_type_dispatch"
                            : proof->rule == CBM_RESOLVE_RULE_CALLABLE_BINDING ? "lsp_callable_alias"
                                                                               : "lsp_direct";
@@ -1734,17 +1939,19 @@ static bool go_emit_proven(GoLSPContext *ctx, const cbm_resolve_result_t *proof,
                  : proof->rule == CBM_RESOLVE_RULE_IMPORT_BINDING ? "symbol_not_in_registry"
                                                                   : "function_not_in_registry";
     }
-    CBMResolvedCall row = {
-        .caller_qn = ctx->enclosing_func_qn,
-        .callee_qn = proof->target,
-        .strategy = accepted ? strategy : "lsp_unresolved",
-        .confidence = accepted ? 0.97f : 0.0f,
-        .reason = reason,
-        .kind = kind,
-        .site_start_byte = ts_node_start_byte(site),
-        .site_end_byte = ts_node_end_byte(site),
-        .source_origin = CBM_SOURCE_ORIGIN_RAW,
-        .evidence = {.analysis = proof->analysis, .rule = proof->rule, .facts = proof->facts}};
+    CBMResolvedCall row = {.caller_qn = ctx->enclosing_func_qn,
+                           .callee_qn = proof->target,
+                           .strategy = accepted ? strategy : "lsp_unresolved",
+                           .confidence = accepted ? 0.97f : 0.0f,
+                           .reason = reason,
+                           .kind = kind,
+                           .site_start_byte = ts_node_start_byte(site),
+                           .site_end_byte = ts_node_end_byte(site),
+                           .source_origin = CBM_SOURCE_ORIGIN_RAW,
+                           .evidence = {.analysis = proof->analysis,
+                                        .rule = proof->rule,
+                                        .facts = proof->facts,
+                                        .proof = proof->proof}};
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, row);
     return true;
 }
@@ -1865,6 +2072,22 @@ static void go_invalidate_control_flow_aliases(GoLSPContext *ctx, TSNode node, i
     for (uint32_t i = 0; i < count; i++) {
         go_invalidate_control_flow_aliases(ctx, ts_node_named_child(node, i), depth + 1);
     }
+}
+
+/* The generated external registry records interface membership explicitly,
+ * although it omits separate function rows for those signatures. This exact
+ * member list supports a declaration diagnostic; it does not establish project
+ * source or runtime implementation identity and carries no emission proof. */
+static const char *go_external_interface_member(GoLSPContext *ctx, const char *interface_qn,
+                                                const char *member) {
+    const CBMRegisteredType *type =
+        interface_qn ? cbm_registry_lookup_type(ctx->registry, interface_qn) : NULL;
+    if (!type || type->project_source || !type->is_interface || !type->method_names || !member)
+        return NULL;
+    for (size_t i = 0; type->method_names[i]; i++)
+        if (!strcmp(type->method_names[i], member))
+            return cbm_arena_sprintf(ctx->arena, "%s.%s", type->qualified_name, member);
+    return NULL;
 }
 
 // --- Walk call expressions and resolve them ---
@@ -2009,9 +2232,16 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
                                     iface_qn ? cbm_registry_lookup_method(ctx->registry, iface_qn,
                                                                           field_name)
                                              : NULL;
+                                const char *external =
+                                    method
+                                        ? NULL
+                                        : go_external_interface_member(ctx, iface_qn, field_name);
                                 if (method)
                                     emit_resolved_call(ctx, method->qualified_name,
                                                        "lsp_interface_dispatch", 0.95f, node);
+                                else if (external)
+                                    emit_resolved_call(ctx, external, "lsp_interface_dispatch",
+                                                       0.95f, node);
                                 else
                                     emit_unresolved_call(ctx, field_name,
                                                          "interface_declaration_not_found", node);
@@ -2732,6 +2962,10 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->name;
+            /* Preserve the same source declaration identity used for types.
+             * A QN alone is not a declaration witness for the shared resolver. */
+            rf.declaration_identity = cbm_arena_sprintf(
+                arena, "%s:%d", d->file_path ? d->file_path : result->module_qn, i);
             const char *return_key = cbm_arena_sprintf(arena, "%u:%s", d->start_line, d->name);
             if (!strcmp(d->label, "Function") && return_facts && return_key)
                 rf.source_return_type = cbm_ht_get(return_facts, return_key);
@@ -3042,6 +3276,9 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     // Phase 2: Build LSP context and run
     GoLSPContext lsp_ctx;
     go_lsp_init(&lsp_ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(result, CBM_SOURCE_ORIGIN_RAW, module_qn);
+    (void)cbm_lsp_proof_context(&lsp_ctx.proven_types, &proof_source, module_qn);
 
     // Add imports
     for (int i = 0; i < result->imports.count; i++) {
@@ -3644,6 +3881,17 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           const char *module_qn, CBMLSPDef *defs, int def_count,
                           const char **import_names, const char **import_qns, int import_count,
                           TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_go_lsp_cross_with_source(arena, source, source_len, module_qn, defs, def_count,
+                                     import_names, import_qns, import_count, cached_tree, out,
+                                     NULL);
+}
+
+void cbm_run_go_lsp_cross_with_source(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, CBMLSPDef *defs, int def_count,
+                                      const char **import_names, const char **import_qns,
+                                      int import_count, TSTree *cached_tree,
+                                      CBMResolvedCallArray *out,
+                                      const cbm_resolve_proof_source_t *source_context) {
     if (!source || source_len <= 0)
         return;
 
@@ -3914,6 +4162,8 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
     // 4. Build LSP context and run
     GoLSPContext ctx;
     go_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
+    if (source_context)
+        (void)cbm_lsp_proof_context(&ctx.proven_types, source_context, module_qn);
 
     for (int i = 0; i < import_count; i++) {
         if (import_names[i] && import_qns[i]) {
@@ -4067,6 +4317,16 @@ void cbm_run_go_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         const char **import_names, const char **import_qns,
                                         int import_count, TSTree *cached_tree,
                                         CBMResolvedCallArray *out) {
+    cbm_run_go_lsp_cross_with_registry_with_source(arena, source, source_len, module_qn, reg,
+                                                   import_names, import_qns, import_count,
+                                                   cached_tree, out, NULL);
+}
+
+void cbm_run_go_lsp_cross_with_registry_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    CBMTypeRegistry *reg, const char **import_names, const char **import_qns, int import_count,
+    TSTree *cached_tree, CBMResolvedCallArray *out,
+    const cbm_resolve_proof_source_t *source_context) {
     if (!source || source_len <= 0 || !reg)
         return;
 
@@ -4092,6 +4352,8 @@ void cbm_run_go_lsp_cross_with_registry(CBMArena *arena, const char *source, int
 
     GoLSPContext ctx;
     go_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
+    if (source_context)
+        (void)cbm_lsp_proof_context(&ctx.proven_types, source_context, module_qn);
     for (int i = 0; i < import_count; i++) {
         if (import_names[i] && import_qns[i]) {
             go_lsp_add_import(&ctx, import_names[i], import_qns[i]);
@@ -4118,13 +4380,20 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
     if (!result || !reg)
         return 0;
     GoLSPContext ctx = {.arena = &result->arena, .registry = reg, .package_qn = result->module_qn};
+    cbm_resolve_types_init(&ctx.proven_types, &result->arena, 0);
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(result, CBM_SOURCE_ORIGIN_RAW, result->module_qn);
+    (void)cbm_lsp_proof_context(&ctx.proven_types, &proof_source, result->module_qn);
     int initial_count = result->resolved_calls.count;
     for (int i = 0; i < initial_count; i++) {
         CBMResolvedCall source = result->resolved_calls.items[i];
         if (!source.callee_qn || !source.caller_qn ||
             source.site_start_byte >= source.site_end_byte ||
             source.evidence.analysis != CBM_RESOLVE_ANALYSIS_LIMITED ||
-            !(source.evidence.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT))
+            !(source.evidence.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT) || !source.evidence.proof)
+            continue;
+        const cbm_resolve_proof_view_t *occurrence = go_pending_site(&source);
+        if (!occurrence)
             continue;
         cbm_resolve_result_t proof = {0};
         if (source.evidence.rule == CBM_RESOLVE_RULE_TYPE_MEMBER &&
@@ -4136,11 +4405,21 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
                                                   (size_t)(dot - source.callee_qn));
             if (!owner || !cbm_registry_lookup_type(reg, owner))
                 continue;
+            const cbm_resolve_proof_view_t *prior = cbm_resolve_proof_view(source.evidence.proof);
+            if (!prior || !cbm_resolve_admit(&prior->outcome) ||
+                !(prior->outcome.facts & CBM_RESOLVE_FACT_TYPE_BOUND) || !prior->outcome.target ||
+                strcmp(prior->outcome.target, owner))
+                continue;
             cbm_resolve_type_fact_t receiver = {.type = cbm_type_named(&result->arena, owner),
                                                 .status = CBM_RESOLVE_TYPE_KNOWN,
                                                 .origin = CBM_RESOLVE_TYPE_OBSERVED_BINDING,
-                                                .evidence = go_type_proof(owner)};
-            cbm_resolve_method_query_t query = {.registry = reg,
+                                                .proof_pool = &ctx.proven_types.proofs,
+                                                .evidence = prior->outcome};
+            receiver.evidence.proof = source.evidence.proof;
+            cbm_resolve_method_query_t query = {.proof_pool = &ctx.proven_types.proofs,
+                                                .proof_source = &ctx.proven_types.proof_source,
+                                                .lookup_domain = owner,
+                                                .registry = reg,
                                                 .receiver = &receiver,
                                                 .receiver_qn = owner,
                                                 .method_name = dot + 1,
@@ -4159,15 +4438,27 @@ int cbm_go_fast_resolve_qualified_calls(CBMFileResult *result, CBMTypeRegistry *
                    (source.evidence.rule == CBM_RESOLVE_RULE_CALLABLE_BINDING &&
                     (source.evidence.facts & CBM_RESOLVE_FACT_CALLABLE_TYPED))) {
             proof = go_scoped_candidate(&ctx, source.callee_qn, source.evidence.rule,
-                                        source.evidence.facts);
+                                        source.evidence.facts, source.evidence.proof, (TSNode){0});
         }
         if (!cbm_resolve_admit(&proof))
+            continue;
+        /* Reuse the source producer's occurrence, never manufacture a new one
+         * from the metadata row. Target identity comes from the fresh lookup. */
+        cbm_resolve_proof_key_t key = occurrence->key;
+        key.binding_identity = proof.target;
+        const cbm_resolve_proof_t *premises[] = {proof.proof, source.evidence.proof};
+        proof.proof =
+            cbm_resolve_proof_derive(&ctx.proven_types.proofs, CBM_PROOF_NAMED_JOIN,
+                                     &occurrence->source, &key, &proof, premises, 2, true);
+        const cbm_resolve_proof_view_t *completed = cbm_resolve_proof_view(proof.proof);
+        if (!completed || completed->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+            !cbm_resolve_admit(&completed->outcome))
             continue;
         source.callee_qn = proof.target;
         source.strategy = "lsp_strategy_cross_file";
         source.confidence = 0.97f;
-        source.reason = NULL;
-        source.evidence = (cbm_resolve_evidence_t){proof.analysis, proof.rule, proof.facts};
+        source.reason = occurrence->key.lookup_key;
+        source.evidence = cbm_lsp_proof_evidence(proof);
         cbm_resolvedcall_push(&result->resolved_calls, &result->arena, source);
     }
     return 0;
@@ -4191,6 +4482,8 @@ void cbm_batch_go_lsp_cross(CBMArena *arena, CBMBatchGoLSPFile *files, int file_
         CBMArena file_arena;
         cbm_arena_init(&file_arena);
 
+        cbm_resolve_proof_pool_t copied_proofs;
+        cbm_resolve_proof_pool_init(&copied_proofs, arena, 0, 0, 0);
         CBMResolvedCallArray file_out;
         memset(&file_out, 0, sizeof(file_out));
 
@@ -4217,7 +4510,7 @@ void cbm_batch_go_lsp_cross(CBMArena *arena, CBMBatchGoLSPFile *files, int file_
                 dst->site_start_byte = src->site_start_byte;
                 dst->site_end_byte = src->site_end_byte;
                 dst->source_origin = src->source_origin;
-                dst->evidence = src->evidence;
+                dst->evidence = cbm_lsp_proof_copy(&copied_proofs, src->evidence);
             }
         }
 

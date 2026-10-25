@@ -71,6 +71,12 @@ typedef struct cbm_resolve_method_query {
     uint64_t work_limit; /* zero selects a finite default */
     cbm_resolve_method_classify_fn classify;
     void *context;
+    /* Per-analysis arena, never a shared registry arena. Method queries may
+     * use receiver->proof_pool when this is NULL. Immutable standalone
+     * receiver/function facts must provide a pool explicitly. */
+    cbm_resolve_proof_pool_t *proof_pool;
+    const cbm_resolve_proof_source_t *proof_source;
+    const char *lookup_domain;
 } cbm_resolve_method_query_t;
 
 typedef struct {

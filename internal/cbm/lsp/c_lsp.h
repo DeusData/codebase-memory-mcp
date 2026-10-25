@@ -27,7 +27,7 @@ typedef struct {
     int proof_using_count, proof_using_cap;
     bool binding_failed;
     uint32_t proof_syntax_limit; /* first unaudited syntax error; earlier complete sites survive */
-    int callable_flow_depth; /* delayed bodies cannot borrow mutable outer callable state */
+    int callable_flow_depth;     /* delayed bodies cannot borrow mutable outer callable state */
     CBMScope *current_scope;
     CBMResolveTypeMap field_types; /* explicit declaration evidence, keyed by lexical binding */
 
@@ -288,5 +288,17 @@ typedef struct {
 // out must point to file_count pre-zeroed CBMResolvedCallArray structs.
 bool cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_count,
                            CBMResolvedCallArray *out);
+
+CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMTypeRegistry *reg, const char **include_paths, const char **include_ns_qns,
+    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    const cbm_resolve_proof_source_t *source_context);
+
+CBMLSPStatus cbm_run_c_lsp_cross_status_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMLSPDef *defs, int def_count, const char **include_paths, const char **include_ns_qns,
+    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    const cbm_resolve_proof_source_t *source_context);
 
 #endif // CBM_LSP_C_LSP_H

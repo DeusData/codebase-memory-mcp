@@ -1,3 +1,4 @@
+#include "proof_bridge.h"
 #include "php_proof.h"
 #include "../callable_sig.h"
 #include "../resolve/policy.h"
@@ -324,22 +325,43 @@ static const CBMLSPDef *php_proof_type(php_proof_context_t *context, const char 
                ? definition
                : NULL;
 }
-static cbm_resolve_result_t php_proof_type_evidence(const CBMLSPDef *definition) {
-    return (cbm_resolve_result_t){
-        .binding = CBM_RESOLVE_BINDING_UNIQUE,
-        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
-        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                 CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-        .target = definition->graph_qualified_name ? definition->graph_qualified_name
-                                                   : definition->qualified_name,
-        .candidate_count = 1,
-        .reason = "php_source_declared_type"};
+static cbm_resolve_result_t php_proof_type_evidence(php_proof_context_t *context,
+                                                    const CBMLSPDef *definition, TSNode site) {
+    if (!definition)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
+    return cbm_lsp_proof_type_lookup(
+        &context->type_map, php_proof_text(&context->source, site), site,
+        "php_proof-type-name-domain", definition->qualified_name, definition->declaration_identity,
+        definition->graph_qualified_name ? definition->graph_qualified_name
+                                         : definition->qualified_name,
+        definition->source_flags, "php_proof-complete-source-type-lookup");
+}
+static const char *php_proof_occurrence_spelling(php_proof_context_t *context, TSNode site,
+                                                 CBMResolvedKind kind) {
+    TSNode expression = site;
+    if (kind == CBM_RESOLVED_INVOCATION) {
+        TSNode member = php_proof_field(site, "name");
+        const char *name = php_proof_text(&context->source, member);
+        /* Static call extraction records the terminal function name. */
+        if (php_proof_is(site, "scoped_call_expression"))
+            return name;
+        const char *receiver = php_proof_text(&context->source, php_proof_field(site, "object"));
+        return receiver && name ? cbm_arena_sprintf(context->source.arena, "%s.%s", receiver, name)
+                                : NULL;
+    }
+    return php_proof_text(&context->source, expression);
 }
 static void php_proof_emit(php_proof_context_t *context, const char *caller, TSNode site,
                            CBMResolvedKind kind, cbm_resolve_result_t proof) {
     if (!caller || !cbm_resolve_admit(&proof))
+        return;
+    const char *relation = kind == CBM_RESOLVED_INVOCATION       ? "CALLS"
+                           : kind == CBM_RESOLVED_CALL_REFERENCE ? "CALL_REFERENCE"
+                           : kind == CBM_RESOLVED_TYPE_REFERENCE ? "USES_TYPE"
+                                                                 : "USAGE";
+    const char *spelling = php_proof_occurrence_spelling(context, site, kind);
+    proof = cbm_lsp_proof_occurrence(&context->type_map, proof, site, caller, spelling, relation);
+    if (!cbm_resolve_admit(&proof))
         return;
     CBMResolvedCall row = {.caller_qn = caller,
                            .callee_qn = proof.target,
@@ -349,7 +371,10 @@ static void php_proof_emit(php_proof_context_t *context, const char *caller, TSN
                            .site_start_byte = ts_node_start_byte(site),
                            .site_end_byte = ts_node_end_byte(site),
                            .source_origin = CBM_SOURCE_ORIGIN_RAW,
-                           .evidence = {proof.analysis, proof.rule, proof.facts}};
+                           .evidence = {.analysis = proof.analysis,
+                                        .rule = proof.rule,
+                                        .facts = proof.facts,
+                                        .proof = proof.proof}};
     cbm_resolvedcall_push(context->out, context->source.arena, row);
 }
 static bool php_proof_read_syntax(const char *kind) {
@@ -467,7 +492,9 @@ static void php_proof_call(php_proof_context_t *context, TSNode call, const char
         fact = (cbm_resolve_type_fact_t){
             .type = cbm_type_named(context->source.arena, type->qualified_name),
             .status = CBM_RESOLVE_TYPE_KNOWN,
-            .evidence = php_proof_type_evidence(type)};
+            .origin = CBM_RESOLVE_TYPE_ANNOTATION,
+            .proof_pool = &context->type_map.proofs,
+            .evidence = php_proof_type_evidence(context, type, receiver)};
         php_proof_emit(context, caller, receiver, CBM_RESOLVED_TYPE_REFERENCE, fact.evidence);
     } else if (!static_call && php_proof_is(receiver, "variable_name")) {
         const char *variable = php_proof_text(&context->source, receiver);
@@ -478,7 +505,10 @@ static void php_proof_call(php_proof_context_t *context, TSNode call, const char
     if (fact.status != CBM_RESOLVE_TYPE_KNOWN || !fact.type || fact.type->kind != CBM_TYPE_NAMED)
         return;
     context->static_call = static_call;
-    cbm_resolve_method_query_t query = {.registry = context->registry,
+    cbm_resolve_method_query_t query = {.proof_pool = &context->type_map.proofs,
+                                        .proof_source = &context->type_map.proof_source,
+                                        .lookup_domain = fact.type->data.named.qualified_name,
+                                        .registry = context->registry,
                                         .receiver = &fact,
                                         .receiver_qn = fact.type->data.named.qualified_name,
                                         .method_name = name,
@@ -554,7 +584,7 @@ static void php_proof_function(php_proof_context_t *context, TSNode node, const 
             const CBMLSPDef *definition = reference ? NULL : php_proof_type(context, spelling);
             if (!definition)
                 continue;
-            cbm_resolve_result_t proof = php_proof_type_evidence(definition);
+            cbm_resolve_result_t proof = php_proof_type_evidence(context, definition, type_node);
             const CBMType *type = cbm_type_named(context->source.arena, definition->qualified_name);
             if (!cbm_resolve_types_declare(&context->type_map, scope, variable,
                                            ts_node_start_byte(parameter), type,
@@ -596,6 +626,16 @@ void cbm_php_proof_resolve(CBMArena *arena, const char *source, int source_len,
                            const char *module_qn, TSNode root, const CBMTypeRegistry *registry,
                            const CBMPHPImportBindings *bindings, const CBMLSPDef *defs, int count,
                            CBMResolvedCallArray *out) {
+    cbm_php_proof_resolve_with_source(arena, source, source_len, module_qn, root, registry,
+                                      bindings, defs, count, out, NULL);
+}
+
+void cbm_php_proof_resolve_with_source(CBMArena *arena, const char *source, int source_len,
+                                       const char *module_qn, TSNode root,
+                                       const CBMTypeRegistry *registry,
+                                       const CBMPHPImportBindings *bindings, const CBMLSPDef *defs,
+                                       int count, CBMResolvedCallArray *out,
+                                       const cbm_resolve_proof_source_t *source_context) {
     if (!arena || !source || source_len <= 0 || !module_qn || !registry || !out ||
         ts_node_is_null(root) || ts_node_has_error(root))
         return;
@@ -623,6 +663,12 @@ void cbm_php_proof_resolve(CBMArena *arena, const char *source, int source_len,
     context.file_types = cbm_ht_create(64);
     context.imports = cbm_ht_create(16);
     cbm_resolve_types_init(&context.type_map, arena, 0);
+    bool context_ok = source_context
+                          ? cbm_lsp_proof_context(&context.type_map, source_context, module_qn)
+                          : cbm_lsp_proof_standalone_context(&context.type_map, source, source_len,
+                                                             module_qn, CBM_SOURCE_ORIGIN_RAW);
+    if (!context_ok)
+        context.source.failed = true;
     int first = out->count;
     if (context.types && context.file_types && context.imports &&
         php_proof_indexes(&context, bindings, defs, count))

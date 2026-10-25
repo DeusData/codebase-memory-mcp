@@ -1,6 +1,8 @@
 #include "test_framework.h"
 #include "pipeline/lsp_resolve.h"
 #include "resolve/policy.h"
+#include "resolve/proof.h"
+#include "resolve/snapshot.h"
 #include "store/store_resolver.h"
 
 TEST(resolver_target_mapping_requires_exact_identity) {
@@ -223,25 +225,63 @@ TEST(resolver_outcomes_preserve_occurrences_without_edges) {
 }
 
 TEST(resolver_record_requires_exact_source_occurrence) {
+    const char *source = "function caller(){ target(); }\nfunction target() {}\n";
+    CBMFileResult *parsed = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT,
+                                             "proj", "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(parsed);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_proof_pool_init(&pool, &arena, 0, 0, 0);
+    uint32_t start = (uint32_t)(strstr(source, "target();") - source);
     cbm_resolve_record_t row = {
         .file_path = "main.ts",
         .scope = "proj.main.caller",
         .relation = "CALLS",
-        .start_byte = 0,
-        .end_byte = 6,
+        .spelling = "target",
+        .start_byte = start,
+        .end_byte = start + 6,
         .result = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
                    .domain = CBM_RESOLVE_DOMAIN_PROJECT,
                    .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
                    .rule = CBM_RESOLVE_RULE_SCOPE_BINDING,
                    .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
                             CBM_RESOLVE_FACT_SCOPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-                   .target = "proj.lib.target",
+                   .target = "proj.main.target",
                    .candidate_count = 1},
         .emitted = true};
+    /* Flags alone remain insufficient. This fixed source has one hoisted
+     * declaration and no competing binding in caller's lexical lookup. */
+    ASSERT_FALSE(cbm_resolve_record_admit(&row));
+    cbm_resolve_proof_source_t captured =
+        cbm_result_proof_source(parsed, CBM_SOURCE_ORIGIN_RAW, row.scope);
+    cbm_resolve_proof_key_t key = {.lookup_domain = row.scope,
+                                   .lookup_key = row.spelling,
+                                   .lookup_closed = true,
+                                   .declaration_identity = row.result.target,
+                                   .start_byte = row.start_byte,
+                                   .end_byte = row.end_byte,
+                                   .detail = "audited fixed source scope"};
+    const cbm_resolve_proof_t *audit =
+        cbm_resolve_proof_leaf(&pool, CBM_PROOF_ADAPTER_DOMAIN, &captured, &key, &row.result);
+    ASSERT_NOT_NULL(audit);
+    row.result.proof = cbm_resolve_proof_derive(&pool, CBM_PROOF_REGISTRY_LOOKUP, &captured, &key,
+                                                &row.result, &audit, 1, true);
+    ASSERT_NOT_NULL(row.result.proof);
+    row.content_identity = captured.content_identity;
+    row.configuration_identity = captured.configuration_identity;
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT(cbm_gbuf_record_resolution(gb, &row));
+    ASSERT(cbm_gbuf_resolutions_own_shared(gb));
+    size_t count = 0;
+    const cbm_resolve_record_t *sealed = cbm_gbuf_resolutions(gb, &count);
+    ASSERT_EQ(count, 1);
+    row = sealed[0];
     ASSERT(cbm_resolve_record_admit(&row));
     row.end_byte = 0;
     ASSERT_FALSE(cbm_resolve_record_admit(&row));
-    row.end_byte = 6;
+    row.end_byte = start + 6;
     row.result.facts &= ~CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
     ASSERT_FALSE(cbm_resolve_record_admit(&row));
     row.result.facts |= CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
@@ -253,6 +293,9 @@ TEST(resolver_record_requires_exact_source_occurrence) {
     row.scope = "proj.main.caller";
     row.relation = "UNKNOWN_RELATION";
     ASSERT_FALSE(cbm_resolve_record_admit(&row));
+    cbm_gbuf_free(gb);
+    cbm_free_result(parsed);
+    cbm_arena_destroy(&arena);
     PASS();
 }
 

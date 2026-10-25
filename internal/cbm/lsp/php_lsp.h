@@ -166,4 +166,10 @@ typedef struct {
 void cbm_batch_php_lsp_cross(CBMArena *arena, CBMBatchPHPLSPFile *files, int file_count,
                              CBMResolvedCallArray *out);
 
+void cbm_run_php_lsp_cross_with_bindings_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns, int import_count,
+    TSTree *cached_tree, CBMResolvedCallArray *out, const CBMPHPImportBindings *bindings,
+    const cbm_resolve_proof_source_t *source_context);
+
 #endif /* CBM_LSP_PHP_LSP_H */

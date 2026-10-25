@@ -17,6 +17,7 @@
  * value() must route to the helper.
  */
 
+#include "proof_bridge.h"
 #include "php_lsp.h"
 #include "php_proof.h"
 #include "lsp_node_iter.h"
@@ -4805,6 +4806,16 @@ void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, in
                                          int import_count, TSTree *cached_tree,
                                          CBMResolvedCallArray *out,
                                          const CBMPHPImportBindings *bindings) {
+    cbm_run_php_lsp_cross_with_bindings_with_source(arena, source, source_len, module_qn, defs,
+                                                    def_count, import_names, import_qns,
+                                                    import_count, cached_tree, out, bindings, NULL);
+}
+
+void cbm_run_php_lsp_cross_with_bindings_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns, int import_count,
+    TSTree *cached_tree, CBMResolvedCallArray *out, const CBMPHPImportBindings *bindings,
+    const cbm_resolve_proof_source_t *source_context) {
     if (!arena || !source || source_len <= 0 || !out)
         return;
 
@@ -4888,8 +4899,8 @@ void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, in
     php_lsp_process_file(&ctx, root);
     /* Refinement has finished; proof queries never observe an unindexed tail. */
     cbm_registry_finalize_into(&reg, &idx_arena);
-    cbm_php_proof_resolve(arena, source, source_len, module_qn, root, &reg, bindings, defs,
-                          def_count, out);
+    cbm_php_proof_resolve_with_source(arena, source, source_len, module_qn, root, &reg, bindings,
+                                      defs, def_count, out, source_context);
     cbm_arena_destroy(&idx_arena);
 
     if (owns_tree && tree)
@@ -4912,6 +4923,8 @@ void cbm_batch_php_lsp_cross(CBMArena *arena, CBMBatchPHPLSPFile *files, int fil
         CBMArena file_arena;
         cbm_arena_init(&file_arena);
 
+        cbm_resolve_proof_pool_t copied_proofs;
+        cbm_resolve_proof_pool_init(&copied_proofs, arena, 0, 0, 0);
         CBMResolvedCallArray file_out;
         memset(&file_out, 0, sizeof(file_out));
 
@@ -4938,6 +4951,8 @@ void cbm_batch_php_lsp_cross(CBMArena *arena, CBMBatchPHPLSPFile *files, int fil
                     dst->kind = src->kind;
                     dst->site_start_byte = src->site_start_byte;
                     dst->site_end_byte = src->site_end_byte;
+                    dst->source_origin = src->source_origin;
+                    dst->evidence = cbm_lsp_proof_copy(&copied_proofs, src->evidence);
                 }
             } else {
                 out[f].count = 0;

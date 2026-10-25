@@ -8,6 +8,11 @@
  * its atomic publication. No schema table means unavailable, never zero. */
 int cbm_store_resolver_replace(cbm_store_t *store, const char *project,
                                const cbm_resolve_record_t *rows, size_t count);
+int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *project,
+                                          const cbm_resolve_record_t *rows, size_t count,
+                                          const cbm_resolve_file_t *files, size_t file_count,
+                                          const cbm_resolve_summary_t *summaries,
+                                          size_t summary_count);
 int cbm_store_resolver_summary(cbm_store_t *store, const char *project,
                                cbm_resolve_counts_t *counts, bool *present);
 /* Ordered, bounded diagnostics for abstained occurrences. Borrowed row strings

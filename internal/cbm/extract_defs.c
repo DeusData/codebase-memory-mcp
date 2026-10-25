@@ -10034,17 +10034,10 @@ static void extract_vars_dynamic(CBMExtractCtx *ctx, TSNode node, CBMArena *a, c
     }
 }
 
-// Kotlin variable name resolution: name > simple_identifier > identifier > variable_declaration.
+/* A property's direct identifier can belong to its initializer. Resolve the
+ * declaration child first so `val consume = unknown` never declares unknown. */
 static TSNode resolve_kotlin_var_name(TSNode node) {
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-    if (!ts_node_is_null(name_node)) {
-        return name_node;
-    }
-    name_node = cbm_find_child_by_kind(node, "simple_identifier");
-    if (!ts_node_is_null(name_node)) {
-        return name_node;
-    }
-    name_node = cbm_find_child_by_kind(node, "identifier");
     if (!ts_node_is_null(name_node)) {
         return name_node;
     }
@@ -10056,8 +10049,14 @@ static TSNode resolve_kotlin_var_name(TSNode node) {
         }
         return cbm_find_child_by_kind(var_decl, "identifier");
     }
-    TSNode null_node = {0};
-    return null_node;
+    /* Retain direct declaration-node support, but never fall through to a
+     * property initializer when no supported declaration was extracted. */
+    if (strcmp(ts_node_type(node), "variable_declaration") != 0) {
+        TSNode null_node = {0};
+        return null_node;
+    }
+    name_node = cbm_find_child_by_kind(node, "simple_identifier");
+    return ts_node_is_null(name_node) ? cbm_find_child_by_kind(node, "identifier") : name_node;
 }
 
 static void extract_vars_jvm(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {

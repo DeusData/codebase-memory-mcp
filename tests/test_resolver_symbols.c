@@ -13,11 +13,29 @@ typedef struct {
     bool compare_types;
     bool unknown_exposure;
     bool wrong_target;
-    bool prove_declaration_identity;
+    bool coalesce_identical_declarations;
+    bool proof_initialized;
+    cbm_resolve_proof_pool_t proofs;
     bool external;
     bool unknown_domain;
     int calls;
 } method_adapter_t;
+
+/* This suite constructs registry entries directly and has no parsed source.
+ * Its context explicitly attests those standalone fixture inputs; it is never
+ * presented as captured file content or admitted by generation persistence. */
+static const cbm_resolve_proof_source_t symbol_fixture_source = {
+    .module = "standalone.symbol.fixture",
+    .scope = "standalone.symbol.fixture.query",
+    .content_identity = "attestation:resolver-symbol-fixtures-v1",
+    .configuration_identity = "standalone-registry-test-v1"};
+
+static void method_adapter_proofs(method_adapter_t *adapter) {
+    if (!adapter->proof_initialized) {
+        cbm_resolve_proof_pool_init(&adapter->proofs, adapter->arena, 0, 0, 0);
+        adapter->proof_initialized = true;
+    }
+}
 
 static cbm_resolve_method_candidate_t classify_method(const cbm_resolve_method_query_t *query,
                                                       const CBMTypeRegistry *owner,
@@ -38,7 +56,15 @@ static cbm_resolve_method_candidate_t classify_method(const cbm_resolve_method_q
     if (adapter->unknown_exposure) {
         result.exposed = CBM_RESOLVE_METHOD_UNKNOWN;
     }
-    if (adapter->prove_declaration_identity) {
+    /* These fixtures have at most one fallback registry. Independent rows
+     * remain distinct even when their graph names and signatures coincide. */
+    if (method->declaration_identity && method->declaration_identity[0]) {
+        result.declaration_identity = cbm_arena_sprintf(
+            adapter->arena, "%s:%s", owner == query->registry ? "primary" : "fallback",
+            method->declaration_identity);
+        result.declaration_identity_exact = result.declaration_identity != NULL;
+    }
+    if (adapter->coalesce_identical_declarations) {
         result.declaration_identity = result.graph_target;
         result.declaration_identity_exact = true;
     }
@@ -80,6 +106,9 @@ static void add_method(CBMTypeRegistry *registry, const char *receiver, const ch
             .signature = cbm_type_func(registry->arena, NULL, params, NULL),
             .min_params = parameter ? 1 : 0,
             .sig = sig,
+            .declaration_identity =
+                cbm_arena_sprintf(registry->arena, "fixture:%s.%s%s:entry:%d", receiver, method,
+                                  sig ? sig : "", registry->func_count),
         });
 }
 
@@ -102,6 +131,7 @@ static cbm_resolve_type_fact_t method_receiver(CBMArena *arena, const char *name
 static cbm_resolve_method_query_t method_query(CBMTypeRegistry *registry,
                                                const cbm_resolve_type_fact_t *receiver,
                                                method_adapter_t *adapter) {
+    method_adapter_proofs(adapter);
     return (cbm_resolve_method_query_t){.registry = registry,
                                         .receiver = receiver,
                                         .receiver_qn = "project.Widget",
@@ -109,7 +139,9 @@ static cbm_resolve_method_query_t method_query(CBMTypeRegistry *registry,
                                         .argument_count = 0,
                                         .adapter_facts = METHOD_FACTS,
                                         .classify = classify_method,
-                                        .context = adapter};
+                                        .context = adapter,
+                                        .proof_pool = &adapter->proofs,
+                                        .proof_source = &symbol_fixture_source};
 }
 
 TEST(resolver_symbol_exact_receiver_and_method) {
@@ -130,6 +162,17 @@ TEST(resolver_symbol_exact_receiver_and_method) {
     ASSERT(result.owner == &registry);
     ASSERT(result.method == &registry.funcs[0]);
     ASSERT_EQ(adapter.calls, 1);
+    query.proof_pool = NULL;
+    result = cbm_resolve_method(&query);
+    ASSERT_FALSE(cbm_resolve_admit(&result.result));
+    ASSERT_STR_EQ(result.result.reason, "symbol_proof_context_missing");
+    query.proof_pool = &adapter.proofs;
+    const char *identity = registry.funcs[0].declaration_identity;
+    registry.funcs[0].declaration_identity = NULL;
+    result = cbm_resolve_method(&query);
+    ASSERT_FALSE(cbm_resolve_admit(&result.result));
+    ASSERT_STR_EQ(result.result.reason, "symbol_declaration_identity_unproven");
+    registry.funcs[0].declaration_identity = identity;
     query.receiver_qn = "Widget";
     result = cbm_resolve_method(&query);
     ASSERT(!cbm_resolve_admit(&result.result));
@@ -348,16 +391,21 @@ static void add_function(CBMTypeRegistry *registry, const char *qn, const char *
     if (parameter) {
         params[0] = cbm_type_builtin(registry->arena, parameter);
     }
-    cbm_registry_add_func(registry, (CBMRegisteredFunc){.qualified_name = qn,
-                                                        .short_name = "run",
-                                                        .signature = cbm_type_func(
-                                                            registry->arena, NULL, params, NULL),
-                                                        .min_params = parameter ? 1 : 0,
-                                                        .sig = sig});
+    cbm_registry_add_func(
+        registry,
+        (CBMRegisteredFunc){.qualified_name = qn,
+                            .short_name = "run",
+                            .signature = cbm_type_func(registry->arena, NULL, params, NULL),
+                            .min_params = parameter ? 1 : 0,
+                            .sig = sig,
+                            .declaration_identity =
+                                cbm_arena_sprintf(registry->arena, "fixture:%s%s:entry:%d", qn,
+                                                  sig ? sig : "", registry->func_count)});
 }
 
 static cbm_resolve_function_query_t function_query(CBMTypeRegistry *registry,
                                                    method_adapter_t *adapter) {
+    method_adapter_proofs(adapter);
     return (cbm_resolve_function_query_t){
         .registry = registry,
         .function_qn = "project.worker.run",
@@ -368,6 +416,8 @@ static cbm_resolve_function_query_t function_query(CBMTypeRegistry *registry,
         .adapter_facts = METHOD_FACTS,
         .classify = classify_method,
         .context = adapter,
+        .proof_pool = &adapter->proofs,
+        .proof_source = &symbol_fixture_source,
     };
 }
 
@@ -447,9 +497,9 @@ TEST(resolver_symbol_function_duplicate_needs_proved_declaration_identity) {
     cbm_resolve_function_result_t result = cbm_resolve_function(&query);
     ASSERT_EQ(result.result.binding, CBM_RESOLVE_BINDING_AMBIGUOUS);
     ASSERT(result.function == NULL);
-    /* These fixtures have identical parameter signatures. The adapter supplies
-     * the declaration identity only after establishing that equality. */
-    adapter.prove_declaration_identity = true;
+    /* These fixtures have identical parameter signatures. Only the explicit
+     * equivalence proof lets their otherwise distinct identities coalesce. */
+    adapter.coalesce_identical_declarations = true;
     result = cbm_resolve_function(&query);
     ASSERT(cbm_resolve_admit(&result.result));
     ASSERT_STR_EQ(result.result.target, "project.worker.run(int)");
@@ -541,7 +591,104 @@ TEST(resolver_symbol_name_identity_needs_no_invented_call_arity) {
     PASS();
 }
 
+TEST(resolver_symbol_cached_receiver_loses_revoked_observation) {
+    for (int adapted = 0; adapted < 2; adapted++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMTypeRegistry registry;
+        cbm_registry_init(&registry, &arena);
+        add_method(&registry, "project.Widget", "run", NULL, NULL);
+        cbm_registry_finalize(&registry);
+        CBMScope *scope = cbm_scope_push(&arena, NULL);
+        CBMResolveTypeMap map;
+        cbm_resolve_types_init(&map, &arena, 0);
+        ASSERT(cbm_resolve_types_set_context(&map, &symbol_fixture_source));
+        cbm_resolve_type_fact_t immutable = method_receiver(&arena, "project.Widget");
+        ASSERT(cbm_resolve_types_declare(&map, scope, "item", 1, immutable.type,
+                                         CBM_RESOLVE_TYPE_ANNOTATION, &immutable.evidence));
+        cbm_resolve_type_fact_t cached = cbm_resolve_types_lookup(&map, scope, "item", 2);
+        /* A checked pointer-to-owner adaptation may clear this convenience
+         * field. It must not detach the source binding's revocation state. */
+        if (adapted)
+            cached.binding = NULL;
+        method_adapter_t adapter = {.arena = &arena};
+        cbm_resolve_method_query_t query = method_query(&registry, &cached, &adapter);
+        cbm_resolve_method_result_t result = cbm_resolve_method(&query);
+        ASSERT(cbm_resolve_admit(&result.result));
+        cbm_resolve_result_t unproven = immutable.evidence;
+        unproven.analysis = CBM_RESOLVE_ANALYSIS_LIMITED;
+        ASSERT(cbm_resolve_types_observe(&map, scope, "item", 3, immutable.type,
+                                         CBM_RESOLVE_TYPE_OBSERVED_BINDING, &unproven));
+        ASSERT(cbm_scope_lookup(scope, "item") == immutable.type);
+        ASSERT_EQ(cbm_resolve_types_lookup(&map, scope, "item", 4).status,
+                  CBM_RESOLVE_TYPE_UNKNOWN);
+        adapter.calls = 0;
+        result = cbm_resolve_method(&query);
+        ASSERT_FALSE(cbm_resolve_admit(&result.result));
+        ASSERT(result.method == NULL);
+        ASSERT_STR_EQ(result.result.reason, "method_receiver_stale");
+        ASSERT_EQ(adapter.calls, 0);
+        cbm_arena_destroy(&arena);
+    }
+    PASS();
+}
+
+TEST(resolver_symbol_cached_receiver_loses_failed_or_reinitialized_map) {
+    for (int example = 0; example < 3; example++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMTypeRegistry registry;
+        cbm_registry_init(&registry, &arena);
+        add_method(&registry, "project.Widget", "run", NULL, NULL);
+        cbm_registry_finalize(&registry);
+        CBMScope *scope = cbm_scope_push(&arena, NULL);
+        CBMResolveTypeMap map;
+        cbm_resolve_types_init(&map, &arena, example == 1 ? 64 : 0);
+        ASSERT(cbm_resolve_types_set_context(&map, &symbol_fixture_source));
+        cbm_resolve_type_fact_t immutable = method_receiver(&arena, "project.Widget");
+        ASSERT(cbm_resolve_types_declare(&map, scope, "item", 1, immutable.type,
+                                         CBM_RESOLVE_TYPE_ANNOTATION, &immutable.evidence));
+        cbm_resolve_type_fact_t cached = cbm_resolve_types_lookup(&map, scope, "item", 2);
+        ASSERT_EQ(cached.status, CBM_RESOLVE_TYPE_KNOWN);
+        if (example == 0) {
+            cbm_resolve_types_init(&map, &arena, 0);
+            ASSERT(cbm_resolve_types_set_context(&map, &symbol_fixture_source));
+            ASSERT(cbm_resolve_types_declare(&map, scope, "item", 1, immutable.type,
+                                             CBM_RESOLVE_TYPE_ANNOTATION, &immutable.evidence));
+            cbm_resolve_type_fact_t current = cbm_resolve_types_lookup(&map, scope, "item", 2);
+            ASSERT_EQ(current.status, CBM_RESOLVE_TYPE_KNOWN);
+            ASSERT_EQ(current.version, cached.version);
+        } else if (example == 1) {
+            cbm_resolve_type_fact_t current = cached;
+            for (int i = 0; i < 128 && current.status == CBM_RESOLVE_TYPE_KNOWN; i++)
+                current = cbm_resolve_types_lookup(&map, scope, "item", 2);
+            ASSERT_EQ(current.status, CBM_RESOLVE_TYPE_LIMITED);
+        } else {
+            CBMScope exhausted = {.parent = scope};
+            ASSERT_FALSE(cbm_resolve_types_declare(&map, &exhausted, "other", 3, immutable.type,
+                                                   CBM_RESOLVE_TYPE_ANNOTATION,
+                                                   &immutable.evidence));
+            ASSERT_EQ(cbm_resolve_types_lookup(&map, scope, "item", 4).status,
+                      CBM_RESOLVE_TYPE_FAILED);
+        }
+        ASSERT(cbm_scope_lookup(scope, "item") == immutable.type);
+        method_adapter_t adapter = {.arena = &arena};
+        cbm_resolve_method_query_t query = method_query(&registry, &cached, &adapter);
+        cbm_resolve_method_result_t result = cbm_resolve_method(&query);
+        ASSERT_FALSE(cbm_resolve_admit(&result.result));
+        ASSERT(result.method == NULL);
+        ASSERT_EQ(result.result.analysis, example == 1   ? CBM_RESOLVE_ANALYSIS_LIMITED
+                                          : example == 2 ? CBM_RESOLVE_ANALYSIS_FAILED
+                                                         : CBM_RESOLVE_ANALYSIS_UNSUPPORTED);
+        ASSERT_EQ(adapter.calls, 0);
+        cbm_arena_destroy(&arena);
+    }
+    PASS();
+}
+
 SUITE(resolver_symbols) {
+    RUN_TEST(resolver_symbol_cached_receiver_loses_revoked_observation);
+    RUN_TEST(resolver_symbol_cached_receiver_loses_failed_or_reinitialized_map);
     RUN_TEST(resolver_symbol_exact_receiver_and_method);
     RUN_TEST(resolver_symbol_known_overload_and_signature_identity);
     RUN_TEST(resolver_symbol_unknown_overload_never_picks_first);

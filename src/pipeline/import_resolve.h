@@ -45,4 +45,8 @@ int cbm_pipeline_php_import_map(const cbm_gbuf_t *graph, const char *project,
 /* Source-audited Rust use bindings, separate from dependency File targets. */
 int cbm_pipeline_rust_import_map(const cbm_gbuf_t *, const char *, const char *,
                                  const CBMFileResult *, const char ***, const char ***, int *);
+/* Exact source include path -> declaration namespace, from the admission
+ * snapshot; dependency File QNs keep their separate extension-bearing identity. */
+int cbm_pipeline_c_include_map(const cbm_gbuf_t *, const char *, const char *,
+                               const CBMFileResult *, const char ***, const char ***, int *);
 #endif

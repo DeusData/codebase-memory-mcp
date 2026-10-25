@@ -19,8 +19,36 @@ typedef struct {
     uint32_t end_byte;
     uint32_t source_origin;
     cbm_resolve_result_t result;
+    const cbm_resolve_proof_t *binding_proof;
+    const char *content_identity;
+    const char *configuration_identity;
+    /* Transient ownership only: shared immutable solver roots are imported
+     * once by the coordinator before their shared arena is destroyed. */
+    bool proof_borrowed;
     bool emitted;
 } cbm_resolve_record_t;
+
+/* Captured extraction summary, independent of derived lookup outcomes. */
+typedef struct {
+    const char *file_path;
+    const char *module;
+    const char *raw_content_identity;
+    const char *preprocessed_content_identity;
+    const char *configuration_identity;
+    const char *extracted_summary;
+    uint64_t raw_length, preprocessed_length;
+    uint32_t language;
+    bool complete;
+} cbm_resolve_file_t;
+
+/* A stabilized exported binding/type state, including unresolved states. */
+typedef struct {
+    const char *file_path;
+    const char *key;
+    unsigned kind;
+    bool module, closed, proof_borrowed;
+    cbm_resolve_result_t result;
+} cbm_resolve_summary_t;
 
 /* The denominator is extracted occurrences, not all genuine references.
  * Recall must be measured independently against source-labelled fixtures,

@@ -31,6 +31,7 @@
  *   - 0.0  — diagnostic (won't be promoted to an edge)
  */
 
+#include "proof_bridge.h"
 #include "java_lsp.h"
 #include "../helpers.h"
 #include "../callable_sig.h"
@@ -674,18 +675,15 @@ static const CBMRegisteredType *java_proof_type_name(JavaLSPContext *ctx, const 
     return NULL;
 }
 
-static cbm_resolve_result_t java_proof_type(const CBMRegisteredType *type) {
+static cbm_resolve_result_t java_proof_type(JavaLSPContext *ctx, const CBMRegisteredType *type,
+                                            TSNode site) {
     if (!type)
         return java_proof_unknown("java_declared_type_unresolved");
-    return (cbm_resolve_result_t){
-        .binding = CBM_RESOLVE_BINDING_UNIQUE,
-        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
-        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                 CBM_RESOLVE_FACT_TYPE_BOUND,
-        .target = type->graph_qualified_name ? type->graph_qualified_name : type->qualified_name,
-        .candidate_count = 1};
+    return cbm_lsp_proof_type_lookup(
+        &ctx->proven_types, java_node_text(ctx, site), site, "java-source-type-name-domain",
+        type->qualified_name, type->declaration_identity,
+        type->graph_qualified_name ? type->graph_qualified_name : type->qualified_name,
+        type->source_flags, "java-complete-source-type-lookup");
 }
 
 static bool java_proof_annotation_shadowed(JavaLSPContext *ctx, TSNode type_node) {
@@ -719,7 +717,7 @@ static void java_proof_bind(JavaLSPContext *ctx, const char *name, TSNode type_n
     if ((!strcmp(kind, "type_identifier") || !strcmp(kind, "scoped_type_identifier")) &&
         !java_proof_annotation_shadowed(ctx, type_node))
         type = java_proof_type_name(ctx, java_node_text(ctx, type_node));
-    cbm_resolve_result_t proof = java_proof_type(type);
+    cbm_resolve_result_t proof = java_proof_type(ctx, type, type_node);
     const CBMType *observed = cbm_scope_lookup(ctx->current_scope, name);
     if (type) {
         observed = cbm_type_named(ctx->arena, type->qualified_name);
@@ -789,7 +787,9 @@ static cbm_resolve_result_t java_proof_member(JavaLSPContext *ctx, TSNode receiv
         if (type) {
             fact.type = cbm_type_named(ctx->arena, type->qualified_name);
             fact.status = CBM_RESOLVE_TYPE_KNOWN;
-            fact.evidence = java_proof_type(type);
+            fact.evidence = java_proof_type(ctx, type, receiver);
+            fact.origin = CBM_RESOLVE_TYPE_ANNOTATION;
+            fact.proof_pool = &ctx->proven_types.proofs;
         }
     } else {
         fact = cbm_resolve_types_lookup(&ctx->proven_types, ctx->current_scope, variable, at);
@@ -818,7 +818,10 @@ static cbm_resolve_result_t java_proof_member(JavaLSPContext *ctx, TSNode receiv
         if (!strcmp(name, object_methods[i]))
             return java_proof_unknown("java_object_member_domain_incomplete");
     JavaProofSelection selection = {.ctx = ctx, .class_receiver = class_receiver};
-    cbm_resolve_method_query_t query = {.registry = ctx->registry,
+    cbm_resolve_method_query_t query = {.proof_pool = &ctx->proven_types.proofs,
+                                        .proof_source = &ctx->proven_types.proof_source,
+                                        .lookup_domain = qn,
+                                        .registry = ctx->registry,
                                         .receiver = &fact,
                                         .receiver_qn = qn,
                                         .method_name = name,
@@ -868,6 +871,16 @@ static bool java_emit_proof(JavaLSPContext *ctx, TSNode receiver, TSNode name_no
         java_proof_member(ctx, receiver, name, ts_node_start_byte(site), argument_count);
     if (!cbm_resolve_admit(&proof) || !ctx->resolved_calls || !ctx->enclosing_method_qn)
         return false;
+    const char *spelling = name;
+    if (kind == CBM_RESOLVED_INVOCATION && !ts_node_is_null(receiver)) {
+        const char *object = java_node_text(ctx, receiver);
+        spelling = object ? cbm_arena_sprintf(ctx->arena, "%s.%s", object, name) : NULL;
+    }
+    proof = cbm_lsp_proof_occurrence(&ctx->proven_types, proof, site, ctx->enclosing_method_qn,
+                                     spelling,
+                                     kind == CBM_RESOLVED_INVOCATION ? "CALLS" : "CALL_REFERENCE");
+    if (!cbm_resolve_admit(&proof))
+        return false;
     CBMResolvedCall row = {.caller_qn = ctx->enclosing_method_qn,
                            .callee_qn = proof.target,
                            .strategy = "lsp_proven_declared_receiver",
@@ -877,7 +890,10 @@ static bool java_emit_proof(JavaLSPContext *ctx, TSNode receiver, TSNode name_no
                            .site_start_byte = ts_node_start_byte(site),
                            .site_end_byte = ts_node_end_byte(site),
                            .source_origin = CBM_SOURCE_ORIGIN_RAW,
-                           .evidence = {proof.analysis, proof.rule, proof.facts}};
+                           .evidence = {.analysis = proof.analysis,
+                                        .rule = proof.rule,
+                                        .facts = proof.facts,
+                                        .proof = proof.proof}};
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, row);
     return true;
 }
@@ -897,6 +913,8 @@ void java_lsp_init(JavaLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
     cbm_resolve_types_init(&ctx->proven_types, arena, 0);
+    (void)cbm_lsp_proof_standalone_context(&ctx->proven_types, source, source_len, module_qn,
+                                           CBM_SOURCE_ORIGIN_RAW);
     ctx->proof_failed = ctx->current_scope == NULL;
 
     const char *dbg = getenv("CBM_LSP_DEBUG");
@@ -4334,6 +4352,9 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &reg, NULL, module_qn, &result->resolved_calls);
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(result, CBM_SOURCE_ORIGIN_RAW, module_qn);
+    (void)cbm_lsp_proof_context(&ctx.proven_types, &proof_source, module_qn);
 
     /* Add imports collected by extract_imports.c — they are stored as
      * (local_name, module_path = full Java path). We translate to the LSP
@@ -4575,6 +4596,9 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
 
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &overlay, NULL, module_qn, out);
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(result, CBM_SOURCE_ORIGIN_RAW, module_qn);
+    (void)cbm_lsp_proof_context(&ctx.proven_types, &proof_source, module_qn);
 
     register_local_func_or_type_from_file(&ctx, &overlay, result);
     cbm_pxc_count_perfile_defs((uint64_t)result->defs.count);
@@ -4624,6 +4648,17 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_java_lsp_cross_with_source(arena, source, source_len, module_qn, defs, def_count,
+                                       import_names, import_qns, import_count, cached_tree, out,
+                                       NULL);
+}
+
+void cbm_run_java_lsp_cross_with_source(CBMArena *arena, const char *source, int source_len,
+                                        const char *module_qn, CBMLSPDef *defs, int def_count,
+                                        const char **import_names, const char **import_qns,
+                                        int import_count, TSTree *cached_tree,
+                                        CBMResolvedCallArray *out,
+                                        const cbm_resolve_proof_source_t *source_context) {
     if (!arena || !source)
         return;
 
@@ -4661,6 +4696,8 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     JavaLSPContext ctx;
     java_lsp_init(&ctx, arena, source, source_len, &reg, NULL, module_qn, out);
+    if (source_context)
+        (void)cbm_lsp_proof_context(&ctx.proven_types, source_context, module_qn);
 
     /* Apply caller-supplied imports. */
     for (int i = 0; i < import_count; i++) {

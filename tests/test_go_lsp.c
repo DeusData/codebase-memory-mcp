@@ -13,6 +13,8 @@
 #include "cbm.h"
 #include "lsp/go_lsp.h"
 #include "pipeline/lsp_resolve.h"
+#include "resolve/policy.h"
+#include "resolve/proof.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -83,6 +85,12 @@ static int find_resolved_arr_confident(const CBMResolvedCallArray *arr, const ch
             return i;
     }
     return -1;
+}
+
+static bool go_call_has_project_proof(const CBMResolvedCall *row) {
+    const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(row->evidence.proof);
+    return proof && cbm_resolve_admit(&proof->outcome) && proof->outcome.target && row->callee_qn &&
+           !strcmp(proof->outcome.target, row->callee_qn);
 }
 
 /* ── Category 1: Parameter type inference ──────────────────────── */
@@ -333,8 +341,8 @@ TEST(golsp_interface_dispatch) {
     ASSERT_NOT_NULL(r);
     int idx = require_resolved(r, "writeAll", "Write");
     ASSERT_GTE(idx, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[idx].strategy, "lsp_interface_dispatch");
-    ASSERT_TRUE(r->resolved_calls.items[idx].confidence <= 0.90f);
+    ASSERT_STR_EQ(r->resolved_calls.items[idx].callee_qn, "test.Writer.Write");
+    ASSERT(go_call_has_project_proof(&r->resolved_calls.items[idx]));
     cbm_free_result(r);
     PASS();
 }
@@ -594,12 +602,15 @@ TEST(golsp_interface_satisfaction) {
     ASSERT_NOT_NULL(r);
     int idx = find_resolved(r, "runProcessor", "ProcessChunk");
     ASSERT_GTE(idx, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[idx].strategy, "lsp_interface_resolve");
-    ASSERT_TRUE(r->resolved_calls.items[idx].confidence >= 0.89f);
+    ASSERT_STR_EQ(r->resolved_calls.items[idx].callee_qn, "test.DataProcessor.ProcessChunk");
+    ASSERT(go_call_has_project_proof(&r->resolved_calls.items[idx]));
 
     int idx2 = find_resolved(r, "runProcessor", "Finalize");
     ASSERT_GTE(idx2, 0);
-    ASSERT_STR_EQ(r->resolved_calls.items[idx2].strategy, "lsp_interface_resolve");
+    ASSERT_STR_EQ(r->resolved_calls.items[idx2].callee_qn, "test.DataProcessor.Finalize");
+    ASSERT(go_call_has_project_proof(&r->resolved_calls.items[idx2]));
+    ASSERT_EQ(find_resolved(r, "runProcessor", "MyProcessor.ProcessChunk"), -1);
+    ASSERT_EQ(find_resolved(r, "runProcessor", "MyProcessor.Finalize"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -737,9 +748,9 @@ TEST(golsp_interface_method_single_file) {
     ASSERT_NOT_NULL(r);
     int idx = find_resolved(r, "process", "Bind");
     ASSERT_GTE(idx, 0);
-    const char *s = r->resolved_calls.items[idx].strategy;
-    ASSERT_TRUE(strcmp(s, "lsp_interface_resolve") == 0 ||
-                strcmp(s, "lsp_interface_dispatch") == 0);
+    ASSERT_EQ(count_resolved(r, "process", "Bind"), 1);
+    ASSERT_STR_EQ(r->resolved_calls.items[idx].callee_qn, "test.Binder.Bind");
+    ASSERT(go_call_has_project_proof(&r->resolved_calls.items[idx]));
     cbm_free_result(r);
     PASS();
 }
@@ -768,8 +779,9 @@ TEST(golsp_interface_method_field_chain) {
 /* Parser-backed calls already carry their full call-expression spans. The Go
  * semantic resolver must preserve the same occurrence identity; otherwise two
  * same-leaf calls in one caller both join whichever Render record appears
- * first in resolved_calls. Use concrete and ambiguous-interface dispatch so
- * the targets are distinct under Go's existing flat concrete-method QN model. */
+ * first in resolved_calls. Use concrete and interface declaration targets so
+ * the targets are distinct under Go's existing flat concrete-method QN model.
+ * Both rows must carry admissible proofs; strategy names are diagnostics. */
 TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site) {
     const char *source = "package main\n\n"
                          "type Renderer interface { Render(label string) }\n\n"
@@ -834,13 +846,11 @@ TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site) {
         render_semantics++;
         if (rc->site_end_byte <= rc->site_start_byte)
             zero_span_hijackers++;
-        if (rc->site_start_byte == a_start && rc->site_end_byte == a_end && rc->strategy &&
-            strcmp(rc->strategy, "lsp_type_dispatch") == 0) {
+        if (rc->site_start_byte == a_start && rc->site_end_byte == a_end) {
             a_semantic = rc;
         }
-        if (rc->site_start_byte == b_start && rc->site_end_byte == b_end && rc->strategy &&
-            strcmp(rc->strategy, "lsp_interface_dispatch") == 0 &&
-            strstr(rc->callee_qn, ".Renderer.Render")) {
+        if (rc->site_start_byte == b_start && rc->site_end_byte == b_end &&
+            !strcmp(rc->callee_qn, "test.Renderer.Render")) {
             b_semantic = rc;
         }
     }
@@ -849,6 +859,8 @@ TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site) {
     ASSERT_EQ(zero_span_hijackers, 0);
     ASSERT_NOT_NULL(a_semantic);
     ASSERT_NOT_NULL(b_semantic);
+    ASSERT(go_call_has_project_proof(a_semantic));
+    ASSERT(go_call_has_project_proof(b_semantic));
     ASSERT_TRUE(a_semantic != b_semantic);
     ASSERT_NEQ(a_semantic->site_start_byte, b_semantic->site_start_byte);
 
@@ -962,9 +974,11 @@ TEST(golsp_fast_crossfile_same_leaf_calls_preserve_exact_sites) {
     defs[0].receiver_type = a_receiver;
     defs[0].def_module_qn = r->module_qn;
     defs[0].lang = CBM_LANG_GO;
+    defs[0].declaration_identity = "methods.go:A.Render";
     defs[1] = defs[0];
     defs[1].qualified_name = b_unresolved_qn;
     defs[1].receiver_type = b_receiver;
+    defs[1].declaration_identity = "methods.go:B.Render";
 
     CBMTypeRegistry *reg = cbm_go_build_cross_registry(&r->arena, defs, 2);
     ASSERT_NOT_NULL(reg);
@@ -1009,6 +1023,8 @@ TEST(golsp_fast_crossfile_same_leaf_calls_preserve_exact_sites) {
     ASSERT_EQ(zero_span_hijackers, 0);
     ASSERT_NOT_NULL(a_semantic);
     ASSERT_NOT_NULL(b_semantic);
+    ASSERT(go_call_has_project_proof(a_semantic));
+    ASSERT(go_call_has_project_proof(b_semantic));
     ASSERT_TRUE(a_semantic != b_semantic);
     ASSERT_NEQ(a_semantic->site_start_byte, b_semantic->site_start_byte);
 
@@ -1131,7 +1147,8 @@ TEST(golsp_crossfile_interface_dispatch) {
          .short_name = "Binder",
          .label = "Interface",
          .def_module_qn = "myapp/svc",
-         .is_interface = true},
+         .is_interface = true,
+         .declaration_identity = "svc.go:Binder"},
         {.qualified_name = "myapp/svc.DefaultBinder",
          .short_name = "DefaultBinder",
          .label = "Type",
@@ -1141,6 +1158,12 @@ TEST(golsp_crossfile_interface_dispatch) {
          .label = "Method",
          .def_module_qn = "myapp/svc",
          .receiver_type = "myapp/svc.DefaultBinder"},
+        {.qualified_name = "myapp/svc.Binder.Bind",
+         .short_name = "Bind",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.Binder",
+         .declaration_identity = "svc.go:Binder.Bind"},
     };
     const char *imp_names[] = {"svc"};
     const char *imp_qns[] = {"myapp/svc"};
@@ -1152,11 +1175,16 @@ TEST(golsp_crossfile_interface_dispatch) {
     cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 4, imp_names,
                          imp_qns, 1, NULL, &out);
 
+    /* One indexed implementation does not establish dynamic identity. */
+    ASSERT_EQ(find_resolved_arr_confident(&out, "handler", "Bind"), -1);
+    out = (CBMResolvedCallArray){0};
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 5, imp_names,
+                         imp_qns, 1, NULL, &out);
     int idx = find_resolved_arr_confident(&out, "handler", "Bind");
     ASSERT_GTE(idx, 0);
-    const char *s = out.items[idx].strategy;
-    ASSERT_TRUE(strcmp(s, "lsp_interface_resolve") == 0 ||
-                strcmp(s, "lsp_interface_dispatch") == 0);
+    ASSERT_STR_EQ(out.items[idx].callee_qn, "myapp/svc.Binder.Bind");
+    ASSERT(go_call_has_project_proof(&out.items[idx]));
+    ASSERT_EQ(find_resolved_arr_confident(&out, "handler", "DefaultBinder.Bind"), -1);
 
     cbm_arena_destroy(&arena);
     PASS();
@@ -1197,6 +1225,12 @@ TEST(golsp_crossfile_interface_field_chain) {
          .label = "Method",
          .def_module_qn = "myapp/echo",
          .receiver_type = "myapp/echo.DefaultBinder"},
+        {.qualified_name = "myapp/echo.Binder.Bind",
+         .short_name = "Bind",
+         .label = "Method",
+         .def_module_qn = "myapp/echo",
+         .receiver_type = "myapp/echo.Binder",
+         .declaration_identity = "echo.go:Binder.Bind"},
     };
     const char *imp_names[] = {"echo"};
     const char *imp_qns[] = {"myapp/echo"};
@@ -1208,9 +1242,24 @@ TEST(golsp_crossfile_interface_field_chain) {
     cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 6, imp_names,
                          imp_qns, 1, NULL, &out);
 
+    ASSERT_EQ(find_resolved_arr_confident(&out, "process", "Bind"), -1);
+    out = (CBMResolvedCallArray){0};
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 7, imp_names,
+                         imp_qns, 1, NULL, &out);
     int idx = find_resolved_arr_confident(&out, "process", "Bind");
     ASSERT_GTE(idx, 0);
-    ASSERT_TRUE(out.items[idx].confidence >= 0.8f);
+    ASSERT_STR_EQ(out.items[idx].callee_qn, "myapp/echo.Binder.Bind");
+    ASSERT_EQ(find_resolved_arr_confident(&out, "process", "DefaultBinder.Bind"), -1);
+    /* WHY: receiver chains lack field-declaration/type witnesses in the strict
+     * adapter, so this valid call remains a measured graph-quality omission.
+     * TRIED: explicit interface method declaration restores the correct legacy
+     * diagnostic; go_receiver_fact_inner still has no selector-expression rule.
+     * The direct receiver proof contract is covered by
+     * golsp_crossfile_interface_dispatch; keep this independent denominator. */
+    const int genuine_edges = 1;
+    int recovered_edges = go_call_has_project_proof(&out.items[idx]) ? 1 : 0;
+    printf("  Go interface field-chain quality: genuine=%d recovered=%d missing=%d\n",
+           genuine_edges, recovered_edges, genuine_edges - recovered_edges);
 
     cbm_arena_destroy(&arena);
     PASS();
@@ -1267,6 +1316,18 @@ TEST(golsp_crossfile_stdlib_interface) {
          .short_name = "process",
          .label = "Function",
          .def_module_qn = "test.main"},
+        {.qualified_name = "test.main.Decoy.Done",
+         .short_name = "Done",
+         .label = "Method",
+         .def_module_qn = "test.main",
+         .receiver_type = "test.main.Decoy",
+         .declaration_identity = "decoy.go:Done"},
+        {.qualified_name = "test.main.Decoy.Err",
+         .short_name = "Err",
+         .label = "Method",
+         .def_module_qn = "test.main",
+         .receiver_type = "test.main.Decoy",
+         .declaration_identity = "decoy.go:Err"},
     };
     const char *imp_names[] = {"context"};
     const char *imp_qns[] = {"context"};
@@ -1275,11 +1336,19 @@ TEST(golsp_crossfile_stdlib_interface) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
 
-    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 1, imp_names,
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 3, imp_names,
                          imp_qns, 1, NULL, &out);
 
-    ASSERT_GTE(find_resolved_arr_confident(&out, "process", "Done"), 0);
-    ASSERT_GTE(find_resolved_arr_confident(&out, "process", "Err"), 0);
+    int done = find_resolved_arr_confident(&out, "process", "Done");
+    int err = find_resolved_arr_confident(&out, "process", "Err");
+    ASSERT_GTE(done, 0);
+    ASSERT_GTE(err, 0);
+    ASSERT_STR_EQ(out.items[done].callee_qn, "context.Context.Done");
+    ASSERT_STR_EQ(out.items[err].callee_qn, "context.Context.Err");
+    /* External member-list diagnostics confer no project-source authority. */
+    ASSERT(!go_call_has_project_proof(&out.items[done]));
+    ASSERT(!go_call_has_project_proof(&out.items[err]));
+    ASSERT_EQ(find_resolved_arr_confident(&out, "process", "test.main.Decoy"), -1);
 
     cbm_arena_destroy(&arena);
     PASS();
@@ -1358,8 +1427,8 @@ TEST(golsp_crossfile_aliased_field_requal) {
         for (int i = 0; i < out.count; i++) {
             const CBMResolvedCall *rc = &out.items[i];
             printf("    %s -> %s [%s %.2f]\n", rc->caller_qn ? rc->caller_qn : "(null)",
-                   rc->callee_qn ? rc->callee_qn : "(null)",
-                   rc->strategy ? rc->strategy : "(null)", rc->confidence);
+                   rc->callee_qn ? rc->callee_qn : "(null)", rc->strategy ? rc->strategy : "(null)",
+                   rc->confidence);
         }
     }
     ASSERT_GTE(svc_idx, 0);
@@ -1394,7 +1463,8 @@ TEST(golsp_crossfile_local_interface_single_impl) {
          .label = "Interface",
          .def_module_qn = "myapp/svc",
          .is_interface = true,
-         .method_names_str = "Get|Put"},
+         .method_names_str = "Get|Put",
+         .declaration_identity = "svc.go:Store"},
         {.qualified_name = "myapp/svc.RedisStore",
          .short_name = "RedisStore",
          .label = "Class",
@@ -1409,6 +1479,18 @@ TEST(golsp_crossfile_local_interface_single_impl) {
          .label = "Method",
          .def_module_qn = "myapp/svc",
          .receiver_type = "myapp/svc.RedisStore"},
+        {.qualified_name = "myapp/svc.Store.Get",
+         .short_name = "Get",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.Store",
+         .declaration_identity = "svc.go:Store.Get"},
+        {.qualified_name = "myapp/svc.Store.Put",
+         .short_name = "Put",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.Store",
+         .declaration_identity = "svc.go:Store.Put"},
     };
     const char *imp_names[] = {"svc"};
     const char *imp_qns[] = {"myapp/svc"};
@@ -1420,14 +1502,21 @@ TEST(golsp_crossfile_local_interface_single_impl) {
     cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 5, imp_names,
                          imp_qns, 1, NULL, &out);
 
+    ASSERT_EQ(find_resolved_arr_confident(&out, "process", "Get"), -1);
+    ASSERT_EQ(find_resolved_arr_confident(&out, "process", "Put"), -1);
+    out = (CBMResolvedCallArray){0};
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 7, imp_names,
+                         imp_qns, 1, NULL, &out);
     int idxGet = find_resolved_arr_confident(&out, "process", "Get");
     ASSERT_GTE(idxGet, 0);
-    ASSERT_STR_EQ(out.items[idxGet].strategy, "lsp_interface_resolve");
-    ASSERT_STR_EQ(out.items[idxGet].callee_qn, "myapp/svc.RedisStore.Get");
+    ASSERT_STR_EQ(out.items[idxGet].callee_qn, "myapp/svc.Store.Get");
+    ASSERT(go_call_has_project_proof(&out.items[idxGet]));
 
     int idxPut = find_resolved_arr_confident(&out, "process", "Put");
     ASSERT_GTE(idxPut, 0);
-    ASSERT_STR_EQ(out.items[idxPut].strategy, "lsp_interface_resolve");
+    ASSERT_STR_EQ(out.items[idxPut].callee_qn, "myapp/svc.Store.Put");
+    ASSERT(go_call_has_project_proof(&out.items[idxPut]));
+    ASSERT_EQ(find_resolved_arr_confident(&out, "process", "RedisStore"), -1);
 
     cbm_arena_destroy(&arena);
     PASS();

@@ -1,5 +1,8 @@
 #include "test_framework.h"
 #include "cbm.h"
+#include "graph_buffer/graph_buffer.h"
+#include "resolve/proof.h"
+#include "resolve/snapshot.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
 #include "store/store_resolver.h"
@@ -72,7 +75,58 @@ static int diagnostic_rows(cbm_store_t *store, const char *project) {
                     .target = "diag.target",
                     .candidate_count = 1,
                     .reason = "exact_scope"}}};
-    return cbm_store_resolver_replace(store, project, rows, sizeof(rows) / sizeof(rows[0]));
+    const char *source = "void admitted(void) {}\nvoid caller(void) { admitted(); }\n";
+    CBMFileResult *parsed =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_C, project, "a.c", 0, NULL, NULL);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_proof_pool_init(&pool, &arena, 0, 0, 0);
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp");
+    cbm_resolve_file_t file;
+    char digest[65], target[128], scope[128];
+    bool ok = parsed && gb && cbm_resolve_snapshot(parsed, "a.c", CBM_LANG_C, &file, digest);
+    if (ok) {
+        cbm_resolve_record_t *admitted = &rows[sizeof(rows) / sizeof(rows[0]) - 1];
+        snprintf(target, sizeof(target), "%s.a.admitted", project);
+        snprintf(scope, sizeof(scope), "%s.a.caller", project);
+        admitted->scope = scope;
+        admitted->result.target = target;
+        admitted->start_byte = (uint32_t)(strstr(source, "admitted();") - source);
+        admitted->end_byte = admitted->start_byte + 8;
+        admitted->content_identity = file.raw_content_identity;
+        admitted->configuration_identity = file.configuration_identity;
+        cbm_resolve_proof_source_t captured =
+            cbm_result_proof_source(parsed, CBM_SOURCE_ORIGIN_RAW, scope);
+        cbm_resolve_proof_key_t key = {.lookup_domain = scope,
+                                       .lookup_key = "admitted",
+                                       .lookup_closed = true,
+                                       .declaration_identity = target,
+                                       .start_byte = admitted->start_byte,
+                                       .end_byte = admitted->end_byte,
+                                       .detail = "audited fixed source scope"};
+        const cbm_resolve_proof_t *audit = cbm_resolve_proof_leaf(
+            &pool, CBM_PROOF_ADAPTER_DOMAIN, &captured, &key, &admitted->result);
+        admitted->result.proof =
+            audit ? cbm_resolve_proof_derive(&pool, CBM_PROOF_REGISTRY_LOOKUP, &captured, &key,
+                                             &admitted->result, &audit, 1, true)
+                  : NULL;
+        ok = admitted->result.proof && cbm_gbuf_record_resolver_file(gb, &file);
+        for (size_t i = 0; ok && i < sizeof(rows) / sizeof(rows[0]); i++)
+            ok = cbm_gbuf_record_resolution(gb, &rows[i]);
+        ok = ok && cbm_gbuf_resolutions_own_shared(gb);
+    }
+    int result = CBM_STORE_ERR;
+    if (ok) {
+        size_t count = 0;
+        const cbm_resolve_record_t *sealed = cbm_gbuf_resolutions(gb, &count);
+        result =
+            cbm_store_resolver_replace_generation(store, project, sealed, count, &file, 1, NULL, 0);
+    }
+    cbm_gbuf_free(gb);
+    cbm_free_result(parsed);
+    cbm_arena_destroy(&arena);
+    return result;
 }
 
 typedef struct {

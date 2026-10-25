@@ -641,6 +641,9 @@ typedef enum {
     CBM_RESOLVED_FIELD_REFERENCE,
     /* A source annotation or explicit type name bound to its declaration. */
     CBM_RESOLVED_TYPE_REFERENCE,
+    /* Exact source value binding, with no assertion of callable identity.
+     * A Function/Method graph label does not upgrade this proof to a call. */
+    CBM_RESOLVED_VALUE_REFERENCE,
 } CBMResolvedKind;
 
 // LSP-resolved invocation/reference: high-confidence type-aware resolution.
@@ -960,6 +963,13 @@ typedef struct CBMFileResult {
     // file (defs/calls already extracted are unaffected).
     const char *source;
     int source_len;
+    /* Captured at extraction, before either source buffer can be released.
+     * Origins never borrow each other's coordinates or content identity. */
+    const char *source_project;
+    const char *source_file;
+    char source_content_id[2][65];
+    uint64_t source_content_length[2];
+    char source_configuration_id[65];
 
     // Composite extraction results (currently ObjectScript Studio Export)
     // retain their per-unit results so shallow-copied carrier strings remain
@@ -1223,6 +1233,11 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
 // timeout_micros: per-file tree-sitter parse budget in microseconds of the
 // calling thread's CPU time, with a wall-clock backstop of
 // CBM_PARSE_WALL_CEILING_FACTOR x the budget (0 = no budget).
+/* Compare supplied bytes to the immutable analyzed snapshot, never to a
+ * freshly reconstructed identity. Missing identities fail closed. */
+bool cbm_result_source_matches(const CBMFileResult *result, const char *source, size_t length,
+                               CBMSourceOrigin origin);
+
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, // NULL-terminated, or NULL

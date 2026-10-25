@@ -1,4 +1,5 @@
 #include "policy.h"
+#include "proof.h"
 
 #include <string.h>
 
@@ -36,9 +37,20 @@ bool cbm_resolve_admit(const cbm_resolve_result_t *result) {
     return required && (result->facts & required) == required;
 }
 
-bool cbm_resolve_record_admit(const cbm_resolve_record_t *record) {
+bool cbm_resolve_record_candidate(const cbm_resolve_record_t *record) {
     if (!record || !record->file_path || !record->file_path[0] || !record->scope ||
-        !record->scope[0] || !record->relation || !cbm_resolve_admit(&record->result))
+        !record->scope[0] || !record->relation || record->source_origin > 1 ||
+        !cbm_resolve_admit(&record->result))
+        return false;
+    const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(record->result.proof);
+    if (!record->content_identity || !record->content_identity[0] ||
+        !record->configuration_identity || !record->configuration_identity[0] || !proof ||
+        proof->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+        proof->outcome.binding != CBM_RESOLVE_BINDING_UNIQUE ||
+        proof->outcome.domain != CBM_RESOLVE_DOMAIN_PROJECT ||
+        proof->outcome.candidate_count != record->result.candidate_count ||
+        !proof->predecessors_closed || !proof->outcome.target ||
+        strcmp(proof->outcome.target, record->result.target))
         return false;
     if (strcmp(record->relation, "IMPORTS") == 0)
         return true;
@@ -53,4 +65,71 @@ bool cbm_resolve_record_admit(const cbm_resolve_record_t *record) {
     }
     return known && record->end_byte > record->start_byte && record->source_origin <= 1 &&
            (record->result.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT) != 0;
+}
+
+static bool same_text(const char *left, const char *right) {
+    return strcmp(left ? left : "", right ? right : "") == 0;
+}
+
+static bool occurrence_role_matches(const char *proved, const char *requested) {
+    if (same_text(proved, requested))
+        return true;
+    /* A type mention or a field read/write is also a usage at that same site.
+     * No converse conversion, invocation, or write authority is implied. */
+    return same_text(requested, "USAGE") &&
+           (same_text(proved, "USES_TYPE") || same_text(proved, "READS") ||
+            same_text(proved, "WRITES"));
+}
+
+bool cbm_resolve_record_site_proof(const cbm_resolve_record_t *record,
+                                   const cbm_resolve_proof_t *proof, const char *project) {
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(proof);
+    if (!record || !view || !project || !project[0] || !view->predecessors_closed ||
+        view->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+        view->outcome.binding != CBM_RESOLVE_BINDING_UNIQUE ||
+        view->outcome.domain != CBM_RESOLVE_DOMAIN_PROJECT || view->outcome.candidate_count != 1 ||
+        view->outcome.rule != record->result.rule ||
+        !same_text(view->outcome.target, record->result.target))
+        return false;
+    bool dependency = same_text(record->relation, "IMPORTS");
+    return (dependency || ((view->outcome.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT) &&
+                           record->end_byte > record->start_byte)) &&
+           same_text(view->source.project, project) &&
+           same_text(view->source.file, record->file_path) &&
+           same_text(view->source.scope, record->scope) &&
+           same_text(view->source.content_identity, record->content_identity) &&
+           same_text(view->source.configuration_identity, record->configuration_identity) &&
+           view->source.source_origin == record->source_origin &&
+           view->key.origin == record->source_origin &&
+           view->key.start_byte == record->start_byte && view->key.end_byte == record->end_byte &&
+           same_text(view->key.lookup_key, record->spelling) &&
+           same_text(view->key.binding_identity, record->result.target) &&
+           occurrence_role_matches(view->key.detail, record->relation);
+}
+
+bool cbm_resolve_record_admit(const cbm_resolve_record_t *record) {
+    if (!cbm_resolve_record_candidate(record) || record->proof_borrowed)
+        return false;
+    const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(record->result.proof);
+    bool site = false;
+    uint32_t supported = 0;
+    for (size_t i = 0; i < proof->premise_count; i++) {
+        const cbm_resolve_proof_t *premise = proof->premises[i];
+        supported |= premise->value.outcome.facts;
+        site |= cbm_resolve_record_site_proof(record, premise, proof->source.project);
+    }
+    return site && (supported & record->result.facts) == record->result.facts &&
+           proof->kind == CBM_PROOF_OCCURRENCE_BINDING && proof->premise_count > 0 &&
+           same_text(proof->source.file, record->file_path) &&
+           same_text(proof->source.scope, record->scope) &&
+           same_text(proof->source.content_identity, record->content_identity) &&
+           same_text(proof->source.configuration_identity, record->configuration_identity) &&
+           proof->source.source_origin == record->source_origin &&
+           proof->key.start_byte == record->start_byte && proof->key.end_byte == record->end_byte &&
+           same_text(proof->key.lookup_domain, record->scope) &&
+           same_text(proof->key.lookup_key, record->spelling) &&
+           same_text(proof->key.detail, record->relation) &&
+           proof->outcome.rule == record->result.rule &&
+           proof->outcome.facts == record->result.facts &&
+           proof->outcome.candidate_count == record->result.candidate_count;
 }

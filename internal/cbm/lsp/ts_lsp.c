@@ -26,6 +26,7 @@
  *   - eval_depth caps at TS_LSP_MAX_EVAL_DEPTH to defend against pathological recursion.
  */
 
+#include "proof_bridge.h"
 #include "ts_lsp.h"
 #include "ts_proof.h"
 #include "../resolve/policy.h"
@@ -2906,6 +2907,9 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
             }
             cbm_resolve_method_result_t proven =
                 cbm_ts_proof_method(ctx, object, method_name, property);
+            proven.result =
+                cbm_lsp_proof_occurrence(&ctx->proven_types, proven.result, property,
+                                         ctx->enclosing_func_qn, method_name, "CALL_REFERENCE");
             if (cbm_resolve_admit(&proven.result)) {
                 int before = ctx->resolved_calls ? ctx->resolved_calls->count : 0;
                 ts_emit_resolved_reference(ctx, proven.result.target,
@@ -2913,8 +2917,7 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
                 if (ctx->resolved_calls && ctx->resolved_calls->count == before + 1) {
                     CBMResolvedCall *row =
                         &ctx->resolved_calls->items[ctx->resolved_calls->count - 1];
-                    row->evidence = (cbm_resolve_evidence_t){
-                        proven.result.analysis, proven.result.rule, proven.result.facts};
+                    row->evidence = cbm_lsp_proof_evidence(proven.result);
                 }
                 continue;
             }
@@ -2999,6 +3002,9 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                 }
                 cbm_resolve_method_result_t proven =
                     cbm_ts_proof_method(ctx, obj, mname, call_node);
+                proven.result =
+                    cbm_lsp_proof_occurrence(&ctx->proven_types, proven.result, call_node,
+                                             ctx->enclosing_func_qn, node_text(ctx, fn), "CALLS");
                 if (cbm_resolve_admit(&proven.result)) {
                     int before = ctx->resolved_calls ? ctx->resolved_calls->count : 0;
                     ts_emit_resolved_call_at(ctx, proven.result.target, "lsp_ts_declared_method",
@@ -3006,8 +3012,7 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                     if (ctx->resolved_calls && ctx->resolved_calls->count == before + 1) {
                         CBMResolvedCall *row =
                             &ctx->resolved_calls->items[ctx->resolved_calls->count - 1];
-                        row->evidence = (cbm_resolve_evidence_t){
-                            proven.result.analysis, proven.result.rule, proven.result.facts};
+                        row->evidence = cbm_lsp_proof_evidence(proven.result);
                     }
                     return;
                 }
@@ -4002,6 +4007,9 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->jsx_mode = jsx_mode;
     ctx->dts_mode = dts_mode;
     ctx->current_scope = arena ? cbm_scope_push(arena, NULL) : NULL;
+    cbm_resolve_types_init(&ctx->proven_types, arena, 0);
+    (void)cbm_lsp_proof_standalone_context(&ctx->proven_types, source, source_len, module_qn,
+                                           CBM_SOURCE_ORIGIN_RAW);
 
     const char *debug_env = getenv("CBM_LSP_DEBUG");
     ctx->debug = (debug_env && debug_env[0]);
@@ -5814,6 +5822,9 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     ts_lsp_init(&ctx, arena, source, source_len, &reg, result->module_qn, js_mode, jsx_mode,
                 dts_mode, &result->resolved_calls);
     ctx.usages = &result->usages;
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(result, CBM_SOURCE_ORIGIN_RAW, result->module_qn);
+    (void)cbm_lsp_proof_context(&ctx.proven_types, &proof_source, result->module_qn);
 
     // Add imports early so type-resolution passes can rewrite NAMED references that
     // refer to imported symbols. ts_parse_type_node consults these via
@@ -6031,6 +6042,16 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         int def_count, const char **import_names,
                                         const char **import_qns, int import_count,
                                         TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_ts_lsp_cross_with_registry_with_source(
+        arena, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, reg, defs, def_count,
+        import_names, import_qns, import_count, cached_tree, out, NULL);
+}
+
+void cbm_run_ts_lsp_cross_with_registry_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMTypeRegistry *reg, CBMLSPDef *defs, int def_count,
+    const char **import_names, const char **import_qns, int import_count, TSTree *cached_tree,
+    CBMResolvedCallArray *out, const cbm_resolve_proof_source_t *source_context) {
     if (!arena || !out || !reg)
         return;
 
@@ -6079,6 +6100,8 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &overlay, module_qn, js_mode, jsx_mode, dts_mode,
                 out);
+    if (source_context)
+        (void)cbm_lsp_proof_context(&ctx.proven_types, source_context, module_qn);
     ctx.cross_file_mode = true;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
@@ -6104,6 +6127,18 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           CBMLSPDef *defs, int def_count, const char **import_names,
                           const char **import_qns, int import_count, TSTree *cached_tree,
                           CBMResolvedCallArray *out) {
+    cbm_run_ts_lsp_cross_with_source(arena, source, source_len, module_qn, js_mode, jsx_mode,
+                                     dts_mode, defs, def_count, import_names, import_qns,
+                                     import_count, cached_tree, out, NULL);
+}
+
+void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, bool js_mode, bool jsx_mode,
+                                      bool dts_mode, CBMLSPDef *defs, int def_count,
+                                      const char **import_names, const char **import_qns,
+                                      int import_count, TSTree *cached_tree,
+                                      CBMResolvedCallArray *out,
+                                      const cbm_resolve_proof_source_t *source_context) {
     if (!arena || !out)
         return;
 
@@ -6300,6 +6335,8 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, js_mode, jsx_mode, dts_mode, out);
+    if (source_context)
+        (void)cbm_lsp_proof_context(&ctx.proven_types, source_context, module_qn);
     ctx.cross_file_mode = true;
 
     // Add imports early so type passes can resolve imported types.

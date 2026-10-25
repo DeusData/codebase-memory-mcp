@@ -2421,6 +2421,8 @@ static int resolve_sequential_occurrences(cbm_pipeline_ctx_t *ctx, const cbm_fil
         cbm_pxc_free_import_map(keys, values, imports);
         cbm_pipeline_result_release(result, loaded);
     }
+    if (rc == 0 && !cbm_gbuf_resolutions_own_shared(ctx->gbuf))
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
     cbm_shared_resolver_free(ctx->shared_resolver);
     ctx->shared_resolver = NULL;
     return rc;
@@ -2736,6 +2738,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                                      module_def_index, &cross_registries)
                               : CBM_PIPELINE_ABORT_PRESERVE_DB;
     if (atomic_load(&ctx->resolver_failed))
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    if (rc == 0 && !cbm_gbuf_resolutions_own_shared(ctx->gbuf))
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
     cbm_shared_resolver_free(ctx->shared_resolver);
     ctx->shared_resolver = NULL;
@@ -3456,8 +3460,14 @@ static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t
     if (ok && generation->gbuf) {
         size_t count = 0;
         const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(generation->gbuf, &count);
+        size_t file_count = 0, summary_count = 0;
+        const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(generation->gbuf, &file_count);
+        const cbm_resolve_summary_t *summaries =
+            cbm_gbuf_resolver_summaries(generation->gbuf, &summary_count);
         ok = cbm_gbuf_resolutions_complete(generation->gbuf) &&
-             cbm_store_resolver_replace(store, generation->project, rows, count) == CBM_STORE_OK;
+             cbm_store_resolver_replace_generation(store, generation->project, rows, count, files,
+                                                   file_count, summaries,
+                                                   summary_count) == CBM_STORE_OK;
     }
     if (ok && generation->adr_content) {
         ok = cbm_store_adr_store(store, generation->project, generation->adr_content) ==
